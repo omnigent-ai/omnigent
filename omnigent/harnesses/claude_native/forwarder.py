@@ -24,19 +24,23 @@ from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
+    AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE,
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
+    ApiRetry,
     BtwOverlay,
     ClaudeHookRecord,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     HookReadResult,
+    PaneSignals,
     ResumeCostBaseline,
     TranscriptReadResult,
     _display_text,
     _transcript_items_from_entry,
     _transcript_timestamp,
     compute_transcript_cumulative_cost,
+    inject_interrupt,
     read_active_session_id,
     read_bridge_id,
     read_claude_context_state,
@@ -168,12 +172,13 @@ _DEFAULT_POLL_INTERVAL_S = 0.25
 _TRANSCRIPT_DISCOVERY_WARNING_S = 30.0
 _TRANSCRIPT_DISCOVERY_ERROR_S = 180.0
 _OBSERVER_HOOK_STDERR_READ_BYTES = 64 * 1024
-# Minimum spacing between pane reads. One ``tmux capture-pane`` subprocess per
-# window feeds every footer-derived signal (permission mode + /btw overlay), so
-# the cost is one subprocess regardless of how many signals are parsed. Both
-# signals change only on a human action (shift+tab, a /btw), so 2s of lag is
-# imperceptible and keeps the subprocess rate low.
+# Minimum spacing between pane reads. One ``tmux capture-pane`` per window feeds
+# every pane-derived signal; they change on a human action or a retry backoff,
+# so 2s of lag is imperceptible and keeps the subprocess rate low.
 _PANE_POLL_INTERVAL_S = 2.0
+# Claude Code names a retried request's status only from attempt 3 (or its last),
+# after its own credential refreshes, so a 401/403 there outlived a refresh.
+_REJECTED_API_RETRY_STATUSES = frozenset({401, 403})
 # Statuses with which a server rejects an ``external_permission_mode_change``
 # whose mode it does not know (a server older than this bridge). Unlike a
 # transport failure, the rejection does not clear on its own.
@@ -193,6 +198,11 @@ _POST_TIMEOUT_S = 10.0
 # A child-history POST carries up to 100 items and can outlast the live lane's
 # budget; that lane runs off the latency-sensitive path, so it gets more room.
 _SUBAGENT_POST_TIMEOUT_S = 30.0
+# A failed external_session_id mirror PATCH backs off (doubling, capped): the
+# mirror runs inline before transcript forwarding, so retrying every poll would
+# stall live output behind each timed-out PATCH.
+_EXTERNAL_SESSION_ID_RETRY_BASE_S = 5.0
+_EXTERNAL_SESSION_ID_RETRY_MAX_S = 120.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
 # A batch gets a bounded number of attempts before it is split into
@@ -1025,6 +1035,14 @@ class _ForwardDedupeState:
     # partial answer.
     btw_pending_key: str | None = None
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
+    # Hook cursor of the latest parent prompt; it identifies a turn before any output.
+    prompt_submit_cursor: int | None = None
+    # The visible API retry already reported as failed / interrupted, and its prompt;
+    # they clear once the retry row leaves the pane or a newer prompt is submitted.
+    api_retry_reported: bool = False
+    api_retry_interrupted: bool = False
+    api_retry_prompt_cursor: int | None = None
+    api_retry_observed_hooks: HookForwardState | None = None
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
@@ -1436,6 +1454,10 @@ async def forward_claude_transcript_to_session(
     # lifetime of the forwarder task; the server's idempotence handles
     # the rare case where two forwarder processes race the same conv.
     external_session_id_mirrored = False
+    # Backoff for transient mirror failures: consecutive failures and the
+    # monotonic time before which the mirror is not attempted again.
+    external_session_id_failures = 0
+    external_session_id_retry_at = 0.0
     # Native task system state: maps and ordered list accumulated from
     # TaskCreated / TaskCompleted / PostToolUse/TaskUpdate hook events.
     # Reset on /clear and /fork rotations alongside other session state.
@@ -1540,6 +1562,8 @@ async def forward_claude_transcript_to_session(
                         subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
                         external_session_id_mirrored = False
+                        external_session_id_failures = 0
+                        external_session_id_retry_at = 0.0
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
@@ -1582,6 +1606,8 @@ async def forward_claude_transcript_to_session(
                         subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
                         external_session_id_mirrored = False
+                        external_session_id_failures = 0
+                        external_session_id_retry_at = 0.0
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
@@ -1598,12 +1624,24 @@ async def forward_claude_transcript_to_session(
                         cost_cache = {}
                         await asyncio.sleep(poll_interval_s)
                         continue
-                    if not external_session_id_mirrored:
-                        external_session_id_mirrored = await _maybe_mirror_external_session_id(
+                    if (
+                        not external_session_id_mirrored
+                        and time.monotonic() >= external_session_id_retry_at
+                    ):
+                        mirror_outcome = await _maybe_mirror_external_session_id(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
                         )
+                        if mirror_outcome is True:
+                            external_session_id_mirrored = True
+                        elif mirror_outcome is False:
+                            external_session_id_failures += 1
+                            external_session_id_retry_at = time.monotonic() + min(
+                                _EXTERNAL_SESSION_ID_RETRY_BASE_S
+                                * 2 ** min(external_session_id_failures - 1, 16),
+                                _EXTERNAL_SESSION_ID_RETRY_MAX_S,
+                            )
                     # Normalize the statusLine shim's raw capture into
                     # context.json (one stat when nothing changed).
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
@@ -1766,16 +1804,13 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
                         )
-                        # Footer-derived signals (permission mode, /btw overlay)
-                        # emit no event and live only in the rendered pane. One
-                        # throttled capture feeds both, so a shift+tab switch and
-                        # a settled /btw exchange both reach the web view without
-                        # spawning a capture-pane subprocess per signal.
+                        # Pane-only signals share one throttled capture.
                         await _forward_pane_signals(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
+                            response_id=state.current_response_id,
                         )
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
@@ -2300,10 +2335,12 @@ def _partition_subagent_batches(
 def _leaves_turn_open(item: ClaudeTranscriptItem, *, open_before: bool) -> bool:
     """Whether a child's turn is still open after this item.
 
-    Assistant text, a handback, and an interrupt end it; a tool result keeps
-    the state its call set.
+    Assistant text, a handback, and an interrupt end it; a tool result and a
+    hook-blocked message keep the state set before them.
     """
-    if item.item_type == "function_call_output":
+    if item.item_type == "function_call_output" or (
+        item.item_type == "error" and item.data.get("code") == AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE
+    ):
         return open_before
     if item.item_type == "function_call":
         return item.data.get("name") != _SUBAGENT_HANDBACK_TOOL
@@ -4411,7 +4448,7 @@ async def _maybe_mirror_external_session_id(
     client: httpx.AsyncClient,
     session_id: str,
     bridge_dir: Path,
-) -> bool:
+) -> bool | None:
     """
     Mirror Claude's native session id onto the Omnigent conversation row.
 
@@ -4419,7 +4456,7 @@ async def _maybe_mirror_external_session_id(
     bridge state file and, if present, PATCHes
     ``external_session_id`` on the Omnigent conversation. Best-effort: a
     transient HTTP failure logs a warning and returns ``False`` so
-    the caller retries on the next poll. Once the PATCH succeeds we
+    the caller retries after a backoff. Once the PATCH succeeds we
     return ``True`` and the caller latches off — the value is
     durable server-side from that point on.
 
@@ -4432,12 +4469,13 @@ async def _maybe_mirror_external_session_id(
     :param bridge_dir: Native Claude bridge directory; the source of
         the captured Claude session id.
     :returns: ``True`` once mirroring is finished (or has been
-        determined to be unrecoverable); ``False`` to retry next
-        poll.
+        determined to be unrecoverable); ``False`` after a transient
+        failure, to retry after a backoff; ``None`` when no Claude
+        session id has been captured yet, to check again next poll.
     """
     claude_sid = read_claude_session_id(bridge_dir)
     if claude_sid is None:
-        return False
+        return None
     try:
         await _patch_external_session_id(
             client,
@@ -4741,6 +4779,7 @@ async def _forward_available_status_events(
             if record.event_name == "UserPromptSubmit" and not _is_subagent_hook_record(
                 record, parent_claude_session_ids=parent_claude_session_ids
             ):
+                dedupe.prompt_submit_cursor = record.event_cursor
                 with contextlib.suppress(Exception):
                     # This proves Claude saw a submit; later hooks can still block the turn.
                     _logger.info(
@@ -6547,15 +6586,32 @@ async def _post_external_permission_mode_change(
     resp.raise_for_status()
 
 
+def _read_pane_observation(
+    bridge_dir: Path, *, session_id: str
+) -> tuple[PaneSignals, HookForwardState | None]:
+    """Capture the pane, deferring retry handling if parent ownership has not been forwarded."""
+    checkpoint = _read_hook_state(bridge_dir)
+    if checkpoint is None:
+        checkpoint = HookForwardState(event_cursor=0, byte_offset=0)
+    else:
+        checkpoint = _validated_hook_state(bridge_dir, checkpoint, session_id=session_id)
+    signals = read_pane_signals(bridge_dir)
+    hooks = _read_hook_events_for_state(bridge_dir, checkpoint)
+    if _has_parent_turn_transition(bridge_dir, hooks.records):
+        return signals, None
+    return signals, checkpoint
+
+
 async def _forward_pane_signals(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     bridge_dir: Path,
     dedupe: _ForwardDedupeState,
+    response_id: str | None = None,
 ) -> None:
     """
-    Capture the Claude pane ONCE per window and relay every footer signal.
+    Share one throttled Claude pane capture across the pane-signal relays.
 
     Neither the permission mode nor a ``/btw`` side-chat is observable to
     Omnigent through the transcript, deltas, or hooks — both live only in the
@@ -6563,23 +6619,175 @@ async def _forward_pane_signals(
     subprocess, this reads the pane a single time (throttled to
     :data:`_PANE_POLL_INTERVAL_S`) and hands the one snapshot to each relay,
     so the always-on cost is one subprocess per window regardless of how many
-    signals are parsed.
+    signals are parsed. Rejected retries are recaptured before reporting and interruption.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param response_id: Active turn's response id, or ``None`` when unknown.
     """
     now = time.monotonic()
     if now < dedupe.pane_next_read:
         return
     dedupe.pane_next_read = now + _PANE_POLL_INTERVAL_S
-    signals = await asyncio.to_thread(read_pane_signals, bridge_dir)
+    signals, observed_hooks = await asyncio.to_thread(
+        _read_pane_observation, bridge_dir, session_id=session_id
+    )
     await _relay_permission_mode(
         client, session_id=session_id, mode=signals.permission_mode, dedupe=dedupe
     )
     await _relay_btw_overlay(
         client, session_id=session_id, overlay=signals.btw_overlay, dedupe=dedupe
+    )
+    if observed_hooks is not None:
+        await _stop_rejected_api_retry(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            retry=signals.api_retry,
+            observed_hooks=observed_hooks,
+            response_id=response_id,
+            dedupe=dedupe,
+        )
+
+
+async def _stop_rejected_api_retry(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    retry: ApiRetry | None,
+    observed_hooks: HookForwardState,
+    response_id: str | None,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Fail the turn and interrupt Claude Code while it retries a rejected request.
+
+    Claude Code reports a retry only in its pane, and fires ``StopFailure``
+    after its last attempt, minutes later. The ``failed`` status is posted
+    before the Escape so the interrupt's trailing idle cannot settle the turn
+    first. A failed post or keystroke is retried on the next capture.
+    The pane and parent hooks are rechecked after earlier relays and after
+    reporting, before each side effect.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param retry: The retry row parsed from the pane, or ``None``.
+    :param observed_hooks: Durable hook checkpoint observed before the pane capture.
+    :param response_id: Active turn's response id, or ``None`` when unknown.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    """
+    # A prompt sent soon after an interrupt can retry before any capture shows no row.
+    if retry is None or dedupe.api_retry_prompt_cursor != dedupe.prompt_submit_cursor:
+        dedupe.api_retry_reported = False
+        dedupe.api_retry_interrupted = False
+        dedupe.api_retry_prompt_cursor = dedupe.prompt_submit_cursor
+        dedupe.api_retry_observed_hooks = None
+    if retry is None:
+        return
+    if retry.status not in _REJECTED_API_RETRY_STATUSES or dedupe.api_retry_interrupted:
+        return
+    if dedupe.api_retry_observed_hooks is None:
+        dedupe.api_retry_observed_hooks = observed_hooks
+    if not dedupe.api_retry_reported:
+        if not await asyncio.to_thread(
+            _api_retry_is_current,
+            bridge_dir,
+            retry=retry,
+            observed_hooks=dedupe.api_retry_observed_hooks,
+        ):
+            return
+        detail = _display_text(
+            f"API Error: {retry.error}\n\nOmnigent stopped Claude Code from retrying this "
+            f"rejected request (attempt {retry.attempt} of {retry.max_retries}).",
+            is_api_error=True,
+        )
+        try:
+            await post_external_session_status(
+                client,
+                session_id=session_id,
+                status="failed",
+                response_id=response_id,
+                failure_detail=detail,
+                failure_context={
+                    "failure_id": native_failure_id(
+                        "claude_api_retry", session_id, dedupe.api_retry_prompt_cursor, response_id
+                    ),
+                    "failure_source": "claude_api_retry",
+                    "native_harness": "claude-native",
+                    "detail_source": "pane_retry_status",
+                    "failure_decision": "session_failed",
+                    "http_status": retry.status,
+                    "native_error_message": retry.error,
+                    "runner_version": VERSION,
+                },
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "Failed to report Claude Code's rejected API retry; session=%s status=%s",
+                session_id,
+                retry.status,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return
+        dedupe.api_retry_reported = True
+    try:
+        dedupe.api_retry_interrupted = await asyncio.to_thread(
+            _interrupt_api_retry_if_current,
+            bridge_dir,
+            retry=retry,
+            observed_hooks=dedupe.api_retry_observed_hooks,
+        )
+    except RuntimeError:
+        _logger.warning(
+            "Failed to interrupt Claude Code's rejected API retry; session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+
+
+def _api_retry_is_current(
+    bridge_dir: Path, *, retry: ApiRetry, observed_hooks: HookForwardState
+) -> bool:
+    """Recheck the pane and on-disk turn hooks before reporting or interrupting a retry."""
+    if read_pane_signals(bridge_dir).api_retry != retry:
+        return False
+    if (
+        observed_hooks.byte_offset
+        and observed_hooks.cursor_fingerprint
+        != _jsonl_cursor_fingerprint(bridge_dir / _HOOKS_FILE, observed_hooks.byte_offset)
+    ):
+        return False
+    hooks = _read_hook_events_for_state(bridge_dir, observed_hooks)
+    return not _has_parent_turn_transition(bridge_dir, hooks.records)
+
+
+def _interrupt_api_retry_if_current(
+    bridge_dir: Path, *, retry: ApiRetry, observed_hooks: HookForwardState
+) -> bool:
+    """Revalidate ownership immediately before sending Escape."""
+    if not _api_retry_is_current(bridge_dir, retry=retry, observed_hooks=observed_hooks):
+        return False
+    inject_interrupt(bridge_dir, timeout_s=1.0)
+    return True
+
+
+def _has_parent_turn_transition(bridge_dir: Path, records: Sequence[ClaudeHookRecord]) -> bool:
+    """Detect parent ownership changes while allowing same-turn compaction and child hooks."""
+    parent_ids = read_seen_claude_session_ids(bridge_dir)
+    return any(
+        (
+            record.event_name in {"UserPromptSubmit", "Stop", "StopFailure"}
+            or (record.event_name == "SessionStart" and record.source != "compact")
+        )
+        and not _is_subagent_hook_record(record, parent_claude_session_ids=parent_ids)
+        for record in records
     )
 
 
@@ -7434,8 +7642,11 @@ async def _patch_external_session_id(
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    # Skip the response's spawn-tree usage aggregate: nothing reads it here,
+    # and on a large tree it can outlast the client timeout.
     resp = await client.patch(
         f"/v1/sessions/{session_id}",
+        params={"include_usage": "false"},
         json={"external_session_id": external_session_id},
     )
     resp.raise_for_status()

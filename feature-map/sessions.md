@@ -53,7 +53,9 @@ the header menu), and each place is a separate entry point.
   `session_title_instructions`; Clear removes only the personal guidance, so
   titles fall back to the operator setting or, without one, the default prompt.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
-  Sessions whose title matches list under **Sessions**, then sessions matching
+  With the tabs sidebar (`workspace_sidebar_v2`) in a desktop app that can hand
+  keys over, ⌘K and the tab chords also work while a browser tab's page has
+  focus. Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
   own Show more. Archived sessions match too, marked **Archived**. Before typing,
   ⌘K lists the five most recently updated sessions, archived ones included and
@@ -61,6 +63,12 @@ the header menu), and each place is a separate entry point.
   (⌘⌥S / Ctrl+Alt+S) lists active sessions only. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
   the search. Desktop and mobile search use the same context.
+- `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**
+  sets a reported UI-only flag to Automatic, On, or Off. Choices stay on this
+  device for this server; changing one reloads the page. **Clear all flag overrides**
+  removes all choices for this server and reloads. In the old palette, search
+  **Enable feature preview: new QuickPick command palette** to opt in.
+  An amber header flag shows active overrides and opens the picker.
 - `palette-session-commands`: ⌘K lists the open session's header-menu actions
   under **Session**: Add nested agent, Pin or Unpin, Share, Fork, Export,
   Rename, Mark as unread, Create automation, Archive or Unarchive, and Delete.
@@ -86,6 +94,21 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+- `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
+  `floating_panes` on, and not a touch device), the QuickPick palette lists the
+  **Pane corners** setting. **Automatic** follows the server's `floating_panes`
+  policy and names what it gives now; **Floating panes** and **Sharp corners**
+  override it on this device, and a reload keeps the choice. Settings →
+  Appearance offers the same choice (`web/src/shell/settingsCommands.test.ts`,
+  `tests/e2e_ui/sessions/test_floating_panes.py`).
+- `workspace-full-screen`: with the tabs sidebar (`workspace_sidebar_v2`), ⇧⌘F
+  (Ctrl+Shift+F off the Mac) and the ⌘K row **Make the workspace full screen** /
+  **Exit workspace full screen** toggle the workspace sidebar's full screen. From
+  a closed sidebar, both open it straight into full screen; a focused browser page
+  hands the chord over.
+  The classic layout, a phone and a grid route don't offer them
+  (`web/src/shell/AppShell.workspaceSidebarV2.test.tsx`,
+  `tests/e2e_ui/sessions/test_workspace_sidebar_v2.py`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -269,8 +292,10 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
-  (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. On phone layouts a submenu replaces the menu's list under a
+  (Updated / Created / Custom) and Show (Harness / Project / Updated / Environment / Repo /
+  Branch) submenus, saved per device. Show → Project names a row's project (its emoji, else a
+  folder glyph) under the title wherever the row isn't inside that project's folder: pins,
+  Shared with me, and every grouping but Default. On phone layouts a submenu replaces the menu's list under a
   back row with its name, and reopening the menu starts at the main list.
   Created ordering keeps sessions newest-created first as messages
   arrive;
@@ -328,6 +353,9 @@ the header menu), and each place is a separate entry point.
   type an action such as "rename session" and press Enter. With
   `quick_pick_palette` on, type "go to session" and press Enter to switch
   sessions, or Escape to return to where you were.
+- For UI feature overrides, search ⌘K for **Override UI feature flag…** or
+  click the amber header flag. If QuickPick is off, search the old palette for
+  **Enable feature preview: new QuickPick command palette** first.
 - For the open screen's ⌘K actions, with `quick_pick_palette` on, press
   Cmd/Ctrl+K in a conversation and type "fork from latest" or "scroll to
   newest"; on a canvas with a conversation open, type "close conversation";
@@ -954,6 +982,13 @@ plain `uv run pytest`, which starts a private server for the test.
   worktree session from the row menu, bulk selection, and header menu, and
   expect the dialog each time; an idle session without a worktree archives
   silently.
+- **`palette-ui-feature-overrides`:** component coverage in
+  `web/src/shell/FeatureFlagsPicker.test.tsx`, `web/src/shell/CommandPalette.test.tsx`,
+  and `web/src/shell/ChatHeader.test.tsx`; storage and server gating are covered
+  in `web/src/lib/uiFeatureOverrides.test.ts` and `tests/server/test_ui_feature_overrides.py`.
+  Manually: enable the preview from the old palette, choose an override in
+  QuickPick, then use the amber header flag to restore Automatic. Each changed
+  choice reloads; selecting the current choice returns without reloading.
 - **`palette-session-commands`:**
   `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_on_an_open_session`
   runs with `quick_pick_palette` on: Rename session from ⌘K opens its dialog
@@ -1519,6 +1554,10 @@ its discoverability.
 
 ## Gotchas
 
+- UI flag overrides require a known server identity and reported flags. Turning
+  QuickPick off suspends the other overrides and hides the header flag. The flag
+  is also absent where the app header is hidden, including the desktop terminal
+  push panel.
 - Family membership is owner-only navigation context, not a sharing grant.
   Siblings start private even if the source has readers. Edit-shared sources
   cannot create siblings. Shared viewers see flat rows.

@@ -14,6 +14,8 @@ import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { resetAppPanes, setAppPaneTabActions, setAppPaneTitle } from "./appPanes";
 import { ChatPaneBody } from "./ChatPaneBody";
+import { useSplitBesideChat, useSplitOnScreen } from "./chatPaneToolbarHost";
+import { isPaneShellEnded, resetEndedPaneShellsForTests } from "./paneShellExit";
 import { readPaneSplit, resetPaneSplitsCache, updatePaneSplit } from "./paneSplitStore";
 import { SidebarTerminalPanes } from "./SidebarTerminalPanes";
 import { SplitPanesMainView, type SplitPanesMainViewProps } from "./SplitPanesMainView";
@@ -69,7 +71,16 @@ vi.mock("./MainTerminalView", () => ({
     <div data-testid="main-terminal-view" data-splittable={String(props.splittable ?? false)} />
   ),
 }));
-const surfaces = vi.hoisted(() => new Map<string, { onResume?: () => void | Promise<void> }>());
+const surfaces = vi.hoisted(
+  () =>
+    new Map<
+      string,
+      {
+        onResume?: () => void | Promise<void>;
+        onStateChange?: TerminalPaneSurfaceProps["onStateChange"];
+      }
+    >(),
+);
 vi.mock("./TerminalPaneSurface", () => ({
   TerminalPaneSurface: (props: TerminalPaneSurfaceProps) => {
     const { terminal, active, focusRequest } = props;
@@ -129,10 +140,111 @@ afterEach(() => {
   resetTerminalPlacement();
   resetTerminalOpenRequestsForTests();
   resetPanePaletteOwnerForTests();
+  resetEndedPaneShellsForTests();
   surfaces.clear();
 });
 
 describe("SplitPanesMainView", () => {
+  /** The agent's pane with SHELL and OTHER stacked beside it, SHELL focused. */
+  const threePanes = (conversationId: string) => {
+    listed.terminals = [...TERMINALS, { id: OTHER_ID, name: "zsh", session: "s2", running: true }];
+    updatePaneSplit(conversationId, () => ({
+      layout: {
+        axis: "columns",
+        ratio: 0.5,
+        children: [AGENT, { axis: "rows", ratio: 0.5, children: [SHELL, OTHER] }],
+      },
+      focusedKey: SHELL,
+    }));
+  };
+  const endShell = () => {
+    const shell = surfaces.get(SHELL_ID)!;
+    act(() => shell.onStateChange?.({ kind: "connected" }));
+    act(() =>
+      shell.onStateChange?.({ kind: "closed", code: 4404, reason: "terminal session ended" }),
+    );
+  };
+
+  it("with floating panes, closes a pane as soon as its shell exits, before the list drops it", () => {
+    const conversationId = nextConversation();
+    threePanes(conversationId);
+    render(<View conversationId={conversationId} cards />);
+    endShell();
+    // Still listed: the runner reports the exit seconds later.
+    expect(screen.queryByTestId(`terminal-${SHELL_ID}`)).toBeNull();
+    expect(screen.getByTestId(`terminal-${OTHER_ID}`)).toBeInTheDocument();
+  });
+
+  it("asks again about a shell back in its pane after floating panes turn off", async () => {
+    const conversationId = nextConversation();
+    threePanes(conversationId);
+    const { rerender } = render(<View conversationId={conversationId} cards />);
+    endShell();
+    expect(screen.queryByTestId(`terminal-${SHELL_ID}`)).toBeNull();
+
+    // Within the ended mark's memory, the same shell is back in the split and connects.
+    rerender(<View conversationId={conversationId} />);
+    act(() => threePanes(conversationId));
+    act(() => surfaces.get(SHELL_ID)!.onStateChange?.({ kind: "connected" }));
+    const closePane = Object.values(usePaletteCommandsStore.getState().groups)
+      .flatMap((group) => group.commands)
+      .find((candidate) => candidate.label === "Close Pane");
+    act(() => closePane!.run());
+    expect(await screen.findByRole("dialog", { name: "Close shell?" })).toBeInTheDocument();
+    expect(screen.getByTestId(`terminal-${SHELL_ID}`)).toBeInTheDocument();
+  });
+
+  it("forgets an ended shell once the sidebar's pane for it connects", async () => {
+    const conversationId = nextConversation();
+    threePanes(conversationId);
+    const { rerender } = render(<View conversationId={conversationId} cards />);
+    endShell();
+    expect(isPaneShellEnded(conversationId, SHELL)).toBe(true);
+
+    // The same shell, back as the sidebar's tab, connects there.
+    rerender(
+      <>
+        <View conversationId={conversationId} cards />
+        <SidebarTerminalPanes
+          conversationId={conversationId}
+          shownKey={SHELL}
+          mountedKeys={[SHELL]}
+          readOnly={false}
+          visible
+          autoFocusKey={null}
+        />
+      </>,
+    );
+    await screen.findByTestId(`terminal-${SHELL_ID}`);
+    act(() => surfaces.get(SHELL_ID)!.onStateChange?.({ kind: "connected" }));
+    expect(isPaneShellEnded(conversationId, SHELL)).toBe(false);
+  });
+
+  it("without floating panes, leaves an exited shell's pane to the terminals list", () => {
+    const conversationId = nextConversation();
+    threePanes(conversationId);
+    render(<View conversationId={conversationId} />);
+    endShell();
+    expect(screen.getByTestId(`terminal-${SHELL_ID}`)).toBeInTheDocument();
+  });
+
+  it("keeps a pane whose attach the server accepts and then refuses", () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => SIDE_BY_SIDE);
+    render(<View conversationId={conversationId} cards />);
+    const shell = surfaces.get(SHELL_ID)!;
+    act(() => shell.onStateChange?.({ kind: "connected" }));
+    act(() =>
+      shell.onStateChange?.({
+        kind: "closed",
+        code: 4404,
+        reason: "terminal resource not found or not running",
+      }),
+    );
+    expect(screen.getByTestId(`terminal-${SHELL_ID}`)).toBeInTheDocument();
+    expect(readPaneSplit(conversationId)).toEqual(SIDE_BY_SIDE);
+  });
+
   it.each([
     ["a viewer who can't split", { readOnly: true }],
     ["a shell the sidebar opened", { initialTerminalKey: SHELL }],
@@ -143,6 +255,37 @@ describe("SplitPanesMainView", () => {
     render(<View conversationId={conversationId} {...props} />);
     expect(screen.getByTestId("main-terminal-view").dataset.splittable).toBe("false");
     expect(screen.queryByTestId("split-panes-main-view")).toBeNull();
+  });
+
+  it("reports its split on screen only while it shows, though a hidden one keeps it beside the chat", async () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => SIDE_BY_SIDE);
+    function SplitState() {
+      const beside = useSplitBesideChat(conversationId);
+      const onScreen = useSplitOnScreen(conversationId);
+      return <output data-testid="split-state">{`${beside}:${onScreen}`}</output>;
+    }
+    const state = () => screen.getByTestId("split-state").textContent;
+    const { rerender, unmount } = render(
+      <>
+        <View conversationId={conversationId} chatShown />
+        <SplitState />
+      </>,
+    );
+    await screen.findByTestId(`terminal-${AGENT_ID}`);
+    expect(state()).toBe("true:true");
+
+    // Chat hides the view, as when the agent's terminal goes: the split stays saved beside it.
+    rerender(
+      <>
+        <View conversationId={conversationId} visible={false} chatShown />
+        <SplitState />
+      </>,
+    );
+    expect(state()).toBe("true:false");
+    unmount();
+    render(<SplitState />);
+    expect(state()).toBe("false:false");
   });
 
   it("keeps the Chat/Terminal switch in the header until a split puts the chat in a pane", async () => {

@@ -24,6 +24,8 @@ import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { TabsRecord } from "@/components/BrowserPane/agentTools/tabStore";
 import { type BrowserActionOutcome, emitBrowserActionSettled } from "@/lib/browserActionBus";
 import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
@@ -192,6 +194,7 @@ import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { AppShell } from "./AppShell";
+import { setSplitOnScreen } from "./chatPaneToolbarHost";
 import { FileViewerContext, useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
 import * as workspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
@@ -508,6 +511,28 @@ describe("workspace_sidebar_v2", () => {
     expect(document.querySelector("[data-main-view]")).toHaveAttribute("data-main-view", "chat");
   });
 
+  // Only floating panes draw a split as cards of its own; without them the chat keeps its card.
+  it.each([
+    ["floats as its own cards", true, "terminal"],
+    ["shows without floating panes", false, "chat"],
+  ] as const)(
+    "gives the column the view it has while a split on screen beside the chat %s",
+    (_case, floating, splitView) => {
+      setViewport(DESKTOP);
+      renderShell({
+        ...withFlag(true),
+        features: { ...withFlag(true).features, floating_panes: floating },
+      });
+      const column = () => document.querySelector("[data-main-view]");
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+
+      act(() => setSplitOnScreen("conv_ws", true));
+      expect(column()).toHaveAttribute("data-main-view", splitView);
+      act(() => setSplitOnScreen("conv_ws", false));
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+    },
+  );
+
   it("reserves the header's room for the rail only while the rail sits inline", async () => {
     setViewport(1000);
     renderShell({
@@ -676,7 +701,6 @@ describe("workspace_sidebar_v2", () => {
   );
 
   it("doesn't reopen a file the classic sidebar remembered when the tabs sidebar reopens", async () => {
-    const { writeSessionWorkspaceState } = await import("@/lib/sessionWorkspaceState");
     writeSessionWorkspaceState("conv_ws", { selectedFilePath: "old.ts", open: true });
     setViewport(DESKTOP);
     renderShell(withFlag(true));
@@ -935,5 +959,63 @@ describe("workspace_sidebar_v2", () => {
     } finally {
       delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
     }
+  });
+});
+
+describe("⇧⌘F and ⌘K's full screen row", () => {
+  const pressFullScreen = () => {
+    const mac = isMacPlatform();
+    const event = new KeyboardEvent("keydown", {
+      key: "F",
+      code: "KeyF",
+      metaKey: mac,
+      ctrlKey: !mac,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    return event;
+  };
+  const fullScreenRow = () =>
+    registeredPaletteCommands().find(
+      (command) => command.shortcut === "workspace.toggleFullScreen",
+    );
+
+  it("fills the window from the chord, and leaves it on a second press", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    await screen.findByTestId("tabs-host");
+    // The row and the chord load with the tabs sidebar's code.
+    await waitFor(() => expect(fullScreenRow()).toBeDefined());
+    expect(pressFullScreen().defaultPrevented).toBe(true);
+    expect(tabs.host).toMatchObject({ maximized: true });
+    expect(fullScreenRow()?.label).toBe("Exit workspace full screen");
+    pressFullScreen();
+    expect(tabs.host).toMatchObject({ maximized: false });
+    expect(fullScreenRow()?.label).toBe("Make the workspace full screen");
+  });
+
+  it("opens a closed sidebar straight into full screen from ⌘K", async () => {
+    setViewport(DESKTOP);
+    writeSessionWorkspaceState("conv_ws", { open: false });
+    renderShell(withFlag(true));
+    await waitFor(() => expect(fullScreenRow()).toBeDefined());
+    act(() => fullScreenRow()!.run());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+  });
+
+  it("leaves the chord alone and offers no row in the classic sidebar", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(false));
+    await screen.findByRole("complementary", { name: "Workspace" });
+    // A row registered late, once some lazy code loads, would still count.
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
+    expect(pressFullScreen().defaultPrevented).toBe(false);
+    expect(fullScreenRow()).toBeUndefined();
   });
 });

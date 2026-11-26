@@ -21,6 +21,7 @@ import type {
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
 import { parseEvent } from "./sse";
+import { itemsToBlocks } from "./itemsToBlocks";
 import type { Response } from "./types";
 
 function makeResponse(opts?: {
@@ -2095,5 +2096,32 @@ describe("BlockStream — Claude sub-agent handback", () => {
     const answer = blocks.find((b): b is TextDone => b.type === "text_done");
     expect(answer?.fullText).toBe("**Audit** done.");
     expect(answer?.ctx.itemId).toBe("fc_1");
+  });
+});
+
+describe("terminal command submission identity", () => {
+  it.each([
+    {
+      wire: { pending_id: "pending_shell", stable_id: "submit_shell" },
+      expected: { pendingId: "pending_shell", stableId: "submit_shell" },
+    },
+    { wire: {}, expected: {} },
+    { wire: undefined, expected: undefined },
+  ])("preserves $wire through live and saved items", ({ wire, expected }) => {
+    const item = {
+      id: "shell",
+      response_id: "resp_shell",
+      status: "completed",
+      type: "terminal_command" as const,
+      kind: "input" as const,
+      input: "ls",
+      submission: wire,
+    };
+    const event = parseEvent("response.output_item.done", { item, response_id: item.response_id });
+    expect(event?.type).toBe("terminal_command");
+    const live = reduce([event!]).find((block) => block.type === "terminal_command");
+    const saved = itemsToBlocks([item])[0];
+    expect(live).toMatchObject({ type: "terminal_command", submission: expected });
+    expect(saved).toMatchObject({ type: "terminal_command", submission: expected });
   });
 });

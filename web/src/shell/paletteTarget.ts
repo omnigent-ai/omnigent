@@ -1,5 +1,6 @@
 import type { ActionCommand } from "./appCommands";
 import type { PaletteCommandRow } from "./paletteCommandRows";
+import type { SessionCommandId } from "./sessionCommands/commandIds";
 
 /** What accepting a ⌘K row does: open a session, run a command, or pick on a command's page. */
 export type PaletteTarget =
@@ -11,4 +12,6 @@ export type PaletteTarget =
   /** A value on a setting's page; `itemId` is the setting row that opened it. */
   | { kind: "setting-choice"; itemId: string; value: string }
   /** One of a command's options, on its page; `itemId` is the command row that opened it. */
-  | { kind: "command-option"; itemId: string; optionId: string };
+  | { kind: "command-option"; itemId: string; optionId: string }
+  /** One of a session's actions, on its page. */
+  | { kind: "session-action"; sessionId: string; command: SessionCommandId };

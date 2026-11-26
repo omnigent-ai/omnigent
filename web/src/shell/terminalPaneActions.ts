@@ -26,6 +26,7 @@ import {
 } from "@/lib/terminals";
 
 import { closePaneShell, removePaneFocusingNeighbor } from "./paneShellClose";
+import { isPaneShellEnded } from "./paneShellExit";
 import {
   closeFailedPaneStart,
   isSplitPane,
@@ -35,6 +36,7 @@ import {
 import { NO_ROOM_MESSAGE, type PaneSizing } from "./paneSizing";
 import { isFailedPaneStart } from "./paneStartFailures";
 import { resolveDefaultShell, writePreferredShell } from "./preferredShell";
+import { type ShellBusy, useShellCloseCheck } from "./shellCloseCheck";
 import {
   insertSplitPane,
   measureSplitSizing,
@@ -50,6 +52,8 @@ import type { TerminalSplitTarget } from "./terminalSplitTarget";
 export interface PendingPaneClose {
   key: string;
   terminal: TerminalInfo;
+  /** What the shell runs, when its runner said, for the dialog to name. */
+  busy?: ShellBusy | null;
 }
 
 // The close each split is asking about, shared by its hosts so one dialog answers it.
@@ -182,6 +186,7 @@ export function useTerminalPaneActions(
   const create = useCreateTerminal(conversationId);
   const endShell = useDeleteTerminal(conversationId);
   const pendingClose = usePendingClose(target.id);
+  const checkShellClose = useShellCloseCheck(conversationId);
   const splitting = useShellLaunching(conversationId);
   const splitKeys = () => {
     const layout = target.read()?.layout;
@@ -301,8 +306,21 @@ export function useTerminalPaneActions(
       return;
     }
     const terminal = latestTerminals.current.find((candidate) => terminalTabKey(candidate) === key);
-    if (!terminal) removePaneFocusingNeighbor(target, key);
-    else setPendingClose(target.id, { key, terminal });
+    // A shell that already exited is still listed for a few seconds, with nothing left to end.
+    if (!terminal || isPaneShellEnded(conversationId, key)) {
+      removePaneFocusingNeighbor(target, key);
+      return;
+    }
+    // An idle shell closes at once; anything else asks, naming the job.
+    checkShellClose([terminal.id], "pane_close", (check) => {
+      const agentTerminal = findAgentTerminal([...latestTerminals.current]);
+      if (!target.canClosePane(key) || !isLivePane(target, key, agentTerminal)) return;
+      if (check.close === "now") {
+        closePaneShell(target, key, terminal.id, (id) => endShell.mutate(id));
+      } else {
+        setPendingClose(target.id, { key, terminal, busy: check.busy });
+      }
+    });
   };
 
   const confirmClose = () => {

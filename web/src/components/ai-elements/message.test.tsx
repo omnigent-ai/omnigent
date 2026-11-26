@@ -382,8 +382,10 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
         const overlay = exit.parentElement!;
         expect(overlay.parentElement).toBe(embedded ? root : document.body);
         expect(overlay.querySelector('svg[id^="mermaid-"]')?.outerHTML).toBe(svg.outerHTML);
+        expect(document.documentElement).toHaveAttribute("data-fullscreen-overlay-open");
         fireEvent.click(exit);
         expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+        expect(document.documentElement).not.toHaveAttribute("data-fullscreen-overlay-open");
         fireEvent.click(screen.getByTitle("View fullscreen"));
         fireEvent.keyDown(window, { key: "Escape" });
         expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
@@ -576,10 +578,12 @@ describe("MessageResponse table fullscreen", () => {
     const dialog = within(embedRoot).getByRole("dialog", { name: "View fullscreen" });
     // Marks a full-window view, which clears the window's top inset (index.css).
     expect(dialog).toHaveAttribute("data-fullscreen-overlay");
+    expect(document.documentElement).toHaveAttribute("data-fullscreen-overlay-open");
     expect(within(dialog).getByRole("cell", { name: "Alpha" })).toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Exit fullscreen" }));
     expect(within(embedRoot).queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+    expect(document.documentElement).not.toHaveAttribute("data-fullscreen-overlay-open");
     embedRoot.remove();
   });
 

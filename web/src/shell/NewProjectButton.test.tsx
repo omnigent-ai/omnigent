@@ -249,6 +249,32 @@ describe("NewProjectButton", () => {
     expect(mocks.createDirectory).toHaveBeenCalledTimes(1);
   });
 
+  it("opens a fresh dialog each time, without what was typed or picked before", async () => {
+    renderButton();
+    fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+      target: { value: "Garden" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Working directory: Not selected" }));
+    fireEvent.click(screen.getByRole("button", { name: "Select test folder" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Create a folder using the project name" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByPlaceholderText("Project name…")).toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "New project" }));
+
+    expect(screen.getByPlaceholderText("Project name…")).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    expect(screen.getByTestId("new-project-workspace")).toHaveAccessibleName(
+      "Working directory: Not selected",
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "Create a folder using the project name" }),
+    ).not.toBeChecked();
+  });
+
   it("does not finish a dismissed folder submission or clear a reopened modal", async () => {
     let resolveDirectory: ((path: string) => void) | undefined;
     mocks.createDirectory.mockReturnValueOnce(

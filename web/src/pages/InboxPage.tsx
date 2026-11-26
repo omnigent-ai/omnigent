@@ -85,6 +85,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import {
   clearUnreadOverride,
@@ -129,6 +130,7 @@ import {
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import {
   DISMISS_REASONS,
+  listSuggestions,
   OPEN_SUGGESTION_STATUSES,
   PROACTIVE_AGENT_DISPLAY_NAME,
   suggestionKindLabel,
@@ -213,10 +215,12 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
 // Enough trailing items to step past a tool call or two after the final reply.
 const PREVIEW_SCAN_ITEMS = 12;
 const UNREAD_ONLY = ["unread"] as const;
+// "Mark all as read" lists at most this many pages of unread suggestions per click.
+const MARK_ALL_SUGGESTION_PAGES = 20;
 const PREVIEW_MAX_CHARS = 280;
 
 /** One inbox card, tagged by kind, with the epoch-seconds time it sorts and groups by. */
-type InboxEntry =
+export type InboxEntry =
   | { kind: "approval"; key: string; at: number; item: InboxItem }
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
   | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
@@ -289,6 +293,8 @@ export function InboxPage() {
     if (!proactiveInbox.enabled) setPinnedSuggestions({});
   }, [proactiveInbox.enabled]);
   const [responded, setResponded] = useState<RespondedMap>({});
+  // True while "Mark all as read" is still listing or marking suggestions.
+  const [markingAll, setMarkingAll] = useState(false);
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
   // the map falls back to the default: expanded only for the newest
@@ -444,6 +450,79 @@ export function InboxPage() {
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
 
+  // "Mark all as read" covers what the current tab lists as unread; approvals
+  // stay, since only an answer clears them. A session whose reply is still
+  // sending stays too: its pending POST may hand the draft back.
+  const unreadSuggestions = visibleSuggestions.filter((item) => item.status === "unread");
+  const unreadSessionsToClear = visibleUnread.filter(
+    ({ row }) => replyStatuses[row.id]?.state !== "sending",
+  );
+  // Outside the advisor tab the server's unread total covers what the tab
+  // lists, so it also counts unread suggestions past the loaded pages.
+  const unloadedUnreadSuggestions =
+    showSuggestions && proactiveInbox.hasNextPage && !advisorOnly
+      ? Math.max(0, proactiveInbox.unreadCount - unreadSuggestions.length)
+      : 0;
+  const markAllReadCount =
+    visibleComments.length +
+    unreadSessionsToClear.length +
+    visibleAutomations.length +
+    unreadSuggestions.length +
+    unloadedUnreadSuggestions;
+  // Tabs stay switchable while a click is still marking, but Awaiting response
+  // lists only approvals, so it never offers the action.
+  const showMarkAllRead = filter !== "awaiting" && (markAllReadCount > 0 || markingAll);
+  const markSuggestionsRead = async () => {
+    const targets = new Set(unreadSuggestions.map((item) => item.id));
+    let listingFailed = false;
+    if (showSuggestions && proactiveInbox.hasNextPage) {
+      try {
+        let cursor: string | null = null;
+        for (let pages = 0; pages < MARK_ALL_SUGGESTION_PAGES; pages += 1) {
+          // oxlint-disable-next-line no-await-in-loop -- Each page's cursor comes from the one before.
+          const page = await listSuggestions(cursor, UNREAD_ONLY);
+          for (const item of page.data) {
+            if (!advisorOnly || isAdvisorItem(item)) targets.add(item.id);
+          }
+          cursor = page.nextCursor;
+          if (cursor === null) break;
+        }
+      } catch {
+        listingFailed = true;
+      }
+    }
+    let failures = 0;
+    const onError = () => {
+      failures += 1;
+    };
+    await Promise.all(
+      [...targets].map((id) => proactiveInbox.update(id, { status: "read" }, { onError })),
+    );
+    if (failures > 0) {
+      showToast(
+        `Couldn’t mark ${failures === 1 ? "1 suggestion" : `${failures} suggestions`} as read. Try again.`,
+      );
+    } else if (listingFailed) {
+      showToast("Couldn’t load every unread suggestion, so some are still unread. Try again.");
+    }
+  };
+  const markAllRead = () => {
+    const clearedKeys = new Set(unreadSessionsToClear.map(({ row }) => `unread:${row.id}`));
+    const clearedSessions = new Set(unreadSessionsToClear.map(({ row }) => row.id));
+    const keep = <T,>(state: Record<string, T>, cleared: Set<string>) =>
+      Object.fromEntries(Object.entries(state).filter(([key]) => !cleared.has(key)));
+    setExpandedOverrides((prev) => keep(prev, clearedKeys));
+    setReplyDrafts((prev) => keep(prev, clearedSessions));
+    setReplyStatuses((prev) => keep(prev, clearedSessions));
+    for (const { row } of unreadSessionsToClear) markConversationRead(row.id, row.updated_at);
+    markCommentsSeen(visibleComments.map(({ comment }) => comment.id));
+    for (const item of visibleAutomations) automationInbox.markRead(item.runId);
+    if (unreadSuggestions.length > 0 || (showSuggestions && proactiveInbox.hasNextPage)) {
+      setMarkingAll(true);
+      void markSuggestionsRead().finally(() => setMarkingAll(false));
+    }
+  };
+
   const groups = groupInboxEntries<InboxEntry>([
     ...visibleSuggestions.map((item) => ({
       kind: "suggestion" as const,
@@ -584,6 +663,20 @@ export function InboxPage() {
         },
       );
     };
+  };
+
+  const chooseFilter = (value: InboxFilter) => {
+    setFilter(value);
+    writeInboxFilter(value);
+  };
+  const markUnreadRead = (entry: Extract<InboxEntry, { kind: "unread" }>) => {
+    const sessionId = entry.item.row.id;
+    // Drop the toggle so a later reply re-surfaces the row collapsed, and
+    // the reply state so it can't come back stale with the row.
+    setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
+    setReplyDrafts(({ [sessionId]: _draft, ...rest }) => rest);
+    setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
+    markConversationRead(sessionId, entry.item.row.updated_at);
   };
 
   const rowsById = new Map(allRows.map((row) => [row.id, row]));
@@ -885,14 +978,7 @@ export function InboxPage() {
     const previewQuery = previewBySession.get(sessionId);
     const output = previewQuery?.data ?? undefined;
     const preview = output?.preview;
-    const markRead = () => {
-      // Drop the toggle so a later reply re-surfaces the row collapsed, and
-      // the reply state so it can't come back stale with the row.
-      setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
-      setReplyDrafts(({ [sessionId]: _draft, ...rest }) => rest);
-      setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
-      markConversationRead(sessionId, item.row.updated_at);
-    };
+    const markRead = () => markUnreadRead(entry);
     // The server refuses user messages below edit access.
     const canReply = isEditorLevel(item.row.permission_level);
     const replyDraft = replyDrafts[sessionId] ?? "";
@@ -1095,14 +1181,25 @@ export function InboxPage() {
             <span className="sr-only">{summary}</span>
           </span>
         )}
+        {showMarkAllRead && (
+          <Button
+            variant="outline"
+            size="xs"
+            className={`ml-auto ${OUTLINE_ACTION}`}
+            disabled={markingAll}
+            onClick={markAllRead}
+            componentId="inbox.mark_all_read"
+            data-testid="inbox-mark-all-read"
+          >
+            <CheckIcon className="size-3.5" /> Mark all as read
+          </Button>
+        )}
       </div>
 
       <Tabs
         value={filter}
         onValueChange={(value) => {
-          if (!isInboxFilter(value)) return;
-          setFilter(value);
-          writeInboxFilter(value);
+          if (isInboxFilter(value)) chooseFilter(value);
         }}
         componentId="inbox.filter"
         className="mb-4"

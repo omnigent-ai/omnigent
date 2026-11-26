@@ -3,7 +3,7 @@ import { GlobeIcon } from "lucide-react";
 
 import { hotkeyAvailability, useHotkeyCommand } from "@/hooks/useHotkeyCommand";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { matchesShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 // Terminals and code editors bind their own chords, so they keep this one.
 const TEXT_ENTRY_SURFACE = ".xterm, .monaco-editor, .cm-editor";

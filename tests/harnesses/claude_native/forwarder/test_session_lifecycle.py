@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -985,10 +989,10 @@ async def test_forwarder_mirrors_external_session_id_after_hook_event(
         server.server_close()
         thread.join(timeout=5.0)
 
-    # Path proves the PATCH targets the right session — a bug that
-    # PATCHed e.g. the agent record would route here with a
-    # different prefix.
-    assert patch_request["path"] == "/v1/sessions/conv_abc"
+    # Path proves the PATCH targets the right session, and that it skips the
+    # response's spawn-tree usage aggregate, which can outlast the client
+    # timeout on a big tree.
+    assert patch_request["path"] == "/v1/sessions/conv_abc?include_usage=false"
     # Body asserts the captured Claude id flowed through unchanged.
     # If the bridge state read returned the wrong key or the
     # request body construction dropped the field, the assertion
@@ -1101,6 +1105,205 @@ async def test_forwarder_mirrors_external_session_id_at_most_once(
     # across the ~3 iterations we forced. Asserting on the literal
     # list (not just length) gives a useful diff in failure output.
     assert leftover_patches == []
+
+
+def _start_failing_patch_server(
+    failures: int | None = None,
+) -> tuple[ThreadingHTTPServer, threading.Thread, str, list[float]]:
+    """
+    Start a server that answers POSTs with 202 and PATCHes with 503.
+
+    :param failures: How many PATCHes fail before the rest succeed with 200,
+        or ``None`` to fail every PATCH.
+    :returns: ``(server, thread, base_url, patch_times)``; ``patch_times``
+        collects the monotonic arrival time of each PATCH.
+    """
+    patch_times: list[float] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            del format, args
+
+        def _reply(self, status: int) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.send_response(status)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def do_POST(self) -> None:
+            self._reply(202)
+
+        def do_PATCH(self) -> None:
+            patch_times.append(time.monotonic())
+            failing = failures is None or len(patch_times) <= failures
+            self._reply(503 if failing else 200)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return server, thread, f"http://{host}:{port}", patch_times
+
+
+@pytest.mark.asyncio
+async def test_forwarder_backs_off_external_session_id_mirror_after_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transient mirror failure waits out a backoff instead of retrying every poll.
+
+    The mirror PATCH runs inline before transcript forwarding, so retrying it
+    on every poll while the server keeps failing (or timing out) would hold
+    live output behind each attempt. The loop still retries after the backoff,
+    because cold resume needs the value to land eventually.
+    """
+    monkeypatch.setattr(forwarder, "_EXTERNAL_SESSION_ID_RETRY_BASE_S", 0.3)
+    monkeypatch.setattr(forwarder, "_EXTERNAL_SESSION_ID_RETRY_MAX_S", 0.3)
+    bridge_dir = tmp_path / "bridge"
+    (tmp_path / "session.jsonl").write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-sid-backoff",
+            "transcript_path": str(tmp_path / "session.jsonl"),
+        },
+    )
+    server, thread, base_url, patch_times = _start_failing_patch_server()
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_backoff",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # ~1 s of 10 ms polls: every-poll retries would send dozens of PATCHes;
+        # a 0.3 s backoff allows about four.
+        await asyncio.sleep(1.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert 2 <= len(patch_times) <= 5, patch_times
+    gaps = [later - earlier for earlier, later in itertools.pairwise(patch_times)]
+    assert min(gaps) >= 0.25, gaps
+
+
+@pytest.mark.asyncio
+async def test_forwarder_mirror_lands_once_the_server_recovers_then_stops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    After transient mirror failures, the PATCH lands once the server answers, then stops.
+
+    Cold resume needs ``external_session_id`` on the row, so failures may delay
+    the mirror but never give it up, and a landed mirror is never re-sent.
+    """
+    monkeypatch.setattr(forwarder, "_EXTERNAL_SESSION_ID_RETRY_BASE_S", 0.02, raising=False)
+    monkeypatch.setattr(forwarder, "_EXTERNAL_SESSION_ID_RETRY_MAX_S", 0.05, raising=False)
+    bridge_dir = tmp_path / "bridge"
+    (tmp_path / "session.jsonl").write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-sid-recovers",
+            "transcript_path": str(tmp_path / "session.jsonl"),
+        },
+    )
+    server, thread, base_url, patch_times = _start_failing_patch_server(failures=2)
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_recovers",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        deadline = time.monotonic() + 10.0
+        while len(patch_times) < 3 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(patch_times) == 3, patch_times
+        # Latched: dozens of polls later, the landed mirror is not sent again.
+        await asyncio.sleep(0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert len(patch_times) == 3, patch_times
+
+
+@pytest.mark.asyncio
+async def test_forwarder_mirrors_external_session_id_captured_after_start(
+    tmp_path: Path,
+) -> None:
+    """
+    Polls before Claude reports its session id do not delay the mirror.
+
+    The backoff applies only to failed PATCHes; until the bridge captures an
+    id there is no request to back off from, so the mirror lands on the first
+    poll after the id appears.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "transcript_path": str(transcript_path)},
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_late",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Many polls with no captured id.
+        await asyncio.sleep(0.3)
+        record_hook_event(
+            bridge_dir,
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "claude-sid-late",
+                "transcript_path": str(transcript_path),
+            },
+        )
+        patch_request = await _get_recorded_request(server, method="PATCH", timeout_s=1.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert patch_request["body"] == {"external_session_id": "claude-sid-late"}
 
 
 @pytest.mark.asyncio

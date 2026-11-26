@@ -283,6 +283,8 @@ import { RewindPicker } from "@/components/RewindPicker";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { ChatPaneBody } from "@/shell/ChatPaneBody";
 import { MainTerminalSurface } from "@/shell/MainTerminalSurface";
+import { LoneChatPaneDropPreview } from "@/shell/PaneDropPreview";
+import { useFloatingPanesShown } from "@/shell/useFloatingPanes";
 import { useChatInPanes } from "@/shell/panesViewGate";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -1746,6 +1748,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // Hidden overlays retain layout so FitAddon geometry stays stable; the chat
   // surface unmounts while Terminal is shown.
   const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
+  // As MainTerminalSurface reads it: floating panes leave a hidden split's tab drop preview here.
+  const floatingPanesShown = useFloatingPanesShown();
   // Non-owners attach read-only: a shared PTY can't attribute input
   // per-user, so only the owner may type. They drive the agent via the
   // composer instead. Server enforces this too.
@@ -1820,6 +1824,10 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   return (
     <>
       {terminalSurfaces}
+      {/* A tab dragged over a chat shown alone: its panes wait hidden, so it previews here. */}
+      {floatingPanesShown && !showTerminal && !chatInPanes && conversationId && mountTerminal && (
+        <LoneChatPaneDropPreview conversationId={conversationId} />
+      )}
       {!showTerminal && (
         <ChatPaneBody sessionId={conversationId ?? ""} host={chatPaneHost} marked={chatMarked}>
           {/* The scrolling transcript column owns every streaming-hot store

@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from sqlalchemy import Engine, case, or_, select, true, tuple_, update
+from sqlalchemy import Engine, case, or_, select, true, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -35,6 +35,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
+from omnigent.db.keyset import keyset_after
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -927,7 +928,11 @@ class HostStore:
             )
             if after is not None:
                 stmt = stmt.where(
-                    tuple_(SqlHost.sandbox_id, SqlHost.workspace_id, SqlHost.host_id) > after
+                    keyset_after(
+                        self._engine.dialect.name,
+                        (SqlHost.sandbox_id, SqlHost.workspace_id, SqlHost.host_id),
+                        after,
+                    )
                 )
             rows = session.execute(stmt).scalars().all()
             return [(row.workspace_id, _row_to_host(row)) for row in rows]
@@ -964,12 +969,11 @@ class HostStore:
             )
             if after is not None:
                 stmt = stmt.where(
-                    tuple_(
-                        SqlHost.terminating_sandbox_id,
-                        SqlHost.workspace_id,
-                        SqlHost.host_id,
+                    keyset_after(
+                        self._engine.dialect.name,
+                        (SqlHost.terminating_sandbox_id, SqlHost.workspace_id, SqlHost.host_id),
+                        after,
                     )
-                    > after
                 )
             rows = session.execute(stmt).scalars().all()
             return [(row.workspace_id, _row_to_host(row)) for row in rows]

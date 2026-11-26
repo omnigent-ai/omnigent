@@ -201,6 +201,22 @@ it("reports a failed update and reloads the list", async () => {
   expect(listSuggestions).toHaveBeenCalledTimes(2);
 });
 
+it("hands a failed update to the caller's onError instead of the toast", async () => {
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+  vi.mocked(updateSuggestion).mockRejectedValueOnce(new Error("offline"));
+  const onError = vi.fn();
+
+  let accepted: Promise<boolean> = Promise.resolve(true);
+  act(() => {
+    accepted = result.current.update("sug", { status: "read" }, { onError });
+  });
+
+  await expect(accepted).resolves.toBe(false);
+  expect(onError).toHaveBeenCalledOnce();
+  expect(showToast).not.toHaveBeenCalled();
+});
+
 it("keeps the item when the update and the recovery fetch both fail", async () => {
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
   await waitFor(() => expect(result.current.items).toEqual([item]));

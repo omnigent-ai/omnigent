@@ -228,6 +228,10 @@ export function reviewSearchLines(
   const lines: ReviewSearchLine[] = [];
   for (const file of files) {
     const id = reviewItemId(file.path);
+    // A renamed file is found by its old name too, listed first as in its header.
+    if (file.previousPath && file.previousPath !== file.path) {
+      lines.push({ id, text: file.previousPath, lineNumber: 1, target: "previousPath" });
+    }
     lines.push({ id, text: file.path, lineNumber: 1, target: "currentPath" });
     const content = contents.get(file.path);
     if (file.isBinary || content?.status !== "ready") continue;

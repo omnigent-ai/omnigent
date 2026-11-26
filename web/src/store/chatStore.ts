@@ -58,7 +58,12 @@ import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
-import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+import {
+  isMessageItem,
+  isTerminalCommandItem,
+  type ConversationItem,
+  type MessageItem,
+} from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -92,6 +97,7 @@ import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
   SessionInputConsumedEvent,
+  TerminalCommandEvent,
   SessionViewer,
   StreamEvent,
 } from "@/lib/events";
@@ -673,6 +679,8 @@ export function removeLocalConversation(tempConvId: string): boolean {
  */
 export interface PendingUserMessage {
   tempId: string;
+  /** Client submission identity, available before the POST response. */
+  stableId?: string;
   content: MessageContentBlock[];
   /** Unsent draft awaiting session/model readiness, including unuploaded files. */
   initialDraft?: { text: string; files: File[] };
@@ -827,6 +835,7 @@ export interface ConversationState {
     itemId: string;
     tempId?: string;
     pendingId?: string;
+    stableId?: string;
     contentKey?: string;
   }[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
@@ -3115,6 +3124,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               ...s.pendingUserMessages,
               {
                 tempId,
+                stableId,
                 content,
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
@@ -3130,6 +3140,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // authoritatively. Only the parked-dialog reason clears — a fresh send is
         // not parked on a dialog.
         blockedOn: null,
+      }));
+    } else {
+      pinnedSetter((s) => ({
+        pendingUserMessages: s.pendingUserMessages.map((p) =>
+          p.tempId === tempId ? { ...p, stableId } : p,
+        ),
       }));
     }
 
@@ -5897,8 +5913,8 @@ async function bindStream(
       // (on cold load) keep the per-conversation stash consistent.
       //
       // Rebind (``hydratePending=false``): the live ``pendingUserMessages``
-      // are authoritative — keep them untouched. Deduping/merging here would
-      // flink the live bubble; they clear via the consumed FIFO path.
+      // are authoritative. Only durable submission identities may acknowledge
+      // shell inputs here; ordinary messages clear via their consumed events.
       //
       // Cold load (``hydratePending=true``): the server's ``pending_inputs``
       // is the source of truth for queued-but-unpersisted messages — replay
@@ -5981,10 +5997,17 @@ async function bindStream(
           ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
           : {}),
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
-        pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }
           : {}),
+        ...recoverShellInputs(
+          {
+            ...state,
+            pendingUserMessages: snapshotPending,
+            failedSendDraft: state.failedSendDraft ?? unsentDraft,
+          },
+          allBlocks,
+        ),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
@@ -6861,6 +6884,7 @@ async function rehydrateWindowOnReconnect(
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+      ...recoverShellInputs(s, freshBlocks),
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
@@ -7071,12 +7095,14 @@ async function reconcileOnReconnect(
       s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
+    const shellSettlement = recoverShellInputs(s, snapshotBlocks);
     const patch: Partial<ChatState> = {
       ...statusPatchFor(s),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
       ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
+      ...shellSettlement,
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -7084,7 +7110,7 @@ async function reconcileOnReconnect(
       (b) => b.type === "user_message" && !isSystemUserContent(b.content),
     ).length;
     if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
+      patch.pendingUserMessages = shellSettlement.pendingUserMessages.slice(recoveredUserInputs);
     }
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
@@ -7770,6 +7796,12 @@ function makeLiveTextBlock(
   };
 }
 
+/** One native live-stream chunk awaiting its frame's commit. */
+interface LiveDeltaChunk {
+  delta: string;
+  index?: number;
+}
+
 /**
  * Fold one streamed chunk into its in-flight preview block in `blocks`.
  *
@@ -7781,45 +7813,118 @@ function makeLiveTextBlock(
  * The server reconciles and deduplicates chunks, so each received delta is
  * appended directly.
  *
+ * :param blocks: the current blocks.
+ * :param activeResponse: the live turn, whose id a new preview joins.
+ * :param itemId: the provisional id, e.g. ``"live:2ca51d97-..."``.
+ * :param chunk: incremental text for this chunk and its stream index.
+ * :returns: the new blocks, or `blocks` itself when the chunk is ignored.
+ */
+function foldLiveDelta(
+  blocks: AnyBlock[],
+  activeResponse: ActiveResponse | null,
+  itemId: string,
+  { delta, index }: LiveDeltaChunk,
+): AnyBlock[] {
+  const at = blocks.findIndex((b) => b.ctx.itemId === itemId);
+  if (at === -1) {
+    const responseId = activeResponse?.state === "streaming" ? activeResponse.responseId : itemId;
+    return [...blocks, makeLiveTextBlock(itemId, delta, responseId, index)];
+  }
+  const existing = blocks[at]!;
+  if (existing.type !== "text_done") return blocks;
+  const fullText = existing.fullText + delta;
+  const next = blocks.slice();
+  const missedChunk =
+    index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
+  next[at] = {
+    ...existing,
+    fullText,
+    hasCodeBlocks: fullText.includes("```"),
+    ...(index !== undefined ? { streamIndex: index } : {}),
+    ...(missedChunk ? { previewInterrupted: true } : {}),
+  };
+  return next;
+}
+
+/**
+ * Fold a message's buffered chunks into its preview in one store commit.
+ *
  * :param set: store setter.
  * :param messageId: vendor's stable per-message id.
- * :param delta: incremental text for this chunk, e.g. ``"Hello "``.
+ * :param chunks: the message's chunks in arrival order.
  * :returns: nothing; mutates `blocks` in the store.
  */
-function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: number): void {
+function applyLiveDeltas(set: Setter, messageId: string, chunks: LiveDeltaChunk[]): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
-    const startupPatch =
-      delta.length > 0
-        ? {
-            mcpStartup: null,
-            mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
-          }
-        : {};
-    const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
-    if (at === -1) {
-      const live = s.activeResponse;
-      const responseId = live?.state === "streaming" ? live.responseId : itemId;
-      return {
-        ...startupPatch,
-        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId, index)],
-      };
-    }
-    const existing = s.blocks[at]!;
-    if (existing.type !== "text_done") return {};
-    const fullText = existing.fullText + delta;
-    const next = s.blocks.slice();
-    const missedChunk =
-      index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
-    next[at] = {
-      ...existing,
-      fullText,
-      hasCodeBlocks: fullText.includes("```"),
-      ...(index !== undefined ? { streamIndex: index } : {}),
-      ...(missedChunk ? { previewInterrupted: true } : {}),
-    };
-    return { ...startupPatch, blocks: next };
+    const blocks = chunks.reduce(
+      (acc, chunk) => foldLiveDelta(acc, s.activeResponse, itemId, chunk),
+      s.blocks,
+    );
+    if (blocks === s.blocks) return {};
+    const startupPatch = chunks.some((chunk) => chunk.delta.length > 0)
+      ? {
+          mcpStartup: null,
+          mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
+        }
+      : {};
+    return { ...startupPatch, blocks };
   });
+}
+
+/**
+ * Per-stream buffer that coalesces native live deltas into one commit.
+ *
+ * `queue` holds a chunk until `drain` folds every buffered message into
+ * `blocks`, and reports a message's first chunk so its preview can paint
+ * without waiting a frame. A drain skips messages ignored or conversations
+ * disposed since their chunks arrived, so a late frame cannot recreate a
+ * removed preview. `close` drains one last time and ignores later drains; it
+ * runs when the stream's binding is aborted, before e.g. a retry drops its
+ * previews, so the replaced pump cannot recreate one from its buffered tail.
+ */
+interface LiveDeltaBuffer {
+  queue: (messageId: string, chunk: LiveDeltaChunk) => boolean;
+  drain: () => void;
+  close: () => void;
+}
+
+function createLiveDeltaBuffer(
+  id: string,
+  ignored: Set<string>,
+  set: Setter,
+  signal: AbortSignal,
+): LiveDeltaBuffer {
+  const pending = new Map<string, LiveDeltaChunk[]>();
+  const seen = new Set<string>();
+  let closed = false;
+  const drain = (): void => {
+    if (closed || pending.size === 0) return;
+    const batch = [...pending];
+    pending.clear();
+    if (isConversationDisposed(id)) return;
+    for (const [messageId, chunks] of batch) {
+      if (!ignored.has(messageId)) applyLiveDeltas(set, messageId, chunks);
+    }
+  };
+  const close = (): void => {
+    drain();
+    closed = true;
+    signal.removeEventListener("abort", close);
+  };
+  signal.addEventListener("abort", close);
+  return {
+    queue(messageId, chunk) {
+      const chunks = pending.get(messageId);
+      if (chunks) chunks.push(chunk);
+      else pending.set(messageId, [chunk]);
+      if (seen.has(messageId)) return false;
+      seen.add(messageId);
+      return true;
+    },
+    drain,
+    close,
+  };
 }
 
 /** Append live output to the matching in-progress tool execution. */
@@ -7864,12 +7969,27 @@ export function reviveStrayCompletedResponse(set: Setter): void {
 }
 
 /**
+ * Commit buffered native live deltas before any other event takes effect,
+ * so session edges and items see the preview text that arrived before them.
+ */
+async function* drainLiveDeltasBeforeOtherEvents(
+  events: AsyncIterable<StreamEvent>,
+  live: LiveDeltaBuffer,
+): AsyncIterable<StreamEvent> {
+  for await (const ev of events) {
+    if (ev.type !== "text_delta" || ev.messageId === undefined) live.drain();
+    yield ev;
+  }
+}
+
+/**
  * Wrap a parsed event stream, diverting terminal-observed live deltas.
  *
  * A `text_delta` carrying a `messageId` is native live streaming:
- * it is folded into its provisional preview block in `blocks` (see
- * `applyLiveDelta`) and NOT yielded downstream, because the `BlockStream`
- * reducer's response-scoped text path would otherwise emit a stray bubble
+ * it is queued in `live` for the next frame's commit into its provisional
+ * preview block in `blocks` (see `foldLiveDelta`) and NOT yielded
+ * downstream, because the `BlockStream` reducer's response-scoped text
+ * path would otherwise emit a stray bubble
  * (these deltas carry no response id and their authoritative text arrives
  * as a separate committed item). Every other event passes through
  * untouched.
@@ -7881,6 +8001,8 @@ export function reviveStrayCompletedResponse(set: Setter): void {
  *     deltas arrived before the new turn was named.
  * :param set: store setter.
  * :param get: store getter.
+ * :param live: buffer the deltas wait in until `requestFrame`'s commit.
+ * :param requestFrame: schedules the frame that drains `live`.
  * :returns: events with native live deltas removed.
  */
 async function* tapLiveDeltas(
@@ -7889,6 +8011,8 @@ async function* tapLiveDeltas(
   ignored: Set<string>,
   set: Setter,
   get: Getter,
+  live: LiveDeltaBuffer,
+  requestFrame: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
     if (ev.type === "message_done" && ev.messageId !== undefined) {
@@ -7903,7 +8027,10 @@ async function* tapLiveDeltas(
           ignored.add(ev.messageId);
           continue;
         }
-        applyLiveDelta(set, ev.messageId, ev.delta, ev.index);
+        // A message's first and final chunks paint at once; the rest batch per frame.
+        const first = live.queue(ev.messageId, { delta: ev.delta, index: ev.index });
+        if (first || ev.final === true) live.drain();
+        else requestFrame();
       }
       continue;
     }
@@ -8188,7 +8315,9 @@ export async function pumpStreamEvents(
 ): Promise<StreamEndReason> {
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
-  const rawEvents = parseSseStream(body, sseResult);
+  // Native live deltas commit once per frame with the buffered blocks below.
+  const live = createLiveDeltaBuffer(id, ignoredMessages, set, controller.signal);
+  const rawEvents = drainLiveDeltasBeforeOtherEvents(parseSseStream(body, sseResult), live);
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
   // (one SSE connection); bounded by item count like `blocks` itself.
@@ -8234,6 +8363,8 @@ export async function pumpStreamEvents(
     ignoredMessages,
     set,
     get,
+    live,
+    () => scheduler.schedule(() => flush()),
   );
   // First content block of each response flushes synchronously (snappy
   // first-token paint); the rest batch.
@@ -8243,6 +8374,8 @@ export async function pumpStreamEvents(
   // applying any sidecar state in the same commit. No-ops if switched away.
   const flush = (trailing?: AnyBlock, extra?: Partial<ChatState>): void => {
     scheduler.cancel();
+    // Buffered live previews commit ahead of the buffered blocks.
+    live.drain();
     if (isConversationDisposed(id)) {
       buffer.length = 0;
       return;
@@ -8554,6 +8687,8 @@ export async function pumpStreamEvents(
     flush();
     return "dropped";
   } finally {
+    // Commit buffered live text, including after a reconnect's attempt abort.
+    live.close();
     // Drop any pending frame + its buffered blocks so a queued flush
     // can't apply this stream's blocks after switchTo bound another.
     // `abortController` lifecycle is owned by `startStreamPump`'s loop,
@@ -8771,8 +8906,8 @@ async function boundedSendVerdict(
  * reloaded or closed mid-send, e.g. while the server held the POST for a
  * sandbox wake, which persists nothing until the wake ends. Only the sender
  * gets the text back, and only if the snapshot holds no item under its stable
- * id. Matching text is no proof: `pending_inputs` entries and native mirrors
- * carry no stable id, and another message can say the same thing. Messages the
+ * id or a terminal input's submission identity. Matching text is no proof:
+ * another message can say the same thing. Messages the
  * page still held in its queue come back the same way, joined after any such send.
  *
  * @param conversationId - The session being bound.
@@ -8781,10 +8916,11 @@ async function boundedSendVerdict(
  */
 function unsentSendToRestore(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly ConversationItem[],
 ): ConversationState["failedSendDraft"] {
   // A send still open in this tab, or a message parked on its bubble, owns its own record.
-  const parkedHere = conversationRegistry.peek(conversationId)?.getState().failedUploads ?? [];
+  const current = conversationRegistry.peek(conversationId)?.getState();
+  const parkedHere = current?.failedUploads ?? [];
   const unsent = peekUnsentSends(conversationId).filter(
     (record) =>
       !inFlightSends.has(record.stableId) &&
@@ -8808,9 +8944,27 @@ function unsentSendToRestore(
       stored.filter((send) => queuedHere.has(send.stableId)),
     );
   }
+  const deliveredIds = new Set(
+    items.flatMap((item) => [
+      item.id,
+      ...(isTerminalCommandItem(item) && item.kind === "input" && item.submission?.stable_id
+        ? [item.submission.stable_id]
+        : []),
+    ]),
+  );
+  // Identity can resolve after a live acknowledgement, before its block flushes.
+  for (const shell of current?.settledShellInputs ?? []) {
+    if (shell.stableId) deliveredIds.add(shell.stableId);
+  }
+  for (const block of current?.blocks ?? []) {
+    if (block.ctx.itemId) deliveredIds.add(block.ctx.itemId);
+    if (block.type === "terminal_command" && block.kind === "input" && block.submission?.stableId) {
+      deliveredIds.add(block.submission.stableId);
+    }
+  }
   const sends = [...unsent, ...queued].filter(
     // Another account may have signed in to this tab since.
-    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+    (send) => send.authorId === viewerId && !deliveredIds.has(send.stableId),
   );
   const [first] = sends;
   if (first === undefined) return null;
@@ -8841,7 +8995,7 @@ function unsentSendToRestore(
  */
 function restoreUnsentSendOnceIdentified(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly ConversationItem[],
 ): void {
   const unsubscribe = subscribeIdentity(() => {
     if (getCurrentUserId() === null) return;
@@ -9117,6 +9271,72 @@ function isShellCommandBubble(bubble: PendingUserMessage, command: string): bool
   if (bubble.initialDraft || wanted === "") return false;
   const text = messageContentText(bubble.content);
   return text.startsWith("!") && text.slice(1).trimStart() === wanted;
+}
+
+/** Settle durable identities on both the live and history paths. */
+function settleShellInputs(
+  state: ChatState,
+  inputs: Pick<TerminalCommandEvent, "itemId" | "submission" | "input">[],
+  allowLegacy = false,
+): Pick<ChatState, "pendingUserMessages" | "settledShellInputs"> & Partial<ChatState> {
+  let { pendingUserMessages, settledShellInputs } = state;
+  const consumedIds = new Set<string>();
+  for (const input of inputs) {
+    const { itemId, submission } = input;
+    if (submission?.stableId) {
+      consumedIds.add(submission.stableId);
+      if (inFlightSends.has(submission.stableId)) inFlightSends.set(submission.stableId, true);
+    }
+    if (
+      submission === undefined &&
+      (!allowLegacy || settledShellInputs.some((e) => e.itemId === itemId))
+    )
+      continue;
+    const at = pendingUserMessages.findIndex((p) => {
+      if (p.initialDraft) return false;
+      if (submission !== undefined) {
+        return (
+          (Boolean(submission.pendingId) &&
+            (p.pendingId === submission.pendingId || p.tempId === submission.pendingId)) ||
+          (Boolean(submission.stableId) && p.stableId === submission.stableId)
+        );
+      }
+      return input.input !== null && isShellCommandBubble(p, input.input);
+    });
+    const popped = pendingUserMessages[at];
+    if (popped) pendingUserMessages = pendingUserMessages.filter((_, index) => index !== at);
+    const previous = settledShellInputs.find((entry) => entry.itemId === itemId);
+    settledShellInputs = [
+      ...settledShellInputs.filter((entry) => entry.itemId !== itemId),
+      {
+        itemId,
+        tempId: popped?.tempId ?? previous?.tempId,
+        pendingId: submission?.pendingId ?? popped?.pendingId ?? previous?.pendingId,
+        stableId: submission?.stableId ?? previous?.stableId,
+        // Modern shells never generate legacy skip receipts; text is not an identity.
+        contentKey: submission === undefined && popped ? contentKeyOf(popped.content) : undefined,
+      },
+    ].slice(-MAX_SETTLED_SHELL_INPUTS);
+  }
+  return {
+    pendingUserMessages,
+    settledShellInputs,
+    ...retractDeliveredSendDraft(state, consumedIds, "consumed"),
+  };
+}
+
+function recoverShellInputs(state: ChatState, blocks: AnyBlock[]) {
+  return settleShellInputs(
+    state,
+    blocks.flatMap((block) =>
+      block.type === "terminal_command" &&
+      block.kind === "input" &&
+      block.ctx.itemId &&
+      block.submission !== undefined
+        ? [{ itemId: block.ctx.itemId, input: block.input, submission: block.submission }]
+        : [],
+    ),
+  );
 }
 
 /** Bound replay protection to the server's maximum pending queue size. */
@@ -10050,28 +10270,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "terminal_command": {
-      // Shell inputs have no consumed receipt; remove only the matching sent bubble.
-      const command = event.kind === "input" ? event.input : null;
-      if (command === null) return;
-      applyToConversation((s) => {
-        if (s.settledShellInputs.some((entry) => entry.itemId === event.itemId)) return {};
-        const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
-        const popped = s.pendingUserMessages[at];
-        return {
-          pendingUserMessages: popped
-            ? [...s.pendingUserMessages.slice(0, at), ...s.pendingUserMessages.slice(at + 1)]
-            : s.pendingUserMessages,
-          settledShellInputs: [
-            ...s.settledShellInputs,
-            {
-              itemId: event.itemId,
-              tempId: popped?.tempId,
-              pendingId: popped?.pendingId,
-              contentKey: popped ? contentKeyOf(popped.content) : undefined,
-            },
-          ].slice(-MAX_SETTLED_SHELL_INPUTS),
-        };
-      });
+      if (event.kind !== "input") return;
+      applyToConversation((s) => settleShellInputs(s, [event], true));
       return;
     }
     case "session_interrupted":

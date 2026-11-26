@@ -5,12 +5,16 @@
 import { type Chord, chordMatches, type KeyChordInput } from "@/lib/shortcuts/chord";
 import {
   activeShortcutChords,
+  menuShortcutChords,
   SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
   type ShortcutId,
+  shortcutDisplayRow,
 } from "@/lib/shortcuts/registry";
 
-import type { SettingsSearchMatcher } from "./settingsSearchIndex";
+import { MatchTier } from "@/components/ui/quick-pick/itemRanking";
+
+import { type SettingsSearchMatcher, TEXT_TIER_BASE } from "./settingsSearchIndex";
 
 type Modifier = "metaKey" | "ctrlKey" | "altKey" | "shiftKey";
 
@@ -244,14 +248,20 @@ function isBarePrintable(chord: Chord): boolean {
 }
 
 /**
- * The chords a binding can be found by here: its active chords, but not bare printable keys,
- * such as the digit a workspace tab takes after its chord, which only works in context.
+ * The chords a binding can be found by here: its active chords and the desktop menu's
+ * accelerators for it, but not bare printable keys, such as the digit a workspace tab takes
+ * after its chord, which only works in context.
  */
 export function searchableChords(id: ShortcutId, environment: ShortcutEnvironment): Chord[] {
-  return activeShortcutChords(id, environment).filter((chord) => !isBarePrintable(chord));
+  return [...activeShortcutChords(id, environment), ...menuShortcutChords(id, environment)].filter(
+    (chord) => !isBarePrintable(chord),
+  );
 }
 
-/** The listed page rows a typed chord finds here: each binding whose searchable chords it presses. */
+/**
+ * The listed page rows a typed chord finds here: each row showing a binding whose searchable
+ * chords it presses, an alternative's or a part's chord finding the row it's drawn on.
+ */
 export function rowsForChord(
   input: KeyChordInput,
   environment: ShortcutEnvironment,
@@ -259,13 +269,14 @@ export function rowsForChord(
 ): Set<ShortcutId> {
   const rows = new Set<ShortcutId>();
   for (const binding of SHORTCUT_BINDINGS) {
-    if (!listedRows.has(binding.id)) continue;
+    const row = shortcutDisplayRow(binding.id);
+    if (!listedRows.has(row)) continue;
     if (
       searchableChords(binding.id, environment).some((chord) =>
         chordMatches(chord, input, environment.mac),
       )
     ) {
-      rows.add(binding.id);
+      rows.add(row);
     }
   }
   return rows;
@@ -273,6 +284,9 @@ export function rowsForChord(
 
 /** Ranks above every text match. */
 export const CHORD_TIER = 0;
+
+/** A bare key name, such as "tab" or "down", is more often a word: after label matches. */
+export const BARE_KEY_TIER = TEXT_TIER_BASE + MatchTier.keyword;
 
 /**
  * Finds the shortcut rows a typed chord presses, in `environment`, among the rows the page
@@ -287,11 +301,13 @@ export function chordMatcher(
     if (!input) return null;
     const rows = rowsForChord(input, environment, listedRows);
     if (rows.size === 0) return null;
+    const bare = !input.metaKey && !input.ctrlKey && !input.altKey && !input.shiftKey;
+    const tier = bare ? BARE_KEY_TIER : CHORD_TIER;
     return (target) =>
       target.part === undefined &&
       target.entry.shortcutId !== undefined &&
       rows.has(target.entry.shortcutId)
-        ? { tier: CHORD_TIER }
+        ? { tier }
         : null;
   };
 }

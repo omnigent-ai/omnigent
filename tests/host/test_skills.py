@@ -22,6 +22,7 @@ from omnigent.host.skills import (
     SKILLS_CACHE_TTL_SECONDS,
     HostSkillDiscovery,
 )
+from omnigent.memory_availability import MEMORY_HEADER, without_memory_tools
 from omnigent.spec import load
 from omnigent.spec.skill_sources import resolve_session_skills
 
@@ -100,7 +101,10 @@ def test_session_catalog_matches_invocation_scope(
 
     runner_bundle = tmp_path / "runner-bundle"
     spec = load(bundle, dest=runner_bundle, expand_env=False)
-    resolved = resolve_session_skills(spec, (tmp_path, runner_bundle), runner_bundle)
+    # The response carries no memory header, so the host has memory off; so does the runner.
+    resolved = resolve_session_skills(
+        without_memory_tools(spec), (tmp_path, runner_bundle), runner_bundle
+    )
     assert catalog == [{"name": s.name, "description": s.description} for s in resolved]
     assert resolved[0].skill_dir == runner_bundle / "skills" / "bundled"
 
@@ -124,7 +128,7 @@ def test_session_catalog_ends_with_the_framework_workflow_skills(tmp_path: Path)
             )
             assert catalog[2]["description"].startswith("Run a multi-step workflow")
         resolved = resolve_session_skills(
-            spec,
+            without_memory_tools(spec),
             (tmp_path,),
             tmp_path / "runner-bundle",
             workflows_enabled=enabled,
@@ -133,6 +137,25 @@ def test_session_catalog_ends_with_the_framework_workflow_skills(tmp_path: Path)
         overridden = custom.discover(current, tmp_path)
         assert {"name": "workflow", "description": "workflow description"} in overridden
         assert [skill["name"] for skill in overridden].count("workflow") == 1
+
+
+@pytest.mark.parametrize("memory_header", [None, "0", "1"])
+def test_session_catalog_offers_the_memory_skill_only_when_the_server_has_memory(
+    tmp_path: Path, memory_header: str | None
+) -> None:
+    """The session's memory group follows the bundle response's memory header, as in the runner."""
+    bundle = _bundle(
+        {"skills/bundled/SKILL.md": _skill("bundled")}, tool_groups={"journal": False}
+    )
+    response = _response(bundle)
+    if memory_header is not None:
+        response.headers[MEMORY_HEADER] = memory_header
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+
+    catalog = HostSkillDiscovery(lambda _: response).discover(frame, tmp_path)
+
+    expected = ["bundled", "import-memory"] if memory_header == "1" else ["bundled"]
+    assert [skill["name"] for skill in catalog] == expected
 
 
 @pytest.mark.parametrize("remove_link", [True, False], ids=["removed", "permission-denied"])
@@ -254,7 +277,7 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     monkeypatch.setenv(variable, env[variable])
     bundle = _bundle({}, executor={"config": {"harness": harness}})
     spec = load(bundle, dest=tmp_path / "runner-bundle", expand_env=False)
-    resolved = resolve_session_skills(spec, (tmp_path,), None)
+    resolved = resolve_session_skills(without_memory_tools(spec), (tmp_path,), None)
     assert host_catalog == [{"name": s.name, "description": s.description} for s in resolved]
     assert {s["name"] for s in host_catalog} == expected_names
 

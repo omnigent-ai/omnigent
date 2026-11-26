@@ -15,13 +15,14 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import pytest
 from PIL import Image
 from playwright.sync_api import Locator, Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
 from tests.e2e_ui.desktop._mac_shell import MAC_SHELL_INIT_SCRIPT, WINDOW_CONTROLS_STRIP
 
 _VIEWPORT = {"width": 1440, "height": 900}
@@ -68,9 +69,23 @@ def _settle(page: Page) -> None:
     page.evaluate(_SETTLE_JS)
 
 
-def _set_features(page: Page, floating: bool, *, tabs_sidebar: bool = True) -> None:
-    """Answer ``/v1/info`` with floating panes set to ``floating``, and the tabs sidebar on
-    unless ``tabs_sidebar`` turns it off for the classic one."""
+_HIDE_SIDEBAR_CONTENTS_JS = """() => {
+  for (const child of document.querySelector(".conversations-sidebar").children) {
+    child.style.visibility = "hidden";
+  }
+}"""
+
+
+def _hide_sidebar_contents(page: Page) -> None:
+    """Leave only the sidebar's surface: sessions other journeys made may fill its rows."""
+    page.evaluate(_HIDE_SIDEBAR_CONTENTS_JS)
+
+
+def _set_features(
+    page: Page, floating: bool, *, tabs_sidebar: bool = True, extra: dict[str, bool] | None = None
+) -> None:
+    """Answer ``/v1/info`` with floating panes set to ``floating``, the tabs sidebar on unless
+    ``tabs_sidebar`` turns it off for the classic one, and any ``extra`` features."""
 
     def answer(route: Route) -> None:
         response = route.fetch()
@@ -79,10 +94,33 @@ def _set_features(page: Page, floating: bool, *, tabs_sidebar: bool = True) -> N
             **(info.get("features") or {}),
             "workspace_sidebar_v2": tabs_sidebar,
             "floating_panes": floating,
+            **(extra or {}),
         }
         route.fulfill(response=response, json=info)
 
     page.route("**/v1/info", answer)
+
+
+def _list_only(page: Page, session_id: str) -> None:
+    """Answer the sidebar's session list with this test's session alone.
+
+    The shard shares one server, so sessions other tests created would otherwise fill the
+    sidebar, and the pixel checks would compare rows a layout change moved, not its surface.
+    """
+
+    def answer(route: Route) -> None:
+        # Only the list endpoint, not /v1/sessions/{id} or its sub-resources.
+        if route.request.method != "GET" or urlparse(route.request.url).path != "/v1/sessions":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        payload["data"] = [
+            session for session in payload.get("data", []) if session.get("id") == session_id
+        ]
+        route.fulfill(response=response, json=payload)
+
+    page.route("**/v1/sessions?*", answer)
 
 
 def _open(
@@ -94,10 +132,11 @@ def _open(
     floating: bool,
     viewport: dict[str, int] = _VIEWPORT,
     tabs_sidebar: bool = True,
+    extra_features: dict[str, bool] | None = None,
 ) -> None:
     page.set_viewport_size(viewport)
     page.emulate_media(color_scheme=scheme)
-    _set_features(page, floating, tabs_sidebar=tabs_sidebar)
+    _set_features(page, floating, tabs_sidebar=tabs_sidebar, extra=extra_features)
     page.goto(f"{base_url}/c/{session_id}")
     expect(message_composer(page)).to_be_visible(timeout=30_000)
     expect(page.locator(".app-shell[data-floating-panes]")).to_have_count(1 if floating else 0)
@@ -174,6 +213,8 @@ def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_pa
     """With the flag off the chat has no card and the dark sidebar keeps its edge; the
     sidebar's own surface is the same either way, so its rows keep their contrast."""
     base_url, session_id = seeded_session
+    # The region compared below must be the sidebar's empty surface in both layouts.
+    _list_only(page, session_id)
     regions: list[Image.Image] = []
     for floating in (True, False):
         _open(page, base_url, session_id, scheme=scheme, floating=floating)
@@ -183,10 +224,11 @@ def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_pa
             assert geometry["chatBorder"] == "0px"
             assert geometry["sidebarBorder"] == ("1px" if scheme == "dark" else "0px")
         sidebar_right = round(geometry["sidebarRight"])
+        _hide_sidebar_contents(page)
         image = _capture(
             page, f"sidebar-{scheme}-floating" if floating else f"edge-to-edge-{scheme}"
         )
-        # The empty lower part of the sidebar, clear of its rows and its edge.
+        # The lower part of the sidebar's bare surface, clear of its edge.
         regions.append(image.crop((16, 760, sidebar_right - 16, 860)))
     floating_region, flat_region = regions
     worst = max(
@@ -194,6 +236,56 @@ def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_pa
         for left, right in zip(floating_region.getdata(), flat_region.getdata(), strict=True)
     )
     assert worst <= _MAX_STEP, f"the sidebar paints up to {worst} differently"
+
+
+def _choose_pane_corners(page: Page, query: str, choice: str | None = None) -> None:
+    """Open ⌘K, find Pane corners by ``query``, and accept ``choice`` (or the one it names)."""
+    page.keyboard.press("ControlOrMeta+k")
+    palette = page.get_by_test_id("command-palette-input")
+    expect(palette).to_be_focused(timeout=10_000)
+    palette.fill(query)
+    # Enter acts on the active row, so wait for the search to settle on Pane corners.
+    row = page.get_by_role("option", name=re.compile("^Pane corners"))
+    expect(row).to_have_attribute("aria-selected", "true")
+    page.keyboard.press("Enter")
+    if choice is not None:
+        page.get_by_role("option", name=re.compile(f"^{re.escape(choice)}")).click()
+    else:
+        page.keyboard.press("Enter")
+    # A setting's choice applies and goes back to the palette's list, which stays open.
+    expect(page.get_by_role("option", name=re.compile("^Pane corners"))).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(palette).to_have_count(0)
+
+
+def test_cmd_k_switches_to_sharp_corners_and_back_to_automatic_across_a_reload(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Typing "sharp corners" in ⌘K turns floating panes off on this device, a reload keeps the
+    choice, and Automatic follows the server's floating panes again."""
+    base_url, session_id = seeded_session
+    # The Pane corners row is a setting the QuickPick ⌘K offers.
+    _open(
+        page,
+        base_url,
+        session_id,
+        scheme="light",
+        floating=True,
+        extra_features={"quick_pick_palette": True},
+    )
+    floating_shell = page.locator(".app-shell[data-floating-panes]")
+
+    _choose_pane_corners(page, "sharp corners", "Sharp corners")
+    expect(floating_shell).to_have_count(0)
+    page.reload()
+    expect(message_composer(page)).to_be_visible(timeout=30_000)
+    expect(floating_shell).to_have_count(0)
+
+    _choose_pane_corners(page, "pane corners", "Automatic (Floating panes)")
+    expect(floating_shell).to_have_count(1)
+    page.reload()
+    expect(message_composer(page)).to_be_visible(timeout=30_000)
+    expect(floating_shell).to_have_count(1)
 
 
 def test_the_chat_card_stays_rounded_after_switching_sessions(
@@ -418,6 +510,119 @@ def test_the_workspace_sidebar_resizes_from_the_gutter_beside_the_chat(
     assert abs(_workspace_width(page) - narrowed) <= 1
 
 
+def _center(locator: Locator) -> tuple[float, float]:
+    box = locator.bounding_box()
+    assert box is not None
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
+def test_one_collapse_right_icon_in_the_corner_opens_and_closes_the_workspace_sidebar(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """The open sidebar collapses from its own collapse-right icon, the header shows no second
+    toggle, and the header's Expand right panel takes the same corner while it's collapsed."""
+    base_url, session_id = seeded_session
+    _open(page, base_url, session_id, scheme="light", floating=True)
+    open_right_rail(page)
+    header_toggles = page.locator(
+        'header.chat-header button[aria-label="Collapse right panel"], '
+        'header.chat-header button[aria-label="Expand right panel"]'
+    )
+    collapse = page.locator(_WORKSPACE).get_by_role("button", name="Collapse right panel")
+    expect(collapse).to_be_visible()
+    expect(header_toggles).to_have_count(0)
+    expect(collapse.locator("svg.lucide-panel-right-close")).to_have_count(1)
+    expect(collapse.locator("svg.lucide-x")).to_have_count(0)
+    if target := os.environ.get("OMNIGENT_E2E_CAPTURES"):
+        clip = {"x": _VIEWPORT["width"] - 420, "y": 0, "width": 420, "height": 90}
+        for scheme in ("light", "dark"):
+            page.emulate_media(color_scheme=scheme)
+            page.wait_for_timeout(200)  # custom-lint: disable=sleep-then-assert -- theme repaint
+            page.screenshot(
+                path=str(Path(target, f"sidebar-collapse-open-{scheme}.png")),
+                clip=clip,
+                animations="disabled",
+            )
+        page.emulate_media(color_scheme="light")
+    open_at = _center(collapse)
+
+    collapse.click()
+    expand = page.locator("header.chat-header").get_by_role("button", name="Expand right panel")
+    expect(expand).to_be_visible()
+    expect(header_toggles).to_have_count(1)
+    expect(collapse).not_to_be_visible()
+    page.wait_for_timeout(600)  # custom-lint: disable=sleep-then-assert -- the slide's length
+    closed_at = _center(expand)
+    if target := os.environ.get("OMNIGENT_E2E_CAPTURES"):
+        clip = {"x": _VIEWPORT["width"] - 420, "y": 0, "width": 420, "height": 90}
+        page.screenshot(
+            path=str(Path(target, "sidebar-collapse-closed-light.png")),
+            clip=clip,
+            animations="disabled",
+        )
+    print(f"corner toggle open={open_at} closed={closed_at}")
+    # Both take one spot in the window's top-right corner, so the pointer opens what it closed.
+    assert abs(open_at[0] - closed_at[0]) <= 1, (open_at, closed_at)
+    assert abs(open_at[1] - closed_at[1]) <= 1, (open_at, closed_at)
+
+    expand.click()
+    expect(collapse).to_be_visible()
+    expect(header_toggles).to_have_count(0)
+
+
+_CORNER_CONTROLS_JS = """(sidebar) => {
+  const header = document.querySelectorAll(
+    'header.chat-header button[aria-label$="right panel"]');
+  const collapse = document.querySelector(
+    `${sidebar} button[aria-label="Collapse right panel"]`);
+  const rail = document.querySelector(sidebar)?.getBoundingClientRect();
+  let shown = false;
+  if (collapse && rail) {
+    const box = collapse.getBoundingClientRect();
+    const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+    shown = box.width > 0 && box.left >= rail.left && box.right <= rail.right + 0.5
+      && box.right <= window.innerWidth && !!hit && collapse.contains(hit);
+  }
+  return { header: header.length, collapseShown: shown, rail: rail ? rail.width : 0 };
+}"""
+
+
+def test_a_narrow_desktop_window_always_shows_one_way_to_collapse_the_sidebar(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """The desktop app keeps both sidebars open in a narrow window, which squeezes the workspace
+    sidebar. At every width either its own Collapse shows whole or the header keeps its toggle."""
+    base_url, session_id = seeded_session
+    page.add_init_script(MAC_SHELL_INIT_SCRIPT)
+    _open(page, base_url, session_id, scheme="light", floating=True)
+    open_right_rail(page)
+    _workspace_width(page)
+    readings: dict[int, dict[str, Any]] = {}
+
+    def read(width: int) -> dict[str, Any]:
+        page.set_viewport_size({"width": width, "height": 900})
+        page.wait_for_timeout(120)  # custom-lint: disable=sleep-then-assert -- a resize's layout
+        reading = page.evaluate(_CORNER_CONTROLS_JS, _WORKSPACE)
+        readings[width] = reading
+        # At least one: the sidebar's own button whole, or the header's toggle.
+        assert reading["header"] == 1 or reading["collapseShown"], (width, reading)
+        return reading
+
+    handed_off = [width for width in range(800, 1201, 4) if read(width)["header"] == 0]
+    assert handed_off, readings
+    # The narrowest windows squeeze the sidebar past its button, so the header's toggle is needed.
+    assert readings[800]["header"] == 1, readings[800]
+    # Around the first width the sidebar takes over, pixel by pixel.
+    for width in range(handed_off[0] - 6, handed_off[0] + 2):
+        read(width)
+    # Tolerated: up to 4px below the handoff both may show, as the measured need runs 1px high.
+    band = range(handed_off[0] - 4, handed_off[0])
+    for width, reading in readings.items():
+        if width not in band:
+            assert (reading["header"] == 1) != reading["collapseShown"], (width, reading)
+    print("narrow corner readings", {w: readings[w] for w in sorted(readings) if w < 1000})
+
+
 def _open_terminal_first(page: Page, base_url: str, session_id: str, **open_args: Any) -> None:
     """Open the session as ``omnigent claude`` sessions are: terminal-first, with the agent's
     terminal listed (no live PTY is needed to place the switch)."""
@@ -490,7 +695,9 @@ def test_a_terminal_first_chat_switches_views_from_its_own_row(
         content_top = terminal_box["y"] + float(
             terminal_view.evaluate("(el) => parseFloat(getComputedStyle(el).paddingTop)")
         )
-        assert content_top >= strip_box["y"] + strip_box["height"] - 0.5, (strip_box, content_top)
+        # Right below it, with no band between the row and the terminal.
+        strip_bottom = strip_box["y"] + strip_box["height"]
+        assert strip_bottom - 0.5 <= content_top <= strip_bottom + 1.5, (strip_box, content_top)
     _capture(page, f"{name}-terminal")
 
     view_switch.get_by_role("button", name="Chat view").click()

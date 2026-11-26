@@ -15,6 +15,8 @@ import {
   ComparisonKind,
   FileSearchMode,
   SearchOrder,
+  ListBranchCommitsRequestSchema,
+  ListBranchCommitsResponseSchema,
   ListWorkingCopyChangesRequestSchema,
   ListWorkingCopyChangesResponseSchema,
   ReadBaseFileResponseSchema,
@@ -485,6 +487,80 @@ describe("readFileViaWorkspaceApi", () => {
       expect(listed?.data[1]).not.toHaveProperty("ignored");
     },
   );
+
+  /** Answers ListDirectory with `pageFor(token)`, so a test can script the host's pages. */
+  function scriptPages(pageFor: (token: string) => { paths: string[]; next: string }) {
+    serveMethods({
+      ListDirectory: (body) => {
+        const { paths, next } = pageFor(fromBinary(ListDirectoryRequestSchema, body).pageToken);
+        const page = create(ListDirectoryResponseSchema, {
+          entries: paths.map((path) => ({ name: path.split("/").at(-1)!, path })),
+          nextPageToken: next,
+        });
+        return new Response(toBinary(ListDirectoryResponseSchema, page), {
+          headers: PROTO_HEADERS,
+        });
+      },
+    });
+  }
+
+  it("stops before asking again for a page token it already asked for, and reports more", async () => {
+    enable("workspace_api_server_access");
+    // The host cycles: "" → A → B → A, resending the first page for B.
+    const pages: Record<string, { paths: string[]; next: string }> = {
+      "": { paths: ["src/a.ts"], next: "A" },
+      A: { paths: ["src/b.ts"], next: "B" },
+      B: { paths: ["src/a.ts"], next: "A" },
+    };
+    scriptPages((token) => pages[token]!);
+
+    const listed = await listDirectoryViaWorkspaceApi("s-list-cycle", "src", 1000);
+
+    expect(listed?.data.map((entry) => entry.path)).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(listed?.hasMore).toBe(true);
+    expect(
+      methodCalls("ListDirectory").map(
+        ([, init]) => fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array).pageToken,
+      ),
+    ).toEqual(["", "A", "B"]);
+  });
+
+  it("keeps each entry once when the host starts over because the token's entry was deleted", async () => {
+    enable("workspace_api_server_access");
+    // `src/b.ts` is deleted after the first page, so the host lists from the top for "b".
+    const pages: Record<string, { paths: string[]; next: string }> = {
+      "": { paths: ["src/a.ts", "src/b.ts"], next: "b" },
+      b: { paths: ["src/a.ts", "src/c.ts"], next: "c" },
+      c: { paths: ["src/d.ts"], next: "" },
+    };
+    scriptPages((token) => pages[token]!);
+
+    const listed = await listDirectoryViaWorkspaceApi("s-list-restart", "src", 1000);
+
+    expect(listed?.data.map((entry) => entry.path)).toEqual([
+      "src/a.ts",
+      "src/b.ts",
+      "src/c.ts",
+      "src/d.ts",
+    ]);
+    expect(listed?.hasMore).toBe(false);
+  });
+
+  it("keeps a listing to the caller's limit when the host ignores the page size", async () => {
+    enable("workspace_api_server_access");
+    // 51,000 entries in pages of 3,000, then the end: a complete listing past the limit.
+    scriptPages((token) => {
+      const start = Number(token || 0);
+      const paths = Array.from({ length: 3000 }, (_, i) => `src/${start + i}`);
+      return { paths, next: start + 3000 < 51_000 ? String(start + 3000) : "" };
+    });
+
+    const listed = await listDirectoryViaWorkspaceApi("s-list-oversized", "src", 50_000);
+
+    expect(listed?.data).toHaveLength(50_000);
+    expect(listed?.data.at(-1)?.path).toBe("src/49999");
+    expect(listed?.hasMore).toBe(true);
+  });
 
   it("leaves a listing the host answers with an error to REST, and keeps the route for reads", async () => {
     enable("workspace_api_server_access");
@@ -1381,6 +1457,62 @@ describe("Git comparisons through the workspace API", () => {
     expect(base).toMatchObject({ path: "src/a.ts", encoding: "utf-8", content: "hi", bytes: 2 });
   });
 
+  it("asks for a named head's commits only of a host that lists one", async () => {
+    enable("workspace_api_server_access");
+    const requests: { baseRevision: string; headRevision: string }[] = [];
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("ListBranchCommits", "branch_commits"), {
+          headers: PROTO_HEADERS,
+        }),
+      ListBranchCommits: (body) => {
+        const { baseRevision, headRevision } = fromBinary(ListBranchCommitsRequestSchema, body);
+        requests.push({ baseRevision, headRevision });
+        return new Response(
+          toBinary(ListBranchCommitsResponseSchema, create(ListBranchCommitsResponseSchema, {})),
+          { headers: PROTO_HEADERS },
+        );
+      },
+    });
+
+    // Without "branch_commits.head" it would list HEAD's commits, so a named head isn't asked.
+    expect(
+      await listBranchCommitsViaWorkspaceApi("s-git-head", { base: "main", head: "feature" }),
+    ).toBeNull();
+    expect(
+      await listBranchCommitsViaWorkspaceApi("s-git-head", { base: "main", head: "" }),
+    ).not.toBeNull();
+    expect(requests).toEqual([{ baseRevision: "main", headRevision: "" }]);
+  });
+
+  it("sends a named head to a host that lists one", async () => {
+    enable("workspace_api_server_access");
+    const requests: { baseRevision: string; headRevision: string }[] = [];
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(
+          capabilitiesBody("ListBranchCommits", "branch_commits", "branch_commits.head"),
+          { headers: PROTO_HEADERS },
+        ),
+      ListBranchCommits: (body) => {
+        const { baseRevision, headRevision } = fromBinary(ListBranchCommitsRequestSchema, body);
+        requests.push({ baseRevision, headRevision });
+        return new Response(
+          toBinary(ListBranchCommitsResponseSchema, create(ListBranchCommitsResponseSchema, {})),
+          { headers: PROTO_HEADERS },
+        );
+      },
+    });
+
+    expect(
+      await listBranchCommitsViaWorkspaceApi("s-git-head-served", {
+        base: "main",
+        head: "feature",
+      }),
+    ).not.toBeNull();
+    expect(requests).toEqual([{ baseRevision: "main", headRevision: "feature" }]);
+  });
+
   it("does not send REVISIONS when revision_comparison is absent", async () => {
     enable("workspace_api_server_access");
     const kinds: unknown[] = [];
@@ -1405,7 +1537,9 @@ describe("Git comparisons through the workspace API", () => {
 
     expect(await listWorkingCopyChangesViaWorkspaceApi("s-git-features", revisions)).toBeNull();
     expect(await resolveWorkingCopyBaseViaWorkspaceApi("s-git-features", revisions)).toBeNull();
-    expect(await listBranchCommitsViaWorkspaceApi("s-git-features", "main")).toBeNull();
+    expect(
+      await listBranchCommitsViaWorkspaceApi("s-git-features", { base: "main", head: "" }),
+    ).toBeNull();
     // The comparison the host does serve still goes through.
     const branchPoint = await listWorkingCopyChangesViaWorkspaceApi("s-git-features", {
       kind: ComparisonKind.BRANCH_POINT,
@@ -1477,7 +1611,7 @@ describe("Git comparisons through the workspace API", () => {
     });
     const file = { commit: "b".repeat(40), path: "src/a.ts", object: "c".repeat(40) };
 
-    const commits = listBranchCommitsViaWorkspaceApi("s-git-refused", "gone");
+    const commits = listBranchCommitsViaWorkspaceApi("s-git-refused", { base: "gone", head: "" });
     await expect(commits).rejects.toThrow("No revision 'gone'");
     await expect(commits).rejects.toMatchObject({ code: Code.NotFound });
     const base = readBaseFileViaWorkspaceApi("s-git-refused", file);

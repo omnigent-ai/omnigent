@@ -9,6 +9,30 @@ import {
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 export const PINNED_WORKSPACE_TABS_STORAGE_KEY = "omnigent:pinned-workspace-tabs";
 
+const preferenceListeners = new Set<() => void>();
+
+/** Called after either preference changes, here or in another window. */
+export function subscribeWorkspaceTabPreferences(listener: () => void): () => void {
+  preferenceListeners.add(listener);
+  return () => {
+    preferenceListeners.delete(listener);
+  };
+}
+
+/** Tell subscribers about a same-window write, such as a settings import. */
+export function notifyWorkspaceTabPreferencesChanged(): void {
+  for (const listener of [...preferenceListeners]) listener();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    const key = event.key;
+    if (key === null || key === STORAGE_KEY || key === PINNED_WORKSPACE_TABS_STORAGE_KEY) {
+      notifyWorkspaceTabPreferencesChanged();
+    }
+  });
+}
+
 export const defaultWorkspaceTabs = ["files", "changes", "github", "subagents", "tasks"] as const;
 export type DefaultWorkspaceTab = (typeof defaultWorkspaceTabs)[number];
 
@@ -50,7 +74,10 @@ export function writeDefaultWorkspaceTab(value: DefaultWorkspaceTab): void {
     } else {
       window.localStorage.setItem(STORAGE_KEY, normalized);
     }
-    if (normalized !== previous) resetSessionWorkspaceTabSelections();
+    if (normalized !== previous) {
+      resetSessionWorkspaceTabSelections();
+      notifyWorkspaceTabPreferencesChanged();
+    }
   } catch {
     // localStorage quota or access errors shouldn't break settings.
   }
@@ -82,6 +109,7 @@ export function writePinnedWorkspaceTabs(tabs: readonly DefaultWorkspaceTab[]): 
       window.localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, JSON.stringify(next));
     }
     unpinSessionWorkspaceTabs(previous.filter((tab) => !next.includes(tab)));
+    notifyWorkspaceTabPreferencesChanged();
   } catch {
     // Storage failures must not break settings.
   }

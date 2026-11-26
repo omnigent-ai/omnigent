@@ -227,6 +227,18 @@ def _environment(*, literal_pathspecs: bool = True) -> dict[str, str]:
     return environment
 
 
+# Absolute paths in Git's message, POSIX or Windows, e.g. an outside Git directory. A quoted
+# one is replaced whole, spaces included; an unquoted one runs to ": ", ", " or the end.
+_QUOTED_PATH = re.compile(r"""(['"`])(?:/|[A-Za-z]:[\\/])[^'"`]*\1""")
+_UNQUOTED_PATH = re.compile(r"(?<![\w.~-])(?:/|\b[A-Za-z]:[\\/])(?:(?!: |, ).)*")
+
+
+def _without_absolute_paths(message: str) -> str:
+    """``message`` with each absolute path replaced, so a detail never names host paths."""
+    quoted = _QUOTED_PATH.sub(lambda match: f"{match[1]}<path>{match[1]}", message)
+    return _UNQUOTED_PATH.sub("<path>", quoted)
+
+
 def failure(output: GitOutput, command: str) -> GitError:
     """The error for a Git child that didn't succeed."""
     if output.returncode < 0:
@@ -245,7 +257,7 @@ def failure(output: GitOutput, command: str) -> GitError:
         )
     ):
         return GitError(GitProblem.MISSING_OBJECT)
-    summary = stderr.splitlines()[-1][:300] if stderr else ""
+    summary = _without_absolute_paths(stderr.splitlines()[-1])[:300] if stderr else ""
     return GitError(GitProblem.FAILED, summary or f"git {command} exited with {output.returncode}")
 
 
@@ -756,3 +768,39 @@ class GitRepository:
             stdout_sink=stdout_sink,
             literal_pathspecs=subcommand not in _MAGIC_PATHSPEC_SUBCOMMANDS,
         )
+
+
+@dataclass(frozen=True)
+class OutsideAnyRepository:
+    """A checked folder that lies outside any repository: no repository is looked up again."""
+
+
+OUTSIDE_ANY_REPOSITORY = OutsideAnyRepository()
+
+
+@dataclass(frozen=True)
+class UnreadableRepository:
+    """A checked folder whose repository Git couldn't read: the comparison reports ``error``."""
+
+    error: GitError
+
+
+# What a folder check found: the repository, none at all, Git's failure to read it, or
+# ``None`` when nothing was checked.
+CheckedRepository = GitRepository | OutsideAnyRepository | UnreadableRepository | None
+
+
+async def checked_or_discovered(
+    root: Path, deadline: Deadline, checked: CheckedRepository
+) -> GitRepository | None:
+    """The repository a folder check found at ``root``, else the one discovered there.
+
+    A folder the check found outside any repository stays outside one, so a repository
+    created there after the check isn't picked up. One Git couldn't read raises that
+    failure, so the comparison reports it as it would for the workspace itself.
+    """
+    if isinstance(checked, OutsideAnyRepository):
+        return None
+    if isinstance(checked, UnreadableRepository):
+        raise checked.error
+    return checked or await GitRepository.discover(root, deadline)

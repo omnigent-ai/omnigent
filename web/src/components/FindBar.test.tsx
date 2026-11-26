@@ -64,6 +64,34 @@ describe("FindBar", () => {
     expect(screen.getByRole("textbox", { name: "Find in file" })).toHaveFocus();
   });
 
+  it("toggles Find in selection, and only says why while there's nothing selected", () => {
+    const onToggle = vi.fn();
+    const options = { options: DEFAULT_FIND_OPTIONS, onOptionsChange: vi.fn() };
+    renderBar({
+      ...options,
+      inSelection: {
+        pressed: false,
+        available: false,
+        unavailableReason: "Select text.",
+        onToggle,
+      },
+    });
+    const toggle = screen.getByRole("button", { name: "Find in selection" });
+    expect(toggle).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(toggle);
+    expect(onToggle).not.toHaveBeenCalled();
+    cleanup();
+    renderBar({
+      ...options,
+      inSelection: { pressed: true, available: true, unavailableReason: "Select text.", onToggle },
+    });
+    const pressed = screen.getByRole("button", { name: "Find in selection" });
+    expect(pressed).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(pressed);
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox", { name: "Find in file" })).toHaveFocus();
+  });
+
   it("docked in a terminal's row, draws its text, field and controls in the terminal's colors", () => {
     renderBar({ docked: { fold: 0 } });
     const bar = screen.getByRole("search");
@@ -124,6 +152,18 @@ describe("FindBar", () => {
       expect(field).toHaveFocus();
       fireEvent.keyDown(field, { key: "Escape" });
       expect(props.onClose).toHaveBeenCalled();
+    });
+
+    it("offers Preserve case only where the caller supports it, and keeps focus in the field", () => {
+      const { replace } = renderReplace({ preserveCase: false, onPreserveCaseChange: vi.fn() });
+      const toggle = screen.getByRole("button", { name: "Preserve case" });
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+      fireEvent.click(toggle);
+      expect(replace.onPreserveCaseChange).toHaveBeenCalledWith(true);
+      expect(screen.getByRole("textbox", { name: "Replace with" })).toHaveFocus();
+      cleanup();
+      renderReplace();
+      expect(screen.queryByRole("button", { name: "Preserve case" })).toBeNull();
     });
 
     it("disables replacing without matches", () => {

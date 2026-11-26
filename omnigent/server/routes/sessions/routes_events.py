@@ -142,6 +142,7 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
+    _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _CLEAR_TYPE,
@@ -398,11 +399,6 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
         _SUBAGENT_STATUS_TYPE,
     }
 )
-
-
-# A host that confirmed the spawn has a runner process that may still be
-# booting (slow imports on a busy machine), so it earns a longer connect wait.
-_ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR = 2.0
 
 
 def _relaunch_connect_timeout_s(*, acknowledged: bool) -> float:

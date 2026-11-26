@@ -103,6 +103,9 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.background_session_titles import (
+    install_coordinator as install_background_title_coordinator,
+)
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
     DeploymentGate,
@@ -2601,10 +2604,12 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        install_background_title_coordinator(background_title_coordinator)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            install_background_title_coordinator(None)
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:
