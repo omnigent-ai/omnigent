@@ -30,6 +30,7 @@ accepted by Copilot.
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import subprocess
 
@@ -106,6 +107,14 @@ def looks_like_github_copilot_token(value: str) -> bool:
 COPILOT_EXTRA = "copilot"
 
 
+def _dist_version(name: str) -> str | None:
+    """Return the installed version of distribution ``name``, or ``None``."""
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
 def copilot_sdk_installed() -> bool:
     """Return whether the Copilot SDK (the optional extra) is importable.
 
@@ -119,8 +128,18 @@ def copilot_sdk_installed() -> bool:
     guard catches the ``ModuleNotFoundError`` it raises when a parent package is
     absent.
 
-    :returns: ``True`` when ``copilot`` is importable.
+    The legacy ``github-copilot-sdk`` 1.x also provides ``copilot``, so the
+    ``microsoft-copilot-sdk`` distribution must be installed at major version 2
+    and the legacy distribution must be absent.
+
+    :returns: ``True`` when SDK 2 is installed and ``copilot`` is importable.
     """
+    sdk_version = _dist_version("microsoft-copilot-sdk")
+    if sdk_version is None or sdk_version.split(".", 1)[0] != "2":
+        return False
+    if _dist_version("github-copilot-sdk") is not None:
+        # A legacy install alongside SDK 2 may have overwritten shared files.
+        return False
     try:
         return importlib.util.find_spec("copilot") is not None
     except ModuleNotFoundError:

@@ -300,6 +300,14 @@ macOS, or `%LOCALAPPDATA%\copilot-sdk\cli\` on Windows), and Omnigent spawns it
 out-of-process over stdio. No separate CLI install is needed on hosts with
 network access to GitHub Releases.
 
+Upgrading from SDK 1.x: `github-copilot-sdk` and `microsoft-copilot-sdk` both
+install the `copilot` package. `uv sync` removes the old distribution
+automatically. With manual `pip` or `uv pip` installs, uninstall
+`github-copilot-sdk` first, then reinstall the `copilot` extra. Setup reports
+mixed installations as not installed. Removing the old distribution after
+installing the new one deletes shared `copilot` files, so reinstall the extra
+after removing the old distribution.
+
 For pre-warmed or offline environments:
 
 - Pre-provision the runtime bundle after installing the extra with

@@ -247,14 +247,47 @@ def test_copilot_extra_install_command_targets_extra() -> None:
     assert "install" in cmd
 
 
-def test_copilot_sdk_installed_true_when_spec_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Detection returns True when ``find_spec`` resolves ``copilot``."""
+def _set_sdk_version(
+    monkeypatch: pytest.MonkeyPatch, sdk_version: str | None, legacy_version: str | None = None
+) -> None:
+    """Stub installed SDK 2 and legacy SDK versions (``None`` = absent)."""
+    versions = {"microsoft-copilot-sdk": sdk_version, "github-copilot-sdk": legacy_version}
+
+    def _version(name: str) -> str:
+        if versions[name] is None:
+            raise copilot_auth.importlib.metadata.PackageNotFoundError(name)
+        return versions[name]
+
+    monkeypatch.setattr(copilot_auth.importlib.metadata, "version", _version)
+
+
+@pytest.mark.parametrize(
+    ("sdk_version", "legacy_version", "expected"),
+    [
+        ("2.0.0", None, True),
+        ("2.3.1", None, True),
+        ("2.0.0", "1.0.0", False),
+        (None, "1.0.0", False),
+        ("1.0.0", None, False),
+        ("3.0.0", None, False),
+        (None, None, False),
+    ],
+)
+def test_copilot_sdk_installed_requires_sdk2_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_version: str | None,
+    legacy_version: str | None,
+    expected: bool,
+) -> None:
+    """Only a clean ``microsoft-copilot-sdk`` 2.x install counts, even when ``copilot`` imports."""
+    _set_sdk_version(monkeypatch, sdk_version, legacy_version)
     monkeypatch.setattr(copilot_auth.importlib.util, "find_spec", lambda name: object())
-    assert copilot_sdk_installed() is True
+    assert copilot_sdk_installed() is expected
 
 
 def test_copilot_sdk_installed_false_when_spec_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Detection returns False when ``find_spec`` returns ``None`` (extra absent)."""
+    """Detection returns False when SDK 2 metadata exists but ``copilot`` is unimportable."""
+    _set_sdk_version(monkeypatch, "2.0.0")
     monkeypatch.setattr(copilot_auth.importlib.util, "find_spec", lambda name: None)
     assert copilot_sdk_installed() is False
 
@@ -271,6 +304,7 @@ def test_copilot_sdk_installed_false_when_module_not_found(
     def _raise(name: str) -> object:
         raise ModuleNotFoundError("No module named 'copilot'")
 
+    _set_sdk_version(monkeypatch, "2.0.0")
     monkeypatch.setattr(copilot_auth.importlib.util, "find_spec", _raise)
     assert copilot_sdk_installed() is False
 
