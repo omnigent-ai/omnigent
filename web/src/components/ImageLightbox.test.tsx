@@ -29,7 +29,8 @@ vi.mock("@/lib/identity", () => ({
 vi.mock("sonner", () => ({ toast: { error: toastError } }));
 
 import { captureDownloads } from "@/test/downloadTestHelpers";
-import { ImageLightboxProvider, ZoomableImage } from "./ImageLightbox";
+import { act } from "react";
+import { closeLightboxShowing, ImageLightboxProvider, ZoomableImage } from "./ImageLightbox";
 
 afterEach(cleanup);
 
@@ -498,5 +499,23 @@ describe("downloading from the lightbox", () => {
 
     respond(new Response(null, { status: 503, statusText: "Service Unavailable" }));
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("Download failed"));
+  });
+});
+
+describe("closeLightboxShowing", () => {
+  it("closes the lightbox only when it shows that image", () => {
+    renderWithProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom image: diagram" }));
+
+    act(() => closeLightboxShowing("/other.png"));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    act(() => closeLightboxShowing("/pic.png"));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("does nothing once the provider is gone", () => {
+    renderWithProvider().unmount();
+    expect(() => closeLightboxShowing("/pic.png")).not.toThrow();
   });
 });

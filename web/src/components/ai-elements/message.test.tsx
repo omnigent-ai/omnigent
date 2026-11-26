@@ -155,9 +155,16 @@ describe("MessageResponse", () => {
       );
     });
 
-    it("renders as before without them", async () => {
-      render(<MessageResponse>IMAGE</MessageResponse>);
-      expect(await screen.findByText("IMAGE")).toBeTruthy();
+    it.each([
+      ["omitted", undefined],
+      ["empty", []],
+    ])("keeps blocking external images with the plugins %s", async (_case, plugins) => {
+      render(
+        <MessageResponse rehypePluginsAfterSanitizing={plugins}>
+          {"![leak](https://attacker.example/pixel.png) IMAGE"}
+        </MessageResponse>,
+      );
+      expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
       expect(screen.queryByRole("img")).toBeNull();
     });
   });
