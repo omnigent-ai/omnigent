@@ -152,6 +152,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.spec.tar_utils import ExtractionError
 
 _logger = logging.getLogger(__name__)
 
@@ -949,7 +950,15 @@ async def _write_cli_startup_instructions(
             instructions = await _native_startup_instructions(
                 entry, client, session_id, workspace=Path.cwd().resolve()
             )
-    except (httpx.HTTPError, RuntimeError, click.ClickException, OSError, ValueError) as error:
+    except (
+        httpx.HTTPError,
+        RuntimeError,
+        click.ClickException,
+        OSError,
+        ValueError,
+        ExtractionError,
+        OmnigentError,
+    ) as error:
         _logger.warning(
             "Could not resolve Antigravity startup instructions (%s)",
             type(error).__name__,

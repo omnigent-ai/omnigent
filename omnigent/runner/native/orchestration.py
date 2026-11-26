@@ -7424,7 +7424,14 @@ async def _auto_create_antigravity_terminal(
     startup_instructions = await _native_startup_instructions(
         agent_spec, server_client, session_id, workspace=workspace
     )
-    await asyncio.to_thread(write_agent_instructions, bridge_dir, startup_instructions)
+    try:
+        await asyncio.to_thread(write_agent_instructions, bridge_dir, startup_instructions)
+    except (OSError, ValueError) as error:
+        _logger.warning(
+            "Could not write Antigravity startup instructions (%s); terminal launch will continue",
+            type(error).__name__,
+            extra={"session_id": session_id},
+        )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
     # active turn and lost (#1494). Disable it before launch. agy now runs under

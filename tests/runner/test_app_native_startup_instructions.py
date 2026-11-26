@@ -106,12 +106,18 @@ async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
     assert memory_guidance == [(client, "sess", spec, "/work/omnigent")]
 
 
-@pytest.mark.parametrize("external_id", [None, "existing-cascade"], ids=["fresh", "resume"])
+@pytest.mark.parametrize(
+    ("external_id", "write_failure"),
+    [(None, None), ("existing-cascade", None), (None, "permission"), (None, "containment")],
+    ids=["fresh", "resume", "rule-permission", "rule-containment"],
+)
 async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     memory_guidance: list[tuple[object, ...]],
     external_id: str | None,
+    write_failure: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The real launch composer delivers authored text, image help and memory."""
     from omnigent.harnesses.antigravity_native import bridge
@@ -139,6 +145,23 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
 
     monkeypatch.setattr(orchestration, "_cancel_auto_forwarder_task", cancel_reader)
     labels = {bridge.ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "startup-bridge"}
+    previous_rule = None
+    if write_failure is not None:
+        bridge_dir = bridge.bridge_dir_for_bridge_id("startup-bridge")
+        bridge.write_agent_instructions(bridge_dir, "Keep previous startup guidance.")
+        previous_rule = (
+            bridge.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+        ).read_text(encoding="utf-8")
+        error = (
+            PermissionError("read-only rules")
+            if write_failure == "permission"
+            else ValueError("rules outside isolated directory")
+        )
+
+        def fail_write(*_args: object) -> None:
+            raise error
+
+        monkeypatch.setattr(bridge, "write_agent_instructions", fail_write)
     relays: list[dict[str, object]] = []
 
     async def relay(_session_id: str, **kwargs: object) -> None:
@@ -187,11 +210,15 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
                 )
             )
 
-    assert captured == [
-        "---\ntrigger: always_on\n---\n\n"
-        f"Keep the session's authored instructions.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
-        "\n\nMEMORY GUIDANCE\n"
-    ]
+    if write_failure is not None:
+        assert captured == [previous_rule]
+        assert "Could not write Antigravity startup instructions" in caplog.text
+    else:
+        assert captured == [
+            "---\ntrigger: always_on\n---\n\n"
+            f"Keep the session's authored instructions.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+            "\n\nMEMORY GUIDANCE\n"
+        ]
     assert memory_guidance == [(client, "sess", spec, workspace)]
     assert relays[0]["session_labels"] == labels
 

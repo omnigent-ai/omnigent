@@ -503,22 +503,6 @@ def register_resource_routes(
                     "and could not be closed."
                 )
 
-            elif terminal_name == "antigravity":
-
-                async def _antigravity_ensure_build(
-                    ctx: NativeLaunchContext,
-                ) -> NativeLaunchContext:
-                    return dataclasses.replace(
-                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
-                    )
-
-                _ensure_build = _antigravity_ensure_build
-                _ensure_is_owned = _is_runner_owned_antigravity_terminal
-                _ensure_conflict = (
-                    "Existing antigravity terminal is not a runner-owned agy TUI "
-                    "and could not be closed."
-                )
-
             elif terminal_name in ("pi", "opencode"):
                 # pi/opencode resolve the spec unwrapped — a resolution error
                 # surfaces as a terminal-start error (the resolver does not
@@ -533,6 +517,7 @@ def register_resource_routes(
                 _ensure_build = _spec_ensure_build
 
             elif terminal_name in (
+                "antigravity",
                 "cursor",
                 "kimi",
                 "devin",
@@ -550,6 +535,12 @@ def register_resource_routes(
                     )
 
                 _ensure_build = _spec_or_none_ensure_build
+                if terminal_name == "antigravity":
+                    _ensure_is_owned = _is_runner_owned_antigravity_terminal
+                    _ensure_conflict = (
+                        "Existing antigravity terminal is not a runner-owned agy TUI "
+                        "and could not be closed."
+                    )
 
             _ensure_result = await _ensure_native_terminal(
                 terminal_name,

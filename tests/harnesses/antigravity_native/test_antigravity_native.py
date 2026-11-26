@@ -697,7 +697,9 @@ async def test_launch_and_record_threads_headless_skip_flag(
     assert "--dangerously-skip-permissions" in captured_args
 
 
-@pytest.mark.parametrize("startup_case", ["authored", "bundle-error", "write-error"])
+@pytest.mark.parametrize(
+    "startup_case", ["authored", "bundle-error", "invalid-archive", "invalid-root", "write-error"]
+)
 async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -731,7 +733,17 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
             ).encode(),
         }
     )
+    if startup_case == "invalid-archive":
+        bundle = b"not an archive"
+    elif startup_case == "invalid-root":
+        bundle = bundle_files({"config.yaml": b"[]\n"})
+    previous_rule = None
     if startup_case == "write-error":
+        bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+        bridge_mod.write_agent_instructions(bridge_dir, "Keep the previous guidance.")
+        previous_rule = (
+            bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+        ).read_bytes()
 
         def fail_write(*_args: object) -> None:
             raise PermissionError("read-only rules")
@@ -757,7 +769,7 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
         bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
         rule = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
         if startup_case == "write-error":
-            assert not rule.exists()
+            assert rule.read_bytes() == previous_rule
         else:
             text = rule.read_text(encoding="utf-8")
             assert WORKSPACE_IMAGE_INSTRUCTION in text
