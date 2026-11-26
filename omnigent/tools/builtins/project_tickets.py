@@ -658,9 +658,11 @@ class SysProjectTelemetryGetTool(_TicketTool):
     help_text = (
         "Read how people work in this project over a UTC window, from the project's own data: "
         "how people start work (sessions vs tickets), how they use the Lead and roles, how the "
-        "team of roles was built, and what the project shipped (tickets, PRs, rework, review "
-        "rounds, stalled work). Totals only; per-person rows are never returned to agents. "
-        "Numbers that aren't measured on this server are null."
+        "team of roles was built, what the project shipped (tickets, PRs, rework, review "
+        "rounds, stalled work), and what it cost: spend by role and the most expensive "
+        "tickets. With role, throughput and spend count only that role's tickets and "
+        "sessions; the other sections stay project-wide. Totals only; per-person rows are "
+        "never returned to agents. Numbers that aren't measured on this server are null."
     )
     arguments = GetProjectKpis
 

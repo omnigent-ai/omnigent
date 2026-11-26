@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from typing import TYPE_CHECKING, Any, Literal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
 from omnigent.db.utils import now_epoch
@@ -17,14 +18,25 @@ from omnigent.server.project_kpis import (
     KpiInputs,
     changes_landed_total,
     compute_metrics,
+    has_landed_commits,
+    load_series,
+    role_series,
+    window_value,
+)
+from omnigent.server.project_spend_attribution import (
+    finished_at,
+    spend_by_role,
+    spend_by_ticket,
 )
 from omnigent.server.project_status import (
     StatusSources,
     StatusWindow,
+    identity_member_key,
     load_status_sources,
     status_period,
 )
 from omnigent.server.project_status_cache import project_status_cache
+from omnigent.server.project_status_spend import micros_to_cents
 from omnigent.server.project_telemetry import (
     PersonMessage,
     ProjectTelemetryReader,
@@ -145,6 +157,53 @@ class Throughput(BaseModel):
     )
 
 
+class RoleSpend(BaseModel):
+    """One role's spend: an agent role, the Lead, other agents, or people's own chats pooled."""
+
+    key: str = Field(description="`identity:<id>`, the Lead's or workers' key, or `people`.")
+    name: str
+    identity_id: str | None
+    spend_usd: float
+
+
+class TicketSpend(BaseModel):
+    ticket_id: str
+    title: str | None
+    spend_usd: float
+
+
+class TicketSpendSplit(BaseModel):
+    """Spend credited to tickets, the top ones listed; rows plus unattributed = the total."""
+
+    tickets: list[TicketSpend] = Field(description="The most expensive tickets, largest first.")
+    tickets_with_spend: int
+    other_tickets_usd: float = Field(description="Spend on tickets beyond the listed ones.")
+    attributed_usd: float
+    unattributed_usd: float = Field(
+        description="Spend of sessions with no ticket activity or open linked ticket that day."
+    )
+
+
+class SpendSplit(BaseModel):
+    """How the window's spend splits by role and by ticket.
+
+    A session-day's spend goes to the tickets that session (or its sub-agents) acted on
+    that day, weighted by its events on each. Without any, it's split evenly over the
+    tickets linked to the session that weren't finished before that day; otherwise it's
+    unattributed. Each row is rounded to cents once, so sums may differ from
+    ``total_usd`` by a cent per row.
+    """
+
+    total_usd: float
+    by_role: list[RoleSpend]
+    by_ticket: TicketSpendSplit
+
+
+class TelemetryRole(BaseModel):
+    identity_id: str
+    name: str
+
+
 class PersonActivity(BaseModel):
     user_id: str
     sessions_started: int
@@ -168,6 +227,16 @@ class ProjectTelemetry(BaseModel):
     role_interaction: RoleInteraction
     team_building: TeamBuilding
     throughput: Throughput
+    spend: SpendSplit | None = Field(
+        default=None, description="Spend by role and by ticket; null without a spend source."
+    )
+    role: TelemetryRole | None = Field(
+        default=None,
+        description=(
+            "Set when the request was filtered to one role: throughput and spend then count "
+            "only its tickets (assignee) and sessions; the other sections stay project-wide."
+        ),
+    )
     people: list[PersonActivity] | None = Field(
         description="All people for the owner, the caller's own row for a member, null for agents."
     )
@@ -181,6 +250,15 @@ class TelemetryOverview(BaseModel):
     since_day_utc: str | None
     today_utc: str
     projects: list[ProjectTelemetry]
+
+
+@dataclass(frozen=True)
+class RoleScope:
+    """One role's share of the project: its tickets, its root sessions and their spend."""
+
+    ticket_ids: set[str]
+    session_ids: set[str]
+    spend_micros: int | None
 
 
 def create_project_telemetry_router(
@@ -215,6 +293,7 @@ def create_project_telemetry_router(
         user_id: str | None,
         histories: Any,
         stages: Any,
+        role: RoleScope | None = None,
     ) -> dict[str, Any]:
         active = sources(request)
         inputs = KpiInputs(
@@ -235,28 +314,113 @@ def create_project_telemetry_router(
                 )
             ),
         )
-        values = compute_metrics(THROUGHPUT_METRICS, inputs)
-        spend_totals = _measure(active.spend, "spend", project, period)
-        spend = spend_totals.total / 100 if spend_totals.available else None
+        stage_ages = ticket_store.ticket_stage_ages(project.id, user_id=user_id)
+        if role is None:
+            values = compute_metrics(THROUGHPUT_METRICS, inputs)
+            spend_totals = _measure(active.spend, "spend", project, period)
+            spend = spend_totals.total / 100 if spend_totals.available else None
+            landed = changes_landed_total(inputs)
+            role_histories = histories()
+        else:
+            series = role_series(
+                load_series([*THROUGHPUT_METRICS, "changes_landed"], inputs),
+                role.ticket_ids,
+                role.session_ids,
+            )
+            values = {
+                metric: window_value(series[metric], period) for metric in THROUGHPUT_METRICS
+            }
+            spend = None if role.spend_micros is None else micros_to_cents(role.spend_micros) / 100
+            landed_value = window_value(series["changes_landed"], period)
+            landed = (
+                int(landed_value.value or 0)
+                if has_landed_commits(inputs) and landed_value.available
+                else None
+            )
+            role_histories = {
+                ticket_id: history
+                for ticket_id, history in histories().items()
+                if ticket_id in role.ticket_ids
+            }
+            stage_ages = [row for row in stage_ages if row[0] in role.ticket_ids]
         return {
             **{
                 metric: (value.value if value.available else None)
                 for metric, value in values.items()
             },
             "spend_usd": spend,
-            "changes_landed": changes_landed_total(inputs),
-            **review_rounds_and_stalled(
-                histories(),
-                stages(),
-                ticket_store.ticket_stage_ages(project.id, user_id=user_id),
-                period,
-            ),
+            "changes_landed": landed,
+            **review_rounds_and_stalled(role_histories, stages(), stage_ages, period),
+        }
+
+    def spend_split(
+        project: Project,
+        period: Any,
+        user_id: str | None,
+        rows: list[Any] | None,
+        identities: list[Any],
+    ) -> dict[str, Any] | None:
+        """Spend by role and by ticket over *rows* (see :class:`SpendSplit`)."""
+        if rows is None:
+            return None
+        sessions = {root for root, _, _, _ in rows}
+        activity = ticket_store.session_ticket_events(
+            project.id, user_id=user_id, since_epoch=period.since_epoch
+        )
+        links = ticket_store.ticket_session_links(project.id, user_id=user_id)
+        sessions.update(session_id for _, session_id, _ in [*activity, *links])
+        found = conversation_store.get_conversations(sorted(sessions)) if sessions else {}
+        root_of = {
+            session_id: conversation.root_conversation_id or session_id
+            for session_id, conversation in found.items()
+        }
+        histories = ticket_store.stage_histories(project.id, user_id=user_id)
+        by_ticket = spend_by_ticket(rows, root_of, activity, links, finished_at(histories), {})
+        titles = ticket_store.ticket_titles(
+            project.id, [row["ticket_id"] for row in by_ticket["tickets"]], user_id=user_id
+        )
+        for row in by_ticket["tickets"]:
+            row["title"] = titles.get(row["ticket_id"])
+        names = {identity_member_key(identity.id): identity.name for identity in identities}
+        return {
+            "total_usd": micros_to_cents(sum(micros for _, _, micros, _ in rows)) / 100,
+            "by_role": spend_by_role(rows, names),
+            "by_ticket": by_ticket,
         }
 
     def build(
-        request: Request, project: Project, window: StatusWindow, user_id: str | None
+        request: Request,
+        project: Project,
+        window: StatusWindow,
+        user_id: str | None,
+        identity_id: str | None = None,
     ) -> dict[str, Any]:
         period = status_period(window, now_epoch())
+        identities = project_store.list_identities(project.id, user_id=user_id)
+        identity = None
+        if identity_id is not None:
+            identity = next((item for item in identities if item.id == identity_id), None)
+            if identity is None:
+                raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+        spend_source = sources(request).spend
+        spend_rows = (
+            spend_source.root_days(project, period)
+            if spend_source is not None and hasattr(spend_source, "root_days")
+            else None
+        )
+        role = None
+        if identity is not None:
+            key = identity_member_key(identity.id)
+            spend_rows = (
+                None if spend_rows is None else [row for row in spend_rows if row[3] == key]
+            )
+            role = RoleScope(
+                ticket_ids=ticket_store.assigned_ticket_ids(
+                    project.id, identity.name, user_id=user_id
+                ),
+                session_ids={row[0] for row in spend_rows or ()},
+                spend_micros=None if spend_rows is None else sum(row[2] for row in spend_rows),
+            )
         histories = functools.cache(
             lambda: ticket_store.stage_histories(
                 project.id, user_id=user_id, since_epoch=period.since_epoch
@@ -294,7 +458,7 @@ def create_project_telemetry_router(
             activity=lambda: ticket_store.activity_actors(
                 project.id, user_id=user_id, since_epoch=period.since_epoch
             ),
-            identities=lambda: project_store.list_identities(project.id, user_id=user_id),
+            identities=lambda: identities,
             member_of_move=move_member_resolver(project, conversation_store),
         )
         result = compute_telemetry(inputs)
@@ -309,7 +473,11 @@ def create_project_telemetry_router(
             "since_day_utc": period.since_day_utc,
             "today_utc": period.today_utc,
             **result,
-            "throughput": throughput(request, project, period, user_id, histories, stages),
+            "throughput": throughput(request, project, period, user_id, histories, stages, role),
+            "spend": spend_split(project, period, user_id, spend_rows, identities),
+            "role": None
+            if identity is None
+            else {"identity_id": identity.id, "name": identity.name},
             "people": visible_people(
                 rows,
                 viewer=user_id,
@@ -323,6 +491,12 @@ def create_project_telemetry_router(
         request: Request,
         project_id: str,
         window: WindowParam = "7d",
+        identity_id: Annotated[
+            str | None,
+            Query(
+                description="Only this role's throughput and spend; the rest stays project-wide."
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         """How people work in a project: starting work, talking to roles, building the team.
 
@@ -333,7 +507,7 @@ def create_project_telemetry_router(
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        return await asyncio.to_thread(build, request, project, window, user_id)
+        return await asyncio.to_thread(build, request, project, window, user_id, identity_id)
 
     @router.get("/telemetry", response_model=TelemetryOverview)
     async def telemetry_overview(

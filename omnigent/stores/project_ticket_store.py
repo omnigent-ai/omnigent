@@ -834,6 +834,41 @@ class ProjectTicketStore:
                 )
             ]
 
+    def session_ticket_events(
+        self, project_id: str, *, user_id: str | None, since_epoch: int | None
+    ) -> builtins.list[tuple[str, str, int]]:
+        """``(ticket_id, session_id, created_at)`` for each ticket event a session made."""
+        with self._session("list_session_ticket_events") as session:
+            self._project(session, project_id, user_id)
+            stmt = select(
+                SqlProjectTicketEvent.ticket_id,
+                SqlProjectTicketEvent.session_id,
+                SqlProjectTicketEvent.created_at,
+            ).where(
+                SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                SqlProjectTicketEvent.project_id == _identifier(project_id),
+                SqlProjectTicketEvent.session_id.is_not(None),
+            )
+            if since_epoch is not None:
+                stmt = stmt.where(SqlProjectTicketEvent.created_at >= since_epoch)
+            return [tuple(row) for row in session.execute(stmt)]  # type: ignore[misc]
+
+    def ticket_session_links(
+        self, project_id: str, *, user_id: str | None
+    ) -> builtins.list[tuple[str, str, int]]:
+        """``(ticket_id, session_id, linked_at)`` for each ticket-session link in the project."""
+        with self._session("list_ticket_session_links") as session:
+            self._project(session, project_id, user_id)
+            stmt = select(
+                SqlProjectTicketSession.ticket_id,
+                SqlProjectTicketSession.session_id,
+                SqlProjectTicketSession.created_at,
+            ).where(
+                SqlProjectTicketSession.workspace_id == current_workspace_id(),
+                SqlProjectTicketSession.project_id == _identifier(project_id),
+            )
+            return [tuple(row) for row in session.execute(stmt)]  # type: ignore[misc]
+
     def ticket_stage_ages(
         self, project_id: str, *, user_id: str | None
     ) -> builtins.list[tuple[str, str | None, int]]:

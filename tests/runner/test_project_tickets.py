@@ -776,6 +776,32 @@ async def test_kpi_tools_read_and_replace_the_projects_kpis():
     }
 
 
+async def test_telemetry_role_filters_by_the_roles_identity():
+    seen: list = []
+    role_id = "e" * 32
+
+    def handler(request):
+        seen.append((request.url.path, request.url.query))
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        if request.url.path.endswith("/identities"):
+            return httpx.Response(
+                200, json={"data": [{"id": role_id, "name": "PM", "builtin": False}]}
+            )
+        return httpx.Response(200, json={"object": "project.telemetry"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        await execute_ticket_tool("sys_project_telemetry_get", {"role": "pm"}, client, SOURCE)
+        missing = await execute_ticket_tool(
+            "sys_project_telemetry_get", {"role": "Nobody"}, client, SOURCE
+        )
+    telemetry = [query for path, query in seen if path.endswith("/telemetry")]
+    assert telemetry == [f"window=7d&identity_id={role_id}".encode()]
+    assert "error" in json.loads(missing)
+
+
 async def test_file_view_refuses_another_projects_file_without_fetching_it():
     seen: list = []
     other = "d" * 32

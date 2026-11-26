@@ -8911,6 +8911,17 @@
             "title": "Project Name",
             "type": "string"
           },
+          "role": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TelemetryRole"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set when the request was filtered to one role: throughput and spend then count only its tickets (assignee) and sessions; the other sections stay project-wide."
+          },
           "role_interaction": {
             "$ref": "#/components/schemas/RoleInteraction"
           },
@@ -8924,6 +8935,17 @@
               }
             ],
             "title": "Since Day Utc"
+          },
+          "spend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpendSplit"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Spend by role and by ticket; null without a spend source."
           },
           "team_building": {
             "$ref": "#/components/schemas/TeamBuilding"
@@ -9720,6 +9742,44 @@
           "people_ticket_only"
         ],
         "title": "RoleInteraction",
+        "type": "object"
+      },
+      "RoleSpend": {
+        "description": "One role's spend: an agent role, the Lead, other agents, or people's own chats pooled.",
+        "properties": {
+          "identity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identity Id"
+          },
+          "key": {
+            "description": "`identity:<id>`, the Lead's or workers' key, or `people`.",
+            "title": "Key",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "spend_usd": {
+            "format": "double",
+            "title": "Spend Usd",
+            "type": "number"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "identity_id",
+          "spend_usd"
+        ],
+        "title": "RoleSpend",
         "type": "object"
       },
       "RoutingDecisionData": {
@@ -17497,6 +17557,33 @@
         "title": "SmartRoutingSourcesInfo",
         "type": "object"
       },
+      "SpendSplit": {
+        "description": "How the window's spend splits by role and by ticket.\n\nA session-day's spend goes to the tickets that session (or its sub-agents) acted on\nthat day, weighted by its events on each. Without any, it's split evenly over the\ntickets linked to the session that weren't finished before that day; otherwise it's\nunattributed. Each row is rounded to cents once, so sums may differ from\n`total_usd` by a cent per row.",
+        "properties": {
+          "by_role": {
+            "items": {
+              "$ref": "#/components/schemas/RoleSpend"
+            },
+            "title": "By Role",
+            "type": "array"
+          },
+          "by_ticket": {
+            "$ref": "#/components/schemas/TicketSpendSplit"
+          },
+          "total_usd": {
+            "format": "double",
+            "title": "Total Usd",
+            "type": "number"
+          }
+        },
+        "required": [
+          "total_usd",
+          "by_role",
+          "by_ticket"
+        ],
+        "title": "SpendSplit",
+        "type": "object"
+      },
       "StartedRun": {
         "properties": {
           "run_id": {
@@ -17795,6 +17882,24 @@
         "title": "TelemetryOverview",
         "type": "object"
       },
+      "TelemetryRole": {
+        "properties": {
+          "identity_id": {
+            "title": "Identity Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity_id",
+          "name"
+        ],
+        "title": "TelemetryRole",
+        "type": "object"
+      },
       "TerminalCommandData": {
         "description": "Data payload for a runner-side terminal command (`!cmd`) observed\nin a harness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop never\ninjects this as phantom content into the LLM's message history.\n\nClaude Code writes two sibling transcript records per `!cmd`\ninvocation: one `<bash-input>` record and one combined\n`<bash-stdout>`/`<bash-stderr>` record. Each maps to one\n`terminal_command` item with `kind=\"input\"` or\n`kind=\"output\"` respectively.",
         "properties": {
@@ -18010,6 +18115,81 @@
           "url"
         ],
         "title": "TicketOutput",
+        "type": "object"
+      },
+      "TicketSpend": {
+        "properties": {
+          "spend_usd": {
+            "format": "double",
+            "title": "Spend Usd",
+            "type": "number"
+          },
+          "ticket_id": {
+            "title": "Ticket Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "ticket_id",
+          "title",
+          "spend_usd"
+        ],
+        "title": "TicketSpend",
+        "type": "object"
+      },
+      "TicketSpendSplit": {
+        "description": "Spend credited to tickets, the top ones listed; rows plus unattributed = the total.",
+        "properties": {
+          "attributed_usd": {
+            "format": "double",
+            "title": "Attributed Usd",
+            "type": "number"
+          },
+          "other_tickets_usd": {
+            "description": "Spend on tickets beyond the listed ones.",
+            "format": "double",
+            "title": "Other Tickets Usd",
+            "type": "number"
+          },
+          "tickets": {
+            "description": "The most expensive tickets, largest first.",
+            "items": {
+              "$ref": "#/components/schemas/TicketSpend"
+            },
+            "title": "Tickets",
+            "type": "array"
+          },
+          "tickets_with_spend": {
+            "format": "int64",
+            "title": "Tickets With Spend",
+            "type": "integer"
+          },
+          "unattributed_usd": {
+            "description": "Spend of sessions with no ticket activity or open linked ticket that day.",
+            "format": "double",
+            "title": "Unattributed Usd",
+            "type": "number"
+          }
+        },
+        "required": [
+          "tickets",
+          "tickets_with_spend",
+          "other_tickets_usd",
+          "attributed_usd",
+          "unattributed_usd"
+        ],
+        "title": "TicketSpendSplit",
         "type": "object"
       },
       "TicketStage": {
@@ -26287,6 +26467,24 @@
               ],
               "title": "Window",
               "type": "string"
+            }
+          },
+          {
+            "description": "Only this role's throughput and spend; the rest stays project-wide.",
+            "in": "query",
+            "name": "identity_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only this role's throughput and spend; the rest stays project-wide.",
+              "title": "Identity Id"
             }
           }
         ],
