@@ -603,17 +603,19 @@ const fastTrackSuccessSchema = z.object({
   ok: z.literal(true),
   // Each operation's consumer reads its own data; a shell's missing or function data is no answer.
   data: z.unknown().refine((data) => data !== undefined && typeof data !== "function"),
+  // An unreadable optional field is left out: a reader that needs who read an answer refuses one
+  // without it, and polls pace without a budget.
   /** For `account: "mac"` reads: the account the answer was read as. */
-  identity: macAccountIdentitySchema.optional(),
+  identity: macAccountIdentitySchema.optional().catch(undefined),
   /** For Mac reads, from shells that advertise `provenance`. */
-  provenance: codeHostProvenanceSchema.optional(),
-  // The reader's tightest hourly budget left, from newer shells; polls pace on it. Advisory, so
-  // an unreadable one is left out rather than failing the read.
+  provenance: codeHostProvenanceSchema.optional().catch(undefined),
+  /** From newer shells: the reader's tightest hourly budget left, which polls pace on. */
   budget: gitHubReadBudgetSchema.optional().catch(undefined),
   /** Device-read page reads: the github.com account main read them for. */
   githubReader: z
     .object({ login: z.string(), generation: z.number(), named: z.literal(true).optional() })
-    .optional(),
+    .optional()
+    .catch(undefined),
 });
 
 const fastTrackFailureSchema = z.object({

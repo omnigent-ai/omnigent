@@ -28,11 +28,6 @@ const MALFORMED = [
   { ok: true },
   { ok: true, data: undefined },
   { ok: true, data: () => {} },
-  { ok: true, data: {}, identity: "octo" },
-  { ok: true, data: {}, identity: { host: "github.com", login: 7, generation: 1 } },
-  { ok: true, data: {}, identity: { host: "github.com", login: "octo", generation: "2" } },
-  { ok: true, data: {}, provenance: { version: 1, provider: "github", host: "github.com" } },
-  { ok: true, data: {}, githubReader: { login: "octo", generation: 1, named: false } },
   { ok: false, error: { code: "rate_limited", message: "Slow down.", retryAt: "soon" } },
   { ok: false, error: { code: "search_rejected", message: "No.", detail: 7 } },
   { ok: "yes", data: {} },
@@ -81,6 +76,20 @@ describe("desktopCodeHostQuery", () => {
     installShell({ codeHostQuery: vi.fn(async () => ({ ok: true, data: [], budget })) });
     expect(await desktopCodeHostQuery(REQUEST)).toEqual({ ok: true, data: [] });
   });
+
+  it.each([
+    { identity: "octo" },
+    { identity: { host: "github.com", login: 7, generation: 1 } },
+    { identity: { host: "github.com", login: "octo", generation: Number.NaN } },
+    { provenance: { version: 1, provider: "github", host: "github.com" } },
+    { githubReader: { login: "octo", generation: 1, named: false } },
+  ])(
+    "leaves out an unreadable field, for the reader that needs it to refuse: %j",
+    async (field) => {
+      installShell({ codeHostQuery: vi.fn(async () => ({ ok: true, data: [], ...field })) });
+      expect(await desktopCodeHostQuery(REQUEST)).toEqual({ ok: true, data: [] });
+    },
+  );
 
   it("answers unsupported without a shell, or on an older one without the bridge", async () => {
     installShell(undefined);
