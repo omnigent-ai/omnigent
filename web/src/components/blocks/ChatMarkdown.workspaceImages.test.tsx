@@ -224,17 +224,18 @@ describe("assistant workspace markdown images", () => {
     expect(document.querySelector("img")).toBeNull();
   });
 
-  it("opens an image outside the workspace in the file viewer only when clicked", async () => {
+  it("opens an outside-workspace image whose family read failed only when clicked", async () => {
     VIEWER.openFile.mockClear();
     renderMarkdown("![Screenshot](/workspace/project-worktrees/worker/shot.png)");
 
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    expect(fetchMock.mock.calls[0][0]).toContain("scope=family");
     const chip = await screen.findByRole("button", { name: "Open Screenshot (shot.png)" });
     expect(VIEWER.openFile).not.toHaveBeenCalled();
     fireEvent.click(chip);
 
     expect(VIEWER.openFile).toHaveBeenCalledOnce();
     expect(VIEWER.openFile).toHaveBeenCalledWith("/workspace/project-worktrees/worker/shot.png");
-    expect(fetchMock.mock.calls[0][0]).toContain("scope=family");
     expect(document.querySelector("img")).toBeNull();
   });
 

@@ -4799,6 +4799,9 @@ async def test_filesystem_workspace_scope_validates_the_request(
 _FAMILY_SOURCE_ID = "79b22ebd2309e48fdeb450c65611d51b"
 _FAMILY_WORKER_ID = "3f1c9a7e52b84d06a1e7c4b9d2f05a68"
 _FAMILY_NESTED_WORKER_ID = "9b4e27d1c06a43f58e1d7a2c6b39f0e4"
+_FAMILY_OTHER_HOST_TWIN_ID = "c27e5b0a9d3f4c1e8b6a5d4f3e2c1b0a"
+_FAMILY_OTHER_HOST_ID = "e8a1d4c7b2f5469e93c0a7b6d5e4f3a2"
+_FAMILY_ROOT_WORKSPACE_ID = "5a6b7c8d9e0f41a2b3c4d5e6f7a8b9c0"
 
 
 class _FamilyConversationStore(_ConversationStore):
@@ -4806,18 +4809,33 @@ class _FamilyConversationStore(_ConversationStore):
 
     def __init__(self) -> None:
         """
-        Put the default session in a family with a worker worktree and a nested one.
+        Build a family around the default session on ``host-main``.
+
+        Two workers on that host have their own worktrees, one nested in the
+        other. Another host records the nested worktree's path for different
+        files and holds a workspace of its own, and one member's workspace is
+        ``/``.
 
         :returns: None.
         """
         super().__init__()
         source = self._conversations[_FAMILY_SOURCE_ID]
         self._conversations[_FAMILY_SOURCE_ID] = dataclasses.replace(
-            source, family_id=_FAMILY_SOURCE_ID, workspace="/workspace/project"
+            source,
+            family_id=_FAMILY_SOURCE_ID,
+            workspace="/workspace/project",
+            host_id="host-main",
         )
-        for conversation_id, workspace in (
-            (_FAMILY_WORKER_ID, "/workspace/project-worktrees/worker"),
-            (_FAMILY_NESTED_WORKER_ID, "/workspace/project-worktrees/worker/nested"),
+        for conversation_id, workspace, host_id in (
+            (_FAMILY_WORKER_ID, "/workspace/project-worktrees/worker", "host-main"),
+            (
+                _FAMILY_OTHER_HOST_TWIN_ID,
+                "/workspace/project-worktrees/worker/nested",
+                "host-other",
+            ),
+            (_FAMILY_NESTED_WORKER_ID, "/workspace/project-worktrees/worker/nested", "host-main"),
+            (_FAMILY_OTHER_HOST_ID, "/workspace/remote", "host-other"),
+            (_FAMILY_ROOT_WORKSPACE_ID, "/", "host-main"),
         ):
             self._conversations[conversation_id] = Conversation(
                 id=conversation_id,
@@ -4827,6 +4845,7 @@ class _FamilyConversationStore(_ConversationStore):
                 agent_id="087b7cb7ac30abf4debfaa578d052ec6",
                 family_id=_FAMILY_SOURCE_ID,
                 workspace=workspace,
+                host_id=host_id,
             )
 
     def get_session_family(self, session_id: str) -> list[Conversation]:
@@ -4915,7 +4934,10 @@ async def test_filesystem_family_scope_reads_the_member_workspace(
     [
         # The displayed session's own workspace is read with a relative path instead.
         ("/workspace/project/shot.png", {"scope": "family", "base": "host"}, 404),
+        # Held only by the "/" workspace, which never matches.
         ("/workspace/elsewhere/shot.png", {"scope": "family", "base": "host"}, 404),
+        # Held only by a member on another host.
+        ("/workspace/remote/shot.png", {"scope": "family", "base": "host"}, 404),
         (
             "/workspace/project-worktrees//worker/shot.png",
             {"scope": "family", "base": "host"},
@@ -4946,6 +4968,50 @@ async def test_filesystem_family_scope_rejects_reads_outside_member_workspaces(
     assert response.status_code == status, response.text
     assert fake_runner.calls == []
     assert "X-Omnigent-File-Scope" not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("granted_ids", "status"),
+    [
+        ((_FAMILY_SOURCE_ID,), 404),
+        ((_FAMILY_WORKER_ID,), 404),
+        ((_FAMILY_SOURCE_ID, _FAMILY_WORKER_ID), 200),
+    ],
+)
+async def test_filesystem_family_scope_requires_browse_access_to_both_sessions(
+    runner_globals_reset: None,
+    granted_ids: tuple[str, ...],
+    status: int,
+) -> None:
+    del runner_globals_reset
+    permissions = _StubPermissionStore()
+    for session_id in granted_ids:
+        permissions.add_grant("alice@example.com", session_id, LEVEL_EDIT)
+    app = _sessions_app(
+        _FamilyConversationStore(),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=permissions,
+    )
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        response = await client.get(
+            f"/v1/sessions/{_FAMILY_SOURCE_ID}/resources/environments/default"
+            "/filesystem/workspace/project-worktrees/worker/shot.png",
+            params={"scope": "family", "base": "host"},
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.headers["X-Omnigent-File-Scope"] == "family"
+        assert len(fake_runner.calls) == 1
+    else:
+        assert fake_runner.calls == []
+        assert "X-Omnigent-File-Scope" not in response.headers
 
 
 @contextlib.asynccontextmanager
