@@ -559,9 +559,15 @@ describe("Changes tab", () => {
     await screen.findByTestId("changes-review");
     expect(captured.review?.comparison).toEqual(saved);
     const typed = { kind: "typed", base: "main", head: "" } as const;
-    captured.review!.onComparisonShown!(typed, { step: true });
+    captured.review!.onComparisonShown!(typed, { step: true, root: null });
     expect(view.onNavigate).toHaveBeenCalledWith(
       { kind: "changes", path: "a.go", comparison: typed },
+      { replace: false },
+    );
+    // A worktree's review records its folder with the comparison.
+    captured.review!.onComparisonShown!(typed, { step: true, root: "/repo/.worktrees/wt" });
+    expect(view.onNavigate).toHaveBeenLastCalledWith(
+      { kind: "changes", path: "a.go", comparison: typed, comparisonRoot: "/repo/.worktrees/wt" },
       { replace: false },
     );
     expect(onNavigate).not.toHaveBeenCalled();
