@@ -641,12 +641,16 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           // when a row changed so tree views pick up status without polling.
           const parentIds = new Set<string>();
           const now = Date.now();
+          const fingerprints = new Map<string, string>();
+          const findParentList = (parentId: string) =>
+            queryClient
+              .getQueryCache()
+              .find({ queryKey: childSessionsQueryKey(parentId), exact: true });
           for (const item of frame.items) {
             if (!item.parent_session_id) continue;
             const fingerprint = JSON.stringify(item);
-            const parentList = queryClient
-              .getQueryCache()
-              .find({ queryKey: childSessionsQueryKey(item.parent_session_id), exact: true });
+            fingerprints.set(item.id, fingerprint);
+            const parentList = findParentList(item.parent_session_id);
             const seen = childRowFingerprintsRef.current.get(item.id);
             // Expiry re-reads membership a discovery push may have missed. A failed
             // list retries on later frames, without restarting a retry in flight.
@@ -658,14 +662,21 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             ) {
               continue;
             }
-            // Invalidation only marks an unmounted list stale, and joins a first
-            // fetch without restarting it, so record the row once the list has data.
+            parentIds.add(item.parent_session_id);
+          }
+          // A refetched list re-reads all its rows, so restamp them together. Invalidation
+          // only marks an unmounted list stale and joins a first fetch, so wait for data.
+          for (const item of frame.items) {
+            if (!item.parent_session_id || !parentIds.has(item.parent_session_id)) continue;
+            const parentList = findParentList(item.parent_session_id);
             if (parentList?.isActive() && parentList.state.data !== undefined) {
-              childRowFingerprintsRef.current.set(item.id, { row: fingerprint, at: now });
+              childRowFingerprintsRef.current.set(item.id, {
+                row: fingerprints.get(item.id)!,
+                at: now,
+              });
             } else {
               childRowFingerprintsRef.current.delete(item.id);
             }
-            parentIds.add(item.parent_session_id);
           }
           for (const parentId of parentIds) {
             void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
