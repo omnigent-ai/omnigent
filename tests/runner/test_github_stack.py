@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 import pytest
@@ -31,10 +30,11 @@ def _pr(number: int, head: str, base: str, *, cross_repository: bool = False) ->
 
 
 class StackGraph:
-    """Answers every ``gh`` call a stack read makes, from a graph of pull requests.
+    """Answers every ``gh`` process a stack read starts, from a graph of pull requests.
 
-    Only ``gh`` itself is faked, so the account lookup and the pull request's read run
-    as they really do and every invocation is recorded in ``calls``.
+    Only the process is faked, so ``gh``'s own deadline and token handling, the account
+    lookup and the pull request's read run as they really do, and every process that
+    starts is recorded in ``calls``.
     """
 
     def __init__(
@@ -49,32 +49,38 @@ class StackGraph:
         self.failing: set[str] = set()
         self.timing_out: set[str] = set()
         self.default_branch: str | None = "main"
+        # Whether ``gh auth status`` takes ``--json``; an older ``gh`` doesn't.
+        self.status_json = True
         self.deadlines: list[float | None] = []
         self.current = next(pr for pr in prs if pr["number"] == current)
         # The real token lookup runs, for an account the workspace chose.
         monkeypatch.setattr(github, "_in_sandbox", lambda: False)
         monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: "octocat")
-        monkeypatch.setattr(github, "_gh", self._gh)
+        monkeypatch.setattr(github, "_run", self._run)
 
-    def _gh(
-        self, argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
-    ) -> tuple[int, str, str]:
+    def _run(
+        self, argv: list[str], *, cwd: str, timeout: float, env: dict[str, str] | None = None
+    ) -> tuple[int | None, str, str]:
+        assert argv[0] == "gh", argv
+        argv = argv[1:]
         self.calls.append(argv)
-        # Every call runs under the walk's one deadline.
+        # Every process runs under the walk's one deadline.
         deadline = github._gh_deadline.get()
         assert deadline is not None
-        assert deadline <= time.monotonic() + github_stack.WALK_SECONDS
+        assert timeout <= github_stack.WALK_SECONDS
         self.deadlines.append(deadline)
         if argv[:2] == ["auth", "token"]:
             self.token_lookups += 1
             return 0, TOKEN + "\n", ""
         if argv[:3] == ["auth", "status", "--json"]:
+            if not self.status_json:
+                return 1, "", "unknown flag: --json"
             # The global listing shows github.com only, as for a host gh signs in per command.
             listing = {"hosts": {"github.com": [{"login": "octocat", "state": "success"}]}}
             return 0, json.dumps(listing), ""
         if argv[:2] == ["auth", "status"]:
             return 0, "", ""
-        self.tokens.append(token)
+        self.tokens.append((env or {}).get("GH_TOKEN"))
         if argv[:2] == ["pr", "view"]:
             return 0, json.dumps(self.current), ""
         if argv[:2] == ["repo", "view"]:
@@ -180,19 +186,24 @@ def test_the_whole_read_stays_within_the_gh_call_cap(monkeypatch: pytest.MonkeyP
     assert len(graph.calls) <= github_stack.MAX_GH_CALLS
 
 
+@pytest.mark.parametrize(
+    "status_json", [True, False], ids=["listing-without-the-host", "gh-without-json"]
+)
 def test_a_read_on_an_enterprise_host_stays_within_the_gh_call_cap(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, status_json: bool
 ) -> None:
-    """The sign-in check there asks for the host directly, after the global listing."""
+    """The sign-in check there can ask for the listing, its fallback, then the host."""
     monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "github.example.com")
     monkeypatch.setattr(github_stack, "MAX_DEPTH", 50)
     graph = StackGraph(monkeypatch, _chain(github_stack.MAX_GH_CALLS + 5), current=1)
+    graph.status_json = status_json
 
     stack = github_stack.pull_request_stack("/workspace", _reference(1, "github.example.com"))
 
     assert stack["truncated"] is True
     assert ["auth", "status", "-h", "github.example.com"] in graph.calls
-    assert len(graph.calls) <= github_stack.MAX_GH_CALLS
+    assert (["auth", "status"] in graph.calls) is not status_json
+    assert len(graph.calls) == github_stack.MAX_GH_CALLS
 
 
 def test_a_failed_list_marks_the_stack_truncated_and_keeps_the_rest(
@@ -271,6 +282,20 @@ def test_a_pull_request_github_cant_load_is_refused(monkeypatch: pytest.MonkeyPa
         github_stack.pull_request_stack("/workspace", _reference(1))
 
     assert str(refused.value) == "GitHub could not load this pull request. Refresh to retry."
+    assert graph.lists == []
+
+
+def test_a_pull_request_from_the_default_branch_has_no_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A backport from main into a release branch, and the release branch merged back.
+    prs = [_pr(1, "main", "release"), _pr(2, "release", "main")]
+    graph = StackGraph(monkeypatch, prs, current=1)
+
+    stack = github_stack.pull_request_stack("/workspace", _reference(1))
+
+    assert _numbers(stack) == [1]
+    assert stack["truncated"] is False
     assert graph.lists == []
 
 

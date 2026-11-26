@@ -11,12 +11,9 @@ from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef
 
 MAX_DEPTH = 10
-# Every ``gh`` call one stack read makes, the reads before the walk included.
+# Every ``gh`` process one stack read starts, counted as they start, the reads before the
+# walk (the account's token, a sign-in check, the pull request and default branch) included.
 MAX_GH_CALLS = 20
-# Before the walk, at most: the account's token, two for the sign-in check on a host other
-# than github.com (its global listing, then the host itself), the pull request's read and
-# the default branch's. All are reserved, whether or not each runs.
-_CALLS_BEFORE_THE_WALK = 5
 # One deadline for the whole walk, inside the server's 30 s wait for a read.
 WALK_SECONDS = 20.0
 _LIST_LIMIT = 30
@@ -97,9 +94,14 @@ def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
     It never looks past the repository's default branch, and a branch that heads more than
     one pull request, such as a long-lived ``develop``, is a base rather than a member.
     When the default branch can't be read, the answer is the pull request alone, truncated.
+    A pull request from the default branch, such as a backport, has no stack.
     """
-    with github._gh_deadline_scope(time.monotonic() + WALK_SECONDS):
-        # One account for the whole walk: the pull request's read and every list.
+    with (
+        github._gh_deadline_scope(time.monotonic() + WALK_SECONDS),
+        github._gh_call_count_scope() as calls,
+    ):
+        # The workspace's chosen account, looked up once for the read and every list. With
+        # none chosen, or its token unreadable, each call runs as gh's active account.
         token = github._pr_token(root, reference)
         binding = github._bound_pr_token.set((reference.url, token))
         try:
@@ -110,8 +112,10 @@ def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
             if default_branch is None:
                 # Without the boundary, a release PR from it would look like a parent.
                 members, truncated = [], True
+            elif current.get("headRefName") == default_branch:
+                members, truncated = [], False
             else:
-                members, truncated = _walk(root, reference, token, current, default_branch)
+                members, truncated = _walk(root, reference, token, current, default_branch, calls)
         finally:
             github._bound_pr_token.reset(binding)
     members.append(_member(current, current=True))
@@ -129,13 +133,13 @@ def _walk(
     token: str | None,
     current: dict[str, Any],
     default_branch: str,
+    calls: github.GhCallCount,
 ) -> tuple[list[dict[str, Any]], bool]:
     """The other members, breadth first, and whether the walk stopped before the end."""
     seen_numbers = {current.get("number")}
     seen_heads = {current.get("headRefOid")}
     members: list[dict[str, Any]] = []
     truncated = False
-    calls = _CALLS_BEFORE_THE_WALK
     # Each entry is (pull request, depth, direction): "up" finds the PR whose head is its
     # base, "down" the PRs stacked on its head.
     queue: deque[tuple[dict[str, Any], int, str]] = deque(
@@ -152,9 +156,8 @@ def _walk(
         # The default branch is where stacks end: nothing above it, and its PRs aren't one.
         if not isinstance(branch, str) or not branch or branch == default_branch:
             continue
-        if depth >= MAX_DEPTH or calls >= MAX_GH_CALLS:
+        if depth >= MAX_DEPTH or calls.started >= MAX_GH_CALLS:
             return members, True
-        calls += 1
         found, complete = _list_by(root, reference, token, flag, branch)
         if github._gh_timed_out.get():
             return members, True
