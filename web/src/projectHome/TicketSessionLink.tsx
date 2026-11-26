@@ -110,7 +110,8 @@ export function TicketSessionLink({
           )))}
       {showStatus && compact ? (
         <span className="flex min-w-0 flex-1 items-center gap-2 text-sm">
-          <span className="shrink-0 font-medium">{title}</span>
+          {/* A long name truncates so the status and chat action stay on screen. */}
+          <span className="min-w-0 max-w-[60%] truncate font-medium">{title}</span>
           <span className="min-w-0 flex-1 truncate text-muted-foreground">
             {involvement || "Linked to this ticket"}
           </span>
