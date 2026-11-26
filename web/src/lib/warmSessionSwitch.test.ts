@@ -87,6 +87,21 @@ describe("switchSessionBeforeNavigate", () => {
     expect(warmSwitchInFlight("conv_a", "conv_b")).toBe(false);
   });
 
+  it("leaves a null source alone so a canceled settings click cannot claim the landing route", () => {
+    spyFeatures({ warm_switch_keep_mounted_ui: true });
+    useChatStore.setState({ conversationId: null });
+    window.history.replaceState({}, "", "/settings");
+    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+
+    switchSessionBeforeNavigate("conv_b");
+    window.history.pushState({}, "", "/");
+    vi.advanceTimersByTime(3000);
+
+    expect(switchTo).not.toHaveBeenCalled();
+    expect(useChatStore.getState().conversationId).toBeNull();
+    expect(warmSwitchInFlight("conv_b", undefined)).toBe(false);
+  });
+
   it("uses the store source even when the click starts outside a chat route", () => {
     spyFeatures({ warm_switch_keep_mounted_ui: true });
     useChatStore.setState({ conversationId: "conv_a" });

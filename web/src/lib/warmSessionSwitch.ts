@@ -30,7 +30,8 @@ export function clearWarmSwitchInFlight(): void {
 export function switchSessionBeforeNavigate(conversationId: string): void {
   if (!warmSwitchKeepMountedEnabled()) return;
   const fromConversationId = useChatStore.getState().conversationId;
-  if (fromConversationId === conversationId) return;
+  // Without an active session there is no mounted transcript to preserve.
+  if (fromConversationId === null || fromConversationId === conversationId) return;
   clearWarmSwitchInFlight();
   const pending = {
     target: conversationId,
