@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 
-from omnigent.runner import github_failures, github_reviews, pr_actions, pr_resource
+from omnigent.runner import github_failures, pr_actions, pr_resource
 from omnigent.runner import github_resource as github
 from omnigent.runner.pull_request_errors import (
     PULL_REQUEST_CHANGED_MESSAGE,
@@ -793,7 +794,7 @@ def test_a_refusal_after_the_head_moved_during_the_send_is_a_moved_head(
 
 
 def _token_lookup_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The write's token lookup runs out of its deadline; the reads before it don't."""
+    """The token lookup at the action's start runs out of its deadline, before any read."""
 
     def timed_out(_root: str, _reference: PullRequestRef) -> str | None:
         if github._gh_deadline.get() is None:
@@ -820,8 +821,6 @@ def test_a_mutation_whose_token_lookup_timed_out_is_never_sent(
 def test_a_comment_change_whose_token_lookup_timed_out_is_never_sent(
     fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
-    # The checks before the write read with the token they were given.
-    monkeypatch.setattr(github_reviews, "_own_comment", lambda *_args, **_kwargs: fake.comment)
     _token_lookup_times_out(monkeypatch)
     with pytest.raises(ValueError, match="Nothing was sent"):
         _change_comment(action)
@@ -1001,10 +1000,7 @@ def test_a_non_github_pull_request_is_refused(monkeypatch: pytest.MonkeyPatch) -
 
 
 def _chosen_login_signed_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A login is chosen for the repository, but the host has no token for it at the write.
-
-    The checks before the write read with the token they're given; the write's lookup fails.
-    """
+    """A login is chosen for the repository, but the action's token lookup at its start fails."""
     monkeypatch.setattr(
         github,
         "_pr_token",
@@ -1103,7 +1099,6 @@ def test_a_mutation_for_a_signed_out_chosen_login_is_never_sent(
 def test_a_comment_change_for_a_signed_out_chosen_login_is_never_sent(
     fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
-    monkeypatch.setattr(github_reviews, "_own_comment", lambda *_args, **_kwargs: fake.comment)
     _chosen_login_signed_out(monkeypatch)
     with pytest.raises(ValueError, match="octocat isn't signed in on the host"):
         _change_comment(action)
@@ -1182,17 +1177,48 @@ def test_a_mutation_with_no_login_chosen_stays_the_account_active_when_it_began(
     assert len(fake.mutations("resolveReviewThread")) == 1
 
 
-@pytest.mark.parametrize("action", ["edit", "delete", "resolve"])
+_COMMON = {"session_id": SESSION, "pr_url": PR_URL}
+_REACTION = {**_COMMON, "kind": "issue", "comment_id": 5, "content": "THUMBS_UP"}
+# Every review action, as the page sends it.
+_REVIEW_ACTIONS: dict[str, Callable[[], object]] = {
+    "edit": lambda: _change_comment("edit"),
+    "delete": lambda: _change_comment("delete"),
+    "resolve": _resolve,
+    "read-pending": lambda: pr_actions.get_pending_review("/workspace", **_COMMON),
+    "start-pending": lambda: pr_actions.start_pending_review(
+        "/workspace", commit_oid=HEAD, **_COMMON
+    ),
+    **{
+        f"pending-{action}": lambda action=action: _pending_change(action, "R_1")
+        for action in ["add", "reply", "update", "delete", "submit", "discard"]
+    },
+    "comment-review": lambda: pr_actions.submit_review(
+        "/workspace", event="COMMENT", body="Looks fine", commit_oid=HEAD, **_COMMON
+    ),
+    "approve": lambda: pr_actions.submit_review_verdict(
+        "/workspace", event="APPROVE", body="Ship it", commit_oid=HEAD, **_COMMON
+    ),
+    "request-changes": lambda: pr_actions.submit_review_verdict(
+        "/workspace", event="REQUEST_CHANGES", body="Not yet", commit_oid=HEAD, **_COMMON
+    ),
+    "add-reaction": lambda: pr_actions.add_reaction("/workspace", **_REACTION),
+    "remove-reaction": lambda: pr_actions.remove_reaction("/workspace", **_REACTION),
+}
+
+
+@pytest.mark.parametrize("action", sorted(_REVIEW_ACTIONS))
 def test_a_change_whose_active_account_cant_be_read_is_never_sent(
     fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
     """Without the active account's token, each call could run as a different account."""
+    fake.pending = _own_pending(_DRAFT)
     _no_login_chosen(monkeypatch, None, TOKEN)
 
     with pytest.raises(ValueError, match="Nothing was sent") as refused:
-        _resolve() if action == "resolve" else _change_comment(action)
+        _REVIEW_ACTIONS[action]()
 
     assert not isinstance(refused.value, UnknownOutcomeError)
+    # Nothing was read or written.
     assert fake.gh_calls == [] and fake.json_calls == []
 
 
