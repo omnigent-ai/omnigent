@@ -65,12 +65,17 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(container.querySelector(".bg-success")).toBeNull();
   });
 
-  it("renders background work with the running spinner and its own label", () => {
+  it("renders background work as a static terminal icon with its own label", () => {
     const { container } = renderBadge({ kind: "running", background: true });
     const badge = screen.getByTestId("session-state-badge");
     expect(badge).toHaveAttribute("data-state", "running");
     expect(badge).toHaveAttribute("aria-label", "Working in the background");
-    expect(container.querySelector('[data-testid="running-dot"]')).not.toBeNull();
+    // A dev server left running between turns must not show the busy-turn spinner.
+    expect(container.querySelector('[data-testid="running-dot"]')).toBeNull();
+    expect(container.querySelector(".animate-spin")).toBeNull();
+    const icon = container.querySelector("svg.lucide-square-terminal");
+    expect(icon).toHaveClass("size-3.5", "shrink-0", "text-muted-foreground");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
   });
 
   it("renders starting with the same spinner as running and its own label", () => {

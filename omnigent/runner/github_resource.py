@@ -66,6 +66,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -98,7 +99,13 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 # A request with its own time budget bounds every ``gh`` call by this monotonic
 # deadline (see :func:`_gh_deadline_scope`); ``_gh_timed_out`` records a cut-off call.
 _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
+# The host the current panel step's ``gh`` calls are for, set by the provider facet.
+_gh_target_host: ContextVar[str | None] = ContextVar("gh_target_host", default=None)
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
+# The token one pull request action resolved up front, by the PR's URL (see _one_pr_account).
+_bound_pr_token: ContextVar[tuple[str, str | None] | None] = ContextVar(
+    "bound_pr_token", default=None
+)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
 # reviews, labels, and the merge fields feed the Summary and Comments tabs.
@@ -183,17 +190,43 @@ def _in_sandbox() -> bool:
     return in_managed_sandbox()
 
 
-def _gh(
-    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
-) -> tuple[int | None, str, str]:
-    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
-    # upload, lower for a best-effort one.
-    timeout = timeout or _gh_timeout_seconds()
-    if (deadline := _gh_deadline.get()) is not None:
-        timeout = min(timeout, deadline - time.monotonic())
-        if timeout <= 0:
-            _gh_timed_out.set(True)
-            return None, "", "gh deadline exceeded"
+@dataclass(frozen=True)
+class GhInvocation:
+    """The process one ``gh`` call starts.
+
+    :ivar argv: The command and its arguments.
+    :ivar env: The child's whole environment, or ``None`` to inherit this process's.
+    :ivar host: The code host the call is for, from :func:`gh_target_host_scope`;
+        ``None`` when the step didn't name one.
+    """
+
+    argv: list[str]
+    env: dict[str, str] | None
+    host: str | None = None
+
+
+@contextmanager
+def gh_target_host_scope(host: str | None) -> Iterator[None]:
+    """Mark every ``gh`` call in the block as being for *host*.
+
+    The value is per context, so concurrent steps in other threads keep their own.
+    """
+    token = _gh_target_host.set(host.lower() if host else None)
+    try:
+        yield
+    finally:
+        _gh_target_host.reset(token)
+
+
+def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> GhInvocation:
+    """Return the command and environment that run ``gh`` with *argv*.
+
+    Every ``gh`` call the panel makes starts through here.
+
+    :param argv: Arguments after ``gh``.
+    :param token: A GitHub token to run this one call as a chosen account, or ``None``.
+    :param host: The code host the call is for, or ``None``; every host runs ``gh``.
+    """
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -218,7 +251,22 @@ def _gh(
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
         env.pop("GITHUB_ENTERPRISE_TOKEN", None)
-    result = _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
+    return GhInvocation(argv=["gh", *argv], env=env, host=host)
+
+
+def _gh(
+    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
+) -> tuple[int | None, str, str]:
+    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
+    # upload, lower for a best-effort one.
+    timeout = timeout or _gh_timeout_seconds()
+    if (deadline := _gh_deadline.get()) is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            _gh_timed_out.set(True)
+            return None, "", "gh deadline exceeded"
+    invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
+    result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     if (
         deadline is not None
         and result[0] is None
@@ -372,6 +420,14 @@ def _workspace_key(root: str) -> str | None:
 def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
     """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
     rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _gh_active_token(root: str, host: str = "github.com") -> str | None:
+    """Return the token of ``gh``'s active account on *host* (never logged)."""
+    rc, out, _ = _gh(["auth", "token", "-h", host], cwd=root)
     if rc != 0:
         return None
     return out.strip() or None
@@ -1125,12 +1181,72 @@ def _repo_argument(ref: PullRequestRef) -> str:
 
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        return bound[1]
     if _in_sandbox():
         return None
     login = _config.github_account_preference(_repo_argument(reference))
     if login:
         return _gh_auth_token(root, login, reference.host)
     return None
+
+
+_ACTIVE_ACCOUNT_UNREADABLE = (
+    "Couldn't read the host's GitHub sign-in. Nothing was sent; sign in with gh and try again."
+)
+
+
+def _signed_out_account(login: str) -> str:
+    return (
+        f"The selected GitHub account {login} isn't signed in on the host. "
+        "Sign in with gh or choose another account."
+    )
+
+
+def _write_token(root: str, reference: PullRequestRef, *, timed_out: str) -> str | None:
+    """The token a write runs with; refuses before the send rather than run as another account.
+
+    Call it inside the write's deadline scope. Without the token of the login chosen for the
+    repository, ``gh`` would run as whichever account is active on the host.
+    """
+    # Read the login before the lookup, so clearing it mid-write can't let this one through.
+    login = None if _in_sandbox() else _config.github_account_preference(_repo_argument(reference))
+    token = _pr_token(root, reference)
+    if _gh_timed_out.get():
+        raise ValueError(timed_out)
+    if login and token is None:
+        raise ValueError(_signed_out_account(login))
+    return token
+
+
+@contextmanager
+def _one_pr_account(root: str, reference: PullRequestRef, *, timed_out: str) -> Iterator[None]:
+    """Run every read and write in the block as one account: the one chosen at its start.
+
+    The token is looked up once, and a chosen login without one refuses before anything is
+    read, so a check can't run as one account and the write it guards as another. With no
+    login chosen, the active account's token is bound, so switching it mid-action can't
+    split one either. Only a sandbox, which has a single identity, runs without a token.
+    """
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        yield
+        return
+    sandbox = _in_sandbox()
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        token = _write_token(root, reference, timed_out=timed_out)
+        if token is None and not sandbox:
+            token = _gh_active_token(root, reference.host)
+            if _gh_timed_out.get():
+                raise ValueError(timed_out)
+            if token is None:
+                raise ValueError(_ACTIVE_ACCOUNT_UNREADABLE)
+    binding = _bound_pr_token.set((reference.url, token))
+    try:
+        yield
+    finally:
+        _bound_pr_token.reset(binding)
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
@@ -2008,10 +2124,7 @@ def _apply_label_edit(
     A final read supplies the labels when every removed label was already absent.
     """
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        # The selected account's token is unknown, so the edit must not run as another.
-        raise ValueError(_LABEL_EDIT_TIMED_OUT)
+    token = _write_token(root, reference, timed_out=_LABEL_EDIT_TIMED_OUT)
     endpoint = f"repos/{reference.repository}/issues/{reference.number}/labels"
     labels: list[Any] | None = None
     for name in remove:
@@ -2144,10 +2257,7 @@ def _run_pr_merge(
                 + (f", {sandbox_login}." if sandbox_login else ".")
             )
         if login and token is None:
-            raise ValueError(
-                f"The selected GitHub account {login} isn't signed in on the host. "
-                "Sign in with gh or choose another account."
-            )
+            raise ValueError(_signed_out_account(login))
         rc, _, err = _gh(
             ["pr", "merge", str(reference.number), "-R", _repo_argument(reference), *flags],
             cwd=root,
@@ -2383,10 +2493,7 @@ def _apply_reviewer_edit(
 ) -> dict[str, Any]:
     """Make the edit's requests, then read the PR's reviewers with their review states."""
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        # The selected account's token is unknown, so the edit must not run as another.
-        raise ValueError(_REVIEWER_EDIT_TIMED_OUT)
+    token = _write_token(root, reference, timed_out=_REVIEWER_EDIT_TIMED_OUT)
     endpoint = f"repos/{reference.repository}/pulls/{reference.number}/requested_reviewers"
     if remove:
         _reviewers_api(root, host, token, ["-X", "DELETE", endpoint, *_reviewer_fields(remove)])
@@ -2412,6 +2519,7 @@ _DETAILS_EDIT_TIMED_OUT = (
 # so a video has time to reach GitHub.
 _ATTACHMENT_REQUEST_SECONDS = 110.0
 _ATTACHMENT_TIMED_OUT = "GitHub took too long to upload the file. Try again."
+COMMENT_AUTHENTICATION_TIMED_OUT = "GitHub authentication timed out. Your comment was not sent."
 
 
 def _pr_json_write(
@@ -2463,9 +2571,7 @@ def _post_comment(
     """Publish once within the caller's deadline; preserve uncertainty after dispatch."""
     uncertain = "Could not confirm comment posting. Check GitHub before retrying."
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+    token = _write_token(root, reference, timed_out=COMMENT_AUTHENTICATION_TIMED_OUT)
     rc, out, err = _pr_json_write(
         root,
         host=host,
@@ -2501,10 +2607,7 @@ def _edit_details(
     """
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         host = _host_args(root, reference)
-        token = _pr_token(root, reference)
-        if _gh_timed_out.get():
-            # The selected account's token is unknown, so the edit must not run as another.
-            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+        token = _write_token(root, reference, timed_out=_DETAILS_EDIT_TIMED_OUT)
         fields = {
             key: value for key, value in (("title", title), ("body", body)) if value is not None
         }
@@ -2561,10 +2664,7 @@ def _upload_attachment(
     """
     with _gh_deadline_scope(time.monotonic() + _ATTACHMENT_REQUEST_SECONDS):
         host = _host_args(root, reference)
-        token = _pr_token(root, reference)
-        if _gh_timed_out.get():
-            # The selected account's token is unknown, so the upload must not run as another.
-            raise ValueError(_ATTACHMENT_TIMED_OUT)
+        token = _write_token(root, reference, timed_out=_ATTACHMENT_TIMED_OUT)
         rc, out, _ = _gh(
             ["api", *host, f"repos/{reference.repository}", "--jq", ".id"],
             cwd=root,

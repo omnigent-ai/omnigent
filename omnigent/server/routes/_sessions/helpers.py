@@ -17,7 +17,6 @@ import threading
 import time
 import urllib.parse
 import weakref
-from collections import deque
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -95,7 +94,11 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.native.permission_modes import (
+    PERMISSION_LAUNCH_ARGS,
+    created_session_launch_args,
+    inherited_permission_mode,
+)
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
@@ -115,7 +118,13 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
+from omnigent.server import (
+    background_session_titles,
+    presence,
+    session_live_state,
+    session_pull_requests,
+    shutdown_state,
+)
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -129,6 +138,7 @@ from omnigent.server.auth import (
     effective_admin,
     env_var_is_truthy,
 )
+from omnigent.server.background_session_titles import saved_workflow_run_title
 from omnigent.server.host_registry import (
     HostConnection,
     HostLaunchResult,
@@ -161,6 +171,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
     _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY,
     _ACP_SUBAGENT_ID_LABEL_KEY,
     _ANTIGRAVITY_NATIVE_HARNESS,
@@ -1547,6 +1558,177 @@ async def _collect_descendant_conversation_ids(
     return descendant_ids
 
 
+_DESCENDANT_PAGE_SIZE = 128
+_SESSION_FILE_DELETE_BATCH_SIZE = 100
+
+
+async def _collect_descendant_conversation_ids_paged(
+    conversation_store: ConversationStore,
+    root_id: str,
+) -> list[str]:
+    """
+    Return every sub-agent descendant of ``root_id`` that can be listed,
+    reading each parent's children in bounded pages.
+
+    A parent whose children can't be listed is logged and skipped; the
+    descendants already found and the rest of the tree are kept.
+
+    :param conversation_store: Store for child-id lookup.
+    :param root_id: Root session/conversation identifier.
+    :returns: Descendant ids in breadth-first order.
+    """
+    descendant_ids: list[str] = []
+    seen = {root_id}
+    frontier = [root_id]
+    while frontier:
+        next_frontier: list[str] = []
+        for parent_id in frontier:
+            after: tuple[int, str] | None = None
+            while True:
+                try:
+                    page = await asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_page,
+                        parent_id,
+                        after=after,
+                        limit=_DESCENDANT_PAGE_SIZE,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _logger.warning(
+                        "Failed to list the sub-agents of session %s for file cleanup: %s",
+                        parent_id,
+                        type(exc).__name__,
+                    )
+                    break
+                for child_id, _created_at in page:
+                    if child_id not in seen:
+                        seen.add(child_id)
+                        descendant_ids.append(child_id)
+                        next_frontier.append(child_id)
+                if len(page) < _DESCENDANT_PAGE_SIZE:
+                    break
+                last_id, last_created_at = page[-1]
+                after = (last_created_at, last_id)
+        frontier = next_frontier
+    return descendant_ids
+
+
+async def _delete_one_session_files(
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    owner_id: str,
+    *,
+    deleting_session_id: str,
+) -> tuple[int, int]:
+    """
+    Delete one session's file rows in bounded batches, then its unshared blobs.
+
+    Blobs are checked only once the session's rows are gone, so no check
+    scans them. A row-deletion failure propagates after the blobs of the rows
+    already deleted are handled; a blob that can't be checked or deleted is
+    logged and skipped.
+
+    :param file_store: Store of the session's file rows.
+    :param artifact_store: Store of the file bytes.
+    :param owner_id: The session whose files go, e.g. ``"conv_abc123"``.
+    :param deleting_session_id: The session being deleted, for log lines.
+    :returns: How many orphaned blobs were attempted, and how many failed.
+    """
+    blob_keys: set[str] = set()
+    failure: Exception | None = None
+    try:
+        while True:
+            deleted, batch_blob_keys = await asyncio.to_thread(
+                file_store.delete_session_files_batch,
+                owner_id,
+                limit=_SESSION_FILE_DELETE_BATCH_SIZE,
+            )
+            blob_keys.update(batch_blob_keys)
+            if deleted < _SESSION_FILE_DELETE_BATCH_SIZE:
+                break
+    except Exception as exc:  # noqa: BLE001
+        failure = exc
+    attempted_blob_count = 0
+    failed_blob_count = 0
+    for blob_key in sorted(blob_keys):
+        try:
+            orphaned = await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key)
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Failed to check attachment blob %s for session %s: %s",
+                blob_key,
+                deleting_session_id,
+                type(exc).__name__,
+            )
+            continue
+        if not orphaned:
+            continue
+        attempted_blob_count += 1
+        try:
+            await asyncio.to_thread(artifact_store.delete, blob_key)
+        except Exception as exc:  # noqa: BLE001
+            failed_blob_count += 1
+            _logger.warning(
+                "Failed to delete attachment blob %s for session %s: %s",
+                blob_key,
+                deleting_session_id,
+                type(exc).__name__,
+            )
+    if failure is not None:
+        raise failure
+    return attempted_blob_count, failed_blob_count
+
+
+async def _delete_session_tree_files(
+    conversation_store: ConversationStore,
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    session_id: str,
+) -> None:
+    """
+    Delete the files of *session_id* and every sub-agent under it, before the
+    subtree itself is deleted.
+
+    Each session's rows go in bounded batches, then its blobs no other row
+    still uses, so a blob a fork shares survives. A failure deleting the
+    session's own rows propagates, so the caller keeps the session for a
+    retry; a sub-agent's failure, or a blob's, is logged.
+
+    :param conversation_store: Store for the sub-agent lookup.
+    :param file_store: Store of the sessions' file rows.
+    :param artifact_store: Store of the file bytes.
+    :param session_id: The session being deleted, e.g. ``"conv_abc123"``.
+    :raises Exception: Whatever the file store raised for the session's own rows.
+    """
+    descendant_ids = await _collect_descendant_conversation_ids_paged(
+        conversation_store, session_id
+    )
+    attempted_blob_count, failed_blob_count = await _delete_one_session_files(
+        file_store, artifact_store, session_id, deleting_session_id=session_id
+    )
+    for owner_id in descendant_ids:
+        try:
+            attempted, failed = await _delete_one_session_files(
+                file_store, artifact_store, owner_id, deleting_session_id=session_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Failed to delete the file rows of session %s while deleting %s: %s",
+                owner_id,
+                session_id,
+                type(exc).__name__,
+            )
+            continue
+        attempted_blob_count += attempted
+        failed_blob_count += failed
+    if failed_blob_count:
+        _logger.warning(
+            "Session %s deleted with %d of %d attachment blobs left behind",
+            session_id,
+            failed_blob_count,
+            attempted_blob_count,
+        )
+
+
 @dataclass(frozen=True)
 class SessionLiveness:
     """
@@ -1755,44 +1937,6 @@ def _publish_elicitation_resolved_to_ancestors(
             )
 
 
-@restart_on_stale_cursor
-def _descendant_sessions(
-    conv_store: ConversationStore,
-    session_id: str,
-) -> list[Conversation]:
-    """
-    Return descendant sub-agent conversations for a session.
-
-    :param conv_store: Store used to list conversations.
-    :param session_id: Ancestor session id, e.g. ``"conv_root123"``.
-    :returns: Sub-agent conversations below ``session_id``. Empty
-        for sessions with no descendants.
-    """
-    descendants: list[Conversation] = []
-    queue: deque[str] = deque([session_id])
-    seen = {session_id}
-    while queue:
-        parent_id = queue.popleft()
-        after: str | None = None
-        while True:
-            page = conv_store.list_conversations(
-                kind="sub_agent",
-                parent_conversation_id=parent_id,
-                limit=100,
-                after=after,
-            )
-            for child in page.data:
-                if child.id in seen:
-                    continue
-                seen.add(child.id)
-                descendants.append(child)
-                queue.append(child.id)
-            if not page.has_more or page.last_id is None:
-                break
-            after = page.last_id
-    return descendants
-
-
 def _pending_elicitation_snapshot_for_session(
     conv_store: ConversationStore,
     conv: Conversation,
@@ -1807,33 +1951,97 @@ def _pending_elicitation_snapshot_for_session(
     Duplicate ids are skipped because live mirroring also records the
     ancestor copy in the in-memory index.
 
-    The descendant walk costs one ``list_conversations`` query per
-    session in the tree, so it is skipped entirely unless some session
-    other than ``conv`` has an outstanding prompt in the in-memory
-    index (the common case is none anywhere).
+    Descendants are found by walking up from the sessions that have a
+    prompt, so the database work follows their depth rather than the
+    size of the snapshotted session's tree.
 
-    :param conv_store: Store used to list descendant sub-agents.
+    :param conv_store: Store used to read the pending sessions' ancestors.
     :param conv: Session conversation being snapshotted.
     :returns: Pending elicitation event dicts suitable for
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
-    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
+    other_pending = [
+        session_id
+        for session_id in pending_elicitations.pending_session_ids()
+        if session_id != conv.id
+    ]
+    if not other_pending:
         return events
     seen = {
         event.get("elicitation_id")
         for event in events
         if isinstance(event.get("elicitation_id"), str)
     }
-    for child in _descendant_sessions(conv_store, conv.id):
-        for event in pending_elicitations.snapshot_for(child.id):
+    for child_id in _pending_descendant_session_ids(conv_store, conv, other_pending):
+        for event in pending_elicitations.snapshot_for(child_id):
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
                 continue
             if isinstance(elicitation_id, str):
                 seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+            events.append(_targeted_elicitation_event(event, target_session_id=child_id))
     return events
+
+
+def _pending_descendant_session_ids(
+    conv_store: ConversationStore,
+    conv: Conversation,
+    candidate_ids: list[str],
+) -> list[str]:
+    """
+    Return the candidates that are visible sub-agent descendants of ``conv``.
+
+    Matches what listing ``conv``'s sub-agent tree would reach: every
+    session on the path below ``conv`` must be a readable, unarchived
+    ``sub_agent``. All candidates move up one level per batch read, so
+    the cost follows the deepest candidate's depth, not the tree size.
+    A session's root never changes, so candidates from another tree stop
+    after the first read.
+
+    :param conv_store: Store used to batch-read conversations.
+    :param conv: Session whose descendants are wanted.
+    :param candidate_ids: Sessions to test, e.g. those with a pending
+        prompt. Returned in this order.
+    :returns: The ``candidate_ids`` below ``conv``.
+    """
+
+    def on_visible_path(node: Conversation) -> bool:
+        return (
+            node.kind == "sub_agent"
+            and not node.archived
+            and node.root_conversation_id == conv.root_conversation_id
+        )
+
+    known: dict[str, Conversation | None] = {}
+    frontier = list(dict.fromkeys(candidate_ids))
+    while frontier:
+        fetched = conv_store.get_conversations(frontier)
+        known.update({session_id: fetched.get(session_id) for session_id in frontier})
+        next_ids: list[str] = []
+        for session_id in frontier:
+            node = known[session_id]
+            if node is None or not on_visible_path(node):
+                continue
+            parent_id = node.parent_conversation_id
+            if parent_id is not None and parent_id != conv.id and parent_id not in known:
+                next_ids.append(parent_id)
+        frontier = list(dict.fromkeys(next_ids))
+
+    def below_conv(session_id: str) -> bool:
+        visited: set[str] = set()
+        current: str | None = session_id
+        while current is not None and current not in visited:
+            visited.add(current)
+            node = known.get(current)
+            if node is None or not on_visible_path(node):
+                return False
+            if node.parent_conversation_id == conv.id:
+                return True
+            current = node.parent_conversation_id
+        return False
+
+    return [session_id for session_id in dict.fromkeys(candidate_ids) if below_conv(session_id)]
 
 
 def _publish_input_consumed(
@@ -3674,6 +3882,9 @@ def _parse_external_conversation_item(
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
+    if item_type == "terminal_command":
+        # Only the pending-input drain can establish submission ownership.
+        item_data = {key: value for key, value in item_data.items() if key != "submission"}
     try:
         data = parse_item_data(item_type, {"type": item_type, **item_data})
     except (ValueError, TypeError) as exc:
@@ -5267,9 +5478,11 @@ def _publish_status(
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
-        # A turn can open or merge a PR while nobody watches; refresh what the server
-        # stores. Stops and archives publish idle without persisting it, and skip this.
+        # A turn can open or merge a PR while nobody watches, and the first turn's
+        # reply can name a session better than its first message did. Stops and
+        # archives publish idle without persisting it, and skip both.
         session_pull_requests.notify_turn_end(session_id)
+        background_session_titles.notify_turn_end(session_id)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
@@ -7311,9 +7524,17 @@ async def _wait_for_managed_runner_tunnel(
     tracker: ManagedLaunchTracker,
     *,
     settle_failure: bool = True,
+    conversation_store: ConversationStore | None = None,
+    host_id: str | None = None,
 ) -> bool:
     """
     Wait for a launched managed runner to connect, failing the launch on timeout.
+
+    A message that finds the runner slow to connect relaunches it on the same
+    host, and the host stops the runner it replaced. Given *conversation_store*
+    and *host_id*, the wait moves on to the runner the session is now bound to
+    on that host rather than failing on one that can no longer connect. It stops
+    following replacements after ``_MANAGED_RUNNER_REPLACEMENT_WAIT_S``.
 
     :param session_id: Session/conversation identifier.
     :param runner_id: Runner id returned by the host launch frame.
@@ -7321,16 +7542,54 @@ async def _wait_for_managed_runner_tunnel(
     :param tracker: Managed launch tracker to settle on failure.
     :param settle_failure: Publish and settle a timeout immediately. Callers
         with rollback work can defer settlement until cleanup finishes.
+    :param conversation_store: Store to re-read the session's runner binding
+        from after a timeout, or ``None`` to wait only for *runner_id*.
+    :param host_id: Host the runner was launched on. A binding to any other
+        host is not followed.
     :returns: ``True`` when the runner connected; ``False`` on timeout.
     """
+    from omnigent.server.managed_hosts import is_move_claim
     from omnigent.server.routes import sessions as _facade
 
-    runner = await tunnel_registry.wait_for_runner(
-        runner_id,
-        timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-    )
-    if runner is not None:
-        return True
+    connect_timeout_s = _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+    follow_deadline = time.monotonic() + _facade._MANAGED_RUNNER_REPLACEMENT_WAIT_S
+    awaited_runner_ids: set[str] = set()
+    while True:
+        runner = await tunnel_registry.wait_for_runner(runner_id, timeout_s=connect_timeout_s)
+        if runner is not None:
+            return True
+        awaited_runner_ids.add(runner_id)
+        if conversation_store is None or host_id is None or time.monotonic() >= follow_deadline:
+            break
+        try:
+            bound = await asyncio.to_thread(
+                conversation_store.get_profile_host_binding, session_id
+            )
+        except ConversationNotFoundError:
+            break
+        remaining_s = follow_deadline - time.monotonic()
+        if (
+            remaining_s <= 0
+            or bound.host_id != host_id
+            or bound.runner_id is None
+            or bound.runner_id in awaited_runner_ids
+            or is_move_claim(bound.runner_id)
+        ):
+            break
+        _logger.info(
+            "Managed runner %s was replaced by %s for session %s; waiting for the replacement",
+            runner_id,
+            bound.runner_id,
+            session_id,
+            extra={"session_id": session_id},
+        )
+        runner_id = bound.runner_id
+        # The message that relaunched it waits this long for a confirmed spawn.
+        connect_timeout_s = min(
+            _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            * _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
+            remaining_s,
+        )
     _logger.error(
         "Managed runner connection timed out",
         extra=debug_event(
@@ -7356,13 +7615,18 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
     managed launch (create-time provisioning or a dead-sandbox
     relaunch): resolve as soon as the launch settles, surface the
     recorded reason when it failed, and give up with a clear retry
-    hint when the launch outlives the rendezvous budget.
+    hint when the launch outlives the rendezvous budget. A launch whose
+    provisioned sandbox's host has not registered says so instead,
+    with the provider's recovery guidance when it offers some.
 
     :param launch: The session's tracker entry.
     :raises OmnigentError: 503 when the launch failed or is still
         running at the timeout.
     """
-    from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+    from omnigent.server.managed_hosts import (
+        MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+        read_provider_recovery_hint,
+    )
 
     try:
         await asyncio.wait_for(
@@ -7370,10 +7634,15 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
             timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
         )
     except TimeoutError:
-        raise OmnigentError(
-            "The session's managed sandbox is still provisioning; try again shortly",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from None
+        message = "The session's managed sandbox is still provisioning; try again shortly"
+        # The hint is bound only while a provisioned sandbox's host registers.
+        if (hint_callback := launch.host_online_failure_hint) is not None:
+            hint = await read_provider_recovery_hint(hint_callback)
+            message = (
+                "The host in the session's managed sandbox has not connected to the server"
+                + (f" — {hint}" if hint else " yet; try again shortly")
+            )
+        raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE) from None
     if launch.error is not None:
         raise OmnigentError(
             f"The session's managed sandbox failed to launch: {launch.error}",
@@ -8328,8 +8597,12 @@ def _build_new_item(
     :raises OmnigentError: When ``body.data`` does not satisfy the
         payload schema for ``body.type``.
     """
+    item_data = {"type": body.type, **body.data}
+    if body.type == "terminal_command":
+        # Direct events do not drain a web submission, regardless of producer claims.
+        item_data["submission"] = {} if item_data.get("kind") == "input" else None
     try:
-        data = parse_item_data(body.type, {"type": body.type, **body.data})
+        data = parse_item_data(body.type, item_data)
     except ValidationError as exc:
         raise OmnigentError(
             f"invalid data for {body.type!r} item: {exc}",
@@ -8780,7 +9053,7 @@ async def _seed_missing_title(
     """
     if conv.title is not None:
         return
-    title = synthesize_conversation_title(content)
+    title = saved_workflow_run_title(content) or synthesize_conversation_title(content)
     if title is None:
         return
     updated = await asyncio.to_thread(
@@ -11280,6 +11553,63 @@ def _derive_terminal_launch_args_from_spec(
     return None
 
 
+# Spec keys that declare a native session's own approval stance.
+_SPEC_PERMISSION_KEYS = ("permission_mode", "exec_mode", "yolo")
+
+
+def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
+    """
+    The harness and permission mode a Claude Code session is running in now.
+
+    The mode label tracks switches made after launch, so it wins over the launch
+    flags it may have replaced. Other harnesses, Codex included, report nothing:
+    their recorded mode can go stale or be left to config, so it isn't passed on.
+
+    :param conv: The session row, e.g. a sub-agent's parent.
+    :returns: ``(harness, mode)``, e.g. ``("claude-native", "auto")``, or ``None``
+        when the session isn't a Claude Code session with a known mode.
+    """
+    from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
+
+    native_agent = _native_coding_agent_for_session(conv)
+    if native_agent is None or native_agent.harness != _CLAUDE_NATIVE_HARNESS:
+        return None
+    mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    mode = mode or claude_launch_permission_mode(list(conv.terminal_launch_args or []))
+    return (_CLAUDE_NATIVE_HARNESS, mode) if mode else None
+
+
+def _inherited_parent_permission_launch_args(
+    parent: Conversation | None, harness: str | None, spec: AgentSpec | None
+) -> list[str] | None:
+    """
+    Launch args that start a sub-agent in the closest match to its parent's mode.
+
+    A child spec that declares its own stance keeps it. A parent mode that skips
+    approval isn't inherited, the same as one the creating agent requests.
+
+    :param parent: The child's parent session, or ``None``.
+    :param harness: The child's canonical harness, e.g. ``"codex-native"``.
+    :param spec: The child's own agent spec, when it loaded.
+    :returns: The CLI args, or ``None`` to keep the harness default.
+    """
+    if parent is None or harness is None:
+        return None
+    if spec is not None and _spec_harness(spec) == harness:
+        if any(spec.executor.config.get(key) is not None for key in _SPEC_PERMISSION_KEYS):
+            return None
+    live = _session_live_permission_mode(parent)
+    if live is None:
+        return None
+    mode = inherited_permission_mode(live[0], live[1], harness)
+    if mode is None:
+        return None
+    try:
+        return created_session_launch_args(harness, mode)
+    except ValueError:
+        return None
+
+
 def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, str]:
     """
     Resolve terminal-first wrapper labels from an already-loaded sub-spec.
@@ -13103,14 +13433,15 @@ __all__ = [
     "_codex_subagent_labels_from_body",
     "_coerce_cumulative_field",
     "_collect_descendant_conversation_ids",
+    "_collect_descendant_conversation_ids_paged",
     "_consume_pre_resolved_harness_elicitation",
     "_create_and_publish_antigravity_child",
     "_create_and_publish_codex_child",
     "_create_and_publish_devin_child",
     "_create_session_worktree",
+    "_delete_session_tree_files",
     "_delete_stored_session_bundle_after_failure",
     "_derive_terminal_launch_args_from_spec",
-    "_descendant_sessions",
     "_devin_subagent_display_tool",
     "_devin_subagent_labels_from_body",
     "_discovery_key",
@@ -13141,6 +13472,7 @@ __all__ = [
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
     "_if_none_match_matches",
+    "_inherited_parent_permission_launch_args",
     "_invalidate_runner_backed_snapshot_state",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",

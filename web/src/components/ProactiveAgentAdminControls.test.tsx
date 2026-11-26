@@ -63,7 +63,7 @@ describe("ProactiveAgentAdminControls", () => {
     };
     render(<ProactiveAgentAdminControls />);
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Run now" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Users to run now" }), {
       target: { value: "alice@example.com, bob@example.com" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Run now" }));

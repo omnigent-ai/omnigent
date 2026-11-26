@@ -2,7 +2,7 @@
 // review's) registers here, and the shortcut goes to the one the user is working in.
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
-import { matchesShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 import { isFocusInDialogOrMenu, isMacPlatform } from "./hotkeys";
 import { isFocusInFindBar } from "./findBarFocus";
 

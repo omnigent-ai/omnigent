@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/dialog";
 import { showToast } from "@/components/ui/toast";
 import {
-  fetchHosts,
+  fetchHostsNow,
   fetchHarnessLogin,
   isSecureVerificationUrl,
   cancelHarnessLogin,
@@ -34,6 +34,7 @@ import {
   type HarnessLogoutResult,
   type Host,
   type StoreCredentialResult,
+  withoutSandboxHosts,
 } from "@/hooks/useHosts";
 import { useHarnessSetupSteps } from "@/lib/agentLabels";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -408,11 +409,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
 
   const refetchReadinessFromHosts = useCallback(async () => {
     await queryClient.invalidateQueries({ queryKey: ["hosts"] });
-    const hosts = await queryClient.fetchQuery({
-      queryKey: ["hosts", { includeSandbox: false }],
-      queryFn: () => fetchHosts(false),
-      staleTime: 0,
-    });
+    const hosts = withoutSandboxHosts(await fetchHostsNow(queryClient));
     const refreshed = hosts.find((candidate) => candidate.host_id === hostId);
     if (!refreshed) throw new Error(`${hostName} is no longer connected.`);
     return {
@@ -1325,13 +1322,7 @@ function CredentialForms({
       <DialogDescription>
         Add a credential {harnessLabel} can use to authenticate on {hostName}.
       </DialogDescription>
-      <HarnessCredentialForm
-        harness={harness}
-        label={harnessLabel}
-        host={host}
-        command={null}
-        onDone={onDone}
-      />
+      <HarnessCredentialForm harness={harness} label={harnessLabel} host={host} onDone={onDone} />
     </>
   );
 }

@@ -15,6 +15,7 @@ import { GraphZoomControls } from "@/components/GraphZoomControls";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { StepDescription } from "@/components/workflows/StepDescription";
+import { useMarkFullscreenOverlayOpen } from "@/hooks/useMarkFullscreenOverlayOpen";
 import { getEmbedRoot } from "@/lib/host";
 import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { failedUpstream, type StepProgress, type StepState } from "@/lib/sessionJournal";
@@ -286,6 +287,7 @@ export function WorkflowGraphOverlay({
   menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
   onClose: () => void;
 }) {
+  useMarkFullscreenOverlayOpen(true);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       // An open menu or card takes the first Escape.

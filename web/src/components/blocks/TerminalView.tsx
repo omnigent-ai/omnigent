@@ -48,6 +48,7 @@ import {
   withAttachParams,
 } from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
+import { noteTerminalInput } from "@/lib/terminalInputTimes";
 import {
   TerminalClipboardPrompt,
   type TerminalClipboardDecision,
@@ -650,10 +651,17 @@ export function TerminalView({
         terminalSession = new TerminalSession(
           node,
           url,
-          notifyState,
+          // A session given up for a later attach, or this view unmounting, reports nothing more.
+          (next) => {
+            if (!superseded()) notifyState(next);
+          },
           isDarkRef.current,
           notifyActivity,
-          notifyInput,
+          // Typing makes an earlier "is this shell idle?" reading of this shell out of date.
+          () => {
+            noteTerminalInput(sessionId, terminalId);
+            notifyInput();
+          },
           !readOnly && activeRef.current,
           notifyClipboardRequest,
           focusOnConnectRef.current,

@@ -1340,6 +1340,29 @@ describe("side-chat interrupt", () => {
     expect(sessionsApi.interrupt).not.toHaveBeenCalled();
   });
 
+  it("queues a follow-up with Mod+Enter when Always steer is on, and sends it when the turn ends", async () => {
+    writeAlwaysSteer(true);
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "After this answer" } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("");
+    expect(screen.getByRole("list", { name: "Queued messages" })).toHaveTextContent(
+      "After this answer",
+    );
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith(
+      "After this answer",
+      "agent_side",
+      undefined,
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+  });
+
   it("reports a failed interrupt and allows retry without clearing the draft", async () => {
     vi.mocked(sessionsApi.interrupt).mockRejectedValueOnce(new Error("Host unavailable"));
     renderPane(<SideChatPane childId={childId} />);
@@ -1745,6 +1768,66 @@ describe("grid cell composer shares its session's draft", () => {
     // Remounting the cell starts empty: nothing from the sent draft comes back.
     renderHook(() => useSharedSessionDraft(childId));
     expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
+  });
+
+  it("sends a pasted chip's file with the cell's message, directly", () => {
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    const text = "Look at @shot.png";
+    // A chip leaves the main composer as a tray file, so the shared draft carries its file.
+    bridgedCell({ text, files: [shot] });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      text,
+      "agent_side",
+      [shot],
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+    expect(send.mock.calls[0]![2]![0]).toBe(shot);
+  });
+
+  it("queues a pasted chip's file with the cell's message while its session runs", () => {
+    writeAlwaysSteer(false);
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    bridgedCell({ text: "Look at @shot.png", files: [shot] });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const queued = useChatStore.getState().queuedMessages[0]!;
+    expect(queued.text).toBe("Look at @shot.png");
+    expect(queued.files).toHaveLength(1);
+    expect(queued.files![0]).toBe(shot);
+  });
+
+  it("keeps an ordinary side chat's tray file name when the text refers to it", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+    const notes = new File(["n"], "notes.txt", { type: "text/plain" });
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Summarize @notes.txt" } });
+    fireEvent.paste(input, {
+      clipboardData: { items: [{ kind: "file", type: notes.type, getAsFile: () => notes }] },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const sent = send.mock.calls[0]!;
+    expect(sent[0]).toBe("Summarize @notes.txt");
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt"]);
+  });
+
+  it("keeps a grid cell's text and file names, including a file pasted into it", () => {
+    const notes = new File(["n"], "notes.txt", { type: "text/plain" });
+    const shot = new File(["c"], "image.png", { type: "image/png" });
+    const pasted = new File(["t"], "image.png", { type: "image/png" });
+    bridgedCell({ text: "Summarize @notes.txt and @image.png", files: [notes, shot] });
+    fireEvent.paste(screen.getByTestId("side-chat-input"), {
+      clipboardData: { items: [{ kind: "file", type: pasted.type, getAsFile: () => pasted }] },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const sent = send.mock.calls[0]!;
+    expect(sent[0]).toBe("Summarize @notes.txt and @image.png");
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual([
+      "notes.txt",
+      "image.png",
+      "image.png",
+    ]);
   });
 
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {
@@ -2187,6 +2270,27 @@ describe("grid cell composer shares its session's draft", () => {
 
     expect(send.mock.calls.map(([text]) => text)).toEqual(["first", "second", "third"]);
     expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("queues a cell's draft behind its backlog with Mod+Enter when Always steer is on", () => {
+    writeAlwaysSteer(true);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_cell", text: "first", conversationId: childId, agentId: "agent_side" },
+      ],
+    });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "after the turn" } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("");
+    expect(useChatStore.getState().queuedMessages.map(({ text }) => text)).toEqual([
+      "first",
+      "after the turn",
+    ]);
   });
 
   it("posts a cell's send into its busy session when Always steer is on", () => {

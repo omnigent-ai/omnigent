@@ -29,6 +29,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_active_session_id,
     read_transcript_path,
     record_hook_event,
+    update_permission_hook_auth_headers,
     validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
@@ -1385,6 +1386,164 @@ def _run_scripted_permission_hook(
     return client
 
 
+def test_parked_permission_prompt_takes_the_runner_refreshed_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A prompt parked past its token's lifetime re-parks with the runner's new token.
+
+    The hook cannot mint a token of its own, and resending the expired bearer
+    would lose the approval answer.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_lapse")
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": "Read", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", lambda *_args: lambda: None)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        claude_native_hook.time, "sleep", lambda seconds: clock.update(t=clock["t"] + seconds)
+    )
+    bearers: list[str] = []
+
+    class _ExpiringTokenClient:
+        def __init__(self, *, headers: dict[str, str], **_kwargs: object) -> None:
+            self._bearer = headers.get("Authorization", "")
+
+        def __enter__(self) -> _ExpiringTokenClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            bearers.append(self._bearer)
+            request = httpx.Request("POST", url)
+            if len(bearers) == 1:
+                # The poll is held while the token expires and the runner refreshes it.
+                clock["t"] += 300.0
+                update_permission_hook_auth_headers(bridge_dir, {"Authorization": "Bearer fresh"})
+                raise httpx.RemoteProtocolError("gateway cut the held poll", request=request)
+            if self._bearer != "Bearer fresh":
+                return httpx.Response(403, text="Invalid Token", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ExpiringTokenClient)
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert bearers == ["Bearer xyz", "Bearer xyz", "Bearer fresh"]
+
+
+def test_parked_permission_prompt_without_a_runner_refresh_mints_its_own_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A parked prompt whose token lapses, with no newer runner snapshot, still mints one.
+
+    A hook launched outside the runner (``omnigent claude``) never sees its
+    header snapshot refreshed, so it must keep renewing the way it always has.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_cli_lapse")
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": "Read", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    mints: list[int] = []
+
+    def _reauth_factory(
+        _server_url: str, headers: dict[str, str]
+    ) -> Callable[[], dict[str, str] | None]:
+        def _reauth() -> dict[str, str] | None:
+            mints.append(1)
+            return {**headers, "Authorization": "Bearer minted"}
+
+        return _reauth
+
+    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", _reauth_factory)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        claude_native_hook.time, "sleep", lambda seconds: clock.update(t=clock["t"] + seconds)
+    )
+    bearers: list[str] = []
+
+    class _ExpiringTokenClient:
+        def __init__(self, *, headers: dict[str, str], **_kwargs: object) -> None:
+            self._bearer = headers.get("Authorization", "")
+
+        def __enter__(self) -> _ExpiringTokenClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            bearers.append(self._bearer)
+            request = httpx.Request("POST", url)
+            if len(bearers) == 1:
+                # The poll is held while the token expires; nothing refreshes the snapshot.
+                clock["t"] += 300.0
+                raise httpx.RemoteProtocolError("gateway cut the held poll", request=request)
+            if self._bearer != "Bearer minted":
+                return httpx.Response(403, text="Invalid Token", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ExpiringTokenClient)
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert bearers == ["Bearer xyz", "Bearer xyz", "Bearer minted"]
+    assert len(mints) == 1
+
+
+@pytest.mark.parametrize(
+    ("started_from", "server_url", "renewed_with"),
+    [
+        ({"Authorization": "Bearer old"}, "http://127.0.0.1:8787", "Bearer xyz"),
+        (None, "http://127.0.0.1:8787", "Bearer minted"),
+        ({"Authorization": "Bearer old"}, "https://other.example.com", "Bearer minted"),
+    ],
+    ids=["snapshot-rewritten-at-startup", "headers-from-argv", "snapshot-for-another-server"],
+)
+def test_permission_hook_reauth_takes_only_a_matching_unsent_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    started_from: dict[str, str] | None,
+    server_url: str,
+    renewed_with: str,
+) -> None:
+    """The runner's snapshot renews only a hook that started from it, for its own server."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_unsent")
+    monkeypatch.setattr(
+        native_policy_hook,
+        "policy_hook_reauth",
+        lambda *_args: lambda: {"Authorization": "Bearer minted"},
+    )
+
+    reauth = claude_native_hook._permission_hook_reauth(
+        bridge_dir, server_url, {"Authorization": "Bearer old"}, started_from
+    )
+
+    renewed = reauth()
+    assert renewed is not None and renewed["Authorization"] == renewed_with
+    assert reauth() == {"Authorization": "Bearer minted"}, "an unchanged snapshot mints"
+
+
 def _assert_chat_fallback(stdout: str) -> None:
     """
     Assert the hook denied a question with the ask-in-chat hint.
@@ -1419,7 +1578,9 @@ def test_permission_request_hook_question_answer_survives_a_server_outage(
     floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
     cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
     held = floor + 290.0
-    script = [("severed", held)] + [("5xx", 0.0)] * (cap + 1) + [("ok", 0.0)]
+    # Nine 503s span about 150 s; other prompts get one more than their cap.
+    failures = 9 if delivered else cap + 1
+    script = [("severed", held)] + [("5xx", 0.0)] * failures + [("ok", 0.0)]
 
     client = _run_scripted_permission_hook(
         tmp_path, monkeypatch, tool_name=tool_name, script=script
@@ -1429,11 +1590,33 @@ def test_permission_request_hook_question_answer_survives_a_server_outage(
     if delivered:
         assert stdout, "the submitted answer never reached Claude"
         assert json.loads(stdout) == {"ok": True}
-        assert len(client.calls) == cap + 3
+        assert len(client.calls) == failures + 2
         assert client.calls[-1] - held >= 150.0
     else:
         assert stdout == ""
         assert len(client.calls) == cap + 1, "other prompts keep the hard-failure cap"
+
+
+@pytest.mark.parametrize("failure", ["5xx", "connect"])
+def test_permission_request_hook_never_approves_a_prompt_the_server_never_took(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    """
+    A tool approval raised while the server fails ends with no decision.
+
+    The hook must not fail open: once it stops retrying, Claude Code keeps its
+    own prompt rather than running the tool, and it stops at the cap.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    script = [(failure, 0.0)] * cap + [("ok", 0.0)]
+
+    client = _run_scripted_permission_hook(tmp_path, monkeypatch, tool_name="Bash", script=script)
+
+    assert capsys.readouterr().out == "", "a prompt the server never took must not get a verdict"
+    assert len(client.calls) == cap
 
 
 @pytest.mark.parametrize(
@@ -2769,6 +2952,49 @@ def test_reattach_5xx_counts_as_hard_failure(
     assert len(client.calls) == claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
 
 
+def test_reattach_rides_out_a_brief_5xx_outage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prompt raised during an 11-minute run of 502s reaches Omnigent once it recovers.
+
+    Giving up sooner leaves only Claude's terminal prompt, which a web-driven
+    session never shows, so the session stays stuck after the server is back.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    client = _scripted_client(
+        script=[("5xx", 0.0)] * (cap - 1) + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+        sleep_advances_clock=True,
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PermissionRequest"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert client.calls[-1] >= 11 * 60, "the last retry must land after an 11-minute outage"
+
+
+def test_reattach_5xx_retries_stay_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server that never recovers still ends the retries within 20 minutes."""
+    client = _scripted_client(
+        script=[("5xx", 0.0)], monkeypatch=monkeypatch, sleep_advances_clock=True
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PermissionRequest"},
+        hook_label="permission",
+    )
+
+    assert resp is None
+    assert client.clock["t"] <= 20 * 60
+
+
 def test_reattach_cap_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
     """``OMNIGENT_HOOK_MAX_RETRIES`` tunes the hard-failure cap.
 
@@ -2810,7 +3036,7 @@ def test_reattach_bad_env_max_retries_falls_back(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("OMNIGENT_HOOK_MAX_RETRIES", "banana")
     reloaded = importlib.reload(claude_native_hook)
     try:
-        assert reloaded._PERMISSION_MAX_CONSECUTIVE_FAILURES == 8  # default preserved
+        assert reloaded._PERMISSION_MAX_CONSECUTIVE_FAILURES == 40  # default preserved
     finally:
         monkeypatch.delenv("OMNIGENT_HOOK_MAX_RETRIES", raising=False)
         importlib.reload(claude_native_hook)

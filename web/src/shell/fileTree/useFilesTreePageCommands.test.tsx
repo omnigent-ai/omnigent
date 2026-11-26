@@ -23,6 +23,11 @@ import {
   BACK_TO_WORKING_FOLDER_LABEL,
   useFilesTreeShowRequests,
 } from "./treeRoot";
+import {
+  FILTER_TREE_BY_NAME_LABEL,
+  forgetTreeNameFilterRequestsForTests,
+  useTreeNameFilterRequests,
+} from "./treeNameFilter";
 import { useFilesTreePageCommands } from "./useFilesTreePageCommands";
 
 const revealCommands = () =>
@@ -30,7 +35,10 @@ const revealCommands = () =>
     .flatMap((group) => group.commands)
     .filter((command) => command.label === REVEAL_ACTIVE_FILE_PALETTE_LABEL);
 
-afterEach(() => forgetActiveFileRevealsForTests());
+afterEach(() => {
+  forgetActiveFileRevealsForTests();
+  forgetTreeNameFilterRequestsForTests();
+});
 
 describe("useFilesTreePageCommands", () => {
   it("asks its page to show the tree, then its panel to reveal the file", () => {
@@ -117,5 +125,33 @@ describe("useFilesTreePageCommands", () => {
     act(() => command(BACK_TO_WORKING_FOLDER_LABEL).run());
     expect(showTree).toHaveBeenCalledTimes(2);
     expect(command(ACTIVE_FOLDER_AS_ROOT_LABEL).availability).toEqual({ available: true });
+  });
+
+  it("shows the tree and asks it to open its name filter, even with no file open", () => {
+    const conversationId = "conv_place_filter";
+    const showTree = vi.fn();
+    renderHook(() => useFilesTreeShowRequests(conversationId, showTree));
+    renderHook(() =>
+      useFilesTreePageCommands({
+        conversationId,
+        activePath: null,
+        showHidden: false,
+        enabled: true,
+      }),
+    );
+    const command = Object.values(usePaletteCommandsStore.getState().groups)
+      .flatMap((group) => group.commands)
+      .find((candidate) => candidate.label === FILTER_TREE_BY_NAME_LABEL)!;
+    expect(command.availability).toEqual({ available: true });
+
+    act(() => command.run());
+    expect(showTree).toHaveBeenCalledTimes(1);
+    // The tree that mounts takes the request up once; another one finds none left.
+    const taken = vi.fn();
+    renderHook(() => useTreeNameFilterRequests(conversationId, taken));
+    expect(taken).toHaveBeenCalledTimes(1);
+    const later = vi.fn();
+    renderHook(() => useTreeNameFilterRequests(conversationId, later));
+    expect(later).not.toHaveBeenCalled();
   });
 });

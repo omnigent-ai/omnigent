@@ -2,13 +2,19 @@
 // tabs (`useTabsSidebar`). The tabs code loads on first use, so a deployment with the
 // flag off never downloads it.
 
-import { lazy } from "react";
+import { type ComponentType, createElement, lazy, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
 import { readBrowserTabsState } from "@/hooks/useBrowserTabs";
 import { onBrowserActionSettled } from "@/lib/browserActionBus";
 
+import {
+  claimFileAction,
+  nextFileActionRequest,
+  useFileActionStore,
+} from "./fileCommands/fileActionStore";
+import type { ShowAllPullRequestsCommandProps } from "./workspaceCommands/useShowAllPullRequestsCommand";
 import type * as WorkspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
 
 type WorkspaceTabsModule = typeof WorkspaceTabsSessions;
@@ -20,6 +26,76 @@ let workspaceTabsModule: Promise<WorkspaceTabsModule> | null = null;
 
 /** The tabs sidebar's host, loaded when it first shows. */
 export const LazyWorkspaceTabsHost = lazy(() => import("./workspaceTabs/WorkspaceTabsHost"));
+
+interface FileActionHostModule {
+  FileActionHost: ComponentType;
+}
+
+/** Said when a file action can't run because its code still won't load. */
+export const FILE_ACTION_LOAD_FAILED =
+  "Couldn't run this file action. Reload the window and try again.";
+
+/**
+ * The file action host's module, or, when it can't load, such as after an update replaced it, a
+ * stand-in that loads it again on the next request: only that action fails, not the shell around it.
+ */
+export function loadFileActionHost(
+  load: () => Promise<FileActionHostModule> = () => import("./fileCommands/FileActionHost"),
+): Promise<{ default: ComponentType }> {
+  return load().then(
+    (module) => ({ default: module.FileActionHost }),
+    (error: unknown) => {
+      console.error("[file-actions] couldn't load the file action host:", error);
+      return { default: () => createElement(FileActionHostRetry, { load }) };
+    },
+  );
+}
+
+/**
+ * Loads the host again for the next request, which waits in the queue with any made meanwhile,
+ * so the host runs them all once loaded; a request the load fails for says so and is dropped.
+ */
+function FileActionHostRetry({ load }: { load: () => Promise<FileActionHostModule> }) {
+  const request = useFileActionStore(nextFileActionRequest);
+  const [host, setHost] = useState<ComponentType | null>(null);
+  const retriedFor = useRef<number | null>(null);
+  useEffect(() => {
+    if (host !== null || request === null || retriedFor.current === request.key) return;
+    retriedFor.current = request.key;
+    load().then(
+      (module) => setHost(() => module.FileActionHost),
+      (error: unknown) => {
+        console.error("[file-actions] couldn't load the file action host:", error);
+        if (claimFileAction(request)) toast.error(FILE_ACTION_LOAD_FAILED);
+      },
+    );
+  }, [host, load, request]);
+  return host === null ? null : createElement(host);
+}
+
+/** Carries out the file actions the tabs sidebar's menus and ⌘K ask for; loaded with the sidebar. */
+export const LazyFileActionHost = lazy(() => loadFileActionHost());
+
+interface ShowAllPullRequestsCommandModule {
+  ShowAllPullRequestsCommand: ComponentType<ShowAllPullRequestsCommandProps>;
+}
+
+/** ⌘K's Show all pull requests, or nothing when its code can't load: only that row is missing. */
+export function loadShowAllPullRequestsCommand(
+  load: () => Promise<ShowAllPullRequestsCommandModule> = () =>
+    import("./workspaceCommands/useShowAllPullRequestsCommand"),
+): Promise<{ default: ComponentType<ShowAllPullRequestsCommandProps> }> {
+  return load().then(
+    (module) => ({ default: module.ShowAllPullRequestsCommand }),
+    (error: unknown) => {
+      console.error("[pull-requests] couldn't load Show all pull requests:", error);
+      return { default: () => null };
+    },
+  );
+}
+
+/** Registers ⌘K's Show all pull requests for a tabs sidebar session; loaded with the sidebar. */
+export const LazyShowAllPullRequestsCommand = lazy(() => loadShowAllPullRequestsCommand());
 
 export { useTabsSidebar } from "./useTabsSidebar";
 

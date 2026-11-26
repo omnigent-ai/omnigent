@@ -24,15 +24,19 @@ import {
   scrollPastEnd,
 } from "@codemirror/view";
 import { reestimateWrappedHeightsOnSettledWidth } from "./wrappedHeightEstimate";
-import { HashIcon, ReplaceIcon } from "lucide-react";
+import { HashIcon, ReplaceIcon, TextSelectIcon } from "lucide-react";
 import { type ReactNode, type RefObject, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { FindBar } from "@/components/FindBar";
 import { OWNS_COMMAND_ENTER_ATTRIBUTE } from "@/hooks/useApproveHotkey";
 import { GO_TO_LINE_LABEL, GoToLineBar } from "@/components/GoToLineBar";
-import { codeMirrorKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { codeMirrorKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { readCodeFont, subscribeCodeFont } from "@/lib/codeFontPreferences";
-import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands";
+import {
+  type PaletteCommand,
+  unavailableBecause,
+  usePaletteCommands,
+} from "@/store/paletteCommands";
 import type { FilePosition } from "../FileViewerContext";
 import { detectLang } from "../codeViewerHelpers";
 import { isFilePositionPending, stopFilePosition } from "../filePositionState";
@@ -74,7 +78,9 @@ import {
 import { FILE_EDITOR_COMMANDS, fileEditorCommandLabel } from "@/components/fileEditorCommands";
 import { baseEditorKeymap, cursorHistory, EDITOR_COMMAND_RUNS } from "./codeMirrorEditorCommands";
 import { indentationFolding } from "./codeMirrorFolding";
+import { stickyScroll } from "./codeMirrorStickyScroll";
 import { detectedIndentation } from "./codeMirrorIndentation";
+import { indentGuides } from "./indentGuides";
 import { selectionWhitespacePlugin } from "./codeMirrorSelectionWhitespace";
 import { documentRefresh } from "./documentRefresh";
 import { copyRawSelection, rawDocument, rawDocumentOf } from "./rawOffsets";
@@ -84,9 +90,19 @@ import {
 } from "./useCodeMirrorCommentLayer";
 import { shikiDecorations } from "./shikiDecorations";
 import { viewportHighlighting } from "./viewportHighlighting";
+import {
+  canToggleFindInSelection,
+  FIND_IN_SELECTION_UNAVAILABLE,
+  findScope,
+  findScopeOf,
+  toggleFindInSelection,
+} from "./findScope";
+import { FIND_AND_REPLACE_LABEL, FIND_IN_FILE_LABEL } from "./editorContextMenuEntries";
+import { EditorContextMenu } from "./EditorContextMenu";
+import { columnSelection } from "./columnSelection";
+import { matchingBrackets } from "./codeMirrorBracketMatching";
 
-export const FIND_IN_FILE_LABEL = "Find in file";
-export const FIND_AND_REPLACE_LABEL = "Find and replace in file";
+export { FIND_AND_REPLACE_LABEL, FIND_IN_FILE_LABEL };
 
 // The file viewer routes Cmd+F to the find bar itself and steps matches through
 // its index below; the editor keeps the other search keys (Mod-d, Escape).
@@ -131,6 +147,8 @@ export interface CodeMirrorFileViewerProps {
   /** Shows that a Markdown file opened as source because it is too large to render. */
   largeMarkdown?: boolean;
   wrapLines: boolean;
+  /** Pins the lines opening the scopes around the top of the view; on unless turned off. */
+  stickyScroll?: boolean;
   searchOpen: boolean;
   /** Bumped on every find request so a repeat press refocuses the query. */
   searchFocusNonce?: number;
@@ -172,6 +190,7 @@ export function CodeMirrorFileViewer({
   truncated,
   largeMarkdown = false,
   wrapLines,
+  stickyScroll: stickyScrollOn = true,
   searchOpen,
   searchFocusNonce,
   onSearchHandled,
@@ -184,6 +203,7 @@ export function CodeMirrorFileViewer({
   const viewRef = useRef<EditorView | null>(null);
   const [editorView, setEditorView] = useState<EditorView | null>(null);
   const [lineWrapping] = useState(() => new Compartment());
+  const [stickyLines] = useState(() => new Compartment());
   const [font] = useState(() => new Compartment());
   const [editableCompartment] = useState(() => new Compartment());
   const editingRef = useRef(editing);
@@ -197,6 +217,9 @@ export function CodeMirrorFileViewer({
   // Set by Find and replace before it opens find, for the open request to focus.
   const pendingFindFocusTargetRef = useRef<"query" | "replace" | null>(null);
   const [replaceOpen, setReplaceOpen] = useState(false);
+  const [preserveCase, setPreserveCase] = useState(false);
+  // Whether Find in selection can act now; shared by the find bar's toggle and ⌘K.
+  const [findInSelectionReady, setFindInSelectionReady] = useState(false);
   const [goToLineState, setGoToLineState] = useState<GoToLineState | null>(null);
   // Where Go to line returns to on Escape, kept in step with edits while it is open.
   const goToLineOriginRef = useRef<GoToLineOrigin | null>(null);
@@ -226,8 +249,8 @@ export function CodeMirrorFileViewer({
       : null;
   };
   // The inputs a new view starts from; changes to a live view arrive through the effects below.
-  const currentInputsRef = useRef({ content, wrapLines, position, editable });
-  currentInputsRef.current = { content, wrapLines, position, editable };
+  const currentInputsRef = useRef({ content, wrapLines, stickyScrollOn, position, editable });
+  currentInputsRef.current = { content, wrapLines, stickyScrollOn, position, editable };
 
   const openGoToLine = (target: EditorView) => {
     goToLineOriginRef.current ??= goToLineOrigin(target);
@@ -248,6 +271,29 @@ export function CodeMirrorFileViewer({
     }
     return true;
   };
+  // Find from the right-click menu: opens the bar, or refocuses its query when it is open.
+  const openFindFromMenu = (target: EditorView) => {
+    if (!searchPanelOpen(target.state)) {
+      openSearchPanel(target);
+      return;
+    }
+    setFindFocusTarget("query");
+    setFindFocusRequest((request) => request + 1);
+  };
+  // Find in selection: limits find to the reader's selection and opens the bar, or turns it off.
+  const findInSelection = (target: EditorView, on = findScopeOf(target.state) === null) => {
+    if (!toggleFindInSelection(target, on)) return false;
+    if (!searchPanelOpen(target.state)) openSearchPanel(target);
+    const start = findScopeOf(target.state)?.[0]?.from;
+    if (start !== undefined) {
+      // Move to the scope's first match, so the selected match is never outside it.
+      target.dispatch({ selection: { anchor: start }, userEvent: "select.search" });
+      pendingStepRef.current = { direction: 1, from: { from: start, to: start }, inclusive: true };
+    }
+    return true;
+  };
+  const findInSelectionRef = useRef(findInSelection);
+  findInSelectionRef.current = findInSelection;
   // The editor's keymap is built once, so it reaches the latest handlers through refs.
   const openGoToLineRef = useRef(openGoToLine);
   openGoToLineRef.current = openGoToLine;
@@ -299,6 +345,10 @@ export function CodeMirrorFileViewer({
           replacer.cancel();
           findIndex.reset();
           if (!tearingDown) onSearchHandledRef.current();
+          // Find in selection ends with find; the panel closes mid-update, so turn it off after.
+          queueMicrotask(() => {
+            if (!tearingDown && view) toggleFindInSelection(view, false);
+          });
         },
       };
     };
@@ -314,8 +364,10 @@ export function CodeMirrorFileViewer({
           commentLayer.extension,
           lineNumbers(),
           indentationFolding(),
+          stickyLines.of(initial.stickyScrollOn ? stickyScroll : []),
           detectedIndentation(initial.content),
           selectionWhitespacePlugin,
+          indentGuides,
           cursorHistory,
           drawSelection(),
           highlightActiveLine(),
@@ -332,10 +384,16 @@ export function CodeMirrorFileViewer({
             createPanel: findPanel,
             scrollToMatch: (range) => EditorView.scrollIntoView(range, { y: "center" }),
           }),
+          findScope,
+          EditorView.updateListener.of((update) => {
+            setFindInSelectionReady(canToggleFindInSelection(update.state));
+          }),
           highlightSelectionMatches({ highlightWordAroundCursor: true, minSelectionLength: 1 }),
           EditorState.allowMultipleSelections.of(true),
-          // Alt-click adds a cursor, as in other code editors.
+          // Alt-click adds a cursor and Alt-drag selects a box, as in other code editors.
           EditorView.clickAddsSelectionRange.of((event) => event.altKey),
+          columnSelection,
+          matchingBrackets,
           keymap.of([
             // Control+G is Go to line everywhere; on Windows and Linux it wins over find next.
             ...codeMirrorKeys("file.goToLine").map((key) => ({
@@ -346,6 +404,11 @@ export function CodeMirrorFileViewer({
             ...codeMirrorKeys("file.findAndReplace").map((key) => ({
               key,
               run: (target: EditorView) => openFindAndReplaceRef.current(target),
+              preventDefault: true,
+            })),
+            ...codeMirrorKeys("file.findInSelection").map((key) => ({
+              key,
+              run: (target: EditorView) => findInSelectionRef.current(target),
               preventDefault: true,
             })),
             { key: "Mod-g", run: step(1), shift: step(-1), preventDefault: true },
@@ -361,9 +424,9 @@ export function CodeMirrorFileViewer({
           }),
           EditorView.updateListener.of((update) => {
             if (!searchPanelOpen(update.state)) return;
-            const queryChanged = !getSearchQuery(update.startState).eq(
-              getSearchQuery(update.state),
-            );
+            const queryChanged =
+              !getSearchQuery(update.startState).eq(getSearchQuery(update.state)) ||
+              findScopeOf(update.startState) !== findScopeOf(update.state);
             if (update.docChanged || queryChanged) {
               // Indexing may select the first match, which can't dispatch mid-update.
               queueMicrotask(() => {
@@ -386,6 +449,7 @@ export function CodeMirrorFileViewer({
     const mountedView = view;
     viewRef.current = mountedView;
     setEditorView(mountedView);
+    setFindInSelectionReady(canToggleFindInSelection(mountedView.state));
     const editorRef = editingRef.current?.editorRef;
     if (editorRef) editorRef.current = editorHandleFor(mountedView);
     const scrollKey = `codemirror:${conversationId}:${path}`;
@@ -448,6 +512,12 @@ export function CodeMirrorFileViewer({
     });
   }, [wrapLines, lineWrapping]);
 
+  useEffect(() => {
+    viewRef.current?.dispatch({
+      effects: stickyLines.reconfigure(stickyScrollOn ? stickyScroll : []),
+    });
+  }, [stickyScrollOn, stickyLines]);
+
   // Reveal a citation until the reader scrolls, clicks, or types; its lines
   // stay highlighted while it is the viewer's position.
   useEffect(() => {
@@ -494,7 +564,8 @@ export function CodeMirrorFileViewer({
       view.dom.querySelector(`.${FIND_PANEL_CLASS}`)?.contains(document.activeElement);
     openSearchPanel(view);
     const selection = view.state.selection.main;
-    if (!barHasFocus && !selection.empty) {
+    // With Find in selection on, the selection is where to search, not what to search for.
+    if (!barHasFocus && !selection.empty && findScopeOf(view.state) === null) {
       queueFirstMatch(
         applyFindQuery(
           view,
@@ -535,6 +606,19 @@ export function CodeMirrorFileViewer({
         run: () => openGoToLineRef.current(editorView),
       },
       {
+        id: "file.find-in-selection",
+        label: "Find in selection",
+        icon: TextSelectIcon,
+        keywords: ["search", "scope", "selection", "within"],
+        shortcut: "file.findInSelection" as const,
+        movesFocus: true,
+        availability: findInSelectionReady
+          ? undefined
+          : unavailableBecause(FIND_IN_SELECTION_UNAVAILABLE),
+        // A toggle, like the find bar's button and the shortcut, so it acts whenever it's offered.
+        run: () => findInSelectionRef.current(editorView),
+      },
+      {
         id: "file.find-and-replace",
         label: FIND_AND_REPLACE_LABEL,
         icon: ReplaceIcon,
@@ -561,7 +645,7 @@ export function CodeMirrorFileViewer({
         },
       })),
     ];
-  }, [onScreen, editorView, editAvailability]);
+  }, [onScreen, editorView, editAvailability, findInSelectionReady]);
   usePaletteCommands(paletteSource, "File", paletteCommands);
 
   const view = viewRef.current;
@@ -576,17 +660,21 @@ export function CodeMirrorFileViewer({
     if (view && origin && restore) returnToOrigin(view, origin);
   };
   const replaceSelected = (target: EditorView, index: FindMatchIndex) => {
-    replacerRef.current?.replaceSelected(target, (resumeFrom) => {
-      // Not a match to replace: select the next one, so a replacement lands only on a highlighted match.
-      if (resumeFrom === null) {
-        requestStep(target, index, 1);
-        return;
-      }
-      const from = { from: resumeFrom, to: resumeFrom };
-      // A replacement that changed nothing leaves the index current; otherwise wait for the new one.
-      if (index.belongsTo(target.state) && stepToMatch(target, index, 1, from)) return;
-      pendingStepRef.current = { direction: 1, from, inclusive: false };
-    });
+    replacerRef.current?.replaceSelected(
+      target,
+      (resumeFrom) => {
+        // Not a match to replace: select the next one, so a replacement lands only on a highlighted match.
+        if (resumeFrom === null) {
+          requestStep(target, index, 1);
+          return;
+        }
+        const from = { from: resumeFrom, to: resumeFrom };
+        // A replacement that changed nothing leaves the index current; otherwise wait for the new one.
+        if (index.belongsTo(target.state) && stepToMatch(target, index, 1, from)) return;
+        pendingStepRef.current = { direction: 1, from, inclusive: false };
+      },
+      { preserveCase },
+    );
   };
   return (
     <div className="flex h-full flex-col">
@@ -627,6 +715,15 @@ export function CodeMirrorFileViewer({
         )}
       </div>
       {commentLayer.actions}
+      <EditorContextMenu
+        view={editorView}
+        conversationId={conversationId}
+        editable={editable}
+        selectionActions={commentLayer.selectionActions}
+        onFind={openFindFromMenu}
+        onFindAndReplace={(target) => openFindAndReplaceRef.current(target)}
+        onGoToLine={(target) => openGoToLineRef.current(target)}
+      />
       {findHost &&
         view &&
         findIndex &&
@@ -637,6 +734,13 @@ export function CodeMirrorFileViewer({
             onQueryChange={(query) => setQuery(query)}
             options={findStatus.options}
             onOptionsChange={(options) => setQuery(findStatus.query, options)}
+            inSelection={{
+              pressed: findStatus.inSelection === true,
+              available: findInSelectionReady,
+              unavailableReason: FIND_IN_SELECTION_UNAVAILABLE,
+              onToggle: () => findInSelection(view),
+              keys: shortcutKeys("file.findInSelection"),
+            }}
             status={findStatusLabel(findStatus)}
             hasMatches={findStatus.matchCount > 0}
             searching={!findStatus.complete || replacing}
@@ -657,7 +761,9 @@ export function CodeMirrorFileViewer({
                     open: replaceOpen,
                     onOpenChange: setReplaceOpen,
                     onReplace: () => replaceSelected(view, findIndex),
-                    onReplaceAll: () => replacerRef.current?.replaceAll(view),
+                    onReplaceAll: () => replacerRef.current?.replaceAll(view, { preserveCase }),
+                    preserveCase,
+                    onPreserveCaseChange: setPreserveCase,
                   }
                 : undefined
             }

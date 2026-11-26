@@ -3,6 +3,7 @@
 // (no workspace root or code hosts; see workspaceLinkResolver.ts), and
 // formatting is canonical, so parse(format(link)) gives back the same link.
 
+import { type ComparisonChoice, isWorkingCopyBaseIntent } from "@/lib/comparisonChoice";
 import { canonicalPullRequestUrl } from "@/lib/pullRequestReference";
 
 import { foldPullRequestSubpage } from "./pullRequestSubpage";
@@ -181,6 +182,8 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
         if (head !== null) range.head = head;
         place.range = range;
       }
+      const comparison = parseComparison(params);
+      if (comparison) place.comparison = comparison;
       return place;
     }
     case "pulls":
@@ -319,6 +322,9 @@ function placeParams(place: WorkspacePlace): [string, string][] {
         entries.push(["base", place.range.base]);
         if (place.range.head !== undefined) entries.push(["head", place.range.head]);
       }
+      if (place.kind === "changes" && place.comparison) {
+        entries.push(...formatComparison(place.comparison));
+      }
       if (place.kind === "changes" && place.fileTab && place.path !== undefined) {
         entries.push(["file-tab", "1"]);
       }
@@ -340,6 +346,29 @@ function placeParams(place: WorkspacePlace): [string, string][] {
     default:
       return [];
   }
+}
+
+/** A visit's comparison: `compare=` names a saved base, `compare-base=` and `compare-head=` typed ones. */
+function parseComparison(params: Params): ComparisonChoice | undefined {
+  const intent = params.get("compare");
+  const base = params.get("compare-base");
+  const head = params.get("compare-head");
+  if (intent !== null && (base !== null || head !== null)) {
+    refuse("A comparison names a saved base or a typed base and head, not both.");
+  }
+  if (head !== null && base === null) refuse("A comparison with a head needs a base too.");
+  if (intent !== null) {
+    if (!isWorkingCopyBaseIntent(intent)) refuse(`Changes can't compare with “${intent}”.`);
+    return { kind: "saved", intent };
+  }
+  return base === null ? undefined : { kind: "typed", base, head: head ?? "" };
+}
+
+function formatComparison(comparison: ComparisonChoice): [string, string][] {
+  if (comparison.kind === "saved") return [["compare", comparison.intent]];
+  const entries: [string, string][] = [["compare-base", comparison.base]];
+  if (comparison.head !== "") entries.push(["compare-head", comparison.head]);
+  return entries;
 }
 
 function placeId(place: WorkspacePlace): string | undefined {

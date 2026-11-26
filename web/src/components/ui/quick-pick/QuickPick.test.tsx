@@ -96,6 +96,51 @@ describe("QuickPick accessibility", () => {
   });
 });
 
+describe("QuickPick keyboard", () => {
+  it("steps with Ctrl-N and Ctrl-P like the arrows once opted in, skipping disabled rows", async () => {
+    const { input, onAccept } = renderPicker({
+      stepsWithCtrlNP: true,
+      segments: [
+        {
+          ...commands,
+          items: [
+            commands.items[0],
+            item("archive", {
+              label: "Archive session",
+              group: "Actions",
+              disabledReason: "Open a session first",
+            }),
+            commands.items[1],
+          ],
+        },
+      ],
+    });
+    await userEvent.keyboard("{Control>}n{/Control}");
+    expect(activeOption(input)).toHaveTextContent("Open settings");
+    await userEvent.keyboard("{Control>}p{/Control}");
+    expect(activeOption(input)).toHaveTextContent("New session");
+    await userEvent.keyboard("{Control>}n{/Control}");
+    expect(input).toHaveValue("");
+    await userEvent.keyboard("{Enter}");
+    expect(onAccept).toHaveBeenCalledWith(commands.items[1], expect.anything());
+  });
+
+  it("leaves ⌘N and Ctrl-Shift-N alone when opted in", () => {
+    const { input } = renderPicker({ stepsWithCtrlNP: true });
+    for (const chord of [{ metaKey: true }, { ctrlKey: true, shiftKey: true }]) {
+      expect(fireEvent.keyDown(input, { key: "n", code: "KeyN", ...chord })).toBe(true);
+      expect(activeOption(input)).toHaveTextContent("New session");
+    }
+  });
+
+  it("marks its query field as an open pick list's only when it steps with Ctrl-N/P", () => {
+    const { input, unmount } = renderPicker({ stepsWithCtrlNP: true });
+    expect(input).toHaveAttribute("data-pick-list-input");
+    unmount();
+    expect(renderPicker().input).not.toHaveAttribute("data-pick-list-input");
+  });
+});
+
 describe("QuickPick rows", () => {
   it("keeps an option's ID when rows above it change", () => {
     const { input } = renderPicker();
@@ -284,6 +329,24 @@ describe("QuickPick caller-chosen active row", () => {
     // The caller clears its row once told about the move, and the moved row stays active.
     rerender(<Harness onAccept={onAccept} activeId={null} onActiveIdChange={onActiveIdChange} />);
     expect(activeOption(input)?.textContent).toContain("New session");
+  });
+});
+
+describe("QuickPick shown active row", () => {
+  it("reports each row that becomes active, by keys or as a query filters the list", () => {
+    const onActiveRowShown = vi.fn();
+    const { input } = renderPicker({ onActiveRowShown });
+    expect(onActiveRowShown).toHaveBeenLastCalledWith("new-session");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(onActiveRowShown).toHaveBeenLastCalledWith("open-settings");
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    // A query that leaves another row on top shows it, though the user didn't move.
+    fireEvent.change(input, { target: { value: "settings" } });
+    expect(onActiveRowShown).toHaveBeenLastCalledWith("open-settings");
+    // Nothing matching reports nothing, so a preview keeps the last row.
+    onActiveRowShown.mockClear();
+    fireEvent.change(input, { target: { value: "zzz" } });
+    expect(onActiveRowShown).not.toHaveBeenCalled();
   });
 });
 
@@ -844,5 +907,16 @@ describe("QuickPick cards", () => {
     const { input } = renderPicker({ segments: [apps] });
     fireEvent.change(input, { target: { value: "files" } });
     expect(layouts()).toEqual([["Files", false]]);
+  });
+});
+
+describe("QuickPick rendering", () => {
+  it("renders once for each change, with no heading buttons to line up", () => {
+    const summary = vi.fn(() => "2 results");
+    const view = renderPicker({ summary });
+    const settled = summary.mock.calls.length;
+    // A new prop renders the list once more, and measuring its headings asks for nothing else.
+    view.rerender(<Harness summary={summary} onAccept={vi.fn()} placeholder="Search" />);
+    expect(summary.mock.calls.length - settled).toBe(1);
   });
 });

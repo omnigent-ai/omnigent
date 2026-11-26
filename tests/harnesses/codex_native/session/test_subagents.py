@@ -538,13 +538,13 @@ def test_forwarder_reattaches_subagent_spawned_before_a_restart(tmp_path: Path) 
 
     Nothing maps a sub-agent spawned before a runner relaunch, and the parent
     sending it new work emits no spawn item. Codex's spawn metadata links the
-    thread back to the parent, so the child keeps its session and the history
-    an earlier forwarder mirrored is not replayed.
+    thread back to the parent, so the child keeps its session and its own
+    model, and the history an earlier forwarder mirrored is not replayed.
     """
     posted: list[tuple[str, dict[str, Any]]] = []
-    codex_client = _PerThreadFakeCodexClient(
-        thread_responses={"thread_child": _child_resume_response(text="mirrored before")}
-    )
+    child_read = _child_resume_response(text="mirrored before")
+    child_read["result"]["thread"]["model"] = "gpt-child"
+    codex_client = _PerThreadFakeCodexClient(thread_responses={"thread_child": child_read})
     codex_client.events = [
         *_child_turn_events(text="after restart"),
         *_child_turn_events(turn_id="turn_again", text="again"),
@@ -566,6 +566,11 @@ def test_forwarder_reattaches_subagent_spawned_before_a_restart(tmp_path: Path) 
         for post in _transcript_posts(posted, "conv_child")
     ] == ["after restart", "again"]
     assert _child_statuses(posted) == ["running", "idle", "running", "idle"]
+    assert [
+        body["data"]["model"]
+        for path, body in posted
+        if path == "/v1/sessions/conv_child/events" and body["type"] == "external_model_change"
+    ] == ["gpt-child"]
     assert [
         request
         for request in codex_client.requests
@@ -737,6 +742,86 @@ def test_forwarder_child_usage_excludes_inherited_totals_across_restart(
         (4500, 2000, 160),
         (4500, 2000, 160),
     ]
+
+
+@pytest.mark.parametrize(
+    ("started_model", "requested_model", "resumed_model", "resumed_thread_model", "child_model"),
+    [
+        pytest.param("gpt-child", None, None, None, "gpt-child", id="thread-started"),
+        pytest.param(None, "gpt-child", None, None, "gpt-child", id="spawn-request"),
+        pytest.param(None, None, "gpt-child", None, "gpt-child", id="resume"),
+        pytest.param(None, None, None, "gpt-child", "gpt-child", id="resume-thread"),
+        pytest.param(
+            "gpt-child", "gpt-requested", None, None, "gpt-child", id="report-beats-request"
+        ),
+        pytest.param(
+            None, "gpt-requested", "gpt-child", None, "gpt-child", id="snapshot-beats-request"
+        ),
+        pytest.param(
+            "gpt-child", None, "gpt-snapshot", None, "gpt-child", id="report-beats-snapshot"
+        ),
+        pytest.param(None, None, None, None, None, id="inherits-parent"),
+    ],
+)
+def test_forwarder_reports_and_prices_child_with_its_own_model(
+    tmp_path: Path,
+    started_model: str | None,
+    requested_model: str | None,
+    resumed_model: str | None,
+    resumed_thread_model: str | None,
+    child_model: str | None,
+) -> None:
+    """A sub-agent running another model reports and prices it on its own session.
+
+    A child without a model of its own keeps the parent's for pricing and
+    reports none, rather than claiming the parent's model as its own.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    child_resume = _child_resume_response()
+    if resumed_model is not None:
+        child_resume["result"]["model"] = resumed_model
+    if resumed_thread_model is not None:
+        child_resume["result"]["thread"]["model"] = resumed_thread_model
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={
+            "thread_parent": {
+                "result": {"model": "gpt-parent", "thread": {"id": "thread_parent", "turns": []}}
+            },
+            "thread_child": child_resume,
+        }
+    )
+    child_thread: dict[str, Any] = {
+        "id": "thread_child",
+        "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "thread_parent"}}},
+    }
+    if started_model is not None:
+        child_thread["model"] = started_model
+    spawn = _collab_item_completed_event()
+    if requested_model is not None:
+        spawn["params"]["item"]["model"] = requested_model
+    codex_client.events = [
+        {"method": "thread/started", "params": {"thread": child_thread}},
+        spawn,
+        _usage_event("thread_child", (300, 0, 30), (300, 0, 30)),
+    ]
+
+    _run_forwarder(tmp_path, codex_client, posted)
+
+    def reported_models(session_id: str) -> list[str]:
+        return [
+            body["data"]["model"]
+            for path, body in posted
+            if path == f"/v1/sessions/{session_id}/events"
+            and body["type"] == "external_model_change"
+        ]
+
+    assert reported_models("conv_parent") == ["gpt-parent"]
+    assert reported_models("conv_child") == ([child_model] if child_model else [])
+    assert [
+        body["data"].get("model")
+        for path, body in posted
+        if path == "/v1/sessions/conv_child/events" and body["type"] == "external_session_usage"
+    ] == [child_model or "gpt-parent"]
 
 
 def test_forwarder_does_not_double_write_stable_id_item_delivered_twice(
@@ -1234,14 +1319,18 @@ def _deliver_parent_events(
             base_url="http://127.0.0.1:8000",
             transport=httpx.MockTransport(_make_omnigent_handler(posted)),
         ) as client:
-            for event in events:
-                await codex_native_forwarder._handle_event(
-                    client,
-                    **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
-                    event=event,
-                    expected_thread_id="thread_parent",
-                    forwarder_state=state,
-                )
+            try:
+                for event in events:
+                    await codex_native_forwarder._handle_event(
+                        client,
+                        **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
+                        event=event,
+                        expected_thread_id="thread_parent",
+                        forwarder_state=state,
+                    )
+                    await state.settle_child_lanes()
+            finally:
+                await state.close_child_streams()
 
     asyncio.run(run())
 
@@ -1356,6 +1445,109 @@ def test_forwarder_collab_snapshot_posts_status_for_child_without_own_lifecycle(
     )
 
     assert _child_statuses(posted) == ["running"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_stage", ["in-flight", "queued"])
+@pytest.mark.parametrize(
+    ("snapshot", "child_event", "snapshot_status", "child_status"),
+    [
+        (_running_snapshot_event(), _child_turn_event("turn/completed"), "running", "idle"),
+        (_running_snapshot_event(), _child_error_event(), "running", "failed"),
+        (_completed_snapshot_event(), _child_turn_event("turn/started"), "idle", "running"),
+    ],
+    ids=["completion", "failure", "new-turn"],
+)
+async def test_forwarder_in_flight_parent_snapshot_cannot_overwrite_the_child_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: dict[str, Any],
+    child_event: dict[str, Any],
+    snapshot_status: str,
+    child_status: str,
+    snapshot_stage: str,
+) -> None:
+    posted: list[tuple[str, dict[str, Any]]] = []
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
+    handler = _make_omnigent_handler(posted)
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+    child_started = asyncio.Event()
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if (
+            request.url.path == "/v1/sessions/conv_child/events"
+            and body.get("type") == "external_session_status"
+            and body["data"]["status"] == snapshot_status
+            and not snapshot_started.is_set()
+            and snapshot_stage == "in-flight"
+        ):
+            snapshot_started.set()
+            await release_snapshot.wait()
+        return handler(request)
+
+    snapshot_task: asyncio.Task[None] | None = None
+
+    class ObservedLock(codex_native_forwarder._ReentrantAsyncLock):
+        async def __aenter__(self) -> None:
+            task = asyncio.current_task()
+            if task is not None and task.get_name() == "codex-native-child-delivery":
+                snapshot_started.set()
+            await super().__aenter__()
+
+    locks = {"conv_child": ObservedLock()} if snapshot_stage == "queued" else {}
+    token = codex_native_forwarder._conversation_item_locks.set(locks)
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(transport)
+        ) as client:
+
+            async def deliver(event: dict[str, Any]) -> None:
+                if event is child_event:
+                    child_started.set()
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
+                    event=event,
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+
+            try:
+                async with asyncio.timeout(5):
+                    await deliver(_subagent_activity_started_event())
+                    if snapshot_stage == "queued":
+                        async with codex_native_forwarder._conversation_item_delivery_scope(
+                            "conv_child"
+                        ):
+                            snapshot_task = asyncio.create_task(deliver(snapshot))
+                            tasks.append(snapshot_task)
+                            await snapshot_started.wait()
+                            await deliver(child_event)
+                    else:
+                        tasks.append(asyncio.create_task(deliver(snapshot)))
+                        await snapshot_started.wait()
+                        tasks.append(asyncio.create_task(deliver(child_event)))
+                        await child_started.wait()
+                        release_snapshot.set()
+                    await asyncio.gather(*tasks)
+                    await state.close_child_streams()
+            finally:
+                release_snapshot.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await state.close_child_streams()
+    finally:
+        codex_native_forwarder._conversation_item_locks.reset(token)
+
+    assert _child_statuses(posted) == (
+        [child_status] if snapshot_stage == "queued" else [snapshot_status, child_status]
+    )
+    assert state.child_turn_status("thread_child") == child_status
 
 
 def test_forwarder_collab_snapshot_marks_child_running_after_new_turn_starts(
@@ -1539,3 +1731,60 @@ def test_forwarder_backfilled_status_does_not_overwrite_live_child_turn(
     assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
     assert _child_statuses(posted) == expected_statuses
     assert state.child_turn_status("thread_child") == expected_state
+
+
+def test_forwarder_resumed_model_does_not_overwrite_live_child_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child's live model switch wins over the model in a delayed resume snapshot."""
+    posted: list[tuple[str, dict[str, Any]]] = []
+    child_resume = _child_resume_response()
+    child_resume["result"]["thread"]["model"] = "gpt-snapshot"
+    codex_client = _SuspendingResumeClient({"thread_child": child_resume})
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        ) as client:
+
+            def handle(event: dict[str, Any]) -> Any:
+                return codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
+                    event=event,
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+
+            try:
+                spawn = asyncio.create_task(handle(_running_snapshot_event()))
+                await asyncio.wait_for(codex_client.resume_started.wait(), timeout=5)
+                await handle(
+                    {
+                        "method": "thread/settings/updated",
+                        "params": {
+                            "threadId": "thread_child",
+                            "threadSettings": {"model": "gpt-live"},
+                        },
+                    }
+                )
+                codex_client.release_resume.set()
+                await asyncio.wait_for(spawn, timeout=5)
+                await handle(_usage_event("thread_child", (300, 0, 30), (300, 0, 30)))
+                await state.settle_child_lanes()
+            finally:
+                await state.close_child_streams()
+
+    asyncio.run(run())
+
+    child_posts = [body for path, body in posted if path == "/v1/sessions/conv_child/events"]
+    assert [
+        body["data"]["model"] for body in child_posts if body["type"] == "external_model_change"
+    ] == ["gpt-live"]
+    assert [
+        body["data"].get("model")
+        for body in child_posts
+        if body["type"] == "external_session_usage"
+    ] == ["gpt-live"]

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { reviewFile } from "./diffReviewModel";
+import { orderTreePaths } from "@/components/file-tree/vendored";
+import { reviewFile, treeOrderedFiles } from "./diffReviewModel";
 import {
+  givenOrder,
   treeGitStatus,
   treeGitStatusEntries,
   treeRowContentKey,
@@ -105,5 +107,42 @@ describe("treeRowContentKey", () => {
     expect(treeRowContentKey(before)).not.toBe(
       treeRowContentKey([{ ...before[0], ownedByViewer: true }]),
     );
+  });
+});
+
+describe("givenOrder", () => {
+  it("builds the tree in the order the review gives, so the tree and the diff read alike", () => {
+    const files = [
+      reviewFile("README.md", "modified", { additions: 3 }),
+      reviewFile("src/app/main.py", "modified", { additions: 1 }),
+      reviewFile("src/app/session_list.py", "modified", { additions: 14, deletions: 6 }),
+      reviewFile("docs/guide.md", "added", { additions: 2 }),
+    ];
+    const bySize = treeOrderedFiles(files, "size").map((file) => file.path);
+    // Largest first across folders: src before docs, and the root file between them.
+    expect(bySize).toEqual([
+      "src/app/session_list.py",
+      "src/app/main.py",
+      "README.md",
+      "docs/guide.md",
+    ]);
+    const tree = (paths: string[]) =>
+      orderTreePaths(paths, { flattenEmptyDirectories: true, sort: givenOrder(paths) });
+    expect(tree(bySize)).toEqual(bySize);
+    const byPath = treeOrderedFiles(files).map((file) => file.path);
+    expect(tree(byPath)).toEqual(byPath);
+  });
+
+  it("orders a path the review didn't name by the tree's default", () => {
+    const compare = givenOrder(["b.ts"]);
+    const entry = (path: string) => ({
+      basename: path,
+      depth: 1,
+      isDirectory: false,
+      path,
+      segments: [path],
+    });
+    expect(compare(entry("a.ts"), entry("b.ts"))).toBeLessThan(0);
+    expect(compare(entry("b.ts"), entry("a.ts"))).toBeGreaterThan(0);
   });
 });

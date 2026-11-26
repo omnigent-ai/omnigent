@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useState } from "react";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,6 +9,8 @@ import {
   type ProactiveAgentRuns,
 } from "@/hooks/useProactiveAgentSettings";
 import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
+import { PROACTIVE_AGENT_WORKSPACE_ENTRY } from "@/pages/settings/search/catalog/admin";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
 
 const SKIP_REASONS: Record<ProactiveAgentRuns["skipped"][number]["reason"], string> = {
   no_task: "no task yet",
@@ -41,8 +43,6 @@ export function ProactiveAgentAdminControls() {
   const run = useRunProactiveAgent();
   const [draft, setDraft] = useState<string | null>(null);
   const [users, setUsers] = useState("");
-  const promptId = useId();
-  const usersId = useId();
   const current = query.data;
   // Start from the saved prompt; keep edits until they are saved or reset.
   useEffect(() => {
@@ -55,7 +55,6 @@ export function ProactiveAgentAdminControls() {
       <div className="flex flex-col gap-2">
         <SettingsLabel
           label="Prompt"
-          labelId={promptId}
           description={`Replaces ${PROACTIVE_AGENT_DISPLAY_NAME}'s built-in instructions for every user, starting with the next run. Restoring the default follows the built-in prompt again as releases update it.`}
         />
         {query.isError && (
@@ -66,7 +65,7 @@ export function ProactiveAgentAdminControls() {
         {current && draft !== null && (
           <>
             <Textarea
-              aria-labelledby={promptId}
+              {...settingsControlProps(PROACTIVE_AGENT_WORKSPACE_ENTRY, "prompt")}
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               rows={14}
@@ -77,6 +76,7 @@ export function ProactiveAgentAdminControls() {
               <Button
                 size="sm"
                 disabled={save.isPending || draft.trim() === "" || draft === current.prompt}
+                {...settingsControlProps(PROACTIVE_AGENT_WORKSPACE_ENTRY, "save")}
                 onClick={() => save.mutate(draft, { onSuccess: (data) => setDraft(data.prompt) })}
                 componentId="settings.proactive_agent.prompt_save"
               >
@@ -86,6 +86,7 @@ export function ProactiveAgentAdminControls() {
                 size="sm"
                 variant="outline"
                 disabled={save.isPending || !current.overridden}
+                {...settingsControlProps(PROACTIVE_AGENT_WORKSPACE_ENTRY, "reset")}
                 onClick={() => save.mutate(null, { onSuccess: (data) => setDraft(data.prompt) })}
                 componentId="settings.proactive_agent.prompt_reset"
               >
@@ -106,12 +107,11 @@ export function ProactiveAgentAdminControls() {
       <div className="flex flex-col gap-2">
         <SettingsLabel
           label="Run now"
-          labelId={usersId}
           description={`Start runs right away for these users, separated by commas or spaces, or * for everyone who has ${PROACTIVE_AGENT_DISPLAY_NAME} on. Users who have not started a session since it was enabled have no run to start yet.`}
         />
         <div className="flex items-center gap-2">
           <Input
-            aria-labelledby={usersId}
+            {...settingsControlProps(PROACTIVE_AGENT_WORKSPACE_ENTRY, "users")}
             value={users}
             onChange={(event) => setUsers(event.target.value)}
             placeholder="alice@example.com, bob@example.com or *"
@@ -121,6 +121,7 @@ export function ProactiveAgentAdminControls() {
           <Button
             size="sm"
             disabled={run.isPending || runUsers.length === 0}
+            {...settingsControlProps(PROACTIVE_AGENT_WORKSPACE_ENTRY, "run")}
             onClick={() => run.mutate(runUsers)}
             componentId="settings.proactive_agent.run_now"
           >

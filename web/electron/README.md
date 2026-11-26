@@ -538,6 +538,36 @@ Hide/reopen the Workspace or switch tabs to retain a page without reloading.
 Closing the tab destroys it. User-created Browser tabs are separate from the
 session's agent browser view and are not targeted by the agent relay.
 
+### Previews from hosts reached over SSH
+
+A session on a remote host can open localhost previews after the desktop
+proves the host's SSH destination and the user grants access. Existing
+destinations from **Connect over SSH** or token-checked file access can be
+used directly. For a new destination, the web app supplies a route hint from
+the host list, and the consent dialog explains the read-only SSH check.
+Only after **Allow** does main run `omnigent host status --server ... --json`
+over SSH. It requires one online daemon with the session's exact host ID and
+selected server/workspace before recording the destination. It never starts
+a daemon or signs in (`src/sshPreviewIdentity.js`, `src/sshPreviewHosts.js`).
+
+When such a session first opens a localhost page (address bar, link, or
+agent), a shell-owned dialog names the destination and asks whether its
+sessions may access this computer's localhost ports, including forwarded ones.
+**Allow** opens the page after any required verification; **Not now** keeps
+that host's localhost pages blocked until Omnigent restarts. The answer lasts
+for this app run and only while the host's recorded destination is unchanged
+(`src/sshPreviewHosts.js`). Failed verification also stays blocked until restart.
+Agent screenshots, snapshots, clicks, and typing revalidate the session host;
+moving the session to a different host revokes the old page's privileged access.
+
+`localhost` still names this computer, so forward the app's port first, for
+example with `ssh -N -L 127.0.0.1:5173:127.0.0.1:5173 <destination>`.
+This grants access to all permitted loopback ports, not only the forwarded
+port; it does not establish forwarding or prove the local endpoint's owner.
+The loopback rules above still apply. This path is available on macOS and
+Linux. New web bundles check the optional `sshLocalhostPreview` capability;
+older shells keep their existing behavior.
+
 ### Agent previews on Arca
 
 The verified Arca exception also applies to the address bar and chat/file links.
@@ -580,6 +610,47 @@ Other loopback addresses, private-network and metadata destinations, hostnames
 that resolve to any of them, and non-web schemes remain restricted. Existing
 tool approvals are unchanged; whether a tool call asks for approval depends on
 the harness and its policy.
+
+### Agent previews on trusted remote hosts
+
+Sessions on a remote host can open localhost previews once the user explicitly
+trusts that host. The first time such a preview is blocked, the desktop asks
+in a native dialog whether to trust that host; trusting writes the entry and
+retries the preview. A decline holds until the desktop restarts, so a retrying
+agent cannot keep asking. Trusted hosts can also be listed, added, and removed
+in Settings > General > Trusted remote hosts. Settings shows only the connected
+server's entries, and adding a host there requires the same native confirmation.
+
+Trust is stored as `trusted_remote_hosts` in the desktop's `settings.json`,
+preserving any other settings:
+
+```json
+{
+  "trusted_remote_hosts": [{ "server_url": "https://server.example.com", "host_id": "abc123" }]
+}
+```
+
+The file lives in the desktop user-data directory: on macOS,
+`~/Library/Application Support/Omnigent/settings.json`; on Linux,
+`~/.config/Omnigent/settings.json`; on Windows, `%APPDATA%/Omnigent/settings.json`.
+Development builds use `Omnigent Dev` instead of `Omnigent`. Hand-editing it
+remains the fallback: save the file and retry the preview; restarting is
+unnecessary. A denied agent loopback preview gives the exact entry to add.
+
+`server_url` is the resolved server URL after sign-in and `host_id` is that session's
+host ID. This grants sessions on that host access to permitted desktop localhost URLs across ports, including
+agent inspection and interaction. Only add hosts you trust with that access.
+
+Trust is scoped to one server and host ID. A host id is stable across restarts
+and relaunches, so a grant normally needs no renewal; only a brand-new host
+registration, a deleted host config, or a reset host id needs a new entry. If
+the host identity does change, the old entry no longer matches and trust
+lapses. Removing the entry blocks future requests and revokes agent access
+to the loaded page on its next operation. Both the desktop and server's web app
+must support this feature; older web apps cannot use the grant.
+The remote app's port must already be forwarded to the desktop; Omnigent does
+not establish or verify forwarding. The URL restrictions described above still
+apply.
 
 ### Local network permission
 
@@ -1349,6 +1420,75 @@ call so `electron .` dev clicks route to the running dev instance.
 
 The decision logic (parse + window selection) is pure and unit-tested in
 `src/deepLink.js`; the orchestration lives in `src/main.js`.
+
+## Opening a conversation from the browser
+
+When a conversation link opens in an ordinary browser while the desktop app is
+running, the page hands the conversation to the app instead of leaving the user
+in the browser. This is the same idea as a deep link, without the browser's
+"Open Omnigent?" prompt and without guessing whether the app is installed.
+
+**How it works.** The app listens on `127.0.0.1`, on the first free port of
+`28417`, `28418`, `28419` (several, so a taken port or a development build beside
+the release build still gets one). The page sends
+`POST /open-conversation` with `{"conversationId": "<id>"}` to each port in turn
+until one answers; `GET /status` on the same port lets the page learn the app
+is running without opening anything. Every answer carries an
+`X-Omnigent-Desktop` header: an answer without it is another program holding
+that port, and the page moves on to the next. The app turns an accepted request into the
+`omnigent://<host>/c/<id>` link for the page's own server and queues it like any
+other deep link, so window selection is exactly as described above. The app
+answers only once the page in one of its windows reports that the conversation
+is on screen (its details and its messages both loaded, for its signed-in
+user): `204` then, or `504` when none does
+within eight seconds (the window needed a sign-in, or failed to load). The
+address alone doesn't count, since a signed-out page sits on the conversation's
+address before it goes to sign-in. The page says the conversation moved only after a `204`;
+otherwise it stays in the browser.
+
+**What the app accepts.** Any website can send a request to a loopback port, so
+the listener trusts nothing in the request body:
+
+- The server is taken from the browser-set `Origin` header, and it must be a
+  server this app is **already connected to** (a recent server, the saved
+  default, or a window's current one). Every other origin gets a bare `403`
+  with no CORS headers, so an unknown site can never make the app connect
+  somewhere or show the unknown-server prompt, and can't read the answer.
+- The body carries only the conversation id, which must be a plain id. A page
+  can therefore only open conversations on its own server.
+- The `Host` header must be `127.0.0.1:<port>`, which rules out DNS rebinding.
+- At most one request per second is accepted, so a page can't keep raising the
+  app's window.
+- The response has no body. Nothing about the user, the app or its sessions
+  leaves the listener.
+- Pages inside the app's own embedded browser panes can't reach the listener:
+  the shell cancels their requests to these ports, so a page an agent opens
+  never steers the main window.
+
+**In the browser.** The first time a conversation link opens in a browser while
+the app is running, the page asks: a toast with an **Open in app** button.
+Accepting turns on **Settings → General → Conversation links → Open
+conversations in the desktop app** (off until then, shown only in a browser)
+and opens that conversation; ignoring the toast leaves it off, and the question
+isn't repeated. From then on the hand-off is automatic. Only the address a tab
+was opened with is handed over, once per tab, so the user can carry on in the
+browser afterwards. A link to a file (`?file=`) or to Canvas stays in the
+browser, because the app would open the plain conversation instead.
+
+Once the app takes the conversation, it comes to the front and the page is
+replaced by "Opening this conversation in the desktop app" with two buttons:
+**Open the desktop app** follows the conversation's `omnigent://` link, and
+**Use the browser instead** shows the conversation in the tab.
+
+Chrome additionally asks the user before a public website may contact this
+device (its Local Network Access permission). The page reads that permission's
+state and never triggers Chrome's prompt on its own: while Chrome would still
+ask, the page can't look for the app either, so it shows its toast and lets the
+user's click bring the prompt up. A server running on this machine isn't subject to that permission. A browser
+that blocks loopback requests from `https` pages keeps today's behaviour.
+
+The listener is in `src/desktopOpenServer.js` (unit-tested without Electron);
+the page's side is `web/src/lib/desktopAppHandoff.ts`.
 
 ## Implementation notes
 

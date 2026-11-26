@@ -9,32 +9,36 @@
 //    hidden ("Read 2 files", rendered by `ToolGroupSummary`). While
 //    the run is the live activity, the trailing `STREAMING_TAIL`
 //    tools stay visible as individual rows so the user can watch
-//    recent steps. Still-in-progress spinners and durable
-//    routing/fan-out cards never fold regardless of position.
+//    recent steps. Still-in-progress spinners, durable routing/fan-out
+//    cards and messages to other sessions never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
 //    "Worked" row, sub-agent notices included. Pending elicitations,
-//    routing cards, the newest notices and assistant messages stay
-//    visible; opt-in `foldNarration` folds narration too (Codex
-//    commentary, else all but the last message).
+//    routing cards, messages to other sessions, task markers, the newest
+//    notices and assistant messages stay visible; opt-in `foldNarration`
+//    folds narration too (Codex commentary, else all but the last message).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { formatDuration } from "@/lib/relativeTime";
 import type { RenderItem } from "@/lib/renderItems";
+import { outboundSessionMessage } from "@/lib/sessionMessageOrigin";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
+import { OutboundSessionMessageCard } from "./SessionMessageCard";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
-import { readTaskActivity } from "@/lib/taskActivity";
+import { readTaskActivity, showsTaskActivity } from "@/lib/taskActivity";
 import { ActivityNotice } from "./TaskActivityMessage";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
@@ -127,7 +131,10 @@ type FoldInputs = Pick<
   | "showsWorking"
   | "defaultExpanded"
   | "foldNarration"
->;
+> & {
+  /** The server's workflows feature, which plan-task markers need to show. */
+  workflowsEnabled?: boolean;
+};
 
 /**
  * How live a turn is, from the bubble's own lifecycle and the session's.
@@ -188,9 +195,6 @@ function hasFoldableShape(
     .findLast((item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity");
   // A terminal failure or denial must stay visible beside the assistant text.
   if (isFailureItem(lastItem)) return false;
-  // A turn that moves tasks keeps its task markers in view: they're the turn's
-  // outline, and its tool calls stay in their own "Called N tools" groups.
-  if (items.some(isTaskMarker)) return false;
   return (
     !isProvisionalTrace(items) &&
     segments.some((segment) => segment.kind === "work") &&
@@ -205,7 +209,12 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
-  const partition = partitionTurn(inputs.items, foldsNarration(inputs), inputs.continued);
+  const partition = partitionTurn(
+    inputs.items,
+    foldsNarration(inputs),
+    inputs.continued,
+    inputs.workflowsEnabled,
+  );
   return (
     hasFoldableShape(inputs.items, partition, inputs.continued) &&
     partition.segments.every((segment) => segment.kind === "work") &&
@@ -246,14 +255,15 @@ export function BlockRenderer({
     showsWorking,
   });
 
+  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   // Keep each message visible even when a later tool call follows it,
   // unless the user opted into folding narration.
   const partition = partitionTurn(
     items,
     foldsNarration({ items, turnLifecycle, foldNarration }),
     continued,
+    workflowsEnabled,
   );
-  const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
   // firing) flips the session to running — Working shimmer included —
@@ -318,6 +328,7 @@ export function BlockRenderer({
 
   if (showFold) {
     const rendered: ReactNode[] = [];
+    const durations = workRunDurations(partition.segments, workedForS);
     for (const segment of partition.segments) {
       if (segment.kind === "text") {
         rendered.push(
@@ -329,17 +340,16 @@ export function BlockRenderer({
         );
         continue;
       }
-      if (segment.kind === "exempt") {
+      if (segment.kind === "exempt" || segment.kind === "marker") {
         rendered.push(
           renderItem(segment.item, segment.index, false, false, false, false, onRetryError),
         );
         continue;
       }
-      // The available duration spans the entire turn, not each work run.
       rendered.push(
         <TurnWorkedFold
           key={`worked:${segment.startIndex}`}
-          workedForS={workRunCount === 1 ? workedForS : undefined}
+          workedForS={durations.get(segment)}
           animateCollapse={animateCollapse}
           defaultOpen={defaultExpanded}
         >
@@ -468,9 +478,13 @@ interface TurnPartition {
   latest: { items: RenderItem[]; startIndex: number } | null;
 }
 
+type TaskMarkerItem = Extract<RenderItem, { kind: "subagent_activity" }>;
+
 type TurnSegment =
   | { kind: "work" | "text"; items: RenderItem[]; startIndex: number }
-  | { kind: "exempt"; item: RenderItem; index: number };
+  | { kind: "exempt"; item: RenderItem; index: number }
+  // A task marker outlines the turn: it stays in view, and the work on either side folds apart.
+  | { kind: "marker"; item: TaskMarkerItem; index: number };
 
 // A trailing `turn_diff` belongs with earlier work, after the last message.
 const TRAILING_WRAPUP_TOOLS = new Set(["turn_diff"]);
@@ -481,19 +495,22 @@ function isTrailingWrapup(item: RenderItem): boolean {
   return item.kind === "tool" && TRAILING_WRAPUP_TOOLS.has(item.execution.name);
 }
 
+/** A task's start or end, or a plan change, that the chat shows (sub-agent notices aren't). */
+function isShownTaskMarker(item: RenderItem, workflowsEnabled: boolean): item is TaskMarkerItem {
+  if (item.kind !== "subagent_activity") return false;
+  const activity = readTaskActivity(item.data);
+  return activity !== null && showsTaskActivity(activity, workflowsEnabled);
+}
+
 /**
  * Split work from assistant text while preserving order. Every completed
  * message stays visible unless `foldNarration` asks to fold narration.
  */
-/** A task's start or end, or a plan change, in the chat (sub-agent notices aren't). */
-function isTaskMarker(item: RenderItem): boolean {
-  return item.kind === "subagent_activity" && readTaskActivity(item.data) !== null;
-}
-
 function partitionTurn(
   items: RenderItem[],
   foldNarration = false,
   continued = false,
+  workflowsEnabled = false,
 ): TurnPartition {
   const latestStart = continued ? items.length : latestNewsStart(items);
   const settled = items.slice(0, latestStart);
@@ -516,6 +533,10 @@ function partitionTurn(
       built.push({ kind: "exempt", item, index: i });
       continue;
     }
+    if (isShownTaskMarker(item, workflowsEnabled)) {
+      built.push({ kind: "marker", item, index: i });
+      continue;
+    }
     const kind = item.kind === "text" && !foldsText(item, i) ? "text" : "work";
     const previous = built[built.length - 1];
     if (previous?.kind === kind) previous.items.push(item);
@@ -535,6 +556,41 @@ function partitionTurn(
 }
 
 /**
+ * Each work run's "Worked for" seconds. Task markers split the turn's time into
+ * stretches; a run alone in its stretch reads that stretch's time, from the marker
+ * before it (or the turn's start) to the next (or the turn's end). Runs that share
+ * a stretch can't be timed apart, so they read "Worked".
+ */
+function workRunDurations(
+  segments: TurnSegment[],
+  workedForS: number | undefined,
+): Map<TurnSegment, number> {
+  const durations = new Map<TurnSegment, number>();
+  let runs: TurnSegment[] = [];
+  let startS: number | undefined = 0;
+  const endStretch = (endS: number | undefined) => {
+    const [run, ...others] = runs;
+    if (
+      run &&
+      others.length === 0 &&
+      startS !== undefined &&
+      endS !== undefined &&
+      endS >= startS
+    ) {
+      durations.set(run, endS - startS);
+    }
+    runs = [];
+    startS = endS;
+  };
+  for (const segment of segments) {
+    if (segment.kind === "work") runs.push(segment);
+    else if (segment.kind === "marker") endStretch(segment.item.turnElapsedS);
+  }
+  endStretch(workedForS);
+  return durations;
+}
+
+/**
  * Where the turn's latest news starts: trailing sub-agent notices and the
  * uncommitted output after them, which may belong to a response not named
  * yet. It stays visible after the fold until committed output follows.
@@ -551,17 +607,26 @@ function isNoticeOrUncommitted(item: RenderItem): boolean {
 }
 
 /**
- * A run of only notices folds with the nearest work, earlier first. With no
- * work in the turn there is no row to fold into, so the notices stay visible.
+ * A run of only notices folds with the nearest work between the same task
+ * markers, earlier first. With no work there to fold into, the notices stay
+ * visible where they landed.
  */
 function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
   const isNoticeRun = (segment: TurnSegment): boolean =>
     segment.kind === "work" && segment.items.every((item) => item.kind === "subagent_activity");
-  const workRuns = segments.filter((segment) => segment.kind === "work" && !isNoticeRun(segment));
+  let markersSoFar = 0;
+  const stretchOf = segments.map((segment) => {
+    if (segment.kind === "marker") markersSoFar += 1;
+    return markersSoFar;
+  });
+  const workRuns = segments.flatMap((segment, index) =>
+    segment.kind === "work" && !isNoticeRun(segment) ? [{ segment, index }] : [],
+  );
   return segments.flatMap((segment, index): TurnSegment[] => {
     if (segment.kind !== "work" || !isNoticeRun(segment)) return [segment];
-    const earlier = workRuns.findLast((run) => segments.indexOf(run) < index);
-    const target = earlier ?? workRuns[0];
+    const sameStretch = workRuns.filter((run) => stretchOf[run.index] === stretchOf[index]);
+    const earlier = sameStretch.findLast((run) => run.index < index)?.segment;
+    const target = earlier ?? sameStretch[0]?.segment;
     if (target?.kind !== "work") {
       return segment.items.map((item, k) => ({
         kind: "exempt",
@@ -834,7 +899,9 @@ const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_sess
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) ||
+      SESSION_SEND_NAMES.has(item.execution.name) ||
+      outboundSessionMessage(item) !== null)
   );
 }
 
@@ -919,7 +986,7 @@ function renderItem(
           duration={suppressReasoningDuration ? undefined : item.duration}
         />
       );
-    case "tool":
+    case "tool": {
       // Intelligent routing's fan-out sizing gets a structured plan card
       // instead of the generic tool row.
       if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
@@ -929,6 +996,18 @@ function renderItem(
             arguments={item.execution.arguments}
             output={item.output}
             state={item.state}
+          />
+        );
+      }
+      // A message to another session reads "To @recipient", once, in place of its call.
+      const outbound = outboundSessionMessage(item);
+      if (outbound !== null) {
+        return (
+          <OutboundSessionMessageCard
+            key={key}
+            message={outbound}
+            startedAt={item.startedAt}
+            duration={item.duration}
           />
         );
       }
@@ -943,6 +1022,7 @@ function renderItem(
           duration={item.duration}
         />
       );
+    }
     case "native_tool":
       // Reuse the same tool card. Native tools are server-side
       // (provider-managed) so they're always "completed" by the

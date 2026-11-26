@@ -277,6 +277,13 @@ _CHILD_DELIVERY_CONCURRENCY = 8
 _CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
 # Upper bound on draining queued child events at forwarder shutdown.
 _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
+_ChildModelSource = Literal["requested", "snapshot", "started"]
+# Weakest first: a weaker source never replaces a child model from a stronger one.
+_CHILD_MODEL_SOURCE_RANK: dict[_ChildModelSource, int] = {
+    "requested": 0,
+    "snapshot": 1,
+    "started": 2,
+}
 # Bounds the inline Codex reads that link an unregistered thread to the parent.
 _CODEX_THREAD_LINEAGE_READ_TIMEOUT_SECONDS = 5.0
 _CODEX_THREAD_LINEAGE_MAX_DEPTH = 4
@@ -627,6 +634,11 @@ class _CodexForwarderState:
         multiple times).
     :param child_turn_status_by_thread: Latest status from each child's own
         lifecycle or initial resume, which outranks conflicting collab snapshots.
+    :param child_models: Model each Codex child thread runs, keyed by child
+        thread id, e.g. ``{"thread_child": "gpt-5.5"}``. A child absent here is
+        assumed to run the parent's ``model``.
+    :param child_model_sources: Where each entry in ``child_models`` came from:
+        ``"requested"``, ``"snapshot"`` or ``"started"``.
     :param lineage_checked_threads: Unregistered Codex thread ids already
         checked for descent from the forwarder's thread this connection, so
         each costs at most one lineage lookup.
@@ -718,6 +730,9 @@ class _CodexForwarderState:
         terminals after a turn, or ``None`` when none is due.
     :param goal_unknown: Whether the last goal read failed. Until a read or a
         goal notification succeeds, the flag may be set but is never cleared.
+    :param forwarder_started_thread_id: Thread this forwarder started for a web
+        clear-context plan answer, e.g. ``"thread_fresh"``. The terminal's TUI is
+        still attached to the planning thread, so it is relaunched on this one.
     """
 
     model: str | None = None
@@ -749,6 +764,8 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_turn_status_by_thread: dict[str, str] = field(default_factory=dict)
+    child_models: dict[str, str] = field(default_factory=dict)
+    child_model_sources: dict[str, _ChildModelSource] = field(default_factory=dict)
     lineage_checked_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     child_delivery_slots: asyncio.Semaphore = field(
@@ -811,6 +828,7 @@ class _CodexForwarderState:
     background_terminals_supported: bool = True
     background_terminal_poll: asyncio.Task[None] | None = None
     goal_unknown: bool = False
+    forwarder_started_thread_id: str | None = None
 
     def __post_init__(self) -> None:
         """
@@ -981,6 +999,41 @@ class _CodexForwarderState:
         self.subagents_by_thread[thread_id] = session_id
         self.pending_child_threads.pop(thread_id, None)
 
+    def note_child_model(
+        self, thread_id: str, model: object, *, source: _ChildModelSource
+    ) -> None:
+        """
+        Record the model a Codex child thread runs.
+
+        :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
+        :param model: Model from ``source``, e.g. ``"gpt-5.5"``. Non-string or
+            empty values are ignored.
+        :param source: ``"started"`` for the child's ``thread/started``,
+            ``"snapshot"`` for a ``thread/resume`` or ``thread/read`` result, or
+            ``"requested"`` for its spawn item. A weaker source never replaces
+            the model, and no source replaces one a live
+            ``thread/settings/updated`` set.
+        :returns: None.
+        """
+        if not isinstance(model, str) or not model:
+            return
+        recorded = self.child_model_sources.get(thread_id)
+        if recorded is not None and (
+            _CHILD_MODEL_SOURCE_RANK[source] < _CHILD_MODEL_SOURCE_RANK[recorded]
+        ):
+            return
+        stream = self.child_streams.get(thread_id)
+        if stream is not None and stream.state.settings_model:
+            return
+        self.child_models[thread_id] = model
+        self.child_model_sources[thread_id] = source
+        if stream is not None:
+            stream.state.model = model
+
+    def child_model(self, thread_id: str) -> str | None:
+        """Return a child's own model, else the parent's model it inherits by default."""
+        return self.child_models.get(thread_id, self.model)
+
     def child_stream(
         self, client: httpx.AsyncClient, thread_id: str, session_id: str
     ) -> _CodexChildStream:
@@ -988,7 +1041,10 @@ class _CodexForwarderState:
         stream = self.child_streams.get(thread_id)
         if stream is None:
             stream = _CodexChildStream(
-                state=_CodexForwarderState(model=self.model, codex_client=self.codex_client),
+                state=_CodexForwarderState(
+                    model=self.child_model(thread_id),
+                    codex_client=self.codex_client,
+                ),
                 delta_coalescer=_OutputTextDeltaCoalescer(client, session_id),
             )
             self.child_streams[thread_id] = stream
@@ -2831,6 +2887,7 @@ async def supervise_forwarder(
     client: CodexAppServerClient | None = None,
     auth: httpx.Auth | None = None,
     ap_transport: httpx.AsyncBaseTransport | None = None,
+    relaunch_terminal: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> None:
     """
     Mirror Codex app-server notifications into an Omnigent session.
@@ -2853,6 +2910,9 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
+    :param relaunch_terminal: Optional ``(session_id, thread_id)`` callback that
+        reattaches the session's Codex TUI to a thread this forwarder started,
+        awaited once the forwarder has subscribed to it.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -2961,6 +3021,17 @@ async def supervise_forwarder(
                                 elicitation_tracker=target.elicitation_tracker,
                                 forwarder_state=forwarder_state,
                                 ready_signal=thread_active,
+                                on_subscribed=(
+                                    None
+                                    if relaunch_terminal is None
+                                    else functools.partial(
+                                        _relaunch_terminal_on_forwarder_thread,
+                                        relaunch_terminal,
+                                        forwarder_state,
+                                        session_id=target.session_id,
+                                        thread_id=target.thread_id,
+                                    )
+                                ),
                             ),
                             name="codex-native-forwarder-subscribe",
                         )
@@ -3412,6 +3483,38 @@ async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) ->
     return payload
 
 
+async def _relaunch_terminal_on_forwarder_thread(
+    relaunch_terminal: Callable[[str, str], Awaitable[None]],
+    forwarder_state: _CodexForwarderState,
+    *,
+    session_id: str,
+    thread_id: str,
+) -> None:
+    """
+    Reattach the session's TUI when the forwarder, not the TUI, started its thread.
+
+    A TUI ``/clear`` already shows the new thread. A web clear-context answer
+    leaves the TUI on the planning thread, and Codex cannot switch it remotely.
+
+    :param relaunch_terminal: ``(session_id, thread_id)`` relaunch callback.
+    :param forwarder_state: Forwarder state recording the thread it started.
+    :param session_id: Omnigent session now owning the thread, e.g. ``"conv_new"``.
+    :param thread_id: Newly subscribed Codex thread id, e.g. ``"thread_fresh"``.
+    :returns: None. Relaunch failures are logged and do not stop forwarding.
+    """
+    if forwarder_state.forwarder_started_thread_id != thread_id:
+        return
+    try:
+        await relaunch_terminal(session_id, thread_id)
+    except Exception:
+        _logger.warning(
+            "Codex terminal relaunch on thread %s failed for session %s",
+            thread_id,
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _subscribe_until_ready(
     client: CodexAppServerClient,
     ap_client: httpx.AsyncClient,
@@ -3423,6 +3526,7 @@ async def _subscribe_until_ready(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     ready_signal: asyncio.Event | None = None,
+    on_subscribed: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Subscribe this app-server connection to a Codex thread.
@@ -3467,6 +3571,8 @@ async def _subscribe_until_ready(
         thread parks here instead of polling. ``None`` falls back to the
         fixed-interval retry (used where no live event stream drives the
         signal).
+    :param on_subscribed: Awaited once after a successful subscription and its
+        replay, outside the delivery scope. Not called when subscribing fails.
     :returns: None.
     """
     bridge_state = read_bridge_state(bridge_dir)
@@ -3543,7 +3649,7 @@ async def _subscribe_until_ready(
                         replay_from_turn_id=replay_from_turn_id,
                         replay_history=not history_unavailable,
                     )
-                    return
+                    break
             if timed_out:
                 _logger.warning(
                     "Codex thread/resume for %s did not answer within %.0fs; retrying",
@@ -3569,6 +3675,8 @@ async def _subscribe_until_ready(
                 # its rollout isn't flushed yet (brief race) — a short
                 # poll covers that window.
                 await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
+    if on_subscribed is not None:
+        await on_subscribed()
 
 
 async def _finish_subscription(
@@ -4044,6 +4152,10 @@ async def _handle_event(
                 child_thread_id,
                 _parent_thread_id_from_started_event(event),
             )
+            forwarder_state.note_child_model(
+                child_thread_id, params["thread"].get("model"), source="started"
+            )
+            _queue_child_model_sync(client, forwarder_state, child_thread_id)
         return
     if method == _CODEX_MCP_STARTUP_STATUS_METHOD:
         # MCP startup is bridge-level state, surfaced on the parent
@@ -6733,6 +6845,7 @@ async def _start_clear_context_plan_implementation_turn(
     if not isinstance(thread_id, str) or not thread_id:
         _logger.warning("Codex clear-context plan implementation skipped: new thread id missing")
         return
+    forwarder_state.forwarder_started_thread_id = thread_id
     update_thread_id(bridge_dir, thread_id)
     text = f"{_PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX}\n\n{plan_text}"
     await _start_plan_implementation_turn(
@@ -7761,6 +7874,7 @@ async def _handle_collab_item(
         return
     parent_thread_id = _collab_parent_thread_id(params, item)
     for child_thread_id in _collab_receiver_thread_ids(item):
+        forwarder_state.note_child_model(child_thread_id, item.get("model"), source="requested")
         await _ensure_child_session(
             client,
             parent_session_id=parent_session_id,
@@ -7859,6 +7973,35 @@ async def _ensure_child_session(
             child_thread_id=child_thread_id,
             forwarder_state=forwarder_state,
         )
+    _queue_child_model_sync(client, forwarder_state, child_thread_id)
+
+
+def _queue_child_model_sync(
+    client: httpx.AsyncClient,
+    forwarder_state: _CodexForwarderState,
+    child_thread_id: str,
+) -> None:
+    """
+    Queue a report of a registered Codex child's own model on its session.
+
+    The report rides the child's ordered lane, like the child's other posts.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param forwarder_state: Connection state holding child mappings and models.
+    :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
+    :returns: None. Skips a child without a session or a known model.
+    """
+    child_session_id = forwarder_state.session_for_child_thread(child_thread_id)
+    if child_session_id is None or child_thread_id not in forwarder_state.child_models:
+        return
+    stream = forwarder_state.child_stream(client, child_thread_id, child_session_id)
+    queued = _QueuedChildEvent(
+        deliver=functools.partial(
+            _sync_model_change, client, session_id=child_session_id, forwarder_state=stream.state
+        ),
+        enqueued_at=asyncio.get_running_loop().time(),
+    )
+    stream.enqueue(queued, forwarder_state.child_delivery_slots)
 
 
 async def _register_child_session(
@@ -7995,6 +8138,8 @@ async def _reattach_descendant_thread(
     # mirrored any other thread's, and replaying it inline would stall the parent.
     announced = thread_id in forwarder_state.pending_child_threads
     forwarder_state.note_child_thread(thread_id, child_session_id)
+    forwarder_state.note_child_model(thread_id, thread.get("model"), source="snapshot")
+    _queue_child_model_sync(client, forwarder_state, thread_id)
     if not announced:
         forwarder_state.note_child_thread_subscribed(thread_id)
     _logger.warning(
@@ -8231,9 +8376,20 @@ async def _apply_child_resume(
         child_thread_id=child_thread_id,
         response=response,
     )
-    # Seed the session model (sub-agents inherit it) so replayed child token
-    # usage is priced into the child's total_cost_usd — see _SessionUsageCoalescer.
-    usage_coalescer = _SessionUsageCoalescer(client, child_session_id, model=forwarder_state.model)
+    result = response.get("result")
+    if isinstance(result, dict):
+        thread = result.get("thread")
+        thread_model = thread.get("model") if isinstance(thread, dict) else None
+        forwarder_state.note_child_model(
+            child_thread_id, thread_model or result.get("model"), source="snapshot"
+        )
+    # Seed the child's model so replayed child token usage is priced into the
+    # child's total_cost_usd — see _SessionUsageCoalescer.
+    usage_coalescer = _SessionUsageCoalescer(
+        client,
+        child_session_id,
+        model=forwarder_state.child_model(child_thread_id),
+    )
     # A fresh tracker is used for child replay rather than the parent's,
     # because child items do not trigger elicitation requests on the parent.
     child_elicitation_tracker = _CodexElicitationTaskTracker()
@@ -8361,6 +8517,32 @@ async def _post_collab_agent_statuses(
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is None:
             continue
+        queued = _QueuedChildEvent(
+            deliver=functools.partial(
+                _post_collab_agent_status,
+                client,
+                child_session_id=child_session_id,
+                thread_id=thread_id,
+                ap_status=ap_status,
+                forwarder_state=forwarder_state,
+            ),
+            enqueued_at=asyncio.get_running_loop().time(),
+        )
+        forwarder_state.child_stream(client, thread_id, child_session_id).enqueue(
+            queued, forwarder_state.child_delivery_slots
+        )
+
+
+async def _post_collab_agent_status(
+    client: httpx.AsyncClient,
+    *,
+    child_session_id: str,
+    thread_id: str,
+    ap_status: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Recheck a queued snapshot while holding the child's publication lock."""
+    async with _conversation_item_delivery_scope(child_session_id):
         own_status = forwarder_state.child_turn_status(thread_id)
         if own_status is not None and ap_status != own_status:
             _logger.info(
@@ -8370,7 +8552,7 @@ async def _post_collab_agent_statuses(
                 own_status,
                 thread_id,
             )
-            continue
+            return
         await _post_status(client, child_session_id, ap_status)
 
 
@@ -9464,12 +9646,13 @@ async def _post_status(
     if compaction_model is not None and selected_model is not None:
         data["compaction_model"] = compaction_model
         data["selected_model"] = selected_model
-    response = await _post_session_event(
-        client,
-        session_id,
-        event_type="external_session_status",
-        data=data,
-    )
+    async with _conversation_item_delivery_scope(session_id):
+        response = await _post_session_event(
+            client,
+            session_id,
+            event_type="external_session_status",
+            data=data,
+        )
     _log_failed_session_event_post("external_session_status", response)
     return response is not None and response.status_code < 400
 

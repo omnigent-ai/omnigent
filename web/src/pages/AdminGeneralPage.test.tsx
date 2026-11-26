@@ -1,8 +1,13 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSharing, useSetSharing } from "@/hooks/useSharing";
 import { AdminGeneralPage } from "./AdminGeneralPage";
+
+/** Settings rows read shell support through queries, as under the app. */
+const queryClient = () => new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
 const mocks = vi.hoisted(() => ({
   isAdmin: true,
@@ -26,17 +31,19 @@ vi.mock("@/components/ProactiveAgentAdminControls", () => ({
   ProactiveAgentAdminControls: () => <div data-testid="advisor-admin-controls" />,
 }));
 vi.mock("@/components/ProactiveAgentSettingControl", () => ({
-  ProactiveAgentSettingControl: ({ scope }: { scope: string }) => (
-    <div data-testid={`advisor-control-${scope}`} />
+  ProactiveAgentSettingControl: ({ scope, children }: { scope: string; children?: ReactNode }) => (
+    <div data-testid={`advisor-control-${scope}`}>{children}</div>
   ),
 }));
 const mutate = vi.fn();
 
 function renderPage() {
   return render(
-    <MemoryRouter>
-      <AdminGeneralPage />
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient()}>
+      <MemoryRouter>
+        <AdminGeneralPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

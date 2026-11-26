@@ -12,6 +12,8 @@ function facts(overrides: Partial<FileCommandFacts> = {}): FileCommandFacts {
     newTabOpenable: true,
     rootable: true,
     linkable: true,
+    revealable: true,
+    fileManager: "Finder",
     editors: ["vscode", "cursor"],
     ...overrides,
   };
@@ -34,7 +36,9 @@ describe("fileCommands", () => {
     expect(availableIds(facts({ codeHostLink, previousPath: "src/old.ts" }))).toEqual(
       FILE_COMMAND_IDS.filter((id) => id !== "open-as-root"),
     );
-    expect(fileCommandsById(facts())["open-in-cursor"].label).toBe("Open in Cursor");
+    const byId = fileCommandsById(facts());
+    expect(byId.reveal.label).toBe("Show in Finder");
+    expect(byId["open-in-cursor"].label).toBe("Open in Cursor");
   });
 
   it("names the code host action by its link, and hides it without one", () => {
@@ -50,8 +54,9 @@ describe("fileCommands", () => {
     ).toEqual(HIDDEN);
   });
 
-  it("never offers a folder to the viewer or a link", () => {
+  it("opens a folder in the file manager but never offers it to the viewer or a link", () => {
     const byId = fileCommandsById(facts({ directory: true }));
+    expect(byId.reveal.label).toBe("Open in Finder");
     expect(byId.open.availability).toEqual(HIDDEN);
     expect(byId["open-in-new-tab"].availability).toEqual(HIDDEN);
     expect(byId["open-as-root"].availability).toEqual(AVAILABLE);
@@ -72,7 +77,7 @@ describe("fileCommands", () => {
   });
 
   it("copies the workspace path as the path until the workspace location loads", () => {
-    const byId = fileCommandsById(facts({ absolutePath: null, editors: [] }));
+    const byId = fileCommandsById(facts({ absolutePath: null, editors: [], revealable: false }));
     expect(byId["copy-path"].availability).toEqual(AVAILABLE);
     // Both rows would copy the same text.
     expect(byId["copy-relative-path"].availability).toEqual(HIDDEN);
@@ -83,6 +88,7 @@ describe("fileCommands", () => {
       "open",
       "open-in-new-tab",
       "copy-path",
+      "reveal",
       "open-in-vscode",
       "open-in-cursor",
     ]);
@@ -101,6 +107,7 @@ describe("fileCommands", () => {
           newTabOpenable: false,
           rootable: false,
           linkable: false,
+          revealable: false,
           editors: ["cursor"],
         }),
       ),

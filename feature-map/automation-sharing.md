@@ -69,6 +69,19 @@ runs' sessions in their own Omnigent Automation folder.
   left says so (Its schedule has no runs left.); otherwise the toast says to pause
   or delete the original so they don't both run. A refused clone shows the
   server's reason in a toast and stays put.
+- `palette-automation-list`: with `quick_pick_palette` on (off by default), the
+  Automations list offers its actions in ⌘K on Your automations: New automation…,
+  an Automations filter setting (All, Active, Paused) while the filter tabs show,
+  and for each of your automations Run “name” now (not for trigger automations),
+  Edit “name”…, Share “name”…, Clone “name” (where the server clones) and Pause or
+  Resume “name”. Each runs the row menu's own handler, greyed by the same rules as
+  the automation's header: while a change to it is saving, every row but Share is
+  greyed, and Share stays available, as the header's button does. Delete stays on
+  the row menu, which deletes without asking, and automations shared with you add
+  no rows. With the flag off the page mounts none of it
+  (`web/src/components/scheduled/automationListPaletteCommands.test.tsx`,
+  `web/src/pages/TasksPage.test.tsx`,
+  `tests/e2e_ui/scheduled/test_quick_pick_automation_commands.py`).
 - `read-only-view`: on those cards' ⋯ and right-click menus and on the
   automation's page, Run now, Edit, Share, Clone (menus only), Pause/Resume and Delete are visible
   but disabled, each with a tooltip such as Only the automation's owner can edit
@@ -92,6 +105,16 @@ runs' sessions in their own Omnigent Automation folder.
   in Pinned. The Shared with me filter lists every shared session flat. Grouped
   views have no folders, so grouped My sessions leaves the runs out. Shared runs
   can't be moved to a project.
+- `palette-automation-actions`: with `quick_pick_palette` on (off by default),
+  an automation's page lists its header actions in ⌘K: Run automation now
+  (absent for trigger automations), Edit automation…, Share automation…, and
+  Pause or Resume automation. Each runs the header button's handler. Run now,
+  Edit, Pause and Resume are greyed while a change is saving; Share stays
+  available then, as its button does. A viewer of a shared automation sees them
+  greyed with the owner-only reason, as the header's buttons are; the owner sees Share
+  only where sharing applies. Delete stays on its button, which deletes without
+  asking (`web/src/components/scheduled/AutomationPaletteCommands.test.tsx`,
+  `tests/e2e_ui/scheduled/test_quick_pick_automation_commands.py`).
 
 ## How to get to it (user POV)
 
@@ -99,6 +122,8 @@ runs' sessions in their own Omnigent Automation folder.
   then the Share button left of Edit in the header.
 - **Automations list:** open an owned automation's ⋯ menu, or right-click its
   card, then choose Share. The dialog opens over the list.
+- **⌘K:** with `quick_pick_palette` on, open an automation's page, press
+  Cmd/Ctrl+K and type "share automation", then press Enter.
 - **Clone:** open an owned automation's ⋯ menu on the Automations list, or
   right-click its card, then choose Clone. The copy's page opens.
 - **Session share dialog:** open Share on the session a shared continue-session
@@ -114,6 +139,8 @@ runs' sessions in their own Omnigent Automation folder.
   sidebar's filter menu and expand Omnigent Automation.
 - **Mobile web / managed embedded:** the same page, row menu and dialog, under the
   host's mount path.
+- **⌘K on the list:** with `quick_pick_palette` on, open Automations, press
+  Cmd/Ctrl+K and type an action and the automation's name, such as "pause digest".
 
 ## Driving it with the repro environment
 

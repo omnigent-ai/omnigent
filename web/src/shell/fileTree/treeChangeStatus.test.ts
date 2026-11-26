@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { treeChangeStatuses } from "./treeChangeStatus";
+import { treeChangeStatuses, treeIgnoredStatuses } from "./treeChangeStatus";
 
 const statusOf = (entries: ReturnType<typeof treeChangeStatuses>, path: string) =>
   entries.find((entry) => entry.path === path)?.status;
@@ -46,5 +46,30 @@ describe("treeChangeStatuses", () => {
 
   it("has nothing to mark when nothing changed", () => {
     expect(treeChangeStatuses([])).toEqual([]);
+  });
+});
+
+describe("treeIgnoredStatuses", () => {
+  it("marks the listed files and folders Git ignores, folders as tree paths", () => {
+    const listed = (path: string, type: "file" | "directory", ignored?: true) => ({
+      path,
+      name: path.split("/").at(-1)!,
+      type,
+      bytes: null,
+      modified_at: null,
+      ...(ignored ? { ignored } : {}),
+    });
+
+    expect(
+      treeIgnoredStatuses([
+        listed("build", "directory", true),
+        listed("debug.log", "file", true),
+        listed("src", "directory"),
+        listed("main.py", "file"),
+      ]),
+    ).toEqual([
+      { path: "build/", status: "ignored" },
+      { path: "debug.log", status: "ignored" },
+    ]);
   });
 });

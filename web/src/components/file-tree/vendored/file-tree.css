@@ -322,6 +322,17 @@
   }
 }
 
+/* The row under the actions button keeps room for it, so the button never covers its name. */
+[data-file-tree] [data-type="item"][data-item-has-menu-button] {
+  padding-inline-end: calc(var(--trees-item-padding-x) + var(--trees-row-height));
+}
+
+/* Pointing at the button still reads as pointing at its row; a selected row keeps its highlight. */
+[data-file-tree]:has([data-type="context-menu-trigger"]:hover)
+  [data-type="item"][data-item-has-menu-button]:not([aria-selected="true"]) {
+  background-color: var(--trees-bg-muted);
+}
+
 /* One actions button follows the hovered or focused row. */
 [data-file-tree] [data-type="context-menu-trigger"] {
   position: absolute;

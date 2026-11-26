@@ -19,6 +19,8 @@ export interface ChangedFileCommand {
   paletteLabel: string;
   keywords: readonly string[];
   availability: CommandAvailability;
+  /** Named after the file, so sessions matching its name stay above it in ⌘K. */
+  leadsSources: false;
   path: string;
 }
 
@@ -39,6 +41,7 @@ export function changedFileCommands(facts: ChangedFileCommandFacts): ChangedFile
         "background",
       ],
       availability: AVAILABLE,
+      leadsSources: false,
       path: facts.shownPath,
     },
   ];

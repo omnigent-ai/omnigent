@@ -368,6 +368,8 @@ function startDisplayCapture(recordDir, display) {
  *   e.g. a scratch `HOME` so credential files stay out of the real one.
  * @param {string[]} [opts.preload] Modules the main process requires before
  *   `main.js`, e.g. a stand-in system browser that must exist from launch.
+ * @param {boolean} [opts.displayCapture] `false` skips the display capture, for a
+ *   journey that starts its own once setup is done.
  * @param {boolean} [opts.waitForShell] `false` returns right after launch with
  *   `window: null`, for journeys whose shell may never load a page.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
@@ -420,7 +422,8 @@ async function launchDesktop(opts) {
   // recording" would silently drop the very content a journey renders inside
   // an embedded browser view. The display capture becomes the primary clip in
   // saveRecording; the per-page clips remain as context.
-  const displayCapture = startDisplayCapture(opts.recordDir, process.env.DISPLAY);
+  const displayCapture =
+    opts.displayCapture === false ? null : startDisplayCapture(opts.recordDir, process.env.DISPLAY);
 
   const stopDisplayCapture = async () => {
     if (displayCapture) await displayCapture.stop();
@@ -578,4 +581,5 @@ module.exports = {
   spawnServer,
   launchDesktop,
   saveRecording,
+  startDisplayCapture,
 };

@@ -842,6 +842,30 @@ class SessionResourcePaginatedList(BaseModel):
     has_more: bool = False
 
 
+class TerminalShellState(BaseModel):
+    """Whether a session terminal runs anything besides its login shell.
+
+    Only what a close confirmation needs: never a pid, an argument or another process.
+    """
+
+    state: Literal["idle", "busy", "unknown"] = Field(
+        description="`idle`: only the login shell runs, with no other process; a loop of "
+        "shell builtins still reads idle. `busy`: something else does. `unknown`: it "
+        "couldn't be told in time, or the terminal doesn't run a shell; treat it as busy."
+    )
+    foreground: str | None = Field(
+        default=None,
+        description="When busy, the foreground job's command name, e.g. `vim`; cleaned and "
+        "at most 32 characters. Null when it can't be told.",
+    )
+    background_jobs: int | None = Field(
+        default=None,
+        ge=0,
+        description="When busy, how many other jobs run. Null when jobs can't be told apart, "
+        "as in a sandboxed pane.",
+    )
+
+
 # ── Conversations ───────────────────────────────────────────────
 
 
@@ -2440,6 +2464,12 @@ class SessionResponse(BaseModel):
         family instead of inferring it from the model string (which
         is wrong when the agent declares no model). ``None`` when
         the agent cannot be looked up.
+    :param permission_mode: The permission mode the session is in, in its
+        harness's vocabulary, e.g. ``"auto"`` or ``"approve-for-me"`` (the
+        names ``sys_session_create`` takes). Follows a switch made while it
+        runs to a mode that keeps approval; a mode that skips approval shows
+        only when the session's launch settings select it. ``None`` when the
+        harness has no permission modes or the mode cannot be told.
     :param model_override: Per-session LLM model override,
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
@@ -2633,6 +2663,7 @@ class SessionResponse(BaseModel):
     root_conversation_id: str | None = None
     llm_model: str | None = None
     harness: str | None = None
+    permission_mode: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
@@ -3572,6 +3603,18 @@ class WorkflowRunStarter(BaseModel):
     title: str
 
 
+class WorkflowRunAutomation(BaseModel):
+    """
+    The automation whose scheduled run started a workflow run.
+
+    :param id: The automation's ID, e.g. ``"0123456789abcdef0123456789abcdef"``.
+    :param name: Its name, e.g. ``"Nightly triage"``.
+    """
+
+    id: str
+    name: str
+
+
 class WorkflowRun(BaseModel):
     """
     One run of a saved workflow: a session that started it.
@@ -3598,6 +3641,8 @@ class WorkflowRun(BaseModel):
         ``None`` for someone else's workflow or a deleted one.
     :param started_by: The session that started it, when another session did
         and the caller can read that session.
+    :param automation: The automation whose scheduled run started its session,
+        when the caller owns that automation or it is shared with them.
     :param descendant_runs: The first page of the workflow runs below this one:
         those of the sessions its session started while it was current, then
         theirs, each right after the run that started it. Empty on the runs
@@ -3627,6 +3672,7 @@ class WorkflowRun(BaseModel):
     statuses: list[SessionJournalEntry] = Field(default_factory=list)
     workflow_name: str | None = None
     started_by: WorkflowRunStarter | None = None
+    automation: WorkflowRunAutomation | None = None
     descendant_runs: list[WorkflowRun] = Field(default_factory=list)
     descendant_run_count: int = 0
     descendant_runs_cursor: str | None = None
@@ -6457,11 +6503,14 @@ class SessionProjectSummary(BaseModel):
     :param icon: The project's chosen emoji icon (a unicode grapheme), read
         from its ``config``; ``None`` when unset or for a label-only folder,
         so the sidebar falls back to the default folder glyph.
+    :param muted: Whether the owner muted notifications for every session in
+        the project, read from its ``config``; ``False`` for a label-only folder.
     """
 
     id: str | None = None
     name: str
     icon: str | None = None
+    muted: bool = False
 
 
 class CreateProjectRequest(BaseModel):

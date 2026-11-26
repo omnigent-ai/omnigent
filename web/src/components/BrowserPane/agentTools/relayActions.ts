@@ -5,7 +5,12 @@
 // the window that has the page (electron/src/browserTabs.js), so this
 // window needn't be the one showing it.
 import { AGENT_BROWSER_TAB_ID, agentBrowserTabId, browserViewId } from "@/hooks/useBrowserTabs";
-import { SESSION_HOST_PROTOCOL, type BrowserHostOptions } from "@/lib/nativeBridge";
+import {
+  SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
+  type BrowserHostOptions,
+} from "@/lib/nativeBridge";
 import {
   addBrowserTab,
   agentTabIn,
@@ -418,7 +423,12 @@ export async function dispatchAgentBrowserAction<D extends object, R extends Age
             // the probed view needs: another tab can be the host-local one.
             readHostOptions ??
               (sourceHostId
-                ? { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId }
+                ? {
+                    sessionHostProtocol: SESSION_HOST_PROTOCOL,
+                    sshPreviewProtocol: SSH_PREVIEW_PROTOCOL,
+                    trustedRemotePreviewProtocol: TRUSTED_REMOTE_PREVIEW_PROTOCOL,
+                    sourceHostId,
+                  }
                 : undefined),
           ),
       );

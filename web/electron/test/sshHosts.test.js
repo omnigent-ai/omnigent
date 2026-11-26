@@ -39,7 +39,10 @@ describe("createSshHostStore", () => {
   });
 
   it("records a dashed id under the same key a lookup uses", () => {
-    const store = createSshHostStore(() => file);
+    const changes = [];
+    const store = createSshHostStore(() => file, {
+      onChange: (server, host) => changes.push([server, host, store.destination(server, host)]),
+    });
 
     store.record("https://a.example/", "01234567-89ab-cdef-0123-456789ABCDEF", "my-box");
 
@@ -47,6 +50,14 @@ describe("createSshHostStore", () => {
       store.destination("https://a.example/", "0123456789abcdef0123456789abcdef"),
       "my-box",
     );
+    store.record("https://a.example/", "0123456789abcdef0123456789abcdef", "my-box");
+    store.record("https://a.example/", "0123456789abcdef0123456789abcdef", "other-box");
+    store.record("https://a.example/", "0123456789abcdef0123456789abcdef", "my-box");
+    assert.deepEqual(changes, [
+      ["https://a.example/", "0123456789abcdef0123456789abcdef", "my-box"],
+      ["https://a.example/", "0123456789abcdef0123456789abcdef", "other-box"],
+      ["https://a.example/", "0123456789abcdef0123456789abcdef", "my-box"],
+    ]);
   });
 
   it("ignores a destination that isn't a valid ssh destination", () => {
@@ -84,7 +95,10 @@ describe("createSshHostStore", () => {
   it("keeps the previous record when a write fails, and leaves no temp file", () => {
     const hostId = "0123456789abcdef0123456789abcdef";
     const otherId = "fedcba9876543210fedcba9876543210";
-    const store = createSshHostStore(() => file);
+    const changes = [];
+    const store = createSshHostStore(() => file, {
+      onChange: (server, host) => changes.push([server, host]),
+    });
     store.record("https://a.example/", hostId, "my-box");
     // A directory where the record should be makes the rename fail.
     fs.rmSync(file);
@@ -94,6 +108,7 @@ describe("createSshHostStore", () => {
 
     assert.equal(store.destination("https://a.example/", hostId), "my-box");
     assert.equal(store.destination("https://a.example/", otherId), null);
+    assert.deepEqual(changes, [["https://a.example/", hostId]]);
     assert.deepEqual(
       fs.readdirSync(directory).filter((name) => name.endsWith(".tmp")),
       [],

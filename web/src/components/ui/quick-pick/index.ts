@@ -4,6 +4,13 @@ export {
   type QuickPickPresentation,
   type QuickPickProps,
 } from "./QuickPick";
+export {
+  QuickPickDialog,
+  type QuickPickDialogAcceptResult,
+  type QuickPickDialogProps,
+  type QuickPickHandOff,
+  type QuickPickHeading,
+} from "./QuickPickDialog";
 export { HighlightedText, type MatchHighlight } from "./HighlightedText";
 export {
   compareItemMatches,
@@ -43,10 +50,12 @@ export { readQuickPickHistory, recordQuickPickHistory, removeQuickPickHistory } 
 export type {
   QuickPickAcceptDetails,
   QuickPickAcceptResult,
+  QuickPickGroupAction,
   QuickPickInputError,
   QuickPickItem,
   QuickPickLoadRequest,
   QuickPickRanking,
+  QuickPickRowAction,
   QuickPickSource,
   QuickPickStats,
 } from "./model";
