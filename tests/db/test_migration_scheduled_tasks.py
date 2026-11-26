@@ -1432,15 +1432,9 @@ def test_receipt_keys_are_bounded_on_sqlite(db_engine: Engine) -> None:
 
 def test_downgrade_guard_seeks_to_its_cursor_on_sqlite(db_engine: Engine) -> None:
     """Each later page of the guard is a seek, so the whole check reads each task once."""
-    import importlib.util
-
-    path = next(
-        Path(__file__).parents[2].glob("omnigent/db/migrations/versions/bdd2c8a6005c_*.py")
+    migration = import_module(
+        "omnigent.db.migrations.versions.bdd2c8a6005c_add_scheduled_task_trigger_config"
     )
-    spec = importlib.util.spec_from_file_location("trigger_migration", path)
-    assert spec is not None and spec.loader is not None
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
     tasks = sa.table(
         "scheduled_tasks", sa.column("workspace_id"), sa.column("id"), sa.column("rrule")
     )
