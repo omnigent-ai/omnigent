@@ -244,7 +244,18 @@ async def measure_scenario(
     except Exception:
         try:
             # Failed assets can leave font readiness pending; capture the rendered frame.
-            capture = await (await context.new_cdp_session(page)).send("Page.captureScreenshot")
+            screenshot_cdp = await context.new_cdp_session(page)
+            try:
+                capture = await screenshot_cdp.send("Page.captureScreenshot")
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Failure screenshot capture failed at %s; retrying",
+                    evidence.with_suffix(".failed.png"),
+                    exc_info=True,
+                )
+                async with asyncio.timeout(2):
+                    await asyncio.sleep(0.1)
+                    capture = await screenshot_cdp.send("Page.captureScreenshot")
             evidence.with_suffix(".failed.png").write_bytes(base64.b64decode(capture["data"]))
         except Exception:
             logging.getLogger(__name__).warning(
