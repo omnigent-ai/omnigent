@@ -55,9 +55,8 @@ export function showPullRequestInPanel(
   sessionId: string,
   url: string,
 ): void {
-  queryClient.setQueryData<PullRequestPanelView>(pullRequestPanelViewKey(sessionId), {
-    selected: url,
-    showingDetails: true,
-    subtab: "summary",
-  });
+  queryClient.setQueryData<PullRequestPanelView>(
+    pullRequestPanelViewKey(sessionId),
+    viewForChosenPullRequest(url, "summary"),
+  );
 }

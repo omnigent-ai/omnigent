@@ -11,6 +11,29 @@ function classicOnly(openGithubTab: (prUrl?: string) => void) {
     createElement(FileViewerContext.Provider, { value }, children);
 }
 
+describe("useShowPullRequests", () => {
+  const PR = "https://github.com/acme/app/pull/42";
+
+  it("is null outside a shell", () => {
+    expect(renderHook(() => useShowPullRequests()).result.current).toBeNull();
+  });
+
+  it("hands the target and options to a shell that shows pull requests itself", () => {
+    const openGithubTab = vi.fn();
+    const showPullRequests = vi.fn();
+    const value = { openGithubTab, showPullRequests } as unknown as NonNullable<
+      ContextType<typeof FileViewerContext>
+    >;
+    const { result } = renderHook(() => useShowPullRequests(), {
+      wrapper: ({ children }: { children: ReactNode }) =>
+        createElement(FileViewerContext.Provider, { value }, children),
+    });
+    result.current!({ kind: "pull", url: PR }, { classic: "open" });
+    expect(showPullRequests).toHaveBeenCalledWith({ kind: "pull", url: PR }, { classic: "open" });
+    expect(openGithubTab).not.toHaveBeenCalled();
+  });
+});
+
 describe("useShowPullRequests without a shell that shows them itself", () => {
   const PR = "https://github.com/acme/app/pull/42";
 
