@@ -1,6 +1,5 @@
-// Files recently opened in each session, most recent first, so Go to File can
-// list them before a query and rank them higher. Kept for the most recently
-// used sessions only, so storage stays bounded however many sessions exist.
+// Files recently opened in each session, newest first, which Go to File lists before a
+// query. Kept for the most recently used sessions only, so storage stays bounded.
 
 export const RECENT_WORKSPACE_FILES_STORAGE_KEY = "omnigent.recentWorkspaceFiles";
 export const RECENT_FILES_PER_SESSION = 50;
