@@ -3,6 +3,8 @@ import { authenticatedFetch } from "./identity";
 import {
   applySuggestionUpdate,
   listSuggestions,
+  markAllSuggestionsRead,
+  reconcileMarkAllRead,
   reconcileSuggestion,
   statusAfterUpdate,
   suggestionLinkTarget,
@@ -87,6 +89,29 @@ describe("API calls", () => {
     expect(result.data[0].actions).toEqual([{ label: "Ramp up", prompt: "Ramp it" }]);
     // Blocks without a string type are dropped; the rest pass through for their renderer.
     expect(result.data[0].media).toEqual([{ type: "chart", chart: { version: 1 } }]);
+  });
+
+  it.each([
+    [null, null, {}],
+    ["agent_x", "5:abc", { agent_id: "agent_x", after: "5:abc" }],
+  ])("marks one batch read, for agent %s after %s", async (agentId, after, body) => {
+    mockFetch.mockResolvedValue(
+      response({ marked_ids: ["a", "b"], next_cursor: "1:b", unread_count: 0 }),
+    );
+
+    const result = await markAllSuggestionsRead(agentId, after);
+
+    expect(mockFetch.mock.calls[0][0]).toBe("/v1/inbox/items/mark-read");
+    expect(mockFetch.mock.calls[0][1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    expect(result).toEqual({
+      markedIds: ["a", "b"],
+      nextCursor: "1:b",
+      unreadCount: 0,
+      unreadCountCapped: false,
+    });
   });
 
   it("asks for the next page of one status", async () => {
@@ -174,6 +199,27 @@ describe("reconcileSuggestion", () => {
     expect(
       reconcileSuggestion(pages, reply(item({ id: "z", status: "dismissed" }), 4))[0],
     ).toMatchObject({ data: pages[0].data, unreadCount: 4 });
+  });
+});
+
+describe("reconcileMarkAllRead", () => {
+  it("reads the items the batch marked and takes the server's total", () => {
+    const pages = [
+      page([
+        item({ id: "a" }),
+        item({ id: "b", agentId: "other" }),
+        item({ id: "c", status: "dismissed" }),
+      ]),
+    ];
+    const next = reconcileMarkAllRead(pages, {
+      markedIds: ["a", "c"],
+      nextCursor: null,
+      unreadCount: 1,
+      unreadCountCapped: false,
+    })[0];
+    // Only an unread item moves; one resolved since keeps its status.
+    expect(next.data.map((entry) => entry.status)).toEqual(["read", "unread", "dismissed"]);
+    expect(next.unreadCount).toBe(1);
   });
 });
 

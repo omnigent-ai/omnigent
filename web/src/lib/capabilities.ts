@@ -405,6 +405,11 @@ export interface ServerInfo {
   /** Agents can post items to this caller's Inbox (``/v1/inbox/items``). */
   inbox_items_available?: boolean;
   /**
+   * ``POST /v1/inbox/items/mark-read`` marks every unread item read in one call;
+   * absent on older servers (off).
+   */
+  inbox_mark_all_read?: boolean;
+  /**
    * Automations shared with the viewer can be listed (``/v1/scheduled-tasks/shared``);
    * absent on older servers (off), including some that advertise sharing.
    */
@@ -808,6 +813,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_sharing: data.scheduled_task_sharing === true,
           inbox_items_available: data.inbox_items_available === true,
+          inbox_mark_all_read: data.inbox_mark_all_read === true,
           scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
           scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
           scheduled_task_clone: data.scheduled_task_clone === true,

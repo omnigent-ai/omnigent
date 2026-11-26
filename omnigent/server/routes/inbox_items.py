@@ -2,8 +2,8 @@
 
 ``POST /v1/inbox/items`` is for agents only: the request must come from a
 session the caller owns, through that session's runner, and the session's
-agent must enable the ``user_inbox`` tool group. ``GET`` and ``PATCH`` serve
-the owner's Inbox.
+agent must enable the ``user_inbox`` tool group. ``GET``, ``PATCH`` and
+``POST /v1/inbox/items/mark-read`` serve the owner's Inbox.
 """
 
 from __future__ import annotations
@@ -48,6 +48,8 @@ MAX_ITEMS_PER_SESSION = INBOX_ITEMS_PER_SESSION
 MAX_ACTIONS_PER_ITEM = 3
 # The unread badge counts up to this many; GET reports when the count is capped.
 UNREAD_COUNT_LIMIT = 100
+# Unread items one mark-read call reads, so each call is one bounded transaction.
+MARK_READ_BATCH_LIMIT = 100
 _POST_ACTION = "Inbox posts"
 _ITEM_ID = re.compile(r"[0-9a-f]{32}")
 _CURSOR = re.compile(r"([0-9]{1,19}):([0-9a-f]{32})")
@@ -129,6 +131,20 @@ class UpdateInboxItemRequest(BaseModel):
         if (self.resolution == "action_taken") != (self.resolution_action is not None):
             raise ValueError("resolution_action goes only with resolution action_taken")
         return self
+
+
+class MarkAllReadRequest(BaseModel):
+    """Body for ``POST /v1/inbox/items/mark-read``.
+
+    ``agent_id`` limits the mark to one posting agent's items, as the web
+    Inbox does on that agent's tab. Each call marks one bounded batch; pass the
+    reply's ``next_cursor`` as ``after`` until it is ``null``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    after: str | None = Field(default=None, max_length=64)
 
 
 def _item_json(item: InboxItem) -> dict[str, Any]:
@@ -313,6 +329,26 @@ def create_inbox_items_router(
         )
         return {
             "data": [_item_json(item) for item in items],
+            "next_cursor": f"{next_cursor[0]}:{next_cursor[1]}" if next_cursor else None,
+            "unread_count": unread,
+            "unread_count_capped": unread >= UNREAD_COUNT_LIMIT,
+        }
+
+    @router.post("/inbox/items/mark-read")
+    async def mark_inbox_items_read(request: Request, body: MarkAllReadRequest) -> dict[str, Any]:
+        """Mark one batch of the caller's unread items read, and report the unread total after."""
+        owner = _owner(request)
+        cursor = _parse_cursor(body.after)
+        marked, next_cursor = await asyncio.to_thread(
+            lambda: store.mark_read_batch(
+                owner, agent_id=body.agent_id, after=cursor, limit=MARK_READ_BATCH_LIMIT
+            )
+        )
+        unread = await asyncio.to_thread(
+            lambda: store.count_unread(owner, limit=UNREAD_COUNT_LIMIT)
+        )
+        return {
+            "marked_ids": marked,
             "next_cursor": f"{next_cursor[0]}:{next_cursor[1]}" if next_cursor else None,
             "unread_count": unread,
             "unread_count_capped": unread >= UNREAD_COUNT_LIMIT,

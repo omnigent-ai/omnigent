@@ -185,6 +185,67 @@ export async function updateSuggestion(
   };
 }
 
+/** The server's reply to one mark-read batch. */
+export interface MarkReadBatchResult {
+  /** The suggestions this batch marked read. */
+  markedIds: string[];
+  /** Pass to the next call; `null` once no unread suggestion is left past this batch. */
+  nextCursor: string | null;
+  unreadCount: number;
+  unreadCountCapped: boolean;
+}
+
+/**
+ * Mark one bounded batch of the viewer's unread suggestions read, or only
+ * *agentId*'s, starting after *after*. Needs `inbox_mark_all_read` in the
+ * server info.
+ */
+export async function markAllSuggestionsRead(
+  agentId: string | null,
+  after: string | null = null,
+): Promise<MarkReadBatchResult> {
+  const body: Record<string, string> = {};
+  if (agentId !== null) body.agent_id = agentId;
+  if (after !== null) body.after = after;
+  const res = await authenticatedFetch("/v1/inbox/items/mark-read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const reply = (await res.json()) as {
+    marked_ids: string[];
+    next_cursor: string | null;
+    unread_count: number;
+    unread_count_capped?: boolean;
+  };
+  return {
+    markedIds: reply.marked_ids,
+    nextCursor: reply.next_cursor,
+    unreadCount: reply.unread_count,
+    unreadCountCapped: reply.unread_count_capped === true,
+  };
+}
+
+/**
+ * Write a mark-read batch into cached pages: the items it marked read, and
+ * every page's total set to the server's count after it.
+ */
+export function reconcileMarkAllRead(
+  pages: SuggestionPage[],
+  saved: MarkReadBatchResult,
+): SuggestionPage[] {
+  const marked = new Set(saved.markedIds);
+  return pages.map((page) => ({
+    ...page,
+    unreadCount: saved.unreadCount,
+    unreadCountCapped: saved.unreadCountCapped,
+    data: page.data.map((item) =>
+      marked.has(item.id) && item.status === "unread" ? { ...item, status: "read" } : item,
+    ),
+  }));
+}
+
 /** The status an update moves an item to, matching the server's rules. */
 export function statusAfterUpdate(update: SuggestionUpdate): SuggestionStatus {
   if ("status" in update) return update.status;

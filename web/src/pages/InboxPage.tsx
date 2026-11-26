@@ -473,6 +473,19 @@ export function InboxPage() {
   // lists only approvals, so it never offers the action.
   const showMarkAllRead = filter !== "awaiting" && (markAllReadCount > 0 || markingAll);
   const markSuggestionsRead = async () => {
+    // One call covers every page; on the advisor tab, only that agent's items.
+    if (proactiveInbox.canMarkAllRead) {
+      if (advisorOnly && advisorSettings === undefined) return;
+      const outcome = await proactiveInbox.markAllRead(
+        advisorOnly && advisorSettings ? advisorSettings.agent_id : null,
+      );
+      if (outcome === "failed") showToast("Couldn’t mark every suggestion as read. Try again.");
+      else if (outcome === "partial") {
+        showToast("Some suggestions are still unread. Click Mark all as read again.");
+      }
+      return;
+    }
+    // Older servers mark one suggestion at a time, so list those past the loaded pages.
     const targets = new Set(unreadSuggestions.map((item) => item.id));
     let listingFailed = false;
     if (showSuggestions && proactiveInbox.hasNextPage) {

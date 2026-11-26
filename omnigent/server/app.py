@@ -317,6 +317,8 @@ class ServerInfoResponse(BaseModel):
     automations_enabled: bool = False
     # Whether agents can post to this caller's Inbox (``/v1/inbox/items``).
     inbox_items_available: bool = False
+    # Whether ``POST /v1/inbox/items/mark-read`` marks every unread item read in one call.
+    inbox_mark_all_read: bool = False
     # Whether the deployment offers the proactive agent to this caller; each
     # user's own on/off state is at ``GET /v1/proactive-agent/settings``.
     proactive_agent_available: bool = False
@@ -4242,6 +4244,7 @@ def create_app(
                 "memory": app.state.memory_available(),
                 "automations_enabled": automations_enabled,
                 "inbox_items_available": app.state.inbox_items_available(),
+                "inbox_mark_all_read": app.state.inbox_items_available(),
                 "proactive_agent_available": app.state.proactive_agent_available(),
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),

@@ -5022,6 +5022,38 @@
         "title": "MCPServerSummary",
         "type": "object"
       },
+      "MarkAllReadRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/inbox/items/mark-read`.\n\n`agent_id` limits the mark to one posting agent's items, as the web\nInbox does on that agent's tab. Each call marks one bounded batch; pass the\nreply's `next_cursor` as `after` until it is `null`.",
+        "properties": {
+          "after": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          }
+        },
+        "title": "MarkAllReadRequest",
+        "type": "object"
+      },
       "McpServerEnabledRequest": {
         "properties": {
           "enabled": {
@@ -8113,6 +8145,11 @@
           "inbox_items_available": {
             "default": false,
             "title": "Inbox Items Available",
+            "type": "boolean"
+          },
+          "inbox_mark_all_read": {
+            "default": false,
+            "title": "Inbox Mark All Read",
             "type": "boolean"
           },
           "installable_harnesses": {
@@ -19918,6 +19955,50 @@
           }
         },
         "summary": "Create Inbox Item",
+        "tags": [
+          "inbox_items"
+        ]
+      }
+    },
+    "/v1/inbox/items/mark-read": {
+      "post": {
+        "description": "Mark one batch of the caller's unread items read, and report the unread total after.",
+        "operationId": "mark_inbox_items_read_v1_inbox_items_mark_read_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkAllReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Mark Inbox Items Read V1 Inbox Items Mark Read Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mark Inbox Items Read",
         "tags": [
           "inbox_items"
         ]

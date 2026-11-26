@@ -13,8 +13,11 @@ import {
   applySuggestionUpdate,
   listSuggestions,
   locateSuggestion,
+  markAllSuggestionsRead,
+  reconcileMarkAllRead,
   reconcileSuggestion,
   updateSuggestion,
+  type MarkReadBatchResult,
   type SuggestionPage,
   type SuggestionStatus,
   type SuggestionUpdate,
@@ -65,11 +68,24 @@ interface ScopeState {
    * until the PATCH settles and writes the server's count. Cards are unaffected.
    */
   started: Map<string, Map<string, number>>;
+  /**
+   * Where a Mark all as read left off, keyed by its agent filter ("" for every
+   * agent), when it stopped before the end. An agent's run skips other agents'
+   * unread items without marking them, so restarting from the newest would read
+   * the same batches again on every click.
+   */
+  markAllCursors: Map<string, string>;
   /** Instances to re-render when the overlay changes. */
   listeners: Set<() => void>;
 }
 
 const scopes = new WeakMap<QueryClient, Map<string, ScopeState>>();
+
+/** Most server batches one Mark all as read runs; each reads up to 100 unread items. */
+export const MARK_ALL_READ_BATCHES = 20;
+
+/** How a Mark all as read ended: all marked, stopped at the batch cap, or a request failed. */
+export type MarkAllReadOutcome = "done" | "partial" | "failed";
 
 function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState {
   let byKey = scopes.get(queryClient);
@@ -86,6 +102,7 @@ function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState 
       resolved: new Set(),
       confirmed: new Map(),
       started: new Map(),
+      markAllCursors: new Map(),
       listeners: new Set(),
     };
     byKey.set(scopeKeyText, state);
@@ -100,6 +117,26 @@ function dataVersions(queryClient: QueryClient, key: readonly unknown[]): Map<st
     versions.set(JSON.stringify(query.queryKey), query.state.dataUpdatedAt);
   }
   return versions;
+}
+
+/**
+ * After a reply rewrites cached lists, keep each other queued item's lists
+ * marked as predating its change: requests run one at a time, so the reply's
+ * total does not include changes still waiting behind it.
+ */
+function carryStartedVersions(
+  scope: ScopeState,
+  before: Map<string, number>,
+  after: Map<string, number>,
+  exceptId?: string,
+): void {
+  for (const [other, versions] of scope.started) {
+    if (other === exceptId) continue;
+    for (const [list, version] of versions) {
+      const rewritten = after.get(list);
+      if (version === before.get(list) && rewritten !== undefined) versions.set(list, rewritten);
+    }
+  }
 }
 
 /** The item's status in whichever cached list holds it, if any. */
@@ -216,18 +253,7 @@ export function useProactiveInbox(
               data ? { ...data, pages: reconcileSuggestion(data.pages, reply) } : data,
             );
             scope.confirmed.set(id, reply.item.status);
-            // The reply's total covers only this item, since PATCHes run one at a
-            // time; other queued items are still missing from the lists it rewrote.
-            const after = dataVersions(queryClient, key);
-            for (const [other, versions] of scope.started) {
-              if (other === id) continue;
-              for (const [list, version] of versions) {
-                const rewritten = after.get(list);
-                if (version === before.get(list) && rewritten !== undefined) {
-                  versions.set(list, rewritten);
-                }
-              }
-            }
+            carryStartedVersions(scope, before, dataVersions(queryClient, key), id);
           }
           return saved !== null;
         })
@@ -240,6 +266,68 @@ export function useProactiveInbox(
           }
           scope.inFlight -= 1;
           notify();
+          if (scope.inFlight === 0) void queryClient.invalidateQueries({ queryKey: key });
+        });
+      scope.chain = request;
+      return request;
+    },
+    [queryClient, scopeKeyText],
+  );
+
+  /**
+   * Mark all unread suggestions read, or only *agentId*'s, one bounded server
+   * batch at a time. It waits behind any update in flight, like they wait for
+   * each other. Resolves to `"done"`, `"partial"` when it stopped after
+   * {@link MARK_ALL_READ_BATCHES} batches, or `"failed"`; the caller reports it.
+   * A run that stops early leaves its cursor for the next run with the same
+   * filter to pick up from.
+   */
+  const markAllRead = useCallback(
+    (agentId: string | null): Promise<MarkAllReadOutcome> => {
+      const scope = scopeState(queryClient, scopeKeyText);
+      const key = JSON.parse(scopeKeyText) as unknown[];
+      scope.inFlight += 1;
+      void queryClient.cancelQueries({ queryKey: key });
+      const applyBatch = (reply: MarkReadBatchResult) => {
+        const before = dataVersions(queryClient, key);
+        queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
+          data ? { ...data, pages: reconcileMarkAllRead(data.pages, reply) } : data,
+        );
+        // A change queued behind this batch builds on the status the server
+        // now holds, so lists that never loaded the item move their total right.
+        for (const id of reply.markedIds) {
+          if (scope.confirmed.has(id)) scope.confirmed.set(id, "read");
+        }
+        carryStartedVersions(scope, before, dataVersions(queryClient, key));
+      };
+      const request: Promise<MarkAllReadOutcome> = scope.chain
+        .then(async () => {
+          const resumeKey = agentId ?? "";
+          let cursor = scope.markAllCursors.get(resumeKey) ?? null;
+          for (let batch = 0; batch < MARK_ALL_READ_BATCHES; batch += 1) {
+            let reply: MarkReadBatchResult;
+            try {
+              // oxlint-disable-next-line no-await-in-loop -- Each batch starts at the cursor the one before returned.
+              reply = await markAllSuggestionsRead(agentId, cursor);
+            } catch {
+              // The caller reports the failure; the refetch below restores the list.
+              return "failed";
+            }
+            // oxlint-disable-next-line no-await-in-loop -- Drop a fetch that may predate this batch.
+            await queryClient.cancelQueries({ queryKey: key });
+            applyBatch(reply);
+            cursor = reply.nextCursor;
+            if (cursor === null) {
+              scope.markAllCursors.delete(resumeKey);
+              return "done";
+            }
+            scope.markAllCursors.set(resumeKey, cursor);
+          }
+          return "partial";
+        })
+        .finally(() => {
+          scope.inFlight -= 1;
+          scope.listeners.forEach((listener) => listener());
           if (scope.inFlight === 0) void queryClient.invalidateQueries({ queryKey: key });
         });
       scope.chain = request;
@@ -272,5 +360,8 @@ export function useProactiveInbox(
     fetchNextPage: query.fetchNextPage,
     refetch: query.refetch,
     update,
+    /** Whether {@link markAllRead} is available; older servers mark one item at a time. */
+    canMarkAllRead: enabled && info.inbox_mark_all_read === true,
+    markAllRead,
   };
 }

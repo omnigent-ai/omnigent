@@ -133,6 +133,31 @@ class InboxItemStore(ABC):
         """
 
     @abstractmethod
+    def mark_read_batch(
+        self,
+        user_id: str,
+        *,
+        agent_id: str | None = None,
+        after: tuple[int, str] | None = None,
+        limit: int,
+    ) -> tuple[list[str], tuple[int, str] | None]:
+        """Mark read one bounded batch of the owner's unread items, newest first.
+
+        Reads at most *limit* unread items after *after*, over the owner's
+        status index, and marks read those *agent_id* posted (all of them when
+        ``None``). Only unread items change, so a resolved item stays closed.
+        Call again with the returned cursor until it is ``None``.
+
+        :param user_id: The owner.
+        :param agent_id: Hex UUID of the posting agent to limit it to, or
+            ``None`` for every agent.
+        :param after: Cursor ``(created_at, id)`` from the previous batch.
+        :param limit: Most unread items to read in this batch.
+        :returns: The ids it marked read, and the cursor for the next batch or
+            ``None`` once no unread item is left past this one.
+        """
+
+    @abstractmethod
     def update(
         self,
         item_id: str,
