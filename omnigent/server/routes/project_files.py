@@ -332,6 +332,17 @@ class _CommentAgents:
             found.append(("Lead", entity.main_session_id))
         return list(dict.fromkeys(found))
 
+    async def reachable(self, session_id: str, project: str) -> bool:
+        """Whether a recipient session still exists, unarchived, in this project."""
+        if self.conversations is None:
+            return False
+        conversation = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        return (
+            conversation is not None
+            and not conversation.archived
+            and conversation.project_id == project
+        )
+
     async def author(self, source: Conversation, user_id: str | None) -> str:
         """How an agent's comment is signed: its role, marked as an agent."""
         name = "Agent"
@@ -472,10 +483,19 @@ def _add_comment_routes(
             raise OmnigentError("Agents can't be reached here", code=ErrorCode.RUNNER_UNAVAILABLE)
         project_entity = await asyncio.to_thread(agents.projects.get, project, user_id=user_id)
         for name, session_id in recipients:
-            if await notifications.deliver_to_session(
+            if not await agents.reachable(session_id, project):
+                continue
+            # The first existing recipient keeps the turn even while it's offline, so a
+            # second agent doesn't answer the same comments when the first one returns.
+            delivered = await notifications.deliver_to_session(
                 request.app, project_entity, session_id, stable_id=stable_id, text=text
-            ):
-                return {"sent": len(open_rows), "session_id": session_id, "recipient": name}
+            )
+            return {
+                "sent": len(open_rows),
+                "session_id": session_id,
+                "recipient": name,
+                "queued": not delivered,
+            }
         raise OmnigentError(
             "No agent is available to take these comments; open the Lead and try again",
             code=ErrorCode.CONFLICT,

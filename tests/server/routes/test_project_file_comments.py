@@ -238,7 +238,36 @@ async def test_address_all_sends_open_comments_to_the_assignee_then_the_lead(
         headers=_as_user(ALICE),
     )
     assert sent.status_code == 200, sent.text
-    assert sent.json() == {"sent": 1, "session_id": session_id, "recipient": "Product Designer"}
+    assert sent.json() == {
+        "sent": 1,
+        "session_id": session_id,
+        "recipient": "Product Designer",
+        "queued": False,
+    }
+
+    # An offline assignee keeps them queued; no second agent gets the same comments.
+    delivered.clear()
+    online = False
+
+    async def deliver_offline(app, project, session_id, *, stable_id, text, automatic=None):
+        delivered.append((session_id, text))
+        return online
+
+    monkeypatch.setattr(
+        multi_user_app.state.project_ticket_notifications, "deliver_to_session", deliver_offline
+    )
+    linked_path = f"/v1/projects/{project_id}/files/{linked_id}/comments/address"
+    queued = await client.post(linked_path, json={}, headers=_as_user(ALICE))
+    assert queued.json()["queued"] is True and queued.json()["recipient"] == "Product Designer"
+    assert [target for target, _ in delivered] == [session_id]
+
+    # A missing (archived) assignee session falls back to the Lead.
+    delivered.clear()
+    online = True
+    SqlAlchemyConversationStore(db_uri).update_conversation(session_id, archived=True)
+    fallback = await client.post(linked_path, json={}, headers=_as_user(ALICE))
+    assert fallback.json()["recipient"] == "Lead" and fallback.json()["queued"] is False
+    assert [target for target, _ in delivered] == [lead_id]
 
     # Only a person sends them; an agent can't.
     agent = {**_bind_runner(db_uri, session_id), ORCHESTRATION_SOURCE_HEADER: session_id}

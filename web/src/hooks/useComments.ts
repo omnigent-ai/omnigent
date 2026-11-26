@@ -274,11 +274,19 @@ export function useAddressProjectFileComments(scopeId: string) {
         const detail = await res.json().catch(() => null);
         throw new Error(detail?.error?.message ?? `${res.status} ${res.statusText}`);
       }
-      return (await res.json()) as { sent: number; recipient: string; session_id: string };
+      return (await res.json()) as {
+        sent: number;
+        recipient: string;
+        session_id: string;
+        queued?: boolean;
+      };
     },
     onSuccess: (data) => {
+      const count = `${data.sent} comment${data.sent === 1 ? "" : "s"}`;
       toast.success(
-        `Sent ${data.sent} comment${data.sent === 1 ? "" : "s"} to ${data.recipient}`,
+        data.queued
+          ? `Queued ${count} for ${data.recipient}; they'll pick them up when they're back`
+          : `Sent ${count} to ${data.recipient}`,
       );
       void queryClient.invalidateQueries({ queryKey: ["comments", scopeId] });
     },
