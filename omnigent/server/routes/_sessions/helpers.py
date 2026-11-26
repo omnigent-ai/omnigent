@@ -3882,6 +3882,9 @@ def _parse_external_conversation_item(
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
+    if item_type == "terminal_command":
+        # Only the pending-input drain can establish submission ownership.
+        item_data = {key: value for key, value in item_data.items() if key != "submission"}
     try:
         data = parse_item_data(item_type, {"type": item_type, **item_data})
     except (ValueError, TypeError) as exc:
@@ -8594,8 +8597,12 @@ def _build_new_item(
     :raises OmnigentError: When ``body.data`` does not satisfy the
         payload schema for ``body.type``.
     """
+    item_data = {"type": body.type, **body.data}
+    if body.type == "terminal_command":
+        # Direct events do not drain a web submission, regardless of producer claims.
+        item_data["submission"] = {} if item_data.get("kind") == "input" else None
     try:
-        data = parse_item_data(body.type, {"type": body.type, **body.data})
+        data = parse_item_data(body.type, item_data)
     except ValidationError as exc:
         raise OmnigentError(
             f"invalid data for {body.type!r} item: {exc}",

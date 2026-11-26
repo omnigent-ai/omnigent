@@ -51,6 +51,7 @@ from omnigent.entities import (
 from omnigent.entities.conversation import (
     FunctionCallData,
     FunctionCallOutputData,
+    TerminalCommandSubmission,
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
@@ -3720,6 +3721,19 @@ async def _persist_external_conversation_item_unlocked(
         drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
         if drained is not None:
             cleared_pending_id = drained.pending_id
+    if isinstance(item.data, TerminalCommandData) and item.data.kind == "input":
+        item = item.model_copy(
+            update={
+                "data": item.data.model_copy(
+                    update={
+                        "submission": TerminalCommandSubmission(
+                            pending_id=drained.pending_id if drained else None,
+                            stable_id=drained.stable_id if drained else None,
+                        )
+                    }
+                )
+            }
+        )
     if drained is not None:
         item = item.model_copy(update={"replaces_pending_id": drained.stable_id})
     # Build the batch: skipped entries first (their positions must precede

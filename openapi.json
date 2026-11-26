@@ -14324,6 +14324,16 @@
             ],
             "title": "Stdout"
           },
+          "submission": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TerminalCommandSubmission"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "type": {
             "const": "terminal_command",
             "title": "Type",
@@ -15399,12 +15409,51 @@
             ],
             "description": "Captured stdout text. Present when `kind=\"output\"`, `None` otherwise.",
             "title": "Stdout"
+          },
+          "submission": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TerminalCommandSubmission"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "kind"
         ],
         "title": "TerminalCommandData",
+        "type": "object"
+      },
+      "TerminalCommandSubmission": {
+        "description": "Server-owned identity of the web submission consumed by a shell input.",
+        "properties": {
+          "pending_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Id"
+          },
+          "stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stable Id"
+          }
+        },
+        "title": "TerminalCommandSubmission",
         "type": "object"
       },
       "TerminalShellState": {
