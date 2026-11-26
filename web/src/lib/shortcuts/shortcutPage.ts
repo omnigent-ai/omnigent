@@ -5,7 +5,7 @@
 import { isMacPlatform } from "@/lib/hotkeys";
 import {
   currentShortcutEnvironment,
-  SHORTCUT_BINDINGS,
+  APP_SHORTCUT_BINDINGS,
   SHORTCUT_GROUPS,
   type ShortcutBinding,
   type ShortcutEnvironment,
@@ -45,7 +45,7 @@ function pageRow(
 ): ShortcutPageRow | null {
   const keys = shortcutRowKeys(binding.id, environment, context);
   if (keys.length === 0) return null;
-  const alternate = SHORTCUT_BINDINGS.find((candidate) => candidate.alternateOf === binding.id);
+  const alternate = APP_SHORTCUT_BINDINGS.find((candidate) => candidate.alternateOf === binding.id);
   const alternateShown = alternate && (alternate.advertised?.(environment) ?? true);
   return {
     label: binding.rowLabel?.(context) ?? binding.label,
@@ -71,7 +71,7 @@ export function shortcutPageGroups(
     submitWithModEnter: context.submitWithModEnter,
   });
   const rows = new Map<ShortcutGroupId, ShortcutPageRow[]>();
-  for (const binding of SHORTCUT_BINDINGS) {
+  for (const binding of APP_SHORTCUT_BINDINGS) {
     // An alternate or a part is drawn on the row it belongs to.
     if (shortcutDisplayRow(binding.id) !== binding.id) continue;
     if (!(binding.shownWhen?.(context) ?? true)) continue;

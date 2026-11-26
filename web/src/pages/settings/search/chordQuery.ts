@@ -6,7 +6,7 @@ import { type Chord, chordMatches, type KeyChordInput } from "@/lib/shortcuts/ch
 import {
   activeShortcutChords,
   menuShortcutChords,
-  SHORTCUT_BINDINGS,
+  APP_SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
   type ShortcutId,
   shortcutDisplayRow,
@@ -268,7 +268,7 @@ export function rowsForChord(
   listedRows: ReadonlySet<ShortcutId>,
 ): Set<ShortcutId> {
   const rows = new Set<ShortcutId>();
-  for (const binding of SHORTCUT_BINDINGS) {
+  for (const binding of APP_SHORTCUT_BINDINGS) {
     const row = shortcutDisplayRow(binding.id);
     if (!listedRows.has(row)) continue;
     if (
