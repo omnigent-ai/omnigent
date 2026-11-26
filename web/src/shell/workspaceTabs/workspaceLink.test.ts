@@ -69,6 +69,16 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
       "omnigent://changes?compare-base=main",
       { place: { kind: "changes", comparison: { kind: "typed", base: "main", head: "" } } },
     ],
+    [
+      "omnigent://changes?compare=head&compare-root=/repo/.worktrees/feature",
+      {
+        place: {
+          kind: "changes",
+          comparison: { kind: "saved", intent: "head" },
+          comparisonRoot: "/repo/.worktrees/feature",
+        },
+      },
+    ],
     ["omnigent://pulls", { place: { kind: "pulls" } }],
     [
       `omnigent://pull?url=${encodeURIComponent(PR)}`,
@@ -176,6 +186,8 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
     ["omnigent://changes?compare-head=HEAD", "needs a base"],
     ["omnigent://changes?compare=sideways", "can't compare with “sideways”"],
     ["omnigent://changes?compare=head&compare-base=main", "not both"],
+    ["omnigent://changes?compare-root=/repo/wt", "needs a comparison too"],
+    ["omnigent://changes?compare=head&compare-root=wt", "must be an absolute path"],
     ["omnigent://terminal", "needs an ID"],
     ["omnigent://agent", "needs an ID"],
     ["omnigent://files/abc", "doesn't take an ID"],

@@ -184,6 +184,12 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
       }
       const comparison = parseComparison(params);
       if (comparison) place.comparison = comparison;
+      const comparisonRoot = params.get("compare-root");
+      if (comparisonRoot !== null) {
+        if (!comparison) refuse("A compared folder needs a comparison too.");
+        if (!comparisonRoot.startsWith("/")) refuse("A compared folder must be an absolute path.");
+        place.comparisonRoot = comparisonRoot;
+      }
       return place;
     }
     case "pulls":
@@ -324,6 +330,8 @@ function placeParams(place: WorkspacePlace): [string, string][] {
       }
       if (place.kind === "changes" && place.comparison) {
         entries.push(...formatComparison(place.comparison));
+        if (place.comparisonRoot !== undefined)
+          entries.push(["compare-root", place.comparisonRoot]);
       }
       if (place.kind === "changes" && place.fileTab && place.path !== undefined) {
         entries.push(["file-tab", "1"]);
@@ -400,7 +408,10 @@ export function formatWorkspaceLink(link: WorkspaceLink): string {
   if (link.tab !== undefined) entries.push(["tab", link.tab]);
   const id = placeId(place);
   const query = entries
-    .map(([name, value]) => `${name}=${encodeValue(value, name === "path")}`)
+    .map(
+      ([name, value]) =>
+        `${name}=${encodeValue(value, name === "path" || name === "compare-root")}`,
+    )
     .join("&");
   return `${SCHEME}${place.kind}${id === undefined ? "" : `/${encodeURIComponent(id)}`}${query ? `?${query}` : ""}`;
 }

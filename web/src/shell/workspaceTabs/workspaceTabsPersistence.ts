@@ -118,16 +118,24 @@ export function parsePlace(value: unknown): WorkspacePlace | null | "unknown" {
         ...(path === undefined ? {} : optional("line", parseLine(value.line))),
         ...(path === undefined ? {} : optional("comment", comment)),
       };
-    case "changes":
+    case "changes": {
+      const comparison = parseComparison(value.comparison);
+      // A folder means nothing without the comparison its review showed.
+      const comparisonRoot =
+        comparison && nonEmptyString(value.comparisonRoot) && value.comparisonRoot.startsWith("/")
+          ? value.comparisonRoot
+          : undefined;
       return {
         kind: "changes",
         ...optional("path", path),
         ...(path === undefined ? {} : optional("line", parseLine(value.line))),
         ...(path === undefined ? {} : optional("comment", comment)),
         ...optional("range", parseRange(value.range)),
-        ...optional("comparison", parseComparison(value.comparison)),
+        ...optional("comparison", comparison),
+        ...optional("comparisonRoot", comparisonRoot),
         ...(path !== undefined && value.fileTab === true ? { fileTab: true as const } : {}),
       };
+    }
     case "pulls":
       return { kind: "pulls" };
     case "pull": {

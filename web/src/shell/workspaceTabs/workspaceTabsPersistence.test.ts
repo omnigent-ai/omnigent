@@ -133,6 +133,21 @@ describe("workspace tab storage", () => {
     });
   });
 
+  it("keeps the folder a Changes visit compared, only with its comparison and absolute", () => {
+    const head = { kind: "saved", intent: "head" } as const;
+    const root = "/repo/.worktrees/feature";
+    expect(parsePlace({ kind: "changes", comparison: head, comparisonRoot: root })).toEqual({
+      kind: "changes",
+      comparison: head,
+      comparisonRoot: root,
+    });
+    expect(parsePlace({ kind: "changes", comparisonRoot: root })).toEqual({ kind: "changes" });
+    expect(parsePlace({ kind: "changes", comparison: head, comparisonRoot: "wt" })).toEqual({
+      kind: "changes",
+      comparison: head,
+    });
+  });
+
   it("drops malformed fields one by one and keeps the rest", () => {
     window.localStorage.setItem(
       WORKSPACE_TABS_STORAGE_KEY,

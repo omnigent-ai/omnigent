@@ -97,7 +97,7 @@ describe("opening", () => {
     expect(store.landing("P")).toBeUndefined();
     await store.open({ place: { kind: "pulls" } }, { opener: "user" });
     const opened = store.landing("P");
-    expect(opened).toEqual({ settled: false, choices: 0 });
+    expect(opened).toEqual({ settled: false, choices: 0, folders: 0 });
     store.select("F");
     expect(store.landing("F")).toBeUndefined();
     // Each landing keeps the session's choice count as it lands.
@@ -105,7 +105,21 @@ describe("opening", () => {
     await store.go("back");
     expect(store.selectedTabId()).toBe("P");
     expect(store.landing("P")).not.toBe(opened);
-    expect(store.landing("P")).toEqual({ settled: false, choices: 3 });
+    expect(store.landing("P")).toEqual({ settled: false, choices: 3, folders: 0 });
+  });
+
+  it("stamps each landing with the session's folder moves, so a folder chosen since wins", async () => {
+    let folders = 2;
+    const { store } = makeStore({ folderCount: () => folders });
+    await store.open({ place: { kind: "pulls" } }, { opener: "user" });
+    expect(store.landing("P")).toMatchObject({ folders: 2 });
+    folders = 5;
+    store.select("F");
+    await store.go("back");
+    expect(store.landing("P")).toMatchObject({ folders: 5 });
+    folders = 6;
+    await store.go("forward");
+    expect(store.landing(store.selectedTabId()!)).toMatchObject({ settled: false, folders: 6 });
   });
 
   it("brings a Diffs tab forward without the comparison it showed before, for the session's own", async () => {
@@ -123,7 +137,11 @@ describe("opening", () => {
     );
     expect(store.selectedTab()).toMatchObject({ id: opened.ok && opened.tabId });
     expect(store.selectedTab()?.place).toEqual(diffFile);
-    expect(store.landing(store.selectedTabId()!)).toEqual({ settled: false, choices: 0 });
+    expect(store.landing(store.selectedTabId()!)).toEqual({
+      settled: false,
+      choices: 0,
+      folders: 0,
+    });
     expectInvariant(store);
   });
 
