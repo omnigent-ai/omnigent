@@ -60,13 +60,21 @@ def test_init_never_starts_a_command_without_its_exact_admission(
 
 
 @pytest.mark.parametrize(
-    ("control_fd", "status"), [(17, 7 << 8), (17, signal.SIGTERM), (4096, 7 << 8)]
+    ("control_fd", "status", "delivery"),
+    [
+        (17, 7 << 8, "complete"),
+        (17, signal.SIGTERM, "complete"),
+        (4096, 7 << 8, "complete"),
+        (17, 7 << 8, "short"),
+        (17, 7 << 8, "error"),
+    ],
 )
 def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_result(
     monkeypatch: pytest.MonkeyPatch,
     init_calls: tuple[MagicMock, MagicMock],
     status: int,
     control_fd: int,
+    delivery: str,
 ) -> None:
     events: list[str] = []
     protection, launch = init_calls
@@ -105,11 +113,17 @@ def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_re
     control.recv.side_effect = admit
     expected_exit = 7 if status == 7 << 8 else -signal.SIGTERM
     result = b"exit:" + _TOKEN + b":" + str(expected_exit).encode()
-    control.send.return_value = len(result)
+    control.send.return_value = len(result) if delivery == "complete" else len(result) - 1
+    if delivery == "error":
+        control.send.side_effect = OSError(errno.EPIPE, "result transport closed")
     monkeypatch.setattr(
         request_init.os, "waitpid", MagicMock(side_effect=[(91, 0), (0, 0), (73, status)])
     )
-    request_init._run_request(control, _CONFIG)
+    if delivery == "complete":
+        request_init._run_request(control, _CONFIG)
+    else:
+        with pytest.raises(OSError, match="result"):
+            request_init._run_request(control, _CONFIG)
     launch.assert_called_once_with(_CONFIG.argv, cwd="/workspace", env={}, close_fds=True)
     assert events == ["protected", "ready", "admitted"]
     control.set_inheritable.assert_called_once_with(False)
