@@ -5,6 +5,7 @@
 // chat links and ⌘K share one implementation.
 
 import { randomUUID } from "@/lib/randomUUID";
+import { recordRecentWorkspaceFile } from "@/lib/recentWorkspaceFiles";
 import { toast } from "sonner";
 
 import type { FilePosition } from "@/shell/FileViewerContext";
@@ -111,6 +112,8 @@ function createSession(sessionId: string): WorkspaceTabsSession {
     onSaveFailed: () => toast.error(SAVE_FAILED_MESSAGE),
     newTabId,
     choiceCount: () => workingCopyComparisons().choiceCount(sessionId),
+    // Go to File lists first the files a tab opened, from the tree, Search or anywhere else.
+    onFileOpened: (path) => recordRecentWorkspaceFile(sessionId, path),
   });
   const currentPlace = (tabId: TabId) => {
     const tab = store.findTab(tabId);

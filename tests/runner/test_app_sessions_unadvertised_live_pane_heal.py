@@ -65,9 +65,9 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     expected_command: str,
 ) -> None:
     """Restore a live pane's missing advertisement before injecting, without recreating it."""
-    conv_id = "e5f60718293a4b5c6d7e8f901a2b3c4d"
+    conv_id = "fe0a160ebffc4da49ca233eff37c560f"
     if event["type"] == "effort_change":
-        conv_id = "f60718293a4b5c6d7e8f901a2b3c4d5e"
+        conv_id = "28e4817b21ff4d9b9c4e420ac4a2a48f"
     auto_create_calls: list[str] = []
     app, registry = await _open_claude_native_session(
         monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
@@ -145,7 +145,7 @@ async def test_failed_readvertise_keeps_pane_and_surfaces_inject_failure(
     The heal is best-effort: the live pane must not be recreated, and the
     injection still reports that the target is not advertised.
     """
-    conv_id = "18293a4b5c6d7e8f901a2b3c4d5e6f70"
+    conv_id = "14c43d6939f74ddd97697dee1fe7b97c"
     auto_create_calls: list[str] = []
     app, registry = await _open_claude_native_session(
         monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
@@ -182,7 +182,7 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     tmp_path: Path,
 ) -> None:
     """An advertisement that already names the live pane must not be rewritten."""
-    conv_id = "0718293a4b5c6d7e8f901a2b3c4d5e6f"
+    conv_id = "e526333f37cb4b588ce10f6837163616"
     auto_create_calls: list[str] = []
     app, registry = await _open_claude_native_session(
         monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls

@@ -17,7 +17,7 @@ import { MenuShortcut } from "@/components/ui/menu-item";
 import { readClipboardText } from "@/lib/clipboard";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { isElectronShell } from "@/lib/nativeBridge";
-import { requestTextSearch, useFileFinderAvailable } from "@/store/fileFinder";
+import { requestTextSearch, useTextSearchAvailable } from "@/store/fileFinder";
 import { EDITOR_COMMAND_RUNS } from "./codeMirrorEditorCommands";
 import { pinnedLineAt, revealStickyLine } from "./codeMirrorStickyScroll";
 import {
@@ -107,7 +107,7 @@ export function EditorContextMenu({
   const triggerRef = useRef<HTMLSpanElement>(null);
   // Set when the menu closes by a click elsewhere or a choice that focuses something else.
   const leavesFocus = useRef(false);
-  const canSearch = useFileFinderAvailable(conversationId);
+  const canSearch = useTextSearchAvailable(conversationId);
   // The listeners are added once per view; they read the latest props here.
   const latest = useRef({ editable, selectionActions, canSearch });
   latest.current = { editable, selectionActions, canSearch };

@@ -62,7 +62,11 @@ the header menu), and each place is a separate entry point.
   marked, so a just-archived session leads the list; Find a session by name
   (⌘⌥S / Ctrl+Alt+S) lists active sessions only. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
-  the search. Desktop and mobile search use the same context.
+  the search. Desktop and mobile search use the same context. With the tabs
+  sidebar on a desktop window, ⌘K's **Search in Sessions…** opens Go to File on
+  its **Sessions** tab, with or without an open session: the same search, with a
+  preview of the matching message beside the list; a failed search or page
+  shows with Retry.
 - `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**
   sets a reported UI-only flag to Automatic, On, or Off. Choices stay on this
   device for this server; changing one reloads the page. **Clear all flag overrides**
