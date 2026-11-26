@@ -359,6 +359,8 @@ function bubbleIndexByItemId(committed: Bubble[]): Map<string, number> {
       indexes.set(bubble.itemId, index);
       return;
     }
+    // Reasoning renders without its item id; the bubble key keeps its first item's.
+    indexes.set(bubble.stableId, index);
     for (const item of bubble.items) {
       if (item.itemId !== null) indexes.set(item.itemId, index);
     }
@@ -366,8 +368,8 @@ function bubbleIndexByItemId(committed: Bubble[]): Map<string, number> {
   return indexes;
 }
 
-// After the newest rendered item saved before the message, or first when none is loaded.
-// An older server names no items: above the startup failure notice, or last.
+// After the newest rendered item saved before the message, else before the oldest rendered
+// one saved after it, else first. An older server names neither: above the failure notice, or last.
 function undeliveredIndex(
   input: PendingInput,
   rendered: Map<string, number>,
@@ -378,6 +380,10 @@ function undeliveredIndex(
   for (const id of input.precedingItemIds) {
     const bubble = rendered.get(id);
     if (bubble !== undefined) return bubble + 1;
+  }
+  for (const id of input.followingItemIds ?? []) {
+    const bubble = rendered.get(id);
+    if (bubble !== undefined) return bubble;
   }
   return 0;
 }

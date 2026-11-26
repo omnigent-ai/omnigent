@@ -494,6 +494,7 @@ describe("createSession", () => {
             content: [{ type: "input_text", text: "lost" }],
             created_by: "alice@example.com",
             preceding_item_ids: ["msg_reply", "msg_first"],
+            following_item_ids: ["msg_notice"],
           },
         ],
       }),
@@ -509,6 +510,7 @@ describe("createSession", () => {
         content: [{ type: "input_text", text: "lost" }],
         createdBy: "alice@example.com",
         precedingItemIds: ["msg_reply", "msg_first"],
+        followingItemIds: ["msg_notice"],
       },
     ]);
   });

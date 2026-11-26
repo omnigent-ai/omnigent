@@ -12983,7 +12983,7 @@
             "title": "External Session Id"
           },
           "failed_inputs": {
-            "description": "Durable managed-startup inputs that were never delivered, e.g. because the sandbox host did not come online. Same shape as `pending_inputs`, in submission order; their file blocks keep ids that still resolve under this session. Each also carries `preceding_item_ids`: up to 20 ids of the transcript items saved just before it, newest first. Empty when nothing failed.",
+            "description": "Durable managed-startup inputs that were never delivered, e.g. because the sandbox host did not come online. Same shape as `pending_inputs`, in submission order; their file blocks keep ids that still resolve under this session. Each also carries `preceding_item_ids` and `following_item_ids`: up to 20 ids each of the transcript items saved just before it (newest first) and just after it (oldest first). Empty when nothing failed.",
             "items": {
               "additionalProperties": true,
               "type": "object"

@@ -69,9 +69,9 @@ _UNCONFIRMED_INPUT_NOTE = (
     "The agent never confirmed it received this message. Check the terminal; "
     "if the agent didn't act on it, send it again."
 )
-# How many transcript items before an undelivered input its snapshot names. Not
-# every item renders, so clients place the message after the newest one they show.
-_PRECEDING_ITEM_LIMIT = 20
+# How many transcript items on each side of an undelivered input its snapshot names.
+# Not every item renders, so clients place the message next to the nearest one they show.
+_NEIGHBOR_ITEM_LIMIT = 20
 
 
 def _settled_startup(conv: Conversation) -> str | None:
@@ -407,8 +407,9 @@ class ManagedStartupInputs:
             ``{"pending_id", "content", "created_by"?}`` in submission order.
             ``failed`` holds inputs no launch or delivery could hand over, so
             clients can show them as undelivered instead of dropping them.
-            Each also carries ``preceding_item_ids``, the transcript items saved
-            just before it, newest first, so clients show it where it was sent.
+            Each also carries ``preceding_item_ids`` and ``following_item_ids``,
+            the transcript items saved just before it (newest first) and just
+            after it (oldest first), so clients show it where it was sent.
         """
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
@@ -424,20 +425,28 @@ class ManagedStartupInputs:
             if item.status != "failed":
                 queued.append(entry)
                 continue
-            preceding = await asyncio.to_thread(self._preceding_item_ids, session_id, item.id)
-            if preceding is not None:
-                failed.append({**entry, "preceding_item_ids": preceding})
+            neighbors = await asyncio.to_thread(self._neighbor_item_ids, session_id, item.id)
+            if neighbors is not None:
+                preceding, following = neighbors
+                failed.append(
+                    {**entry, "preceding_item_ids": preceding, "following_item_ids": following}
+                )
         return queued, failed
 
-    def _preceding_item_ids(self, session_id: str, item_id: str) -> list[str] | None:
-        """The ids of the transcript items saved before an input, or None once it is gone."""
+    def _neighbor_item_ids(
+        self, session_id: str, item_id: str
+    ) -> tuple[list[str], list[str]] | None:
+        """The ids of the items saved just before and after an input, or None once it is gone."""
         try:
-            page = self.conversations.list_items(
-                session_id, limit=_PRECEDING_ITEM_LIMIT, after=item_id, order="desc"
+            preceding = self.conversations.list_items(
+                session_id, limit=_NEIGHBOR_ITEM_LIMIT, after=item_id, order="desc"
+            )
+            following = self.conversations.list_items(
+                session_id, limit=_NEIGHBOR_ITEM_LIMIT, after=item_id, order="asc"
             )
         except StaleCursorError:
             return None
-        return [item.id for item in page.data]
+        return [item.id for item in preceding.data], [item.id for item in following.data]
 
     def host_changed(self, app: Any, host_id: str) -> None:
         key = (current_workspace_id(), host_id)

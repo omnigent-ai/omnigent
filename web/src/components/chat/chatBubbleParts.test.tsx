@@ -4,7 +4,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElicitationBlock } from "@/lib/blocks";
-import type { Bubble, RenderItem } from "@/lib/renderItems";
+import { buildBubbles, type Bubble, type RenderItem } from "@/lib/renderItems";
+import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import type { PendingInput } from "@/lib/types";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import { PEER_SESSION_MESSAGES_STORAGE_KEY } from "@/lib/peerSessionMessagePreferences";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
@@ -1165,42 +1167,80 @@ describe("undelivered startup messages", () => {
     };
     const later: Bubble = { kind: "user", itemId: "user_2", content: [] };
     const committed = [first, reply, later];
-    const place = (...precedingItemIds: string[][]) =>
+    const place = (...neighbors: Pick<PendingInput, "precedingItemIds" | "followingItemIds">[]) =>
       withUncommittedUserBubbles(
         committed,
         [],
-        precedingItemIds.map((ids, index) => ({
-          ...lost,
-          pendingId: `pending_${index}`,
-          precedingItemIds: ids,
-        })),
+        neighbors.map((ids, index) => ({ ...lost, pendingId: `pending_${index}`, ...ids })),
         null,
       ).map((bubble) => (bubble.kind === "assistant" ? bubble.stableId : bubble.itemId));
 
     // An item that renders no bubble (a resource event) is passed over.
-    expect(place(["resource_event", "user_1"])).toEqual([
+    expect(place({ precedingItemIds: ["resource_event", "user_1"] })).toEqual([
       "user_1",
       "pending_0",
       "error_failed",
       "user_2",
     ]);
-    expect(place(["reply_text", "user_1"])).toEqual([
+    expect(place({ precedingItemIds: ["reply_text", "user_1"] })).toEqual([
       "user_1",
       "error_failed",
       "pending_0",
       "user_2",
     ]);
+    // Nothing rendered before it: above the oldest rendered later item.
+    expect(
+      place({ precedingItemIds: ["resource_event"], followingItemIds: ["meta_note", "user_2"] }),
+    ).toEqual(["user_1", "error_failed", "pending_0", "user_2"]);
     // Sent before anything loaded, or before anything at all.
-    expect(place(["older_item"])).toEqual(["pending_0", "user_1", "error_failed", "user_2"]);
-    expect(place([])).toEqual(["pending_0", "user_1", "error_failed", "user_2"]);
-    // A later message whose earlier items don't render stays below the one sent first.
-    expect(place(["user_1"], ["resource_event"])).toEqual([
-      "user_1",
+    expect(place({ precedingItemIds: ["older_item"], followingItemIds: ["older_reply"] })).toEqual([
       "pending_0",
-      "pending_1",
+      "user_1",
       "error_failed",
       "user_2",
     ]);
+    expect(place({ precedingItemIds: [], followingItemIds: ["user_1"] })).toEqual([
+      "pending_0",
+      "user_1",
+      "error_failed",
+      "user_2",
+    ]);
+    // A later message whose earlier items don't render stays below the one sent first.
+    expect(
+      place({ precedingItemIds: ["user_1"] }, { precedingItemIds: ["resource_event"] }),
+    ).toEqual(["user_1", "pending_0", "pending_1", "error_failed", "user_2"]);
+  });
+
+  it("stay below a reply that only reasoned", () => {
+    const committed = buildBubbles(
+      itemsToBlocks([
+        {
+          id: "user_1",
+          response_id: "resp_user",
+          type: "message",
+          role: "user",
+          status: "completed",
+          content: [{ type: "input_text", text: "Plan it" }],
+        },
+        {
+          id: "rs_1",
+          response_id: "resp_1",
+          type: "reasoning",
+          status: "completed",
+          summary: [],
+          content: [{ type: "reasoning_text", text: "Inspect the shared path first." }],
+        },
+      ]),
+      null,
+    );
+    const placed = withUncommittedUserBubbles(
+      committed,
+      [],
+      [{ ...lost, precedingItemIds: ["rs_1", "user_1"], followingItemIds: [] }],
+      null,
+    );
+    expect(placed.map((bubble) => bubble.kind)).toEqual(["user", "assistant", "user"]);
+    expect(placed[2]).toMatchObject({ undelivered: true, itemId: "pending_first" });
   });
 
   it("start a new session carrying the text and the attachments that download", async () => {

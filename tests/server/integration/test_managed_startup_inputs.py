@@ -1092,27 +1092,33 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     )
 
 
-async def test_undelivered_inputs_name_the_transcript_items_before_them(
+async def test_undelivered_inputs_name_the_transcript_items_around_them(
     startup_env: _Env,
 ) -> None:
-    """Clients place each undelivered message after the items saved before it, not last."""
+    """Clients place each undelivered message next to the items saved around it, not last."""
     env = startup_env
     session_id = await _create(env)
     startup = env.app.state.startup_inputs
-    [reply] = env.conv_store.append(
-        session_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_earlier",
-                data=MessageData(
-                    role="assistant",
-                    agent="startup-probe",
-                    content=[{"type": "output_text", "text": "Earlier reply"}],
-                ),
-            )
-        ],
-    )
+
+    def append_replies(response_id: str) -> list[str]:
+        saved = env.conv_store.append(
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=response_id,
+                    data=MessageData(
+                        role="assistant",
+                        agent="startup-probe",
+                        content=[{"type": "output_text", "text": f"Reply {index}"}],
+                    ),
+                )
+                for index in range(21)
+            ],
+        )
+        return [item.id for item in saved]
+
+    earlier = append_replies("resp_earlier")
     follow_up = {
         "type": "message",
         "data": {"role": "user", "content": [{"type": "input_text", "text": "Second input"}]},
@@ -1124,13 +1130,15 @@ async def test_undelivered_inputs_name_the_transcript_items_before_them(
         headers=Headers(),
         first=False,
     )
+    later = append_replies("resp_later")
     await startup.record_launch_failure(session_id, "spend limit reached")
     snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
-    # The failure notice comes after both inputs, so neither names it.
-    assert [entry["preceding_item_ids"] for entry in snapshot["failed_inputs"]] == [
-        [],
-        [reply.id],
-    ]
+    first, second = snapshot["failed_inputs"]
+    # Each side names the nearest 20 items, skipping the other undelivered input.
+    assert first["preceding_item_ids"] == []
+    assert first["following_item_ids"] == earlier[:20]
+    assert second["preceding_item_ids"] == earlier[::-1][:20]
+    assert second["following_item_ids"] == later[:20]
 
 
 async def test_registration_timeout_fences_prompt_before_provider_hint(
