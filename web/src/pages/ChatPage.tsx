@@ -1,5 +1,6 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
+import { clearWarmSwitchInFlight, warmSwitchInFlight } from "@/lib/warmSessionSwitch";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -1153,7 +1154,17 @@ export function ChatPage() {
       isTempConvId(urlConvId) &&
       activeConversationId !== null &&
       !isTempConvId(activeConversationId);
-    if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
+    // A sidebar click under `warm_switch_keep_mounted_ui` has already switched
+    // the store to this navigation's target, one frame before the URL commits.
+    // The mounted surface already shows that target coherently, so keep it
+    // instead of tearing it down behind the placeholder; every path that
+    // doesn't set the marker keeps the placeholder.
+    if (activeConversationId === urlConvId) clearWarmSwitchInFlight();
+    const warmSwitchPending = warmSwitchInFlight(activeConversationId);
+    if (
+      loadingConversation ||
+      (activeConversationId !== urlConvId && !promotingTempConversation && !warmSwitchPending)
+    )
       return <HydratingPlaceholder />;
     if (conversationLoadError) {
       return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;

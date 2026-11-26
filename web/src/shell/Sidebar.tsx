@@ -18,6 +18,7 @@ import { GridSidebar } from "@/grid/GridWorkspace";
 import { GridDropTargets, SPLIT_EDGES, type GridDropTarget } from "@/grid/GridDropTargets";
 import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
+import { switchSessionBeforeNavigate } from "@/lib/warmSessionSwitch";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
 import {
   useProjectFolderCollapse,
@@ -6746,6 +6747,20 @@ function ConversationRowImpl({
             return;
           }
           activateRow(conversation.id, e);
+          // Same guards as activateRow: modified clicks open a new tab and must
+          // not move this one, and draft rows navigate away from /c/:id.
+          if (
+            e.button === 0 &&
+            !e.defaultPrevented &&
+            !e.metaKey &&
+            !e.ctrlKey &&
+            !e.shiftKey &&
+            !e.altKey &&
+            conversation.nested_draft_source_id === undefined &&
+            conversation.project_draft_name === undefined
+          ) {
+            switchSessionBeforeNavigate(conversation.id);
+          }
           onClick(e);
         }}
         onDoubleClick={(e) => {
