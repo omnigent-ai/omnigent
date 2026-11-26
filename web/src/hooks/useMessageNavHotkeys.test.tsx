@@ -32,10 +32,12 @@ function mount() {
 }
 
 describe("useMessageNavHotkeys", () => {
-  it("steps with Ctrl+Alt and an arrow off macOS, Shift held or not", () => {
+  it("steps with Ctrl+Alt and an arrow off macOS, leaving Shift held to Next and Previous session", () => {
     const { nav } = mount();
     expect(press({ key: "ArrowUp", ctrlKey: true, altKey: true }).defaultPrevented).toBe(true);
-    press({ key: "ArrowDown", ctrlKey: true, altKey: true, shiftKey: true });
+    press({ key: "ArrowDown", ctrlKey: true, altKey: true });
+    const sessionStep = press({ key: "ArrowDown", ctrlKey: true, altKey: true, shiftKey: true });
+    expect(sessionStep.defaultPrevented).toBe(false);
     expect(nav.goPrev).toHaveBeenCalledTimes(1);
     expect(nav.goNext).toHaveBeenCalledTimes(1);
   });
