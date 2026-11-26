@@ -2105,6 +2105,15 @@ describe("FileViewer view-preference persistence across refresh", () => {
     expect(screen.getByRole("button", { name: "Unified view" })).toBeInTheDocument();
   });
 
+  it("keeps the CodeMirror viewer's saved sticky scroll choice when it saves its own", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, stickyScroll: false });
+    render(viewerTree({ open: true }));
+    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    expect(readFileViewPreferences()).toMatchObject({ diffActive: true, stickyScroll: false });
+  });
+
   it("?diff=1 forces diff on even when the persisted preference is diff-off", async () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
 
@@ -2359,6 +2368,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
       previewableViewMode: "editor",
       hideWhitespace: false,
       wrapLines: false,
+      stickyScroll: true,
     });
     renderViewer({ open: true, path: "page.html" });
     expect(viewModeOf()).toBe("preview");
@@ -2375,6 +2385,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
       previewableViewMode: "editor",
       hideWhitespace: false,
       wrapLines: false,
+      stickyScroll: true,
     });
     renderViewer({ open: true, path: "page.html" });
     expect(viewModeOf()).toBe("preview");
@@ -2408,6 +2419,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
         previewableViewMode: pref,
         hideWhitespace: false,
         wrapLines: false,
+        stickyScroll: true,
       });
       useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
       renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
@@ -2429,6 +2441,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
       previewableViewMode: "preview",
       hideWhitespace: false,
       wrapLines: false,
+      stickyScroll: true,
     });
     useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
     renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
@@ -3360,6 +3373,7 @@ describe("file position navigation", () => {
       previewableViewMode: "source",
       hideWhitespace: false,
       wrapLines: false,
+      stickyScroll: true,
     });
     const { rerender } = renderViewer({ open: true, path: "file1.md", position: { line: 12 } });
     codeViewerRenders.mockClear();
@@ -3387,6 +3401,7 @@ describe("file position navigation", () => {
       previewableViewMode: "preview",
       hideWhitespace: false,
       wrapLines: false,
+      stickyScroll: true,
     });
     renderViewer({ open: true, path: "file1.md", position: { line: 12 } });
     expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
@@ -3535,6 +3550,7 @@ describe("file position navigation", () => {
         previewableViewMode: "editor",
         hideWhitespace: false,
         wrapLines: false,
+        stickyScroll: true,
       });
       const { rerender, unmount } = renderViewer({ open: true, path: "file1.md" });
       const request = { line: 12 };
@@ -3573,6 +3589,7 @@ describe("large Markdown file routing", () => {
       previewableViewMode: mode,
       hideWhitespace: false,
       wrapLines: false,
+      stickyScroll: true,
     });
   const selectMode = (mode: "Preview" | "Edit") => {
     fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
@@ -3686,6 +3703,7 @@ describe("large Markdown file routing", () => {
       previewableViewMode: "source",
       hideWhitespace: false,
       wrapLines: false,
+      stickyScroll: true,
     });
     setContent(c.content);
     render(viewerTree({ open: true, path: `${c.size}.md` }));
