@@ -1144,6 +1144,73 @@ def test_queued_command_recorded_after_a_plain_follow_up_is_not_lost(command: st
     assert uncertain.content == [_text_block(command)]
 
 
+_IMAGE_WITH_SLASH_TEXT = [{"type": "input_image", "url": "img://1"}, _text_block("/btw explain this")]
+
+
+@pytest.mark.parametrize(
+    ("queued_ahead", "claude_commands", "expected_lost", "expected_uncertain"),
+    [
+        ([], True, ["/probe-cmd"], []),
+        # The earlier prompt starts a turn the command can be held behind.
+        (["earlier prompt"], True, ["earlier prompt"], ["/probe-cmd"]),
+        # A file's reference is pasted ahead of its text, so this is a prompt too.
+        ([_IMAGE_WITH_SLASH_TEXT], True, [_IMAGE_WITH_SLASH_TEXT], ["/probe-cmd"]),
+        # An earlier command an idle Claude never recorded starts no turn.
+        (["/first-cmd"], True, ["/first-cmd", "/probe-cmd"], []),
+        ([], False, [], ["/probe-cmd"]),
+    ],
+    ids=[
+        "idle",
+        "behind-earlier-prompt",
+        "behind-earlier-attachment-prompt",
+        "behind-unrecorded-command",
+        "other-harness",
+    ],
+)
+def test_slash_command_sent_while_claude_was_idle_is_lost_when_jumped_over(
+    queued_ahead: list[str | list[dict[str, object]]],
+    claude_commands: bool,
+    expected_lost: list[str | list[dict[str, object]]],
+    expected_uncertain: list[str],
+) -> None:
+    """
+    An idle Claude runs a "/" command at once, so a later prompt recorded first shows it was lost.
+
+    A command that opened a terminal-only prompt is never recorded at all.
+    """
+
+    def content(queued: str | list[dict[str, object]]) -> list[dict[str, object]]:
+        return [_text_block(queued)] if isinstance(queued, str) else queued
+
+    for queued in [*queued_ahead, "/probe-cmd", "plain follow-up"]:
+        pending_inputs.record("conv", content(queued), agent_idle=True)
+
+    match = pending_inputs.resolve_matching_text(
+        "conv", "plain follow-up", claude_commands=claude_commands
+    )
+
+    assert match.matched is not None
+    assert [entry.content for entry in match.skipped] == [content(lost) for lost in expected_lost]
+    assert [entry.content for entry in match.uncertain] == [
+        content(uncertain) for uncertain in expected_uncertain
+    ]
+
+
+def test_restored_slash_command_keeps_whether_it_was_sent_while_idle() -> None:
+    """A rolled-back drain restores an idle-time command without marking it held behind a turn."""
+    pending_inputs.record("conv", [_text_block("/probe-cmd")], agent_idle=True)
+    pending_inputs.record("conv", [_text_block("plain follow-up")], agent_idle=True)
+    first = pending_inputs.resolve_matching_text("conv", "plain follow-up", claude_commands=True)
+    assert first.matched is not None
+    for drained in [first.matched, *reversed(first.skipped)]:
+        pending_inputs.restore("conv", drained)
+
+    again = pending_inputs.resolve_matching_text("conv", "plain follow-up", claude_commands=True)
+
+    assert [entry.content for entry in again.skipped] == [[_text_block("/probe-cmd")]]
+    assert again.uncertain == []
+
+
 @pytest.mark.parametrize(
     ("older", "claude_commands"),
     [

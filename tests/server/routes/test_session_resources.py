@@ -12147,6 +12147,100 @@ async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_when_sent", ["idle", "running"])
+async def test_claude_native_unrecorded_slash_command_is_flagged_only_when_sent_while_idle(
+    status_when_sent: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``/`` command an idle Claude never recorded is flagged before the next message.
+
+    Claude holds a ``/`` command only behind a running turn, so one sent then may
+    still be recorded after the later message and settles quietly.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import (
+        _dispatch_session_event_to_runner,
+        _persist_external_conversation_item,
+    )
+
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _conversation_id, event: published.append(event)
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    monkeypatch.setitem(sessions_module._session_status_cache, sid, status_when_sent)
+    client = _FakeRunnerClient()
+    pending_ids = []
+
+    try:
+        for text in ("/probe-feedback", "test"):
+            result = await _dispatch_session_event_to_runner(
+                sid,
+                conv,
+                SessionEventInput(
+                    type="message",
+                    data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+                ),
+                store,  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                agent_name="claude-native-ui",
+                file_store=None,
+                artifact_store=None,
+                created_by="alice@example.com",
+            )
+            pending_ids.append(result.pending_id)
+        command_pending, follow_up_pending = pending_ids
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "test"}],
+                    },
+                    "response_id": "resp_test",
+                    "source_id": "claude:test:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+
+        persisted = [
+            (item.type, item.data.code if item.type == "error" else item.data.content[0]["text"])
+            for item in store.appended_items
+        ]
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        if status_when_sent == "idle":
+            assert persisted == [
+                ("message", "/probe-feedback"),
+                ("error", "native_prompt_not_recorded"),
+                ("message", "test"),
+            ]
+            assert (
+                "interactive prompt in the native terminal" in store.appended_items[1].data.message
+            )
+            assert receipts == [command_pending, follow_up_pending]
+        else:
+            assert persisted == [("message", "test")]
+            assert receipts == [follow_up_pending]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "suffix",
     [
