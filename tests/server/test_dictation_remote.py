@@ -35,7 +35,7 @@ def _fake_engine_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dictation, "_engine", None)
 
 
-_TOKEN = "worker-token-0123456789abcdef"
+_TOKEN = "fake-worker-token"
 
 
 @pytest.fixture
