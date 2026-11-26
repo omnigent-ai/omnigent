@@ -25,6 +25,7 @@ from omnigent.server.scheduled.schedule import (
     occurrence_host_id,
     sandbox_host_id,
     scheduled_trigger_key,
+    timer_rule,
 )
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests._helpers.polling import poll_until_async
@@ -148,9 +149,12 @@ async def test_unfinished_fire_return_warns_and_leaves_run_for_recovery(store, c
     assert store.list_runs(task.id)[0][0].status == "failed"
 
 
-async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
+# COUNT=1 is a reminder whose minute passed during an outage: it still runs once,
+# completes, and is never replayed.
+@pytest.mark.parametrize("rrule", ["FREQ=HOURLY", "FREQ=HOURLY;COUNT=1"])
+async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store, rrule) -> None:
     with workspace_scope(42):
-        task = _task(store)
+        task = _task(store, rrule=rrule)
     clock = FakeClock(task.next_run_at + 7200)
     fired = []
 
@@ -172,11 +176,71 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
     assert len(fired) == 1
     assert fired[0].scheduled_at == task.next_run_at
     with workspace_scope(42):
-        assert store.get(task.id).next_run_at > clock.now()
+        saved = store.get(task.id)
+        if rrule.endswith("COUNT=1"):
+            assert (saved.state, saved.next_run_at) == ("completed", None)
+        else:
+            assert saved.next_run_at > clock.now()
         assert len(store.list_runs(task.id)[0]) == 1
     await schedulers[0].poll_once()
     await _drain(schedulers[0])
     assert len(fired) == 1
+    if rrule.endswith("COUNT=1"):
+        # Even an hour later, when the rule would match again, nothing replays.
+        clock.advance(3600)
+        await schedulers[0].poll_once()
+        await _drain(schedulers[0])
+        assert len(fired) == 1
+
+
+async def test_a_pending_reminder_survives_a_restart_and_fires_once(db_uri, store) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    when = (datetime.now(UTC) + timedelta(hours=2)).replace(second=0, microsecond=0)
+    task = _task(
+        store,
+        rrule=reminder_rrule(when),
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="reminder",
+    )
+    assert task.next_run_at == int(when.timestamp())
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run)
+        await lease.attach_session(snapshot.session_id)
+        await lease.finish("running")
+
+    def restarted(clock: FakeClock) -> PersistentTaskScheduler:
+        # A new process: a fresh store and scheduler over the same database.
+        fresh = SqlAlchemyScheduledTaskStore(db_uri)
+        fresh.configure_dispatch(True)
+        return PersistentTaskScheduler(fresh, fire, AsyncMock(), now=clock.now)
+
+    clock = FakeClock(task.next_run_at - 60)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == []
+
+    clock.advance(120)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert [run.scheduled_at for run in fired] == [task.next_run_at]
+    saved = store.get(task.id)
+    assert (saved.state, saved.next_run_at, saved.kind) == ("completed", None, "reminder")
+
+    # Another restart a year later, when the rule's date comes round again, replays nothing.
+    clock.advance(366 * 86400)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert len(fired) == 1
+    assert len(store.list_runs(task.id)[0]) == 1
 
 
 async def test_scan_pages_past_unowned_tasks_and_ownership_errors(
@@ -2026,11 +2090,14 @@ async def test_changed_session_is_logged_again(store, caplog):
     assert store.list_runs(task.id)[0][0].conversation_id == second
 
 
-async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeypatch):
+# COUNT=1 is a one-time schedule such as a reminder, which the dispatcher's own
+# validation must not pause as "fires only once".
+@pytest.mark.parametrize("count", [1, 2])
+async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeypatch, count):
     store.configure_dispatch(False)
     ended = _task(store, "ended", rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
     store.configure_dispatch(True)
-    counted = _task(store, "counted", rrule="FREQ=HOURLY;COUNT=2")
+    counted = _task(store, "counted", rrule=f"FREQ=HOURLY;COUNT={count}")
     clock = FakeClock(counted.next_run_at)
 
     async def fire(task, lease):
@@ -2045,7 +2112,7 @@ async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeyp
         assert store.get(ended.id).state == "completed"
         assert store.list_runs(ended.id)[0] == []
         assert store.get(counted.id).state == "completed"
-        assert len(store.list_runs(counted.id)[0]) == 2
+        assert len(store.list_runs(counted.id)[0]) == count
         assert store.list_uninitialized_tasks() == []
     finally:
         await scheduler.stop()
@@ -2075,11 +2142,12 @@ async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> 
     scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, poll_seconds=3600)
     await scheduler.start()
     try:
-        # The request only records the run, even on the replica that owns its host.
-        run = await scheduler.run_now(task)
-        assert run.status == "scheduled"
-        assert scheduler._startups == {}
-        assert fired == []
+        # Keep the background poll from consuming the run before these assertions.
+        async with scheduler._poll_lock:
+            run = await scheduler.run_now(task)
+            assert run.status == "scheduled"
+            assert scheduler._startups == {}
+            assert fired == []
         await scheduler.poll_once()
         await _drain(scheduler)
     finally:
@@ -2674,3 +2742,59 @@ async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) ->
     await _drain(scheduler)
     fire.assert_awaited_once()
     assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+
+def _timer_task(
+    store: SqlAlchemyScheduledTaskStore,
+    seed: str,
+    *,
+    repeat: bool,
+    interval: int,
+    first_run_at: int,
+):
+    """Save a ``sys_timer_set`` timer as its route does: first firing at *first_run_at*."""
+    return _task(
+        store,
+        seed,
+        timer_rule(interval, repeat=repeat),
+        "[System: timer fired]",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        first_run_at=first_run_at,
+        kind="timer",
+        schedule_anchor=first_run_at - interval,
+    )
+
+
+async def test_a_timer_ticks_on_its_own_interval_below_the_automation_minimum(store) -> None:
+    task = _timer_task(store, "fast_timer", repeat=True, interval=5, first_run_at=1_800_000_000)
+    # The poll comes 12 seconds late, so two ticks were missed meanwhile.
+    clock = FakeClock(task.next_run_at + 12)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(return_value=None), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at
+    saved = store.get(task.id)
+    # Not paused for its five-second interval; missed ticks are skipped, the phase kept.
+    assert (saved.state, saved.next_run_at) == ("active", task.next_run_at + 15)
+
+
+@pytest.mark.parametrize("repeat", [True, False], ids=["repeating", "one_shot"])
+async def test_a_busy_session_never_holds_back_a_timer(store, repeat: bool) -> None:
+    """A tick that lands mid-turn joins it, as a message would; only triggers wait."""
+    task = _timer_task(
+        store, f"busy_timer_{repeat}", repeat=repeat, interval=120, first_run_at=1_800_000_000
+    )
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    busy = AsyncMock(return_value=task.next_run_at + 120)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    busy.assert_not_awaited()
+    fire.assert_awaited_once()

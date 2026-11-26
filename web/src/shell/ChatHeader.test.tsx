@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -9,9 +9,13 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
-import * as sessionsApi from "@/lib/sessionsApi";
-import type { Session } from "@/lib/types";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import type { ServerInfo } from "@/lib/capabilities";
+import { resetUiFeatureOverridesForTests, writeUiFeatureOverride } from "@/lib/uiFeatureOverrides";
+import { useFeatureFlagsPickerStore } from "@/store/featureFlagsPicker";
 import { ChatHeader } from "./ChatHeader";
+import { claimChatPaneViewToggleHost, releaseChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -60,6 +64,9 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  tasksPanelOpen: false,
+  showTasks: false,
+  onOpenTasks: () => {},
   contentSearchPanelOpen: false,
   showContentSearch: false,
   onOpenContentSearch: () => {},
@@ -71,12 +78,11 @@ const mobileMenu = {
 
 function renderHeader(props: {
   sidebarOpen: boolean;
+  serverInfo?: ServerInfo;
   isChildSession?: boolean;
   subAgentName?: string | null;
   conversationId?: string;
   workingDirectory?: string;
-  createdBySessionId?: string;
-  queryClient?: QueryClient;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
@@ -99,12 +105,11 @@ function renderHeader(props: {
   onFork?: () => void;
   settingsMode?: boolean;
 }) {
-  const qc =
-    props.queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
+        <TooltipProvider delayDuration={0}>
           <ChatHeader
             sidebarOpen={props.sidebarOpen}
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
@@ -116,7 +121,6 @@ function renderHeader(props: {
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
             workingDirectory={props.workingDirectory}
-            createdBySessionId={props.createdBySessionId}
             actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
             projectName={props.projectName ?? null}
@@ -143,67 +147,24 @@ function renderHeader(props: {
         </TooltipProvider>
       </QueryClientProvider>
     </MemoryRouter>,
+    {
+      wrapper: ({ children }) => (
+        <CapabilitiesProvider info={props.serverInfo ?? "loading"}>{children}</CapabilitiesProvider>
+      ),
+    },
   );
 }
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
+  resetUiFeatureOverridesForTests();
+  useFeatureFlagsPickerStore.setState({ open: false, replaced: false });
   vi.restoreAllMocks();
   setOmnigentHostConfig({});
   isIOSShellMock.mockReturnValue(false);
   isAndroidShellMock.mockReturnValue(false);
   isMobileMock.mockReturnValue(false);
-});
-
-it.each([false, true])("links the creating session (mobile=%s)", async (mobile) => {
-  isMobileMock.mockReturnValue(mobile);
-  let resolveCreator!: (session: Session) => void;
-  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
-    new Promise<Session>((resolve) => {
-      resolveCreator = resolve;
-    }),
-  );
-  renderHeader({ sidebarOpen: true, conversationId: "worker", createdBySessionId: "manager" });
-  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
-  await act(async () => {
-    resolveCreator({ id: "manager", title: "Release manager" } as Session);
-  });
-  expect(await screen.findByRole("link", { name: "Release manager" })).toHaveAttribute(
-    "href",
-    "/c/manager",
-  );
-  expect(lookup).toHaveBeenCalledWith("manager");
-  expect(screen.getByText(/Created by/)).toBeInTheDocument();
-  expect(screen.queryByRole("link", { name: "Back to parent session" })).not.toBeInTheDocument();
-});
-
-it("rechecks creator access without displaying cached metadata", async () => {
-  const queryClient = new QueryClient();
-  const cached = { id: "private", title: "Previously shared manager" } as Session;
-  queryClient.setQueryData(["session", "private"], cached);
-  queryClient.setQueryData(["session-creator", "private"], cached);
-  let rejectCreator!: (error: Error) => void;
-  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
-    new Promise<Session>((_, reject) => {
-      rejectCreator = reject;
-    }),
-  );
-  renderHeader({
-    sidebarOpen: true,
-    conversationId: "worker",
-    createdBySessionId: "private",
-    queryClient,
-  });
-  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
-  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
-  expect(screen.queryByRole("link")).not.toBeInTheDocument();
-  await act(async () => {
-    rejectCreator(new sessionsApi.ApiError("Unavailable", 403, null));
-  });
-  expect(await screen.findByText("Created by another session")).toBeInTheDocument();
-  expect(lookup).toHaveBeenCalledWith("private");
-  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
-  expect(screen.queryByRole("link")).not.toBeInTheDocument();
 });
 
 describe("ChatHeader — deployed Share presentation", () => {
@@ -300,6 +261,19 @@ describe("ChatHeader — workspace pane alignment", () => {
       session.container.querySelector("header")!.classList.contains("session-header-glass"),
     ).toBe(!mobile);
   });
+
+  it("lets a page's content take clicks under the header, away from its controls", () => {
+    // A page scrolls under the header without a backdrop, e.g. its Back link.
+    const page = renderHeader({ sidebarOpen: true });
+    expect(page.container.querySelector("header")).toHaveClass(
+      "pointer-events-none",
+      "*:pointer-events-auto",
+    );
+    page.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(session.container.querySelector("header")).not.toHaveClass("pointer-events-none");
+  });
 });
 
 describe("ChatHeader — workspace pane shortcut", () => {
@@ -358,12 +332,18 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     );
   });
 
-  it("uses a back arrow and faded header surface for the mobile settings menu", () => {
+  it("uses the menu icon and faded header surface for the mobile settings menu", () => {
     const { container } = renderHeader({ sidebarOpen: false, settingsMode: true });
 
-    const button = screen.getByRole("button", { name: "Back to settings menu" });
-    expect(button.querySelector("svg")).toHaveClass("lucide-arrow-left");
+    const button = screen.getByRole("button", { name: "Open settings menu" });
+    expect(button.querySelector("svg")).toHaveClass("lucide-menu");
     expect(container.querySelector("header")).toHaveClass("settings-mobile-header");
+  });
+
+  it("drops the settings header fade while the sidebar is open", () => {
+    const { container } = renderHeader({ sidebarOpen: true, settingsMode: true });
+
+    expect(container.querySelector("header")).not.toHaveClass("settings-mobile-header");
   });
 
   it("cancels the pending peek as soon as the toggle is pressed", () => {
@@ -707,6 +687,34 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("omits the toggle when there is no TerminalFirst context", () => {
     renderHeaderWithSession(null);
     expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
+  });
+});
+
+describe("ChatHeader — the switch in the chat pane's strip", () => {
+  it("renders the Chat/Terminal switch in the chat pane's spot while one is claimed", () => {
+    const view = renderHeaderWithSession(makeTerminalFirstCtx());
+    const header = view.container.querySelector("header")!;
+    const switchIn = (root: ParentNode) =>
+      root.querySelector('[role="group"][aria-label="Switch between chat and terminal"]');
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
+
+    const spot = document.createElement("span");
+    document.body.append(spot);
+    act(() => claimChatPaneViewToggleHost("sess-1", spot));
+    // The claim is module-wide: let it go even when an assertion below fails.
+    onTestFinished(() => {
+      releaseChatPaneViewToggleHost("sess-1", spot);
+      spot.remove();
+    });
+    expect(switchIn(header)).toBeNull();
+    expect(switchIn(spot)).toHaveAttribute("data-variant", "pane");
+    // One switch, so its chord stays bound once.
+    expect(
+      screen.getAllByRole("group", { name: /switch between chat and terminal/i }),
+    ).toHaveLength(1);
+
+    act(() => releaseChatPaneViewToggleHost("sess-1", spot));
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
   });
 });
 
@@ -1120,6 +1128,29 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(onOpenFiles).toHaveBeenCalled();
   });
 
+  it("opens the Tasks drawer from the kebab, with no count of workers", () => {
+    const onOpenTasks = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, showTasks: true, subagentsWorking: 2, onOpenTasks },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    const item = screen.getByTestId("mobile-tasks-action");
+    // Busy sub-agents count on the Agents item; the Tasks item is just its label.
+    expect(item.textContent?.trim()).toBe("Tasks");
+    fireEvent.click(item);
+    expect(onOpenTasks).toHaveBeenCalled();
+  });
+
   it("opens the content-search drawer from the kebab when the feature is available", () => {
     const onOpenContentSearch = vi.fn();
     isMobileMock.mockReturnValue(true);
@@ -1230,5 +1261,45 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByRole("link", { name: "Back to parent session" })).toBeInTheDocument();
     expect(screen.getByText("reviewer")).toBeInTheDocument();
+  });
+});
+
+describe("ChatHeader — UI feature overrides", () => {
+  const serverInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { quick_pick_palette: true, canvas: false, session_overview: true },
+  };
+
+  it("hides the warning with no effective overrides", () => {
+    renderHeader({ sidebarOpen: true, serverInfo });
+    expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
+  });
+
+  it.each([false, true])("names overrides and opens the picker (mobile: %s)", async (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    expect(writeUiFeatureOverride("canvas", false)).toBe(true);
+    expect(writeUiFeatureOverride("session_overview", false)).toBe(true);
+    resetUiFeatureOverridesForTests();
+    renderHeader({ sidebarOpen: true, serverInfo });
+    const label = "UI feature flags overridden: Canvas Off, Session cost sidebar Off";
+    const button = screen.getByRole("button", { name: label });
+    expect(button).toHaveClass("text-warning");
+    fireEvent.pointerMove(button, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+    fireEvent.click(button);
+    expect(useFeatureFlagsPickerStore.getState().open).toBe(true);
+  });
+
+  it.each<Record<string, boolean>>([
+    { quick_pick_palette: false, canvas: false },
+    { quick_pick_palette: true },
+  ])("hides stored decisions when the gate is disabled or flags are unreported", (features) => {
+    expect(writeUiFeatureOverride("canvas", true)).toBe(true);
+    resetUiFeatureOverridesForTests();
+    renderHeader({
+      sidebarOpen: true,
+      serverInfo: { ...serverInfo, features },
+    });
+    expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
   });
 });

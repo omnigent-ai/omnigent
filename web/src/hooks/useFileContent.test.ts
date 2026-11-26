@@ -17,10 +17,15 @@ const resolveMediaUrl = vi.fn();
 const authenticatedFetch = vi.fn();
 const isIOSShell = vi.fn(() => false);
 const isAndroidShell = vi.fn(() => false);
+const readFileViaWorkspaceApi = vi.fn(async (..._args: unknown[]): Promise<unknown> => null);
 
+vi.mock("@/lib/workspaceApi", () => ({
+  readFileViaWorkspaceApi: (...args: unknown[]) => readFileViaWorkspaceApi(...args),
+}));
 vi.mock("@/lib/host", () => ({
   isDatabricksWorkspace: () => isDatabricksWorkspace(),
   resolveMediaUrl: (p: string) => resolveMediaUrl(p),
+  isHostRoutingEnabled: () => true,
 }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authenticatedFetch(u) }));
 vi.mock("@/lib/nativeBridge", () => ({
@@ -35,7 +40,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/store/chatStore", () => ({ useChatStore: () => undefined }));
 
 import { clearHostKeyless, markHostKeyless, setSessionHost } from "@/lib/sessionHost";
-import { downloadWorkspaceFile, workspaceFileMediaUrl } from "./useFileContent";
+import {
+  downloadWorkspaceFile,
+  fetchFileContent,
+  fetchFileContentViaRest,
+  fileContentQuery,
+  workspaceFileMediaUrl,
+} from "./useFileContent";
 
 const RAW_URL =
   "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py?download=true";
@@ -81,6 +92,84 @@ describe("downloadWorkspaceFile base-path handling", () => {
   });
 });
 
+describe("fetchFileContent", () => {
+  it("gives the SSH alias to the desktop, and keeps it out of the REST request", async () => {
+    authenticatedFetch.mockResolvedValue(new Response("{}", { status: 200 }));
+
+    await fetchFileContent("sess_abc", "src/main.py", undefined, { sshTarget: "my-box" });
+
+    expect(readFileViaWorkspaceApi).toHaveBeenCalledWith(
+      "sess_abc",
+      "src/main.py",
+      undefined,
+      "my-box",
+    );
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py",
+    );
+  });
+
+  it("skips REST when the workspace API answers", async () => {
+    const content = { path: "src/main.py", content: "x" };
+    readFileViaWorkspaceApi.mockResolvedValueOnce(content);
+
+    expect(await fetchFileContent("sess_abc", "src/main.py", undefined, {})).toBe(content);
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetchFileContentViaRest", () => {
+  it("reads through REST only, for a caller that already asked the workspace API", async () => {
+    readFileViaWorkspaceApi.mockClear();
+    authenticatedFetch.mockResolvedValue(
+      new Response(JSON.stringify({ path: "src/main.py", content: "x" }), { status: 200 }),
+    );
+
+    expect(await fetchFileContentViaRest("sess_abc", "src/main.py")).toMatchObject({
+      content: "x",
+    });
+    expect(readFileViaWorkspaceApi).not.toHaveBeenCalled();
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py",
+    );
+  });
+
+  it("fails with the response's status", async () => {
+    authenticatedFetch.mockResolvedValue(
+      new Response("gone", { status: 404, statusText: "Not Found" }),
+    );
+    await expect(fetchFileContentViaRest("sess_abc", "src/main.py")).rejects.toThrow(
+      "404 Not Found",
+    );
+  });
+});
+
+describe("fileContentQuery", () => {
+  it("reads one file under the viewer's key, passing the SSH alias on", async () => {
+    const content = { path: "src/main.py", content: "x" };
+    readFileViaWorkspaceApi.mockResolvedValueOnce(content);
+    const query = fileContentQuery("sess_abc", "src/main.py", "my-box");
+
+    expect(query.queryKey).toEqual(["file-content", "sess_abc", "src/main.py"]);
+    expect(query.staleTime).toBe(5_000);
+    expect(await query.queryFn({ signal: new AbortController().signal })).toBe(content);
+    expect(readFileViaWorkspaceApi).toHaveBeenLastCalledWith(
+      "sess_abc",
+      "src/main.py",
+      expect.anything(),
+      "my-box",
+    );
+  });
+
+  it("sends no read once cancelled", async () => {
+    readFileViaWorkspaceApi.mockClear();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(fileContentQuery("sess_abc", "src/main.py").queryFn(controller)).rejects.toThrow();
+    expect(readFileViaWorkspaceApi).not.toHaveBeenCalled();
+  });
+});
+
 describe("workspaceFileMediaUrl", () => {
   const MEDIA_URL =
     "/v1/sessions/sess_abc/resources/environments/default/filesystem/demo.mp4?download=true";
@@ -96,9 +185,11 @@ describe("workspaceFileMediaUrl", () => {
   });
 
   it("is null when the host has no media resolver, so callers fall back to fetching", () => {
+    setSessionHost("sess_abc", "host_1");
     resolveMediaUrl.mockReturnValue(null);
 
     expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBeNull();
+    expect(resolveMediaUrl).toHaveBeenCalled();
   });
 
   it("routes the headerless media load to the session host's replica", () => {
@@ -109,8 +200,9 @@ describe("workspaceFileMediaUrl", () => {
     );
   });
 
-  it("leaves the load unkeyed when the session host is unknown or proven keyless", () => {
-    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(`https://ws.example${MEDIA_URL}`);
+  it("fetches an unknown host's load and leaves a keyless host's unkeyed", () => {
+    // The authenticated fetch recovers from a wrong-replica miss; a bare <video src> can't.
+    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBeNull();
 
     setSessionHost("sess_abc", "host_1");
     markHostKeyless("host_1");

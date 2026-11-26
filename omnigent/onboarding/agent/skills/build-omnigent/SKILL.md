@@ -30,10 +30,12 @@ Always include:
 - `executor` — how the agent runs. See Step 2a.
 
 Include if needed:
-- `tools.builtins` — built-in tools. The current set is `download_file`,
-  `export_agent`, `list_files`, `search_conversations`, `upload_file`,
-  `web_fetch`, `web_search`. If the `list_builtin_tools` tool is available,
-  call it for the authoritative live set rather than trusting this list.
+- `tools.builtins` — built-in tools. The current set is `export_agent`,
+  `search_conversations`, `web_fetch`, `web_search`. If the
+  `list_builtin_tools` tool is available, call it for the authoritative live
+  set rather than trusting this list. File sharing needs no entry here: an
+  agent gets `sys_files_upload`, `sys_files_list` and `sys_files_download` by
+  setting `tool_groups.files: true`; they are off by default.
 - `tools.agents` — sub-agents, by the `name` each declares under `agents/`
   (a sub-agent's directory name may differ from its name).
 - `os_env` — filesystem/shell access for harness agents (see the

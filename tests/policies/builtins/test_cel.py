@@ -356,6 +356,86 @@ def test_eval_error_returns_none() -> None:
     assert evaluate({"type": "request", "data": "hello"}) is None
 
 
+@pytest.mark.parametrize(
+    "expression",
+    [
+        " || ".join(["event.missing_field"] * 64),
+        " && ".join(["event.missing_field"] * 64),
+        "event.data.records.exists(record, record.missing_field)",
+        "event.data.records.all(record, record.missing_field)",
+    ],
+    ids=["or", "and", "exists", "all"],
+)
+def test_logical_error_chains_have_bounded_representations(
+    expression: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nested logical failures must not recursively embed earlier error text."""
+    error_repr = celpy.CELEvalError.__repr__
+
+    def checked_repr(error: celpy.CELEvalError) -> str:
+        text = error_repr(error)
+        assert len(text) < 1024, "CEL error representation grew beyond a bounded diagnostic"
+        return text
+
+    # Fail before allocating a large string if recursive rendering regresses.
+    monkeypatch.setattr(celpy.CELEvalError, "__repr__", checked_repr)
+    evaluate = cel_policy(expression=expression)
+
+    assert evaluate({"type": "tool_call", "data": {"records": [{} for _ in range(64)]}}) is None
+
+
+@pytest.mark.parametrize("operator", ["||", "&&"])
+@pytest.mark.parametrize(
+    ("left", "right", "disjunction", "conjunction"),
+    [
+        ("true", "true", True, True),
+        ("true", "false", True, False),
+        ("false", "true", True, False),
+        ("false", "false", False, False),
+        ("true", "event.missing_field", True, None),
+        ("event.missing_field", "true", True, None),
+        ("false", "event.missing_field", None, False),
+        ("event.missing_field", "false", None, False),
+        ("event.missing_field", "event.missing_field", None, None),
+        ("1", "2", None, None),
+        ('"text"', "null", None, None),
+    ],
+)
+def test_logical_operators_preserve_boolean_and_error_semantics(
+    operator: str,
+    left: str,
+    right: str,
+    disjunction: bool | None,
+    conjunction: bool | None,
+) -> None:
+    """Decisive booleans suppress errors on either side; other errors abstain."""
+    evaluate = cel_policy(
+        expression=f'({left} {operator} {right}) ? {{"result": "DENY"}} : {{"result": "ALLOW"}}'
+    )
+    result = evaluate({"type": "tool_call"})
+    expected = disjunction if operator == "||" else conjunction
+
+    if expected is None:
+        assert result is None
+    elif expected:
+        assert result == {"result": "DENY", "reason": "Denied by policy."}
+    else:
+        assert result == {"result": "ALLOW"}
+
+
+def test_cel_error_repr_does_not_render_arguments() -> None:
+    """Error arguments can contain large values and nested exceptions."""
+
+    class Unrenderable:
+        def __repr__(self) -> str:
+            pytest.fail("CEL error representation rendered its arguments")
+
+    error = celpy.CELEvalError(Unrenderable())
+    error.line, error.column = 3, 7
+
+    assert repr(error) == "CELEvalError(line=3, column=7)"
+
+
 def test_invalid_syntax_raises() -> None:
     """Invalid CEL syntax is rejected at compile time."""
     with pytest.raises(ValueError, match="CEL"):

@@ -38,6 +38,14 @@ mount and authenticates with your `databricks auth login` token automatically:
 OMNIGENT_URL=https://my-workspace.databricks.com pnpm run dev
 ```
 
+The workspace web-UI URL (`https://<workspace>/omnigent`) works too. A
+`?o=<org-id>` selector in `OMNIGENT_URL` is sent as the `X-Databricks-Org-Id`
+header and picks the `~/.databrickscfg` profile whose `workspace_id` matches,
+when several profiles share the host. Set `OMNIGENT_DATABRICKS_PROFILE=<name>`
+to choose the profile yourself. These tokens are never sent
+over plain `http://`, except to localhost. `omnidev ui` (see
+`dev/omnidev/README.md`) wraps this with a recent-server picker.
+
 Additional `omnigent server` options:
 
 | Flag                  | Default                | Description                          |

@@ -88,6 +88,13 @@ from omnigent.inner.executor import (
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.process_logging import current_process_log_path, display_log_path
 
+from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    harness_sandbox_preparation,
+    validate_harness_sandbox,
+)
+
 logger = logging.getLogger(__name__)
 
 ACP_CANCEL_GRACE_SECONDS = 1.0
@@ -219,8 +226,9 @@ class AcpAgentConfig:
         spawn, e.g. ``("XAI_API_KEY",)``. The spawn env is deny-by-default and
         this executor drives an arbitrary agent, so it cannot infer the family
         the agent authenticates with — an agent that reads a variable must name
-        it here (or in ``os_env.sandbox.env_passthrough``) or it starts
-        unauthenticated. Names only; values come from the host environment.
+        it here, in ``os_env.sandbox.env_passthrough``, or in the host owner's
+        ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``. Names only; values come from the
+        host environment.
     :param permission_mode: Omnigent permission stance, e.g. ``"auto"``
         (default) or ``"bypassPermissions"``. Only the latter changes anything:
         it skips the human approval card for a request no policy had an opinion
@@ -444,6 +452,22 @@ def _resolve_cwd(cwd: str | None, *, session_id: str | None = None) -> str:
         ) from None
 
 
+def _resolve_policy_cwd(
+    cwd: str | None, os_env: OSEnvSpec | None, *, session_id: str | None = None
+) -> str:
+    """Give confined sessions fixed guidance when their working directory is unavailable."""
+    sandbox_requested = os_env is not None and (
+        os_env.sandbox is None or os_env.sandbox.type != "none"
+    )
+    with harness_sandbox_preparation() if sandbox_requested else contextlib.nullcontext():
+        try:
+            return _resolve_cwd(cwd, session_id=session_id)
+        except RuntimeError as exc:
+            if not sandbox_requested:
+                raise
+            raise HarnessSandboxValidationError(str(exc), reason="cwd_unavailable") from exc
+
+
 class AcpExecutor(Executor):
     """Executor that drives any ACP agent over JSON-RPC 2.0 on stdio."""
 
@@ -470,7 +494,7 @@ class AcpExecutor(Executor):
         """
         self._config = config
         self._extension = extension
-        self._cwd = _resolve_cwd(cwd)
+        self._cwd = _resolve_policy_cwd(cwd, os_env)
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
         # reads/writes back to us (executed through the Omnigent OSEnvironment,
@@ -572,11 +596,10 @@ class AcpExecutor(Executor):
         # Re-validate cwd before every spawn and respawn: the workspace may have
         # been deleted after __init__, and this error flows through
         # _startup_error_message so the UI also shows the harness-log path.
-        _resolve_cwd(self._cwd, session_id=self._session_id)
-        # If the cwd is relative the spawn resolves it against the process cwd;
-        # fail early with a clear message if that directory was also deleted.
+        _resolve_policy_cwd(self._cwd, self._os_env, session_id=self._session_id)
+        # Relative paths also require an available inherited process directory.
         if not os.path.isabs(self._cwd):
-            _resolve_cwd(None, session_id=self._session_id)
+            _resolve_policy_cwd(None, self._os_env, session_id=self._session_id)
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
@@ -607,8 +630,7 @@ class AcpExecutor(Executor):
 
         When ``os_env.sandbox`` requests confinement, wraps the agent binary in
         the platform sandbox so its whole process tree runs confined to the
-        spec's read/write roots. Falls back to the bare binary (never blocks
-        startup) when no sandbox is requested or the backend is unavailable.
+        spec's read/write roots. Requested sandbox failures prevent startup.
 
         ponytail: a sandboxed *generic* agent gets only its binary dir (read),
         the cwd, and private scratch space (write) — we can't know an arbitrary agent's config
@@ -621,10 +643,12 @@ class AcpExecutor(Executor):
         os_env = self._os_env
         if os_env is None:
             return binary, rest
-        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
-        if sandbox_spec.type == "none":
-            return binary, rest
-        try:
+        with harness_sandbox_preparation():
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            validate_harness_sandbox(os_env, "ACP", cwd=cwd)
+            sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+            if sandbox_spec.type == "none":
+                return binary, rest
             from .sandbox import (
                 create_exec_launcher,
                 resolve_sandbox,
@@ -632,22 +656,14 @@ class AcpExecutor(Executor):
                 with_spawn_env_allowlist,
             )
 
-            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
-                return binary, rest
+                raise OSError("ACP requires an active sandbox for the requested policy")
             resolved_bin = Path(binary)
             if resolved_bin.parent != Path(".") and resolved_bin.exists():
                 sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(binary, sandbox), rest
-        except (OSError, ImportError, NotImplementedError) as exc:
-            logger.warning(
-                "Could not apply sandbox for ACP agent %s; running unsandboxed: %s",
-                self._config.name,
-                exc,
-            )
-            return binary, rest
+            return create_exec_launcher(binary, sandbox, cwd=str(cwd)), rest
 
     def _startup_error_message(self, exc: BaseException) -> str:
         """Describe a handshake failure, quoting the agent's own stderr.
@@ -804,8 +820,9 @@ class AcpExecutor(Executor):
     def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the generic ACP subprocess.
 
-        Deny-by-default: base + the names declared by the agent's own config and
-        by the spec's ``os_env.sandbox.env_passthrough``. No prefix family is
+        Deny-by-default: base + names declared by the agent's own config, the
+        spec's ``os_env.sandbox.env_passthrough``, and the host owner's
+        ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``. No prefix family is
         added because the executor cannot know which vendor an arbitrary ACP
         agent belongs to; an agent that authenticates from a variable names it
         instead, which keeps every *other* provider's secret out.
@@ -828,18 +845,14 @@ class AcpExecutor(Executor):
     def _warn_initialize_failed(self, reason: str) -> None:
         """Point a failed handshake at the env allowlist.
 
-        A generic ACP agent gets the base environment plus whatever
-        ``os_env.sandbox.env_passthrough`` declares — nothing else, since the
-        executor cannot know which variable an arbitrary agent authenticates
-        with. An agent that reads e.g. ``GEMINI_API_KEY`` therefore starts
-        unauthenticated and usually dies during ``initialize``. That looks like
-        a protocol fault, so name the likely cause once here rather than let
-        every operator rediscover it.
+        A missing credential can look like a protocol fault when the agent
+        dies during ``initialize``. Point to the explicit forwarding routes.
         """
         logger.warning(
             "acp initialize failed for %r: %s. If this agent authenticates from an "
-            "environment variable, declare it in os_env.sandbox.env_passthrough — "
-            "the spawn environment is filtered to the base set plus that list.",
+            "environment variable, declare it in the agent's env_passthrough, "
+            "os_env.sandbox.env_passthrough, "
+            "or the host owner's OMNIGENT_RUNNER_ENV_PASSTHROUGH.",
             self._config.command,
             reason,
         )
@@ -1884,6 +1897,8 @@ class AcpExecutor(Executor):
                 await self._start_process()
             await self._ensure_initialized()
             session_id = await self._ensure_session()
+        except (HarnessSandboxPreparationError, HarnessSandboxValidationError):
+            raise
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
             return

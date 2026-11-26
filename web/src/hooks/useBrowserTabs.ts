@@ -1,12 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { browserPageLabel } from "@/lib/browserPageLabel";
+import { readSavedBrowserPage, saveBrowserPage } from "@/lib/browserTabPages";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
-import { type BrowserHostOptions, navigationHostOptions } from "@/lib/nativeBridge";
+import { resolveIdentity, subscribeIdentity } from "@/lib/identity";
+import type { BrowserHostOptions } from "@/lib/nativeBridge";
+import { previewHostOptions, withPreviewHostRetry } from "@/lib/previewHostOptions";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  isPersistableBrowserUrl,
+  readSessionWorkspaceState,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
+import {
+  startRailClose,
+  useBrowserTabsChanged,
+} from "@/components/BrowserPane/agentTools/railClose";
+import {
+  agentTabAmong,
+  changeTabsNow,
+  changeTabsNowSaved,
+  countNavigation,
+  handTabsBackTo,
+  mainBrowserTabs,
+} from "@/components/BrowserPane/agentTools/tabStore";
 
 export { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 
@@ -24,6 +43,7 @@ interface BrowserPage {
 }
 
 interface BrowserTabsBridge {
+  browserClose?: (viewId: string) => Promise<{ ok: boolean }>;
   browserOpenOrNavigate?: (
     viewId: string,
     url: string,
@@ -36,6 +56,7 @@ interface BrowserTabsBridge {
   onBrowserUrlChanged?: (
     callback: (page: BrowserPage & { conversationId: string }) => void,
   ) => () => void;
+  onBrowserViewClosed?: (callback: (view: { conversationId: string }) => void) => () => void;
   onBrowserOpenTab?: (
     callback: (request: { conversationId: string; url: string }) => void,
   ) => () => void;
@@ -44,6 +65,20 @@ interface BrowserTabsBridge {
 
 function browserTabsBridge(): BrowserTabsBridge | undefined {
   return (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
+}
+
+/** Close a session's browser view; true once it's gone, or where there is none to close. */
+export function closeBrowserView(
+  conversationId: string,
+  tabId: string,
+  bridge: BrowserTabsBridge | undefined = browserTabsBridge(),
+): Promise<boolean> {
+  const closing = bridge?.browserClose?.(browserViewId(conversationId, tabId));
+  if (!closing) return Promise.resolve(true);
+  return closing.then(
+    (result) => result.ok,
+    () => false,
+  );
 }
 
 const agentNavigationEpochs = new Map<string, number>();
@@ -65,11 +100,23 @@ function noteBrowserSelection(conversationId: string): number {
   return count;
 }
 
-function agentNavigationEpoch(conversationId: string): number {
+export function agentNavigationEpoch(conversationId: string): number {
   return agentNavigationEpochs.get(conversationId) ?? 0;
 }
 
-function readBrowserTabsState(conversationId: string): BrowserTabsState {
+export function saveBrowserTabsState(conversationId: string, next: BrowserTabsState): void {
+  writeSessionWorkspaceState(conversationId, {
+    openBrowsers: next.tabs,
+    selectedBrowserId: next.selected,
+  });
+}
+// Tabs main held while the agent browser tools were on come back here when they go off.
+handTabsBackTo(saveBrowserTabsState);
+
+export function readBrowserTabsState(conversationId: string): BrowserTabsState {
+  // While the agent browser tools are on, the desktop app's main process keeps the tabs.
+  const inMain = mainBrowserTabs(conversationId);
+  if (inMain) return inMain;
   const saved = readSessionWorkspaceState(conversationId);
   const tabs = saved.openBrowsers ?? [];
   return {
@@ -83,34 +130,62 @@ export function openBrowserTab(conversationId: string, tabId: string): BrowserTa
   if (tabId === AGENT_BROWSER_TAB_ID) {
     agentNavigationEpochs.set(conversationId, agentNavigationEpoch(conversationId) + 1);
   }
-  const current = readBrowserTabsState(conversationId);
-  const next = {
+  const withTab = (current: BrowserTabsState): BrowserTabsState => ({
     tabs: current.tabs.includes(tabId) ? current.tabs : [...current.tabs, tabId],
     selected: tabId,
-  };
-  writeSessionWorkspaceState(conversationId, {
-    openBrowsers: next.tabs,
-    selectedBrowserId: next.selected,
   });
+  if (mainBrowserTabs(conversationId)) {
+    // Counted per tab, so a rail close started before this navigation keeps the tab.
+    return changeTabsNow(conversationId, (current) => countNavigation(withTab(current), tabId));
+  }
+  const next = withTab(readBrowserTabsState(conversationId));
+  saveBrowserTabsState(conversationId, next);
   return next;
 }
 
-/** Persist the agent browser as a selected soft tab for a session. */
-export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
-  return openBrowserTab(conversationId, AGENT_BROWSER_TAB_ID);
+/** `state` without `tabId`, selecting its left neighbour when it was selected. */
+function withoutBrowserTab(state: BrowserTabsState, tabId: string): BrowserTabsState {
+  const index = state.tabs.indexOf(tabId);
+  if (index === -1) return state;
+  const tabs = state.tabs.filter((id) => id !== tabId);
+  const selected =
+    state.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : state.selected;
+  return { tabs, selected };
+}
+
+/** Forget a browser view whose view a host other than the rail closed, such as a workspace tab. */
+export function forgetBrowserTab(conversationId: string, tabId: string): Promise<void> {
+  return updateBrowserTabs(conversationId, (current) => withoutBrowserTab(current, tabId));
+}
+
+/** The tab agents act on: the reserved agent tab unless an agent picked another one. */
+export function agentBrowserTabId(conversationId: string): string {
+  return agentTabAmong(conversationId, readBrowserTabsState(conversationId), AGENT_BROWSER_TAB_ID);
+}
+
+/** Persist the agent browser (or the agent's `tabId`) as a selected soft tab for a session. */
+export function openAgentBrowserTab(
+  conversationId: string,
+  tabId: string = AGENT_BROWSER_TAB_ID,
+): BrowserTabsState {
+  return openBrowserTab(conversationId, tabId);
 }
 
 function updateBrowserTabs(
   conversationId: string,
   mutate: (current: BrowserTabsState) => BrowserTabsState,
-): void {
-  const next = mutate(readBrowserTabsState(conversationId));
-  // Saving is best effort; mounted rails take the new state either way.
-  writeSessionWorkspaceState(conversationId, {
-    openBrowsers: next.tabs,
-    selectedBrowserId: next.selected,
-  });
+): Promise<void> {
+  let next: BrowserTabsState;
+  let saved: Promise<void> = Promise.resolve();
+  if (mainBrowserTabs(conversationId)) {
+    ({ shown: next, saved } = changeTabsNowSaved(conversationId, mutate));
+  } else {
+    next = mutate(readBrowserTabsState(conversationId));
+    // Saving is best effort; mounted rails take the new state either way.
+    saveBrowserTabsState(conversationId, next);
+  }
   for (const listener of browserTabsListeners) listener(conversationId, next);
+  return saved;
 }
 
 /**
@@ -129,12 +204,19 @@ async function openBrowserTabAt(
   reopenRequests.set(conversationId, request);
   // The session's host lets the shell open its localhost pages, as the address bar does.
   const hostId = await fetchSessionHostId(conversationId);
-  const result = await browserTabsBridge()
-    ?.browserOpenOrNavigate?.(browserViewId(conversationId, tabId), url, undefined, {
-      force: true,
-      ...navigationHostOptions(hostId),
-    })
-    .catch((error: unknown) => ({ ok: false, error: String(error) }));
+  const options = await previewHostOptions(hostId, url);
+  const result = await withPreviewHostRetry(conversationId, hostId, async (retryOptions) =>
+    browserTabsBridge()?.browserOpenOrNavigate?.(
+      browserViewId(conversationId, tabId),
+      url,
+      undefined,
+      {
+        force: true,
+        ...options,
+        ...retryOptions,
+      },
+    ),
+  ).catch((error: unknown) => ({ ok: false, error: String(error) }));
   if (result && !result.ok) return result;
   // The tab comes back either way. It's selected only if nothing was picked since and
   // no later reopen's tab is already shown; a later one that failed doesn't count.
@@ -143,10 +225,18 @@ async function openBrowserTabAt(
     request > (shownReopens.get(conversationId) ?? 0) &&
     mayShow();
   if (latest) shownReopens.set(conversationId, request);
-  updateBrowserTabs(conversationId, (current) => ({
-    tabs: [...current.tabs, tabId],
-    selected: latest ? tabId : current.selected,
-  }));
+  try {
+    await updateBrowserTabs(conversationId, (current) => ({
+      tabs: [...current.tabs, tabId],
+      selected: latest ? tabId : current.selected,
+    }));
+  } catch (error) {
+    // The tab never reached the record, so its page would be left running unseen.
+    void browserTabsBridge()
+      ?.browserClose?.(browserViewId(conversationId, tabId))
+      .catch(() => undefined);
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
   return { ok: true };
 }
 
@@ -178,6 +268,93 @@ function retainOpenTabRequests(): () => void {
   };
 }
 
+/**
+ * The live pages of a session's browser tabs, from the desktop shell's URL and title updates;
+ * an older shell or a plain browser leaves the default labels.
+ */
+export function useBrowserPageLabels(conversationId: string, tabIds: readonly string[]) {
+  // A page read back from storage is marked, since its view may have moved on since.
+  const [pages, setPages] = useState<Record<string, BrowserPage & { fromStorage: boolean }>>({});
+  const viewIdsKey = JSON.stringify(tabIds.map((tabId) => browserViewId(conversationId, tabId)));
+  useEffect(() => {
+    const viewIds = new Set<string>(JSON.parse(viewIdsKey));
+    setPages((current) => {
+      const entries = Object.entries(current);
+      const retained = entries.filter(([viewId]) => viewIds.has(viewId));
+      return retained.length === entries.length ? current : Object.fromEntries(retained);
+    });
+    const bridge = browserTabsBridge();
+    if (!bridge || viewIds.size === 0) return;
+    let active = true;
+    const updated = new Set<string>();
+    const snapshots = new Map<string, BrowserPage | null>();
+    const setPage = (viewId: string, page: BrowserPage, fromStorage = false) => {
+      setPages((current) => ({ ...current, [viewId]: { ...page, fromStorage } }));
+    };
+    const syncSavedPage = (viewId: string) => {
+      if (!active) return;
+      const page = snapshots.get(viewId);
+      if (page) saveBrowserPage(viewId, page.url, page.title);
+      else if (!updated.has(viewId)) setPage(viewId, readSavedBrowserPage(viewId) ?? {}, true);
+    };
+    const unsubscribeIdentity = subscribeIdentity(() => {
+      for (const viewId of snapshots.keys()) syncSavedPage(viewId);
+    });
+    const unsubscribe = bridge.onBrowserUrlChanged?.((page) => {
+      if (!active || !viewIds.has(page.conversationId)) return;
+      updated.add(page.conversationId);
+      if (isPersistableBrowserUrl(page.url)) {
+        const previous = snapshots.get(page.conversationId);
+        snapshots.set(page.conversationId, {
+          url: page.url,
+          title: page.title || (previous?.url === page.url ? previous.title : undefined),
+        });
+      }
+      setPage(page.conversationId, { url: page.url, title: page.title });
+    });
+    const unsubscribeClosed = bridge.onBrowserViewClosed?.(({ conversationId: viewId }) => {
+      if (viewIds.has(viewId)) updated.add(viewId);
+      snapshots.delete(viewId);
+    });
+    const restore = async (viewId: string) => {
+      try {
+        const page = await bridge.browserHasView?.(viewId);
+        // Live updates take precedence over an earlier restore snapshot.
+        if (!active || updated.has(viewId) || !page) return;
+        if (!page.exists) {
+          // A tab whose view the shell destroyed keeps its saved page's label.
+          snapshots.set(viewId, null);
+          await resolveIdentity();
+          syncSavedPage(viewId);
+          return;
+        }
+        const url = page.url && page.url !== "about:blank" ? page.url : page.pendingUrl;
+        // A tab added after its view's first navigation saves that page here.
+        snapshots.set(viewId, { url, title: page.title });
+        syncSavedPage(viewId);
+        setPage(viewId, { url, title: page.title });
+        await resolveIdentity();
+        syncSavedPage(viewId);
+      } catch {
+        // A closed view or an older shell can leave the default tab label.
+      }
+    };
+    for (const viewId of viewIds) void restore(viewId);
+    return () => {
+      active = false;
+      unsubscribeIdentity();
+      unsubscribe?.();
+      unsubscribeClosed?.();
+    };
+  }, [viewIdsKey]);
+
+  const labelFor = (tabId: string, index: number): string =>
+    browserPageLabel(pages[browserViewId(conversationId, tabId)], `Browser ${index + 1}`);
+  const pageFor = (tabId: string): (BrowserPage & { fromStorage: boolean }) | undefined =>
+    pages[browserViewId(conversationId, tabId)];
+  return { labelFor, pageFor };
+}
+
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
   // Reload on a conversation switch during render, so the session's first frame
@@ -190,10 +367,7 @@ export function useBrowserTabs(conversationId: string) {
   // The session on screen, so a late async update for another one only persists.
   const shownConversationRef = useRef(conversationId);
   shownConversationRef.current = conversationId;
-  const [pages, setPages] = useState<Record<string, BrowserPage>>({});
-  const viewIdsKey = JSON.stringify(
-    state.tabs.map((tabId) => browserViewId(conversationId, tabId)),
-  );
+  const { labelFor, pageFor } = useBrowserPageLabels(conversationId, state.tabs);
   useEffect(() => {
     // Showing the session again (or a remounted rail) counts as a selection, so a reopen
     // started before it doesn't move the tab shown now.
@@ -210,56 +384,12 @@ export function useBrowserTabs(conversationId: string) {
   }, []);
   useEffect(() => retainOpenTabRequests(), []);
 
-  useEffect(() => {
-    const viewIds = new Set<string>(JSON.parse(viewIdsKey));
-    setPages((current) => {
-      const entries = Object.entries(current);
-      const retained = entries.filter(([viewId]) => viewIds.has(viewId));
-      return retained.length === entries.length ? current : Object.fromEntries(retained);
-    });
-    const bridge = browserTabsBridge();
-    if (!bridge || viewIds.size === 0) return;
-    let active = true;
-    const updated = new Set<string>();
-    const setPage = (viewId: string, page: BrowserPage) => {
-      setPages((current) => ({ ...current, [viewId]: page }));
-    };
-    const unsubscribe = bridge.onBrowserUrlChanged?.((page) => {
-      if (!active || !viewIds.has(page.conversationId)) return;
-      updated.add(page.conversationId);
-      setPage(page.conversationId, { url: page.url, title: page.title });
-    });
-    const restore = async (viewId: string) => {
-      try {
-        const page = await bridge.browserHasView?.(viewId);
-        // Live updates take precedence over an earlier restore snapshot.
-        if (!active || updated.has(viewId) || !page) return;
-        setPage(
-          viewId,
-          page.exists
-            ? {
-                url: page.url && page.url !== "about:blank" ? page.url : page.pendingUrl,
-                title: page.title,
-              }
-            : {},
-        );
-      } catch {
-        // A closed view or an older shell can leave the default tab label.
-      }
-    };
-    for (const viewId of viewIds) void restore(viewId);
-    return () => {
-      active = false;
-      unsubscribe?.();
-    };
-  }, [viewIdsKey]);
-
-  const labelFor = (tabId: string, index: number): string =>
-    browserPageLabel(pages[browserViewId(conversationId, tabId)], `Browser ${index + 1}`);
-
   const update = useCallback(
-    (mutate: (current: BrowserTabsState) => BrowserTabsState) =>
-      updateBrowserTabs(conversationId, mutate),
+    (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
+      updateBrowserTabs(conversationId, mutate).catch((error: unknown) =>
+        console.warn("[browserTabs] couldn't save the tabs:", error),
+      );
+    },
     [conversationId],
   );
 
@@ -277,7 +407,7 @@ export function useBrowserTabs(conversationId: string) {
     };
     const unsubscribeAction = onBrowserActionRequest((event, sourceConversationId) => {
       if (sourceConversationId === conversationId && event.action === "navigate") {
-        selectBrowser(sourceConversationId, AGENT_BROWSER_TAB_ID);
+        selectBrowser(sourceConversationId, agentBrowserTabId(conversationId));
       }
     });
     const unsubscribeLink = onInAppLinkOpen(selectBrowser);
@@ -286,6 +416,9 @@ export function useBrowserTabs(conversationId: string) {
       unsubscribeLink();
     };
   }, [conversationId]);
+
+  // Re-read when an agent changes this session's tabs (browser_tabs), here or in another window.
+  useBrowserTabsChanged(conversationId, () => setState(readBrowserTabsState(conversationId)));
 
   /** Open and select a tab, loading `url` into its view before the pane mounts; returns its id. */
   const add = (url?: string): string => {
@@ -312,13 +445,13 @@ export function useBrowserTabs(conversationId: string) {
    */
   const pageUrl = async (tabId: string): Promise<string | undefined> => {
     const viewId = browserViewId(conversationId, tabId);
-    // A snapshot without a URL (the view didn't exist yet when the strip looked) asks again.
-    const known = pages[viewId]?.url;
-    if (known) return known;
+    // Stored metadata can be stale if a view opened in this or another window since restoration.
+    const cached = pageFor(tabId);
+    if (cached?.url && !cached.fromStorage) return cached.url;
     const page = await browserTabsBridge()
       ?.browserHasView?.(viewId)
       .catch(() => undefined);
-    if (!page?.exists) return undefined;
+    if (!page?.exists) return readSavedBrowserPage(viewId)?.url;
     return page.url && page.url !== "about:blank" ? page.url : page.pendingUrl;
   };
 
@@ -332,6 +465,7 @@ export function useBrowserTabs(conversationId: string) {
     { beforeClose }: { beforeClose?: () => Promise<void> } = {},
   ): Promise<BrowserTabCloseResult> => {
     const navigationEpoch = agentNavigationEpoch(conversationId);
+    const railClose = startRailClose(conversationId, tabId);
     // A fresh agent navigation supersedes an older close of the reserved agent view.
     const superseded = () =>
       tabId === AGENT_BROWSER_TAB_ID && agentNavigationEpoch(conversationId) !== navigationEpoch;
@@ -340,23 +474,30 @@ export function useBrowserTabs(conversationId: string) {
     const desktop = (
       window as unknown as {
         omnigentDesktop?: {
-          browserClose?: (viewId: string) => Promise<{ ok: boolean }>;
+          browserClose?: (
+            viewId: string,
+            reason?: string,
+            opts?: { expectedNavs?: { tabId: string; count: number } },
+          ) => Promise<{ ok: boolean; superseded?: boolean }>;
         };
       }
     ).omnigentDesktop;
-    const result = await desktop
-      ?.browserClose?.(browserViewId(conversationId, tabId))
-      .catch(() => ({ ok: false }));
+    // Main keeps the page if the tab was navigated since the close began.
+    const { expectedNavs } = railClose;
+    const viewId = browserViewId(conversationId, tabId);
+    const result = await (
+      expectedNavs
+        ? desktop?.browserClose?.(viewId, undefined, { expectedNavs })
+        : desktop?.browserClose?.(viewId)
+    )?.catch(() => ({ ok: false }));
+    if (result && "superseded" in result && result.superseded) return "kept";
     if (result && !result.ok) return "failed";
     // The view closed, but a navigation since recreated the tab: keep it selected.
     if (superseded()) return "closed";
     update((previous) => {
-      const index = previous.tabs.indexOf(tabId);
-      if (index === -1) return previous;
-      const tabs = previous.tabs.filter((id) => id !== tabId);
-      const selected =
-        previous.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : previous.selected;
-      return { tabs, selected };
+      // An agent navigated this tab while main closed its page: keep it.
+      if (railClose.superseded(previous)) return previous;
+      return withoutBrowserTab(previous, tabId);
     });
     return "closed";
   };
@@ -364,7 +505,7 @@ export function useBrowserTabs(conversationId: string) {
   return {
     ...state,
     labelFor,
-    urlFor: (tabId: string) => pages[browserViewId(conversationId, tabId)]?.url,
+    urlFor: (tabId: string) => pageFor(tabId)?.url,
     pageUrl,
     add,
     reopen,

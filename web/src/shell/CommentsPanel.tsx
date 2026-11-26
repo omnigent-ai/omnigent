@@ -1,9 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { CheckIcon, Link2Icon, WandSparklesIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
+import { replaceEmojiShortcodes } from "@/lib/emojiShortcodes";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -97,6 +99,9 @@ export function CommentsPanel({
   const [body, setBody] = useState("");
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
   const selectedCardRef = useRef<HTMLDivElement>(null);
   const autoRouteRef = useRef<{ selection: ActiveSelection; tab: Tab } | null>(null);
   const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
@@ -283,7 +288,14 @@ export function CommentsPanel({
                   setBody(e.target.value);
                   if (pendingBodyRef) pendingBodyRef.current = e.target.value;
                 }}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  isComposingRef.current = false;
+                }}
                 onKeyDown={(e) => {
+                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
                   if (e.key === "Enter" && !e.shiftKey && body.trim()) {
                     e.preventDefault();
                     onAddComment(body.trim());
@@ -390,6 +402,8 @@ function CommentCard({
 }: CommentCardProps) {
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState(c.body);
+  // Display only: editing still shows the body as typed.
+  const displayBody = useMemo(() => replaceEmojiShortcodes(c.body), [c.body]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
@@ -493,7 +507,7 @@ function CommentCard({
               !expanded && "line-clamp-4",
             )}
           >
-            {c.body}
+            {displayBody}
           </p>
           {(clamped || expanded) && (
             <button

@@ -21,7 +21,7 @@ import click
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
@@ -59,9 +59,11 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     RepoWorkspace,
+    build_owner_launcher,
     host_resume_supported,
     launch_managed_host,
     managed_repo_labels,
+    parse_project_repository,
     parse_repo_workspace,
     parse_sandbox_config,
     read_managed_repo_workspaces,
@@ -2274,6 +2276,54 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
 
 
 @pytest.mark.parametrize(
+    ("repository", "expected_url", "expected_branch"),
+    [
+        (
+            {"url": " https://git.example.com/team/app.git ", "branch": " main "},
+            "https://git.example.com/team/app.git",
+            "main",
+        ),
+        (
+            {"url": "https://git.example.com/team/app.git"},
+            "https://git.example.com/team/app.git",
+            None,
+        ),
+        (
+            {"url": "git@git.example.com:team/app.git", "branch": "  "},
+            "git@git.example.com:team/app.git",
+            None,
+        ),
+    ],
+)
+def test_parse_project_repository_accepts_url_and_optional_branch(
+    repository: dict[str, object], expected_url: str, expected_branch: str | None
+) -> None:
+    """A saved repository is trimmed and split into its URL and branch."""
+    parsed = parse_project_repository(repository)
+    assert (parsed.url, parsed.branch) == (expected_url, expected_branch)
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "https://git.example.com/team/app.git",
+        ["https://git.example.com/team/app.git"],
+        {"branch": "main"},
+        {"url": "https://git.example.com/team/app.git", "depth": 1},
+        {"url": 3},
+        {"url": "https://git.example.com/team/app.git", "branch": 7},
+        {"url": "https://git.example.com/team/app.git#main"},
+        {"url": "https://git.example.com/team/app.git", "branch": "-upload-pack=x"},
+        {"url": "org/repo"},
+    ],
+)
+def test_parse_project_repository_rejects_malformed_values(repository: object) -> None:
+    """Anything other than an object with a valid URL and optional branch is refused."""
+    with pytest.raises(ValueError):
+        parse_project_repository(repository)
+
+
+@pytest.mark.parametrize(
     "workspace",
     [
         "https://x-access-token:s3cr3t@github.com/org/repo",
@@ -2281,6 +2331,9 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
         # (the credential check runs before any URL-echoing error).
         "https://user:s3cr3t@github.com",
         "git@x-access-token:s3cr3t@github.com:org/repo.git",
+        # Unrecognised schemes take the generic branch, which must not echo either.
+        "HTTPS://user:s3cr3t@github.com/org/repo",
+        "ftp://user:s3cr3t@github.com/org/repo",
     ],
 )
 def test_credential_rejection_does_not_echo_the_token(workspace: str) -> None:
@@ -2360,9 +2413,73 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "single": {"multi_repo": False},
-        "multi": {"multi_repo": True},
+        "single": {"multi_repo": False, "accepts_session_move": True},
+        "multi": {"multi_repo": True, "accepts_session_move": True},
     }
+
+
+class _NoticeLauncher(FakeSandboxLauncher):
+    """A provider whose unattended runs need the owner to keep a credential fresh."""
+
+    automation_notice = "Keep your laptop's credentials fresh."
+
+
+def test_provider_automation_notices_list_only_launchable_providers_that_set_one() -> None:
+    """A launchable provider's automation notice reaches /v1/info for the automation
+    form; a provider without one, or one that can't launch, is absent."""
+
+    def unlaunchable_factory() -> _NoticeLauncher:
+        raise AssertionError("a provider that can't launch must not be instantiated")
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            *(
+                ManagedSandboxConfig(
+                    server_url="https://s",
+                    provider=provider,
+                    token_ttl_s=3600,
+                    launcher_factory=factory,
+                )
+                for provider, factory in (
+                    ("noted", _NoticeLauncher),
+                    ("plain", FakeSandboxLauncher),
+                )
+            ),
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="unlaunchable",
+                token_ttl_s=3600,
+                launcher_factory=unlaunchable_factory,
+                managed_launch_supported=False,
+            ),
+        )
+    )
+
+    assert deployment.provider_automation_notices() == {
+        "noted": "Keep your laptop's credentials fresh."
+    }
+
+
+def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
+    """A provider that manages sandbox profiles is reported as no destination for
+    a move, which the move route refuses, whether profile discovery is on or not."""
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider=provider,
+                token_ttl_s=3600,
+                launcher_factory=FakeSandboxLauncher,
+                manages_profiles=manages_profiles,
+            )
+            for provider, manages_profiles in (("plain", False), ("profiled", True))
+        )
+    )
+
+    capabilities = deployment.provider_ui_capabilities()
+
+    assert capabilities["plain"]["accepts_session_move"] is True
+    assert capabilities["profiled"]["accepts_session_move"] is False
 
 
 def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -> None:
@@ -2388,9 +2505,13 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "kubernetes": {"multi_repo": False},
-        "modal": {"multi_repo": False},
-        "agent_sandbox": {"multi_repo": False, "inference_models": True},
+        "kubernetes": {"multi_repo": False, "accepts_session_move": True},
+        "modal": {"multi_repo": False, "accepts_session_move": True},
+        "agent_sandbox": {
+            "multi_repo": False,
+            "accepts_session_move": True,
+            "inference_models": True,
+        },
     }
 
 
@@ -2442,12 +2563,12 @@ def test_provider_ui_capabilities_advertise_default_models_for_unbound_discovery
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "hooked": {"multi_repo": False, "default_models": True},
-        "discovered": {"multi_repo": False, "default_models": True},
-        "static": {"multi_repo": False},
-        "bound": {"multi_repo": False, "inference_models": True},
-        "malformed": {"multi_repo": False},
-        "malformed-inference": {"multi_repo": False},
+        "hooked": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "discovered": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "static": {"multi_repo": False, "accepts_session_move": True},
+        "bound": {"multi_repo": False, "accepts_session_move": True, "inference_models": True},
+        "malformed": {"multi_repo": False, "accepts_session_move": True},
+        "malformed-inference": {"multi_repo": False, "accepts_session_move": True},
     }
 
 
@@ -2594,6 +2715,33 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     # No provider set on the injected config → the UI keeps the generic
     # label rather than inventing a name.
     assert body["sandbox_provider"] is None
+
+
+async def test_info_reports_a_providers_automation_notice_apart_from_its_flags(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` reports a provider's text notice in its own map, so the
+    capability map keeps its boolean-valued contract."""
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://s.example.com",
+            provider="noted",
+            launcher_factory=_NoticeLauncher,
+            token_ttl_s=3600,
+        )
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sandbox_provider_automation_notices"] == {
+        "noted": "Keep your laptop's credentials fresh."
+    }
+    capabilities = body["sandbox_provider_capabilities"]
+    assert capabilities == {"noted": {"multi_repo": False, "accepts_session_move": True}}
+    TypeAdapter(dict[str, dict[str, bool]]).validate_python(capabilities, strict=True)
 
 
 # ── launch_managed_host ─────────────────────────────────────
@@ -3594,6 +3742,62 @@ class _ReusedIdFakeLauncher(FakeSandboxLauncher):
         return name
 
 
+class _OwnerRecordingLauncher(FakeSandboxLauncher):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.events: list[tuple[str, str | None]] = []
+
+    def bind_owner(self, owner: str) -> None:
+        self.events.append(("bind_owner", owner))
+
+    def provision(self, name: str) -> str:
+        self.events.append(("provision", None))
+        return super().provision(name)
+
+
+async def test_launch_binds_owner_before_provision(db_uri: str) -> None:
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _OwnerRecordingLauncher(on_host_start=_register)
+    await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=host_store)
+
+    assert fake.events[:2] == [("bind_owner", _OWNER), ("provision", None)]
+
+
+async def test_relaunch_binds_the_host_owner(db_uri: str) -> None:
+    host_store = HostStore(db_uri)
+    host_owner = "bob@example.com"
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=host_owner
+        )
+
+    fake = _OwnerRecordingLauncher(on_host_start=_register)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=host_owner, host_store=host_store)
+    gen1 = host_store.get_host(first.host_id)
+    assert gen1 is not None
+    assert gen1.user_id == host_owner
+
+    fake.events.clear()
+    await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
+
+    assert fake.events[-2:] == [("bind_owner", host_owner), ("provision", None)]
+
+
+def test_build_owner_launcher_tolerates_launcher_without_bind_owner() -> None:
+    duck = SimpleNamespace(provider="duck")
+    entry = SimpleNamespace(launcher_factory=lambda: duck)
+
+    assert build_owner_launcher(entry, None, _OWNER) is duck
+
+
 async def test_relaunch_rejects_pending_reused_id_then_allows_retry(
     db_uri: str, monkeypatch
 ) -> None:
@@ -4210,6 +4414,82 @@ async def test_run_managed_wake_forwards_recorded_repo(
         [parse_repo_workspace(raw_repo)] if raw_repo is not None and raw_repo != "bad" else []
     )
     assert tracker.get("conv_1") is None
+
+
+@pytest.mark.parametrize(
+    ("resume_preserves_host", "hint"),
+    [
+        (False, "Sign the sandbox host in again, then retry."),
+        (False, None),
+        (True, "Sign the sandbox host in again, then retry."),
+    ],
+)
+async def test_wake_rendezvous_reports_sandbox_host_that_cannot_register(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, resume_preserves_host: bool, hint: str | None
+) -> None:
+    """A message waiting on a wake whose host cannot register is not told it is provisioning."""
+    from omnigent.errors import OmnigentError
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.helpers import _await_settled_managed_launch
+    from tests._helpers.polling import poll_until_async
+
+    host_store = HostStore(db_uri)
+    host_signs_in = threading.Event()
+    host_signs_in.set()
+
+    def _register(invocation: HostStartInvocation) -> None:
+        if host_signs_in.is_set():
+            host_store.upsert_on_connect(
+                host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+            )
+
+    fake = _IsloFakeLauncher(
+        on_host_start=_register, can_resume=True, resume_preserves_host=resume_preserves_host
+    )
+    monkeypatch.setattr(fake, "host_online_failure_hint", lambda _sandbox_id: hint)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    # The sandbox keeps running, but its host has lost the login it registers with.
+    host_signs_in.clear()
+    host_store.set_offline(first.host_id)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 60)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 0.5)
+    tracker = ManagedLaunchTracker()
+    tracker.begin("conv-wake")
+    state = tracker.get("conv-wake")
+    assert state is not None
+    with pytest.raises(OmnigentError, match="still provisioning"):
+        await _await_settled_managed_launch(state)
+
+    conv = SimpleNamespace(inference_snapshot=None, labels={}, host_id=first.host_id)
+    wake = asyncio.create_task(
+        orchestration._run_managed_wake(
+            session_id="conv-wake",
+            conv=conv,
+            sandbox_config=config,
+            tracker=tracker,
+            conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
+            host_store=host_store,
+            host_registry=None,
+            tunnel_registry=None,
+        )
+    )
+    try:
+        await poll_until_async(
+            lambda: fake.resumed if resume_preserves_host else len(fake.host_starts) == 2
+        )
+        with pytest.raises(OmnigentError) as error:
+            await _await_settled_managed_launch(state)
+    finally:
+        wake.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wake
+    assert fake.resumed == ["sb-fake-1"]
+    assert state.host_online_failure_hint is None
+    unconnected = "The host in the session's managed sandbox has not connected to the server"
+    assert error.value.message == (
+        f"{unconnected} — {hint}" if hint else f"{unconnected} yet; try again shortly"
+    )
 
 
 async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri: str) -> None:

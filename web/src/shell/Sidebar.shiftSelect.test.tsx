@@ -196,7 +196,7 @@ describe("Sidebar shift-click selection", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
       expect(screen.getByRole("link", { name: "b" })).toBeVisible();
-      expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a", "b", "c", "x"]);
+      expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a", "c", "b", "x"]);
     },
   );
 
@@ -379,6 +379,49 @@ describe("Sidebar shift-click selection", () => {
       expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual(selected);
     },
   );
+
+  it("includes a collapsed folder's held open session and its family in a projects-scope range", async () => {
+    projectsMock.push("Alpha", "Beta", "Gamma");
+    const family = { id: "fb", representative_id: "b1", pinned: false };
+    mockConversations([
+      conv("a0", { labels: { omni_project: "Alpha" }, updated_at: 5 }),
+      conv("b0", { labels: { omni_project: "Beta" }, updated_at: 4 }),
+      conv("b1", { labels: { omni_project: "Beta" }, updated_at: 3, family }),
+      conv("b2", { labels: { omni_project: "Beta" }, updated_at: 2, family }),
+      conv("g0", { labels: { omni_project: "Gamma" }, updated_at: 1 }),
+    ]);
+    localStorage.setItem(
+      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+      JSON.stringify(["Alpha", "Beta", "Gamma"]),
+    );
+    renderSidebar();
+    fireEvent.click(await screen.findByRole("link", { name: "b1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Beta" }));
+    expect(screen.queryByRole("link", { name: "b0" })).toBeNull();
+    expect(screen.getByRole("link", { name: "b2" })).toBeVisible();
+    expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a0", "b1", "b2", "g0"]);
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    fireEvent.click(await screen.findByRole("link", { name: "a0" }));
+    fireEvent.click(screen.getByRole("link", { name: "g0" }), { shiftKey: true });
+    await waitFor(() => {
+      expect(screen.getByText("4 selected")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+    await waitFor(() => {
+      expect(bulkArchiveMock.mutate).toHaveBeenCalledTimes(1);
+    });
+    expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual([
+      "a0",
+      "b1",
+      "b2",
+      "g0",
+    ]);
+  });
 
   it("keeps a selected folder session in bulk actions once it moves behind Show more", async () => {
     projectsMock.push("Alpha");

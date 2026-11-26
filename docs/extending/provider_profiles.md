@@ -94,7 +94,8 @@ sessions, which keep their legacy behavior. It requires a provider with
 `manages_profiles`; leave it unset to keep a selection mandatory.
 `GET /v1/sandbox-profiles` reports it in `default_profile_ids`, and the composer
 and fork dialog preselect it when nothing else is chosen (a same-provider fork
-still starts on its source's profile).
+still starts on its source's profile). The composer prefers the profile the user
+last picked on that provider while it is still listed.
 
 Opting a provider into profiles without a default makes a selection mandatory, so
 clients that don't pick (older API clients, scheduled fresh sandboxes) are rejected
@@ -258,10 +259,12 @@ summary. No private configuration is stored. Host affinity uses the existing
 conversation `host_id`. Capable controllers remain authoritative for sandbox
 assignments; a missing sandbox can be replaced from its bound session's reference.
 Ordinary hosts skip
-profile discovery entirely. Legacy host recovery reads at most 201 session IDs
-through the existing host index and rejects histories over 200 before reading
-profile references. Each reference read uses only the seven canonical label keys.
-Enable controller assignment lookup for large histories or orphan recovery.
+profile discovery entirely. Legacy host recovery reads session IDs through the
+existing host index in pages of 500 and reads each page's profile references in
+one query using only the seven canonical label keys. It rejects histories over
+10,000 sessions; start a new session on overflow. A controller lookup that
+returns the sandbox's assignment skips this scan. Enable controller assignment
+lookup for orphan recovery.
 Runner-only adoption reads host IDs through the existing runner index in one
 statement snapshot, so concurrent rotation cannot hide a host between pages.
 This read has a separate safety budget of 10,000 currently attached sessions

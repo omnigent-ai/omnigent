@@ -41,6 +41,7 @@ from omnigent_slack.events import (
     iter_sse_events,
     session_status,
 )
+from omnigent_slack.user_agent import USER_AGENT_HEADERS
 
 __all__ = [
     "AuthRequiredError",
@@ -288,6 +289,7 @@ class OmnigentClient:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout),
+            headers=USER_AGENT_HEADERS,
         )
         self._runner_launch_timeout_seconds = runner_launch_timeout_seconds
         self._auth = auth

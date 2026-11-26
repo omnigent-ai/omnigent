@@ -27,6 +27,8 @@ Env vars read at startup:
   e.g. ``"my-gcp-project"``.
 - ``HARNESS_ANTIGRAVITY_LOCATION``: GCP region for the Vertex AI path,
   e.g. ``"us-central1"``.
+- ``HARNESS_ANTIGRAVITY_OS_ENV``: JSON-encoded OS environment policy.
+  Requested sandbox restrictions are rejected because the SDK cannot enforce them.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ from fastapi import FastAPI
 
 from omnigent.inner.antigravity_executor import AntigravityExecutor
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
+from omnigent.inner.sandbox import reject_unsupported_harness_sandbox
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -49,6 +53,7 @@ _ENV_API_KEY = "HARNESS_ANTIGRAVITY_API_KEY"
 _ENV_VERTEX = "HARNESS_ANTIGRAVITY_VERTEX"
 _ENV_PROJECT = "HARNESS_ANTIGRAVITY_PROJECT"
 _ENV_LOCATION = "HARNESS_ANTIGRAVITY_LOCATION"
+_ENV_OS_ENV = "HARNESS_ANTIGRAVITY_OS_ENV"
 
 # Truthy spellings accepted for the boolean Vertex flag.
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -63,6 +68,7 @@ def _build_antigravity_executor() -> Executor:
 
     :returns: A configured :class:`AntigravityExecutor` instance.
     """
+    reject_unsupported_harness_sandbox(resolve_harness_os_env(_ENV_OS_ENV), "Antigravity")
     return AntigravityExecutor(
         model=os.environ.get(_ENV_MODEL) or None,
         api_key=os.environ.get(_ENV_API_KEY) or None,

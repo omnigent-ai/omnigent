@@ -11,7 +11,7 @@ import type { SandboxProfile } from "./sandboxProfilesApi";
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
-import type { ConversationItem } from "./conversationItems";
+import { isMessageItem, type ConversationItem } from "./conversationItems";
 import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
@@ -19,7 +19,10 @@ import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
+import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
+import { timezoneRequestHeaders } from "./timezones";
 import { parseBackgroundTasks } from "./sse";
+import { muteReadMarker, reconcileMuteLabel } from "./sessionMute";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -160,6 +163,8 @@ interface SessionResponseWire {
    */
   background_agents?: BackgroundTaskInfo[] | null;
   created_at: number;
+  /** Unix seconds of the last persisted change; absent on older servers. */
+  updated_at?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent or a user-supplied string for a top-level session.
@@ -204,6 +209,8 @@ interface SessionResponseWire {
   last_total_tokens?: number | null;
   usage_included?: boolean;
   total_cost_usd?: number | null;
+  /** `true` when the operator hides USD cost; clients clear any cached cost. */
+  cost_hidden?: boolean | null;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
    * model id. Each value is a `ModelUsage` (the five token buckets + optional
@@ -379,6 +386,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     backgroundAgents: parseBackgroundTasks(wire.background_agents),
     createdAt: wire.created_at,
+    updatedAt: wire.updated_at ?? null,
     title: wire.title ?? null,
     labels: wire.labels,
     projectId: wire.project_id ?? null,
@@ -400,6 +408,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     lastTotalTokens: wire.last_total_tokens,
     usageIncluded: wire.usage_included ?? true,
     totalCostUsd: wire.total_cost_usd,
+    costHidden: wire.cost_hidden === true,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
     pendingElicitations: wire.pending_elicitations ?? [],
@@ -562,9 +571,12 @@ function postEventResponseFromWire(wire: {
  * created by passing `parentSessionId` (and optionally a `title`). Leave
  * `subAgentName` unset (or null) for a user-added agent so the runner
  * resolves the child's own bound agent_id rather than walking the
- * parent's declared sub-agent tree. Optional fields are only sent when
- * provided, so a plain `createSession(agentId)` posts the same minimal
- * body as before.
+ * parent's declared sub-agent tree. It also covers a session started on a
+ * connected host: `hostId` + `workspace` make the server launch its runner
+ * there, with the labels and launch settings the new-session page sends.
+ * `sandbox` instead asks the server to provision a sandbox for it.
+ * Optional fields are only sent when provided, so a plain
+ * `createSession(agentId)` posts the same minimal body as before.
  *
  * @param agentId - Durable id of the agent to bind, e.g. "ag_abc123".
  * @param initialItems - Optional history seed (e.g. a first user message).
@@ -572,7 +584,21 @@ function postEventResponseFromWire(wire: {
  *   session under as a child, e.g. "conv_parent987".
  * @param options.subAgentName - Sub-agent name for parent-spec-tree
  *   resolution; null/omitted for user-added agents.
- * @param options.title - Child title, e.g. "ui:claude-native-ui:1".
+ * @param options.title - The session's title, e.g. "Create workflow: Triage flaky
+ *   tests", or a child's, e.g. "ui:claude-native-ui:1".
+ * @param options.hostId - Connected host to run on, e.g. "host_1".
+ * @param options.workspace - Absolute directory on that host.
+ * @param options.projectId - File the session in this project, keeping the chosen placement.
+ * @param options.sandbox - Run in a new sandbox instead: the provider (null
+ *   for the server's first), an optional profile, the repository workspaces
+ *   to clone (empty for an empty workspace), and the new host's id when the
+ *   server asks the client to choose it.
+ * @param options.initialInput - The first message, for a sandbox create; the
+ *   server delivers it once the sandbox is up.
+ * @param options.labels - Session labels, e.g. a native agent's wrapper labels.
+ * @param options.terminalLaunchArgs - Native CLI flags, e.g. a permission mode.
+ * @param options.modelOverride - Model to pin, e.g. "claude-opus-4-7".
+ * @param options.reasoningEffort - Effort to pin, e.g. "high".
  */
 export async function createSession(
   agentId: string,
@@ -581,6 +607,22 @@ export async function createSession(
     parentSessionId?: string;
     subAgentName?: string | null;
     title?: string;
+    projectId?: string;
+    workflowId?: string;
+    hostId?: string;
+    workspace?: string;
+    sandbox?: {
+      provider: string | null;
+      profileId?: string;
+      profileRevision?: string;
+      workspaces: string[];
+      hostId?: string;
+    };
+    initialInput?: SessionEventInput;
+    labels?: Record<string, string>;
+    terminalLaunchArgs?: string[];
+    modelOverride?: string;
+    reasoningEffort?: string;
   } = {},
 ): Promise<Session> {
   const body: {
@@ -589,7 +631,41 @@ export async function createSession(
     parent_session_id?: string;
     sub_agent_name?: string | null;
     title?: string;
+    project_id?: string;
+    workflow_id?: string;
+    host_id?: string;
+    workspace?: string | null;
+    git?: null;
+    host_type?: "managed";
+    sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
+    workspaces?: string[];
+    initial_input?: SessionEventInput;
+    labels?: Record<string, string>;
+    terminal_launch_args?: string[];
+    model_override?: string;
+    reasoning_effort?: string;
   } = { agent_id: agentId, initial_items: initialItems };
+  if (options.workflowId !== undefined) body.workflow_id = options.workflowId;
+  if (options.projectId !== undefined) {
+    body.project_id = options.projectId;
+    // Project launch hints must not replace the dialog's chosen placement.
+    body.workspace = options.workspace ?? null;
+    body.git = null;
+  }
+  const { sandbox } = options;
+  if (sandbox !== undefined) {
+    body.host_type = "managed";
+    if (sandbox.provider !== null) body.sandbox_provider = sandbox.provider;
+    if (sandbox.profileId !== undefined) {
+      body.sandbox_profile_id = sandbox.profileId;
+      body.sandbox_profile_revision = sandbox.profileRevision;
+    }
+    body.workspaces = sandbox.workspaces;
+    if (sandbox.hostId !== undefined) body.host_id = sandbox.hostId;
+  }
+  if (options.initialInput !== undefined) body.initial_input = options.initialInput;
   if (options.parentSessionId !== undefined) {
     body.parent_session_id = options.parentSessionId;
   }
@@ -599,12 +675,21 @@ export async function createSession(
   if (options.title !== undefined) {
     body.title = options.title;
   }
+  if (options.hostId !== undefined) body.host_id = options.hostId;
+  if (options.workspace !== undefined) body.workspace = options.workspace;
+  if (options.labels !== undefined) body.labels = options.labels;
+  if (options.terminalLaunchArgs !== undefined) {
+    body.terminal_launch_args = options.terminalLaunchArgs;
+  }
+  if (options.modelOverride !== undefined) body.model_override = options.modelOverride;
+  if (options.reasoningEffort !== undefined) body.reasoning_effort = options.reasoningEffort;
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
+      ...timezoneRequestHeaders(),
     },
     body: JSON.stringify(body),
   });
@@ -680,7 +765,11 @@ export async function importLocalSessions(
   const body = { host_id: hostId, source, limit, session_id: sessionId };
   const res = await authenticatedFetch("/v1/imports/local/stream", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(),
+    },
     body: JSON.stringify(body),
   });
   // Older server without the streaming endpoint: fall back to the buffered
@@ -787,7 +876,11 @@ async function importLocalSessionsBuffered(
 ): Promise<LocalImportResult> {
   const res = await authenticatedFetch("/v1/imports/local", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(),
+    },
     body: JSON.stringify({ host_id: hostId, source, limit }),
   });
   const wire = await readJsonOrThrow<{
@@ -864,6 +957,7 @@ export async function createBundledSession(
     headers: {
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
+      ...timezoneRequestHeaders(),
     },
     body: form,
   });
@@ -1017,10 +1111,149 @@ export async function forkSession(
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(), // this app's advanced browser tools switch
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/** A user prompt `/rewind` can return to. */
+export interface RewindPrompt {
+  /** The prompt's item id, e.g. "msg_abc". */
+  itemId: string;
+  /** Its text, joined from the prompt's text parts. */
+  text: string;
+  /** Epoch seconds, when the server recorded it. */
+  createdAt?: number;
+}
+
+/** Message pages `/rewind` reads per request for prompts. */
+const REWIND_PROMPT_PAGES = 5;
+const REWIND_PROMPT_PAGE_SIZE = 200;
+
+/** A batch of `/rewind` prompts, newest first. */
+export interface RewindPromptsPage {
+  prompts: RewindPrompt[];
+  /** Pass back as `after` to read older prompts; `null` once none remain. */
+  olderCursor: string | null;
+}
+
+/**
+ * List a session's user prompts, newest first, for the `/rewind` picker.
+ *
+ * Reads message items only (`GET /v1/sessions/{id}/items?type=message`, which
+ * servers advertising `session_rewind` support) and skips hidden context
+ * messages. Reads at most {@link REWIND_PROMPT_PAGES} pages per call; the
+ * returned cursor continues with older ones.
+ *
+ * @param sessionId - Session to read, e.g. "conv_abc".
+ * @param signal - Aborts the requests when the picker closes.
+ * @param after - An `olderCursor` from the previous batch; omit for the newest.
+ */
+export async function fetchRewindPrompts(
+  sessionId: string,
+  signal?: AbortSignal,
+  after: string | null = null,
+): Promise<RewindPromptsPage> {
+  const prompts: RewindPrompt[] = [];
+  let cursor = after;
+  // Each page needs the previous page's cursor.
+  /* oxlint-disable no-await-in-loop */
+  for (let page = 0; page < REWIND_PROMPT_PAGES; page++) {
+    const params = new URLSearchParams({
+      limit: String(REWIND_PROMPT_PAGE_SIZE),
+      order: "desc",
+      type: "message",
+    });
+    if (cursor) params.set("after", cursor);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+      { signal },
+    );
+    const body = await readJsonOrThrow<SessionItemsResponseWire>(res);
+    for (const item of body.data) {
+      if (!isMessageItem(item) || item.role !== "user" || item.is_meta) continue;
+      const text = item.content
+        .flatMap((part) => (part.type === "input_text" ? [part.text] : []))
+        .join("\n");
+      prompts.push({ itemId: item.id, text, createdAt: item.created_at });
+    }
+    if (!body.has_more || body.last_id == null) return { prompts, olderCursor: null };
+    cursor = body.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return { prompts, olderCursor: cursor };
+}
+
+/** A file the chosen `/rewind` prompt attached, as the rewound session holds it. */
+export interface RewindAttachment {
+  /** The prompt's content block type. */
+  type: "input_file" | "input_image";
+  /** The rewound session's copy of the file, e.g. "file_abc"; absent for an inline attachment. */
+  fileId?: string;
+  /** An image the prompt carried inline, as a `data:image/...` URI, with no stored file. */
+  imageUrl?: string;
+  /** A document the prompt carried inline, as a base64 `data:` URI, with no stored file. */
+  fileData?: string;
+  /** The attachment's name, e.g. "diagram.png". */
+  filename: string;
+}
+
+/**
+ * Rewind a Claude session to just before one of its prompts:
+ * `POST /v1/sessions/{id}/rewind`.
+ *
+ * The server forks the history before the prompt onto the same host and
+ * runner and links the source to the fork; the caller opens the fork and puts
+ * `prompt` back in its composer.
+ *
+ * @param sessionId - Session to rewind, e.g. "conv_abc".
+ * @param itemId - The user prompt to return to, e.g. "msg_abc".
+ * @returns The rewound session's id, the prompt's text and its attachments
+ *   (empty from servers that return none).
+ */
+export async function rewindSession(
+  sessionId: string,
+  itemId: string,
+): Promise<{
+  sessionId: string;
+  prompt: string;
+  attachments: RewindAttachment[];
+  attachmentsIncomplete: boolean;
+}> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/rewind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ item_id: itemId }),
+  });
+  const body = await readJsonOrThrow<{
+    session_id: string;
+    prompt: string;
+    attachments_incomplete?: boolean;
+    attachments?: {
+      type: RewindAttachment["type"];
+      file_id?: string | null;
+      image_url?: string | null;
+      file_data?: string | null;
+      filename: string;
+    }[];
+  }>(res);
+  return {
+    sessionId: body.session_id,
+    prompt: body.prompt,
+    attachmentsIncomplete: body.attachments_incomplete === true,
+    attachments: (body.attachments ?? []).map((attachment) => ({
+      type: attachment.type,
+      ...(attachment.file_id ? { fileId: attachment.file_id } : {}),
+      ...(attachment.image_url ? { imageUrl: attachment.image_url } : {}),
+      ...(attachment.file_data ? { fileData: attachment.file_data } : {}),
+      filename: attachment.filename,
+    })),
+  };
 }
 
 /**
@@ -1142,6 +1375,45 @@ export async function launchRunner(
   }
   const wire = (await res.json()) as { runner_id: string };
   return { runnerId: wire.runner_id };
+}
+
+/**
+ * Move an existing session onto a new server-provisioned sandbox:
+ * ``POST /v1/sessions/{sessionId}/managed-host``.
+ *
+ * The sandbox counterpart of {@link launchRunner}, so the session's runner
+ * must be released first (`updateSession(id, { runnerId: "" })`). Returns as
+ * soon as the launch is scheduled: `hostId` / `workspace` stay null and the
+ * sandbox status reads "provisioning" until the sandbox host registers.
+ *
+ * @param sessionId - The runner-released session to move, e.g. "conv_abc".
+ * @param sandbox.provider - One of the server's configured sandbox providers;
+ *   `null` takes its first.
+ * @param sandbox.workspace - `<url>[#<branch>]` repository cloned into the
+ *   sandbox; `null` gives the session an empty sandbox.
+ * @param sandbox.hostId - Id for the new sandbox host, as on a managed
+ *   create; omitted, the server mints one.
+ * @returns The session snapshot once the move is accepted.
+ * @throws ApiError carrying the server's reason (e.g. an unconfigured
+ *   provider) so the dialog can surface it inline.
+ */
+export async function launchManagedHost(
+  sessionId: string,
+  sandbox: { provider: string | null; workspace: string | null; hostId?: string },
+): Promise<Session> {
+  const body: { sandbox_provider?: string; workspace?: string; host_id?: string } = {};
+  if (sandbox.provider !== null) body.sandbox_provider = sandbox.provider;
+  if (sandbox.workspace !== null) body.workspace = sandbox.workspace;
+  if (sandbox.hostId !== undefined) body.host_id = sandbox.hostId;
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/managed-host`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
 /**
@@ -1286,8 +1558,12 @@ export async function bindOnlyOnlineRunner(sessionId: string): Promise<Session |
  * with no transient (delta) coverage.
  */
 export async function getSession(sessionId: string): Promise<Session> {
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`);
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  return reconcileMuteLabel(
+    sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+    readMarker,
+  );
 }
 
 export interface SessionRepositoryBranch {
@@ -1345,11 +1621,15 @@ export async function getSessionSlim(
     include_usage: "false",
   });
   if (options.refreshState === true) params.set("refresh_state", "true");
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
     { signal: options.signal },
   );
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  return reconcileMuteLabel(
+    sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+    readMarker,
+  );
 }
 
 export interface SessionSignInLink {
@@ -1378,6 +1658,7 @@ export async function getSessionSignInLink(
 export interface SessionUsageSnapshot {
   id: string;
   totalCostUsd: number | null;
+  costHidden: boolean;
   usageByModel: Record<string, ModelUsage> | null;
 }
 
@@ -1397,12 +1678,13 @@ export async function getSessionUsage(
     { signal: options.signal },
   );
   const wire =
-    await readJsonOrThrow<Pick<SessionResponseWire, "id" | "total_cost_usd" | "usage_by_model">>(
-      res,
-    );
+    await readJsonOrThrow<
+      Pick<SessionResponseWire, "id" | "total_cost_usd" | "cost_hidden" | "usage_by_model">
+    >(res);
   return {
     id: wire.id,
     totalCostUsd: wire.total_cost_usd ?? null,
+    costHidden: wire.cost_hidden === true,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
   };
 }
@@ -1651,6 +1933,19 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
 }
 
+/** Send *text* to a session as a plain user message, e.g. from a page other than its chat. */
+export function sendUserMessage(
+  sessionId: string,
+  text: string,
+  workflowRunId?: string,
+): Promise<PostEventResponse> {
+  return postEvent(sessionId, {
+    type: "message",
+    data: { role: "user", content: [{ type: "input_text", text }] },
+    ...(workflowRunId ? { workflow_run_id: workflowRunId } : {}),
+  });
+}
+
 /** Reconnect or relaunch the existing runner without replaying user input. */
 export function retrySession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "retry_session", data: {} });
@@ -1668,18 +1963,7 @@ export function continueFailedTurn(sessionId: string): Promise<void> {
   const pending = failedTurnContinuations.get(sessionId);
   if (pending) return pending;
 
-  const retry = postEvent(sessionId, {
-    type: "message",
-    data: {
-      role: "user",
-      content: [
-        {
-          type: "input_text",
-          text: "Please continue from where you left off.",
-        },
-      ],
-    },
-  })
+  const retry = sendUserMessage(sessionId, "Please continue from where you left off.")
     .then((result) => {
       if (result.denied) throw new Error("The retry was blocked by a policy");
       if (!result.queued) throw new Error("The retry was not accepted");

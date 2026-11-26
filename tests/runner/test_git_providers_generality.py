@@ -37,6 +37,7 @@ from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
     PullRequestAuth,
+    PullRequestStatus,
     ShellPrOp,
     ShellSegment,
 )
@@ -466,7 +467,11 @@ def test_optional_title_failure_keeps_selected_pr_and_healthy_titles(
         },
     )
     monkeypatch.setattr(github, "titles_available", lambda _root: True)
-    monkeypatch.setattr(github, "pr_title", lambda *_args: ("Healthy GitHub title", False))
+    monkeypatch.setattr(
+        github,
+        "pr_status",
+        lambda *_args: (PullRequestStatus("Healthy GitHub title", "OPEN", False), False),
+    )
 
     def broken(*_args):
         raise RuntimeError("External forge unavailable")
@@ -528,7 +533,7 @@ def test_every_remote_provider_is_discovered_and_unlink_stays_removed(
     monkeypatch.setattr(github, "on_inferred_pr", lambda *_: None)
     monkeypatch.setattr(github, "titles_available", lambda _: True)
     monkeypatch.setattr(
-        github, "pr_title", lambda *_: pytest.fail("Discovery already read the title")
+        github, "pr_status", lambda *_: pytest.fail("Discovery already read the title")
     )
     monkeypatch.setattr(
         github,
@@ -785,3 +790,20 @@ def test_checkout_inference_keeps_an_existing_association(
     pr_resource.infer_checkout_pr("session", repo)
     [entry] = SessionPrRegistry("session").list()
     assert entry.relationship == relationship
+
+
+def test_a_provider_with_only_the_commit_methods_keeps_its_commit_history() -> None:
+    """Through head is a separate facet, so a provider without it still lists commits."""
+    from omnigent.runner.git_providers import CommitCompareFacet, CommitsFacet
+
+    class CommitsOnly:
+        def commits(self, root: str, reference: object, *, head_sha: str) -> dict[str, object]:
+            return {"object": "list", "data": [], "has_more": False}
+
+        def commit_diff(
+            self, root: str, reference: object, *, commit_sha: str
+        ) -> dict[str, object]:
+            return {"object": "session.github.pr_diff", "patch": ""}
+
+    assert isinstance(CommitsOnly(), CommitsFacet)
+    assert not isinstance(CommitsOnly(), CommitCompareFacet)

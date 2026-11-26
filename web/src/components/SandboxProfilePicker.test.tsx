@@ -64,17 +64,18 @@ beforeEach(() => {
     });
 });
 afterEach(cleanup);
-function mount(value: SandboxProfileSelection | null = null) {
+function mount(value: SandboxProfileSelection | null = null, remembered: string | null = null) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onChange = vi.fn();
   function Picker() {
     const [selection, setSelection] = useState(value);
-    const { launchError } = useSandboxProfileCatalog("company", selection);
+    const { launchError } = useSandboxProfileCatalog("company", selection, remembered);
     return (
       <>
         <SandboxProfilePicker
           provider="company"
           value={selection}
+          rememberedProfileId={remembered}
           onChange={(p) => {
             onChange(p);
             setSelection(p);
@@ -117,16 +118,122 @@ it.each([
   );
 });
 
-it("keeps an explicit choice over the provider default", async () => {
+it.each([
+  ["on the first page", "profile-5", "Build profile 5"],
+  ["beyond the first page", "profile-30", "Build profile 30"],
+])("starts on the profile last picked %s, ahead of the default", async (_where, id, name) => {
   defaults = { company: "profile-3" };
-  const { onChange } = mount();
-  await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" });
-  await open("Build profile 3");
+  mount(null, id);
+  expect(await screen.findByRole("button", { name: `Sandbox profile: ${name}` })).toBeTruthy();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+  );
+});
+
+it("falls back to the provider default when the last picked profile is gone", async () => {
+  defaults = { company: "profile-3" };
+  mount(null, "retired-profile");
+  expect(
+    await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" }),
+  ).toBeTruthy();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+  );
+});
+
+it("falls back to the provider default when looking up the last picked profile fails", async () => {
+  defaults = { company: "profile-3" };
+  const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
+  vi.mocked(fetchSandboxProfiles).mockImplementation(async (provider, options) => {
+    if (options?.profileId === "profile-30") throw new Error("lookup failed");
+    return listPage(provider, options);
+  });
+  mount(null, "profile-30");
+  expect(
+    await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" }),
+  ).toBeTruthy();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+  );
+});
+
+it.each([
+  ["fails", () => Promise.reject(new Error("check failed"))],
+  ["no longer lists it", null],
+])(
+  "falls back to the provider default when checking a listed last picked profile %s",
+  async (_case, check) => {
+    defaults = { company: "profile-3" };
+    const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
+    vi.mocked(fetchSandboxProfiles).mockImplementation(async (provider, options) => {
+      if (options?.profileId !== "profile-5") return listPage(provider, options);
+      if (check) return check();
+      return { profiles: [], managed_providers: ["company"], next_cursor: null };
+    });
+    mount(null, "profile-5");
+    expect(
+      await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" }),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+    );
+  },
+);
+
+it("launches the last picked profile on its current revision", async () => {
+  // The first page still lists v1; the profile's own check returns v2.
+  const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
+  vi.mocked(fetchSandboxProfiles).mockImplementation(async (provider, options) => {
+    const page = await listPage(provider, options);
+    if (options?.profileId !== "profile-5") return page;
+    return { ...page, profiles: page.profiles.map((p) => ({ ...p, revision: "v2" })) };
+  });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result } = renderHook(() => useSandboxProfileCatalog("company", null, "profile-5"), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  await waitFor(() => expect(result.current.launchError).toBeNull());
+  expect(result.current.selection).toEqual(
+    expect.objectContaining({ id: "profile-5", revision: "v2" }),
+  );
+});
+
+it("keeps an explicit choice over the last picked profile and the default", async () => {
+  defaults = { company: "profile-3" };
+  const { onChange } = mount(null, "profile-4");
+  await screen.findByRole("button", { name: "Sandbox profile: Build profile 4" });
+  await open("Build profile 4");
   fireEvent.click(screen.getByRole("option", { name: /Build profile 5/ }));
   expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ id: "profile-5" }));
   expect(
     await screen.findByRole("button", { name: "Sandbox profile: Build profile 5" }),
   ).toBeTruthy();
+});
+
+it("switches to a listed profile without loading it again", async () => {
+  defaults = { company: "profile-3" };
+  mount();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
+  await open("Build profile 3");
+  fireEvent.click(screen.getByRole("option", { name: /Build profile 5/ }));
+  expect(screen.getByRole("button", { name: "Start" })).toBeEnabled();
+  expect(fetchSandboxProfiles).not.toHaveBeenCalledWith(
+    "company",
+    expect.objectContaining({ profileId: "profile-5" }),
+  );
+});
+
+it("opens on the current profile, checked", async () => {
+  mount(rows[5]);
+  await open(rows[5].name);
+  const current = screen.getByRole("option", { name: /Build profile 5/ });
+  expect(current).toHaveAttribute("aria-selected", "true");
+  expect(current).toHaveAttribute("data-checked", "true");
+  const first = screen.getByRole("option", { name: /Build profile 0/ });
+  expect(first).toHaveAttribute("aria-selected", "false");
+  expect(first).toHaveAttribute("data-checked", "false");
 });
 
 it("caps the menu and finds profiles beyond the first page", async () => {

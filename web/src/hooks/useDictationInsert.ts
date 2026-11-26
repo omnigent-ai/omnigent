@@ -31,7 +31,11 @@
 // spent interim span out of characters that by then belong to the user.
 // Dictation must never delete or displace text it didn't write.
 
-import { type RefObject, useCallback, useLayoutEffect, useRef } from "react";
+import { type RefObject, useCallback, useLayoutEffect, useRef, useState } from "react";
+import {
+  isComposerTargetFocused,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 
 /** The draft this hook produced, and how to keep building on it.
  *
@@ -90,7 +94,7 @@ function splice(
 export function useDictationInsert(
   draft: string,
   setDraft: (next: string) => void,
-  textareaRef?: RefObject<HTMLTextAreaElement | null>,
+  textareaRef?: RefObject<ComposerTextTarget | null>,
 ): {
   /** Pin a final utterance, replacing any pending interim region. */
   appendFinal: (text: string) => void;
@@ -98,6 +102,8 @@ export function useDictationInsert(
   replaceInterim: (text: string) => void;
   /** Report that the composer has been focused, so its caret is real. */
   noteFocus: () => void;
+  /** A streaming partial is in the draft, so the composer must not swap its input now. */
+  hasInterim: boolean;
 } {
   // The draft as last seen. Refreshed on every render so external changes
   // win, and written on insert so a second transcript in the same batch
@@ -123,6 +129,8 @@ export function useDictationInsert(
   // Caret this hook has asked for but not yet applied, or null when none is
   // outstanding. Non-null means the DOM caret is stale.
   const wantCaretRef = useRef<number | null>(null);
+  // Whether a streaming partial is in the draft, as state so a change always re-renders.
+  const [interimPending, setInterimPending] = useState(false);
 
   // Applied in a layout effect because the draft is React state: setting the
   // value moves the caret to the end, and the value to select into only
@@ -140,7 +148,7 @@ export function useDictationInsert(
     // watching one part of a long draft shouldn't get yanked elsewhere.
     const { scrollTop, scrollLeft } = ta;
     ta.setSelectionRange(position, position);
-    if (ta !== document.activeElement) {
+    if (!isComposerTargetFocused(ta)) {
       ta.scrollTop = scrollTop;
       ta.scrollLeft = scrollLeft;
     }
@@ -186,12 +194,15 @@ export function useDictationInsert(
       // DOM caret as stale, pinning inserts to the tail and ignoring the user.
       if (spliced.next === current) {
         producedRef.current = mine === null ? null : settled;
+        // No draft render follows, so the pinned region must re-render on its own.
+        setInterimPending((producedRef.current?.region ?? null) !== null);
         return;
       }
 
       draftRef.current = spliced.next;
       producedRef.current = settled;
       wantCaretRef.current = spliced.caret;
+      setInterimPending(settled.region !== null);
       setDraft(spliced.next);
     },
     [setDraft, textareaRef],
@@ -203,5 +214,7 @@ export function useDictationInsert(
     noteFocus: useCallback(() => {
       focusedRef.current = true;
     }, []),
+    // A draft the hook didn't write releases its region during render, before state catches up.
+    hasInterim: interimPending && (producedRef.current?.region ?? null) !== null,
   };
 }

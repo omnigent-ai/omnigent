@@ -24,7 +24,8 @@ export const SANDBOX_WAKE_STAGE_LIMIT_MS = 5 * 60_000;
 
 // One sandbox wake request per session, shared by everything that wakes it
 // (Reconnect host, opening the session, the Files and Changes tabs, the
-// terminal's Resume): a caller during the request joins it and gets its answer.
+// terminal's Resume, a shell tab's Resume session): a caller during the request
+// joins it and gets its answer.
 const sandboxWakeRequests = new Map<string, Promise<PostEventResponse>>();
 
 /** Send `retry_session` to wake *sessionId*'s sandbox, or join the one in flight. */
@@ -36,6 +37,11 @@ export function wakeSandboxSession(sessionId: string): Promise<PostEventResponse
   });
   sandboxWakeRequests.set(sessionId, request);
   return request;
+}
+
+/** Stop joining `request`, a wake its caller gave up waiting for, so the next wake asks again. */
+export function abandonSandboxWake(sessionId: string, request: Promise<PostEventResponse>): void {
+  if (sandboxWakeRequests.get(sessionId) === request) sandboxWakeRequests.delete(sessionId);
 }
 
 // Sessions whose shown view is waking their sandbox, for other panels to say so.

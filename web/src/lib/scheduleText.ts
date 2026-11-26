@@ -213,7 +213,8 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
   owner_deleted: { stage: "Owner", reason: "The owner's account was removed." },
   owner_identity_unavailable: {
     stage: "Owner",
-    reason: "Couldn't act as the owner. The next run tries again.",
+    // Recurrence-neutral: a one-time automation, such as a reminder, has no next run.
+    reason: "Couldn't act as the owner. A recurring automation tries again at its next run.",
   },
   reauthorization_required: {
     stage: "Owner",
@@ -337,7 +338,9 @@ const MONTH_NAMES = [
  * formatter doesn't special-case, so a valid-but-unusual rule still renders
  * something readable rather than blank.
  */
-export function describeSchedule(rrule: string): string {
+export function describeSchedule(rrule: string | null, timezone?: string): string {
+  // The server withholds a trigger automation's rule when it decides when the trigger polls.
+  if (rrule === null) return "";
   const rule = tryParse(rrule);
   if (!rule) return rrule;
   const o = rule.origOptions;
@@ -347,6 +350,38 @@ export function describeSchedule(rrule: string): string {
   const timeSuffix = ` at ${formatClockTime(hour, minute)}`;
   const days = normalizeWeekdays(o.byweekday);
   const interval = typeof o.interval === "number" && o.interval > 1 ? o.interval : 1;
+
+  // A one-time rule, such as a reminder, runs at its first match and then completes.
+  if (o.count === 1) {
+    const months = normalizeNums(o.bymonth);
+    const monthDays = normalizeNums(o.bymonthday);
+    const hours = normalizeNums(o.byhour);
+    const minutes = normalizeNums(o.byminute);
+    const monthName = months.length === 1 ? MONTH_NAMES[months[0]! - 1] : undefined;
+    // A literal date only for the reminder shape: one month, one positive day and
+    // one time. Anything else (negative days, several times) names no single moment.
+    if (
+      o.freq === RRule.YEARLY &&
+      monthName !== undefined &&
+      monthDays.length === 1 &&
+      monthDays[0]! > 0 &&
+      hours.length <= 1 &&
+      minutes.length <= 1
+    ) {
+      // A reminder is stored in UTC, so name the zone its time is in.
+      const zone = !timezone ? "" : timezone === "UTC" ? " UTC" : ` (${timezone})`;
+      return `Once on ${monthName} ${monthDays[0]}${timeSuffix}${zone}`;
+    }
+    const recurring = rrule
+      .replace(/^RRULE:/i, "")
+      .split(";")
+      .filter((part) => !/^\s*COUNT\s*=/i.test(part))
+      .join(";");
+    return `Once: ${describeSchedule(recurring)}`;
+  }
+
+  // A summary that skipped a field would describe a different schedule.
+  if (!phrasesStateEveryField(o)) return rrule;
 
   if (o.freq === RRule.MINUTELY) {
     // The library's toText() drops minute-rule filters; preserve them verbatim.
@@ -413,6 +448,55 @@ export function describeSchedule(rrule: string): string {
   }
 }
 
+/**
+ * Whether the phrases in `describeSchedule` state every field of a rule: the shapes the
+ * visual builder makes. Rules with, e.g., BYSETPOS or several hours are shown as written.
+ */
+function phrasesStateEveryField(o: RRule["origOptions"]): boolean {
+  if (o.bysetpos != null || o.byyearday != null || o.byweekno != null || o.byeaster != null)
+    return false;
+  if (normalizeNums(o.bysecond).some((second) => second !== 0)) return false;
+  const hours = normalizeNums(o.byhour);
+  const minutes = normalizeNums(o.byminute);
+  const months = normalizeNums(o.bymonth);
+  const monthDays = normalizeNums(o.bymonthday);
+  const weekdays = o.byweekday == null ? [] : [o.byweekday].flat();
+  // A numbered weekday such as 1MO (the first Monday) has no phrase.
+  if (weekdays.some((day) => typeof day === "object" && day.n != null && day.n !== 0)) return false;
+  if (hours.length > 1 || minutes.length > 1) return false;
+  const inRange = (values: number[], min: number, max: number) =>
+    values.every((value) => value >= min && value <= max);
+  if (!inRange(hours, 0, 23) || !inRange(minutes, 0, 59)) return false;
+  if (!inRange(months, 1, 12) || !inRange(monthDays, 1, 31)) return false;
+  const interval = typeof o.interval === "number" ? o.interval : 1;
+  const dayFilters = weekdays.length + months.length + monthDays.length;
+  switch (o.freq) {
+    case RRule.MINUTELY:
+      // Minute rules show any filter as written below.
+      return true;
+    case RRule.SECONDLY:
+      return dayFilters + hours.length + minutes.length === 0;
+    case RRule.HOURLY:
+      return hours.length === 0 && dayFilters === 0;
+    case RRule.DAILY:
+      return dayFilters === 0;
+    case RRule.WEEKLY: {
+      // WKST changes which weeks a multi-week interval groups together.
+      const wkst = typeof o.wkst === "object" && o.wkst !== null ? o.wkst.weekday : o.wkst;
+      return (
+        months.length + monthDays.length === 0 && !(interval > 1 && wkst != null && wkst !== 0)
+      );
+    }
+    case RRule.MONTHLY:
+      return weekdays.length + months.length === 0;
+    case RRule.YEARLY:
+      // Without BYMONTH, BYMONTHDAY runs in every month.
+      return weekdays.length === 0 && (monthDays.length === 0 || months.length > 0);
+    default:
+      return false;
+  }
+}
+
 /** Weekday-set phrasing for the interval-1 weekly case (with shorthands). */
 function weekdayText(days: number[]): string {
   if (sameSet(days, WEEKDAYS)) return "Weekdays";
@@ -438,10 +522,11 @@ function dayLabelList(days: number[]): string {
  * `python-dateutil` evaluation localizes the rule.
  */
 export function nextRunAtMs(
-  rrule: string,
+  rrule: string | null,
   timezone: string,
   now: Date = new Date(),
 ): number | null {
+  if (rrule === null) return null;
   const base = tryParse(rrule);
   if (!base) return null;
   // rrule's `.after` treats the DTSTART/occurrences as UTC-naive wall times.

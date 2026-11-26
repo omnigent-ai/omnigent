@@ -51,6 +51,7 @@ from omnigent.host.frames import (
     HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
+    HostWorkspaceReplyFrame,
     encode_host_frame,
 )
 from omnigent.host.harness_startup import HarnessStartup
@@ -124,6 +125,27 @@ def _fail_pending_imports(conn: HostConnection) -> None:
                     "error": f"host '{conn.host_id}' disconnected mid-import",
                 },
             )
+        )
+
+
+def deliver_workspace_reply(conn: HostConnection, frame: HostWorkspaceReplyFrame) -> None:
+    """Hand a workspace call's reply to its waiting caller; a late reply is dropped."""
+    replies = conn.pending_workspace_calls.get(frame.request_id)
+    if replies is not None:
+        replies.put_nowait(frame)
+
+
+def _fail_pending_workspace_calls(conn: HostConnection) -> None:
+    """End every in-flight workspace call when its tunnel disconnects or is replaced."""
+    for request_id in list(conn.pending_workspace_calls):
+        deliver_workspace_reply(
+            conn,
+            HostWorkspaceReplyFrame(
+                request_id=request_id,
+                done=True,
+                error_code="unavailable",
+                error_message=f"host '{conn.host_id}' disconnected",
+            ),
         )
 
 
@@ -202,6 +224,11 @@ def _fail_pending_worktrees(conn: HostConnection) -> None:
         conn.pending_list_worktrees,
     ):
         _fail_pending_inventory(pending, conn.host_id)
+
+
+def _fail_pending_clones(conn: HostConnection) -> None:
+    """Fail clone requests as soon as their host disappears."""
+    _fail_pending_inventory(conn.pending_clones, conn.host_id)
 
 
 def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
@@ -445,6 +472,9 @@ class HostConnection:
         host sends ``host.create_dir_result``. Values carry the
         result fields (``status``, ``path``, ``error``). Same
         ``Any`` typing rationale as ``pending_stats``.
+    :param pending_clones: Per-``request_id`` futures for in-flight
+        ``host.clone_repository`` requests. Values carry ``status``,
+        ``path``, ``error``, and ``error_code``.
     :param pending_installs: Per-``request_id`` futures for in-flight
         ``host.install_harness`` requests. Resolved when the host sends
         ``host.install_harness_result``. Values carry the result fields
@@ -478,6 +508,9 @@ class HostConnection:
         Resolved when the host sends ``host.fs_result``. Values
         carry ``status``, ``payload``, ``error_status``,
         ``error_code``, and ``error``.
+    :param pending_workspace_calls: Per-``request_id`` reply queues for
+        in-flight ``host.workspace_call`` workspace API calls. Each queue
+        receives the call's ``host.workspace_reply`` frames in order.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
@@ -506,6 +539,7 @@ class HostConnection:
     # user machine reusing a managed host's id under ordinary login. Read by the
     # default-public policy so only genuine sandboxes count as managed.
     registered_with_managed_token: bool = False
+    recovery_task: asyncio.Task[None] | None = None
     pending_launches: dict[str, asyncio.Future[HostLaunchResult]] = field(
         default_factory=dict,
     )
@@ -531,6 +565,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_clones: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(
@@ -566,6 +603,9 @@ class HostConnection:
     )
     credential_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_workspace_calls: dict[str, asyncio.Queue[HostWorkspaceReplyFrame]] = field(
         default_factory=dict,
     )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
@@ -647,6 +687,51 @@ class HostRegistry:
         """Resolve launch activation; omit the wire field when no harness is active."""
         return active_harnesses(self._mcp_disabled_servers, self._feature_flags) or None
 
+    def live_newer_duplicate(
+        self,
+        host_id: str,
+        hello: HostHelloFrame,
+        owner: str | None,
+        *,
+        max_silence_s: float,
+        workspace_id: int | None = None,
+    ) -> HostConnection | None:
+        """Return the live connection an older duplicate host must not replace.
+
+        ``register`` lets the newest connection win so a reconnecting host can
+        retire its own stale socket. A second, older host process sharing the
+        id (a forgotten daemon from an earlier install) would win each
+        reconnect too, so launches would flap onto a build that cannot run
+        current sessions.
+
+        :param host_id: Host identifier from the tunnel path, in any accepted
+            spelling (see :func:`_canonical_host_id`).
+        :param hello: The connecting host's hello frame.
+        :param owner: Authenticated owner of the connecting tunnel.
+        :param max_silence_s: How recently the registered connection must have
+            sent a frame to count as live, e.g. ``90.0``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: The registered connection when it belongs to the same owner,
+            sent a frame within ``max_silence_s``, and reports a strictly newer
+            PEP 440 version than ``hello``; otherwise ``None``, including when
+            either version does not parse.
+        """
+        from packaging.version import InvalidVersion, Version
+
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        with self._lock:
+            current = self._hosts.get((ws_id, _canonical_host_id(host_id)))
+            if current is None or current.owner != owner:
+                return None
+            if time.monotonic() - current.last_frame_monotonic > max_silence_s:
+                return None
+            try:
+                is_newer = Version(current.hello.version) > Version(hello.version)
+            except InvalidVersion:
+                return None
+            return current if is_newer else None
+
     def register(
         self,
         host_id: str,
@@ -714,11 +799,13 @@ class HostRegistry:
                 _fail_pending_imports(old)
                 _fail_pending_harness_startup(old)
                 _fail_pending_plugins(old)
+                _fail_pending_workspace_calls(old)
                 _fail_pending_skill_content(old)
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
                 _fail_pending_worktrees(old)
+                _fail_pending_clones(old)
                 _fail_pending_harness_rpcs(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
@@ -765,11 +852,13 @@ class HostRegistry:
         _fail_pending_imports(removed)
         _fail_pending_harness_startup(removed)
         _fail_pending_plugins(removed)
+        _fail_pending_workspace_calls(removed)
         _fail_pending_skill_content(removed)
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
         _fail_pending_worktrees(removed)
+        _fail_pending_clones(removed)
         _fail_pending_harness_rpcs(removed)
         return True
 

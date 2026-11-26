@@ -84,6 +84,41 @@ class _FakeExecutor(Executor):
         return True
 
 
+@pytest.mark.parametrize("failure", ["session", "cancel"])
+async def test_shutdown_reaches_final_executor_close_after_session_failure_or_cancellation(
+    failure: str,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class FailingSessionExecutor(_FakeExecutor):
+        async def close_session(self, session_key: str) -> None:
+            await super().close_session(session_key)
+            if failure == "session":
+                raise RuntimeError("session close failed")
+            entered.set()
+            await release.wait()
+
+    executor = FailingSessionExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    adapter._executor = executor
+
+    if failure == "session":
+        with pytest.raises(RuntimeError, match="session close failed"):
+            await adapter.on_shutdown()
+    else:
+        shutdown = asyncio.create_task(adapter.on_shutdown())
+        await entered.wait()
+        shutdown.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+
+    assert executor.close_session_calls == 1
+    assert executor.close_calls == 1
+    assert adapter._executor is None
+
+
 def _ctx(response_id: str) -> TurnContext:
     return TurnContext(
         response_id=response_id,
@@ -472,14 +507,17 @@ async def test_cleanup_cannot_enable_unsafe_retry(
     assert executor.close_session_calls == 1
     assert adapter._orphan_callback_count == 0
     assert adapter._resyncing is False
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await adapter._ensure_executor_for_turn()
 
-    # Counter resets on a clean turn start: a single later orphan does not
-    # immediately re-trip the watchdog.
+    # A new adapter starts a clean turn after the old one shuts down.
     executor2 = _FakeExecutor(events=[TurnComplete(response="ok")])
-    adapter._executor_factory = lambda: executor2
-    await adapter.run_turn(_request(), _ctx("resp_after_reset"))
-    assert adapter._orphan_callback_count == 0
+    next_adapter = ExecutorAdapter(executor_factory=lambda: executor2)
+    next_adapter._orphan_callback_count = 1
+    await next_adapter.run_turn(_request(), _ctx("resp_after_reset"))
+    assert next_adapter._orphan_callback_count == 0
     assert executor2.interrupt_calls == []
+    await next_adapter.on_shutdown()
 
 
 class _InterruptScriptExecutor(_FakeExecutor):
