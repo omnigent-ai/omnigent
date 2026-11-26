@@ -41,8 +41,9 @@ function fastMatches(query: SearchQuery, doc: Text, from = 0, to = doc.length) {
 function random(seed: number) {
   let state = seed;
   return (below: number) => {
-    state = (state * 1103515245 + 12345) % 2 ** 31;
-    return state % below;
+    state = (Math.imul(state, 1103515245) + 12345) & 0x7fffffff;
+    // The low bits of this generator cycle quickly, so choices read the high ones.
+    return (state >>> 15) % below;
   };
 }
 
@@ -84,10 +85,26 @@ function sample(pick: (below: number) => number, alphabet: string[], length: num
   return Array.from({ length }, () => alphabet[pick(alphabet.length)]!).join("");
 }
 
+// The search ranges each case may take: the whole document, a prefix, a suffix, or inside it.
+const RANGE_KINDS = ["document", "prefix", "suffix", "interior"] as const;
+
+function rangeOf(
+  kind: (typeof RANGE_KINDS)[number],
+  pick: (below: number) => number,
+  length: number,
+): { from: number; to: number } {
+  if (kind === "document") return { from: 0, to: length };
+  if (kind === "prefix") return { from: 0, to: pick(length + 1) };
+  if (kind === "suffix") return { from: pick(length + 1), to: length };
+  const from = pick(length + 1);
+  return { from, to: from + pick(length - from + 1) };
+}
+
 describe("plainMatches", () => {
   it("matches CodeMirror's cursor exactly, whatever the text and options", () => {
     let fastRuns = 0;
     let wholeWordRuns = 0;
+    const rangeRuns = new Map<string, number>();
     for (let seed = 1; seed <= 1000; seed += 1) {
       const pick = random(seed);
       const alphabet =
@@ -109,11 +126,12 @@ describe("plainMatches", () => {
         for (const options of OPTIONS) {
           const query = new SearchQuery({ search, ...options });
           if (!query.valid) continue;
-          const from = pick(2) ? 0 : pick(doc.length);
-          const to = pick(2) ? doc.length : from + pick(doc.length - from + 1);
+          const kind = RANGE_KINDS[pick(RANGE_KINDS.length)]!;
+          const { from, to } = rangeOf(kind, pick, doc.length);
           const fast = fastMatches(query, doc, from, to);
           if (fast === null) continue;
           fastRuns += 1;
+          rangeRuns.set(kind, (rangeRuns.get(kind) ?? 0) + 1);
           if (options.wholeWord) wholeWordRuns += 1;
           expect(fast, JSON.stringify({ seed, text, search, options, from, to })).toEqual(
             cursorMatches(query, doc, from, to),
@@ -124,6 +142,7 @@ describe("plainMatches", () => {
     // The fast path ran for most cases, so the comparison means something.
     expect(fastRuns).toBeGreaterThan(8000);
     expect(wholeWordRuns).toBeGreaterThan(2000);
+    for (const kind of RANGE_KINDS) expect(rangeRuns.get(kind), kind).toBeGreaterThan(1500);
   });
 
   it.each([

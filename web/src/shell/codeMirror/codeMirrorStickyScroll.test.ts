@@ -1,6 +1,12 @@
-import { Compartment, EditorState, Text } from "@codemirror/state";
+import {
+  Compartment,
+  EditorState,
+  type StateEffect,
+  Text,
+  type TransactionSpec,
+} from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   pinnedLineAt,
   revealStickyLine,
@@ -31,9 +37,20 @@ describe("revealStickyLine", () => {
       parent: document.body,
       state: EditorState.create({ doc: docOf(NESTED) }),
     });
+    // Without layout the line height is 0, so give the margin a size to check.
+    vi.spyOn(view, "defaultLineHeight", "get").mockReturnValue(18);
+    const dispatch = vi.spyOn(view, "dispatch");
     revealStickyLine(view, 3, 2);
-    expect(view.state.selection.main.head).toBe(view.state.doc.line(3).from);
+    const lineStart = view.state.doc.line(3).from;
+    expect(view.state.selection.main.head).toBe(lineStart);
     expect(document.activeElement).toBe(view.contentDOM);
+    // It scrolls the line to the top, below the two pinned rows above it.
+    const spec = dispatch.mock.calls[0]![0] as TransactionSpec;
+    expect((spec.effects as StateEffect<unknown>).value).toMatchObject({
+      range: { from: lineStart, to: lineStart },
+      y: "start",
+      yMargin: 36,
+    });
   });
 
   it("ignores a line that's no longer in the document", () => {

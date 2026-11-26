@@ -101,12 +101,17 @@ function rightClick(view: EditorView): MouseEvent {
 }
 
 /** Shift+F10 in the editor, the keyboard's way to open the menu. */
-function pressShiftF10(view: EditorView): void {
-  act(() => {
-    view.contentDOM.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "F10", shiftKey: true, bubbles: true, cancelable: true }),
-    );
+function pressShiftF10(view: EditorView): KeyboardEvent {
+  const event = new KeyboardEvent("keydown", {
+    key: "F10",
+    shiftKey: true,
+    bubbles: true,
+    cancelable: true,
   });
+  act(() => {
+    view.contentDOM.dispatchEvent(event);
+  });
+  return event;
 }
 
 const menuItems = () => screen.queryAllByRole("menuitem").map((item) => item.textContent);
@@ -222,9 +227,9 @@ describe("EditorContextMenu", () => {
   );
 
   /** A right-click on "ph": without layout, the click's position is given. */
-  function rightClickOnPh(view: EditorView): void {
+  function rightClickOnPh(view: EditorView): Event {
     vi.spyOn(view, "posAtCoords").mockReturnValue(3);
-    rightClick(view);
+    return rightClick(view);
   }
 
   it.each([
@@ -238,7 +243,8 @@ describe("EditorContextMenu", () => {
       document.execCommand = execCommand;
       try {
         const { view } = editorWithMenu("alpha\nb", COLUMN_WITH_EMPTY_MAIN, { editable: true });
-        open(view);
+        // The editor's own menu replaces the browser's, from either opener.
+        expect(open(view).defaultPrevented).toBe(true);
         expect(view.state.selection.ranges.map((range) => [range.from, range.to])).toEqual([
           [2, 4],
           [7, 7],
@@ -282,21 +288,6 @@ describe("EditorContextMenu", () => {
     const dispatch = vi.spyOn(view, "dispatch");
     await act(async () => finishRead("pasted"));
     expect(dispatch).not.toHaveBeenCalled();
-  });
-
-  it("opens from the keyboard with Shift+F10", () => {
-    const { view } = editorWithMenu("alpha", EditorSelection.single(0));
-    const event = new KeyboardEvent("keydown", {
-      key: "F10",
-      shiftKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
-    act(() => {
-      view.contentDOM.dispatchEvent(event);
-    });
-    expect(event.defaultPrevented).toBe(true);
-    expect(screen.getByTestId("file-editor-context-menu")).toBeTruthy();
   });
 
   it("puts the cursor on a pinned sticky-scroll line, not the hidden text under it", () => {

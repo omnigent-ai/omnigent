@@ -39,8 +39,6 @@ _NESTED_SOURCE = "\n".join(
 )
 _MENU_PATH = "src/menu.py"
 _MENU_SOURCE = 'def greet(name):\n    return "hello " + name\n'
-_CASES_PATH = "src/cases.py"
-_CASES_SOURCE = "foobar = FOOBAR + Foobar\n"
 _SCOPE_PATH = "src/scope.py"
 _SCOPE_SOURCE = "total = 0\ntotal += 1\ntotal += 2\nprint(total)\n"
 # Larger than the server's 10 MiB read cap, so the file arrives truncated and opens read-only.
@@ -51,7 +49,6 @@ _SEEDED = {
     _COLUMNS_PATH: _COLUMNS_SOURCE,
     _NESTED_PATH: _NESTED_SOURCE,
     _MENU_PATH: _MENU_SOURCE,
-    _CASES_PATH: _CASES_SOURCE,
     _SCOPE_PATH: _SCOPE_SOURCE,
 }
 
@@ -247,30 +244,6 @@ def test_right_click_lists_the_editors_commands(page: Page, code_session: tuple[
     expect(editor.locator(".cm-content")).to_be_focused()
 
     _wait_for_persisted(base_url, session_id, _MENU_PATH, '    # return "hello " + name')
-
-
-def test_replace_all_can_preserve_each_matchs_case(
-    page: Page, code_session: tuple[str, str]
-) -> None:
-    """With Preserve case on, Replace all gives each replacement the case of its match."""
-    base_url, session_id = code_session
-    editor = _open_file(page, base_url, session_id, _CASES_PATH)
-    lines = editor.locator(".cm-line")
-    expect(lines.first).to_have_text("foobar = FOOBAR + Foobar", timeout=30_000)
-
-    lines.first.click()
-    page.keyboard.press("ControlOrMeta+Alt+Shift+f")
-    replacement = page.get_by_role("textbox", name="Replace with")
-    expect(replacement).to_be_focused()
-    page.get_by_test_id("file-find-input").fill("foobar")
-    expect(page.get_by_test_id("file-find-status")).to_have_text("1 of 3")
-    replacement.fill("bazQux")
-    preserve = page.get_by_role("button", name="Preserve case")
-    preserve.click()
-    expect(preserve).to_have_attribute("aria-pressed", "true")
-    replacement.press("ControlOrMeta+Enter")
-    expect(lines.first).to_have_text("bazqux = BAZQUX + BazQux")
-    _wait_for_persisted(base_url, session_id, _CASES_PATH, "bazqux = BAZQUX + BazQux")
 
 
 def test_find_in_selection_counts_and_replaces_only_inside_it(

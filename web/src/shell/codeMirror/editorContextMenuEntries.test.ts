@@ -111,7 +111,7 @@ describe("editorMenuEntries", () => {
     expect(paste).toMatchObject({ enabled: false, description: "Press ⌘V to paste here." });
   });
 
-  it("names Ctrl+V in the Paste hint off macOS, as the row's keys do", () => {
+  it("names Ctrl in the clipboard keys and the Paste hint off macOS", () => {
     const paste = item(
       editorMenuEntries({ ...READ_ONLY, editable: true, canReadClipboard: false, mac: false }),
       "paste",
@@ -121,9 +121,6 @@ describe("editorMenuEntries", () => {
       description: "Press Ctrl+V to paste here.",
     });
     expect(pasteWithKeysDescription(false)).toBe("Press Ctrl+V to paste here.");
-  });
-
-  it("shows Ctrl for the clipboard keys off macOS", () => {
     expect(item(editorMenuEntries({ ...READ_ONLY, mac: false }), "copy").keys).toEqual([
       "Ctrl",
       "C",

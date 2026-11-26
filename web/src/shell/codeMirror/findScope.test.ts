@@ -292,13 +292,17 @@ describe("find in selection edge cases", () => {
     ["an anchor past the scope", "(alpha)$", 0],
     ["a lookahead past the scope", "alpha(?= two)", 1],
   ])("reads %s in the line's context, and Replace agrees with the count", (_case, find, count) => {
-    const view = editor();
-    query(view, find, true, "$&X");
-    view.dispatch({ selection: { anchor: 10, head: 15 }, userEvent: "select" });
-    toggleFindInSelection(view, true);
+    const scoped = () => {
+      const view = editor();
+      query(view, find, true, "$&X");
+      view.dispatch({ selection: { anchor: 10, head: 15 }, userEvent: "select" });
+      toggleFindInSelection(view, true);
+      return view;
+    };
+    const replaced = count > 0 ? DOC.replace("alpha two", "alphaX two") : DOC;
+    const view = scoped();
     const index = indexFor(view);
     expect(index.status(view.state).matchCount).toBe(count);
-    const replaced = DOC.replace("alpha two", "alphaX two");
     if (count > 0) {
       view.dispatch({ selection: { anchor: 10, head: 15 } });
       const resumed: (number | null)[] = [];
@@ -307,19 +311,10 @@ describe("find in selection edge cases", () => {
       );
       expect(resumed).toEqual([16]);
       expect(view.state.doc.toString()).toBe(replaced);
-      return;
     }
-    new FindReplacer(index, immediate).replaceAll(view);
-    expect(view.state.doc.toString()).toBe(DOC);
-  });
-
-  it("agrees between Replace all and the count for a lookahead past the scope", () => {
-    const view = editor();
-    query(view, "alpha(?= two)", true, "$&X");
-    view.dispatch({ selection: { anchor: 10, head: 15 }, userEvent: "select" });
-    toggleFindInSelection(view, true);
-    new FindReplacer(indexFor(view), immediate).replaceAll(view);
-    expect(view.state.doc.toString()).toBe(DOC.replace("alpha two", "alphaX two"));
+    const all = scoped();
+    new FindReplacer(indexFor(all), immediate).replaceAll(all);
+    expect(all.state.doc.toString()).toBe(replaced);
   });
 
   it("is available only with a selection or while on", () => {

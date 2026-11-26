@@ -20,6 +20,7 @@ import { FILE_EDITOR_COMMANDS, fileEditorCommandLabel } from "@/components/fileE
 import { CodeMirrorFileViewer, type CodeMirrorFileViewerProps } from "./CodeMirrorFileViewer";
 import { getSavedScrollTop } from "../useScrollRestore";
 import { setCommentLayer } from "./commentHighlighting";
+import { findScopeOf } from "./findScope";
 import { isCommandListed, usePaletteCommandsStore } from "@/store/paletteCommands";
 import { useChatStore } from "@/store/chatStore";
 
@@ -776,6 +777,20 @@ describe("CodeMirrorFileViewer find and replace", () => {
     expect(view.state.doc.line(2).text).toBe("let 1 = count;");
   });
 
+  it("gives each replacement its match's case with Preserve case on", async () => {
+    const { input, view } = await openFind({ content: "foobar = FOOBAR + Foobar" });
+    fireEvent.click(screen.getByRole("button", { name: "Replace" }));
+    fireEvent.change(input, { target: { value: "foobar" } });
+    await waitFor(() => expect(screen.getByTestId("file-find-status")).toHaveTextContent("1 of 3"));
+    const replacement = screen.getByRole("textbox", { name: "Replace with" });
+    fireEvent.change(replacement, { target: { value: "bazQux" } });
+    const preserve = screen.getByRole("button", { name: "Preserve case" });
+    fireEvent.click(preserve);
+    expect(preserve).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(replacement, { key: "Enter", ...MOD });
+    expect(view.state.doc.toString()).toBe("bazqux = BAZQUX + BazQux");
+  });
+
   it.each([
     ["^", ">", ">alpha\n>beta\n>gamma"],
     ["$", "<", "alpha<\nbeta<\ngamma<"],
@@ -1152,6 +1167,34 @@ describe("CodeMirrorFileViewer find in selection", () => {
       "aria-pressed",
       "true",
     );
+  });
+
+  it("turns on for the selection from ⌥⌘L in the editor", async () => {
+    const { container } = renderViewer({ content: "alpha beta\nalpha", editing: editing() });
+    const view = editorViewOf(container);
+    act(() => view.dispatch({ selection: { anchor: 0, head: 5 }, userEvent: "select" }));
+    const mod = /Mac/.test(navigator.platform) ? { metaKey: true } : { ctrlKey: true };
+    fireEvent.keyDown(view.contentDOM, { key: "l", code: "KeyL", altKey: true, ...mod });
+    await screen.findByRole("textbox", { name: "Find in file" });
+    expect(findScopeOf(view.state)).toEqual([{ from: 0, to: 5 }]);
+    expect(screen.getByRole("button", { name: "Find in selection" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("drops its scope when Find closes, so Find opens again over the whole file", async () => {
+    const { container } = renderViewer({ content: "alpha beta\nalpha", editing: editing() });
+    const command = () => fileCommands().find((entry) => entry.id === "file.find-in-selection")!;
+    const view = editorViewOf(container);
+    act(() => view.dispatch({ selection: { anchor: 0, head: 5 }, userEvent: "select" }));
+    await waitFor(() => expect(command().availability).toBeUndefined());
+    act(() => command().run());
+    await screen.findByRole("textbox", { name: "Find in file" });
+    expect(findScopeOf(view.state)).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Close find" }));
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "Find in file" })).toBeNull());
+    expect(findScopeOf(view.state)).toBeNull();
   });
 
   it("keeps the palette command for turning an active scope off after the selection clears", async () => {
