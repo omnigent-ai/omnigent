@@ -3,7 +3,12 @@
 
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
+import {
+  type DesktopCommand,
+  isNativeShell,
+  shellRoutesDesktopCommands,
+  supportsDesktopCommands,
+} from "@/lib/nativeBridge";
 import {
   type Chord,
   chordAriaShortcut,
@@ -20,9 +25,13 @@ export interface ShortcutEnvironment {
   native: boolean;
   /** The desktop shell's menus own some chords (⌘, for Settings) and hand the command to the page. */
   desktopMenu: boolean;
+  /** The desktop menu's Go items own ⌘[ / ⌘]: the shell says it routes Go Back and Go Forward. */
+  goMenu: boolean;
   /** The composer sends with ⌘↵ and inserts a newline with ↵. */
   submitWithModEnter: boolean;
 }
+
+const GO_COMMANDS: readonly DesktopCommand[] = ["go-back", "go-forward"];
 
 /** Environments built here, which read each field once, on first use. */
 const resolvedEnvironments = new WeakSet<object>();
@@ -49,6 +58,9 @@ export function currentShortcutEnvironment(
     },
     get desktopMenu() {
       return read("desktopMenu", supportsDesktopCommands);
+    },
+    get goMenu() {
+      return read("goMenu", () => shellRoutesDesktopCommands(GO_COMMANDS));
     },
     get submitWithModEnter() {
       return read("submitWithModEnter", readSubmitWithModEnter);
@@ -456,14 +468,19 @@ const APP_BINDINGS = {
   "history.back": {
     group: "navigation",
     label: "Go back",
-    chords: () => [{ mod: true, code: "BracketLeft", matchesAltGraph: true }],
+    // A shell whose Go menu takes ⌘[ hands it over as a command, even from a browser view.
+    chords: (environment) =>
+      environment.goMenu ? [] : [{ mod: true, code: "BracketLeft", matchesAltGraph: true }],
+    menuChords: (environment) => (environment.goMenu ? [{ mod: true, code: "BracketLeft" }] : []),
     // A browser tab keeps its own Back and Forward.
     shownWhen: (context) => context.electron,
   },
   "history.forward": {
     group: "navigation",
     label: "Go forward",
-    chords: () => [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
+    chords: (environment) =>
+      environment.goMenu ? [] : [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
+    menuChords: (environment) => (environment.goMenu ? [{ mod: true, code: "BracketRight" }] : []),
     // A browser tab keeps its own Back and Forward.
     shownWhen: (context) => context.electron,
   },

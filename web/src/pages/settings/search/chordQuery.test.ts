@@ -220,7 +220,16 @@ function isBarePrintable(chord: Chord): boolean {
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
     [true, false].flatMap((desktopMenu) =>
-      [true, false].map((submitWithModEnter) => ({ mac, native, desktopMenu, submitWithModEnter })),
+      // The Go menu exists only on a shell with the command bridge.
+      (desktopMenu ? [false, true] : [false]).flatMap((goMenu) =>
+        [true, false].map((submitWithModEnter) => ({
+          mac,
+          native,
+          desktopMenu,
+          goMenu,
+          submitWithModEnter,
+        })),
+      ),
     ),
   ),
 );
@@ -228,6 +237,7 @@ const MAC_DESKTOP: ShortcutEnvironment = {
   mac: true,
   native: true,
   desktopMenu: true,
+  goMenu: true,
   submitWithModEnter: false,
 };
 

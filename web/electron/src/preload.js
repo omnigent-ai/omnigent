@@ -197,13 +197,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Report which menu commands this page can act on right now, plus the open
    * session's pin/archive state, so the native menu can enable and label them.
    * Fire-and-forget.
-   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean}} state
+   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean, pickListFocused?: boolean}} state
    */
   setDesktopCommandState: (state) => {
     ipcRenderer.send("omnigent:set-desktop-command-state", {
       commands: Array.isArray(state?.commands) ? state.commands.map(String) : [],
       sessionPinned: state?.sessionPinned === true,
       sessionArchived: state?.sessionArchived === true,
+      pickListFocused: state?.pickListFocused === true,
     });
   },
   /**
@@ -217,6 +218,26 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       typeof conversationId === "string" ? conversationId : null,
     );
   },
+  /**
+   * The menu commands this shell routes to the page, so it can leave their chords to the menu.
+   * Kept equal to DESKTOP_COMMANDS in desktopCommands.js, which a sandboxed preload can't load.
+   */
+  desktopCommands: Object.freeze([
+    "close",
+    "new-terminal",
+    "new-browser-tab",
+    "archive-session",
+    "toggle-pin-session",
+    "fork-session",
+    "go-back",
+    "go-forward",
+    "reload",
+    "focus-address-bar",
+    "reopen-closed-tab",
+    "previous-tab",
+    "next-tab",
+    "quit",
+  ]),
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
   /** Open a session in its own window on this server. Resolves whether it opened. */

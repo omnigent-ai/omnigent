@@ -36,12 +36,16 @@ const TAKES_OVER: Record<string, readonly string[]> = {
 
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
-    [true, false].map((desktopMenu) => ({
-      mac,
-      native,
-      desktopMenu,
-      submitWithModEnter: false,
-    })),
+    [true, false].flatMap((desktopMenu) =>
+      // A shell from before the Go list has the command bridge, and leaves ⌘[ / ⌘] to the page.
+      (desktopMenu ? [false, true] : [false]).map((goMenu) => ({
+        mac,
+        native,
+        desktopMenu,
+        goMenu,
+        submitWithModEnter: false,
+      })),
+    ),
   ),
 );
 

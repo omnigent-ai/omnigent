@@ -67,8 +67,9 @@ the header menu), and each place is a separate entry point.
   its **Sessions** tab, with or without an open session: the same search, with a
   preview of the matching message beside the list; a failed search or page
   shows with Retry. Ctrl-N and Ctrl-P step the palette's rows as the arrows do,
-  except that in the Windows and Linux desktop app the menu's New Session
-  accelerator still takes Ctrl+N first (see `composer.md`'s new-session hotkey).
+  in the Windows and Linux desktop app too: its menu's New Session accelerator
+  yields Ctrl+N while the palette has focus (see `composer.md`'s new-session
+  hotkey).
   Closing it with Escape, or with a command that leaves focus alone, returns the
   keyboard to the field it was opened from.
 - `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**

@@ -352,6 +352,8 @@ interface ElectronDesktopApi extends NativeShellApi, CodeHostDesktopApi {
   ) => () => void;
   /** Report which menu commands this page can run now (fire-and-forget). */
   setDesktopCommandState?: (state: DesktopCommandState) => void;
+  /** The menu commands this shell routes to the page; absent on shells from before the list. */
+  desktopCommands?: readonly string[];
   /** Report the conversation this page has loaded, or null for none (fire-and-forget). */
   reportConversationShown?: (conversationId: string | null) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
@@ -493,6 +495,8 @@ export interface DesktopCommandState {
   commands: DesktopCommand[];
   sessionPinned: boolean;
   sessionArchived: boolean;
+  /** An open pick list has the keyboard and steps on Ctrl-N / Ctrl-P, which the menu then leaves. */
+  pickListFocused?: boolean;
 }
 
 /** One importable site tree and how many cookies a profile holds for it. */
@@ -1027,6 +1031,16 @@ export function supportsDesktopCommands(): boolean {
     typeof electron?.onDesktopCommand === "function" &&
     typeof electron.setDesktopCommandState === "function"
   );
+}
+
+/**
+ * True when the shell's menu routes every one of `commands` to this page, by the list it
+ * advertises. A shell from before that list may still route some, so it answers false.
+ */
+export function shellRoutesDesktopCommands(commands: readonly DesktopCommand[]): boolean {
+  if (!supportsDesktopCommands()) return false;
+  const routed = electronApi()?.desktopCommands;
+  return Array.isArray(routed) && commands.every((command) => routed.includes(command));
 }
 
 /** Subscribe to native menu commands; a no-op outside a supporting shell. */
