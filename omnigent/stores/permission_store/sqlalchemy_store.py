@@ -1069,6 +1069,24 @@ class SqlAlchemyPermissionStore(PermissionStore):
             deleted = session.execute(select(*probes)).one()
         return {user_id for user_id, gone in zip(wanted, deleted, strict=True) if gone}
 
+    def outlived_accounts(self, user_ids: Sequence[str]) -> set[str]:
+        """Accounts this request authenticated as that are gone. See base class."""
+        wanted = sorted({u for u in user_ids if account_generation(u) is not None})
+        if not wanted:
+            return set()
+        with self._session("read_outlived_accounts") as session:
+            rows = session.execute(
+                select(SqlUser.id, SqlUser.deleted_at, SqlUser.account_generation).where(
+                    SqlUser.workspace_id == current_workspace_id(), SqlUser.id.in_(wanted)
+                )
+            ).all()
+        live = {row.id: row.account_generation for row in rows if row.deleted_at is None}
+        return {
+            user_id
+            for user_id in wanted
+            if user_id in live and live[user_id] != account_generation(user_id)
+        } | {row.id for row in rows if row.deleted_at is not None and row.id not in live}
+
     def account_registrations(self, user_ids: Sequence[str]) -> dict[str, str]:
         """Name each live account's registration. See base class.
 

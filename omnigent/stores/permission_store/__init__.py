@@ -325,6 +325,16 @@ class PermissionStore(ABC):
         """
         return set()
 
+    def outlived_accounts(self, user_ids: Sequence[str]) -> set[str]:  # noqa: ARG002
+        """Which of *user_ids* this request authenticated as an account that is gone:
+        deleted, or replaced by another registration of the name (its account generation
+        differs from the one the request captured). An identity with no generation captured
+        (an SSO-supplied one) or no account row never outlived it. The default knows of none.
+
+        :returns: The outlived ones.
+        """
+        return set()
+
     def account_registrations(self, user_ids: Sequence[str]) -> dict[str, str]:  # noqa: ARG002
         """Name the current registration of each live account among *user_ids*, in one batch.
 

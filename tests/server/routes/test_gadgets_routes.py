@@ -753,6 +753,30 @@ async def test_an_account_deleted_after_its_request_authenticated_writes_nothing
     )
 
 
+async def test_an_account_activated_from_a_sharing_placeholder_uses_gadgets(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    # Sharing made a placeholder row without a registration; an administrator then set a
+    # password. The live account is itself: it uses gadgets, with no registration.
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(stores.db_uri)
+    stores.permissions.ensure_user("erin@example.com")
+    accounts.update_password("erin@example.com", "erin-hash")
+    account = accounts.get_user("erin@example.com")
+    assert account is not None and account.account_generation is not None
+    # As the accounts login binds it: the request carries the account's generation.
+    with account_authority_scope("erin@example.com", account.account_generation):
+        assert stores.permissions.outlived_accounts(["erin@example.com"]) == set()
+        created = await client.post(
+            "/v1/gadgets", json={"name": "Erin's board"}, headers=_as("erin@example.com")
+        )
+        assert created.status_code == 201, created.text
+        listed = await client.get("/v1/gadgets", headers=_as("erin@example.com"))
+    assert [item["id"] for item in listed.json()["items"]] == [created.json()["id"]]
+
+
 def test_a_request_that_outlived_its_account_names_no_registration(
     stores: SimpleNamespace,
 ) -> None:
@@ -769,6 +793,7 @@ def test_a_request_that_outlived_its_account_names_no_registration(
 
     with account_authority_scope("dave@example.com", old.account_generation):
         assert stores.permissions.account_registrations(["dave@example.com"]) == {}
+        assert stores.permissions.outlived_accounts(["dave@example.com"]) == {"dave@example.com"}
     with account_authority_scope("dave@example.com", new.account_generation):
         assert "dave@example.com" in stores.permissions.account_registrations(["dave@example.com"])
 

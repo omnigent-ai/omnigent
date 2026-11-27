@@ -24,7 +24,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, Response
 
-from omnigent.db.account_authority import account_generation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.gadgets.access import GadgetAccess, workspace_registration
 from omnigent.gadgets.actions import ACTION_STATES
@@ -285,13 +284,15 @@ def create_gadgets_router(
             raw is None
             and permission_store is not None
             and (
-                account_generation(user_id) is not None
+                user_id in permission_store.outlived_accounts([user_id])
                 or user_id in permission_store.deleted_accounts([user_id])
             )
         ):
             # The account this request authenticated as is gone (deleted, or its name
             # registered again since). Its writes would land where no cleanup looks, or
-            # under the new account: refused, before the workspace names a fallback.
+            # under the new account: refused, before the workspace names a fallback. A live
+            # account without a registration (activated from a sharing placeholder) is
+            # still itself, and goes on with none, like an SSO identity.
             raise OmnigentError(
                 "This account was deleted; sign in again", code=ErrorCode.UNAUTHORIZED
             )
