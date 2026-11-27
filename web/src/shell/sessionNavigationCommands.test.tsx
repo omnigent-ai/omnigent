@@ -118,15 +118,20 @@ describe("Switch to recent session", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("is offered for a session cached outside the sidebar's rows, once it's cached", () => {
+  it("is offered only for a session the switcher can reach: visited, or in the sidebar's rows", () => {
     // The sidebar lists only the open session; the other sits in a project folder's list.
     useSidebarSessionOrderStore.setState({ orderedSessionIds: ["b"], activeSessionId: "b" });
     queryClient.setQueryData(["conversations", "mine"], listPage([row("b", 2)]));
     registerCachedSessions();
     const { result } = renderCommands();
+    act(() => queryClient.setQueryData(["project-sessions", "p1"], listPage([row("z", 1)])));
+    // Never visited and not in the sidebar's order, so the switcher would only reselect b.
     expect(isCommandListed(command(result.current, "recent-session").availability)).toBe(false);
 
-    act(() => queryClient.setQueryData(["project-sessions", "p1"], listPage([row("z", 1)])));
+    act(() => useRecentSessionSwitchStore.setState({ history: ["z"] }));
+    expect(isCommandListed(command(result.current, "recent-session").availability)).toBe(true);
+    act(() => useRecentSessionSwitchStore.setState({ history: [] }));
+    act(() => useSidebarSessionOrderStore.setState({ orderedSessionIds: ["b", "z"] }));
     expect(isCommandListed(command(result.current, "recent-session").availability)).toBe(true);
   });
 

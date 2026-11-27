@@ -6,8 +6,8 @@ import { ArrowDownIcon, ArrowUpIcon, HistoryIcon } from "lucide-react";
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 
 import {
-  liveRecentSessionIds,
   openRecentSessionSwitcher,
+  reachableRecentSessionIds,
   useRecentSessionSwitchStore,
 } from "@/hooks/useRecentSessionSwitch";
 import {
@@ -15,14 +15,15 @@ import {
   stepSidebarSession,
   useSidebarSessionOrderStore,
 } from "@/hooks/useSidebarSessionOrder";
+import { subscribeToSessionLists } from "@/lib/liveSessions";
 import { useNavigate } from "@/lib/routing";
 import { AVAILABLE, HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
 
 import { useCommandContext } from "./commandContext";
 
-/** Whether the switcher has a live session to open besides the ones in `openIds`. */
+/** Whether the switcher has a session to open besides the ones in `openIds`. */
 export function hasOtherLiveSession(
-  liveIds: ReadonlySet<string>,
+  liveIds: Iterable<string>,
   openIds: readonly (string | null)[],
 ): boolean {
   for (const id of liveIds) if (!openIds.includes(id)) return true;
@@ -30,25 +31,27 @@ export function hasOtherLiveSession(
 }
 
 /**
- * Whether ⌃] has a session to switch to: any live session the client has cached, including
- * ones a collapsed folder or the sidebar's filter hides, as the switcher lists them.
+ * Whether ⌃] has a session to switch to: a live visited session or sidebar row, including ones a
+ * collapsed folder or the sidebar's filter hides, as the switcher's order holds them.
  */
 function useCanSwitchToRecentSession(openId: string | null): boolean {
   const queryClient = useQueryClient();
   const openRootId = useSidebarSessionOrderStore((state) => state.activeSessionId);
   const subscribe = useCallback(
     (onChange: () => void) => {
-      const stopCache = queryClient.getQueryCache().subscribe(onChange);
-      const stopStore = useRecentSessionSwitchStore.subscribe(onChange);
+      const stops = [
+        subscribeToSessionLists(queryClient, onChange),
+        useRecentSessionSwitchStore.subscribe(onChange),
+        useSidebarSessionOrderStore.subscribe(onChange),
+      ];
       return () => {
-        stopCache();
-        stopStore();
+        for (const stop of stops) stop();
       };
     },
     [queryClient],
   );
   return useSyncExternalStore(subscribe, () =>
-    hasOtherLiveSession(liveRecentSessionIds(), [openId, openRootId]),
+    hasOtherLiveSession(reachableRecentSessionIds(), [openId, openRootId]),
   );
 }
 

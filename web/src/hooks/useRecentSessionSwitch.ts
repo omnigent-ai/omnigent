@@ -81,6 +81,16 @@ export function liveRecentSessionIds(): ReadonlySet<string> {
   return useRecentSessionSwitchStore.getState().readLiveSessionIds?.() ?? NO_LIVE_SESSIONS;
 }
 
+/** The live sessions the switcher's order holds: visited ones, then the sidebar's rows. */
+export function reachableRecentSessionIds(): string[] {
+  const live = liveRecentSessionIds();
+  return recentSessionOrder(
+    useRecentSessionSwitchStore.getState().history,
+    useSidebarSessionOrderStore.getState().orderedSessionIds,
+    (id) => live.has(id),
+  );
+}
+
 /** Make `sessionId` the most recent visit. */
 export function recordRecentSessionVisit(sessionId: string): void {
   const history = recordSessionVisit(useRecentSessionSwitchStore.getState().history, sessionId);

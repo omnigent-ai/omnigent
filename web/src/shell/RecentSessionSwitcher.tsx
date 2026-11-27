@@ -15,7 +15,7 @@ import {
   selectRecentSession,
   useRecentSessionSwitchStore,
 } from "@/hooks/useRecentSessionSwitch";
-import { liveSessionsInCache } from "@/lib/liveSessions";
+import { liveSessionsInCache, subscribeToSessionLists } from "@/lib/liveSessions";
 import { relativeTime } from "@/lib/relativeTime";
 
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
@@ -58,7 +58,7 @@ export function RecentSessionSwitcher() {
     if (!open) return;
     const refresh = () => setSessions(liveSessionsInCache(queryClient));
     refresh();
-    return queryClient.getQueryCache().subscribe(refresh);
+    return subscribeToSessionLists(queryClient, refresh);
   }, [open, queryClient]);
   useEffect(() => {
     if (open) reconcileRecentSessionSwitcher();
