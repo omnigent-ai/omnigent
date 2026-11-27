@@ -5,7 +5,7 @@
 // below it is how the diff shows. The review is the shared one, on the same source.
 
 import { randomUUID } from "@/lib/randomUUID";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   FileDiffIcon,
   FolderGit2Icon,
@@ -41,7 +41,11 @@ import { BRANCH_COMMITS_KEY } from "@/lib/branchCommits";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { useFindSurface } from "@/lib/findRouting";
 import { type LocalComparisonView, onComparisonChosen } from "@/lib/localComparison";
-import { comparisonHeadIsWorkingCopy, type EffectiveComparison } from "@/lib/workingCopyComparison";
+import {
+  comparisonHeadIsWorkingCopy,
+  type EffectiveComparison,
+  hostListing,
+} from "@/lib/workingCopyComparison";
 import {
   AVAILABLE,
   type PaletteCommand,
@@ -71,8 +75,28 @@ import { useLocalComparison } from "./useLocalComparison";
 import { useVisitComparison, type VisitComparisonOptions } from "./useVisitComparison";
 import type { CommentSelectionRequest } from "./commentSelectionHandoff";
 import { actionsOnlyCommentContext } from "./useReviewCommentLayer";
+import {
+  folderName,
+  type ReviewFolder,
+  ReviewFolderName,
+  useReviewFolder,
+} from "./ChangesReviewFolder";
+import { ComparisonOwnerContext, useSessionChoiceCount } from "@/hooks/useComparisonOwner";
+import { repositoryPathOf, workspacePathInRepository } from "@/lib/repositoryFolder";
+import {
+  browseLocationChanges,
+  rememberBrowseLocation,
+  useBrowseLocationChanges,
+} from "./filesPane/browseLocations";
+import { sessionChoiceCount, workingCopyComparisonsAt } from "@/lib/workingCopyComparisons";
 import { unrepresentableNote, WorkingCopyDiffReviewBody } from "./WorkingCopyDiffReview";
 import { useLastInteractedSurface } from "./useLastInteractedSurface";
+import {
+  landingStands,
+  sameReviewFolder,
+  type VisitLanding,
+  visitFolderStep,
+} from "./visitFolderRestore";
 
 const REVIEW_METADATA_KEYS = [BRANCH_COMMITS_KEY, REPOSITORY_REFS_KEY] as const;
 /** A commit's review toolbar: how its diff shows, with nothing about the session's comparison. */
@@ -105,10 +129,21 @@ export interface ChangesReviewProps {
   requestedRange?: { base: string; head: string };
   /** The comparison this visit showed, which showing it again applies to the session. */
   comparison?: ComparisonChoice;
-  /** Records a comparison the session shows on the visit; without it, visits keep none. */
-  onComparisonShown?: VisitComparisonOptions["onShown"];
-  /** How the tab last landed on the visit, which applies the visit's comparison once. */
-  landing?: VisitComparisonOptions["landing"];
+  /** The folder, absolute, whose review showed `comparison`; null for the workspace. */
+  comparisonRoot?: string | null;
+  /**
+   * Records a comparison the session shows on the visit, with the folder whose review shows it
+   * (`root`, null for the workspace); without it, visits keep none.
+   */
+  onComparisonShown?: (
+    shown: ComparisonChoice,
+    options: { step: boolean; root: string | null },
+  ) => void;
+  /**
+   * How the tab last landed on the visit, which brings back the visit's folder and then applies
+   * its comparison, once.
+   */
+  landing?: VisitLanding;
   /** The tab is selected and the sidebar is open. */
   active: boolean;
   /** Shows a file itself, in a Files tab. */
@@ -188,11 +223,6 @@ export function requestedRangeView(
   };
 }
 
-function repositoryName(root: string | null): string {
-  if (!root) return "Workspace";
-  return root.replace(/\/+$/, "").split("/").at(-1) || root;
-}
-
 /** The header's note beside Refresh; `prefix` gives way in a narrow header. */
 interface HeaderStatus {
   prefix?: string;
@@ -253,7 +283,8 @@ function PaneHeader({
   sectionsRef,
   onRefresh,
 }: {
-  repository: string;
+  /** The repository's name, or the button that chooses another. */
+  repository: React.ReactNode;
   status: HeaderStatus | null;
   comparison: React.ReactNode;
   /** Commits and Changes, where the branch's commits can be listed; none elsewhere. */
@@ -271,9 +302,7 @@ function PaneHeader({
       data-testid="changes-review-header"
     >
       <FolderGit2Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-      <span className="min-w-0 shrink-[3] truncate font-semibold" title={repository}>
-        {repository}
-      </span>
+      {repository}
       {/* On a phone the comparison's name truncates too, so the tabs and Refresh stay on screen. */}
       <div className="flex min-w-12 shrink items-center">{comparison}</div>
       <span className="ml-auto flex shrink-0 items-center gap-0.5 pl-2">
@@ -381,10 +410,8 @@ function ComparisonNotes({
   comparison: EffectiveComparison;
   asleep: boolean;
 }) {
-  const leftOut =
-    comparison.base === "branch-point"
-      ? unrepresentableNote(comparison.comparison.unrepresentableNames)
-      : null;
+  const listing = hostListing(comparison);
+  const leftOut = listing ? unrepresentableNote(listing.unrepresentableNames) : null;
   return (
     <>
       <ComparisonStatusRow view={view} asleep={asleep} />
@@ -466,7 +493,138 @@ function ReviewMessage({
   );
 }
 
-export function ChangesReview({
+/**
+ * The session's Diffs: the repository holding the directory Files shows, such as a
+ * worktree inside the workspace, reviewed apart from the workspace's own comparison.
+ */
+export function ChangesReview(props: ChangesReviewProps) {
+  const { conversationId, active, comparison, comparisonRoot, onComparisonShown, landing } = props;
+  // A landing stands until a comparison or a folder is chosen; then the review shows the choice.
+  const choices = useSessionChoiceCount(conversationId);
+  const folders = useBrowseLocationChanges(conversationId);
+  const stands = landingStands(landing, { choices, folders });
+  const visitRoot = comparisonRoot ?? null;
+  const folder = useReviewFolder(
+    conversationId,
+    active,
+    stands && comparison !== undefined ? visitRoot : null,
+  );
+  const { repository, workspace, workspaceKey } = folder;
+  // A visit's comparison is its folder's. Another folder's review never applies it, and records
+  // its own comparison on the visit in place, with its folder.
+  const shownRoot = repository ? folder.root : null;
+  const sameFolder = sameReviewFolder(visitRoot, shownRoot);
+  const folderStep = visitFolderStep({
+    stands,
+    active,
+    hasComparison: comparison !== undefined,
+    visitRoot,
+    shownRoot,
+    directory: folder.directory,
+    resolved: folder.resolved,
+    visitRootShows: sameReviewFolder(folder.rootFor(visitRoot), visitRoot),
+    canChoose: folder.canChoose,
+  });
+  // Before paint, move Diffs and Files to the visit's folder; the landing then stands there.
+  const restoreTo = folderStep.kind === "restore" ? folderStep.directory : undefined;
+  useLayoutEffect(() => {
+    if (restoreTo === undefined || !landing) return;
+    const now = {
+      choices: sessionChoiceCount(conversationId),
+      folders: browseLocationChanges(conversationId),
+    };
+    if (!landingStands(landing, now)) return;
+    rememberBrowseLocation(conversationId, restoreTo);
+    landing.folders = browseLocationChanges(conversationId);
+  }, [restoreTo, landing, conversationId]);
+  // While the folder is on its way or unknown, the review neither applies, records nor waits on
+  // the visit, so it never records a comparison under the wrong folder.
+  const holding = folderStep.kind !== "none" || !folder.resolved;
+  const visit = useMemo((): Pick<
+    ChangesReviewAtProps,
+    "comparison" | "onComparisonShown" | "landing"
+  > => {
+    if (holding) return { comparison: undefined, onComparisonShown: undefined, landing: undefined };
+    const recordHere: VisitComparisonOptions["onShown"] | undefined =
+      onComparisonShown &&
+      ((shown, { step }) => onComparisonShown(shown, { step, root: shownRoot }));
+    return {
+      comparison: sameFolder ? comparison : undefined,
+      onComparisonShown: recordHere,
+      landing: stands ? landing : undefined,
+    };
+  }, [holding, sameFolder, onComparisonShown, comparison, shownRoot, stands, landing]);
+  // A repository's review names files as the session does; kept across renders, so the
+  // review's file actions and comments don't rebuild when the parent renders.
+  const { onViewFile, onCommentOnFile, onOpenFileInNewTab, revealPath } = props;
+  const repositoryActions = useMemo((): Pick<
+    ChangesReviewAtProps,
+    "onViewFile" | "onCommentOnFile" | "onOpenFileInNewTab"
+  > | null => {
+    if (!repository) return null;
+    const toSession = (path: string) => workspacePathInRepository(path, repository);
+    return {
+      onViewFile: (path) => onViewFile(toSession(path)),
+      onCommentOnFile:
+        onCommentOnFile &&
+        ((request) => onCommentOnFile({ ...request, path: toSession(request.path) })),
+      onOpenFileInNewTab:
+        onOpenFileInNewTab && ((path, options) => onOpenFileInNewTab(toSession(path), options)),
+    };
+  }, [repository, onViewFile, onCommentOnFile, onOpenFileInNewTab]);
+  const { onComparisonShown: _recorded, comparisonRoot: _root, ...shared } = props;
+  const mapped: ChangesReviewAtProps = repositoryActions
+    ? {
+        ...shared,
+        ...visit,
+        ...repositoryActions,
+        // A link to a workspace file shows only if it lies in this repository.
+        revealPath: revealPath
+          ? (repositoryPathOf(revealPath, repository ?? "", workspace) ?? undefined)
+          : revealPath,
+      }
+    : { ...shared, ...visit };
+  const folderOwner = useMemo(
+    () => (repository ? workingCopyComparisonsAt(repository, workspaceKey) : null),
+    [repository, workspaceKey],
+  );
+  if (repository === null) {
+    return (
+      <>
+        <ReviewMessage
+          title="Can't Show This Folder in Diffs"
+          message={`${folderName(folder.root)} is outside the workspace. Diffs can show worktrees inside ${folderName(workspace)}.`}
+          actions={[
+            { label: `Show ${folderName(workspace)}`, run: folder.showWorkspace, primary: true },
+            ...(folder.canChoose ? [{ label: "Choose Folder…", run: folder.choose }] : []),
+          ]}
+        />
+        {folder.dialog}
+      </>
+    );
+  }
+  if (!repository || !folderOwner) {
+    return (
+      <>
+        <ChangesReviewAt {...mapped} folder={folder} />
+        {folder.dialog}
+      </>
+    );
+  }
+  return (
+    <ComparisonOwnerContext.Provider value={folderOwner}>
+      <ChangesReviewAt key={`${workspaceKey}\u0000${repository}`} {...mapped} folder={folder} />
+      {folder.dialog}
+    </ComparisonOwnerContext.Provider>
+  );
+}
+
+/** A review's props, with the visit's comparison recorded as the review shows it. */
+type ChangesReviewAtProps = Omit<ChangesReviewProps, "onComparisonShown" | "comparisonRoot"> & {
+  onComparisonShown?: VisitComparisonOptions["onShown"];
+};
+
+function ChangesReviewAt({
   conversationId,
   revealPath,
   revealPosition,
@@ -481,8 +639,11 @@ export function ChangesReview({
   onCommentOnFile,
   onOpenFileInNewTab,
   sort,
-}: ChangesReviewProps) {
+  folder,
+}: ChangesReviewAtProps & { folder: ReviewFolder }) {
   const { changes, view: sessionView, choice } = useLocalComparison(conversationId, { active });
+  // A landing counts the session's choices in every folder's review, as these do.
+  const sessionChoices = useSessionChoiceCount(conversationId);
   // Where typed comparisons work, a linked base and head is the visit's comparison instead.
   const comparesTyped = ["available", "checking"].includes(changes.revisionSupport.kind);
   const requestedRange = comparesTyped ? undefined : linkedRange;
@@ -492,7 +653,7 @@ export function ChangesReview({
     visit: visitComparison,
     landing,
     session: choice,
-    choices: changes.choices,
+    choices: sessionChoices,
     onShown: onComparisonShown ?? NO_VISIT,
   });
   // While on screen, links to the files it shows stay in this review. A requested base and
@@ -501,17 +662,24 @@ export function ChangesReview({
   const changedList = changes.data;
   const listFailed = changes.isError;
   const comparesRequestedRange = requestedRange !== undefined || pendingVisit !== null;
-  const reviewFiles = useMemo(
-    (): ShownReviewFiles =>
-      comparesRequestedRange
-        ? { state: "unavailable" }
-        : changedReviewFiles({
-            comparison: { base: comparisonBase },
-            data: changedList,
-            isError: listFailed,
-          }),
-    [comparesRequestedRange, comparisonBase, changedList, listFailed],
+  // How the session names this review's files: as they are, or inside a worktree's folder.
+  const repository = folder.repository ?? "";
+  const sessionPath = useMemo(
+    () => (repository ? (path: string) => workspacePathInRepository(path, repository) : null),
+    [repository],
   );
+  const reviewFiles = useMemo((): ShownReviewFiles => {
+    if (comparesRequestedRange) return { state: "unavailable" };
+    const shown = changedReviewFiles({
+      comparison: { base: comparisonBase },
+      data: changedList,
+      isError: listFailed,
+    });
+    // Links name files as the session does, so membership is published that way.
+    return shown.state === "listed" && sessionPath
+      ? { state: "listed", paths: shown.paths.map(sessionPath) }
+      : shown;
+  }, [comparesRequestedRange, comparisonBase, changedList, listFailed, sessionPath]);
   const publisher = useRef({});
   useEffect(() => {
     if (!active) return;
@@ -562,9 +730,10 @@ export function ChangesReview({
             canCommentOn: () => true,
             onAddComment: (path, selection, text) =>
               onCommentOnFile({ id: randomUUID(), path, ...selection, text }),
+            ...(sessionPath && { sessionPath }),
           })
         : undefined,
-    [changesActive, workingCopyHead, onCommentOnFile],
+    [changesActive, workingCopyHead, onCommentOnFile, sessionPath],
   );
   // Here, above the review, so access lost while no review is shown still clears its text.
   useForgetDiffTextWhenRevoked(conversationId, changes.permitted);
@@ -712,6 +881,7 @@ export function ChangesReview({
       ...reviewFileActions(
         resolveFileCommandTarget(file.path, {
           root,
+          base: repository,
           conversationId,
           hostId: sessionHostId,
           deleted: file.change === "deleted",
@@ -720,15 +890,20 @@ export function ChangesReview({
         { onOpen: null, activeFile: true },
       ),
     ],
-    [onViewFile, root, conversationId, sessionHostId, fileEnvironment],
+    [onViewFile, root, repository, conversationId, sessionHostId, fileEnvironment],
   );
   const folderActions = useCallback(
     (path: string) =>
       reviewFolderActions(
-        resolveFileCommandTarget(path, { root, conversationId, hostId: sessionHostId }),
+        resolveFileCommandTarget(path, {
+          root,
+          base: repository,
+          conversationId,
+          hostId: sessionHostId,
+        }),
         fileEnvironment,
       ),
-    [root, conversationId, sessionHostId, fileEnvironment],
+    [root, repository, conversationId, sessionHostId, fileEnvironment],
   );
 
   // Any comparison chosen in the picker shows in Changes, even one that fails or is unchanged.
@@ -813,7 +988,7 @@ export function ChangesReview({
   const fileCount = listed ? listed.length : null;
   const header = (
     <PaneHeader
-      repository={repositoryName(root)}
+      repository={<ReviewFolderName folder={folder} />}
       status={changes.isLoading ? { label: "Checking…" } : capturedLabel(changes.dataUpdatedAt)}
       comparison={comparison}
       sections={

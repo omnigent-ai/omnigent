@@ -156,6 +156,7 @@ import { cn } from "@/lib/utils";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { Conversation } from "@/hooks/useConversations";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
+import { InboxPaletteCommands } from "./inboxPaletteCommands";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
 type RespondedMap = Record<
@@ -255,7 +256,8 @@ export function InboxPage() {
     identityReady,
   } = useSidebarData();
   const navigate = useNavigate();
-  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
+  const serverInfo = useServerInfo();
+  const taskDetailsEnabled = isFeatureEnabled(serverInfo, "automations_v2");
   const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const {
     available: advisorAvailable,
@@ -305,6 +307,8 @@ export function InboxPage() {
   // and the draft must survive the toggle.
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
   const [replyStatuses, setReplyStatuses] = useState<Record<string, ReplyStatus>>({});
+  // ⌘K's Reply asks this session's reply field for focus once its card is expanded.
+  const [replyFocus, setReplyFocus] = useState<{ sessionId: string; request: number } | null>(null);
   const [submitWithModEnter] = useState(readSubmitWithModEnter);
   const isMobileViewport = useIsMobileViewport();
   const preventsKeyboardSubmit = isMobileViewport;
@@ -678,8 +682,23 @@ export function InboxPage() {
     setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
     markConversationRead(sessionId, entry.item.row.updated_at);
   };
+  const replyTo = (entry: Extract<InboxEntry, { kind: "unread" }>) => {
+    setExpandedOverrides((prev) => ({ ...prev, [entry.key]: true }));
+    setReplyFocus((prev) => ({ sessionId: entry.item.row.id, request: (prev?.request ?? 0) + 1 }));
+  };
 
   const rowsById = new Map(allRows.map((row) => [row.id, row]));
+  /** A sent reply whose answer hasn't arrived yet, which the card shows instead of its field. */
+  const replyAwaitsAnswer = (sessionId: string) =>
+    replyStatuses[sessionId]?.state === "sent" && !settledReplyIds.includes(sessionId);
+  /** Whether an unread card shows its reply field: the card body and ⌘K's Reply both ask. */
+  const showsReplyField = (sessionId: string, permissionLevel: number | null) =>
+    // The server refuses user messages below edit access.
+    isEditorLevel(permissionLevel) && !replyAwaitsAnswer(sessionId);
+  const canReplyTo = (sessionId: string) => {
+    const row = rowsById.get(sessionId);
+    return row !== undefined && showsReplyField(sessionId, row.permission_level);
+  };
   const renderEntry = (entry: InboxEntry) => {
     const expanded = expandedOverrides[entry.key] ?? entry.key === defaultExpandedKey;
     const onToggle = () => {
@@ -979,17 +998,14 @@ export function InboxPage() {
     const output = previewQuery?.data ?? undefined;
     const preview = output?.preview;
     const markRead = () => markUnreadRead(entry);
-    // The server refuses user messages below edit access.
-    const canReply = isEditorLevel(item.row.permission_level);
     const replyDraft = replyDrafts[sessionId] ?? "";
     const replyStatus = replyStatuses[sessionId];
     const replySending = replyStatus?.state === "sending";
-    const replyAwaitingAnswer =
-      replyStatus?.state === "sent" && !settledReplyIds.includes(sessionId);
+    const replyAwaitingAnswer = replyAwaitsAnswer(sessionId);
     // A send records the current output to tell the agent's answer from it, so
     // only a loaded preview will do; a failed fetch leaves no baseline.
     const previewReady = previewQuery?.isSuccess === true;
-    const showReplyField = canReply && !replyAwaitingAnswer;
+    const showReplyField = showsReplyField(sessionId, item.row.permission_level);
     const sendIsPrimary = showReplyField && replyDraft.trim() !== "";
     const sendReply = () => {
       if (!replyDraft.trim() || replySending || !previewReady) return;
@@ -1100,6 +1116,8 @@ export function InboxPage() {
             error={replyStatus?.state === "failed" ? replyStatus.message : undefined}
             submitWithModEnter={submitWithModEnter}
             preventsKeyboardSubmit={preventsKeyboardSubmit}
+            focusRequest={replyFocus?.sessionId === sessionId ? replyFocus.request : undefined}
+            onFocusHandled={() => setReplyFocus(null)}
           />
         )}
         {showReplyField && previewQuery?.isError && (
@@ -1363,6 +1381,23 @@ export function InboxPage() {
           {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
       )}
+      {isFeatureEnabled(serverInfo, "quick_pick_palette") && (
+        <InboxPaletteCommands
+          filter={filter}
+          tabs={INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab)}
+          entries={groups.flatMap((group) => group.entries)}
+          taskDetailsEnabled={taskDetailsEnabled}
+          replySending={(sessionId) => replyStatuses[sessionId]?.state === "sending"}
+          canReply={canReplyTo}
+          handlers={{
+            chooseFilter,
+            navigate,
+            markUnreadRead,
+            markAutomationRead: automationInbox.markRead,
+            replyTo,
+          }}
+        />
+      )}
     </PageScroll>
   );
 }
@@ -1595,6 +1630,8 @@ function InboxReplyField({
   error,
   submitWithModEnter,
   preventsKeyboardSubmit,
+  focusRequest,
+  onFocusHandled,
 }: {
   label: string;
   value: string;
@@ -1604,13 +1641,27 @@ function InboxReplyField({
   error?: string;
   submitWithModEnter: boolean;
   preventsKeyboardSubmit: boolean;
+  /** A new value focuses the field, with the caret after the draft. */
+  focusRequest?: number;
+  onFocusHandled?: () => void;
 }) {
   const errorId = useId();
+  const fieldRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (focusRequest === undefined) return;
+    const textarea = fieldRef.current?.querySelector("textarea");
+    if (!textarea) return;
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    onFocusHandled?.();
+    // Only a new request moves focus; the callback's identity changes every render.
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest]);
   // Safari confirms an IME candidate with an Enter that isn't flagged as
   // composing, so track composition like the chat composer does.
   const isComposingRef = useRef(false);
   return (
-    <div className="flex flex-col gap-1.5">
+    <div ref={fieldRef} className="flex flex-col gap-1.5">
       <Textarea
         aria-label={label}
         aria-invalid={error !== undefined}

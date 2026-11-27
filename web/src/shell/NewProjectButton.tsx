@@ -1,8 +1,9 @@
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ChevronRightIcon,
   FolderIcon,
   FolderOpenIcon,
+  FolderPlusIcon,
   GitBranchIcon,
   PlusIcon,
   SmilePlusIcon,
@@ -46,6 +47,9 @@ import { deriveRepoName, sandboxRepoProblem } from "@/lib/sandboxRepositories";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import type { PaletteCommand } from "@/store/paletteCommands";
+
+import { useQuickPickPaletteCommands } from "./screenCommands/useQuickPickPaletteCommands";
 
 interface WorkspaceSelection {
   hostId: string;
@@ -173,6 +177,8 @@ function friendlyCloneError(error: unknown): string {
   return "The repository couldn’t be cloned. Check the details and try again.";
 }
 
+const NO_COMMANDS: PaletteCommand[] = [];
+
 /**
  * "New project" control in the Projects group header. Opens a dialog that
  * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
@@ -189,11 +195,14 @@ export function NewProjectButton({
   hostId,
   hosts,
   hostsLoading,
+  inPalette = false,
 }: {
   onCreated: (name: string) => void;
   hostId: string | null;
   hosts: Host[];
   hostsLoading: boolean;
+  /** Offer New project… in the QuickPick ⌘K palette; one mounted button does. */
+  inPalette?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -418,7 +427,7 @@ export function NewProjectButton({
     );
   };
 
-  // A fresh dialog each time it opens.
+  // A fresh dialog each time, from the button or ⌘K.
   const openDialog = () => {
     submissionGeneration.current += 1;
     setName("");
@@ -441,6 +450,28 @@ export function NewProjectButton({
     setSubmitError(null);
     setOpen(true);
   };
+  const openDialogRef = useRef(openDialog);
+  openDialogRef.current = openDialog;
+  const paletteCommands = useMemo<PaletteCommand[]>(
+    () =>
+      inPalette
+        ? [
+            {
+              id: "project.new",
+              label: "New project…",
+              icon: FolderPlusIcon,
+              keywords: ["project", "folder", "create", "add"],
+              // The dialog takes focus once the palette has closed.
+              movesFocus: true,
+              run: () => openDialogRef.current(),
+            },
+          ]
+        : NO_COMMANDS,
+    [inPalette],
+  );
+  // Each button's own key: one that doesn't offer the command (Canvas) never withdraws another's.
+  const paletteSource = `new-project:${useId()}`;
+  useQuickPickPaletteCommands(paletteSource, "Project", paletteCommands);
 
   const dialog = (
     <Dialog

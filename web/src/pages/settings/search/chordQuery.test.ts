@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 import type { Chord, KeyChordInput } from "@/lib/shortcuts/chord";
 import {
   activeShortcutChords,
+  APP_SHORTCUT_BINDINGS,
   matchesShortcut,
   shortcutDisplayRow,
-  SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
   type ShortcutId,
 } from "@/lib/shortcuts/registry";
@@ -220,7 +220,16 @@ function isBarePrintable(chord: Chord): boolean {
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
     [true, false].flatMap((desktopMenu) =>
-      [true, false].map((submitWithModEnter) => ({ mac, native, desktopMenu, submitWithModEnter })),
+      // The Go menu exists only on a shell with the command bridge.
+      (desktopMenu ? [false, true] : [false]).flatMap((goMenu) =>
+        [true, false].map((submitWithModEnter) => ({
+          mac,
+          native,
+          desktopMenu,
+          goMenu,
+          submitWithModEnter,
+        })),
+      ),
     ),
   ),
 );
@@ -228,10 +237,13 @@ const MAC_DESKTOP: ShortcutEnvironment = {
   mac: true,
   native: true,
   desktopMenu: true,
+  goMenu: true,
   submitWithModEnter: false,
 };
 
-const ALL_LISTED: ReadonlySet<ShortcutId> = new Set(SHORTCUT_BINDINGS.map((binding) => binding.id));
+const ALL_LISTED: ReadonlySet<ShortcutId> = new Set(
+  APP_SHORTCUT_BINDINGS.map((binding) => binding.id),
+);
 
 const rows = (query: string, environment: ShortcutEnvironment) => {
   const input = parseChordQuery(query, environment.mac);
@@ -241,7 +253,7 @@ const rows = (query: string, environment: ShortcutEnvironment) => {
 describe("finding shortcuts by chord", () => {
   it("finds each listed binding's row by any of its searchable chords, in every spelling", () => {
     for (const environment of ENVIRONMENTS) {
-      for (const binding of SHORTCUT_BINDINGS) {
+      for (const binding of APP_SHORTCUT_BINDINGS) {
         for (const chord of searchableChords(binding.id, environment)) {
           for (const spelling of spellings(chord, environment.mac)) {
             expect(
@@ -270,7 +282,7 @@ describe("finding shortcuts by chord", () => {
 
   it("never finds a bare printable key, which only works in context", () => {
     for (const environment of ENVIRONMENTS) {
-      for (const binding of SHORTCUT_BINDINGS) {
+      for (const binding of APP_SHORTCUT_BINDINGS) {
         for (const chord of activeShortcutChords(binding.id, environment)) {
           if (!isBarePrintable(chord)) continue;
           expect(searchableChords(binding.id, environment)).not.toContainEqual(chord);
@@ -285,6 +297,28 @@ describe("finding shortcuts by chord", () => {
     expect(rowsForChord(input, MAC_DESKTOP, new Set(["palette.commands"]))).toEqual(
       new Set(["palette.commands"]),
     );
+  });
+
+  it("keeps the browser's Pin key off a page that doesn't list Pin", () => {
+    // A Mac browser tab: ⌘⌥P is Pin's chord there only with quick_pick_palette, which the
+    // page doesn't list, so Settings search can't surface it either.
+    const browserPage = shortcutPageGroups(
+      {
+        ...PAGE_CONTEXT,
+        native: false,
+        electron: false,
+        desktopCommands: false,
+      },
+      true,
+    );
+    const listed = new Set(
+      browserPage.flatMap((group) => group.items.map((row) => row.shortcutId)),
+    );
+    const macBrowser: ShortcutEnvironment = { ...MAC_DESKTOP, native: false, desktopMenu: false };
+    const input = parseChordQuery("cmd opt p", true)!;
+    expect(listed.has("session.pin")).toBe(false);
+    expect(rowsForChord(input, macBrowser, ALL_LISTED)).toContain("session.pin");
+    expect(rowsForChord(input, macBrowser, listed)).not.toContain("session.pin");
   });
 });
 

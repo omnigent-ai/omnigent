@@ -13,7 +13,21 @@ vi.mock("./CommandPalette", () => ({
 }));
 vi.mock("@/components/KeyboardShortcutsDialog", () => ({ KeyboardShortcutsDialog: () => null }));
 vi.mock("@/components/onboarding/HostImportReview", () => ({ ImportReviewGate: () => null }));
-vi.mock("./RecentSessionsSwitcher", () => ({ RecentSessionsSwitcher: () => null }));
+vi.mock("./RecentSessionsSwitcher", () => ({
+  RecentSessionsSwitcher: ({ enabled }: { enabled: boolean }) => (
+    <div data-testid="recent-sessions-switcher" data-enabled={String(enabled)} />
+  ),
+}));
+// The desktop shell, where the recent switcher takes Ctrl+Tab.
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  isElectronShell: () => true,
+}));
+vi.mock("./openSession", () => ({
+  OpenSessionPublisher: ({ sessionId }: { sessionId: string | null }) => (
+    <div data-testid="open-session-publisher" data-session={sessionId ?? ""} />
+  ),
+}));
 
 afterEach(cleanup);
 // Which flagged modules this case imported. Each case loads the shell and these mocks afresh,
@@ -34,6 +48,22 @@ beforeEach(() => {
     loaded.add("ThemePicker");
     return { ThemePicker: () => <div data-testid="theme-picker" /> };
   });
+  vi.doMock("./sessionCommands/SessionActionHost", () => {
+    loaded.add("SessionActionHost");
+    return { SessionActionHost: () => <div data-testid="session-action-host" /> };
+  });
+  vi.doMock("./projectCommands/ProjectActionHost", () => {
+    loaded.add("ProjectActionHost");
+    return { ProjectActionHost: () => <div data-testid="project-action-host" /> };
+  });
+  vi.doMock("./quickPickShortcuts/RecentSessionSwitchHost", () => {
+    loaded.add("RecentSessionSwitchHost");
+    return { RecentSessionSwitchHost: () => <div data-testid="recent-session-switch-host" /> };
+  });
+  vi.doMock("./quickPickShortcuts/QuickPickShortcutHost", () => {
+    loaded.add("QuickPickShortcutHost");
+    return { QuickPickShortcutHost: () => <div data-testid="quick-pick-shortcut-host" /> };
+  });
 });
 
 async function renderOverlays(
@@ -53,7 +83,7 @@ async function renderOverlays(
     goToSession: vi.fn(),
     gridRoute: false,
     allConversations: undefined,
-    serverConversationId: undefined,
+    serverConversationId: "c1",
     updateOverlayHeight: 0,
   };
   const { AppShellOverlays } = await import("./AppShellOverlays");
@@ -63,6 +93,19 @@ async function renderOverlays(
     </QueryClientProvider>,
   );
 }
+
+describe("AppShellOverlays recent sessions switcher", () => {
+  it.each([
+    ["off", { quick_pick_palette: false }, "true"],
+    ["on", { quick_pick_palette: true }, "false"],
+  ] as const)(
+    "takes Ctrl+Tab in the desktop app only with quick_pick_palette %s",
+    async (_state, features, enabled) => {
+      const { getByTestId } = await renderOverlays(features);
+      expect(getByTestId("recent-sessions-switcher").dataset.enabled).toBe(enabled);
+    },
+  );
+});
 
 describe("AppShellOverlays palette flag", () => {
   const notOn = [
@@ -81,6 +124,7 @@ describe("AppShellOverlays palette flag", () => {
       expect(getByTestId("cmdk-palette").dataset.sessionsOnly).toBe(String(sessionSearch));
       expect(queryByTestId("quick-pick-palette")).toBeNull();
       expect(queryByTestId("theme-picker")).toBeNull();
+      expect(queryByTestId("open-session-publisher")).toBeNull();
       // Without the flag, neither the QuickPick palette nor its theme picker is even fetched.
       expect([...loaded]).toEqual([]);
     },
@@ -98,7 +142,19 @@ describe("AppShellOverlays palette flag", () => {
       );
       expect(await findByTestId("theme-picker")).toBeTruthy();
       expect(queryByTestId("cmdk-palette")).toBeNull();
-      expect([...loaded].sort()).toEqual(["QuickPickCommandPalette", "ThemePicker"]);
+      expect(await findByTestId("session-action-host")).toBeTruthy();
+      expect(await findByTestId("project-action-host")).toBeTruthy();
+      expect(await findByTestId("quick-pick-shortcut-host")).toBeTruthy();
+      expect(await findByTestId("recent-session-switch-host")).toBeTruthy();
+      expect((await findByTestId("open-session-publisher")).dataset.session).toBe("c1");
+      expect([...loaded].sort()).toEqual([
+        "ProjectActionHost",
+        "QuickPickCommandPalette",
+        "QuickPickShortcutHost",
+        "RecentSessionSwitchHost",
+        "SessionActionHost",
+        "ThemePicker",
+      ]);
     },
   );
 });

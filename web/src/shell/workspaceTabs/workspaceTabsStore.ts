@@ -167,6 +167,8 @@ export interface WorkspaceTabsStoreOptions {
   choiceCount?: () => number;
   /** Told the file's path each time an open or a navigation lands a tab on a file. */
   onFileOpened?: (path: string) => void;
+  /** How many times the session's folder has moved, stamped on each landing. */
+  folderCount?: () => number;
 }
 
 /** A line, column or comment move inside the same file, which history records in place. */
@@ -207,6 +209,8 @@ export interface TabLanding {
   settled: boolean;
   /** The session's choice count as it landed; a pick since is newer than the visit. */
   choices: number;
+  /** The session's folder moves as it landed; a folder chosen since is newer than the visit. */
+  folders: number;
 }
 
 export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
@@ -224,12 +228,14 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     newDraftKey = newPendingSideChatId,
     choiceCount = () => 0,
     onFileOpened,
+    folderCount = () => 0,
   } = options;
 
   let tabs: WorkspaceTabRecord[] = withPinnedFirst([...options.initial.tabs]);
   // Each tab's latest landing on a visit by a step, a link or an open, which its view settles once.
   const landings = new Map<TabId, TabLanding>();
-  const land = (tabId: TabId) => landings.set(tabId, { settled: false, choices: choiceCount() });
+  const land = (tabId: TabId) =>
+    landings.set(tabId, { settled: false, choices: choiceCount(), folders: folderCount() });
   let selectedTabId: TabId | null = options.initial.selectedTabId;
   let closed: ClosedTab[] = [...options.initial.closed];
   let tabSettings: AppliedTabSettings | undefined = options.initial.tabSettings;
@@ -267,6 +273,15 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   );
   // A session saved or migrated with no tabs shows a New tab, as closing the last one does.
   if (tabs.length === 0 && resting === "new-tab") addEmptyNewTab();
+  // A page load lands on the saved Diffs tab's visit, so its folder and comparison come back.
+  const restoredSelected = options.initial.tabs.find((tab) => tab.id === selectedTabId);
+  if (
+    restoredSelected &&
+    !isUnknownTab(restoredSelected) &&
+    restoredSelected.place.kind === "changes"
+  ) {
+    land(restoredSelected.id);
+  }
 
   const knownTabs = (): WorkspaceTab[] =>
     tabs.filter((tab): tab is WorkspaceTab => !isUnknownTab(tab));

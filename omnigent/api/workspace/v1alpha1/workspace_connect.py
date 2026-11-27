@@ -352,7 +352,11 @@ class WorkspaceService(Protocol):
 
     def read_pull_request_image(self, request: ReadPullRequestImageRequest, ctx: RequestContext[ReadPullRequestImageRequest, ReadPullRequestImageResponse], /) -> AsyncIterator[ReadPullRequestImageResponse]:
         """
-        Streams an image the pull request links to: its metadata, then its bytes.
+        Streams an attachment image on the pull request's host: its metadata, then its bytes.
+        Only the session's owner may call it. A caller that leaves early may hold one of the
+        host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+        system resolver gives up. A client may keep an image in memory, keyed by
+        `(pr_url, image_url)`, for as long as the page that shows it stays open.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -2446,7 +2450,11 @@ class WorkspaceServiceClient(ConnectClient):
         timeout_ms: int | None = None,
     ) -> AsyncIterator[ReadPullRequestImageResponse]:
         """
-        Streams an image the pull request links to: its metadata, then its bytes.
+        Streams an attachment image on the pull request's host: its metadata, then its bytes.
+        Only the session's owner may call it. A caller that leaves early may hold one of the
+        host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+        system resolver gives up. A client may keep an image in memory, keyed by
+        `(pr_url, image_url)`, for as long as the page that shows it stays open.
         """
         return self.execute_server_stream(
             request=request,
@@ -3082,7 +3090,11 @@ class WorkspaceServiceSync(Protocol):
 
     def read_pull_request_image(self, request: ReadPullRequestImageRequest, ctx: RequestContext[ReadPullRequestImageRequest, ReadPullRequestImageResponse], /) -> Iterator[ReadPullRequestImageResponse]:
         """
-        Streams an image the pull request links to: its metadata, then its bytes.
+        Streams an attachment image on the pull request's host: its metadata, then its bytes.
+        Only the session's owner may call it. A caller that leaves early may hold one of the
+        host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+        system resolver gives up. A client may keep an image in memory, keyed by
+        `(pr_url, image_url)`, for as long as the page that shows it stays open.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -5174,7 +5186,11 @@ class WorkspaceServiceClientSync(ConnectClientSync):
         timeout_ms: int | None = None,
     ) -> Iterator[ReadPullRequestImageResponse]:
         """
-        Streams an image the pull request links to: its metadata, then its bytes.
+        Streams an attachment image on the pull request's host: its metadata, then its bytes.
+        Only the session's owner may call it. A caller that leaves early may hold one of the
+        host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+        system resolver gives up. A client may keep an image in memory, keyed by
+        `(pr_url, image_url)`, for as long as the page that shows it stays open.
         """
         return self.execute_server_stream(
             request=request,

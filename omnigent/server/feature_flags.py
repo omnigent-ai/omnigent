@@ -67,6 +67,7 @@ class Feature(StrEnum):
     FLOATING_PANES = "floating_panes"
     GADGETS = "gadgets"
     SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
+    WARM_SWITCH_KEEP_MOUNTED_UI = "warm_switch_keep_mounted_ui"
     PULL_REQUESTS_V2 = "pull_requests_v2"
 
 
@@ -392,6 +393,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.SHARED_SESSION_UPDATES_SOCKET,
         description="Share one session-updates WebSocket between a browser's tabs",
+        owner="web",
+        review_by_release="0.28.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WARM_SWITCH_KEEP_MOUNTED_UI,
+        description=(
+            "Switch the chat store before an in-app navigation to a session so the warm "
+            "chat surface stays mounted instead of remounting over a placeholder"
+        ),
         owner="web",
         review_by_release="0.28.0",
     ),

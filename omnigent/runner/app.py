@@ -3709,6 +3709,13 @@ def create_runner_app(
 
                 _launch_pre = _antigravity_pre_launch
 
+                async def _antigravity_resolve_spec() -> AgentSpec | None:
+                    return await _native_runtime._antigravity_startup_agent_spec(
+                        session_id, _resolve_session_agent_spec_or_none
+                    )
+
+                _launch_resolve_spec = _antigravity_resolve_spec
+
             elif harness_name == "pi-native":
                 # pi resolves its spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
@@ -6775,7 +6782,10 @@ def create_runner_app(
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
             write_mcp_bridge_config(antigravity_bdir)
             await _ensure_comment_relay_started(
-                conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
+                conv,
+                explicit_bridge_dir=antigravity_bdir,
+                await_notify=False,
+                session_labels=antigravity_labels,
             )
         elif harness_name == "hermes":
             from omnigent.harnesses.hermes_native.bridge import (

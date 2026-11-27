@@ -559,12 +559,28 @@ describe("Changes tab", () => {
     await screen.findByTestId("changes-review");
     expect(captured.review?.comparison).toEqual(saved);
     const typed = { kind: "typed", base: "main", head: "" } as const;
-    captured.review!.onComparisonShown!(typed, { step: true });
+    captured.review!.onComparisonShown!(typed, { step: true, root: null });
     expect(view.onNavigate).toHaveBeenCalledWith(
       { kind: "changes", path: "a.go", comparison: typed },
       { replace: false },
     );
+    // A worktree's review records its folder with the comparison.
+    captured.review!.onComparisonShown!(typed, { step: true, root: "/repo/.worktrees/wt" });
+    expect(view.onNavigate).toHaveBeenLastCalledWith(
+      { kind: "changes", path: "a.go", comparison: typed, comparisonRoot: "/repo/.worktrees/wt" },
+      { replace: false },
+    );
     expect(onNavigate).not.toHaveBeenCalled();
+    cleanup();
+
+    // A visit recorded in a worktree hands the review that folder, and a workspace visit none.
+    renderView({ kind: "changes", comparison: typed, comparisonRoot: "/repo/.worktrees/wt" });
+    await screen.findByTestId("changes-review");
+    expect(captured.review?.comparisonRoot).toBe("/repo/.worktrees/wt");
+    cleanup();
+    renderView({ kind: "changes", comparison: typed });
+    await screen.findByTestId("changes-review");
+    expect(captured.review?.comparisonRoot).toBeNull();
   });
 
   it("opens a file from the review's tree in a Diffs tab of its own, keeping the range", async () => {

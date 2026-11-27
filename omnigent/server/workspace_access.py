@@ -61,6 +61,9 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "MergePullRequest": WorkspaceGate.SESSION_OWNER,
     "MergePullRequestAsAccount": WorkspaceGate.SESSION_OWNER,
     "DisableAutoMerge": WorkspaceGate.SESSION_OWNER,
+    "EnableAutoMerge": WorkspaceGate.SESSION_OWNER,
+    "SetPullRequestState": WorkspaceGate.SESSION_OWNER,
+    "SetPullRequestDraft": WorkspaceGate.SESSION_OWNER,
     # Reviews act as the host's account, and its pending review holds unsubmitted drafts.
     "GetPendingReview": WorkspaceGate.SESSION_OWNER,
     "StartPendingReview": WorkspaceGate.SESSION_OWNER,
@@ -77,6 +80,14 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "AddReaction": WorkspaceGate.SESSION_OWNER,
     "RemoveReaction": WorkspaceGate.SESSION_OWNER,
     "UploadAttachment": WorkspaceGate.SESSION_OWNER,
+    # The queue acts as the host's account, and its state is read for the owner's controls.
+    "GetMergeQueue": WorkspaceGate.SESSION_OWNER,
+    "EnqueuePullRequest": WorkspaceGate.SESSION_OWNER,
+    "DequeuePullRequest": WorkspaceGate.SESSION_OWNER,
+    # The stack lists the repository's other pull requests, read as the host's account.
+    "GetPullRequestStack": WorkspaceGate.SESSION_OWNER,
+    # Fetched with the host account's token, which sees its private repositories' images.
+    "ReadPullRequestImage": WorkspaceGate.SESSION_OWNER,
 }
 
 

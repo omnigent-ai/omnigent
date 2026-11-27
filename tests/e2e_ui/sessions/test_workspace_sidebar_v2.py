@@ -857,3 +857,178 @@ def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
 
     switch_ignored_files()
     expect(build).to_have_count(0, timeout=30_000)
+
+
+def _add_worktree(tmp_path: Path) -> None:
+    """A worktree `.worktrees/wt` with its own change, beside one in the workspace."""
+    repository = tmp_path / "repository"
+    # Kept out of the workspace's own changes, as a project's ignore file would.
+    with (repository / ".git" / "info" / "exclude").open("a") as exclude:
+        exclude.write(".worktrees/\n")
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "wt", ".worktrees/wt"], cwd=repository, check=True
+    )
+    (repository / ".worktrees" / "wt" / "only_in_worktree.txt").write_text("worktree\n")
+    (repository / "only_in_workspace.txt").write_text("workspace\n")
+
+
+def _changed(sidebar: Locator, name: str) -> Locator:
+    return sidebar.get_by_role("button", name=f"Copy path {name}", exact=True)
+
+
+def _pick_comparison(page: Page, sidebar: Locator, choice: str) -> None:
+    sidebar.get_by_role("button", name="Change compared revisions").click()
+    picker = page.get_by_role("dialog", name="Compared revisions")
+    picker.get_by_role("group", name="Compare").get_by_role("button", name=choice).click()
+    expect(picker).to_have_count(0)
+
+
+def _pick_worktree_in_diffs(page: Page, sidebar: Locator) -> Locator:
+    """Diffs' folder name → the worktree `.worktrees/wt`; returns the folder name."""
+    folder = sidebar.get_by_test_id("changes-review-folder")
+    expect(folder).to_have_text("repository", timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
+    folder.click()
+    picker = page.get_by_test_id("workspace-picker")
+    expect(picker).to_be_visible(timeout=15_000)
+    # The browser hides dot-folders until asked to show them.
+    picker.get_by_test_id("workspace-picker-show-hidden").click()
+    picker.get_by_test_id("workspace-picker-entry-.worktrees").click()
+    picker.get_by_test_id("workspace-picker-entry-wt").click()
+    expect(picker.get_by_test_id("workspace-picker-breadcrumbs")).to_contain_text("wt")
+    picker.get_by_test_id("workspace-picker-select").click()
+    expect(folder).to_have_text("wt", timeout=30_000)
+    return folder
+
+
+def test_diffs_folder_name_picks_a_worktree_that_files_follows(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Diffs' folder name → pick a worktree inside the workspace → Diffs lists the worktree's
+    own change; a comparison changed there and Back keep the worktree; Files shows its folder →
+    the workspace again from ⌘K moves both back."""
+    base_url, session_id = git_session
+    _add_worktree(tmp_path)
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Diffs")
+
+    folder = _pick_worktree_in_diffs(page, sidebar)
+
+    # Diffs reviews the worktree on its own: its change, and none of the workspace's.
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_have_count(0)
+    expect(sidebar.get_by_text("Not available on this host yet.")).to_have_count(0)
+
+    # A comparison changed in the worktree is a step there: Back returns to the worktree's
+    # previous comparison, not to the workspace's.
+    trigger = sidebar.get_by_role("button", name="Change compared revisions")
+    _pick_comparison(page, sidebar, "All branch changes")
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    _pick_comparison(page, sidebar, "Last commit")
+    expect(trigger).to_contain_text("Last commit", timeout=30_000)
+    sidebar.get_by_role("group", name="Workspace history").get_by_role(
+        "button", name="Back"
+    ).click()
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(folder).to_have_text("wt")
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+
+    # Files moved with it.
+    _open_app(page, sidebar, "Files")
+    expect(sidebar.get_by_test_id("files-page-tree-header")).to_contain_text("wt", timeout=30_000)
+    expect(sidebar.get_by_role("treeitem", name="only_in_worktree.txt", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+
+    # Back to the workspace from ⌘K while Diffs is on screen, and Files follows.
+    strip = sidebar.get_by_role("tablist", name="Workspace tabs")
+    strip.get_by_role("tab", name=re.compile(r"^Diffs")).click()
+    page.keyboard.press("ControlOrMeta+k")
+    palette = page.get_by_test_id("command-palette-input")
+    expect(palette).to_be_focused(timeout=10_000)
+    palette.fill("Show repository in Diffs")
+    page.get_by_role("option", name=re.compile("Show repository in Diffs")).first.click()
+    expect(folder).to_have_text("repository", timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
+    strip.get_by_role("tab", name="Files", exact=True).click()
+    expect(
+        sidebar.get_by_role("treeitem", name="only_in_workspace.txt", exact=True)
+    ).to_be_visible(timeout=30_000)
+
+
+def test_back_and_reload_bring_diffs_back_to_a_visits_worktree(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A worktree's comparison in Diffs → Files returns to the workspace → Back, then a reload,
+    each show Diffs in that worktree with that comparison → a folder Files picks afterwards
+    stays."""
+    base_url, session_id = git_session
+    _add_worktree(tmp_path)
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    history = sidebar.get_by_role("group", name="Workspace history")
+    expect(history).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Diffs")
+    folder = _pick_worktree_in_diffs(page, sidebar)
+    trigger = sidebar.get_by_role("button", name="Change compared revisions")
+    _pick_comparison(page, sidebar, "All branch changes")
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+
+    # Files moves back to the workspace, and takes the session's folder with it.
+    _open_app(page, sidebar, "Files")
+    expect(sidebar.get_by_test_id("files-page-tree-header")).to_contain_text("wt", timeout=30_000)
+    sidebar.get_by_role("button", name="Back to working folder").click()
+    expect(
+        sidebar.get_by_role("treeitem", name="only_in_workspace.txt", exact=True)
+    ).to_be_visible(timeout=30_000)
+
+    # Back onto the Diffs visit shows its worktree again, with its comparison.
+    history.get_by_role("button", name="Back").click()
+    expect(folder).to_have_text("wt", timeout=30_000)
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+
+    # A reload forgets the session's folder; the saved Diffs visit brings it back.
+    page.reload()
+    expect(folder).to_have_text("wt", timeout=60_000)
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+
+    # A folder Files picks afterwards stays: Diffs follows it, and nothing pulls it back.
+    strip = sidebar.get_by_role("tablist", name="Workspace tabs")
+    strip.get_by_role("tab", name="Files", exact=True).click()
+    sidebar.get_by_role("button", name="Back to working folder").click()
+    expect(
+        sidebar.get_by_role("treeitem", name="only_in_workspace.txt", exact=True)
+    ).to_be_visible(timeout=30_000)
+    strip.get_by_role("tab", name=re.compile(r"^Diffs")).click()
+    expect(folder).to_have_text("repository", timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
+
+
+def test_diff_file_link_opens_its_diff_in_diffs(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A ``?file=`` link with ``diff=1`` to a changed file opens Diffs on that file's diff."""
+    base_url, session_id = git_session
+    (tmp_path / "repository" / "base.txt").write_text("Add the base\nedited for the link\n")
+    _set_flag(page, True)
+    page.set_viewport_size(_VIEWPORTS["desktop"])
+    page.goto(f"{base_url}/c/{session_id}?file=base.txt&diff=1")
+
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    strip = sidebar.get_by_role("tablist", name="Workspace tabs")
+    diffs = strip.get_by_role("tab", name=re.compile(r"^Diffs"))
+    expect(diffs).to_have_attribute("aria-selected", "true", timeout=60_000)
+    expect(sidebar.get_by_role("button", name="Copy path base.txt", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    expect(sidebar.get_by_text("edited for the link")).to_be_visible(timeout=30_000)
+    # The link is handed to the tab, so a reload doesn't open it again.
+    expect(page).not_to_have_url(re.compile(r"[?&](?:file|diff)="))

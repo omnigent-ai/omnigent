@@ -38,11 +38,12 @@ from omnigent.host.workspace_pull_request_input import (
     MAX_ATTACHMENT_NAME_CHARACTERS,
     MAX_PULL_REQUEST_URL_CHARACTERS,
 )
-from omnigent.runner import pr_resource
+from omnigent.runner import github_images, pr_resource
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server import workspace_access, workspace_api
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
 from omnigent.server.pull_request_viewers import PullRequestViewer
+from omnigent.server.read_only_code_hosts import READ_ONLY_CODE_HOST_MESSAGE
 from omnigent.server.workspace_access import METHOD_GATES, WorkspaceGate, callable_methods
 from omnigent.stores.session_pull_request_store import SessionPullRequests
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
@@ -116,9 +117,17 @@ def provider_reads(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
     return reached
 
 
-def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: _Store | None) -> Any:
+def _client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    store: _Store | None,
+    *,
+    read_only_code_hosts: tuple[str, ...] = (),
+) -> Any:
     monkeypatch.setattr(server_prs, "open_store", lambda _conversations: store)
-    app = service_tests._server_app(tmp_path, monkeypatch)
+    app = service_tests._server_app(
+        tmp_path, monkeypatch, read_only_code_hosts=read_only_code_hosts
+    )
     return service_tests._connect(app, service_tests._SERVER_BASE, ProtocolType.CONNECT)
 
 
@@ -315,8 +324,8 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         ),
         (
             "ListLabels",
-            pb.ListLabelsRequest(pr_url=_PR, text="bug"),
-            "Label search isn't available on this host",
+            pb.ListLabelsRequest(pr_url=_PR, text="a" * 257),
+            "The label search is longer than 256 characters",
         ),
         (
             "UploadAttachment",
@@ -343,7 +352,7 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         "account-without-pr",
         "account-with-remote",
         "merge-as-no-account",
-        "label-search",
+        "label-search-too-long",
         "upload-no-name",
         "upload-long-name",
         "upload-long-url",
@@ -639,6 +648,8 @@ def _tunnel(
     *,
     refuse_send: bool = False,
     viewer: PullRequestViewer = PullRequestViewer.VIEWER,
+    vouch: Callable[[str], Any] = _no_vouch,
+    read_only_code_hosts: tuple[str, ...] = (),
 ) -> _Tunnel:
     registry = HostRegistry()
     hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
@@ -657,7 +668,11 @@ def _tunnel(
         workspace_api.HostTarget(registry, host, str(tmp_path)),
         content_search=False,
         pull_requests=workspace_api.PullRequestRoute(
-            _SESSION, vouch=_no_vouch, overview=_as_reported, viewer=viewer
+            _SESSION,
+            vouch=vouch,
+            overview=_as_reported,
+            viewer=viewer,
+            read_only_code_hosts=read_only_code_hosts,
         ),
     )
     return _Tunnel(registry, host, service, sent)
@@ -722,8 +737,19 @@ async def test_an_unavailable_answer_after_the_frame_leaves_the_change_unconfirm
     assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _CHANGE_UNCONFIRMED)
 
 
-# The pull request changes; the review changes have their own cases below.
-_WRITES = sorted(_PULL_REQUEST_WRITES - set(host_tests._REVIEW_CALLS))
+# The lifecycle changes of one pull request, which answer as any pull request change does.
+_LIFECYCLE_WRITES = frozenset({"SetPullRequestState", "SetPullRequestDraft"})
+_REVIEW_WRITES = sorted(
+    set(host_tests._GITHUB_CHANGE_CALLS) - {"GetPendingReview"} - _LIFECYCLE_WRITES
+)
+# The pull request changes; the review changes and the auto-merge batch have their own cases.
+_WRITES = sorted(_PULL_REQUEST_WRITES - set(_REVIEW_WRITES) - {"EnableAutoMerge"})
+# A valid request for each of those changes.
+_WRITE_REQUESTS = {
+    **host_tests._OWNER_CALLS,
+    **host_tests._QUEUE_CALLS,
+    **{method: host_tests._GITHUB_CHANGE_CALLS[method] for method in _LIFECYCLE_WRITES},
+}
 
 
 async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str) -> ConnectError:
@@ -745,8 +771,8 @@ async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str
 
 
 def test_every_write_has_a_request_case() -> None:
-    assert set(_WRITES) <= set(host_tests._OWNER_CALLS)
-    assert len(_WRITES) == 11
+    assert set(_WRITES) <= set(_WRITE_REQUESTS)
+    assert len(_WRITES) == 15
 
 
 @pytest.mark.parametrize("method", _WRITES)
@@ -755,7 +781,7 @@ async def test_a_host_failure_after_a_change_was_sent_is_unconfirmed(
 ) -> None:
     """A host error shaping GitHub's answer may follow a change GitHub made."""
     tunnel = _tunnel(tmp_path)
-    error = await _end_after_frame(tunnel, method, host_tests._OWNER_CALLS[method][0], "internal")
+    error = await _end_after_frame(tunnel, method, _WRITE_REQUESTS[method][0], "internal")
 
     assert (error.code, error.message) == (Code.UNKNOWN, _unconfirmed_for(method))
 
@@ -1015,6 +1041,7 @@ async def test_an_old_host_behind_the_new_server_offers_no_owner_method(
     reads_only_host: None,
     host_calls: list[HostWorkspaceCallFrame],
     owner_calls: list[tuple[str, str, dict[str, Any]]],
+    image_reads: list[tuple[str, str, str]],
 ) -> None:
     """A call made anyway gets the host's UNIMPLEMENTED, which says nothing was changed."""
     monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
@@ -1023,12 +1050,22 @@ async def test_an_old_host_behind_the_new_server_offers_no_owner_method(
     listed = await client.get_capabilities(pb.GetCapabilitiesRequest())
     with pytest.raises(ConnectError) as refused:
         await client.create_comment(_CREATE_COMMENT)
+    image = pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=host_tests._IMAGE_URL)
+    with pytest.raises(ConnectError) as image_refused:
+        await _image(client, image)
 
     assert set(listed.capabilities) >= _PULL_REQUEST_READS
     assert not set(listed.capabilities) & _PULL_REQUEST_OWNER_METHODS
+    assert "ReadPullRequestImage" in _PULL_REQUEST_OWNER_METHODS
     assert refused.value.code == Code.UNIMPLEMENTED
-    assert [call.method for call in host_calls] == ["GetCapabilities", "CreateComment"]
+    assert image_refused.value.code == Code.UNIMPLEMENTED
+    assert [call.method for call in host_calls] == [
+        "GetCapabilities",
+        "CreateComment",
+        "ReadPullRequestImage",
+    ]
     assert owner_calls == []
+    assert image_reads == []
 
 
 @pytest.mark.parametrize("session_owner", [True, False], ids=["owner", "non-owner"])
@@ -1056,20 +1093,20 @@ def _failure_reasons(error: ConnectError) -> list[str]:
 
 
 @pytest.fixture
-def review_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
-    """Each GitHub review call a review method made on the host."""
-    return host_tests.record_review_calls(monkeypatch)
+def github_changes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
+    """Each GitHub review, lifecycle, merge queue or stack call a method made on the host."""
+    return host_tests.record_github_changes(monkeypatch)
 
 
-@pytest.mark.parametrize("method", sorted(host_tests._REVIEW_CALLS))
-async def test_a_review_change_to_a_linked_pr_runs_on_the_servers_word(
+@pytest.mark.parametrize("method", sorted(host_tests._SELECTED_PR_CALLS))
+async def test_a_github_call_to_a_linked_pr_runs_on_the_servers_word(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],
-    review_calls: list[tuple[str, str, str, dict[str, Any]]],
+    github_changes: list[tuple[str, str, str, dict[str, Any]]],
     method: str,
 ) -> None:
-    request, function, _kwargs = host_tests._REVIEW_CALLS[method]
+    request, function, _kwargs = host_tests._SELECTED_PR_CALLS[method]
     client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
 
     response = await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
@@ -1078,18 +1115,18 @@ async def test_a_review_change_to_a_linked_pr_runs_on_the_servers_word(
     assert [(call.session_id, call.vouch) for call in host_calls] == [
         (_SESSION, PullRequestVouch(server_tracked=True)),
     ]
-    assert [(call[0], call[2]) for call in review_calls] == [(function, _PR)]
+    assert [(call[0], call[2]) for call in github_changes] == [(function, _PR)]
 
 
-@pytest.mark.parametrize("method", sorted(host_tests._REVIEW_CALLS))
-async def test_a_review_change_to_an_unlinked_pr_is_refused_before_the_host(
+@pytest.mark.parametrize("method", sorted(host_tests._SELECTED_PR_CALLS))
+async def test_a_github_call_to_an_unlinked_pr_is_refused_before_the_host(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],
-    review_calls: list[tuple[str, str, str, dict[str, Any]]],
+    github_changes: list[tuple[str, str, str, dict[str, Any]]],
     method: str,
 ) -> None:
-    request, _function, _kwargs = host_tests._REVIEW_CALLS[method]
+    request, _function, _kwargs = host_tests._SELECTED_PR_CALLS[method]
     client = _client(tmp_path, monkeypatch, _Store(_linked(_OTHER_PR)))
 
     with pytest.raises(ConnectError) as refused:
@@ -1097,7 +1134,122 @@ async def test_a_review_change_to_an_unlinked_pr_is_refused_before_the_host(
 
     assert refused.value.code == Code.FAILED_PRECONDITION
     assert host_calls == []
-    assert review_calls == []
+    assert github_changes == []
+
+
+@pytest.fixture
+def auto_merges(monkeypatch: pytest.MonkeyPatch) -> list[list[tuple[str, str, str]]]:
+    """Each auto-merge batch the host sent: its pull requests, methods and heads."""
+    return host_tests.record_auto_merges(monkeypatch)
+
+
+async def test_auto_merge_of_linked_prs_runs_on_the_servers_word_for_each(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    auto_merges: list[list[tuple[str, str, str]]],
+) -> None:
+    store = _Store(_linked(_PR, _OTHER_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    response = await client.enable_auto_merge(host_tests._AUTO_MERGE)
+
+    assert payload_dict(response.payload) == {"object": "test"}
+    assert [(call.session_id, call.vouch) for call in host_calls] == [
+        (_SESSION, PullRequestVouch(server_tracked=True)),
+    ]
+    assert store.reads == 2
+    assert [[url for url, _method, _head in batch] for batch in auto_merges] == [[_PR, _OTHER_PR]]
+
+
+async def test_auto_merge_naming_an_unlinked_pr_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    auto_merges: list[list[tuple[str, str, str]]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.enable_auto_merge(host_tests._AUTO_MERGE)
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert host_calls == []
+    assert auto_merges == []
+
+
+async def test_auto_merge_before_the_server_stores_the_prs_leaves_each_to_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    auto_merges: list[list[tuple[str, str, str]]],
+) -> None:
+    """Without the server's word for every PR, the host checks each against its record."""
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR, _OTHER_PR, synced=False)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.enable_auto_merge(host_tests._AUTO_MERGE)
+
+    assert [call.vouch for call in host_calls] == [None]
+    assert (refused.value.code, refused.value.message) == (
+        Code.FAILED_PRECONDITION,
+        "This pull request is not associated with the session",
+    )
+    assert auto_merges == []
+
+
+@pytest.mark.parametrize(
+    "items, refusal",
+    [
+        ([], "Enable auto-merge for 1 to 20 pull requests at once"),
+        (
+            [pb.PullRequestAutoMerge(merge_method="squash", expected_head_oid=host_tests._HEAD)],
+            "Name each pull request to merge automatically",
+        ),
+    ],
+    ids=["none", "unnamed"],
+)
+async def test_an_auto_merge_batch_the_server_cant_vouch_for_is_refused_before_the_vouch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    items: list[pb.PullRequestAutoMerge],
+    refusal: str,
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    with pytest.raises(ConnectError) as refused:
+        await client.enable_auto_merge(pb.EnableAutoMergeRequest(pull_requests=items))
+
+    assert (refused.value.code, refused.value.message) == (Code.INVALID_ARGUMENT, refusal)
+    assert store.reads == 0
+    assert host_calls == []
+
+
+_AUTO_MERGE_UNCONFIRMED = (
+    "Could not confirm which pull requests will merge automatically. Check GitHub before retrying."
+)
+
+
+async def test_an_auto_merge_batch_waits_longer_and_its_lost_answer_is_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch reads and changes up to 20 pull requests, past a single change's 20 s."""
+    assert workspace_api._reply_timeout("EnableAutoMerge", changes=True) == 120.0
+    assert workspace_api._reply_timeout("SetPullRequestState", changes=True) == 20.0
+    monkeypatch.setattr(workspace_api, "_WRITE_REPLY_TIMEOUT_S", 60.0)
+    monkeypatch.setattr(workspace_api, "_AUTO_MERGE_REPLY_TIMEOUT_S", 0.05)
+    tunnel = _tunnel(tmp_path)
+
+    with pytest.raises(ConnectError) as lost:
+        await tunnel.call("EnableAutoMerge", host_tests._AUTO_MERGE)
+
+    assert (lost.value.code, lost.value.message) == (
+        Code.DEADLINE_EXCEEDED,
+        _AUTO_MERGE_UNCONFIRMED,
+    )
+    assert len(tunnel.sent) == 1
 
 
 async def test_a_malformed_review_change_is_refused_before_the_vouch_as_invalid_input(
@@ -1130,7 +1282,7 @@ async def test_a_hosts_refusal_reason_reaches_the_client(
     client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
 
     with pytest.raises(ConnectError) as refused:
-        await client.edit_comment(host_tests._REVIEW_CALLS["EditComment"][0])
+        await client.edit_comment(host_tests._GITHUB_CHANGE_CALLS["EditComment"][0])
 
     assert refused.value.code == Code.FAILED_PRECONDITION
     assert _failure_reasons(refused.value) == ["comment_changed"]
@@ -1142,19 +1294,20 @@ async def test_a_hosts_refusal_reason_reaches_the_client(
         ("comment_changed", ["comment_changed"]),
         ("pull_request_changed", ["pull_request_changed"]),
         ("invalid_input", ["invalid_input"]),
-        ("read_only_code_host", []),
+        ("read_only_code_host", ["read_only_code_host"]),
+        ("merge_queue_full", []),
         ("<b>Click here</b>", []),
         ("", []),
         (None, []),
     ],
-    ids=["comment", "head", "input", "other-known", "arbitrary", "empty", "none"],
+    ids=["comment", "head", "input", "read-only", "other-known", "arbitrary", "empty", "none"],
 )
 async def test_only_an_allowed_reason_from_the_host_is_attached(
     tmp_path: Path, reason: str | None, attached: list[str]
 ) -> None:
     """A host can't push its own text into the structured field a client acts on."""
     tunnel = _tunnel(tmp_path)
-    request = host_tests._REVIEW_CALLS["EditComment"][0]
+    request = host_tests._GITHUB_CHANGE_CALLS["EditComment"][0]
     call = asyncio.create_task(tunnel.call("EditComment", request))
     await tunnel.frame_sent()
     deliver_workspace_reply(
@@ -1182,11 +1335,12 @@ def test_a_pull_request_failure_carries_only_its_reason() -> None:
         "comment_changed",
         "pull_request_changed",
         "invalid_input",
+        "read_only_code_host",
+        *github_images.IMAGE_REFUSAL_REASONS,
     } == workspace_api.PULL_REQUEST_FAILURE_REASONS
 
 
 _REVIEW_UNCONFIRMED = "Could not confirm the review change. Check GitHub before retrying."
-_REVIEW_WRITES = sorted(set(host_tests._REVIEW_CALLS) - {"GetPendingReview"})
 
 
 @pytest.mark.parametrize("method", _REVIEW_WRITES)
@@ -1194,7 +1348,7 @@ async def test_a_review_change_whose_host_drops_after_the_frame_is_unconfirmed(
     tmp_path: Path, method: str
 ) -> None:
     tunnel = _tunnel(tmp_path)
-    request = host_tests._REVIEW_CALLS[method][0]
+    request = host_tests._GITHUB_CHANGE_CALLS[method][0]
     call = asyncio.create_task(tunnel.call(method, request))
     await tunnel.frame_sent()
     tunnel.registry.deregister("host_ws", conn=tunnel.host)
@@ -1211,7 +1365,9 @@ async def test_a_host_failure_after_a_review_change_was_sent_is_unconfirmed(
 ) -> None:
     """A host error shaping GitHub's answer may follow a change GitHub made."""
     tunnel = _tunnel(tmp_path)
-    error = await _end_after_frame(tunnel, method, host_tests._REVIEW_CALLS[method][0], "internal")
+    error = await _end_after_frame(
+        tunnel, method, host_tests._GITHUB_CHANGE_CALLS[method][0], "internal"
+    )
 
     assert (error.code, error.message) == (Code.UNKNOWN, _REVIEW_UNCONFIRMED)
 
@@ -1219,7 +1375,10 @@ async def test_a_host_failure_after_a_review_change_was_sent_is_unconfirmed(
 async def test_a_host_failure_on_the_pending_review_read_stays_internal(tmp_path: Path) -> None:
     tunnel = _tunnel(tmp_path)
     error = await _end_after_frame(
-        tunnel, "GetPendingReview", host_tests._REVIEW_CALLS["GetPendingReview"][0], "internal"
+        tunnel,
+        "GetPendingReview",
+        host_tests._GITHUB_CHANGE_CALLS["GetPendingReview"][0],
+        "internal",
     )
 
     assert (error.code, error.message) == (Code.INTERNAL, "Workspace call failed")
@@ -1233,7 +1392,7 @@ async def test_a_review_change_whose_answer_times_out_is_unconfirmed(
 
     with pytest.raises(ConnectError) as lost:
         await tunnel.call(
-            "SubmitPendingReview", host_tests._REVIEW_CALLS["SubmitPendingReview"][0]
+            "SubmitPendingReview", host_tests._GITHUB_CHANGE_CALLS["SubmitPendingReview"][0]
         )
 
     assert (lost.value.code, lost.value.message) == (Code.DEADLINE_EXCEEDED, _REVIEW_UNCONFIRMED)
@@ -1244,7 +1403,7 @@ async def test_the_pending_review_read_cut_off_by_the_host_stays_safe_to_retry(
 ) -> None:
     tunnel = _tunnel(tmp_path)
     call = asyncio.create_task(
-        tunnel.call("GetPendingReview", host_tests._REVIEW_CALLS["GetPendingReview"][0])
+        tunnel.call("GetPendingReview", host_tests._GITHUB_CHANGE_CALLS["GetPendingReview"][0])
     )
     await tunnel.frame_sent()
     tunnel.registry.deregister("host_ws", conn=tunnel.host)
@@ -1398,3 +1557,399 @@ async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
     [thread] = payload_dict(response.payload)["data"]
     assert thread["can_reply"] is owner
     assert thread["comments"]["data"][0]["can_update"] is owner
+
+
+# Every change to the pull request on its code host, with a valid request for it.
+_CODE_HOST_CHANGES = sorted(_PULL_REQUEST_WRITES - {"SetPullRequestAccount"})
+_CHANGE_REQUESTS = {
+    **host_tests._OWNER_CALLS,
+    **host_tests._GITHUB_CHANGE_CALLS,
+    **host_tests._QUEUE_CALLS,
+    "EnableAutoMerge": (host_tests._AUTO_MERGE, "enable_auto_merge", {}),
+}
+_READ_ONLY_GITHUB = ("github.com",)
+
+
+@pytest.mark.parametrize(
+    ("read_only_code_hosts", "capabilities", "marked"),
+    [
+        pytest.param(
+            _READ_ONLY_GITHUB,
+            {"merging": True, "line_counts": True},
+            {"read_only": True, "capabilities": {"merging": False, "line_counts": True}},
+            id="read-only",
+        ),
+        pytest.param(_READ_ONLY_GITHUB, None, {"read_only": True}, id="older-host"),
+        pytest.param(("git.example.com",), {"merging": True}, {}, id="writable"),
+    ],
+)
+# The overview is shaped as well when the server has no PR store or can't store the PRs.
+@pytest.mark.parametrize(
+    "fault", [None, "no-store", "ingest-fails"], ids=["stored", "no-store", "ingest-fails"]
+)
+async def test_the_overview_of_a_pr_on_a_read_only_host_offers_no_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_only_code_hosts: tuple[str, ...],
+    capabilities: dict[str, bool] | None,
+    marked: dict[str, Any],
+    fault: str | None,
+) -> None:
+    """The workspace API shapes the host's overview as the REST route does."""
+    overview: dict[str, Any] = {"selected_pr_url": _PR, "pr": {"url": _PR}}
+    if capabilities is not None:
+        overview["capabilities"] = capabilities
+    stored = _linked(_PR)
+
+    def ingest(*_args: Any, **_kwargs: Any) -> Any:
+        if fault == "ingest-fails":
+            raise OSError("disk full")
+        return stored
+
+    monkeypatch.setattr(server_prs, "ingest_info", ingest)
+    monkeypatch.setattr(server_prs, "answer", lambda info, _stored: dict(info))
+    monkeypatch.setattr(
+        WorkspaceReader, "github_info", lambda _self, _session, _url: dict(overview)
+    )
+    store = None if fault == "no-store" else _Store(stored)
+    client = _client(tmp_path, monkeypatch, store, read_only_code_hosts=read_only_code_hosts)
+
+    response = await client.get_pull_request(pb.GetPullRequestRequest(pr_url=_PR))
+
+    assert payload_dict(response.payload) == {**overview, **marked}
+
+
+async def _tracked(_pr_url: str) -> PullRequestVouch:
+    """The vouch once the server stores the session's PRs: their first is the default."""
+    return PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+
+
+async def _refused_before_the_host(tunnel: _Tunnel, method: str, request: Any) -> ConnectError:
+    """The read-only refusal a change gets, checking that no frame went to the host."""
+    with pytest.raises(ConnectError) as refused:
+        # A change that isn't refused waits for the host; this one has no answer.
+        await asyncio.wait_for(tunnel.call(method, request), timeout=5)
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
+    assert _failure_reasons(refused.value) == ["read_only_code_host"]
+    assert tunnel.sent == []
+    return refused.value
+
+
+@pytest.mark.parametrize("method", _CODE_HOST_CHANGES)
+async def test_a_change_to_a_pr_on_a_read_only_host_is_refused_before_the_host(
+    tmp_path: Path, method: str
+) -> None:
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=_READ_ONLY_GITHUB)
+
+    await _refused_before_the_host(tunnel, method, _CHANGE_REQUESTS[method][0])
+
+
+async def test_an_auto_merge_batch_naming_a_read_only_hosts_pr_is_refused_before_the_host(
+    tmp_path: Path,
+) -> None:
+    """The session's first pull request is writable; a later one in the batch isn't."""
+    batch = pb.EnableAutoMergeRequest(
+        pull_requests=[
+            pb.PullRequestAutoMerge(pr_url=_PR, merge_method="squash", expected_head_oid="a" * 40),
+            pb.PullRequestAutoMerge(
+                pr_url="https://git.example.com/example-org/example-repo/pull/9",
+                merge_method="squash",
+                expected_head_oid="b" * 40,
+            ),
+        ]
+    )
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=("git.example.com",))
+
+    await _refused_before_the_host(tunnel, "EnableAutoMerge", batch)
+
+
+async def test_an_auto_merge_batch_on_writable_hosts_reaches_the_host(tmp_path: Path) -> None:
+    """A batch names no single pull request, so each one it names is checked instead."""
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=("git.example.com",))
+
+    await _end_after_frame(tunnel, "EnableAutoMerge", host_tests._AUTO_MERGE, "internal")
+
+    assert [frame.method for frame in tunnel.sent] == ["EnableAutoMerge"]
+
+
+@pytest.mark.parametrize(
+    "request_message",
+    [
+        pb.CreateCommentRequest(body="Looks good"),
+        pb.CreateCommentRequest(pr_url="\u00a0" + _PR, body="Looks good"),
+        pb.CreateCommentRequest(
+            pr_url="https://example.visualstudio.com/project/_git/repo/pullrequest/7",
+            body="Looks good",
+        ),
+    ],
+    ids=["no-pr", "padded-url", "legacy-alias"],
+)
+async def test_a_change_the_server_cant_place_off_a_read_only_host_is_refused(
+    tmp_path: Path, request_message: Any
+) -> None:
+    """Before the server stores the session's PRs, the host picks or normalizes the PR."""
+    hosts = (*_READ_ONLY_GITHUB, "dev.azure.com")
+    tunnel = _tunnel(tmp_path, vouch=_no_vouch, read_only_code_hosts=hosts)
+
+    await _refused_before_the_host(tunnel, "CreateComment", request_message)
+
+
+async def test_a_change_naming_no_pr_is_refused_when_the_first_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    """Through the route, so the server's configured hosts reach the workspace API."""
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=_READ_ONLY_GITHUB
+    )
+
+    with pytest.raises(ConnectError) as refused:
+        await client.create_comment(pb.CreateCommentRequest(body="Looks good"))
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
+    assert _failure_reasons(refused.value) == ["read_only_code_host"]
+    assert host_calls == []
+
+
+async def test_a_change_naming_no_pr_reaches_the_host_when_the_first_is_writable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """Another host being read-only doesn't hold back a change to the session's first PR."""
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=("git.example.com",)
+    )
+
+    await client.create_comment(pb.CreateCommentRequest(body="Looks good"))
+
+    assert [call.method for call in host_calls] == ["CreateComment"]
+    [(function, _root, arguments)] = owner_calls
+    assert function == "create_pr_comment"
+    # Forwarded as sent; the real host then refuses a comment that names no PR.
+    assert arguments["pr_url"] is None
+    assert arguments["body"] == "Looks good"
+
+
+@pytest.mark.parametrize("method", ["SetPullRequestAccount", "GetMergeOptions"])
+async def test_reads_and_the_account_choice_on_a_read_only_host_reach_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=_READ_ONLY_GITHUB
+    )
+
+    await getattr(client, WORKSPACE_METHODS[method].python_name)(_CHANGE_REQUESTS[method][0])
+
+    assert [call.method for call in host_calls] == [method]
+    assert len(owner_calls) == 1
+
+
+# -- An image read streams through the server for the session's owner. -------------------
+
+
+@pytest.fixture
+def image_reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    return host_tests.record_image_reads(monkeypatch)
+
+
+async def _image(client: Any, request: pb.ReadPullRequestImageRequest) -> bytes:
+    """Every part of an image read, joined, after checking its metadata comes first."""
+    replies = [reply async for reply in client.read_pull_request_image(request)]
+    assert replies[0].HasField("metadata")
+    assert not any(reply.HasField("metadata") for reply in replies[1:])
+    assert replies[0].metadata.size == sum(len(reply.data) for reply in replies)
+    return b"".join(reply.data for reply in replies)
+
+
+async def test_an_image_of_a_linked_pr_streams_through_the_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    image_reads: list[tuple[str, str, str]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    image = await _image(
+        client, pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=host_tests._IMAGE_URL)
+    )
+
+    assert image == host_tests._IMAGE.data
+    assert image_reads == [(str(tmp_path.resolve()), _PR, host_tests._IMAGE_URL)]
+    assert [(call.method, call.session_id) for call in host_calls] == [
+        ("ReadPullRequestImage", _SESSION)
+    ]
+
+
+async def test_an_image_of_an_unlinked_pr_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    image_reads: list[tuple[str, str, str]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+    request = pb.ReadPullRequestImageRequest(pr_url=_OTHER_PR, image_url=host_tests._IMAGE_URL)
+
+    with pytest.raises(ConnectError) as refused:
+        await _image(client, request)
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert host_calls == []
+    assert image_reads == []
+
+
+async def test_an_image_read_with_no_url_is_refused_before_the_vouch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    with pytest.raises(ConnectError) as refused:
+        await _image(client, pb.ReadPullRequestImageRequest(pr_url=_PR))
+
+    assert (refused.value.code, refused.value.message) == (
+        Code.INVALID_ARGUMENT,
+        "Expected an image URL",
+    )
+    assert _failure_reasons(refused.value) == ["invalid_input"]
+    assert store.reads == 0
+    assert host_calls == []
+
+
+async def test_an_image_refusal_reaches_the_client_with_its_reason_and_no_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(_root: str, _reference: Any, _image_url: str) -> Any:
+        raise github_images.ImageRefused("host_not_allowed")
+
+    monkeypatch.setattr(github_images, "read_pull_request_image", refuse)
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+    signed = "https://private-user-images.githubusercontent.com/1/a.png?jwt=secret"
+
+    with pytest.raises(ConnectError) as refused:
+        await _image(client, pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=signed))
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert refused.value.message == "GitHub won't show images from that address."
+    assert _failure_reasons(refused.value) == ["host_not_allowed"]
+
+
+def _image_stream(tunnel: _Tunnel) -> Any:
+    request = pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=host_tests._IMAGE_URL)
+    return tunnel.service.read_pull_request_image(request, None)  # type: ignore[call-arg]
+
+
+async def test_a_host_failure_after_the_first_part_ends_the_image_read(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path)
+    stream = _image_stream(tunnel)
+    first = asyncio.create_task(anext(stream))
+    await tunnel.frame_sent()
+    request_id = tunnel.sent[0].request_id
+    metadata = pb.ReadPullRequestImageResponse(
+        metadata=pb.PullRequestImageMetadata(content_type="image/png", size=10)
+    )
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(request_id=request_id, message=metadata.SerializeToString()),
+    )
+    assert (await first).metadata.size == 10
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=request_id,
+            done=True,
+            error_code="unavailable",
+            error_message="GitHub couldn't load that image. Try again.",
+            error_reason="fetch_failed",
+        ),
+    )
+
+    with pytest.raises(ConnectError) as failed:
+        await anext(stream)
+
+    assert failed.value.code == Code.UNAVAILABLE
+    assert _failure_reasons(failed.value) == ["fetch_failed"]
+    assert tunnel.host.pending_workspace_calls == {}
+
+
+async def test_an_image_read_waits_its_own_time_for_each_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first reply follows the PR read and the whole fetch, past a read's 30 s."""
+    monkeypatch.setattr(workspace_api, "_IMAGE_REPLY_TIMEOUT_S", 0.05)
+    tunnel = _tunnel(tmp_path)
+
+    # Bounded here, so a read waiting only a read's 30 s fails the test at once.
+    with pytest.raises(ConnectError) as lost:
+        await asyncio.wait_for(anext(_image_stream(tunnel)), timeout=5.0)
+
+    assert (lost.value.code, lost.value.message) == (
+        Code.DEADLINE_EXCEEDED,
+        "The session's host did not answer",
+    )
+
+
+async def test_an_image_part_after_the_metadata_waits_the_images_time_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Long enough to deliver the metadata under load; the part after it never comes.
+    monkeypatch.setattr(workspace_api, "_IMAGE_REPLY_TIMEOUT_S", 0.5)
+    tunnel = _tunnel(tmp_path)
+    stream = _image_stream(tunnel)
+    first = asyncio.create_task(anext(stream))
+    await tunnel.frame_sent()
+    metadata = pb.ReadPullRequestImageResponse(
+        metadata=pb.PullRequestImageMetadata(content_type="image/png", size=10)
+    )
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id, message=metadata.SerializeToString()
+        ),
+    )
+    await first
+
+    with pytest.raises(ConnectError) as lost:
+        await asyncio.wait_for(anext(stream), timeout=5.0)
+
+    assert lost.value.code == Code.DEADLINE_EXCEEDED
+
+
+def test_the_first_image_reply_wait_covers_every_phase_of_the_host_read() -> None:
+    """Account lookup, token read, slot wait and fetch all come before the metadata."""
+    from omnigent.runner import github_resource
+
+    phases = (
+        github_resource._PR_EDIT_REQUEST_SECONDS
+        + github_images._READ_TOKEN_SECONDS
+        + github_images.SLOT_WAIT_SECONDS
+        + github_images.FETCH_DEADLINE_SECONDS
+    )
+    assert phases < workspace_api._IMAGE_REPLY_TIMEOUT_S
+
+
+async def test_a_caller_that_leaves_an_image_read_ends_its_call(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path)
+    stream = _image_stream(tunnel)
+    first = asyncio.create_task(anext(stream))
+    await tunnel.frame_sent()
+    metadata = pb.ReadPullRequestImageResponse(
+        metadata=pb.PullRequestImageMetadata(content_type="image/png", size=10)
+    )
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id, message=metadata.SerializeToString()
+        ),
+    )
+    await first
+
+    await stream.aclose()
+
+    assert tunnel.host.pending_workspace_calls == {}

@@ -49,6 +49,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   isElectronShell: () => true,
   supportsBrowser: () => true,
   supportsDesktopCommands: () => desktop.enabled,
+  shellRoutesDesktopCommands: () => desktop.enabled,
   onDesktopCommand: (callback: typeof desktop.send) => {
     desktop.send = callback;
     return () => {};

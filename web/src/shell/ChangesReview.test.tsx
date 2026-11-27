@@ -18,11 +18,27 @@ import { BRANCH_RANGE } from "@/lib/branchCommits";
 import type * as BranchCommitsModule from "@/lib/branchCommits";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { openFindForActiveSurface } from "@/lib/findRouting";
-import { resetShownReviewsForTests, shownReview } from "@/lib/reviewFileLinks";
+import { resetShownReviewsForTests, reviewMembership, shownReview } from "@/lib/reviewFileLinks";
+import { useChoosingComparisonOwner } from "@/hooks/useComparisonOwner";
+import type * as ReviewFolderModule from "./ChangesReviewFolder";
+import type * as FileViewerContextModule from "./FileViewerContext";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as SessionWorktreesModule from "@/hooks/useSessionWorktrees";
+import type { SessionWorktreesResult } from "@/hooks/useSessionWorktrees";
+import { resetReviewFolderListsForTests, type ReviewFolder } from "./ChangesReviewFolder";
 import { comparisonChoiceOf } from "@/lib/comparisonChoice";
 import type { ComparisonAvailability } from "@/shell/useVisitComparison";
 import { localComparisonView, type LocalComparisonInput } from "@/lib/localComparison";
-import { invalidateWorkingCopyChanges } from "@/lib/workingCopyComparisons";
+import {
+  invalidateWorkingCopyChanges,
+  sessionChoiceCount,
+  workingCopyComparisonsAt,
+} from "@/lib/workingCopyComparisons";
+import {
+  browseLocationChanges,
+  rememberBrowseLocation,
+  rememberedBrowseLocation,
+} from "./filesPane/browseLocations";
 import type { EffectiveComparison } from "@/lib/workingCopyComparison";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { ChangesReview, type ChangesReviewProps } from "./ChangesReview";
@@ -40,7 +56,88 @@ const mocks = vi.hoisted(() => ({
   commitOwner: { retry: vi.fn() },
   commitChanges: vi.fn<(spec: RevisionSpec | null) => WorkingCopyChanges>(),
   width: vi.fn(() => 0),
+  /**
+   * The folder the review shows, when a test sets it, or how it follows the session's directory;
+   * otherwise the workspace.
+   */
+  folder: null as ReviewFolder | ((directory: string | null) => ReviewFolder) | null,
+  /** What each file's actions were resolved with. */
+  fileTargets: [] as { path: string; base?: string }[],
+  /**
+   * When set, the review uses the real folder hook, over the workspace `/repo` with this worktree
+   * answer; otherwise `folder` above.
+   */
+  realFolder: null as { worktrees: SessionWorktreesResult; permissionLevel?: number } | null,
 }));
+// The real folder hook's inputs, given only while a test asks for that hook.
+vi.mock("./FileViewerContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof FileViewerContextModule>();
+  return {
+    ...actual,
+    useWorkspacePaths: () => {
+      const paths = actual.useWorkspacePaths();
+      return mocks.realFolder ? { ...paths, root: "/repo" } : paths;
+    },
+  };
+});
+vi.mock("@/hooks/useSession", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseSessionModule>();
+  return {
+    ...actual,
+    useSession: (...args: Parameters<typeof actual.useSession>) =>
+      mocks.realFolder
+        ? {
+            session: { permissionLevel: mocks.realFolder.permissionLevel ?? 4 },
+            isLoading: false,
+            error: null,
+          }
+        : actual.useSession(...args),
+  };
+});
+vi.mock("@/hooks/useSessionWorktrees", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionWorktreesModule>();
+  return {
+    ...actual,
+    useSessionWorktrees: (...args: Parameters<typeof actual.useSessionWorktrees>) =>
+      mocks.realFolder
+        ? { data: mocks.realFolder.worktrees, isLoading: false }
+        : actual.useSessionWorktrees(...args),
+  };
+});
+vi.mock("./ChangesReviewFolder", async (importOriginal) => {
+  const actual = await importOriginal<typeof ReviewFolderModule>();
+  const { useRememberedBrowseLocation } = await import("./filesPane/browseLocations");
+  // The folder a test sets, or the workspace's.
+  const useTestFolder: typeof actual.useReviewFolder = (conversationId) => {
+    const directory = useRememberedBrowseLocation(conversationId);
+    const folder = mocks.folder;
+    if (typeof folder === "function") return folder(directory);
+    return (
+      folder ?? {
+        workspace: null,
+        root: null,
+        repository: "",
+        workspaceKey: "",
+        directory: null,
+        canChoose: false,
+        cannotChooseReason: null,
+        resolved: true,
+        rootFor: () => null,
+        choose: () => {},
+        showWorkspace: () => {},
+        dialog: null,
+      }
+    );
+  };
+  return {
+    ...actual,
+    // The real hook when a test asks for it; one or the other for a whole test.
+    useReviewFolder: (conversationId: string, active: boolean, lookUp: string | null = null) => {
+      const useFolder = mocks.realFolder ? actual.useReviewFolder : useTestFolder;
+      return useFolder(conversationId, active, lookUp);
+    },
+  };
+});
 // The open commit's owner: what it compares, read as its views read it.
 vi.mock("@/lib/workingCopyComparisons", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkingCopyComparisonsModule>()),
@@ -61,10 +158,20 @@ vi.mock("@/hooks/useWorkingCopyChanges", async (importOriginal) => ({
     return mocks.commitChanges(spec);
   },
 }));
-vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
-  ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
-  useWorkspaceAsleep: mocks.asleep,
-}));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof WorkspaceChangedFilesModule>();
+  return {
+    ...actual,
+    useWorkspaceAsleep: mocks.asleep,
+    useWorkspaceEnvironment: (...args: Parameters<typeof actual.useWorkspaceEnvironment>) =>
+      mocks.realFolder
+        ? {
+            data: { available: true, root: "/repo", reachable: { unconfined: true, roots: [] } },
+            isLoading: false,
+          }
+        : actual.useWorkspaceEnvironment(...args),
+  };
+});
 // The shared notice follows the same asleep signal the review reads.
 vi.mock("@/hooks/useSandboxResume", () => ({
   useSandboxResume: () => ({
@@ -90,8 +197,11 @@ vi.mock("./fileCommands/useFileCommandFacts", () => ({
   useFileCommandEnvironment: () => ({}),
 }));
 vi.mock("./fileCommands/target", () => ({
-  useSessionHostId: () => null,
-  resolveFileCommandTarget: (path: string) => ({ path }),
+  useSessionHostId: () => (mocks.realFolder ? "host_1" : null),
+  resolveFileCommandTarget: (path: string, options: { base?: string }) => {
+    mocks.fileTargets.push({ path, base: options.base });
+    return { path };
+  },
 }));
 vi.mock("./fileCommands/reviewFileActions", () => ({ reviewFileActions: () => [] }));
 
@@ -210,8 +320,13 @@ function renderReview(overrides: Partial<ChangesReviewProps> = {}) {
 
 afterEach(() => {
   resetShownReviewsForTests();
+  resetReviewFolderListsForTests();
   vi.clearAllMocks();
   mocks.commitComparisons = null;
+  mocks.folder = null;
+  mocks.realFolder = null;
+  rememberBrowseLocation("s1", null);
+  mocks.fileTargets = [];
   mocks.width.mockReturnValue(0);
   mocks.asleep.mockReturnValue(false);
   window.localStorage.clear();
@@ -459,7 +574,7 @@ describe("ChangesReview", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show Default Comparison" }));
     expect(onComparisonShown).toHaveBeenCalledWith(
       { kind: "saved", intent: "head" },
-      { step: true },
+      { step: true, root: null },
     );
   });
 
@@ -484,7 +599,7 @@ describe("ChangesReview", () => {
     renderReview({ onComparisonShown });
     expect(onComparisonShown).toHaveBeenCalledWith(
       { kind: "saved", intent: "head" },
-      { step: false },
+      { step: false, root: null },
     );
     cleanup();
     const data = source(settledChanges);
@@ -733,7 +848,12 @@ describe("the Commits and Changes tabs", () => {
     expect(tab("Commits")).toContainElement(
       screen.getByText("2", { selector: "[data-slot=badge]" }),
     );
-    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith("s1", BRANCH_RANGE, expect.anything());
+    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith(
+      "s1",
+      BRANCH_RANGE,
+      expect.anything(),
+      "",
+    );
 
     await userEvent.click(tab("Commits"));
     expect(await screen.findByRole("option", { name: /Fix the build/ })).toBeVisible();
@@ -751,11 +871,13 @@ describe("the Commits and Changes tabs", () => {
       "s1",
       { base: "v1", head: "feature" },
       expect.anything(),
+      "",
     );
     expect(mocks.fetchBranchCommits).not.toHaveBeenCalledWith(
       "s1",
       BRANCH_RANGE,
       expect.anything(),
+      expect.any(String),
     );
   });
 
@@ -1221,5 +1343,511 @@ describe("the Commits tab's count", () => {
     await userEvent.click(screen.getByRole("combobox", { name: "Diffs section" }));
     const option = await screen.findByRole("option", { name: /^Commits/ });
     expect(option).toHaveTextContent("1");
+  });
+});
+
+describe("a review of a worktree inside the workspace", () => {
+  const ROOT = "/repo/.worktrees/feature";
+  const folder = (overrides: Partial<ReviewFolder> = {}): ReviewFolder => ({
+    workspace: "/repo",
+    root: ROOT,
+    repository: ".worktrees/feature",
+    workspaceKey: "host_1\n/repo",
+    directory: ROOT,
+    canChoose: true,
+    cannotChooseReason: null,
+    resolved: true,
+    rootFor: (directory) => (directory?.startsWith(ROOT) ? ROOT : null),
+    choose: vi.fn(),
+    showWorkspace: vi.fn(),
+    dialog: null,
+    ...overrides,
+  });
+
+  it("applies a landing's comparison in the worktree whose review showed it", () => {
+    mocks.folder = folder();
+    const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+    mocks.source.mockReturnValue(data);
+    const visit = { kind: "saved", intent: "branch-point" } as const;
+    renderReview({
+      comparison: visit,
+      comparisonRoot: ROOT,
+      landing: { settled: false, choices: 0 },
+      onComparisonShown: vi.fn(),
+    });
+    expect(data.choice.choose).toHaveBeenCalledWith(visit);
+  });
+
+  it("never applies a worktree's comparison in another folder's review, and records its own there", () => {
+    mocks.folder = folder({ root: "/repo", repository: "" });
+    const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+    mocks.source.mockReturnValue(data);
+    const onComparisonShown = vi.fn();
+    renderReview({
+      comparison: { kind: "saved", intent: "branch-point" },
+      comparisonRoot: ROOT,
+      landing: { settled: false, choices: 0 },
+      onComparisonShown,
+    });
+    expect(data.choice.choose).not.toHaveBeenCalled();
+    expect(rememberedBrowseLocation("s1")).toBeNull();
+    expect(onComparisonShown).toHaveBeenCalledWith(
+      { kind: "saved", intent: "head" },
+      { step: false, root: null },
+    );
+  });
+
+  describe("landing on a visit from another folder", () => {
+    const visit = { kind: "saved", intent: "branch-point" } as const;
+    // The review follows the session's directory: the worktree once it's chosen, else the workspace.
+    const following = (directory: string | null) =>
+      directory?.startsWith(ROOT)
+        ? folder({ directory })
+        : folder({ root: "/repo", repository: "", directory });
+    const landed = () => ({
+      settled: false,
+      choices: sessionChoiceCount("s1"),
+      folders: browseLocationChanges("s1"),
+    });
+
+    it("brings back the visit's worktree, then applies its comparison there", () => {
+      mocks.folder = following;
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const onComparisonShown = vi.fn();
+      renderReview({
+        comparison: visit,
+        comparisonRoot: ROOT,
+        landing: landed(),
+        onComparisonShown,
+      });
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+      // The workspace's comparison never replaced the visit's on the way.
+      expect(onComparisonShown).not.toHaveBeenCalledWith(expect.anything(), {
+        step: false,
+        root: null,
+      });
+    });
+
+    it("returns to the workspace for a workspace visit while a worktree shows", () => {
+      rememberBrowseLocation("s1", `${ROOT}/src`);
+      mocks.folder = following;
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      renderReview({
+        comparison: visit,
+        comparisonRoot: null,
+        landing: landed(),
+        onComparisonShown: vi.fn(),
+      });
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+    });
+
+    it("keeps a folder chosen after the landing, and records what it shows in place", () => {
+      mocks.folder = following;
+      const landing = landed();
+      rememberBrowseLocation("s1", "/repo/src");
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const onComparisonShown = vi.fn();
+      renderReview({ comparison: visit, comparisonRoot: ROOT, landing, onComparisonShown });
+      expect(rememberedBrowseLocation("s1")).toBe("/repo/src");
+      expect(data.choice.choose).not.toHaveBeenCalled();
+      expect(onComparisonShown).toHaveBeenCalledWith(
+        { kind: "saved", intent: "head" },
+        { step: false, root: null },
+      );
+    });
+
+    it("holds the visit, neither applying nor recording, until the folder's answers load", () => {
+      mocks.folder = (directory) => ({ ...following(directory), resolved: false });
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const onComparisonShown = vi.fn();
+      const landing = landed();
+      const { props, rerender } = renderReview({
+        comparison: visit,
+        comparisonRoot: ROOT,
+        landing,
+        onComparisonShown,
+      });
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+      expect(onComparisonShown).not.toHaveBeenCalled();
+      expect(data.choice.choose).not.toHaveBeenCalled();
+      expect(landing.settled).toBe(false);
+      mocks.folder = following;
+      rerender(<ChangesReview {...props} />);
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+    });
+
+    it("applies the visit in its worktree however the visit spells that folder", () => {
+      rememberBrowseLocation("s1", ROOT);
+      mocks.folder = following;
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      renderReview({
+        comparison: visit,
+        comparisonRoot: `${ROOT}/`,
+        landing: landed(),
+        onComparisonShown: vi.fn(),
+      });
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+    });
+
+    it("keeps the visit while the worktree lookup fails, and brings it back once they list", () => {
+      mocks.realFolder = { worktrees: { status: "unknown" } };
+      const data = source(changes({ workspace: { hostId: "host_1", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const onComparisonShown = vi.fn();
+      const landing = landed();
+      const { props, rerender, unmount } = renderReview({
+        comparison: visit,
+        comparisonRoot: ROOT,
+        landing,
+        onComparisonShown,
+      });
+      // A failed lookup proves nothing about the worktree, so the visit is neither applied nor replaced.
+      expect(onComparisonShown).not.toHaveBeenCalled();
+      expect(data.choice.choose).not.toHaveBeenCalled();
+      expect(landing.settled).toBe(false);
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+
+      mocks.realFolder = {
+        worktrees: {
+          status: "ok",
+          worktrees: [
+            { path: "/repo", branch: "main", is_main: true, detached: false },
+            { path: ROOT, branch: "feature", is_main: false, detached: false },
+          ],
+        },
+      };
+      rerender(<ChangesReview {...props} />);
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+      // Unmounted while the real hook still applies, since the next test's folder mock differs.
+      unmount();
+    });
+
+    it("keeps a shown worktree's review and visit through a failed refetch of the worktrees", () => {
+      const listed: SessionWorktreesResult = {
+        status: "ok",
+        worktrees: [
+          { path: "/repo", branch: "main", is_main: true, detached: false },
+          { path: ROOT, branch: "feature", is_main: false, detached: false },
+        ],
+      };
+      rememberBrowseLocation("s1", ROOT);
+      mocks.realFolder = { worktrees: listed };
+      const shown = { kind: "saved", intent: "head" } as const;
+      mocks.source.mockReturnValue(
+        source(changes({ workspace: { hostId: "host_1", root: "/repo" } })),
+      );
+      const onComparisonShown = vi.fn();
+      // A settled visit of the worktree, showing the comparison it recorded.
+      const { props, rerender, unmount } = renderReview({
+        comparison: shown,
+        comparisonRoot: ROOT,
+        landing: { ...landed(), settled: true },
+        onComparisonShown,
+      });
+      expect(screen.getByTestId("changes-review-folder")).toHaveTextContent("feature");
+
+      mocks.realFolder = { worktrees: { status: "unknown" } };
+      rerender(<ChangesReview {...props} />);
+      expect(screen.getByTestId("changes-review-folder")).toHaveTextContent("feature");
+      mocks.realFolder = { worktrees: listed };
+      rerender(<ChangesReview {...props} />);
+
+      expect(onComparisonShown).not.toHaveBeenCalledWith(expect.anything(), {
+        step: false,
+        root: null,
+      });
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      unmount();
+    });
+
+    it("keeps the worktree for a Diffs tab that opens after a failed refetch of the worktrees", () => {
+      const listed: SessionWorktreesResult = {
+        status: "ok",
+        worktrees: [
+          { path: "/repo", branch: "main", is_main: true, detached: false },
+          { path: ROOT, branch: "feature", is_main: false, detached: false },
+        ],
+      };
+      rememberBrowseLocation("s1", ROOT);
+      mocks.realFolder = { worktrees: listed };
+      mocks.source.mockReturnValue(
+        source(changes({ workspace: { hostId: "host_1", root: "/repo" } })),
+      );
+      const first = renderReview({ landing: { ...landed(), settled: true } });
+      first.unmount();
+
+      // The refetch fails, then another Diffs tab of the session opens.
+      mocks.realFolder = { worktrees: { status: "unknown" } };
+      const onComparisonShown = vi.fn();
+      const { unmount } = renderReview({
+        comparison: { kind: "saved", intent: "head" },
+        comparisonRoot: ROOT,
+        landing: landed(),
+        onComparisonShown,
+      });
+      expect(screen.getByTestId("changes-review-folder")).toHaveTextContent("feature");
+      expect(onComparisonShown).not.toHaveBeenCalledWith(expect.anything(), {
+        step: false,
+        root: null,
+      });
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      unmount();
+    });
+
+    it("records nothing for a settled worktree visit while its first worktree lookup fails", () => {
+      rememberBrowseLocation("s1", ROOT);
+      mocks.realFolder = { worktrees: { status: "unknown" } };
+      mocks.source.mockReturnValue(
+        source(changes({ workspace: { hostId: "host_1", root: "/repo" } })),
+      );
+      const onComparisonShown = vi.fn();
+      const { unmount } = renderReview({
+        comparison: { kind: "saved", intent: "head" },
+        comparisonRoot: ROOT,
+        landing: { ...landed(), settled: true },
+        onComparisonShown,
+      });
+      // Without a list the worktree reads as the workspace, so nothing is recorded under it.
+      expect(onComparisonShown).not.toHaveBeenCalled();
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      unmount();
+    });
+
+    it("applies a workspace visit for a collaborator who may not list the host's worktrees", () => {
+      // Only the host's owner may list worktrees; an editor's lookup is refused.
+      mocks.realFolder = { worktrees: { status: "unknown", denied: true }, permissionLevel: 2 };
+      const data = source(changes({ workspace: { hostId: "host_1", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const { unmount } = renderReview({
+        comparison: visit,
+        comparisonRoot: null,
+        landing: landed(),
+        onComparisonShown: vi.fn(),
+      });
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+      unmount();
+    });
+
+    it("waits for the worktrees before comparing folders, then returns to the workspace", () => {
+      rememberBrowseLocation("s1", ROOT);
+      // Until the worktrees load, the chosen worktree reads as the workspace.
+      mocks.folder = (directory) => ({
+        ...folder({ root: "/repo", repository: "", directory }),
+        resolved: false,
+      });
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const landing = landed();
+      const { props, rerender } = renderReview({
+        comparison: visit,
+        comparisonRoot: null,
+        landing,
+        onComparisonShown: vi.fn(),
+      });
+      expect(data.choice.choose).not.toHaveBeenCalled();
+      expect(landing.settled).toBe(false);
+      mocks.folder = following;
+      rerender(<ChangesReview {...props} />);
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+    });
+
+    it("keeps the current folder when the visit's worktree is gone", () => {
+      // The worktree no longer exists, so its folder would review the workspace.
+      mocks.folder = (directory) => ({
+        ...folder({ root: "/repo", repository: "", directory }),
+        rootFor: () => null,
+      });
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const onComparisonShown = vi.fn();
+      renderReview({
+        comparison: visit,
+        comparisonRoot: ROOT,
+        landing: landed(),
+        onComparisonShown,
+      });
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+      expect(data.choice.choose).not.toHaveBeenCalled();
+      expect(onComparisonShown).toHaveBeenCalledWith(
+        { kind: "saved", intent: "head" },
+        { step: false, root: null },
+      );
+    });
+
+    it("leaves the folder alone for a viewer who can't choose folders", () => {
+      mocks.folder = (directory) => ({ ...following(directory), canChoose: false });
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      renderReview({
+        comparison: visit,
+        comparisonRoot: ROOT,
+        landing: landed(),
+        onComparisonShown: vi.fn(),
+      });
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+      expect(data.choice.choose).not.toHaveBeenCalled();
+    });
+
+    it("never restores for a hidden review, nor once a newer comparison was chosen", () => {
+      mocks.folder = following;
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const props = { comparison: visit, comparisonRoot: ROOT, onComparisonShown: vi.fn() };
+      const { unmount } = renderReview({ ...props, active: false, landing: landed() });
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+      unmount();
+      renderReview({ ...props, landing: { ...landed(), choices: sessionChoiceCount("s1") - 1 } });
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+      expect(data.choice.choose).not.toHaveBeenCalled();
+    });
+  });
+
+  it("drops a waiting visit once a folder inside its worktree is chosen, and shows the review", () => {
+    mocks.folder = (directory) => folder({ directory });
+    rememberBrowseLocation("s1", ROOT);
+    const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+    data.choice.availability = () => "later";
+    mocks.source.mockReturnValue(data);
+    const onComparisonShown = vi.fn();
+    const landing = {
+      settled: false,
+      choices: sessionChoiceCount("s1"),
+      folders: browseLocationChanges("s1"),
+    };
+    renderReview({
+      comparison: { kind: "saved", intent: "branch-point" },
+      comparisonRoot: ROOT,
+      landing,
+      onComparisonShown,
+    });
+    expect(onComparisonShown).not.toHaveBeenCalled();
+    act(() => rememberBrowseLocation("s1", `${ROOT}/src`));
+    expect(data.choice.choose).not.toHaveBeenCalled();
+    expect(onComparisonShown).toHaveBeenCalledWith(
+      { kind: "saved", intent: "head" },
+      { step: false, root: ROOT },
+    );
+  });
+
+  it("records a worktree's comparison with its folder, and a folder picked since in place", () => {
+    mocks.folder = folder();
+    mocks.source.mockReturnValue(source(changes({ workspace: { hostId: "host", root: "/repo" } })));
+    const onComparisonShown = vi.fn();
+    renderReview({ comparison: { kind: "saved", intent: "head" }, onComparisonShown });
+    expect(onComparisonShown).toHaveBeenCalledWith(
+      { kind: "saved", intent: "head" },
+      { step: false, root: ROOT },
+    );
+  });
+
+  it("names the worktree in the header, where choosing opens the folder browser", async () => {
+    mocks.folder = folder();
+    mocks.source.mockReturnValue(source(changes()));
+    renderReview();
+    const name = screen.getByTestId("changes-review-folder");
+    expect(name).toHaveTextContent("feature");
+    expect(name).toHaveAccessibleName(`Diffs folder: ${ROOT}. Choose another folder.`);
+    await userEvent.click(name);
+    expect(mocks.folder.choose).toHaveBeenCalled();
+  });
+
+  it("names the workspace plainly for a viewer who can't choose", () => {
+    mocks.folder = folder({ root: "/repo", repository: "", canChoose: false });
+    mocks.source.mockReturnValue(source(changes()));
+    renderReview();
+    expect(screen.queryByTestId("changes-review-folder")).toBeNull();
+    expect(screen.getByTestId("changes-review-header")).toHaveTextContent("repo");
+  });
+
+  it("names files as the session does, inside the workspace", () => {
+    mocks.folder = folder();
+    mocks.source.mockReturnValue(source(changes()));
+    const { props } = renderReview({ revealPath: ".worktrees/feature/src/app.ts" });
+    const body = mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps;
+    expect(body.revealPath).toBe("src/app.ts");
+    const [view] = body.fileActions!({ path: "src/app.ts", change: "modified" } as never);
+    view!.run();
+    expect(props.onViewFile).toHaveBeenCalledWith(".worktrees/feature/src/app.ts");
+    // Copy Link and the other file commands resolve the path inside the worktree's folder.
+    expect(mocks.fileTargets.at(-1)).toEqual({ path: "src/app.ts", base: ".worktrees/feature" });
+  });
+
+  it("publishes its files as the session names them, so links land on the worktree's", () => {
+    mocks.folder = folder();
+    mocks.source.mockReturnValue(source(changes()));
+    renderReview();
+    const shown = shownReview("s1")!;
+    expect(reviewMembership(shown, ".worktrees/feature/src/app.ts")).toBe("included");
+    // The workspace's own file of the same name opens itself, not this review.
+    expect(reviewMembership(shown, "src/app.ts")).toBe("excluded");
+  });
+
+  it("names a selection's file as the session does for Add comment and Attach to agent", () => {
+    mocks.folder = folder();
+    mocks.source.mockReturnValue(source(changes()));
+    const onCommentOnFile = vi.fn();
+    renderReview({ onCommentOnFile });
+    const body = mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps;
+    expect(body.comments?.sessionPath?.("src/app.ts")).toBe(".worktrees/feature/src/app.ts");
+    body.comments!.onAddComment!(
+      "src/app.ts",
+      { start_index: 0, end_index: 3, anchor_content: "one" },
+      "one\n",
+    );
+    expect(onCommentOnFile).toHaveBeenCalledWith(
+      expect.objectContaining({ path: ".worktrees/feature/src/app.ts", start_index: 0 }),
+    );
+  });
+
+  it("keeps a worktree's comments and file opener across a parent's renders", () => {
+    mocks.folder = folder();
+    mocks.source.mockReturnValue(source(changes()));
+    const { props, rerender } = renderReview({
+      onCommentOnFile: vi.fn(),
+      onOpenFileInNewTab: vi.fn(),
+    });
+    const first = mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps;
+    rerender(<ChangesReview {...props} />);
+    const next = mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps;
+    expect(mocks.body.mock.calls.length).toBeGreaterThan(1);
+    expect(next.comments).toBe(first.comments);
+    expect(next.onOpenFileInNewTab).toBe(first.onOpenFileInNewTab);
+  });
+
+  it("gives its comparison commands the worktree's owner in this session's host and workspace", () => {
+    mocks.folder = folder();
+    const choosing: unknown[] = [];
+    mocks.source.mockImplementation(() => {
+      choosing.push(useChoosingComparisonOwner());
+      return source(changes());
+    });
+    renderReview();
+    // The folder of this session's host and workspace, not a same-named one elsewhere.
+    expect(choosing.at(-1)).toBe(workingCopyComparisonsAt(".worktrees/feature", "host_1\n/repo"));
+  });
+
+  it("asks nothing for a worktree outside the workspace, and offers the workspace instead", async () => {
+    mocks.folder = folder({ root: "/linked/other", repository: null });
+    renderReview();
+    expect(mocks.source).not.toHaveBeenCalled();
+    expect(screen.getByTestId("changes-review-message")).toHaveTextContent(
+      "other is outside the workspace. Diffs can show worktrees inside repo.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Show repo" }));
+    expect(mocks.folder.showWorkspace).toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Choose Folder…" }));
+    expect(mocks.folder.choose).toHaveBeenCalled();
   });
 });

@@ -14,6 +14,7 @@ import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import type { RefObject } from "react";
+import { REVEAL_DECORATION_SPEC } from "./TipTapRevealDecoration";
 import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
 
 export const searchDecorationKey = new PluginKey<DecorationSet>("searchDecoration");
@@ -146,9 +147,12 @@ function buildDecorations(
   if (matches.length === 0) return DecorationSet.empty;
   const current = ((state.currentIndex % matches.length) + matches.length) % matches.length;
   const decos = matches.map((m, i) =>
-    Decoration.inline(m.from, m.to, {
-      class: i === current ? "md-search-match md-search-match-current" : "md-search-match",
-    }),
+    Decoration.inline(
+      m.from,
+      m.to,
+      { class: i === current ? "md-search-match md-search-match-current" : "md-search-match" },
+      i === current ? REVEAL_DECORATION_SPEC : undefined,
+    ),
   );
   return DecorationSet.create(doc, decos);
 }

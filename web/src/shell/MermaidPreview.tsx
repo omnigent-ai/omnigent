@@ -5,7 +5,8 @@
 
 import { mermaid } from "@/components/ai-elements/mermaidPlugin";
 import { Streamdown } from "streamdown";
-import { MERMAID_STREAMDOWN_PROPS } from "@/components/ai-elements/MermaidBlock";
+import { useRef } from "react";
+import { MERMAID_STREAMDOWN_PROPS, useMermaidDrawn } from "@/components/ai-elements/MermaidBlock";
 import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "@/components/ai-elements/MermaidError";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -14,14 +15,16 @@ import { fenceForBody } from "./markdownFence";
 const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
 
 /** Render mermaid `source` (the diagram body, no fence) as an SVG diagram. */
-export function MermaidPreview({ source }: { source: string }) {
+export function MermaidPreview({ source, onDrawn }: { source: string; onDrawn?: () => void }) {
   const themeMode = useResolvedThemeMode();
+  const containerRef = useRef<HTMLDivElement>(null);
+  useMermaidDrawn(containerRef, onDrawn);
   const trimmed = source.replace(/\n$/, "");
   // Fence with more backticks than any run in the source, so a ``` line inside
   // the diagram can't close the wrapper early and spill out as plain markdown.
   const fence = fenceForBody(trimmed);
   return (
-    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
+    <div ref={containerRef} data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
       <MarkdownErrorBoundary source={source}>
         {/* Mermaid renders async with no cancellation. Remount on source or theme
             changes to discard a superseded in-flight render. */}

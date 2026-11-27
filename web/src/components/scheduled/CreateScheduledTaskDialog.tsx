@@ -270,6 +270,8 @@ export function CreateScheduledTaskDialog({
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const workflowsEnabled = isFeatureEnabled(info, "workflows");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
+  const newSandboxSubhourSupported =
+    info !== "loading" && info.scheduled_task_subhour_new_sandbox === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
   const triggerHeadersSupported =
     info !== "loading" && info.scheduled_task_trigger_headers === true;
@@ -1205,6 +1207,7 @@ export function CreateScheduledTaskDialog({
       sessionMode,
       subhourSupported,
       executionTarget,
+      newSandboxSubhourSupported,
     });
   }
   const scheduleInvalid = scheduleError !== null;
@@ -1281,6 +1284,7 @@ export function CreateScheduledTaskDialog({
       sessionMode,
       subhourSupported,
       executionTarget,
+      newSandboxSubhourSupported,
     }) === null
       ? defaultTriggerSchedule
       : HOURLY_SCHEDULE_MODEL;
@@ -1299,7 +1303,7 @@ export function CreateScheduledTaskDialog({
   const recurrenceValid =
     validateSchedule(
       { ...schedule, end: undefined },
-      { sessionMode, subhourSupported, executionTarget },
+      { sessionMode, subhourSupported, executionTarget, newSandboxSubhourSupported },
     ) === null;
   const endingInvalid =
     validateSchedule({ ...DEFAULT_SCHEDULE_MODEL, end: schedule.end }, { allowPastEnd }) !== null ||
@@ -1948,6 +1952,7 @@ export function CreateScheduledTaskDialog({
               sessionMode={sessionMode}
               executionTarget={executionTarget}
               subhourSupported={subhourSupported}
+              newSandboxSubhourSupported={newSandboxSubhourSupported}
               recurrenceUnsupported={scheduleUnsupported}
               allowPastEnd={allowPastEnd}
               onChange={setSchedule}

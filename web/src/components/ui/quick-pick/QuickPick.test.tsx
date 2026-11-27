@@ -964,3 +964,53 @@ describe("QuickPick content below the query field", () => {
     expect(below.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
+
+describe("QuickPick switcher presentation", () => {
+  it("hides its field but keeps the list's keys on it, and lists every row", () => {
+    const { input, onAccept } = renderPicker({ presentation: "switcher" });
+    expect(input).toHaveAttribute("readonly");
+    expect(input.closest(".sr-only")).not.toBeNull();
+    expect(input).toHaveFocus();
+    expect(optionNames()).toEqual(["New session⌘N", "Open settings"]);
+    expect(
+      screen.getByRole("listbox", { name: "Command palette" }).closest(".min-h-16"),
+    ).not.toBeNull();
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(activeOption(input)).toHaveTextContent("Open settings");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onAccept).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "open-settings" }),
+      expect.anything(),
+    );
+  });
+
+  it("leaves the default field visible and editable", () => {
+    const { input } = renderPicker();
+    expect(input).not.toHaveAttribute("readonly");
+    expect(input.closest(".sr-only")).toBeNull();
+  });
+});
+
+describe("QuickPick switcher header", () => {
+  it("shows no back button or end control, which would take focus where nothing shows", () => {
+    renderPicker({
+      presentation: "switcher",
+      onBack: vi.fn(),
+      backLabel: "Back",
+      inputEnd: <button type="button">Options</button>,
+    });
+    expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Options" })).toBeNull();
+  });
+
+  it("keeps both in the default presentation", () => {
+    renderPicker({
+      onBack: vi.fn(),
+      backLabel: "Back",
+      inputEnd: <button type="button">Options</button>,
+    });
+    expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Options" })).toBeTruthy();
+  });
+});

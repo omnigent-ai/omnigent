@@ -4,8 +4,10 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as BranchCommitsModule from "@/lib/branchCommits";
+import { ComparisonOwnerContext } from "@/hooks/useComparisonOwner";
 import { BRANCH_RANGE, fetchBranchCommits } from "@/lib/branchCommits";
 import { commitRevisions, type RevisionSpec } from "@/lib/customComparison";
+import type { WorkingCopyComparisonOwner } from "@/lib/workingCopyComparisonOwner";
 
 import { useBranchCommits } from "./useBranchCommits";
 
@@ -24,26 +26,40 @@ const TYPED = { base: "v1", head: "feature" };
 
 afterEach(() => vi.mocked(fetchBranchCommits).mockClear());
 
+interface CommitsProps {
+  custom: RevisionSpec | null;
+  sessionId?: string;
+  workspace?: typeof WORKSPACE;
+}
+
+/** An owner that only names the folder its review shows, which is all the hook reads. */
+const folderOwner = (repository: string) =>
+  ({ repository, workspaceKey: "host_1\n/repo" }) as WorkingCopyComparisonOwner;
+
+/** The repository folder the review shows; set it before a rerender to move the review. */
+let reviewedFolder = "";
+
+afterEach(() => {
+  reviewedFolder = "";
+});
+
 function renderCommits(initialCustom: RevisionSpec | null) {
   const client = new QueryClient();
   return renderHook(
-    ({
-      custom,
-      sessionId = "s1",
-      workspace = WORKSPACE,
-    }: {
-      custom: RevisionSpec | null;
-      sessionId?: string;
-      workspace?: typeof WORKSPACE;
-    }) => useBranchCommits(sessionId, workspace, custom, { enabled: true, shown: true }),
+    ({ custom, sessionId = "s1", workspace = WORKSPACE }: CommitsProps) =>
+      useBranchCommits(sessionId, workspace, custom, { enabled: true, shown: true }),
     {
-      initialProps: { custom: initialCustom } as {
-        custom: RevisionSpec | null;
-        sessionId?: string;
-        workspace?: typeof WORKSPACE;
-      },
+      initialProps: { custom: initialCustom } as CommitsProps,
       wrapper: ({ children }: { children: ReactNode }) =>
-        createElement(QueryClientProvider, { client }, children),
+        createElement(
+          QueryClientProvider,
+          { client },
+          createElement(
+            ComparisonOwnerContext.Provider,
+            { value: reviewedFolder ? folderOwner(reviewedFolder) : null },
+            children,
+          ),
+        ),
     },
   );
 }
@@ -75,5 +91,18 @@ describe("useBranchCommits", () => {
     rerender({ custom: commitRevisions("a".repeat(40)), ...next });
 
     await waitFor(() => expect(ranges()).toEqual([TYPED, BRANCH_RANGE]));
+  });
+
+  it("lists the branch, not the last range, for one commit in another repository folder", async () => {
+    reviewedFolder = ".worktrees/feature";
+    const { rerender } = renderCommits(TYPED);
+    await waitFor(() => expect(ranges()).toEqual([TYPED]));
+    expect(vi.mocked(fetchBranchCommits).mock.calls[0][3]).toBe(".worktrees/feature");
+
+    reviewedFolder = ".worktrees/other";
+    rerender({ custom: commitRevisions("a".repeat(40)) });
+
+    await waitFor(() => expect(ranges()).toEqual([TYPED, BRANCH_RANGE]));
+    expect(vi.mocked(fetchBranchCommits).mock.calls[1][3]).toBe(".worktrees/other");
   });
 });

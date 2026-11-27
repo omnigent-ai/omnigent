@@ -4210,6 +4210,9 @@ class ClaudeSDKExecutor(Executor):
         # ``disableClaudeAiConnectors`` opt-out and would still auto-fetch the
         # account's connectors; carry the opt-out in the launch settings.
         hermetic = resolved.setting_sources == []
+        if hermetic:
+            # Claude Code builds older than that setting honor only this knob.
+            env[_CLAUDE_CODE_ENABLE_CLAUDEAI_MCP_ENV] = "false"
         from omnigent.mcp_disabled_servers import apply_claude_settings
 
         settings_payload = apply_claude_settings(
@@ -4220,11 +4223,15 @@ class ClaudeSDKExecutor(Executor):
             ),
             executor="claude-sdk",
             active_harnesses=self._mcp_active_harnesses,
+            cwd=self._cwd,
+            # The SDK starts the CLI with this process's environment plus *env*.
+            env={**os.environ, **env},
+            setting_sources=(
+                resolved.setting_sources
+                if resolved.setting_sources is not None
+                else ("user", "project")
+            ),
         )
-        if hermetic:
-            # Claude Code builds older than that setting honor only this knob.
-            env[_CLAUDE_CODE_ENABLE_CLAUDEAI_MCP_ENV] = "false"
-
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
 

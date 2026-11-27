@@ -13,7 +13,8 @@ import asyncio
 import re
 import secrets
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +52,11 @@ from omnigent.server.pull_request_viewers import (
     review_comments_for_viewer,
     review_threads_for_viewer,
 )
+from omnigent.server.read_only_code_hosts import (
+    READ_ONLY_CODE_HOST_MESSAGE,
+    READ_ONLY_CODE_HOST_REASON,
+    refuses_change,
+)
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 # Each reply must arrive within this; a whole ReadFile can take longer.
@@ -62,6 +68,12 @@ _WRITE_REPLY_TIMEOUT_S = 20.0
 # An upload's answer may take as long as REST's attachment route waits for it.
 _UPLOAD_REPLY_TIMEOUT_S = 120.0
 _UPLOAD_METHOD = "UploadAttachment"
+# An auto-merge batch reads and changes each of its pull requests in turn.
+_AUTO_MERGE_REPLY_TIMEOUT_S = 120.0
+_AUTO_MERGE_METHOD = "EnableAutoMerge"
+# An image's first reply follows the account lookup (15 s), the token read (15 s),
+# the wait for a read slot (10 s) and the whole fetch (30 s).
+_IMAGE_REPLY_TIMEOUT_S = 75.0
 # The pull request methods that answer with its overview, which lists the session's PRs.
 _OVERVIEW_METHODS = frozenset({"GetPullRequest", "SetPullRequestAccount"})
 _COMMENT_WRITES = frozenset({"CreateComment", "CreateReviewThread", "ReplyToReviewThread"})
@@ -84,9 +96,21 @@ _REVIEW_WRITES = frozenset(
         "RemoveReaction",
     }
 )
+# Changes that stay on the session's host, such as which account it uses.
+_HOST_ONLY_CHANGES = frozenset({"SetPullRequestAccount"})
 # The refusal reasons a client may read; any other reason a host sends is dropped.
 PULL_REQUEST_FAILURE_REASONS = frozenset(
-    {"comment_changed", "pull_request_changed", "invalid_input"}
+    {
+        "comment_changed",
+        "pull_request_changed",
+        "invalid_input",
+        READ_ONLY_CODE_HOST_REASON,
+        # Why an image can't be shown, so a client can tell "not allowed" from "try again".
+        "host_not_allowed",
+        "too_large",
+        "not_image",
+        "fetch_failed",
+    }
 )
 # The reads whose answer the server shapes for who reads it: the host account's rights.
 _VIEWER_SHAPES: dict[str, Callable[[dict[str, Any], PullRequestViewer], dict[str, Any]]] = {
@@ -125,12 +149,15 @@ class PullRequestRoute:
         call was sent.
     :param viewer: Who reads; anyone but the owner gets the thread reads without the
         host account's rights. The least trusted by default.
+    :param read_only_code_hosts: Host patterns whose pull requests the server serves
+        read-only; a change to one is refused before the host.
     """
 
     session_id: str
     vouch: Callable[[str], Awaitable[PullRequestVouch | None]]
     overview: Callable[[dict[str, Any], float], Awaitable[dict[str, Any]]]
     viewer: PullRequestViewer = PullRequestViewer.VIEWER
+    read_only_code_hosts: tuple[str, ...] = ()
 
 
 class HostWorkspaceService(WorkspaceServiceMethods):
@@ -191,8 +218,10 @@ class HostWorkspaceService(WorkspaceServiceMethods):
             return False
         return self._callable_methods is None or name in self._callable_methods
 
-    async def _pull_request_call(self, method: WorkspaceMethod, request: Message) -> Message:
-        """Forward a pull request call with the session and the server's vouch."""
+    async def _pull_request_vouch(
+        self, method: WorkspaceMethod, request: Message
+    ) -> tuple[PullRequestRoute, PullRequestVouch | None]:
+        """Check a pull request call's fields, then the server's vouch for every PR it names."""
         route = self._pull_requests
         if route is None:
             raise ConnectError(Code.UNIMPLEMENTED, "Pull requests aren't served on this route")
@@ -201,9 +230,40 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         except PullRequestRefused as exc:
             raise ConnectError(exc.code, exc.message, details=failure_details(exc.reason)) from exc
         # The vouch comes from the PRs the server stores, never from the request message.
-        vouch = await route.vouch(getattr(request, "pr_url", ""))
+        return route, await _vouch(route, request)
+
+    async def _pull_request_stream(
+        self, method: WorkspaceMethod, request: Message
+    ) -> AsyncGenerator[bytes, None]:
+        """Forward a streamed pull request read with the session and the server's vouch."""
+        route, vouch = await self._pull_request_vouch(method, request)
+        forwarded = self._forward(
+            method.name,
+            request,
+            session_id=route.session_id,
+            vouch=vouch,
+            timeout=_IMAGE_REPLY_TIMEOUT_S,
+        )
+        # A caller that goes away ends the call here, not when the generator is collected.
+        async with aclosing(forwarded) as messages:
+            async for message in messages:
+                yield message
+
+    async def _pull_request_call(self, method: WorkspaceMethod, request: Message) -> Message:
+        """Forward a pull request call with the session and the server's vouch."""
+        route, vouch = await self._pull_request_vouch(method, request)
         sent_at = time.time()
         changes = not method.no_side_effects
+        writes = changes and method.name not in _HOST_ONLY_CHANGES
+        targets = _change_targets(request, vouch)
+        if writes and any(
+            refuses_change(target, route.read_only_code_hosts) for target in targets
+        ):
+            raise ConnectError(
+                Code.FAILED_PRECONDITION,
+                READ_ONLY_CODE_HOST_MESSAGE,
+                details=failure_details(READ_ONLY_CODE_HOST_REASON),
+            )
         shape = _VIEWER_SHAPES.get(method.name)
         owner = route.viewer is PullRequestViewer.OWNER
         message = await self._unary(
@@ -267,7 +327,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         account_rights: bool = False,
         unconfirmed: str | None = None,
         timeout: float = _REPLY_TIMEOUT_S,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes, None]:
         """Send one call to the host and yield its serialized responses.
 
         :param session_id: The authorized session, sent on pull request calls only.
@@ -339,8 +399,14 @@ def _host_forwarder(method: WorkspaceMethod) -> Callable[..., object]:
             self: HostWorkspaceService, request: Message, _ctx: RequestContext
         ) -> AsyncIterator[Message]:
             self._check_served(method)
-            async for message in self._forward(method.name, request):
-                yield method.response_type.FromString(message)
+            messages = (
+                self._pull_request_stream(method, request)
+                if method.pull_request
+                else self._forward(method.name, request)
+            )
+            async with aclosing(messages) as replies:
+                async for message in replies:
+                    yield method.response_type.FromString(message)
 
         forward_stream.__name__ = method.python_name
         return forward_stream
@@ -362,10 +428,40 @@ for _method in WORKSPACE_METHODS.values():
         setattr(HostWorkspaceService, _method.python_name, _host_forwarder(_method))
 
 
+async def _vouch(route: PullRequestRoute, request: Message) -> PullRequestVouch | None:
+    """The server's vouch for every pull request a call names.
+
+    A batch names several in ``pull_requests``; each must be one the session links. A
+    vouch makes the host serve any pull request, so it is given only when every one was
+    checked; otherwise the host's own record decides for all of them.
+    """
+    items = getattr(request, "pull_requests", None)
+    if items is None:
+        return await route.vouch(getattr(request, "pr_url", ""))
+    vouches = [await route.vouch(item.pr_url) for item in items]
+    if not vouches or any(vouch is None or not vouch.server_tracked for vouch in vouches):
+        return None
+    return PullRequestVouch(server_tracked=True)
+
+
+def _change_targets(request: Message, vouch: PullRequestVouch | None) -> list[str | None]:
+    """The pull requests a change acts on.
+
+    Each one a batch names; otherwise the one the call names, or else the server's first,
+    which the host would change.
+    """
+    items = getattr(request, "pull_requests", None)
+    if items is not None:
+        return [item.pr_url or None for item in items] or [None]
+    return [getattr(request, "pr_url", "") or (vouch.default_pr_url if vouch else None)]
+
+
 def _reply_timeout(method: str, *, changes: bool) -> float:
     """How long each reply of a pull request call may take."""
     if method == _UPLOAD_METHOD:
         return _UPLOAD_REPLY_TIMEOUT_S
+    if method == _AUTO_MERGE_METHOD:
+        return _AUTO_MERGE_REPLY_TIMEOUT_S
     return _WRITE_REPLY_TIMEOUT_S if changes else _REPLY_TIMEOUT_S
 
 
@@ -374,6 +470,11 @@ def _unconfirmed_change(method: str) -> str:
     if method == _UPLOAD_METHOD:
         # GitHub keeps an unlinked file and nothing else, so attaching again is safe.
         return "Could not confirm the upload. Try attaching the file again."
+    if method == _AUTO_MERGE_METHOD:
+        return (
+            "Could not confirm which pull requests will merge automatically. "
+            "Check GitHub before retrying."
+        )
     if method in _COMMENT_WRITES:
         return "Could not confirm comment posting. Check GitHub before retrying."
     if method in _REVIEW_WRITES:

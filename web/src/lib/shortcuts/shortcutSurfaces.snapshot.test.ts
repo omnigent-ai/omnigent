@@ -7,10 +7,12 @@ import { describe, expect, it } from "vitest";
 import type { Chord, KeyChordInput } from "@/lib/shortcuts/chord";
 import {
   activeShortcutChords,
+  APP_SHORTCUT_BINDINGS,
   codeMirrorKeys,
   matchesShortcut,
-  SHORTCUT_BINDINGS,
+  menuShortcutChords,
   type ShortcutEnvironment,
+  type ShortcutPageContext,
   type ShortcutId,
   shortcutAriaKeys,
   shortcutBinding,
@@ -22,10 +24,31 @@ import { rowsForChord, searchableChords } from "@/pages/settings/search/chordQue
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
     [true, false].flatMap((desktopMenu) =>
-      [true, false].map((submitWithModEnter) => ({ mac, native, desktopMenu, submitWithModEnter })),
+      // Without the Go menu; "a shell that routes Go" below covers what it moves.
+      [true, false].map((submitWithModEnter) => ({
+        mac,
+        native,
+        desktopMenu,
+        goMenu: false,
+        submitWithModEnter,
+      })),
     ),
   ),
 );
+
+const EVERYTHING_SUPPORTED: ShortcutPageContext = {
+  native: true,
+  electron: true,
+  browser: true,
+  submitWithModEnter: false,
+  preventsKeyboardSubmit: false,
+  contentSearch: true,
+  grids: true,
+  splitTerminal: true,
+  siblingSessions: true,
+  desktopCommands: true,
+  alwaysSteer: false,
+};
 
 const environmentName = ({ mac, native, desktopMenu, submitWithModEnter }: ShortcutEnvironment) =>
   [
@@ -35,7 +58,7 @@ const environmentName = ({ mac, native, desktopMenu, submitWithModEnter }: Short
     submitWithModEnter ? "mod-enter-sends" : "enter-sends",
   ].join(" ");
 
-const IDS: ShortcutId[] = [...SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS].map(
+const IDS: ShortcutId[] = [...APP_SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS].map(
   (binding) => binding.id,
 );
 
@@ -85,8 +108,11 @@ function surfaceLine(id: ShortcutId, environment: ShortcutEnvironment): string {
 
 /** What a typed chord finds in Settings search, for each listed binding's searchable chords. */
 function searchLine(id: ShortcutId, environment: ShortcutEnvironment, listed: Set<ShortcutId>) {
-  const found = searchableChords(id, environment).map((chord) =>
-    [...rowsForChord(pressFor(chord, environment.mac), environment, listed)].toSorted().join(","),
+  const found = searchableChords(id, environment).map(
+    (chord) =>
+      [...rowsForChord(pressFor(chord, environment.mac), environment, listed)]
+        .toSorted()
+        .join(",") || "-",
   );
   return `${id} | search=${found.join(" ") || "-"}`;
 }
@@ -97,12 +123,36 @@ describe("shortcut surfaces", () => {
   });
 
   it("read as recorded in every environment", async () => {
-    const listed = new Set<ShortcutId>(SHORTCUT_BINDINGS.map((binding) => binding.id));
+    // Every row the page can list somewhere: all it reads but those it never lists.
+    const listed = new Set<ShortcutId>(
+      APP_SHORTCUT_BINDINGS.filter(
+        (binding) => binding.shownWhen?.(EVERYTHING_SUPPORTED) ?? true,
+      ).map((binding) => binding.id),
+    );
     const lines = ENVIRONMENTS.flatMap((environment) => [
       `# ${environmentName(environment)}`,
       ...IDS.map((id) => surfaceLine(id, environment)),
-      ...SHORTCUT_BINDINGS.map(({ id }) => searchLine(id, environment, listed)),
+      ...APP_SHORTCUT_BINDINGS.map(({ id }) => searchLine(id, environment, listed)),
     ]);
     await expect(`${lines.join("\n")}\n`).toMatchFileSnapshot("./shortcutSurfaces.golden.txt");
+  });
+
+  it("move only Back and Forward to a shell that routes Go, which then owns their chords", () => {
+    const listed = new Set<ShortcutId>(APP_SHORTCUT_BINDINGS.map((binding) => binding.id));
+    for (const environment of ENVIRONMENTS.filter(({ desktopMenu }) => desktopMenu)) {
+      const goMenu = { ...environment, goMenu: true };
+      const changed = IDS.filter(
+        (id) =>
+          surfaceLine(id, environment) !== surfaceLine(id, goMenu) ||
+          (listed.has(id) &&
+            searchLine(id, environment, listed) !== searchLine(id, goMenu, listed)),
+      );
+      expect(changed, environmentName(environment)).toEqual(["history.back", "history.forward"]);
+      for (const id of changed) {
+        // The menu's accelerator takes the chord, so the page neither matches nor shows it.
+        expect(activeShortcutChords(id, goMenu)).toEqual([]);
+        expect(menuShortcutChords(id, goMenu)).toHaveLength(1);
+      }
+    }
   });
 });

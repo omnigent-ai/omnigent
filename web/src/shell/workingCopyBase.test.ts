@@ -1,7 +1,28 @@
-import { describe, expect, it } from "vitest";
+import { renderHook } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import type { WorkingCopyBaseCommand } from "@/lib/workingCopyBaseCommands";
-import { LAST_COMMIT_BASE, workingCopyBase, workingCopyBaseMenu } from "./workingCopyBase";
+
+const review = vi.hoisted(() => ({
+  root: "/repo",
+  repository: "",
+  worktrees: [] as { path: string; branch: string | null; detached: boolean }[],
+}));
+vi.mock("./FileViewerContext", () => ({ useWorkspacePaths: () => ({ root: review.root }) }));
+vi.mock("./fileCommands/target", () => ({ useSessionHostId: () => "host_1" }));
+vi.mock("@/hooks/useComparisonOwner", () => ({
+  useComparisonRepository: () => review.repository,
+}));
+vi.mock("@/hooks/useSessionWorktrees", () => ({
+  useSessionWorktrees: () => ({ data: { status: "ok", worktrees: review.worktrees } }),
+}));
+
+import {
+  LAST_COMMIT_BASE,
+  useWorkingCopyBase,
+  workingCopyBase,
+  workingCopyBaseMenu,
+} from "./workingCopyBase";
 
 function worktree(path: string, branch: string | null): HostWorktree {
   return { path, branch, detached: branch === null } as HostWorktree;
@@ -35,6 +56,18 @@ describe("workingCopyBase", () => {
     expect(
       workingCopyBase({ status: "ok", worktrees: [worktree("/repo", "main")] }, null),
     ).toBeNull();
+  });
+});
+
+describe("useWorkingCopyBase", () => {
+  it("names the branch of the worktree a folder's review shows, on a Windows host too", () => {
+    review.root = "C:\\";
+    review.repository = "project";
+    review.worktrees = [worktree("C:/", "main"), worktree("C:/project", "feature")];
+    const { result } = renderHook(() => useWorkingCopyBase("conv_base"));
+    expect(result.current?.description).toBe(
+      "Uncommitted and untracked changes compared with the last commit on feature.",
+    );
   });
 });
 

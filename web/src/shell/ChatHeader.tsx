@@ -172,6 +172,8 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** The URL-owned workspace can lag a warm header switch. */
+  workspaceConversationId?: string | null;
   workingDirectory?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
@@ -372,6 +374,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  workspaceConversationId = conversationId,
   workingDirectory,
   permissionLevel,
   actionConversation = null,
@@ -403,7 +406,7 @@ export function ChatHeader({
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
   // Floating panes give the switch to the chat pane's own strip.
-  const viewToggleHost = useChatPaneViewToggleHost(conversationId);
+  const viewToggleHost = useChatPaneViewToggleHost(workspaceConversationId ?? undefined);
   const info = useServerInfo();
   const overrides = activeUiFeatureOverrides(info);
   const overrideNames = overrides.map(({ label, value }) => `${label} ${value ? "On" : "Off"}`);

@@ -1991,6 +1991,30 @@ def _resolve_session_provider_entry(
         return None
 
 
+def _resolve_session_pricing_context(conv: Any) -> tuple[str | None, Any | None]:
+    """Prefer a session's saved inference binding, with legacy pricing as fallback."""
+    snapshot = getattr(conv, "inference_snapshot", None)
+    if snapshot is not None:
+        try:
+            from omnigent.inference_config import resolve_bound_provider
+
+            harness = snapshot["harness"]
+            provider = resolve_bound_provider(
+                snapshot["runtime_config"], harness, allow_empty=True
+            )
+            if provider is not None:
+                return harness, provider
+        except Exception:  # noqa: BLE001 — a saved configuration must not break accounting
+            warn_key = f"snapshot-lookup-error:{getattr(conv, 'agent_id', None)}"
+            if warn_key not in _WARNED_PRICING_LOOKUPS:
+                _WARNED_PRICING_LOOKUPS.add(warn_key)
+                _logger.warning(
+                    "saved inference provider lookup failed for session %s; using legacy pricing",
+                    getattr(conv, "id", None),
+                )
+    return _resolve_harness(conv) if conv else None, _resolve_session_provider_entry(conv)
+
+
 def _sane_relay_token_count(value: object) -> int:
     """
     Coerce a runner-reported token count to a trusted non-negative int.
@@ -2121,14 +2145,8 @@ def _accumulate_session_usage(
             )
             from omnigent.onboarding.provider_config import load_config
 
-            # Load provider config to check for custom pricing
-            provider_config = load_config()
-            # Resolve harness from conversation (agent spec + overrides)
-            harness = _resolve_harness(conv) if conv else None
-            # Resolve the actual provider the session was launched with so
-            # sessions on a non-default named provider are priced at their
-            # configured rate rather than the harness default's rate.
-            provider_entry = _resolve_session_provider_entry(conv)
+            harness, provider_entry = _resolve_session_pricing_context(conv)
+            provider_config = load_config() if provider_entry is None else None
             pricing = fetch_model_pricing_with_provider(
                 llm_model,
                 provider_config=provider_config,
@@ -2442,13 +2460,8 @@ def _persist_native_cumulative_usage(
             )
             from omnigent.onboarding.provider_config import load_config
 
-            # Load provider config to check for custom pricing
-            provider_config = load_config()
-            # Resolve harness from conversation (agent spec + overrides)
-            harness = _resolve_harness(conv) if conv else None
-            # Resolve the actual named provider so non-default sessions are
-            # priced at their configured rate, not the harness default's rate.
-            provider_entry = _resolve_session_provider_entry(conv)
+            harness, provider_entry = _resolve_session_pricing_context(conv)
+            provider_config = load_config() if provider_entry is None else None
             pricing = fetch_model_pricing_with_provider(
                 model_name,
                 provider_config=provider_config,

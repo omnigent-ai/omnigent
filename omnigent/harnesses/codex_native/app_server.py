@@ -28,7 +28,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias, cast
+from typing import TYPE_CHECKING, NoReturn, TypeAlias, cast
 
 import tomlkit
 import websockets
@@ -2621,6 +2621,56 @@ class CodexNativeAppServer:
     certificate_failure: CertificateFailure | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
 
+    def _mcp_launch_context(self) -> tuple[Sequence[str], Path]:
+        """Resolve only supported strict-mode commands before inspecting CLI config."""
+        from omnigent.config import global_config_path
+        from omnigent.host.harness_startup import (
+            env_wrapper_chdir,
+            env_wrapper_command,
+            env_wrapper_environment,
+        )
+        from omnigent.mcp_disabled_servers import McpStrictModeError
+        from omnigent.mcp_inheritance import resolve_mcp_inheritance
+
+        configured = self.app_server_command or (self.codex_path,)
+        executable = configured[0]
+        args = list(configured[1:])
+        cwd = self.cwd
+        if resolve_mcp_inheritance("codex-native").inherit:
+            return tuple(args), cwd
+
+        def refuse() -> NoReturn:
+            raise McpStrictModeError(
+                "codex-native",
+                global_config_path(),
+                "unresolved app-server launch context",
+                problem=(
+                    "strict MCP discovery requires Codex directly or a supported env wrapper "
+                    "that preserves the session's private CODEX_HOME"
+                ),
+            )
+
+        if Path(executable).name == "env":
+            env = {**self.env, "CODEX_HOME": str(self.codex_home)}
+            wrapper = env_wrapper_environment(executable, args, env)
+            command = env_wrapper_command(executable, args, env)
+            if wrapper is None or command is None:
+                refuse()
+            changed = env_wrapper_chdir(executable, args, env)
+            if changed is not None:
+                cwd = (cwd / changed).resolve()
+            effective = dict(env) if wrapper.inherit else {}
+            for name in wrapper.unset:
+                effective.pop(name, None)
+            effective.update(wrapper.variables)
+            home = effective.get("CODEX_HOME")
+            if not home or (cwd / home).resolve() != self.codex_home.resolve():
+                refuse()
+            executable, args = command
+        if Path(executable).name != "codex" and executable != self.codex_path:
+            refuse()
+        return tuple(args), codex_workspace_roots(args, cwd)[0]
+
     async def _spawn_app_server_process(self, resolved_listen: str) -> None:
         """
         Spawn one app-server attempt, for the initial launch or a silent-start respawn.
@@ -2860,12 +2910,14 @@ class CodexNativeAppServer:
             plan_codex_launch,
         )
 
+        mcp_launch_args, mcp_launch_cwd = self._mcp_launch_context()
         mcp_plan = plan_codex_launch(
             self.config_overrides,
             executor="codex-native",
             active_harnesses=self.active_harnesses,
             codex_home=self.codex_home,
-            cwd=self.cwd,
+            cwd=mcp_launch_cwd,
+            launch_args=mcp_launch_args,
         )
         self.config_overrides = list(mcp_plan.config_overrides)
         await self._spawn_app_server_process(resolved_listen)

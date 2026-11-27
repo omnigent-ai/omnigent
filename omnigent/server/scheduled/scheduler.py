@@ -256,9 +256,7 @@ class ScheduledTaskScheduler:
         """
         if task.kind == "timer":
             return
-        trigger = validate_rrule(
-            task.rrule, session_mode=task.session_mode, execution_target=task.execution_target
-        )
+        trigger = validate_rrule(task.rrule)
         self.remove(task.id)  # replace_existing semantics
         job = _Job(
             task_id=task.id,

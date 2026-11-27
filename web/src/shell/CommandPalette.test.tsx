@@ -318,7 +318,8 @@ describe("CommandPalette — sessions", () => {
     ]);
     const { onOpenChange } = renderPalette({ sessionsOnly: true });
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "fxprs" } });
-    expect(screen.getByText("Fix the parser")).toBeTruthy();
+    // By name: a palette that marks each fuzzy-matched letter splits the label's text.
+    expect(screen.getByRole("option", { name: /Fix the parser/ })).toBeTruthy();
     expect(screen.queryByText("Deploy API")).toBeNull();
     expect(screen.queryByText("Unrelated")).toBeNull();
     expect(screen.queryByText("Go to Inbox")).toBeNull();
@@ -692,6 +693,53 @@ describe("CommandPalette — match preview", () => {
   });
 });
 
+describe("CommandPalette — focus as it closes", () => {
+  /** A palette ⌘K opens from a terminal's input, with no trigger button, as the app does. */
+  function ShortcutOpenedPalette() {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <textarea
+          aria-label="Terminal input"
+          onKeyDown={(event) => {
+            if (event.metaKey && event.key === "k") setOpen(true);
+          }}
+        />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  async function openFromTerminal() {
+    render(<ShortcutOpenedPalette />, { wrapper: withQueryClient() });
+    const terminal = screen.getByRole("textbox", { name: "Terminal input" });
+    terminal.focus();
+    fireEvent.keyDown(terminal, { key: "k", metaKey: true });
+    const input = await screen.findByTestId("command-palette-input");
+    await vi.waitFor(() => expect(input).toHaveFocus());
+    return { terminal, input };
+  }
+
+  it("gives the keyboard back to the field it opened from on Escape", async () => {
+    const { terminal, input } = await openFromTerminal();
+    fireEvent.keyDown(input, { key: "Escape" });
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await vi.waitFor(() => expect(terminal).toHaveFocus());
+  });
+
+  it("gives it back after running a command that leaves focus alone", async () => {
+    const { terminal } = await openFromTerminal();
+    fireEvent.click(await screen.findByRole("option", { name: /Toggle conversations sidebar/ }));
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await vi.waitFor(() => expect(terminal).toHaveFocus());
+  });
+});
+
 describe("CommandPalette — input", () => {
   it("uses the sessions-first placeholder", () => {
     renderPalette();
@@ -936,6 +984,37 @@ describe("CommandPalette — title and content groups", () => {
 
     fireEvent.keyDown(input, { key: "Enter" });
     expect(navigate).toHaveBeenCalledWith("/c/second");
+  });
+
+  it("steps the rows with Ctrl-N and Ctrl-P as the arrows do, leaving Ctrl+J alone", () => {
+    setSessions([conv("c1", "Fix the parser"), conv("c2", "Deploy API"), conv("c3", "Ship it")]);
+    render(
+      <CommandPalette
+        open
+        onOpenChange={vi.fn()}
+        onToggleLeftSidebar={vi.fn()}
+        onToggleRightSidebar={vi.fn()}
+      />,
+      { wrapper: withQueryClient() },
+    );
+    const input = screen.getByTestId("command-palette-input");
+    input.focus();
+    const selected = () => screen.getByRole("option", { selected: true }).textContent;
+    expect(selected()).toContain("Fix the parser");
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    expect(selected()).toContain("Deploy API");
+    // The arrows and Ctrl-N/Ctrl-P walk the same selection.
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(selected()).toContain("Fix the parser");
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "p", code: "KeyP", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "j", code: "KeyJ", ctrlKey: true });
+    // Neither key types into the field or takes focus from it.
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c2");
   });
 
   it("selects the top row again when the palette reopens", () => {
@@ -1493,4 +1572,86 @@ describe("CommandPalette — commands a mounted feature offers", () => {
       expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
     },
   );
+});
+
+// Either palette's dialog content.
+const PALETTE_CONTENT = "[data-command-palette], [data-quick-pick-dialog]";
+
+/**
+ * Gives the palette's content an enter animation while open and an exit one once closing, so
+ * Radix keeps it mounted until the exit ends, as in the app.
+ */
+function stubExitAnimation() {
+  let animationName = "enter";
+  const computedStyle = window.getComputedStyle.bind(window);
+  const styleSpy = vi.spyOn(window, "getComputedStyle").mockImplementation((element) => {
+    const style = computedStyle(element);
+    if (!(element instanceof HTMLElement) || !element.matches(PALETTE_CONTENT)) return style;
+    return new Proxy(style, {
+      get: (target, property) =>
+        property === "animationName" ? animationName : Reflect.get(target, property),
+    });
+  });
+  onTestFinished(() => styleSpy.mockRestore());
+  return {
+    exitNext: () => {
+      animationName = "exit";
+    },
+    stop: () => {
+      animationName = "none";
+      styleSpy.mockRestore();
+    },
+  };
+}
+
+describe("CommandPalette reopened during its exit animation", () => {
+  let setOpen: (open: boolean) => void = () => undefined;
+  function Opener() {
+    const [open, setOpenState] = useState(false);
+    setOpen = setOpenState;
+    return (
+      <>
+        <textarea aria-label="Editor" />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpenState}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  it("focuses its search field again after a row click left focus on the list", async () => {
+    const animation = stubExitAnimation();
+    render(<Opener />, { wrapper: withQueryClient() });
+    const editor = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "Editor" });
+    editor.focus();
+    act(() => setOpen(true));
+    await vi.waitFor(() => expect(screen.getByTestId("command-palette-input")).toHaveFocus());
+    animation.exitNext();
+    // Clicking a row focuses the list, and the row's command closes the palette.
+    act(() => screen.getByRole("listbox").focus());
+    act(() => setOpen(false));
+    expect(document.querySelector(PALETTE_CONTENT)).not.toBeNull();
+
+    // ⌘K again while it animates out.
+    act(() => setOpen(true));
+    const input = screen.getByTestId("command-palette-input");
+    await vi.waitFor(() => expect(input).toHaveFocus());
+    // The replaced content's late close doesn't pull focus back to the editor.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(input).toHaveFocus();
+    fireEvent.change(input, { target: { value: "settings" } });
+    expect(input).toHaveValue("settings");
+
+    // Cancelling still returns focus to where the user was before the first opening.
+    animation.stop();
+    fireEvent.keyDown(input, { key: "Escape" });
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // Radix returns focus just after the content unmounts.
+    await vi.waitFor(() => expect(editor).toHaveFocus());
+  });
 });

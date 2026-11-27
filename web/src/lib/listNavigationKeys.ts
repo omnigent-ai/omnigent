@@ -108,10 +108,29 @@ export function translateReadlineStepInList(
   const row = listRow(event.target);
   if (!row || row.closest(LIST_SELECTOR) !== event.currentTarget) return;
   event.preventDefault();
+  dispatchArrowFor(step, row);
+}
+
+function dispatchArrowFor(step: ListStep, target: EventTarget): void {
   const key = step === "next" ? "ArrowDown" : "ArrowUp";
-  row.dispatchEvent(
+  target.dispatchEvent(
     new KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true }),
   );
+}
+
+/**
+ * For a list whose own Ctrl-N/Ctrl-P handling is off, such as cmdk without vim bindings:
+ * re-sends the step to `event.target` as the arrow the list already handles. Returns
+ * whether it did.
+ */
+export function readlineStepAsArrow(
+  event: ListKeyEvent & { target: EventTarget | null; preventDefault: () => void },
+): boolean {
+  const step = readlineListStep(event);
+  if (step === null || event.target === null) return false;
+  event.preventDefault();
+  dispatchArrowFor(step, event.target);
+  return true;
 }
 
 type TranslatableKeyEvent = Parameters<typeof translateReadlineStepInList>[0];

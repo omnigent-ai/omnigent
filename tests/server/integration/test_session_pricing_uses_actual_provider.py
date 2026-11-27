@@ -17,6 +17,7 @@ cheaper DEFAULT rate.
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
@@ -166,6 +167,94 @@ async def test_named_provider_session_priced_at_named_rate_not_default(
     assert cost == pytest.approx(_EXPECTED_NAMED_COST), (
         f"expected named-provider cost {_EXPECTED_NAMED_COST}, got {cost}. usage={usage}"
     )
+
+
+@pytest.mark.parametrize("usage_path", ["relay", "native"])
+@pytest.mark.parametrize("saved_harness", ["claude-sdk", "codex-native"])
+@pytest.mark.parametrize("snapshot_state", ["saved", "unbound", "legacy", "malformed"])
+def test_accounting_uses_saved_inference_provider_and_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    usage_path: str,
+    saved_harness: str,
+    snapshot_state: str,
+) -> None:
+    """A saved binding survives bundle changes; sessions without one keep legacy pricing."""
+    from types import SimpleNamespace
+
+    from omnigent.onboarding.provider_config import load_providers
+    from omnigent.server.routes._sessions import orchestration
+
+    config = copy.deepcopy(_PROVIDER_CONFIG)
+    for name, rates in (("cheap-default", (4.0, 8.0)), ("expensive-named", (40.0, 80.0))):
+        config["providers"][name]["openai"] = {
+            "base_url": "https://provider.example/v1",
+            "api_key": "test-key",
+            "pricing": {"input_per_million": rates[0], "output_per_million": rates[1]},
+        }
+    runtime_config = copy.deepcopy(config)
+    runtime_config["inference"] = {
+        "harnesses": {saved_harness: {"provider": "expensive-named"}}
+        if snapshot_state == "saved"
+        else {}
+    }
+    snapshot = {"harness": saved_harness, "runtime_config": runtime_config}
+    if snapshot_state == "malformed":
+        snapshot["runtime_config"] = None
+    current_harness = "codex-native" if saved_harness == "claude-sdk" else "claude-sdk"
+    conv = SimpleNamespace(
+        id="pricing-session",
+        agent_id="updated-agent",
+        sub_agent_name=None,
+        session_usage={},
+        inference_snapshot=None if snapshot_state == "legacy" else snapshot,
+    )
+    captured: dict[str, Any] = {}
+    store = SimpleNamespace(
+        get_conversation=lambda _: conv,
+        increment_session_usage=lambda _, delta: captured.update(delta) or captured,
+        set_session_usage=lambda _, usage: captured.update(usage),
+    )
+    monkeypatch.setattr(orchestration, "_resolve_harness", lambda _: current_harness)
+    monkeypatch.setattr(
+        orchestration,
+        "_resolve_session_provider_entry",
+        lambda _: load_providers(config)["cheap-default"],
+    )
+    monkeypatch.setattr(orchestration, "_record_daily_cost", lambda *args: None)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", lambda: config)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda _: None)
+    model = "pricing-fixture-model"
+
+    if usage_path == "relay":
+        orchestration._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": _INPUT_TOKENS,
+                    "output_tokens": _OUTPUT_TOKENS,
+                    "model": model,
+                }
+            },
+            conv.id,
+            store,
+        )
+    else:
+        orchestration._persist_native_cumulative_usage(
+            conv.id,
+            {
+                "cumulative_input_tokens": _INPUT_TOKENS,
+                "cumulative_output_tokens": _OUTPUT_TOKENS,
+                "model": model,
+            },
+            store,
+        )
+
+    expected = (
+        (30.0 if saved_harness == "claude-sdk" else 120.0)
+        if snapshot_state == "saved"
+        else (3.0 if current_harness == "claude-sdk" else 12.0)
+    )
+    assert captured["total_cost_usd"] == pytest.approx(expected)
+    assert captured["by_model"][model]["total_cost_usd"] == pytest.approx(expected)
 
 
 def test_resolve_session_provider_entry_resolves_nested_sub_agent(

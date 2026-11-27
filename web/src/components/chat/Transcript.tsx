@@ -33,7 +33,9 @@ import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
+import { useMessageNavHotkeys } from "@/hooks/useMessageNavHotkeys";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+import { useQuickPickPaletteEnabled } from "@/shell/screenCommands/useQuickPickPaletteCommands";
 import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
 import {
   RunnerStartingIndicator,
@@ -393,8 +395,12 @@ function TranscriptImpl({
     [display.streamBubbles],
   );
 
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
+  // Message steps: the registry's chords with quick_pick_palette, which leave Ctrl+Alt+Shift+↑/↓
+  // to session steps off macOS; otherwise any Cmd+Alt+↑/↓ (Ctrl+Alt on Windows and Linux).
+  const registryMessageSteps = useQuickPickPaletteEnabled();
+  useMessageNavHotkeys(nav, registryMessageSteps);
   useEffect(() => {
+    if (registryMessageSteps) return;
     const handler = (e: globalThis.KeyboardEvent) => {
       if (!hasCommandModifier(e) || !e.altKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
@@ -405,7 +411,7 @@ function TranscriptImpl({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [nav]);
+  }, [nav, registryMessageSteps]);
 
   const showWorkingIndicator =
     !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
@@ -534,6 +540,7 @@ function TranscriptImpl({
           <TranscriptPaletteCommands
             conversationId={display.conversationId}
             bubbles={display.streamBubbles}
+            messageNav={nav}
           />
           <ConversationScrollButton
             className={

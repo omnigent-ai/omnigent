@@ -43,14 +43,20 @@ export const MAX_MINUTE_INTERVAL = 366 * 60;
 export const MIN_SUBHOUR_MINUTE_INTERVAL = 10;
 export const MIN_HOURLY_MINUTE_INTERVAL = 60;
 
+/** @param newSandboxSubhourSupported False on older servers, which need an hour for a
+ * sandbox that starts a new session each run. */
 export function minimumScheduleInterval(
   frequency: CustomFreq,
   sessionMode: "new" | "continue",
   subhourSupported: boolean,
   executionTarget?: ScheduledTaskExecutionTarget,
+  newSandboxSubhourSupported = false,
 ): number {
   if (frequency !== "minutely") return 1;
-  return subhourSupported && (sessionMode === "continue" || executionTarget === "connected_host")
+  return subhourSupported &&
+    (newSandboxSubhourSupported ||
+      sessionMode === "continue" ||
+      executionTarget === "connected_host")
     ? MIN_SUBHOUR_MINUTE_INTERVAL
     : MIN_HOURLY_MINUTE_INTERVAL;
 }
@@ -305,12 +311,14 @@ export function validateSchedule(
     sessionMode = "new",
     executionTarget,
     subhourSupported = false,
+    newSandboxSubhourSupported = false,
   }: {
     allowPastEnd?: boolean;
     now?: Date;
     sessionMode?: "new" | "continue";
     executionTarget?: ScheduledTaskExecutionTarget;
     subhourSupported?: boolean;
+    newSandboxSubhourSupported?: boolean;
   } = {},
 ): string | null {
   if (model.preset === "custom" && model.customFreq === "rule") {
@@ -338,12 +346,17 @@ export function validateSchedule(
       sessionMode,
       subhourSupported,
       executionTarget,
+      newSandboxSubhourSupported,
     );
     const maximum = model.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366;
     if (!Number.isInteger(model.interval) || model.interval < minimum || model.interval > maximum) {
       if (model.customFreq === "minutely" && model.interval < MIN_HOURLY_MINUTE_INTERVAL) {
         if (!subhourSupported) return "This server requires schedules of at least 60 minutes.";
-        if (sessionMode !== "continue" && executionTarget !== "connected_host")
+        if (
+          !newSandboxSubhourSupported &&
+          sessionMode !== "continue" &&
+          executionTarget !== "connected_host"
+        )
           return "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals.";
       }
       return `Interval must be a whole number of at least ${minimum} and at most ${maximum}.`;

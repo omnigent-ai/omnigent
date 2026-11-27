@@ -42,13 +42,17 @@ export interface ReviewCommentContext {
   storedComments?: boolean;
   /** Where Add comment sends the selection, with the file text its offsets are in. */
   onAddComment?: (path: string, selection: ActiveSelection, text: string) => void;
+  /** How the session names a file of this review, as for a worktree's; the path itself without it. */
+  sessionPath?: (path: string) => string;
 }
 
 /** A context that offers Add comment and Attach to agent, with no comments of its own shown. */
 export function actionsOnlyCommentContext({
   canCommentOn,
   onAddComment,
-}: Required<Pick<ReviewCommentContext, "canCommentOn" | "onAddComment">>): ReviewCommentContext {
+  sessionPath,
+}: Required<Pick<ReviewCommentContext, "canCommentOn" | "onAddComment">> &
+  Pick<ReviewCommentContext, "sessionPath">): ReviewCommentContext {
   return {
     currentComments: [],
     activeSelection: null,
@@ -56,6 +60,7 @@ export function actionsOnlyCommentContext({
     canCommentOn,
     storedComments: false,
     onAddComment,
+    ...(sessionPath && { sessionPath }),
   };
 }
 
@@ -211,7 +216,8 @@ export function useReviewCommentLayer({
     if (!pending || !pendingAllowed) return;
     const lines = currentLines.get(pending.path);
     const lineRange = lines && selectedLineRange(lines, pending.start, pending.end);
-    if (lineRange) attachLinesToAgent(pending.path, lineRange);
+    const sessionPath = latest.current.context?.sessionPath;
+    if (lineRange) attachLinesToAgent(sessionPath?.(pending.path) ?? pending.path, lineRange);
   }, [pending, pendingAllowed, currentLines]);
 
   const canAttachToAgent = useCanAttachToAgent(pending?.path ?? currentPath);

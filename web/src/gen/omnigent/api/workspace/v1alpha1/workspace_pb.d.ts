@@ -1903,8 +1903,9 @@ export declare type ListLabelsRequest = Message<"omnigent.api.workspace.v1alpha1
   prUrl: string;
 
   /**
-   * Labels whose name matches; unset lists the repository's labels.
-   * Not supported yet: setting this field returns INVALID_ARGUMENT.
+   * Labels whose name or description matches, best match first, at most 50;
+   * unset lists the repository's labels by name. Longer than 256 characters
+   * returns INVALID_ARGUMENT.
    *
    * @generated from field: string text = 2;
    */
@@ -3269,6 +3270,8 @@ export declare const PullRequestAutoMergeSchema: GenMessage<PullRequestAutoMerge
  */
 export declare type EnableAutoMergeRequest = Message<"omnigent.api.workspace.v1alpha1.EnableAutoMergeRequest"> & {
   /**
+   * 1 to 20 pull requests the session links, each named once.
+   *
    * @generated from field: repeated omnigent.api.workspace.v1alpha1.PullRequestAutoMerge pull_requests = 1;
    */
   pullRequests: PullRequestAutoMerge[];
@@ -3285,7 +3288,9 @@ export declare const EnableAutoMergeRequestSchema: GenMessage<EnableAutoMergeReq
  */
 export declare type EnableAutoMergeResponse = Message<"omnigent.api.workspace.v1alpha1.EnableAutoMergeResponse"> & {
   /**
-   * Each pull request's result, in request order.
+   * Each pull request's result, in request order: `enabled_at`, or an `error` with its
+   * `reason`, and `unconfirmed: true` when GitHub may have turned auto-merge on. The
+   * results stop at the first pull request whose head moved; the rest weren't sent.
    *
    * @generated from field: google.protobuf.Struct payload = 1;
    */
@@ -3681,7 +3686,7 @@ export declare type ReadPullRequestImageRequest = Message<"omnigent.api.workspac
   prUrl: string;
 
   /**
-   * An image URL the pull request's description or comments link to.
+   * An attachment on the pull request's host: https://<host>/user-attachments/assets/<id>.
    *
    * @generated from field: string image_url = 2;
    */
@@ -3860,7 +3865,9 @@ export declare const ReadPullRequestImageResponseSchema: GenMessage<ReadPullRequ
  */
 export declare type PullRequestFailure = Message<"omnigent.api.workspace.v1alpha1.PullRequestFailure"> & {
   /**
-   * One of "comment_changed", "pull_request_changed" or "invalid_input".
+   * One of "comment_changed", "pull_request_changed", "invalid_input" or
+   * "read_only_code_host"; for an image read, one of "host_not_allowed", "too_large",
+   * "not_image" or "fetch_failed".
    *
    * @generated from field: string reason = 1;
    */
@@ -4915,7 +4922,11 @@ export declare const WorkspaceService: GenService<{
     output: typeof PreviewReviewerPingResponseSchema;
   },
   /**
-   * Streams an image the pull request links to: its metadata, then its bytes.
+   * Streams an attachment image on the pull request's host: its metadata, then its bytes.
+   * Only the session's owner may call it. A caller that leaves early may hold one of the
+   * host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+   * system resolver gives up. A client may keep an image in memory, keyed by
+   * `(pr_url, image_url)`, for as long as the page that shows it stays open.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ReadPullRequestImage
    */

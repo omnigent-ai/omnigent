@@ -1208,6 +1208,31 @@ def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
     assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"rrule": "FREQ=MINUTELY;INTERVAL=10"},
+        {"session_mode": "continue"},
+        {"execution_target": "managed_sandbox"},
+    ],
+    ids=["recurrence", "session-mode", "execution-target"],
+)
+def test_update_from_a_stale_snapshot_conflicts_on_schedule_changes(
+    store: SqlAlchemyScheduledTaskStore, change: dict[str, Any]
+) -> None:
+    """A write checked against an older recurrence, session mode or target is refused."""
+    snapshot = _session_task(store, "st_stale_schedule")
+    assert store.update(snapshot.id, expected_schedule=snapshot, **change) is not None
+
+    with pytest.raises(OmnigentError, match="Reload and try again") as raised:
+        store.update(snapshot.id, expected_schedule=snapshot, name="Renamed")
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    saved = store.get(snapshot.id)
+    assert saved is not None
+    assert saved.name == snapshot.name
+
+
 def test_update_guard_sees_the_locked_task_and_a_refusal_saves_nothing(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:

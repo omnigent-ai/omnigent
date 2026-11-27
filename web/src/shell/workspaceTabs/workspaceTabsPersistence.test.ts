@@ -28,6 +28,11 @@ const state: WorkspaceTabsSessionState = {
       place: { kind: "pull", url: "https://github.com/o/r/pull/1", view: "changes" },
       openedBy: "user",
     },
+    {
+      id: "q",
+      place: { kind: "pull", url: "https://github.com/o/r/pull/2", view: "changes", list: true },
+      openedBy: "user",
+    },
     { id: "k", place: { kind: "tasks" }, openedBy: "user" },
   ],
   selectedTabId: "a",
@@ -49,6 +54,23 @@ describe("workspace tab storage", () => {
     expect(saveWorkspaceTabsSession("s1", state)).toBe("saved");
     expect(readWorkspaceTabsSession("s1")).toEqual({ status: "saved", state });
     expect(readWorkspaceTabsSession("s2")).toEqual({ status: "missing" });
+  });
+
+  it("restores a Changes visit's compared folder in tabs, history and closed tabs", () => {
+    const rooted = {
+      kind: "changes",
+      comparison: { kind: "saved", intent: "head" },
+      comparisonRoot: "/repo/.worktrees/feature",
+    } as const;
+    const withRoots: WorkspaceTabsSessionState = {
+      ...state,
+      tabs: [...state.tabs, { id: "d", place: rooted, openedBy: "user" }],
+      timeline: [...state.timeline, { tabId: "d", place: rooted }],
+      cursor: 2,
+      closed: [{ tab: { id: "e", place: rooted, openedBy: "user" }, index: 0 }],
+    };
+    expect(saveWorkspaceTabsSession("s1", withRoots)).toBe("saved");
+    expect(readWorkspaceTabsSession("s1")).toEqual({ status: "saved", state: withRoots });
   });
 
   it("restores the Workspace settings a strip took, and drops a malformed record", () => {
@@ -132,6 +154,40 @@ describe("workspace tab storage", () => {
       kind: "changes",
     });
   });
+
+  it("keeps the folder a Changes visit compared, only with its comparison and absolute", () => {
+    const head = { kind: "saved", intent: "head" } as const;
+    const root = "/repo/.worktrees/feature";
+    expect(parsePlace({ kind: "changes", comparison: head, comparisonRoot: root })).toEqual({
+      kind: "changes",
+      comparison: head,
+      comparisonRoot: root,
+    });
+    expect(parsePlace({ kind: "changes", comparisonRoot: root })).toEqual({ kind: "changes" });
+    // A malformed folder goes alone, and a saved spelling reads as its link would.
+    for (const malformed of ["wt", "/repo\0/wt", "/../wt"]) {
+      expect(parsePlace({ kind: "changes", comparison: head, comparisonRoot: malformed })).toEqual({
+        kind: "changes",
+        comparison: head,
+      });
+    }
+    expect(
+      parsePlace({
+        kind: "changes",
+        comparison: head,
+        comparisonRoot: "/repo/./x/../.worktrees/feature/",
+      }),
+    ).toEqual({ kind: "changes", comparison: head, comparisonRoot: root });
+  });
+
+  it.each([false, "true", 1, null, {}])(
+    "restores a pull request without list mode for list: %j",
+    (list) => {
+      expect(
+        parsePlace({ kind: "pull", url: "https://github.com/o/r/pull/1", view: "changes", list }),
+      ).toEqual({ kind: "pull", url: "https://github.com/o/r/pull/1", view: "changes" });
+    },
+  );
 
   it("drops malformed fields one by one and keeps the rest", () => {
     window.localStorage.setItem(

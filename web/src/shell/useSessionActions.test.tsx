@@ -118,6 +118,7 @@ describe("useSessionActions Leave, reporting after its caller unmounts", () => {
     act(() => dropRow());
     await act(async () => finishLeave());
     expect(goHome).toHaveBeenCalledOnce();
+    expect(goHome).toHaveBeenCalledWith("leave");
   });
 
   it("stays on the session the user switched to before the Leave succeeds", async () => {
@@ -168,6 +169,7 @@ describe("useSessionActions Leave, by default", () => {
     );
     act(() => leave.mutate.mock.calls[0]![1].onSuccess());
     expect(goHome).toHaveBeenCalledOnce();
+    expect(goHome).toHaveBeenCalledWith("leave");
   });
 });
 

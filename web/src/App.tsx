@@ -13,6 +13,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
 import { isElectronShell } from "@/lib/nativeBridge";
+import { CANVAS_SESSION_ROUTE, CHAT_SESSION_ROUTE } from "@/lib/sessionRoutes";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -277,7 +278,7 @@ function AppRoutes({ basename }: AppProps) {
         />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route path={`${prefix}${CHAT_SESSION_ROUTE}`} element={<ChatPage />} />
           <Route
             path={`${prefix}/grid/:gridId`}
             element={
@@ -304,7 +305,7 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route
-            path={`${prefix}/canvas/c/:conversationId`}
+            path={`${prefix}${CANVAS_SESSION_ROUTE}`}
             element={
               <FeatureGatedPage feature="canvas">
                 <ChatPage />

@@ -44,6 +44,7 @@ from omnigent.runner import subagent_work
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
+    AgentSpecFetchError,
     _agent_cache_dest,
     _AgentSpecCache,
     _apply_host_interactive_shells,
@@ -3943,7 +3944,7 @@ async def test_resolve_agent_spec_from_server_raises_when_throttling_persists(
         transport=httpx.MockTransport(_handler),
         base_url="http://server.test",
     ) as client:
-        with pytest.raises(RuntimeError, match="HTTP 429"):
+        with pytest.raises(AgentSpecFetchError, match="HTTP 429"):
             await _resolve_agent_spec_from_server(
                 client, _AgentSpecCache(tmp_path), "ag_throttled", session_id="conv_test"
             )
@@ -3953,10 +3954,10 @@ async def test_resolve_agent_spec_from_server_raises_when_throttling_persists(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [401, 403, 500, 502])
+@pytest.mark.parametrize("status_code", [401, 403, 500, 502, None])
 async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     tmp_path: Path,
-    status_code: int,
+    status_code: int | None,
 ) -> None:
     """Auth and server failures are not reported as missing agents.
 
@@ -3974,6 +3975,8 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
         :returns: A response with ``status_code``.
         """
         assert request.url.path == "/v1/sessions/conv_test/agent/contents"
+        if status_code is None:
+            raise httpx.ConnectError("connection unavailable", request=request)
         return httpx.Response(status_code)
 
     async with httpx.AsyncClient(
@@ -3986,7 +3989,13 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
             )
 
     message = str(exc_info.value)
-    assert f"HTTP {status_code}" in message
+    assert isinstance(exc_info.value, AgentSpecFetchError) is (
+        status_code is None or status_code >= 500
+    )
+    if status_code is None:
+        assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+    else:
+        assert f"HTTP {status_code}" in message
     assert "/v1/sessions/conv_test/agent/contents" in message
 
 

@@ -1,4 +1,22 @@
-"""Captured mock-provider request inspection shared by process and browser tests."""
+"""Mock-provider readiness and captured request inspection, shared by process and browser tests."""
+
+import httpx
+
+
+def mock_llm_answers(base_url: str) -> bool:
+    """
+    Whether the mock LLM server at *base_url* answers ``GET /stats`` yet.
+
+    A booting server can refuse the connection, accept it and close it before
+    replying, or answer slowly; each means "not yet", so a readiness loop keeps polling.
+
+    :param base_url: The mock server's base URL, e.g. ``"http://127.0.0.1:8001"``.
+    :returns: True once ``/stats`` answers 200.
+    """
+    try:
+        return httpx.get(f"{base_url}/stats", timeout=1.0).status_code == 200
+    except httpx.TransportError:
+        return False
 
 
 def advertised_tool_names(requests: list[dict]) -> set[str]:
