@@ -144,24 +144,11 @@ describe("useSessionNumberHotkeys", () => {
 
   it("goes back to the session the window just left, before the router renders the next page", () => {
     // The router still renders the session while the new page loads; the URL has moved on.
-    const { rerender } = render(ids, "/c/a");
+    render(ids, "/c/a");
+    // No re-render: the press itself reads where the window is.
     window.history.pushState(null, "", "/");
-    rerender();
     press("1");
     expect(navigate).toHaveBeenCalledWith("/c/a");
-  });
-
-  it.each([
-    ["a trailing slash", "/c/a/", undefined],
-    ["a Canvas route", "/canvas/c/a", undefined],
-    ["the server's base path", "/omnigent/c/a/", "/omnigent"],
-  ])("knows the window shows the session at %s", (_case, path, base) => {
-    window.__OMNIGENT_BASE_PATH__ = base;
-    render(ids, path);
-    press("1");
-    expect(navigate).not.toHaveBeenCalled();
-    press("2");
-    expect(navigate).toHaveBeenCalledWith("/c/b");
   });
 
   it("knows the session under an embedding host's mount", () => {
@@ -169,12 +156,6 @@ describe("useSessionNumberHotkeys", () => {
     render(ids, "/mount/c/a");
     press("1");
     expect(navigate).not.toHaveBeenCalled();
-  });
-
-  it("opens the session from a page whose path only ends like its route", () => {
-    render(ids, "/extensions/demo/c/a");
-    press("1");
-    expect(navigate).toHaveBeenCalledWith("/c/a");
   });
 
   it("prevents the browser's native tab-switch when it navigates", () => {

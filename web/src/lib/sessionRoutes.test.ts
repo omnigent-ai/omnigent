@@ -22,6 +22,8 @@ describe("sessionIdAtPath", () => {
   it("strips the server's base path first", () => {
     window.__OMNIGENT_BASE_PATH__ = "/omnigent";
     expect(sessionIdAtPath("/omnigent/c/abc")).toBe("abc");
+    expect(sessionIdAtPath("/omnigent/c/abc/")).toBe("abc");
+    expect(sessionIdAtPath("/omnigent/canvas/c/abc")).toBe("abc");
   });
 
   it("matches under an embedding host's mount", () => {
