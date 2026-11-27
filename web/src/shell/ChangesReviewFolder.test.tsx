@@ -23,7 +23,7 @@ const mocks = vi.hoisted(() => ({
   worktrees: [] as { path: string; branch: string; is_main: boolean; detached: boolean }[],
   worktreeLookups: [] as (string | null)[],
   /** How the worktree lookup answers: a list, a failure, or not yet. */
-  worktreeAnswer: "ok" as "ok" | "unknown" | "pending",
+  worktreeAnswer: "ok" as "ok" | "unknown" | "pending" | "not_git" | "denied",
 }));
 vi.mock("./FileViewerContext", () => ({ useWorkspacePaths: () => ({ root: mocks.workspace }) }));
 vi.mock("./fileCommands/target", () => ({ useSessionHostId: () => "host_1" }));
@@ -42,6 +42,11 @@ vi.mock("@/hooks/useSessionWorktrees", () => ({
     if (mocks.worktreeAnswer === "pending") return { data: undefined, isLoading: true };
     if (mocks.worktreeAnswer === "unknown")
       return { data: { status: "unknown" }, isLoading: false };
+    if (mocks.worktreeAnswer === "not_git")
+      return { data: { status: "not_git" }, isLoading: false };
+    if (mocks.worktreeAnswer === "denied") {
+      return { data: { status: "unknown", denied: true }, isLoading: false };
+    }
     return { data: { status: "ok", worktrees: mocks.worktrees }, isLoading: false };
   },
 }));
@@ -221,6 +226,25 @@ describe("useReviewFolder", () => {
         available: false,
         reason: LARGER_REPOSITORY_REASON,
       });
+    },
+  );
+
+  it.each(["not_git", "denied"] as const)(
+    "forgets the last list once the lookup answers %s, so a later failure doesn't bring it back",
+    (answer) => {
+      act(() => rememberBrowseLocation(SESSION, "/repo/.worktrees/feature"));
+      const { result, rerender } = renderHook(() => useReviewFolder(SESSION, true));
+      expect(result.current.repository).toBe(".worktrees/feature");
+
+      mocks.worktreeAnswer = answer;
+      rerender();
+      expect(result.current.repository).toBe("");
+
+      // The next lookup fails: the worktree that answer ruled out stays gone, and so does the answer.
+      mocks.worktreeAnswer = "unknown";
+      rerender();
+      expect(result.current.repository).toBe("");
+      expect(result.current.resolved).toBe(false);
     },
   );
 

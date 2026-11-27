@@ -95,6 +95,8 @@ export function useReviewFolder(
   const lookupKey = `${hostId ?? ""}\u0000${workspace ?? ""}`;
   const lastListed = useRef<{ key: string; worktrees: HostWorktree[] } | null>(null);
   if (answer?.status === "ok") lastListed.current = { key: lookupKey, worktrees: answer.worktrees };
+  // "Not a Git repository" and a refusal rule the old list out, so a later failure can't revive it.
+  else if (answer?.status === "not_git" || denied) lastListed.current = null;
   const kept =
     answer?.status === "unknown" && !denied && lastListed.current?.key === lookupKey
       ? lastListed.current.worktrees
