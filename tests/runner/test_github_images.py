@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
 import gzip
 import json
 import logging
@@ -16,12 +15,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 
+import httpcore
 import httpx
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
 
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.runner import github_images
@@ -29,6 +25,7 @@ from omnigent.runner import github_resource as github
 from omnigent.runner.github_images import ImageRefused, checked_image_url, read_pull_request_image
 from omnigent.runner.session_prs import PullRequestRef
 from omnigent.util import tls
+from tests._helpers.https_server import enable_https
 
 TOKEN = "ghp_example_token_value"
 OTHER_TOKEN = "ghp_other_example_token"
@@ -45,6 +42,9 @@ WEBP = b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 64
 AVIF = b"\x00\x00\x00\x1cftypavif" + b"\x00" * 64
 LISTINGS = ("issues/*/comments", "pulls/*/comments", "pulls/*/reviews")
 PAGE_SIZE = 100
+
+# gh's own token lookup, before a fake replaces it.
+_REAL_ACTIVE_TOKEN = github._gh_active_token
 
 
 class FakeGitHub:
@@ -64,6 +64,8 @@ class FakeGitHub:
         monkeypatch.setattr(github, "_in_sandbox", lambda: False)
         monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: None)
         self.active_tokens = [TOKEN]
+        # What a sandbox's gh answers from its hosts.yml.
+        self.broker_token = ""
         monkeypatch.setattr(github, "_gh_active_token", self._active_token)
 
     def _active_token(self, _root: str, _host: str = "github.com") -> str | None:
@@ -73,6 +75,8 @@ class FakeGitHub:
         self, argv: list[str], *, cwd: str, token: str | None = None
     ) -> tuple[int | None, str, str]:
         self.calls.append((argv, token))
+        if argv[:2] == ["auth", "token"]:
+            return 0, f"{self.broker_token}\n", ""
         endpoint = argv[-1]
         path, _, query = endpoint.partition("?")
         if not query:
@@ -616,6 +620,104 @@ def test_every_refusal_reads_one_fixed_message() -> None:
     assert all("http" not in message for message in messages.values())
 
 
+# The real transport, over a fake network: what tracing and logging see.
+
+
+class _RecordingStream(httpcore.AsyncMockStream):
+    """One connection's answer, recording the bytes the request writes."""
+
+    def __init__(self, answer: bytes, written: list[bytes]) -> None:
+        super().__init__([answer])
+        self._written = written
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self._written.append(buffer)
+
+
+class _Network(httpcore.AsyncMockBackend):
+    """Answers each new connection with the next raw HTTP response."""
+
+    def __init__(self, *answers: bytes) -> None:
+        super().__init__([])
+        self.answers = list(answers)
+        self.written: list[bytes] = []
+
+    async def connect_tcp(self, *_args: Any, **_kwargs: Any) -> httpcore.AsyncNetworkStream:
+        return _RecordingStream(self.answers.pop(0), self.written)
+
+
+@pytest.fixture
+def network(monkeypatch: pytest.MonkeyPatch) -> _Network:
+    """Every hop gets httpx's own transport, over a network that answers a signed redirect."""
+    for variable in ("HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(variable, raising=False)
+    image = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %d\r\n\r\n" % len(PNG)
+    network = _Network(
+        f"HTTP/1.1 302 Found\r\nLocation: {SIGNED}\r\nContent-Length: 0\r\n\r\n".encode(),
+        image + PNG,
+    )
+    real = github_images._transport_for
+
+    def transport_for(url: httpx.URL) -> httpx.AsyncHTTPTransport:
+        transport = real(url)
+        transport._pool = httpcore.AsyncConnectionPool(network_backend=network)
+        return transport
+
+    monkeypatch.setattr(github_images, "_transport_for", transport_for)
+    return network
+
+
+def test_a_fetch_emits_no_span_and_sends_no_trace_header(
+    fake: FakeGitHub, network: _Network
+) -> None:
+    """A client span would record each hop's URL, and the signed one is a credential."""
+    instrumentation = pytest.importorskip("opentelemetry.instrumentation.httpx")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exported = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exported))
+    instrumentor = instrumentation.HTTPXClientInstrumentor()
+    instrumentor.instrument(tracer_provider=provider)
+    try:
+        assert _read(ASSET).data == PNG
+    finally:
+        instrumentor.uninstrument()
+
+    assert exported.get_finished_spans() == ()
+    sent = b"".join(network.written)
+    assert b"GET /1/2-x.png?jwt=" in sent
+    assert b"traceparent" not in sent.lower()
+
+
+def test_a_fetch_leaves_no_url_in_the_transports_debug_records(
+    fake: FakeGitHub, network: _Network, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    assert _read(ASSET).data == PNG
+
+    assert "githubusercontent" not in caplog.text
+    assert "user-attachments" not in caplog.text
+
+
+def test_other_requests_keep_their_transport_records(
+    network: _Network, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    async def fetch() -> None:
+        async with github_images._transport_for(httpx.URL(SIGNED)) as transport:
+            response = await transport.handle_async_request(httpx.Request("GET", SIGNED))
+            await response.aclose()
+
+    asyncio.run(fetch())
+
+    assert "receive_response_headers" in caplog.text
+
+
 # Slots.
 
 
@@ -694,55 +796,43 @@ def test_a_pr_on_the_gh_host_set_up_is_read(
     assert transport.seen[0].headers["authorization"] == f"token {TOKEN}"
 
 
-def test_a_sandbox_fetches_without_a_token(
+def test_a_sandbox_fetches_with_its_brokered_token_on_the_first_request_only(
     fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A sandbox's gh signs in from hosts.yml; the fetch asks gh for that token, not the env."""
     monkeypatch.setattr(github, "_in_sandbox", lambda: True)
-    transport = Transport(_image())
+    monkeypatch.setenv("GH_TOKEN", OTHER_TOKEN)
+    monkeypatch.setenv("GITHUB_TOKEN", OTHER_TOKEN)
+    monkeypatch.setattr(github, "_gh_active_token", _REAL_ACTIVE_TOKEN)
+    fake.broker_token = "gho_brokered_example"
+    transport = Transport(_redirect(SIGNED), _image())
 
-    _read(ASSET, transport)
+    assert _read(ASSET, transport).data == PNG
 
-    assert "authorization" not in transport.seen[0].headers
+    first, second = transport.seen
+    assert first.headers["authorization"] == "token gho_brokered_example"
+    assert "authorization" not in second.headers
+    assert ["auth", "token", "-h", "github.com"] in [argv for argv, _token in fake.calls]
+
+
+def test_two_accounts_dont_share_a_revisions_linked_urls(fake: FakeGitHub) -> None:
+    """A pending review's links show only to the account that wrote it."""
+    _read(ASSET, Transport(_image()))
+    fake.active_tokens = [OTHER_TOKEN]
+
+    _read(ASSET, Transport(_image()))
+
+    listings = [endpoint for endpoint in fake.endpoints() if "?per_page=" in endpoint]
+    assert len(listings) == 2 * len(LISTINGS)
 
 
 # TLS.
 
 
-def _certificate(directory: Path) -> tuple[Path, Path]:
-    """A self-signed certificate for ``localhost``, and its key."""
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    now = datetime.datetime.now(datetime.UTC)
-    certificate = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(hours=1))
-        .not_valid_after(now + datetime.timedelta(hours=1))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(key, hashes.SHA256())
-    )
-    cert_path, key_path = directory / "cert.pem", directory / "key.pem"
-    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
-    return cert_path, key_path
-
-
 @pytest.fixture
-def tls_server(tmp_path: Path) -> Iterator[tuple[int, Path]]:
-    """A local HTTPS server with a self-signed certificate: its port and certificate."""
+def tls_server(tmp_path: Path) -> Iterator[tuple[int, str]]:
+    """A local HTTPS server: its port and the certificate authority that signed it."""
     import http.server
-
-    cert_path, key_path = _certificate(tmp_path)
 
     class Answer(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -756,12 +846,10 @@ def tls_server(tmp_path: Path) -> Iterator[tuple[int, Path]]:
             pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Answer)
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(cert_path, key_path)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    trust = enable_https(server, tmp_path)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    yield server.server_address[1], cert_path
+    yield server.server_address[1], trust["SSL_CERT_FILE"]
     server.shutdown()
     server.server_close()
 
@@ -779,9 +867,9 @@ def _fetch_from(port: int) -> int:
 
 
 def test_a_server_with_an_untrusted_certificate_is_refused(
-    monkeypatch: pytest.MonkeyPatch, tls_server: tuple[int, Path]
+    monkeypatch: pytest.MonkeyPatch, tls_server: tuple[int, str]
 ) -> None:
-    port, _cert = tls_server
+    port, _authority = tls_server
     monkeypatch.setattr(tls, "_client_ssl_context", None)
     for variable in ("HTTPS_PROXY", "https_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR"):
         monkeypatch.delenv(variable, raising=False)
@@ -791,28 +879,12 @@ def test_a_server_with_an_untrusted_certificate_is_refused(
 
 
 def test_a_certificate_authority_in_ssl_cert_file_is_trusted(
-    monkeypatch: pytest.MonkeyPatch, tls_server: tuple[int, Path]
+    monkeypatch: pytest.MonkeyPatch, tls_server: tuple[int, str]
 ) -> None:
-    port, cert_path = tls_server
+    port, authority = tls_server
     monkeypatch.setattr(tls, "_client_ssl_context", None)
     monkeypatch.delenv("HTTPS_PROXY", raising=False)
     monkeypatch.delenv("https_proxy", raising=False)
-    monkeypatch.setenv("SSL_CERT_FILE", str(cert_path))
+    monkeypatch.setenv("SSL_CERT_FILE", authority)
 
     assert _fetch_from(port) == 200
-
-
-def test_the_fetch_always_verifies_the_certificate_and_its_host() -> None:
-    context = github_images.client_ssl_context()
-
-    assert context.verify_mode == ssl.CERT_REQUIRED
-    assert context.check_hostname
-
-
-def test_a_fetch_logs_no_url(fake: FakeGitHub, caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.DEBUG)
-
-    _read(ASSET, Transport(_redirect(SIGNED), _image()))
-
-    assert "user-attachments" not in caplog.text
-    assert "githubusercontent" not in caplog.text

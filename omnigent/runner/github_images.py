@@ -10,16 +10,20 @@ is ever logged, cached or put in an error.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hashlib
 import html
 import ipaddress
 import json
+import logging
 import re
 import ssl
 import threading
 import time
 import urllib.request
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -149,10 +153,11 @@ def _plain_hostname(host: str) -> bool:
 
 
 _linked_urls_lock = threading.Lock()
-# Keyed by host, repository, number, head SHA and update time; one revision per pull request.
-_linked_urls_cache: OrderedDict[tuple[str, str, int, str, str], tuple[frozenset[str], float]] = (
-    OrderedDict()
-)
+# Keyed by host, repository, number, account, head SHA and update time: one revision per pull
+# request and account, since a pending review's links show only to the account that wrote it.
+_linked_urls_cache: OrderedDict[
+    tuple[str, str, int, str, str, str], tuple[frozenset[str], float]
+] = OrderedDict()
 _read_slots = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
 
 
@@ -221,7 +226,11 @@ def _revision(pull_request: dict[str, Any]) -> tuple[str, str] | None:
 
 
 def linked_image_urls(
-    root: str, reference: PullRequestRef, *, clock: Callable[[], float] = time.monotonic
+    root: str,
+    reference: PullRequestRef,
+    *,
+    account: str = "",
+    clock: Callable[[], float] = time.monotonic,
 ) -> frozenset[str]:
     """Every https URL the pull request links to, cached per revision for a short while.
 
@@ -232,7 +241,7 @@ def linked_image_urls(
     revision = _revision(pull_request)
     if revision is None:
         return _linked_urls(root, reference, pull_request)
-    pull_request_key = (reference.host, reference.repository.casefold(), reference.number)
+    pull_request_key = (reference.host, reference.repository.casefold(), reference.number, account)
     key = (*pull_request_key, *revision)
     with _linked_urls_lock:
         cached = _linked_urls_cache.get(key)
@@ -241,7 +250,7 @@ def linked_image_urls(
             return cached[0]
     urls = _linked_urls(root, reference, pull_request)
     with _linked_urls_lock:
-        for stale in [known for known in _linked_urls_cache if known[:3] == pull_request_key]:
+        for stale in [known for known in _linked_urls_cache if known[:4] == pull_request_key]:
             del _linked_urls_cache[stale]
         _linked_urls_cache[key] = (urls, clock())
         while len(_linked_urls_cache) > MAX_CACHED_REVISIONS:
@@ -289,6 +298,34 @@ async def _read_image(
     if _sniff(data) != content_type:
         raise ImageRefused("not_image")
     return PullRequestImage(content_type=content_type, data=data)
+
+
+# Set while an image fetch runs, so its transport records can be told from other requests'.
+_fetching_image = contextvars.ContextVar("fetching_image", default=False)
+
+
+class _DropImageFetchRecords(logging.Filter):
+    """Drops httpcore's records of an image fetch: at DEBUG they hold the redirect URLs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno > logging.DEBUG or not _fetching_image.get()
+
+
+for _name in ("connection", "http11", "http2", "proxy", "socks"):
+    logging.getLogger(f"httpcore.{_name}").addFilter(_DropImageFetchRecords())
+
+
+@contextmanager
+def _untraced() -> Iterator[None]:
+    """No HTTP client spans or trace headers: a span would record each signed URL."""
+    try:
+        from opentelemetry.instrumentation.utils import suppress_http_instrumentation
+    except ImportError:
+        # Without the instrumentation library nothing traces these requests.
+        yield
+        return
+    with suppress_http_instrumentation():
+        yield
 
 
 def _transport_for(url: httpx.URL) -> httpx.AsyncHTTPTransport:
@@ -360,10 +397,12 @@ def _fetch_in_time(
     """
 
     async def within_deadline() -> PullRequestImage:
-        async with asyncio.timeout(FETCH_DEADLINE_SECONDS):
-            return await _fetch(
-                url, pr_host=pr_host, token=token, transport=transport, clock=clock
-            )
+        _fetching_image.set(True)
+        with _untraced():
+            async with asyncio.timeout(FETCH_DEADLINE_SECONDS):
+                return await _fetch(
+                    url, pr_host=pr_host, token=token, transport=transport, clock=clock
+                )
 
     try:
         return asyncio.run(within_deadline())
@@ -393,10 +432,10 @@ def read_pull_request_image(
         raise ValueError(_UNKNOWN_HOST)
     with github._one_pr_account(root, reference, timed_out=_AUTHENTICATION_TIMED_OUT):
         with github._gh_deadline_scope(time.monotonic() + _READ_PULL_REQUEST_SECONDS):
-            linked = linked_image_urls(root, reference, clock=clock)
+            token = _image_token(root, reference)
+            linked = linked_image_urls(root, reference, account=_account(token), clock=clock)
         if image_url not in linked:
             raise ImageRefused("not_in_pr")
-        token = github._pr_token(root, reference)
     if not _read_slots.acquire(timeout=SLOT_WAIT_SECONDS):
         raise ImageRefused("fetch_failed")
     try:
@@ -405,3 +444,21 @@ def read_pull_request_image(
         )
     finally:
         _read_slots.release()
+
+
+def _image_token(root: str, reference: PullRequestRef) -> str | None:
+    """The bound account's token; in a managed sandbox, the owner's brokered one.
+
+    A sandbox binds no token, because ``gh`` reads the owner's from its ``hosts.yml``. The
+    fetch doesn't go through ``gh``, so it asks ``gh`` for that token, which ignores the
+    ambient token variables there.
+    """
+    token = github._pr_token(root, reference)
+    if token is None and github._in_sandbox():
+        token = github._gh_active_token(root, reference.host)
+    return token
+
+
+def _account(token: str | None) -> str:
+    """A cache key for the account a token belongs to, without keeping the token."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""
