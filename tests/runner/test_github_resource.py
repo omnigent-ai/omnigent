@@ -2130,7 +2130,10 @@ def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
 @pytest.mark.parametrize("failure", [None, "api", "enterprise_auth", "invalid_json"])
 def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatch, failure):
     old = [{"body": f"old-{i}", "createdAt": "2026-01-01"} for i in range(100)]
-    latest = [{"body": f"new-{i}", "createdAt": "2026-10-26"} for i in range(100)]
+    latest = [
+        {"id": f"IC_{i}", "body": f"new-{i}", "createdAt": "2026-10-26", **_RIGHTS}
+        for i in range(100)
+    ]
     calls = []
     host = "ghe.example.com" if failure == "enterprise_auth" else "github.com"
     monkeypatch.setattr(github_resource, "_list_accounts", lambda _root: (False, []))
@@ -2197,6 +2200,9 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
     shaped = github_resource._shape_comments(old + latest)
     assert len(shaped) == 100
     assert shaped[-1]["body"] == "new-99"
+    # The busy tail's IDs and the account's rights come from the same read.
+    assert shaped[-1]["id"] == "IC_99"
+    assert shaped[-1]["can_update"] is True
 
 
 @pytest.mark.parametrize("fields", ["title,url", "reviewRequests,latestReviews"])
@@ -2361,20 +2367,6 @@ def test_conversation_comments_carry_their_ids_reactions_and_the_accounts_rights
     ]
 
 
-def test_a_busy_conversation_takes_its_comments_and_rights_from_githubs_read(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    listed = [{"body": f"old-{i}", "createdAt": "2026-01-01"} for i in range(100)]
-    latest = [
-        {"id": f"IC_{i}", "body": f"new-{i}", "createdAt": "2026-10-26", **_RIGHTS}
-        for i in range(100)
-    ]
-    read = _conversation_read(monkeypatch, listed=listed, latest=latest)
-    assert "--cache" not in read["query"]
-    assert read["comments"][-1]["body"] == "new-99"
-    assert read["comments"][-1]["can_update"] is True
-
-
 @pytest.mark.parametrize(
     ("anchor", "expected"),
     [
@@ -2387,10 +2379,13 @@ def test_a_busy_conversation_takes_its_comments_and_rights_from_githubs_read(
     ],
 )
 def test_a_conversation_comments_number_comes_only_from_a_bounded_anchor(
-    monkeypatch: pytest.MonkeyPatch, anchor: str, expected: int | None
+    anchor: str, expected: int | None
 ) -> None:
-    """An anchor too long or too large for an exact ID names no comment; the read still loads."""
+    """An anchor too long or too large for an exact ID names no comment."""
     url = f"https://github.com/o/r/pull/8#issuecomment-{anchor}"
-    listed = [{"body": "hi", "createdAt": "2026-11-01", "url": url, "isMinimized": False}]
-    (comment,) = _conversation_read(monkeypatch, listed=listed, latest=[])["comments"]
-    assert comment.get("database_id") == expected
+    assert github_resource._issue_comment_number(url) == expected
+
+
+@pytest.mark.parametrize("url", [None, 5, "https://github.com/o/r/pull/8"])
+def test_a_conversation_comment_without_an_anchor_has_no_number(url: object) -> None:
+    assert github_resource._issue_comment_number(url) is None
