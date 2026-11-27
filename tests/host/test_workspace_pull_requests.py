@@ -304,7 +304,10 @@ def _naming_the_pr(method: str) -> Any:
         return request_type(pr_url=_PR)
     if "pr_urls" in request_type.DESCRIPTOR.fields_by_name:
         return request_type(pr_urls=[_PR])
-    return request_type(pull_requests=[{"pr_url": _PR}])
+    if "pull_requests" in request_type.DESCRIPTOR.fields_by_name:
+        return request_type(pull_requests=[{"pr_url": _PR}])
+    # A branch list names none; it is served only with the server's call frame all the same.
+    return request_type(branch="feature/login")
 
 
 async def _stream_error(
@@ -580,7 +583,7 @@ _SEARCH_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
 }
 # The methods that act on GitHub for the session's selected pull request.
 _SELECTED_PR_CALLS = {**_GITHUB_CHANGE_CALLS, **_QUEUE_CALLS, **_STACK_CALLS, **_SEARCH_CALLS}
-# The methods that read pull requests by URL alone: a request, its function and arguments.
+# The methods that read pull requests by URL or branch alone: a request, its function, arguments.
 _FINDER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "LookupPullRequest": (
         pb.LookupPullRequestRequest(pr_url=_OTHER_PR),
@@ -591,6 +594,11 @@ _FINDER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
         pb.GetPullRequestListStatsRequest(pr_urls=[_PR, _OTHER_PR]),
         "pull_request_list_stats",
         {"pr_urls": [_PR, _OTHER_PR]},
+    ),
+    "ListBranchPullRequests": (
+        pb.ListBranchPullRequestsRequest(branch="feature/login"),
+        "branch_pull_requests",
+        {"branch": "feature/login"},
     ),
 }
 
@@ -1035,7 +1043,8 @@ def record_finder_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str,
             calls.append((_function, root, kwargs))
             return {"object": "test"}
 
-        monkeypatch.setattr(github_lookup, function, record)
+        module = github_search if function == "branch_pull_requests" else github_lookup
+        monkeypatch.setattr(module, function, record)
     return calls
 
 
@@ -1100,6 +1109,36 @@ async def test_a_finder_naming_no_usable_url_is_refused_with_nothing_read(
 
     assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
     assert finder_calls == []
+
+
+async def test_a_branch_list_naming_no_branch_is_refused_with_nothing_read(
+    tmp_path: Path, finder_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    """The host refuses a malformed branch itself; the rules are in the input tests."""
+    request = pb.ListBranchPullRequestsRequest(branch="a..b")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "ListBranchPullRequests", request.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert code == Code.INVALID_ARGUMENT.value
+    assert message is not None and message.startswith("branch name must not contain '..'")
+    assert finder_calls == []
+
+
+async def test_a_branch_list_github_cant_answer_is_a_precondition_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unlisted(_root: str, **_kwargs: Any) -> dict[str, Any]:
+        raise PullRequestError("GitHub couldn't list this branch's pull requests. Try again.")
+
+    monkeypatch.setattr(github_search, "branch_pull_requests", unlisted)
+    request = pb.ListBranchPullRequestsRequest(branch="main")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "ListBranchPullRequests", request.SerializeToString())
+    )
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert message == "GitHub couldn't list this branch's pull requests. Try again."
 
 
 @pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))

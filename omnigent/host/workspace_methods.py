@@ -46,7 +46,9 @@ class WorkspaceMethod:
 PULL_REQUEST_FIELDS = frozenset({"pr_url", "pull_requests"})
 # Pull request methods that find pull requests beyond the session's own. Only the server's
 # route serves them, and it sends them with no vouch, since they need none of the session's.
-PULL_REQUEST_FINDERS: frozenset[str] = frozenset({"GetPullRequestListStats", "LookupPullRequest"})
+PULL_REQUEST_FINDERS: frozenset[str] = frozenset(
+    {"GetPullRequestListStats", "ListBranchPullRequests", "LookupPullRequest"}
+)
 
 
 def _snake_case(name: str) -> str:
@@ -58,7 +60,6 @@ def _snake_case(name: str) -> str:
 DECLARED_NOT_SERVED: frozenset[str] = frozenset(
     {
         "GetMergeReadiness",
-        "ListBranchPullRequests",
         "PreviewReviewerPing",
         "SendReviewerPing",
     }

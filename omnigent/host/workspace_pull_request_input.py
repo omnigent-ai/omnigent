@@ -12,6 +12,7 @@ from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
+from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 from omnigent.runner import pr_resource
 from omnigent.runner.github_lookup import MAX_PULL_REQUEST_URLS
 from omnigent.runner.github_review_fields import (
@@ -38,6 +39,8 @@ MAX_LABEL_SEARCH_CHARACTERS = 256
 MAX_SEARCH_CHARACTERS = MAX_LABEL_SEARCH_CHARACTERS
 _COMPLETION_KINDS = frozenset({pb.COMPLETION_KIND_MENTION, pb.COMPLETION_KIND_REFERENCE})
 MAX_IMAGE_URL_CHARACTERS = 2048
+# A ref name's limit on common filesystems.
+MAX_BRANCH_NAME_BYTES = 255
 _LONG_PULL_REQUEST_URL = (
     f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
 )
@@ -113,6 +116,8 @@ def refuse_unserved_request(method: str, request: Any) -> None:
         reason = _named_url_refusal(request.pr_url)
     elif method == "GetPullRequestListStats":
         reason = _list_stats_refusal(request.pr_urls)
+    elif method == "ListBranchPullRequests":
+        reason = _branch_refusal(request.branch)
     elif method == "EnableAutoMerge":
         reason = _auto_merge_refusal(request)
     elif method == "ReadPullRequestImage":
@@ -165,6 +170,20 @@ def _list_stats_refusal(pr_urls: Any) -> str | None:
     if not 1 <= len(pr_urls) <= MAX_PULL_REQUEST_URLS:
         return f"Ask for 1 to {MAX_PULL_REQUEST_URLS} pull requests"
     return next(filter(None, (_named_url_refusal(url) for url in pr_urls)), None)
+
+
+def _branch_refusal(branch: str) -> str | None:
+    """Why ``branch`` can't name a branch, by git's ref rules and its length limit."""
+    if len(branch.encode()) > MAX_BRANCH_NAME_BYTES:
+        return f"The branch name is longer than {MAX_BRANCH_NAME_BYTES} bytes"
+    # ``git check-ref-format --branch`` refuses it; it names the checkout, not a branch.
+    if branch == "HEAD":
+        return "branch name must not be 'HEAD'"
+    try:
+        validate_branch_name(branch)
+    except WorktreeError as exc:
+        return str(exc)
+    return None
 
 
 def _review_refusal(method: str, request: Any) -> str | None:
