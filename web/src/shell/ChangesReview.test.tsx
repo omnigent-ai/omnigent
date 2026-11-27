@@ -1698,6 +1698,21 @@ describe("a review of a worktree inside the workspace", () => {
     );
   });
 
+  it("keeps a worktree's comments and file opener across a parent's renders", () => {
+    mocks.folder = folder();
+    mocks.source.mockReturnValue(source(changes()));
+    const { props, rerender } = renderReview({
+      onCommentOnFile: vi.fn(),
+      onOpenFileInNewTab: vi.fn(),
+    });
+    const first = mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps;
+    rerender(<ChangesReview {...props} />);
+    const next = mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps;
+    expect(mocks.body.mock.calls.length).toBeGreaterThan(1);
+    expect(next.comments).toBe(first.comments);
+    expect(next.onOpenFileInNewTab).toBe(first.onOpenFileInNewTab);
+  });
+
   it("gives its comparison commands the worktree's owner in this session's host and workspace", () => {
     mocks.folder = folder();
     const choosing: unknown[] = [];

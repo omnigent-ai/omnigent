@@ -553,18 +553,16 @@ export function ChangesReview(props: ChangesReviewProps) {
       landing: stands ? landing : undefined,
     };
   }, [holding, sameFolder, onComparisonShown, comparison, shownRoot, stands, landing]);
-  const mapped = useMemo((): ChangesReviewAtProps => {
-    const { onComparisonShown: _recorded, comparisonRoot: _root, ...shared } = props;
-    if (!repository) return { ...shared, ...visit };
+  // A repository's review names files as the session does; kept across renders, so the
+  // review's file actions and comments don't rebuild when the parent renders.
+  const { onViewFile, onCommentOnFile, onOpenFileInNewTab, revealPath } = props;
+  const repositoryActions = useMemo((): Pick<
+    ChangesReviewAtProps,
+    "onViewFile" | "onCommentOnFile" | "onOpenFileInNewTab"
+  > | null => {
+    if (!repository) return null;
     const toSession = (path: string) => workspacePathInRepository(path, repository);
-    const { onViewFile, onCommentOnFile, onOpenFileInNewTab, revealPath } = props;
     return {
-      ...shared,
-      ...visit,
-      // A link to a workspace file shows only if it lies in this repository.
-      revealPath: revealPath
-        ? (repositoryPathOf(revealPath, repository, workspace) ?? undefined)
-        : revealPath,
       onViewFile: (path) => onViewFile(toSession(path)),
       onCommentOnFile:
         onCommentOnFile &&
@@ -572,7 +570,19 @@ export function ChangesReview(props: ChangesReviewProps) {
       onOpenFileInNewTab:
         onOpenFileInNewTab && ((path, options) => onOpenFileInNewTab(toSession(path), options)),
     };
-  }, [props, visit, repository, workspace]);
+  }, [repository, onViewFile, onCommentOnFile, onOpenFileInNewTab]);
+  const { onComparisonShown: _recorded, comparisonRoot: _root, ...shared } = props;
+  const mapped: ChangesReviewAtProps = repositoryActions
+    ? {
+        ...shared,
+        ...visit,
+        ...repositoryActions,
+        // A link to a workspace file shows only if it lies in this repository.
+        revealPath: revealPath
+          ? (repositoryPathOf(revealPath, repository ?? "", workspace) ?? undefined)
+          : revealPath,
+      }
+    : { ...shared, ...visit };
   const folderOwner = useMemo(
     () => (repository ? workingCopyComparisonsAt(repository, workspaceKey) : null),
     [repository, workspaceKey],
