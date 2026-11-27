@@ -29,7 +29,7 @@ and :class:`PolicyResult` from here (or from the
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -78,6 +78,16 @@ _log = logging.getLogger(__name__)
 # (``omnigent.runner.app`` and ``omnigent.runtime.harnesses._scaffold``)
 # can't drift if the set of fail-closed phases changes.
 FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL", "PHASE_REQUEST")
+
+# Cumulative usage the policy engine reports before a session's first LLM call.
+INITIAL_USAGE: Mapping[str, float] = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "total_cost_usd": 0.0,
+}
 
 
 @dataclass(frozen=True)

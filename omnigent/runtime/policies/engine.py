@@ -20,7 +20,7 @@ from omnigent.llms.context_window import ModelPricing, compute_llm_cost
 from omnigent.policies.base import Policy
 from omnigent.policies.function import FunctionPolicy
 from omnigent.policies.schema import AUTOMATIC_RUNTIME_STATE_KEYS, is_reserved_state_key
-from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.policies.types import INITIAL_USAGE, EvaluationContext, PolicyResult
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     LabelDef,
@@ -138,17 +138,7 @@ class PolicyEngine:
         self._root_conversation_id = root_conversation_id or conversation_id
         self._labels = dict(initial_labels)
         self._session_state: dict[str, Any] = dict(initial_session_state or {})
-        self._usage: dict[str, float] = dict(
-            initial_usage
-            or {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "total_cost_usd": 0.0,
-            }
-        )
+        self._usage: dict[str, float] = dict(initial_usage or INITIAL_USAGE)
         # Ensure cache-token keys exist even when seeded from old
         # persisted usage that predates cache-token tracking.
         self._usage.setdefault("cache_read_input_tokens", 0)

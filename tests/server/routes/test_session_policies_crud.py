@@ -8,7 +8,8 @@ a ``policy_store``. These tests use the shared policy app with a route-only clie
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import sys
+from collections.abc import AsyncIterator, Iterator
 from unittest.mock import patch
 
 import httpx
@@ -106,6 +107,62 @@ async def test_create_session_policy_unregistered_python(
         ),
     )
     assert resp.status_code == 400
+
+
+@pytest.fixture()
+def restore_recursion_limit() -> Iterator[None]:
+    """
+    Undo the process-wide recursion limit that CEL validation raises.
+
+    Later tests in this worker, such as nested config parsing, rely on the default.
+    """
+    limit = sys.getrecursionlimit()
+    yield
+    sys.setrecursionlimit(limit)
+
+
+@pytest.mark.usefixtures("restore_recursion_limit")
+async def test_create_session_cel_policy_rejects_expression_failing_on_a_phase(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """A CEL policy that cannot evaluate on some event type is not stored."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies",
+        json=_policy_payload(
+            name="unguarded_cel",
+            type="python",
+            handler="omnigent.policies.builtins.cel.cel_policy",
+            factory_params={
+                "expression": 'event.data.name == "sys_os_shell" ? {"result": "DENY"} : null'
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "fails to evaluate a request event" in resp.json()["error"]["message"]
+    listed = await client.get(f"/v1/sessions/{session_id}/policies")
+    assert [p for p in listed.json()["data"] if p["source"] == "session"] == []
+
+
+@pytest.mark.usefixtures("restore_recursion_limit")
+async def test_create_session_cel_policy_accepts_guarded_expression(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """A CEL policy that evaluates on every event type is stored."""
+    expression = (
+        'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+        ' ? {"result": "DENY"} : null'
+    )
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies",
+        json=_policy_payload(
+            name="guarded_cel",
+            type="python",
+            handler="omnigent.policies.builtins.cel.cel_policy",
+            factory_params={"expression": expression},
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["factory_params"] == {"expression": expression}
 
 
 # ── GET /sessions/{session_id}/policies ───────────────────────────────

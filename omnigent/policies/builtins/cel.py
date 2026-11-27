@@ -74,6 +74,7 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Mapping, Sequence
+from typing import cast
 
 try:
     import celpy
@@ -85,6 +86,7 @@ try:
 except ImportError:
     celpy = None  # type: ignore[assignment]
 
+from omnigent.policies.function import _build_event
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -92,6 +94,8 @@ from omnigent.policies.schema import (
     is_reserved_state_key,
     request_user_text,
 )
+from omnigent.policies.types import INITIAL_USAGE, EvaluationContext
+from omnigent.spec.types import Phase
 
 _log = logging.getLogger(__name__)
 
@@ -170,19 +174,7 @@ def cel_policy(
     _state_updates_key = celpy.celtypes.StringType("state_updates")
 
     def evaluate(event: PolicyEvent) -> PolicyResponse | None:
-        # llm_client is a live object used by Python policy callables;
-        # CEL expressions cannot call methods on it and json_to_cel would
-        # raise ValueError trying to convert it.
-        cel_event = {k: v for k, v in event.items() if k != "llm_client"}
-        # REQUEST-phase ``data`` is now the structured dict
-        # ({"user_content", "attachments"}) from the input gate, but CEL
-        # expressions authored against the request phase expect the user text as
-        # a bare string (e.g. ``event.data.contains("secret")``). Project it back
-        # to that string so existing request-phase CEL policies keep matching — a
-        # map here would silently fail-open (string ops raise -> abstain -> ALLOW,
-        # and ``==`` against a string is just false).
-        if event.get("type") == "request":
-            cel_event["data"] = request_user_text(event.get("data"))
+        cel_event = _cel_event(event)
         try:
             result = prog.evaluate({"event": json_to_cel(cel_event)})
         except (CELEvalError, ValueError, TypeError):
@@ -242,6 +234,127 @@ def _compile(expression: str) -> Runner:
     """
     env = Environment()
     return env.program(env.compile(expression))
+
+
+def _cel_event(event: PolicyEvent) -> dict[str, object]:
+    """
+    Project a policy event onto the value CEL expressions see as ``event``.
+
+    :param event: The policy event, e.g. ``{"type": "response", "data": "Done."}``.
+    :returns: The event without its live ``llm_client``, with REQUEST-phase
+        ``data`` reduced to the user's text.
+    """
+    # llm_client is a live object used by Python policy callables;
+    # CEL expressions cannot call methods on it and json_to_cel would
+    # raise ValueError trying to convert it.
+    cel_event: dict[str, object] = {k: v for k, v in event.items() if k != "llm_client"}
+    # Request policies expect the user text as a string (``event.data.contains``);
+    # the input gate's structured map would make their string ops fail open.
+    if event.get("type") == "request":
+        cel_event["data"] = request_user_text(event.get("data"))
+    return cel_event
+
+
+# Payloads that match no tool, model or text, so a dry run reaches the same
+# type-specific field accesses an unrelated real event would.
+_DRY_RUN_CONTENT: dict[Phase, object] = {
+    Phase.REQUEST: {"user_content": "", "attachments": []},
+    Phase.TOOL_CALL: {"name": "", "arguments": {}},
+    Phase.TOOL_RESULT: {"result": ""},
+    Phase.RESPONSE: "",
+    Phase.LLM_REQUEST: {
+        "model": "",
+        "messages_count": 0,
+        "tools_count": 0,
+        "system_prompt_preview": "",
+        "last_user_message": "",
+    },
+    Phase.LLM_RESPONSE: {"model": "", "text_preview": "", "tool_calls_count": 0},
+}
+
+
+def _dry_run_event(phase: Phase) -> PolicyEvent:
+    """
+    Build the event a policy receives in *phase*, with neutral values.
+
+    Uses the runtime's event builder plus the identity and usage fields the
+    engine injects, so a dry run sees every field a real event carries.
+
+    :param phase: The enforcement point, e.g. ``Phase.TOOL_CALL``.
+    :returns: An event without user content.
+    """
+    is_tool_phase = phase in (Phase.TOOL_CALL, Phase.TOOL_RESULT)
+    tool_call = _DRY_RUN_CONTENT[Phase.TOOL_CALL]
+    return _build_event(
+        EvaluationContext(
+            phase=phase,
+            content=_DRY_RUN_CONTENT[phase],
+            tool_name="" if is_tool_phase else None,
+            actor={"run_as": "", "client_id": ""},
+            request_data=tool_call if phase is Phase.TOOL_RESULT else None,
+            session_state={},
+            usage=dict(INITIAL_USAGE),
+            model="",
+            conversation_id="",
+        )
+    )
+
+
+def _contains_eval_error(value: object) -> bool:
+    """
+    Whether an evaluation result holds an error that CEL returned instead of raising.
+
+    :param value: A value returned by ``Runner.evaluate``, e.g. the map from
+        ``{"result": event.data.name == "x" ? "DENY" : "ALLOW"}`` on a request.
+    :returns: ``True`` when the value, or a value nested in it, is a ``CELEvalError``.
+    """
+    if isinstance(value, CELEvalError):
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_eval_error(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_eval_error(item) for item in value)
+    return False
+
+
+def validate_cel_policy_params(factory_params: dict[str, object]) -> str | None:
+    """
+    Explain why CEL policy arguments would not enforce, before they are stored.
+
+    Compiles the expression, then evaluates it on one neutral event per phase.
+    Session policies see every phase and an evaluation error abstains, so an
+    expression that fails here does not apply to such events.
+
+    :param factory_params: Schema-checked :func:`cel_policy` arguments, e.g.
+        ``{"expression": 'event.type == "tool_call" ? {"result": "ASK"} : null'}``.
+    :returns: An error naming the failing phase, or ``None`` when the
+        expression evaluates on every phase.
+    """
+    # Environment() raises the recursion limit deep expressions need.
+    Environment()
+    try:
+        program = _compile(cast(str, factory_params["expression"]))
+    except CELParseError as exc:
+        return f"CEL policy: compile error in expression: {exc}"
+    for phase in _DRY_RUN_CONTENT:
+        activation = {"event": json_to_cel(_cel_event(_dry_run_event(phase)))}
+        try:
+            failed = _contains_eval_error(program.evaluate(activation))
+        except RecursionError:
+            return (
+                f"CEL policy: expression is nested too deeply to evaluate a {phase.value} event."
+            )
+        # cel-python raises some failures as plain Python errors, e.g. OverflowError from int().
+        except Exception:  # noqa: BLE001
+            failed = True
+        if failed:
+            return (
+                f"CEL policy: expression fails to evaluate a {phase.value} event, and a failed "
+                "evaluation abstains. Guard fields that some events lack, e.g. "
+                'event.type == "tool_call" && event.data.name == "sys_os_shell", '
+                "or has(event.session_state.count)."
+            )
+    return None
 
 
 @functools.lru_cache(maxsize=_PROGRAM_CACHE_SIZE)
@@ -346,6 +459,9 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                             " for llm_request); "
                             "event.context.actor.run_as (user email); "
                             "event.context.usage.total_cost_usd (session spend). "
+                            "The expression runs on every event type, so guard "
+                            "type-specific fields with event.type; an expression that "
+                            "fails to evaluate on any event type is rejected. "
                             "Example: "
                             'event.type == "tool_call" && event.data.name == "sys_os_shell" '
                             '? {"result": "DENY", "reason": "Shell blocked."} '
@@ -362,6 +478,7 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                 },
                 "required": ["expression"],
             },
+            "params_validator": validate_cel_policy_params,
         },
     ]
 )

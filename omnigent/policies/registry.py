@@ -22,9 +22,14 @@ from __future__ import annotations
 
 import importlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 _logger = logging.getLogger(__name__)
+
+# A handler's check beyond its params schema: returns an error message, or None.
+ParamsValidator = Callable[[dict[str, object]], str | None]
 
 # Bundle-fetch response headers. The server sends its configured policy_modules and whether it
 # is a local single-user server; the runner uses them to decide handler authority for a bundle.
@@ -67,6 +72,8 @@ class PolicyRegistryEntry:
 _registry: list[PolicyRegistryEntry] = []
 # Lookup by handler path for O(1) schema retrieval.
 _registry_by_handler: dict[str, PolicyRegistryEntry] = {}
+# Declared params validators by handler path; kept off the served entries.
+_params_validators: dict[str, ParamsValidator] = {}
 
 
 def _string_object_dict(value: object) -> dict[str, object] | None:
@@ -104,6 +111,9 @@ def load_registry(
     logged and skipped — a broken module should not prevent
     the server from starting.
 
+    An entry may declare a ``params_validator`` callable, which
+    :func:`validate_factory_params` runs after its schema checks pass.
+
     :param extra_modules: Additional dotted module paths to
         scan for ``POLICY_REGISTRY`` lists. Sourced from the
         server config's ``policy_modules`` key. ``None`` and
@@ -113,6 +123,7 @@ def load_registry(
 
     _registry.clear()
     _registry_by_handler.clear()
+    _params_validators.clear()
 
     all_modules = list(BUILTIN_POLICY_MODULES) + list(extra_modules or [])
     for module_path in all_modules:
@@ -166,6 +177,9 @@ def load_registry(
             )
             _registry.append(entry)
             _registry_by_handler[entry.handler] = entry
+            params_validator = declaration.get("params_validator")
+            if callable(params_validator):
+                _params_validators[entry.handler] = cast(ParamsValidator, params_validator)
 
     _logger.info(
         "Policy registry loaded: %d entries from %d modules",
@@ -279,6 +293,8 @@ def validate_factory_params(
     Returns an error message string if validation fails, or
     ``None`` if valid. Does not validate if the handler is not
     in the registry (custom policies are allowed without schema).
+    Params that pass the schema then go to the handler's declared
+    ``params_validator``, if any (e.g. the CEL policy's dry run).
 
     :param handler: Full dotted import path.
     :param factory_params: The params to validate.
@@ -343,7 +359,8 @@ def validate_factory_params(
                 f"got {type(value).__name__}"
             )
 
-    return None
+    params_validator = _params_validators.get(handler)
+    return params_validator(factory_params) if params_validator is not None else None
 
 
 def _type_matches(value: object, json_type: str) -> bool:

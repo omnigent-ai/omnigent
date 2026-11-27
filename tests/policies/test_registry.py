@@ -8,12 +8,22 @@ declared schemas.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.policies.registry import (
     get_params_schema,
     get_registry,
     is_registered_handler,
     load_registry,
     validate_factory_params,
+)
+
+_CEL_HANDLER = "omnigent.policies.builtins.cel.cel_policy"
+# OR-chained tool-name checks read tool-call fields on events that lack them.
+_UNGUARDED_TOOL_NAME_CHAIN = (
+    "("
+    + " || ".join(f'event.data.name == "tool_{index}"' for index in range(64))
+    + ') ? {"result": "DENY"} : {"result": "ALLOW"}'
 )
 
 # ── load_registry + get_registry ────────────────────────────────────────────
@@ -181,6 +191,85 @@ def test_validate_skips_unknown_handler() -> None:
         {"anything": "goes"},
     )
     assert error is None
+
+
+@pytest.mark.parametrize(
+    ("expression", "failing_phase"),
+    [
+        (_UNGUARDED_TOOL_NAME_CHAIN, "request"),
+        ('event.type == "tool_call" && event.data.arguments.command == "rm"', "tool_call"),
+        ('event.type == "tool_result" && event.data.missing == "x"', "tool_result"),
+        ('event.type == "response" && event.data.missing == "x"', "response"),
+        ('event.type == "llm_request" && event.data.missing == "x"', "llm_request"),
+        ('event.type == "llm_response" && event.data.missing == "x"', "llm_response"),
+        ('{"result": event.data.name == "sys_os_shell" ? "DENY" : "ALLOW"}', "request"),
+        ('int(1e309) > 0 ? {"result": "DENY"} : null', "request"),
+    ],
+    ids=[
+        "unguarded-tool-name-chain",
+        "missing-tool-argument",
+        "tool-result",
+        "response",
+        "llm-request",
+        "llm-response",
+        "error-inside-result-map",
+        "numeric-overflow",
+    ],
+)
+def test_validate_cel_rejects_expression_failing_on_a_phase(
+    expression: str, failing_phase: str
+) -> None:
+    """A CEL expression that fails on one event type would abstain on those events."""
+    load_registry()
+    error = validate_factory_params(_CEL_HANDLER, {"expression": expression})
+    assert error is not None
+    assert f"fails to evaluate a {failing_phase} event" in error
+
+
+def test_validate_cel_rejects_too_deeply_nested_expression() -> None:
+    """Exhausting the evaluator's recursion limit is a validation error, not a crash."""
+    load_registry()
+    error = validate_factory_params(_CEL_HANDLER, {"expression": "(" * 2000 + "true" + ")" * 2000})
+    assert error is not None
+    assert "nested too deeply to evaluate a request event" in error
+
+
+def test_validate_cel_rejects_syntax_error() -> None:
+    """A CEL syntax error is reported when the policy is created."""
+    load_registry()
+    error = validate_factory_params(_CEL_HANDLER, {"expression": "event.type ==== bad"})
+    assert error is not None
+    assert "compile error" in error
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+        ' ? {"result": "DENY"} : {"result": "ALLOW"}',
+        'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+        ' && event.data.arguments.command.contains("rm") ? {"result": "DENY"} : null',
+        "event.target == 'sys_os_shell' ? {'result': 'DENY'} : null",
+        'event.type == "request" && event.data.contains("secret") ? {"result": "DENY"} : null',
+        'event.context.usage.total_cost_usd > 5.0 ? {"result": "ASK"} : null',
+        'event.context.actor.run_as.endsWith("@example.com") ? null : {"result": "DENY"}',
+        "has(event.session_state.count) && event.session_state.count > 5"
+        ' ? {"result": "DENY"} : null',
+    ],
+    ids=[
+        "guarded-tool-name",
+        "guarded-tool-argument",
+        "tool-target",
+        "request-text",
+        "session-cost",
+        "actor",
+        "guarded-session-state",
+    ],
+)
+def test_validate_cel_accepts_expression_evaluating_on_every_phase(expression: str) -> None:
+    """Guarded expressions and engine-provided context fields pass the dry run."""
+    load_registry()
+    assert validate_factory_params(_CEL_HANDLER, {"expression": expression}) is None
 
 
 # ── is_registered_handler (allowlist) ──────────────────────────────

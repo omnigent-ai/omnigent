@@ -7,7 +7,8 @@ supply one, so these tests use the shared policy app with a route-only client.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import sys
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -165,6 +166,39 @@ async def test_create_policy_unregistered_python_handler(policy_client: httpx.As
         ),
     )
     assert resp.status_code == 400
+
+
+@pytest.fixture()
+def restore_recursion_limit() -> Iterator[None]:
+    """
+    Undo the process-wide recursion limit that CEL validation raises.
+
+    Later tests in this worker, such as nested config parsing, rely on the default.
+    """
+    limit = sys.getrecursionlimit()
+    yield
+    sys.setrecursionlimit(limit)
+
+
+@pytest.mark.usefixtures("restore_recursion_limit")
+async def test_create_cel_policy_rejects_expression_failing_on_a_phase(
+    policy_client: httpx.AsyncClient,
+) -> None:
+    """A default CEL policy that cannot evaluate on some event type is not stored."""
+    resp = await policy_client.post(
+        "/v1/policies",
+        json=_policy_payload(
+            name="unguarded_cel",
+            handler="omnigent.policies.builtins.cel.cel_policy",
+            factory_params={
+                "expression": 'event.data.name == "sys_os_shell" ? {"result": "DENY"} : null'
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "fails to evaluate a request event" in resp.json()["error"]["message"]
+    listed = await policy_client.get("/v1/policies")
+    assert "unguarded_cel" not in [policy["name"] for policy in listed.json()["data"]]
 
 
 # ── GET /v1/policies ─────────────────────────────────────────────────
