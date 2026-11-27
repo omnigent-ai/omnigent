@@ -7,10 +7,8 @@ import json
 import os
 import shlex
 import shutil
-import statistics
 import subprocess
 import sys
-import time
 from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -436,70 +434,6 @@ print(json.dumps({
         assert await _helper_process(registry, spec) is original
         assert original.poll() is None
         upstream.assert_not_awaited()
-    finally:
-        await registry.cleanup_session("live-shell")
-
-
-@pytest.mark.skipif(not _LIVE_LINUX, reason="requires Linux and Bubblewrap")
-@pytest.mark.skipif(
-    os.environ.get("OMNIGENT_SHELL_LATENCY_EVIDENCE") != "1",
-    reason="opt-in latency evidence; lifecycle correctness runs independently",
-)
-@pytest.mark.asyncio
-@pytest.mark.timeout(60)
-async def test_real_runner_shell_reuse_records_latency_against_disposable_calls(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Record opt-in timing evidence; lifecycle cases enforce correctness separately.
-
-    There is no performance threshold: shared-runner timings are diagnostic.
-    Enable with OMNIGENT_SHELL_LATENCY_EVIDENCE=1 when collecting measurements.
-    """
-    spec = _spec(tmp_path)
-    _require_request_launcher(spec, tmp_path)
-    (tmp_path / "note.txt").write_text("ready\n")
-    starts: list[_HelperProcessClient] = []
-    start = _HelperProcessClient._start_locked
-
-    def record_start(helper: _HelperProcessClient) -> None:
-        starts.append(helper)
-        start(helper)
-
-    monkeypatch.setattr(_HelperProcessClient, "_start_locked", record_start)
-    registry = SessionResourceRegistry()
-    execute = partial(_execute_os_env_tool, agent_spec=spec, conversation_id="live-shell")
-    samples: dict[str, list[float]] = {"warm": [], "disposable": []}
-    try:
-        await execute("sys_os_read", {"path": "note.txt"}, resource_registry=registry)
-        original = await _helper_process(registry, spec)
-        for mode, owner in (("warm", registry), ("disposable", None)):
-            before = len(starts)
-            for _ in range(3):
-                began = time.perf_counter()
-                result = json.loads(
-                    await execute(
-                        "sys_os_shell",
-                        {"command": "printf verified", "timeout": 10},
-                        resource_registry=owner,
-                    )
-                )
-                samples[mode].append(time.perf_counter() - began)
-                assert result["stdout"] == "verified" and result["exit_code"] == 0
-            assert len(starts) - before == (0 if mode == "warm" else 3)
-        assert await _helper_process(registry, spec) is original
-        print(
-            json.dumps(
-                {
-                    "entry_point": "runner-local sys_os_shell",
-                    "backend": "linux_bwrap",
-                    "provider_calls": 0,
-                    "samples_seconds": samples,
-                    "median_seconds": {
-                        mode: statistics.median(values) for mode, values in samples.items()
-                    },
-                }
-            )
-        )
     finally:
         await registry.cleanup_session("live-shell")
 
