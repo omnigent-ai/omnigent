@@ -332,6 +332,7 @@ def test_a_member_github_answered_wrongly_is_a_gap(
         ({"updatedAt": "\uff12\uff10\uff12\uff16-01-02T03:04:05Z"}, {"updated_at": None}),
         ({"updatedAt": "yesterday"}, {"updated_at": None}),
         ({"updatedAt": "2026-01-02 03:04:05"}, {"updated_at": None}),
+        ({"updatedAt": "2026-13-45T25:61:61Z"}, {"updated_at": None}),
         ({"headRefOid": "A" * 40}, {"head_sha": None}),
         ({"baseRefOid": "abc"}, {"base_sha": None}),
         ({"baseRefName": "é" * 128}, {"base_ref": None}),
@@ -369,6 +370,7 @@ def test_a_member_github_answered_wrongly_is_a_gap(
         "updated-other-digits",
         "updated-not-a-time",
         "updated-not-iso",
+        "updated-impossible-date",
         "head-sha-uppercase",
         "base-sha-short",
         "base-ref-256-bytes",
@@ -417,21 +419,18 @@ def test_fields_at_their_limits_are_kept(fake: FakeGraphQL) -> None:
     )
 
 
-def test_entries_with_no_position_are_dropped_and_odd_positions_kept(fake: FakeGraphQL) -> None:
+def test_repeated_and_out_of_range_positions_are_kept(fake: FakeGraphQL) -> None:
     """The page's model marks repeated or out-of-range positions; the host invents no order."""
     fake.answer = _answer(
         [
-            {"position": "1", "pullRequest": _member(1)},
+            {"position": 9, "pullRequest": _member(1)},
             {"position": 9, "pullRequest": _member(2)},
-            {"position": 9, "pullRequest": _member(3)},
-            # Past GraphQL's largest Int, so GitHub never sent it.
-            {"position": 2**31, "pullRequest": _member(4)},
-            {"position": 2**31 - 1, "pullRequest": _member(5)},
-            "not an entry",
+            {"position": 0, "pullRequest": _member(3)},
+            {"position": 2**31 - 1, "pullRequest": _member(4)},
         ]
     )
 
-    assert [entry["position"] for entry in _entries(_read())] == [9, 9, 2**31 - 1]
+    assert [entry["position"] for entry in _entries(_read())] == [9, 9, 0, 2**31 - 1]
 
 
 @pytest.mark.parametrize("login", ["octocat", "github-actions[bot]", "example-app[bot]"])
@@ -443,10 +442,11 @@ def test_the_account_it_was_read_as_may_be_a_user_or_an_app(fake: FakeGraphQL, l
 
 
 def test_a_member_github_hides_is_a_gap(fake: FakeGraphQL) -> None:
+    """The error decides, even where the answer still has usable data at that path."""
     nodes = [
         {"position": 1, "pullRequest": None},
         {"position": 2, "pullRequest": _member(2)},
-        {"position": 3, "pullRequest": None},
+        {"position": 3, "pullRequest": _member(3)},
     ]
     fake.answer = _answer(nodes)
     fake.answer["errors"] = [
@@ -468,21 +468,29 @@ def test_a_member_github_hides_is_a_gap(fake: FakeGraphQL) -> None:
     ("field", "shaped"),
     [
         (["headRepository"], {"head_repository": None}),
+        (["headRepository", "nameWithOwner"], {"head_repository": None}),
         (["baseRepository"], {"base_repository": None, "base_default_branch": None}),
+        (["baseRepository", "nameWithOwner"], {"base_repository": None}),
         (["baseRepository", "defaultBranchRef"], {"base_default_branch": None}),
+        (["baseRepository", "defaultBranchRef", "name"], {"base_default_branch": None}),
     ],
-    ids=["private-fork", "base-repository", "default-branch"],
+    ids=[
+        "private-fork",
+        "private-fork-name",
+        "base-repository",
+        "base-repository-name",
+        "default-branch",
+        "default-branch-name",
+    ],
 )
 def test_a_field_github_hides_inside_a_member_is_left_out_and_the_member_kept(
     fake: FakeGraphQL, field: list[str], shaped: dict[str, Any]
 ) -> None:
-    """A private fork's head repository says nothing about the PR itself."""
-    member = _member(3)
-    if field == ["baseRepository", "defaultBranchRef"]:
-        member["baseRepository"]["defaultBranchRef"] = None
-    else:
-        member[field[0]] = None
-    fake.answer = _answer([{"position": 3, "pullRequest": member}])
+    """A private fork's head repository says nothing about the PR itself.
+
+    The member keeps its usable values at the hidden path, so only the error can leave it out.
+    """
+    fake.answer = _answer([{"position": 3, "pullRequest": _member(3)}])
     fake.answer["errors"] = [
         {"type": "FORBIDDEN", "path": [*_NODES, 0, "pullRequest", *field], "message": "secret"}
     ]
@@ -493,7 +501,7 @@ def test_a_field_github_hides_inside_a_member_is_left_out_and_the_member_kept(
 
 
 def test_a_required_field_github_hides_makes_its_member_a_gap(fake: FakeGraphQL) -> None:
-    fake.answer = _answer([{"position": 3, "pullRequest": _member(3, headRefName=None)}])
+    fake.answer = _answer([{"position": 3, "pullRequest": _member(3)}])
     fake.answer["errors"] = [
         {"type": "FORBIDDEN", "path": [*_NODES, 0, "pullRequest", "headRefName"], "message": "x"}
     ]
@@ -557,6 +565,8 @@ def test_a_host_without_stacks_cant_say(fake: FakeGraphQL, fields: list[tuple[st
         [{"type": "FORBIDDEN", "path": [*_NODES, 7, "pullRequest"], "message": "no such entry"}],
         [{"type": "SOMETHING_NEW", "path": [*_NODES, 0, "pullRequest"], "message": "x"}],
         "not a list",
+        ["not an error"],
+        [{"type": "FORBIDDEN", "path": [*_NODES, 0, "pullRequest", 5], "message": "x"}],
         {},
         "",
         0,
@@ -574,6 +584,8 @@ def test_a_host_without_stacks_cant_say(fake: FakeGraphQL, fields: list[tuple[st
         "path-to-no-entry",
         "unknown-type",
         "errors-not-a-list",
+        "error-not-an-object",
+        "hidden-path-part-not-text",
         "errors-empty-object",
         "errors-empty-text",
         "errors-zero",
@@ -595,10 +607,31 @@ def test_any_other_error_is_a_failure_that_names_nothing_github_said(
     assert str(failed.value) == UNREADABLE
 
 
-def _without(key: str) -> dict[str, Any]:
+def _without(*path: str) -> dict[str, Any]:
+    """The default answer with the key at ``path``, under ``data``, removed."""
     answer = _answer()
-    del answer["data"]["repository"]["pullRequest"][key]
+    target = answer["data"]
+    for key in path[:-1]:
+        target = target[key]
+    del target[path[-1]]
     return answer
+
+
+def _member_without(key: str) -> dict[str, Any]:
+    member = _member(2)
+    del member[key]
+    return member
+
+
+def _with_entry(entry: Any) -> dict[str, Any]:
+    """An answer whose stack of three has ``entry`` in the middle."""
+    return _answer(
+        [
+            {"position": 1, "pullRequest": _member(1)},
+            entry,
+            {"position": 3, "pullRequest": _member(3)},
+        ]
+    )
 
 
 def _with(path: list[str], value: Any) -> dict[str, Any]:
@@ -634,8 +667,44 @@ def _with(path: list[str], value: Any) -> dict[str, Any]:
         {"data": None},
         ["not", "an", "answer"],
         # Missing isn't null: an answer without the stack would read as no stack.
-        _without("stack"),
-        _without("stackEntry"),
+        _without("repository", "pullRequest", "stack"),
+        _without("repository", "pullRequest", "stackEntry"),
+        _without("viewer"),
+        _without("viewer", "login"),
+        _without("repository", "pullRequest", "number"),
+        _without("repository", "pullRequest", "stack", "id"),
+        _without("repository", "pullRequest", "stack", "entries", "pageInfo", "hasNextPage"),
+        _with(["repository"], None),
+        _with(["viewer", "login"], 5),
+        _with(["repository", "pullRequest", "number"], "2"),
+        _with(["repository", "pullRequest", "stackEntry"], []),
+        _with(["repository", "pullRequest", "stackEntry"], {}),
+        _with(["repository", "pullRequest", "stack"], []),
+        _with(["repository", "pullRequest", "stack", "entries"], None),
+        _with(["repository", "pullRequest", "stack", "entries", "nodes"], None),
+        _with(["repository", "pullRequest", "stack", "entries", "pageInfo", "hasNextPage"], "no"),
+        # A member is an object or null; any other shape isn't GitHub's.
+        _with_entry({"position": 2, "pullRequest": "PR 2"}),
+        _with_entry({"position": 2, "pullRequest": [_member(2)]}),
+        _with_entry({"position": 2, "pullRequest": _member_without("title")}),
+        _with_entry({"position": 2, "pullRequest": _member_without("headRepository")}),
+        _with_entry({"position": 2, "pullRequest": _member(2, headRepository=REPOSITORY)}),
+        _with_entry(
+            {
+                "position": 2,
+                "pullRequest": _member(2, baseRepository={"nameWithOwner": REPOSITORY}),
+            }
+        ),
+        # A malformed entry, dropped quietly, would read as a shorter stack.
+        _with_entry("not an entry"),
+        _with_entry(None),
+        _with_entry({"pullRequest": _member(2)}),
+        _with_entry({"position": None, "pullRequest": _member(2)}),
+        _with_entry({"position": True, "pullRequest": _member(2)}),
+        _with_entry({"position": "2", "pullRequest": _member(2)}),
+        _with_entry({"position": 2**31, "pullRequest": _member(2)}),
+        _with_entry({"position": -(2**31) - 1, "pullRequest": _member(2)}),
+        _with_entry({"position": 2}),
     ],
     ids=[
         "viewer-with-space",
@@ -660,6 +729,35 @@ def _with(path: list[str], value: Any) -> dict[str, Any]:
         "list",
         "no-stack-key",
         "no-stack-entry-key",
+        "no-viewer-key",
+        "no-login-key",
+        "no-pull-request-number-key",
+        "no-stack-id-key",
+        "no-has-next-page-key",
+        "no-repository",
+        "viewer-login-number",
+        "pull-request-number-as-text",
+        "stack-entry-as-list",
+        "stack-entry-no-position",
+        "stack-as-list",
+        "entries-null",
+        "nodes-null",
+        "has-next-page-as-text",
+        "member-as-text",
+        "member-as-list",
+        "member-no-title-key",
+        "member-no-head-repository-key",
+        "head-repository-as-text",
+        "base-repository-no-default-branch-key",
+        "entry-not-an-object",
+        "entry-null",
+        "entry-no-position",
+        "entry-position-null",
+        "entry-position-boolean",
+        "entry-position-as-text",
+        "entry-position-past-int",
+        "entry-position-below-int",
+        "entry-no-pull-request-key",
     ],
 )
 def test_an_answer_that_isnt_githubs_is_a_failure(fake: FakeGraphQL, answer: Any) -> None:

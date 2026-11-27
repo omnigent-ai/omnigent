@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from omnigent.runner import github_resource as github
@@ -46,13 +48,107 @@ _STACK_FIELDS = {
 }
 _HIDDEN = frozenset({"FORBIDDEN", "NOT_FOUND"})
 _ENTRIES_PATH = ("repository", "pullRequest", "stack", "entries", "nodes")
-# A member's fields that may be hidden from this account while the PR itself is visible,
-# and the answer's fields each one leaves out.
+# A member's parts that may be hidden from this account while the PR itself is visible, by
+# the start of the hidden path, and the answer's fields each one leaves out. The longest
+# matching start applies; a hidden path no start matches makes the member a gap.
 _OPTIONAL_PARTS = {
     ("headRepository",): ("head_repository",),
     ("baseRepository",): ("base_repository", "base_default_branch"),
+    ("baseRepository", "nameWithOwner"): ("base_repository",),
     ("baseRepository", "defaultBranchRef"): ("base_default_branch",),
 }
+
+
+@dataclass(frozen=True)
+class _Object:
+    """An object the query asks for: every key it names must be in the answer."""
+
+    fields: dict[str, Any] = field(default_factory=dict)
+    nullable: bool = False
+
+
+@dataclass(frozen=True)
+class _List:
+    item: _Object
+
+
+# A scalar: present, with its value checked where it's shaped.
+_SCALAR = None
+_REPOSITORY_OBJECT = _Object({"nameWithOwner": _SCALAR}, nullable=True)
+_MEMBER = _Object(
+    {
+        **dict.fromkeys(
+            (
+                "url",
+                "number",
+                "title",
+                "state",
+                "isDraft",
+                "updatedAt",
+                "reviewDecision",
+                "headRefName",
+                "headRefOid",
+                "baseRefName",
+                "baseRefOid",
+            ),
+            _SCALAR,
+        ),
+        "headRepository": _REPOSITORY_OBJECT,
+        "baseRepository": _Object(
+            {
+                "nameWithOwner": _SCALAR,
+                "defaultBranchRef": _Object({"name": _SCALAR}, nullable=True),
+            },
+            nullable=True,
+        ),
+    },
+    # Null where GitHub hides the PR, or it no longer exists.
+    nullable=True,
+)
+_STACK = _Object(
+    {
+        **dict.fromkeys(("id", "number", "size", "baseRefName"), _SCALAR),
+        "entries": _Object(
+            {
+                "pageInfo": _Object({"hasNextPage": _SCALAR}),
+                "nodes": _List(_Object({"position": _SCALAR, "pullRequest": _MEMBER})),
+            }
+        ),
+    },
+    nullable=True,
+)
+# The answer this read accepts. A null GitHub may send elsewhere, such as for a repository
+# or pull request it can't find, isn't an answer the read can show.
+_DATA = _Object(
+    {
+        "viewer": _Object({"login": _SCALAR}),
+        "repository": _Object(
+            {
+                "pullRequest": _Object(
+                    {
+                        "number": _SCALAR,
+                        "stackEntry": _Object({"position": _SCALAR}, nullable=True),
+                        "stack": _STACK,
+                    }
+                )
+            }
+        ),
+    }
+)
+
+
+def _conforms(value: Any, shape: _Object | _List | None) -> bool:
+    """Whether ``value`` has ``shape``'s objects, lists and keys; scalars are checked later."""
+    if shape is _SCALAR:
+        return True
+    if isinstance(shape, _List):
+        return isinstance(value, list) and all(_conforms(item, shape.item) for item in value)
+    if value is None:
+        return shape.nullable
+    return isinstance(value, dict) and all(
+        key in value and _conforms(value[key], part) for key, part in shape.fields.items()
+    )
+
 
 _QUERY = f"""query($owner: String!, $name: String!, $number: Int!) {{
   viewer {{ login }}
@@ -119,6 +215,23 @@ def _matching(pattern: re.Pattern[str], value: Any) -> str | None:
     return value if isinstance(value, str) and pattern.fullmatch(value) else None
 
 
+def _timestamp(value: Any) -> str | None:
+    """A UTC time as GitHub writes one, which must also be a real date and time."""
+    if _matching(_TIMESTAMP, value) is None:
+        return None
+    try:
+        datetime.strptime(value.removesuffix("Z") + "+0000", "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+    return value
+
+
+def _left_out(part: tuple[str, ...]) -> tuple[str, ...] | None:
+    """The answer's fields a hidden ``part`` of a member leaves out; ``None`` if it's required."""
+    starts = [start for start in _OPTIONAL_PARTS if part[: len(start)] == start]
+    return _OPTIONAL_PARTS[max(starts, key=len)] if starts else None
+
+
 def _count(value: Any, *, least: int, most: int) -> int | None:
     is_integer = isinstance(value, int) and not isinstance(value, bool)
     return value if is_integer and least <= value <= most else None
@@ -166,36 +279,36 @@ def _hidden_parts(errors: list[Any], entry_count: int) -> dict[int, set[tuple[st
 
 
 def _member(node: Any, reference: PullRequestRef, hidden: set[tuple[str, ...]]) -> dict[str, Any]:
-    """An entry's PR as the page reads it: ``None`` where it can't be trusted or is hidden."""
-    if () in hidden or not isinstance(node, dict):
+    """An entry's PR as the page reads it: ``None`` where it can't be trusted or is hidden.
+
+    ``node`` has the member's shape already: an object with every key, or null.
+    """
+    if () in hidden or node is None:
         return {"pullRequest": None}
-    left_out = {
-        field for part, fields in _OPTIONAL_PARTS.items() if part in hidden for field in fields
-    }
-    if any(part not in _OPTIONAL_PARTS for part in hidden):
+    parts = [_left_out(part) for part in hidden]
+    if None in parts:
         # A field the PR can't be shown without is hidden, so the PR is a gap.
         return {"pullRequest": None}
+    left_out = {name for names in parts if names for name in names}
     try:
-        found = PullRequestRef.from_url(node["url"]) if isinstance(node.get("url"), str) else None
+        found = PullRequestRef.from_url(node["url"]) if _text(node["url"]) else None
     except ValueError:
         found = None
     if found is None or found.provider != "github":
         return {"pullRequest": None}
     if found.host != reference.host or found.repository.lower() != reference.repository.lower():
         return {"pullRequest": None, "outside_repository": True}
-    number = _count(node.get("number"), least=1, most=_INT_MAX)
-    head_ref = _ref_name(node.get("headRefName"))
-    state = _one_of(node.get("state"), _STATES)
+    number = _count(node["number"], least=1, most=_INT_MAX)
+    head_ref = _ref_name(node["headRefName"])
+    state = _one_of(node["state"], _STATES)
     if number != found.number or head_ref is None or state is None:
         return {"pullRequest": None}
-    if not isinstance(node.get("isDraft"), bool):
+    if not isinstance(node["isDraft"], bool):
         return {"pullRequest": None}
-    title = _text(node.get("title")) or ""
-    head_repository = node.get("headRepository")
-    base_repository = node.get("baseRepository")
-    base = base_repository if isinstance(base_repository, dict) else {}
-    default_branch = base.get("defaultBranchRef")
-    review = node.get("reviewDecision")
+    title = _text(node["title"]) or ""
+    head_repository = node["headRepository"] or {}
+    base = node["baseRepository"] or {}
+    default_branch = base.get("defaultBranchRef") or {}
     member = {
         # The canonical URL, never GitHub's string.
         "url": found.url,
@@ -203,19 +316,15 @@ def _member(node: Any, reference: PullRequestRef, hidden: set[tuple[str, ...]]) 
         "title": title[:MAX_TITLE_CHARACTERS],
         "state": state,
         "is_draft": node["isDraft"],
-        "updated_at": _matching(_TIMESTAMP, node.get("updatedAt")),
-        "review_decision": _one_of(review, _REVIEW_DECISIONS),
+        "updated_at": _timestamp(node["updatedAt"]),
+        "review_decision": _one_of(node["reviewDecision"], _REVIEW_DECISIONS),
         "head_ref": head_ref,
-        "head_sha": _matching(_SHA, node.get("headRefOid")),
-        "base_ref": _ref_name(node.get("baseRefName")),
-        "base_sha": _matching(_SHA, node.get("baseRefOid")),
-        "head_repository": _repository_name(
-            head_repository.get("nameWithOwner") if isinstance(head_repository, dict) else None
-        ),
+        "head_sha": _matching(_SHA, node["headRefOid"]),
+        "base_ref": _ref_name(node["baseRefName"]),
+        "base_sha": _matching(_SHA, node["baseRefOid"]),
+        "head_repository": _repository_name(head_repository.get("nameWithOwner")),
         "base_repository": _repository_name(base.get("nameWithOwner")),
-        "base_default_branch": _ref_name(
-            default_branch.get("name") if isinstance(default_branch, dict) else None
-        ),
+        "base_default_branch": _ref_name(default_branch.get("name")),
     }
     return {"pullRequest": {**member, **dict.fromkeys(left_out)}}
 
@@ -223,37 +332,34 @@ def _member(node: Any, reference: PullRequestRef, hidden: set[tuple[str, ...]]) 
 def _stack(stack: Any, reference: PullRequestRef, errors: list[Any]) -> dict[str, Any] | None:
     """The stack as the page reads it, or ``None`` for a PR in none.
 
-    :raises PullRequestError: For a stack whose identity or shape isn't GitHub's.
+    ``stack`` has the stack's shape already: an object with every key, or null.
+
+    :raises PullRequestError: For a stack whose identity, or an entry's position, isn't GitHub's.
     """
     if stack is None:
         if errors:
             raise _unreadable()
         return None
-    if not isinstance(stack, dict):
-        raise _unreadable()
-    entries = stack.get("entries")
-    page = entries.get("pageInfo") if isinstance(entries, dict) else None
-    nodes = entries.get("nodes") if isinstance(entries, dict) else None
-    has_next_page = page.get("hasNextPage") if isinstance(page, dict) else None
+    has_next_page = stack["entries"]["pageInfo"]["hasNextPage"]
+    nodes = stack["entries"]["nodes"]
     shaped = {
-        "id": _matching(_NODE_ID, stack.get("id")),
-        "number": _count(stack.get("number"), least=1, most=_INT_MAX),
-        "size": _count(stack.get("size"), least=0, most=MAX_STACK_SIZE),
-        "baseRefName": _ref_name(stack.get("baseRefName")),
+        "id": _matching(_NODE_ID, stack["id"]),
+        "number": _count(stack["number"], least=1, most=_INT_MAX),
+        "size": _count(stack["size"], least=0, most=MAX_STACK_SIZE),
+        "baseRefName": _ref_name(stack["baseRefName"]),
     }
     if any(value is None for value in shaped.values()) or not isinstance(has_next_page, bool):
         raise _unreadable()
-    if not isinstance(nodes, list):
+    # A malformed position, dropped quietly, would read as a shorter stack.
+    if any(_count(node["position"], least=_INT_MIN, most=_INT_MAX) is None for node in nodes):
         raise _unreadable()
     hidden = _hidden_parts(errors, len(nodes))
     shaped_nodes = [
         {
             "position": node["position"],
-            **_member(node.get("pullRequest"), reference, hidden.get(index, set())),
+            **_member(node["pullRequest"], reference, hidden.get(index, set())),
         }
         for index, node in enumerate(nodes[:MAX_NATIVE_STACK_ENTRIES])
-        if isinstance(node, dict)
-        and _count(node.get("position"), least=_INT_MIN, most=_INT_MAX) is not None
     ]
     # An answer longer than the read asked for is cut, and says it has more.
     more = has_next_page or len(nodes) > MAX_NATIVE_STACK_ENTRIES
@@ -300,20 +406,16 @@ def pull_request_native_stack(root: str, reference: PullRequestRef) -> dict[str,
         raise _unreadable()
     if errors and all(_lacks_stacks(error) for error in errors):
         return {"object": "pull_request_native_stack", "supported": False, "viewer": None}
-    data = response.get("data")
-    viewer = data.get("viewer") if isinstance(data, dict) else None
-    login = _matching(_LOGIN, viewer.get("login") if isinstance(viewer, dict) else None)
-    repository = data.get("repository") if isinstance(data, dict) else None
-    pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
-    if login is None or not isinstance(pull_request, dict):
+    data: Any = response.get("data")
+    # Every object and key the query asks for, before any value is read.
+    if not _conforms(data, _DATA):
         raise _unreadable()
-    if _count(pull_request.get("number"), least=1, most=_INT_MAX) != reference.number:
+    login = _matching(_LOGIN, data["viewer"]["login"])
+    pull_request = data["repository"]["pullRequest"]
+    if login is None or _count(pull_request["number"], least=1, most=_INT_MAX) != reference.number:
         raise _unreadable()
-    # Both are asked for, so an answer without either isn't GitHub's; each may be null.
-    if "stackEntry" not in pull_request or "stack" not in pull_request:
-        raise _unreadable()
-    entry = pull_request.get("stackEntry")
-    position = entry.get("position") if isinstance(entry, dict) else None
+    entry = pull_request["stackEntry"]
+    position = None if entry is None else entry["position"]
     if entry is not None and _count(position, least=_INT_MIN, most=_INT_MAX) is None:
         raise _unreadable()
     return {
@@ -322,6 +424,6 @@ def pull_request_native_stack(root: str, reference: PullRequestRef) -> dict[str,
         "viewer": login,
         "native_stack": {
             "stackEntry": None if entry is None else {"position": position},
-            "stack": _stack(pull_request.get("stack"), reference, errors),
+            "stack": _stack(pull_request["stack"], reference, errors),
         },
     }
