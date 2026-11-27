@@ -1,13 +1,11 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { basenamedRouting, reactRouterRouting } from "@/lib/routing";
-import * as capabilities from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useChatStore } from "@/store/chatStore";
 import {
   isWarmSwitchPending,
   switchSessionBeforeNavigate,
-  warmSwitchKeepMountedEnabled,
   useWarmSwitchConversationId,
 } from "./warmSessionSwitch";
 
@@ -17,7 +15,6 @@ const rebasePath = reactRouterRouting.rebasePath;
 beforeEach(() => {
   vi.useFakeTimers();
   window.history.replaceState({}, "", "/c/conv_a");
-  vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue(null);
 });
 
 afterEach(() => {
@@ -31,31 +28,11 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function spyFeatures(features: Record<string, boolean>) {
-  return vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
-    ...capabilities.FALLBACK_SERVER_INFO,
-    features,
-  });
-}
-
 function seedLive(...ids: string[]) {
   for (const id of ids) {
     conversationRegistry.acquire(id).setState({ abortController: new AbortController() });
   }
 }
-
-describe("warmSwitchKeepMountedEnabled", () => {
-  it("is off while the server info is missing or loading", () => {
-    expect(warmSwitchKeepMountedEnabled()).toBe(false);
-  });
-
-  it("reads the warm_switch_keep_mounted_ui release feature", () => {
-    const cached = spyFeatures({ warm_switch_keep_mounted_ui: true });
-    expect(warmSwitchKeepMountedEnabled()).toBe(true);
-    cached.mockReturnValue({ ...capabilities.FALLBACK_SERVER_INFO, features: {} });
-    expect(warmSwitchKeepMountedEnabled()).toBe(false);
-  });
-});
 
 describe("isWarmSwitchPending", () => {
   it.each([
@@ -74,7 +51,6 @@ describe("isWarmSwitchPending", () => {
   ] as const)(
     "store %s, router %s, browser %s, base %s => %s",
     (active, url, pathname, base, expected) => {
-      spyFeatures({ warm_switch_keep_mounted_ui: true });
       window.__OMNIGENT_BASE_PATH__ = base;
       window.history.replaceState({}, "", pathname);
       expect(isWarmSwitchPending(active, url, rebasePath)).toBe(expected);
@@ -87,22 +63,15 @@ describe("isWarmSwitchPending", () => {
     ["/c/conv_b", false],
     ["/ml/omnigent-embed-other/c/conv_b", false],
   ] as const)("matches the active embed route at %s: %s", (pathname, expected) => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
     window.history.replaceState({}, "", pathname);
     expect(
       isWarmSwitchPending("conv_b", "conv_a", basenamedRouting("/ml/omnigent-embed").rebasePath),
     ).toBe(expected);
   });
-
-  it("does not retain the mismatch when the flag is off", () => {
-    window.history.replaceState({}, "", "/c/conv_b");
-    expect(isWarmSwitchPending("conv_b", "conv_a", rebasePath)).toBe(false);
-  });
 });
 
 describe("useWarmSwitchConversationId", () => {
-  it("tracks the store only during an enabled browser-first navigation", () => {
-    const cached = spyFeatures({ warm_switch_keep_mounted_ui: true });
+  it("tracks the store only during a browser-first navigation", () => {
     useChatStore.setState({ conversationId: "conv_a" });
     const { result, rerender } = renderHook(({ id }) => useWarmSwitchConversationId(id), {
       initialProps: { id: "conv_a" },
@@ -112,9 +81,6 @@ describe("useWarmSwitchConversationId", () => {
       useChatStore.setState({ conversationId: "conv_b" });
     });
     expect(result.current).toBe("conv_b");
-    cached.mockReturnValue({ ...capabilities.FALLBACK_SERVER_INFO, features: {} });
-    rerender({ id: "conv_a" });
-    expect(result.current).toBe("conv_a");
     rerender({ id: "conv_b" });
     expect(result.current).toBe("conv_b");
   });
@@ -122,7 +88,6 @@ describe("useWarmSwitchConversationId", () => {
 
 describe("switchSessionBeforeNavigate", () => {
   it("switches a live target synchronously and leaves successful navigation alone", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
     seedLive("conv_a", "conv_b");
     useChatStore.setState({ conversationId: "conv_a" });
     const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
@@ -144,7 +109,6 @@ describe("switchSessionBeforeNavigate", () => {
   ])(
     "restores canceled clicks to the browser source on the next task: $targets under $basename",
     ({ targets, basename }) => {
-      spyFeatures({ warm_switch_keep_mounted_ui: true });
       seedLive("conv_a", "conv_b", "conv_c");
       useChatStore.setState({ conversationId: "conv_a" });
       const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
@@ -162,7 +126,6 @@ describe("switchSessionBeforeNavigate", () => {
   );
 
   it("does not let a canceled click overwrite a newer store switch", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
     seedLive("conv_a", "conv_b", "conv_c");
     useChatStore.setState({ conversationId: "conv_a" });
     const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
@@ -176,7 +139,6 @@ describe("switchSessionBeforeNavigate", () => {
   });
 
   it("skips the fast path while the browser still identifies a temporary source", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
     seedLive("conv_a", "conv_b");
     useChatStore.setState({ conversationId: "conv_a" });
     window.history.replaceState({}, "", "/c/temp:source");
@@ -187,14 +149,6 @@ describe("switchSessionBeforeNavigate", () => {
 
     expect(switchTo).not.toHaveBeenCalled();
     expect(useChatStore.getState().conversationId).toBe("conv_a");
-  });
-
-  it("leaves the store alone when the flag is off", () => {
-    useChatStore.setState({ conversationId: "conv_a" });
-    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
-    switchSessionBeforeNavigate("conv_b", rebasePath);
-    expect(switchTo).not.toHaveBeenCalled();
-    expect(conversationRegistry.peek("conv_b")).toBeUndefined();
   });
 
   it.each([
@@ -208,7 +162,6 @@ describe("switchSessionBeforeNavigate", () => {
   ])(
     "does not switch first for source $source, target $target, stream $stream",
     ({ source, target, stream }) => {
-      spyFeatures({ warm_switch_keep_mounted_ui: true });
       if (stream !== "missing") {
         conversationRegistry.acquire(target).setState({
           abortController: stream === "stopped" ? null : new AbortController(),

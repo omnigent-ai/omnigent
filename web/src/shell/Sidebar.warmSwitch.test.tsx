@@ -1,12 +1,9 @@
-// The sidebar row's switch-first wiring: with `warm_switch_keep_mounted_ui` on,
-// a plain click on a session row switches the chat store as it navigates; a
-// modified click (new tab) and the flag-off path never touch the store.
+// The sidebar row's switch-first wiring: a plain click on a session row switches
+// the chat store as it navigates; a modified click (new tab) never touches the store.
 import { cleanup, fireEvent, screen } from "@testing-library/react";
 import { useLayoutEffect } from "react";
 import { useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import * as capabilities from "@/lib/capabilities";
-import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { sessionRowsPage } from "@/lib/sidebarData";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useChatStore } from "@/store/chatStore";
@@ -43,15 +40,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderSessions(
-  sessions = [conversation("conv_a"), conversation("conv_b")],
-  enabled = true,
-) {
-  const features = { warm_switch_keep_mounted_ui: enabled };
-  vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
-    ...FALLBACK_SERVER_INFO,
-    features,
-  });
+function renderSessions(sessions = [conversation("conv_a"), conversation("conv_b")]) {
   useChatStore.setState({ conversationId: "conv_a" });
   if (!sessions.some((session) => session.id === "conv_a")) seedLive("conv_a");
   for (const session of sessions) seedLive(session.id);
@@ -62,11 +51,11 @@ function renderSessions(
       json: async () => (String(url).includes("/projects") ? [] : sessionRowsPage(sessions)),
     })),
   );
-  return renderSidebar({ route: "/c/conv_a", features, children: <LocationProbe /> });
+  return renderSidebar({ route: "/c/conv_a", features: {}, children: <LocationProbe /> });
 }
 
 describe("Sidebar warm switch activation", () => {
-  it("switches the store while navigating on a plain click with the flag on", async () => {
+  it("switches the store while navigating on a plain click", async () => {
     renderSessions();
 
     fireEvent.click(await screen.findByText("conv_b"));
@@ -82,15 +71,6 @@ describe("Sidebar warm switch activation", () => {
 
     expect(useChatStore.getState().conversationId).toBe("conv_a");
     expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_a");
-  });
-
-  it("does not switch the store when the flag is off", async () => {
-    renderSessions(undefined, false);
-
-    fireEvent.click(await screen.findByText("conv_b"));
-
-    expect(useChatStore.getState().conversationId).toBe("conv_a");
-    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_b");
   });
 
   it("does not call switchTo when clicking the active row", async () => {
