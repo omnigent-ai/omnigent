@@ -417,6 +417,11 @@ export interface TextDone {
 export interface ReasoningStartBlock {
   type: "reasoning_start";
   ctx: BlockContext;
+  /**
+   * The persisted item a delta-streamed section turned out to be. Kept out of
+   * `ctx.itemId` so reconnect and dedupe still treat the streamed section as in flight.
+   */
+  streamedItemId?: string;
 }
 
 /**

@@ -1182,9 +1182,10 @@ function walkBubbles(
       kind: "assistant",
       responseId: groupResponseId,
       stableId,
-      itemIds: groupBlocks.flatMap((block) =>
-        block.ctx.itemId === null ? [] : [block.ctx.itemId],
-      ),
+      itemIds: groupBlocks.flatMap((block) => [
+        ...(block.ctx.itemId === null ? [] : [block.ctx.itemId]),
+        ...(block.type === "reasoning_start" && block.streamedItemId ? [block.streamedItemId] : []),
+      ]),
       ...(liveOpener !== undefined ? { liveOpener } : {}),
       lifecycle,
       error,
