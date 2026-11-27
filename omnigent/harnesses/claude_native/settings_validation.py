@@ -299,7 +299,12 @@ async def validate_caller_settings(
         raise CallerSettingsError(CallerSettingsErrorReason.SANDBOX_REQUIRED)
     try:
         if wrapper is not None:
-            command = _validation_executable(command, selected_env, cwd)
+            if sandbox is not None and sandbox.active and sandbox.copy_on_write_namespace:
+                # Resolve the inner executable only after entering the selected filesystem.
+                prefix = ["--", command, *prefix]
+                command = _validation_executable("env", {}, Path("/"))
+            else:
+                command = _validation_executable(command, selected_env, cwd)
         async with asyncio.timeout(_VALIDATION_TIMEOUT):
             with tempfile.TemporaryDirectory(
                 prefix="claude-settings-check-", dir=instance.private_dir.parent
@@ -325,7 +330,12 @@ async def validate_caller_settings(
                             # A fork lives below the private parent; mount only its workspace.
                             roots = [*(policy.read_roots or []), cwd.resolve()]
                             executable = shutil.which(
-                                command, path=selected_env.get("PATH", os.defpath)
+                                (
+                                    wrapper.command
+                                    if wrapper is not None and sandbox.copy_on_write_namespace
+                                    else command
+                                ),
+                                path=selected_env.get("PATH", os.defpath),
                             )
                             if executable is not None:
                                 for path in (Path(executable), Path(executable).resolve()):

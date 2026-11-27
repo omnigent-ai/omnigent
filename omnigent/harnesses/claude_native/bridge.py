@@ -3221,8 +3221,7 @@ def augment_claude_args(
     :param settings_request: Explicit owner for a deferred launch generation.
     :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
     :param defer_inherited_mcp_discovery: ``True`` when the caller resolves the
-        launch cwd and environment in :func:`finalize_claude_caller_settings`;
-        legacy peers use :func:`apply_claude_launch_mcp_policy`. Otherwise strict
+        launch cwd and environment during receiver-side settings finalization. Otherwise strict
         MCP mode reads inherited settings for *workspace* and this process's environment.
     :returns: Augmented argument list for the terminal resource.
     """
@@ -3312,9 +3311,9 @@ def apply_claude_launch_mcp_policy(
     """
     Apply strict MCP discovery to the invocation settings for Claude's launch context.
 
-    Completes legacy single-file launches with deferred MCP discovery. Owned
-    generations use :func:`finalize_claude_caller_settings` instead, preserving
-    the immutable baseline while reading the terminal's launch context.
+    Supports explicit finalization of legacy single-file settings. Receiver-side
+    finalization uses :func:`finalize_claude_caller_settings` for owned generations,
+    preserving the immutable baseline while reading the terminal's launch context.
 
     :param bridge_dir: Bridge directory holding the invocation settings.
     :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.

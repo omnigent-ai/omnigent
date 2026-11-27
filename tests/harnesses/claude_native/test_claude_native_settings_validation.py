@@ -223,6 +223,11 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         selected_command = str(executable)
         which = Mock(return_value=selected_command)
         monkeypatch.setattr(validation.shutil, "which", which)
+    namespace_env = str(Path(os.defpath.split(os.pathsep)[0]) / "env")
+    if sandboxed and env_wrapped:
+        which.side_effect = lambda command, *, path: (
+            namespace_env if command == "env" and path == os.defpath else selected_command
+        )
     prefix = (
         [
             *([] if sandboxed else ["-i"]),
@@ -300,7 +305,12 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         assert command == (
             str(tmp_path / "launcher") if sandboxed or env_wrapped else selected_command
         )
-        assert args[: len(selected_prefix)] == selected_prefix
+        expected_prefix = (
+            ["--", selected_command, *selected_prefix]
+            if sandboxed and env_wrapped
+            else selected_prefix
+        )
+        assert args[: len(expected_prefix)] == expected_prefix
         assert cwd == (Path("/") if sandboxed else selected_cwd)
         assert env["PATH"] == selected_path
         if env_wrapped:
@@ -350,7 +360,9 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         assert which.call_args == call(selected_command, path=selected_path)
     assert len(launches) == (4 if (sandboxed or env_wrapped) and not rejected else 0)
     assert [command for command, _ in launches] == (
-        [selected_command] * 4 if (sandboxed or env_wrapped) and not rejected else []
+        [namespace_env if sandboxed and env_wrapped else selected_command] * 4
+        if (sandboxed or env_wrapped) and not rejected
+        else []
     )
     for _, cloned in launches:
         if not sandboxed:

@@ -151,11 +151,28 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
 
 @pytest.mark.parametrize("backend_name", ["linux_bwrap", "darwin_seatbelt"])
 def test_reexec_transports_payload_path_without_reading_values(
-    tmp_path: Path, inert_launcher, backend_name: str
+    tmp_path: Path, inert_launcher, backend_name: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     policy = _policy(True)
     policy.backend_type = backend_name
     payload = _payload(tmp_path)
+    for active in (False, True):
+        source_policy = _policy(active)
+        source_policy.backend_type = backend_name
+        path = Path(
+            sb.create_exec_launcher(
+                _TARGET, source_policy, cwd="/fixture", target_environment_path=str(payload)
+            )
+        )
+        try:
+            source = path.read_text()
+            assert str(payload) in source
+            assert _SENTINEL not in source
+            assert path.stat().st_mode & 0o777 == 0o700
+        finally:
+            path.unlink()
+    inert_launcher.run.assert_not_called()
+    inert_launcher.execute.assert_not_called()
     with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         with pytest.raises(SystemExit, match="inert re-exec boundary"):
             sb.run_launcher(
@@ -186,6 +203,7 @@ def test_reexec_transports_payload_path_without_reading_values(
     assert keywords["cwd"] == "/fixture/workspace"
     assert keywords["_spawn_wrapped"] is True
     assert _SENTINEL not in json.dumps(inert_launcher.execute.call_args.args)
+    assert _SENTINEL not in caplog.text
     inert_launcher.cleanup.assert_called_once_with(inert_launcher.scratch)
 
 
@@ -207,28 +225,6 @@ def test_default_launcher_keeps_inherited_environment_call(inert_launcher, activ
     assert "payload-read" not in inert_launcher.events
     source = sb._launcher_inline_source(_TARGET, _policy(False), cwd="/fixture")
     assert "target_environment_path" not in source
-
-
-@pytest.mark.parametrize("active", [False, True])
-def test_launcher_source_contains_only_payload_path(
-    tmp_path: Path, inert_launcher, active: bool, caplog: pytest.LogCaptureFixture
-) -> None:
-    payload = _payload(tmp_path)
-    path = Path(
-        sb.create_exec_launcher(
-            _TARGET, _policy(active), cwd="/fixture", target_environment_path=str(payload)
-        )
-    )
-    try:
-        source = path.read_text()
-        assert str(payload) in source
-        assert _SENTINEL not in source
-        assert path.stat().st_mode & 0o777 == 0o700
-    finally:
-        path.unlink()
-    inert_launcher.run.assert_not_called()
-    inert_launcher.execute.assert_not_called()
-    assert _SENTINEL not in caplog.text
 
 
 @pytest.mark.parametrize(

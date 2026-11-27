@@ -100,6 +100,7 @@ def _context(tmp_path: Path, *, sandboxed: bool, form: str):
         prefix = [*options, *operands]
     return SimpleNamespace(
         instance=instance,
+        command=command,
         prefix=prefix,
         original_prefix=list(prefix),
         executable=executable,
@@ -121,7 +122,12 @@ def _context(tmp_path: Path, *, sandboxed: bool, form: str):
 
 def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False, fault=None):
     def launcher(command, policy, *, cwd, target_environment_path=None):
-        assert command == str(context.executable)
+        shared = bool(context.original_policy and context.original_policy.copy_on_write_namespace)
+        assert command == (
+            str(Path(os.defpath.split(os.pathsep)[0]) / "env")
+            if shared
+            else str(context.executable)
+        )
         assert cwd == str(context.cwd)
         assert target_environment_path is not None
         payload = Path(target_environment_path)
@@ -142,13 +148,17 @@ def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False,
 
     async def doctor(command, args, *, cwd, env):
         assert command == str(context.launcher_paths[-1])
-        assert cwd == (Path("/") if context.sandboxed else context.cwd)
+        shared = bool(context.original_policy and context.original_policy.copy_on_write_namespace)
+        assert cwd == (Path("/") if shared else context.cwd)
         assert env["PATH"] == "/bootstrap/bin"
         assert "EXAMPLE_TARGET_ONLY" not in env
         assert "OMNIGENT_LAUNCHER_SPAWN_WRAPPED" not in env
         assert "PYTHONPATH" not in env and "LD_PRELOAD" not in env
         assert _SENTINEL not in json.dumps([command, args, env])
-        assert args[: len(context.cli_prefix)] == context.cli_prefix
+        expected_prefix = (
+            ["--", context.command, *context.cli_prefix] if shared else context.cli_prefix
+        )
+        assert args[: len(expected_prefix)] == expected_prefix
         context.bootstrap.append(dict(env))
         if fault == "doctor":
             raise RuntimeError("inert doctor failure")
@@ -184,7 +194,7 @@ def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False,
                 assert (
                     sb.run_launcher(
                         encoded,
-                        str(context.executable),
+                        context.launches[-1][0],
                         list(args),
                         cwd=str(context.cwd),
                         target_environment_path=str(context.payload_paths[-1]),
@@ -272,10 +282,14 @@ async def test_validator_keeps_wrapper_values_out_of_bootstrap(
 @pytest.mark.parametrize(
     "mode", ["absolute", "relative-path", "empty-path", "unset-path", "relative-command"]
 )
+@pytest.mark.parametrize("shared", [False, True], ids=["host-filesystem", "shared-filesystem"])
 async def test_validator_selects_executable_using_selected_cwd_and_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, shared: bool
 ) -> None:
     context = _context(tmp_path, sandboxed=True, form="reset")
+    if not shared:
+        context.instance.sandbox_policy.copy_on_write_namespace = None
+        context.original_policy = copy.deepcopy(context.instance.sandbox_policy)
     command = "selected-wrapper"
     selected_path = str(context.executable.parent)
     if mode == "relative-path":
@@ -286,6 +300,7 @@ async def test_validator_selects_executable_using_selected_cwd_and_path(
         command = "./tools/selected-wrapper"
     assignments = [] if mode == "unset-path" else [f"PATH={selected_path}"]
     context.prefix = ["-i", "-C", "subdir", *assignments, command]
+    context.command = command
     context.cli_prefix = []
     context.original_prefix = list(context.prefix)
     expected_path = (
@@ -300,13 +315,24 @@ async def test_validator_selects_executable_using_selected_cwd_and_path(
     expected_command = (
         str(context.cwd / "tools" / "selected-wrapper") if mode == "relative-command" else command
     )
-    lookup = Mock(return_value=str(context.executable))
+    lookup = Mock(
+        return_value=(
+            str(Path(os.defpath.split(os.pathsep)[0]) / "env")
+            if shared
+            else str(context.executable)
+        )
+    )
+    if shared:
+        context.executable.unlink()
     monkeypatch.setattr(validation.shutil, "which", lookup)
     _install_doubles(context, monkeypatch)
     await validation.validate_caller_settings(
         context.instance, {"attribution": False}, wrapper_prefix=context.prefix
     )
-    lookup.assert_called_once_with(expected_command, path=expected_path)
+    if shared:
+        lookup.assert_called_once_with("env", path=os.defpath)
+    else:
+        lookup.assert_called_once_with(expected_command, path=expected_path)
     assert len(context.launches) == 4
     assert all(not path.exists() for path in context.payload_paths)
 

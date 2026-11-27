@@ -282,10 +282,12 @@ async def test_session_cleanup_leaves_other_session_independent(cow_spec, tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True], ids=["settings-read", "overlay-only-validator"])
 async def test_claude_settings_prepare_reads_shared_terminal_overlay(
-    cow_spec, tmp_path, monkeypatch
+    cow_spec, tmp_path, monkeypatch, wrapped
 ):
     import json
+    from textwrap import dedent
     from unittest.mock import AsyncMock
 
     from omnigent.harnesses.claude_native import bridge, settings_validation
@@ -294,7 +296,8 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
 
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
-    monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
+    if not wrapped:
+        monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
     cow_spec.sandbox.read_paths.append(str(Path(sys.prefix).resolve()))
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -304,13 +307,43 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
         ("--settings", "dependencies/settings.json"),
         bridge_dir=bridge_dir,
     )
-    generation = bridge.record_claude_settings_boundary(bridge_dir, args, claude_args_start=0)
+    prefix = ["PATH=dependencies", "claude"] if wrapped else []
+    args = [*prefix, *args]
+    generation = bridge.record_claude_settings_boundary(
+        bridge_dir, args, claude_args_start=len(prefix)
+    )
     terminals = TerminalRegistry()
     resources = SessionResourceRegistry(terminal_registry=terminals, runner_workspace=tmp_path)
     environment = resources._resolve_primary("settings", None, os_env_spec=cow_spec)
     assert "error" not in await environment.write(
         "dependencies/settings.json", '{"env":{"SETTINGS_VIEW":"overlay"}}'
     )
+    if wrapped:
+        validator = "dependencies/claude"
+        source = f"#!{sys.executable}\n" + dedent(
+            """\
+            import json
+            import sys
+            from pathlib import Path
+
+            if "--help" in sys.argv:
+                print("Usage: claude doctor [options]\\nReads settings files\\n"
+                      "For a full setup checkup that can also fix issues, "
+                      "run /doctor in a session.")
+            else:
+                candidate = Path(sys.argv[sys.argv.index("--settings") + 1])
+                document = json.loads(candidate.read_text())
+                print("Running: inert-overlay-validator\\nCommit: fixture-build\\n"
+                      "Path: overlay-only-claude")
+                if document.get("hooks", {}).get("PreToolUse") == [None]:
+                    print(f"Invalid settings\\n- {candidate} › hooks.PreToolUse.0: invalid")
+                print("For a full setup checkup that can also fix issues, "
+                      "run /doctor in a Claude Code session.")
+            """
+        )
+        assert "error" not in await environment.write(validator, source)
+        await assert_shell(environment, f"chmod 700 {validator}")
+        assert not (tmp_path / validator).exists()
     prepared = []
 
     async def prepare(instance):
@@ -332,7 +365,7 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
             "settings",
             "claude",
             "main",
-            TerminalEnvSpec(command="claude", args=args, os_env="inherit"),
+            TerminalEnvSpec(command="env" if wrapped else "claude", args=args, os_env="inherit"),
             parent_os_env=cow_spec,
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
             prepare_terminal=prepare,
@@ -351,5 +384,7 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
         settings = json.loads(result["content"])
         assert settings["env"]["SETTINGS_VIEW"] == "overlay"
         assert json.loads(settings_file.read_text())["env"]["SETTINGS_VIEW"] == "host"
+        if wrapped:
+            assert not (tmp_path / validator).exists()
     finally:
         await resources.cleanup_session("settings")
