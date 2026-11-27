@@ -1262,7 +1262,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
   it("labels Codex structured input prompts as Codex prompts", () => {
     // Codex and Claude share the structured AskUserQuestion renderer,
     // but the title must reflect the producer. Otherwise a Codex plan
-    // prompt in web incorrectly says "Claude has questions".
+    // prompt in web incorrectly says "Claude needs your input".
     render(
       <ApprovalCard
         elicitationId="elic_codex_label"
@@ -1287,8 +1287,8 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    expect(screen.getByText("Codex needs input")).toBeDefined();
-    expect(screen.queryByText("Claude has questions")).toBeNull();
+    expect(screen.getByText("Codex needs your input")).toBeDefined();
+    expect(screen.queryByText("Claude needs your input")).toBeNull();
   });
 
   it("titles a workflow question with the task waiting on it, on any harness", () => {
@@ -1316,13 +1316,13 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     expect(screen.getByText("Waiting for you on Review and approve the plan")).toBeDefined();
-    expect(screen.queryByText("Claude has questions")).toBeNull();
+    expect(screen.queryByText("Claude needs your input")).toBeNull();
   });
 
   it("labels Antigravity structured input prompts as Antigravity prompts", () => {
     // Antigravity (agy) reuses the same AskUserQuestion renderer via the
     // ``ask_user_question`` extra, so the title must reflect the producer
-    // rather than defaulting to "Claude has questions".
+    // rather than defaulting to "Claude needs your input".
     render(
       <ApprovalCard
         elicitationId="elic_agy_label"
@@ -1347,7 +1347,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     expect(screen.getByText("Antigravity needs your input")).toBeDefined();
-    expect(screen.queryByText("Claude has questions")).toBeNull();
+    expect(screen.queryByText("Claude needs your input")).toBeNull();
   });
 
   it.each([
@@ -1355,7 +1355,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       name: "Cursor policy",
       policyName: "cursor_native_permission",
       phase: "pre_tool_use",
-      title: "Cursor has questions",
+      title: "Cursor needs your input",
     },
     {
       name: "Devin policy",
@@ -1379,7 +1379,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       name: "the legacy default for unknown prefixes",
       policyName: "question_policy",
       phase: "pre_tool_use",
-      title: "Claude has questions",
+      title: "Claude needs your input",
     },
   ])("labels structured input prompts using $name", ({ policyName, phase, title }) => {
     render(
@@ -1477,9 +1477,9 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         />,
       );
       expect(
-        screen.getByText(harness === "Pi" ? "Pi needs your input" : "Codex needs input"),
+        screen.getByText(harness === "Pi" ? "Pi needs your input" : "Codex needs your input"),
       ).toBeDefined();
-      expect(screen.queryByText("Claude has questions")).toBeNull();
+      expect(screen.queryByText("Claude needs your input")).toBeNull();
       const submit = screen.getByTestId("ask-user-question-submit");
       expect(submit.hasAttribute("disabled")).toBe(!textInput && options.length === 0);
       if (textInput) {
