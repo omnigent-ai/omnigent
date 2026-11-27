@@ -126,6 +126,18 @@ describe("useReviewFolder", () => {
     expect(screen.getByTestId("repository")).toBeEmptyDOMElement();
   });
 
+  it("opens the folder browser from ⌘K, and returns to the workspace from it", async () => {
+    render(<Harness />);
+    act(() => void paletteCommand("Choose Folder for Diffs…")!.run());
+    expect(screen.getByTestId("picker")).toHaveAttribute("data-initial", "/repo");
+    await userEvent.click(screen.getByRole("button", { name: "Pick worktree" }));
+    expect(rememberedBrowseLocation(SESSION)).toBe("/repo/.worktrees/feature");
+
+    act(() => void paletteCommand("Show repo in Diffs")!.run());
+    expect(rememberedBrowseLocation(SESSION)).toBeNull();
+    expect(screen.getByTestId("repository")).toBeEmptyDOMElement();
+  });
+
   it("names a worktree outside the workspace as one Diffs can't review", async () => {
     render(<Harness />);
     await userEvent.click(screen.getByTestId("changes-review-folder"));
