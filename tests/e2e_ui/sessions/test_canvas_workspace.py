@@ -117,6 +117,7 @@ def test_canvas_controls_clear_the_macos_titlebar(
     home.click()
     expect(page).to_have_url(f"{base_url}/")
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
+    expect(expand).to_be_visible()
 
 
 def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(

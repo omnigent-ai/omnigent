@@ -335,7 +335,8 @@ the header menu), and each place is a separate entry point.
 - `canvas-navigation`: Canvas uses the same collapsed-sidebar button and hover
   preview as other pages, including the macOS titlebar controls. Opening it
   reveals the shared destinations, including Usage when enabled. The board
-  header's Home link returns to the new-session page without opening it.
+  header's Home link returns to the new-session page, so leaving Canvas does
+  not require opening navigation.
 - `canvas-create`: the plus button on Main or a project opens the new-session
   composer; sending returns to that board with the new session selected.
 - `canvas-session-health`: an opened Canvas session receives host health and
