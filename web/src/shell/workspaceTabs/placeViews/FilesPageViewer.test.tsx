@@ -13,6 +13,7 @@ import {
 } from "@/hooks/useFileContent";
 import type { CodeMirrorFileEditor } from "@/shell/codeMirror/CodeMirrorFileEditor";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { readFileViewPreferences, writeStickyScroll } from "@/lib/fileViewPreferences";
 import type { FileViewer } from "@/shell/FileViewer";
 import { useFileFinderStore } from "@/store/fileFinder";
 
@@ -177,7 +178,7 @@ describe("FilesPageViewer", () => {
     expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
   });
 
-  it("puts find, the file's paths, its download and the finders in File actions", async () => {
+  it("puts find, the file's paths, its download and view settings, and the finders in File actions", async () => {
     useFileFinderStore.getState().setAvailableSession("conv_1", { textSearch: true });
     renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
     await userEvent.click(screen.getByRole("button", { name: "File actions" }));
@@ -189,6 +190,7 @@ describe("FilesPageViewer", () => {
       "Copy path",
       "Copy link to file",
       "Download file",
+      "Sticky scroll",
       "Go to File in Workspace…",
       "Search Text in Workspace…",
     ]);
@@ -212,6 +214,23 @@ describe("FilesPageViewer", () => {
     expect(captured.editor!.searchFocusNonce).not.toBe(firstRequest);
     act(() => captured.editor!.onSearchHandled!());
     expect(captured.editor!.searchOpen).toBe(false);
+  });
+
+  it("turns sticky scroll off and on from File actions, keeping the menu open", async () => {
+    writeStickyScroll(true);
+    renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
+    await userEvent.click(screen.getByRole("button", { name: "File actions" }));
+    const row = screen.getByRole("menuitemcheckbox", { name: "Sticky scroll" });
+    expect(row).toHaveAttribute("aria-checked", "true");
+    await userEvent.click(row);
+    expect(readFileViewPreferences().stickyScroll).toBe(false);
+    expect(screen.getByRole("menuitemcheckbox", { name: "Sticky scroll" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(captured.editor!.stickyScroll).toBe(false);
+    await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sticky scroll" }));
+    expect(readFileViewPreferences().stickyScroll).toBe(true);
   });
 
   it.each([
