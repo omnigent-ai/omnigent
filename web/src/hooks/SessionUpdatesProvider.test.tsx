@@ -35,13 +35,14 @@ import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 const setWatched = vi.fn();
 const start = vi.fn();
 const subscribe = vi.fn((_fn: () => void) => () => {});
+const subscribeStatus = vi.fn((_fn: () => void) => () => {});
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: {
     start: (...args: unknown[]) => start(...args),
     stop: vi.fn(),
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
-    subscribeStatus: () => () => {},
+    subscribeStatus: (fn: () => void) => subscribeStatus(fn),
     isConnected: () => false,
   },
 }));
@@ -49,7 +50,7 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 import { SidebarDataContext, SidebarDataProvider, useSidebarView } from "./useSidebarData";
 import { useCanEdit } from "./usePermissions";
 import { sidebarConfig } from "@/lib/sidebarConfig";
-import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
+import { CHILD_ROW_RECHECK_MS, SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
 import { modalHostId } from "@/lib/sessionHost";
@@ -175,6 +176,7 @@ beforeEach(() => {
   setWatched.mockClear();
   start.mockClear();
   subscribe.mockClear();
+  subscribeStatus.mockClear();
 });
 
 afterEach(() => {
@@ -1836,4 +1838,400 @@ it("keeps a directly opened shared session watched and permission-aware with the
     client.clear();
     vi.unstubAllGlobals();
   }
+});
+
+describe("SessionUpdatesProvider sub-agent tree refetches", () => {
+  function childRow(id: string, parentId: string, status = "idle") {
+    return { ...conv(id), parent_session_id: parentId, status };
+  }
+
+  // A mounted (observed) child list for `parentId`; returns its fetch spy.
+  function mountChildList(client: QueryClient, parentId: string, childIds: string[]) {
+    const rows = childIds.map((id) => ({ id }));
+    const fetchChildren = vi.fn(async () => rows);
+    const stop = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey(parentId),
+      queryFn: fetchChildren,
+      initialData: rows,
+      staleTime: Infinity,
+    }).subscribe(() => {});
+    onTestFinished(stop);
+    return fetchChildren;
+  }
+
+  function childListInvalidations(invalidate: { mock: { calls: unknown[][] } }, parentId: string) {
+    const key = JSON.stringify(childSessionsQueryKey(parentId));
+    return invalidate.mock.calls.filter(
+      ([filters]) => JSON.stringify((filters as { queryKey?: unknown })?.queryKey) === key,
+    );
+  }
+
+  it("does not refetch a mounted child list when a snapshot restates unchanged rows", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = mountChildList(client, "conv_a", ["child_1", "child_2"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const rows = [childRow("child_1", "conv_a"), childRow("child_2", "conv_a")];
+
+    // First sight refetches once, in case a row moved since the list loaded.
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+
+    // A watch-set change restates the same rows: no refetch.
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    act(() => handler({ type: "snapshot", items: [...rows, conv("conv_a")] }));
+    expect(childListInvalidations(invalidate, "conv_a")).toEqual([]);
+    expect(fetchChildren).toHaveBeenCalledTimes(1);
+  });
+
+  it("refetches the parent's list when a child's row changes", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = mountChildList(client, "conv_a", ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "snapshot", items: [childRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [childRow("child_1", "conv_a", "running")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("refetches a list when a new child of it first appears", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = mountChildList(client, "conv_a", ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "snapshot", items: [childRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [childRow("child_2", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("refetches every child list on the snapshot after a reconnect", async () => {
+    // Children created while disconnected get no discovery push.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchRootChildren = mountChildList(client, "conv_a", ["child_1"]);
+    const fetchGrandchildren = mountChildList(client, "child_1", ["grand_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const rows = [childRow("child_1", "conv_a"), childRow("grand_1", "child_1")];
+
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchRootChildren).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fetchGrandchildren).toHaveBeenCalledTimes(1));
+
+    // The socket dropped: isConnected() is now false.
+    for (const [onStatus] of subscribeStatus.mock.calls) act(() => onStatus());
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchRootChildren).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(fetchGrandchildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps invalidating an unmounted child list until it is mounted", () => {
+    // Invalidation only marks an unobserved list stale, and lists don't
+    // refetch on mount, so each frame must mark it again.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    client.setQueryData(childSessionsQueryKey("conv_a"), [{ id: "child_1" }]);
+    renderProvider(client, ["/"]);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const handler = frameHandler();
+    const rows = [childRow("child_1", "conv_a")];
+
+    act(() => handler({ type: "snapshot", items: rows }));
+    act(() => handler({ type: "snapshot", items: rows }));
+    expect(childListInvalidations(invalidate, "conv_a")).toHaveLength(2);
+  });
+});
+
+describe("SessionUpdatesProvider sub-agent list refetches that must keep working", () => {
+  function subagentRow(id: string, parentId: string, status = "idle") {
+    return { ...conv(id), parent_session_id: parentId, status };
+  }
+
+  // An observed child list for `parentId`, as a mounted tree view holds it.
+  function observeChildList(
+    client: QueryClient,
+    parentId: string,
+    fetchChildren: () => Promise<{ id: string }[]>,
+    childIds: string[],
+  ) {
+    const stop = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey(parentId),
+      queryFn: fetchChildren,
+      initialData: childIds.map((id) => ({ id })),
+      staleTime: Infinity,
+      retry: false,
+    }).subscribe(() => {});
+    onTestFinished(stop);
+  }
+
+  it("refetches each time a child's row changes, including back to an earlier value", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi.fn(async () => [{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "snapshot", items: [subagentRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [subagentRow("child_1", "conv_a", "running")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+    act(() => handler({ type: "changed", items: [subagentRow("child_1", "conv_a", "idle")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(3));
+  });
+
+  it("refetches only the list of the parent whose child changed", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a", "conv_b"]);
+    const fetchA = vi.fn(async () => [{ id: "child_a" }]);
+    const fetchB = vi.fn(async () => [{ id: "child_b" }]);
+    observeChildList(client, "conv_a", fetchA, ["child_a"]);
+    observeChildList(client, "conv_b", fetchB, ["child_b"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "changed", items: [subagentRow("child_a", "conv_a", "running")] }));
+    await waitFor(() => expect(fetchA).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fetchB).not.toHaveBeenCalled();
+  });
+
+  it("refetches the parent of a child that left the watch-set and came back", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi.fn(async () => [{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const row = subagentRow("child_1", "conv_a");
+
+    act(() => handler({ type: "snapshot", items: [row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    // A watch-set without the child, then with it again, unchanged.
+    act(() => handler({ type: "snapshot", items: [conv("conv_a")] }));
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("refetches the parent of a removed child that is streamed again", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi.fn(async () => [{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const row = subagentRow("child_1", "conv_a");
+
+    act(() => handler({ type: "snapshot", items: [row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "removed", ids: ["child_1"] }));
+    act(() => handler({ type: "changed", items: [row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("refetches a list mounted after its rows were first streamed", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const row = subagentRow("child_1", "conv_a");
+
+    // Streamed while no tree view shows conv_a's children.
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), row] }));
+    const fetchChildren = vi.fn(async () => [{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not restart a failed list's retry while it is in flight", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string }[]>>()
+      .mockResolvedValueOnce([{ id: "child_1" }])
+      .mockRejectedValueOnce(new Error("503 Service Unavailable"))
+      .mockImplementation(() => new Promise(() => {}));
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const running = subagentRow("child_1", "conv_a", "running");
+
+    act(() => handler({ type: "snapshot", items: [subagentRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [running] }));
+    await waitFor(() =>
+      expect(client.getQueryState(childSessionsQueryKey("conv_a"))?.status).toBe("error"),
+    );
+    act(() => handler({ type: "snapshot", items: [running] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(3));
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), running] }));
+    await act(async () => {});
+    expect(fetchChildren).toHaveBeenCalledTimes(3);
+  });
+
+  it("refetches a list whose first fetch was in flight when its child's row changed", async () => {
+    // Invalidation joins a first fetch instead of restarting it, so the next
+    // frame restating the row must refetch past the older response.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    let answerFirst: (rows: { id: string; busy: boolean }[]) => void = () => {};
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string; busy: boolean }[]>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            answerFirst = resolve;
+          }),
+      )
+      .mockResolvedValue([{ id: "child_1", busy: true }]);
+    const stop = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn: fetchChildren,
+      staleTime: Infinity,
+      retry: false,
+    }).subscribe(() => {});
+    onTestFinished(stop);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const running = subagentRow("child_1", "conv_a", "running");
+
+    act(() => handler({ type: "changed", items: [running] }));
+    act(() => answerFirst([{ id: "child_1", busy: false }]));
+    await waitFor(() =>
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        { id: "child_1", busy: false },
+      ]),
+    );
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), running] }));
+    await waitFor(() =>
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        { id: "child_1", busy: true },
+      ]),
+    );
+  });
+
+  it("eventually finds a new child no frame announced on later snapshots", async () => {
+    // Discovery pushes reach only the replica that published them.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    onTestFinished(() => clock.mockRestore());
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string }[]>>()
+      .mockResolvedValueOnce([{ id: "child_1" }])
+      .mockResolvedValue([{ id: "child_1" }, { id: "child_2" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const rows = [subagentRow("child_1", "conv_a")];
+
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    clock.mockReturnValue(1_000_000 + CHILD_ROW_RECHECK_MS);
+    act(() => handler({ type: "snapshot", items: [...rows, conv("conv_a")] }));
+    await waitFor(() =>
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        { id: "child_1" },
+        { id: "child_2" },
+      ]),
+    );
+  });
+
+  it("refetches a remounted list whose rows were restated while it was unmounted", async () => {
+    // Child lists don't refetch on mount, so the next frame after a remount must.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string }[]>>()
+      .mockResolvedValueOnce([{ id: "child_1" }])
+      .mockResolvedValue([{ id: "child_1" }, { id: "child_2" }]);
+    const unmount = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn: fetchChildren,
+      initialData: [{ id: "child_1" }],
+      staleTime: Infinity,
+      retry: false,
+    }).subscribe(() => {});
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const rows = [subagentRow("child_1", "conv_a")];
+
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    unmount();
+    act(() => handler({ type: "snapshot", items: [...rows, conv("conv_a")] }));
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() =>
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        { id: "child_1" },
+        { id: "child_2" },
+      ]),
+    );
+  });
+
+  it("retries a child list whose refetch failed on the next frame that restates it", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string }[]>>()
+      .mockResolvedValueOnce([{ id: "child_1" }])
+      .mockRejectedValueOnce(new Error("503 Service Unavailable"))
+      .mockResolvedValue([{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const running = subagentRow("child_1", "conv_a", "running");
+
+    act(() => handler({ type: "snapshot", items: [subagentRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [running] }));
+    await waitFor(() =>
+      expect(client.getQueryState(childSessionsQueryKey("conv_a"))?.status).toBe("error"),
+    );
+    // Any later watch-set change restates the row.
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), running] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(client.getQueryState(childSessionsQueryKey("conv_a"))?.status).toBe("success"),
+    );
+  });
+
+  it("re-reads an unchanged list once per recheck window, however far apart its rows were first seen", async () => {
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    onTestFinished(() => clock.mockRestore());
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const ids = Array.from({ length: 10 }, (_, i) => `child_${i}`);
+    const fetchChildren = vi.fn(async () => ids.map((id) => ({ id })));
+    observeChildList(client, "conv_a", fetchChildren, []);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    // Ten sub-agents spawned 30 s apart: each first sight records its row then.
+    for (const id of ids) {
+      act(() => handler({ type: "changed", items: [subagentRow(id, "conv_a")] }));
+      now += 30_000;
+    }
+    const rows = ids.map((id) => subagentRow(id, "conv_a"));
+    await act(async () => {});
+    const before = fetchChildren.mock.calls.length;
+    // Ten more minutes of snapshots every 30 s (a watch-set change elsewhere), rows unchanged.
+    for (let i = 0; i < 20; i += 1) {
+      act(() => handler({ type: "snapshot", items: [conv("conv_a"), ...rows] }));
+      now += 30_000;
+    }
+    // Two windows: one re-read at 5 min, one at 10 min, not one per snapshot.
+    expect(fetchChildren.mock.calls.length - before).toBe(2);
+  });
 });

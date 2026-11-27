@@ -68,6 +68,12 @@ import { isTempConvId } from "@/lib/tempConversationId";
 // single frame can trigger.
 const DEBOUNCE_MS = 250;
 
+/**
+ * How long an unchanged sub-agent row stops snapshots from refetching its
+ * parent's child list, which bounds how long a missed new sibling stays hidden.
+ */
+export const CHILD_ROW_RECHECK_MS = 5 * 60_000;
+
 /** Query hash of the Archived view's project-picker scan. */
 const ARCHIVED_PROJECT_NAMES_HASH = hashKey(ARCHIVED_PROJECT_NAMES_KEY);
 
@@ -374,6 +380,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // the post-reconnect snapshot.
   const commentsFingerprintsRef = useRef(new Map<string, string>());
 
+  // Last streamed row (as JSON) per sub-agent and when it was recorded; snapshots
+  // refetch a parent's child list only for new, changed or expired rows.
+  // Cleared on disconnect, so the snapshot after a reconnect refetches every list.
+  const childRowFingerprintsRef = useRef(new Map<string, { row: string; at: number }>());
+
   // Last streamed archived flag per session, for the frozen Archived snapshot.
   const snapshotArchivedRef = useRef(new Map<string, boolean>());
 
@@ -555,6 +566,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       if (targets.size > 0) reconciler.schedule(targets);
     });
 
+    const unsubscribeStatus = sessionUpdatesSocket.subscribeStatus(() => {
+      if (!sessionUpdatesSocket.isConnected()) childRowFingerprintsRef.current.clear();
+    });
+
     const unsubscribeFrames = sessionUpdatesSocket.subscribe((frame: SessionUpdatesFrame) => {
       switch (frame.type) {
         case "heartbeat":
@@ -578,6 +593,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         case "removed":
           for (const id of frame.ids) {
             commentsFingerprintsRef.current.delete(id);
+            childRowFingerprintsRef.current.delete(id);
             snapshotArchivedRef.current.delete(id);
             // A revoked share or a deletion must not be re-injected by the
             // keep-alive once the refetch correctly leaves it out.
@@ -617,14 +633,53 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             for (const id of commentsFingerprintsRef.current.keys()) {
               if (!watchedIds.has(id)) commentsFingerprintsRef.current.delete(id);
             }
+            for (const id of childRowFingerprintsRef.current.keys()) {
+              if (!watchedIds.has(id)) childRowFingerprintsRef.current.delete(id);
+            }
           }
-          // For child sessions the server includes parent_session_id in the
-          // wire item. Invalidate the parent's child_sessions cache so tree
-          // views (SubagentsPanel, SubagentsGraphView) pick up status changes
-          // without polling.
+          // Child rows carry parent_session_id; refetch the parent's child list
+          // when a row changed so tree views pick up status without polling.
           const parentIds = new Set<string>();
+          const now = Date.now();
+          const fingerprints = new Map<string, string>();
+          const findParentList = (parentId: string) =>
+            queryClient
+              .getQueryCache()
+              .find({ queryKey: childSessionsQueryKey(parentId), exact: true });
           for (const item of frame.items) {
-            if (item.parent_session_id) parentIds.add(item.parent_session_id);
+            if (!item.parent_session_id) continue;
+            const fingerprint = JSON.stringify(item);
+            fingerprints.set(item.id, fingerprint);
+            const parentList = findParentList(item.parent_session_id);
+            const seen = childRowFingerprintsRef.current.get(item.id);
+            // Expiry re-reads membership a discovery push may have missed. A list not
+            // mounted with data is never skipped (see below), and a failed list retries
+            // on later frames without restarting a retry in flight.
+            const retrying = parentList?.state.status === "error";
+            if (
+              seen?.row === fingerprint &&
+              now - seen.at < CHILD_ROW_RECHECK_MS &&
+              parentList?.isActive() &&
+              parentList.state.data !== undefined &&
+              (!retrying || parentList.state.fetchStatus === "fetching")
+            ) {
+              continue;
+            }
+            parentIds.add(item.parent_session_id);
+          }
+          // A refetched list re-reads all its rows, so restamp them together. Invalidation
+          // only marks an unmounted list stale and joins a first fetch, so wait for data.
+          for (const item of frame.items) {
+            if (!item.parent_session_id || !parentIds.has(item.parent_session_id)) continue;
+            const parentList = findParentList(item.parent_session_id);
+            if (parentList?.isActive() && parentList.state.data !== undefined) {
+              childRowFingerprintsRef.current.set(item.id, {
+                row: fingerprints.get(item.id)!,
+                at: now,
+              });
+            } else {
+              childRowFingerprintsRef.current.delete(item.id);
+            }
           }
           for (const parentId of parentIds) {
             void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
@@ -689,6 +744,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     });
 
     return () => {
+      unsubscribeStatus();
       unsubscribeFrames();
       unsubscribeMutations();
       unsubscribeMuteRecheck();
