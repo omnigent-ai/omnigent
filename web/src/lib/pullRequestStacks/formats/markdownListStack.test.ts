@@ -122,4 +122,21 @@ describe("markdownListStackFormat on hand-edited descriptions", () => {
     expect(parse(`${LINEAR}\n${LINEAR}`)).toBeNull();
     expect(parse(LINEAR.replace("## Stacked changes", "## Stack list"))).toBeNull();
   });
+
+  it("matches its header as a whole word, so a longer heading is neither its section nor a second one", () => {
+    const shorter = markdownListStackFormat({ id: "short-stack", header: "## Stack" });
+    expect(shorter.parse(LINEAR, SELF)).toBeNull();
+    expect(parse(`${LINEAR}\n## Stacked changesets\n\nThe release's own notes.\n`)?.trust).toBe(
+      "verified",
+    );
+  });
+
+  it("ignores a footer inside a code block or quote above the header", () => {
+    const withoutFooter = LINEAR.replace("\n---------\n", "\n");
+    for (const above of ["```\n---------\n```", "> ---------"]) {
+      const parsed = parse(`${above}\n\n${withoutFooter}`);
+      expect(parsed?.trust).toBe("tolerated");
+      expect(tolerancesOf(parsed)).toContain("footer");
+    }
+  });
 });

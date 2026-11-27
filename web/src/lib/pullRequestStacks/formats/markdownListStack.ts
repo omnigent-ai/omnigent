@@ -37,6 +37,7 @@ export interface MarkdownListStackSyntax {
 const FOOTER = /^-{9}[ \t]*$/;
 const RULE = /^ {0,3}-{3,}[ \t]*$/;
 const BULLET = /^([ \t]*)- (.*)$/;
+const WORD_START = /^[\p{L}\p{N}_]/u;
 // Git forbids ASCII spaces and `[` in branch names, so a label never runs into the text
 // after it; other Unicode spaces are legal and stay part of the name.
 const LINKED_LABEL = /^\[([^ \t[]+?)\]\(([^ \t()]+)\)/;
@@ -138,8 +139,12 @@ function sectionEnd(
 
 export function markdownListStackFormat(syntax: MarkdownListStackSyntax): StackFormat {
   const { id, header: heading, headerSuffix, introLine, landing } = syntax;
+  // The heading as a whole word, so `## Stack` never claims a `## Stacked changes` section.
   const isHeader = (line: MarkdownLine) =>
-    !line.fenced && !line.quoted && line.text.startsWith(heading);
+    !line.fenced &&
+    !line.quoted &&
+    line.text.startsWith(heading) &&
+    !WORD_START.test(line.text.slice(heading.length));
 
   function parse(body: string, self: StackSelf): StackParse | null {
     const lines = markdownLines(body);
@@ -161,7 +166,10 @@ export function markdownListStackFormat(syntax: MarkdownListStackSyntax): StackF
     // A footer that only appears above the header belongs to something else.
     if (
       footerIndex === -1 &&
-      lines.some((line, index) => index < headerIndex && FOOTER.test(line.text))
+      lines.some(
+        (line, index) =>
+          index < headerIndex && !line.fenced && !line.quoted && FOOTER.test(line.text),
+      )
     ) {
       return null;
     }
