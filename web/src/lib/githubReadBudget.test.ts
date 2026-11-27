@@ -207,7 +207,7 @@ describe("githubReadBudgets and the shell's rollback flag", () => {
     expect(setOptions).toHaveBeenCalledTimes(2);
   });
 
-  it("wakes held polls and work paced by hand at the reset, with no answer in between", () => {
+  it("tells work paced by hand at the reset, with no answer in between, and leaves held polls be", () => {
     vi.useFakeTimers();
     try {
       const { store, advance } = budgets();
@@ -222,7 +222,8 @@ describe("githubReadBudgets and the shell's rollback flag", () => {
       expect(eased).not.toHaveBeenCalled();
       advance(1);
       vi.advanceTimersByTime(1);
-      expect(setOptions).toHaveBeenCalledTimes(1);
+      // A held poll's own interval already ends at the reset; rescheduling it would delay it.
+      expect(setOptions).not.toHaveBeenCalled();
       expect(eased).toHaveBeenCalledTimes(1);
       expect(store.pace(KEY)).toEqual({ pace: "normal" });
       vi.advanceTimersByTime(2 * 60 * 60_000);

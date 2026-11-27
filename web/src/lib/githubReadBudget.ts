@@ -60,7 +60,8 @@ export function createGitHubReadBudgets({
     for (const listener of [...listeners]) listener();
   };
 
-  // Polls a budget paused don't read, so no answer reports its reset: a timer wakes them then.
+  // Paused polls don't read, so no answer reports a reset: a timer tells work paced by hand.
+  // Held polls need no wake here, since their own interval already ends at the reset.
   function scheduleReset() {
     if (resetTimer !== null) clearTimeout(resetTimer);
     resetTimer = null;
@@ -75,7 +76,7 @@ export function createGitHubReadBudgets({
     resetTimer = setTimeout(
       () => {
         resetTimer = null;
-        wake();
+        for (const listener of [...listeners]) listener();
         changed();
         scheduleReset();
       },
