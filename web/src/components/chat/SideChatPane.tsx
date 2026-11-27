@@ -34,6 +34,7 @@ import {
   bubbleKey,
   computeIsWorking,
   computeIsTurnActive,
+  orderedTranscriptItemIds,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
@@ -371,6 +372,7 @@ export function SideChatPane({
   const state = useConversationEntryState(pending ? null : childId);
   const {
     blocks,
+    loadedItemIds,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
@@ -500,15 +502,18 @@ export function SideChatPane({
       subagentRoutingOverride,
     );
     // A session opened in a grid shows its undelivered startup messages too.
+    // Inherited items stay as invisible anchors even when their bubbles are hidden.
     return withUncommittedUserBubbles(
       committed,
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
       failedUploads,
+      failedInputs.length > 0 ? orderedTranscriptItemIds(loadedItemIds, visibleBlocks) : [],
     );
   }, [
     visibleBlocks,
+    loadedItemIds,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,

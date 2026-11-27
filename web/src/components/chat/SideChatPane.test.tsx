@@ -2398,6 +2398,37 @@ describe("history a side chat copied from its parent", () => {
     expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
   });
 
+  it("keeps a copied hidden anchor before later side-chat turns", () => {
+    listSideChat();
+    const copied = userItem(`${childId.slice(0, 12)}copy`, "resp_copy", "Copied context");
+    const later = userItem("side_later", "resp_later", "Later side turn");
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      blocks: itemsToBlocks([copied, later]),
+      loadedItemIds: [copied.id, later.id],
+      failedInputs: [
+        {
+          pendingId: "pending_first",
+          content: [{ type: "input_text", text: "Lost send" }],
+          precedingItemIds: [copied.id],
+          followingItemIds: [],
+        },
+      ],
+    });
+    renderPane(
+      <MemoryRouter>
+        <SideChatPane childId={childId} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByText("Copied context")).toBeNull();
+    const notice = screen.getByTestId("message-undelivered");
+    const laterText = screen.getByText("Later side turn");
+    expect(notice.compareDocumentPosition(laterText) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
+      0,
+    );
+  });
+
   it("waits for the session before choosing which history to hide", () => {
     loadingSession.id = childId;
     const entry = conversationRegistry.acquire(childId);

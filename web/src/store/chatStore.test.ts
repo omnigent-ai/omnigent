@@ -45,7 +45,10 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
 import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles } from "@/lib/renderItems";
-import { withUncommittedUserBubbles } from "@/components/chat/chatBubbleParts";
+import {
+  orderedTranscriptItemIds,
+  withUncommittedUserBubbles,
+} from "@/components/chat/chatBubbleParts";
 import {
   getSessionSlim,
   INITIAL_WINDOW_ITEMS,
@@ -2669,6 +2672,21 @@ describe("chatStore — switchTo", () => {
       name: "read_database",
       data: { rows: 3 },
     });
+  });
+
+  it("keeps hidden item ids in order while older history is loaded", async () => {
+    const items = Array.from({ length: INITIAL_WINDOW_ITEMS + 2 }, (_, index) => ({
+      ...userMessage(`item_${index}`, `Message ${index}`),
+      ...(index % 2 === 0 ? { is_meta: true } : {}),
+    }));
+    seedSession("conv_hidden_pages", items);
+    await useChatStore.getState().switchTo("conv_hidden_pages");
+    expect(useChatStore.getState().loadedItemIds).toEqual(
+      items.slice(-INITIAL_WINDOW_ITEMS).map((item) => item.id),
+    );
+    await useChatStore.getState().loadMoreHistory();
+    expect(useChatStore.getState().loadedItemIds).toEqual(items.map((item) => item.id));
+    expect(useChatStore.getState().blocks.length).toBeLessThan(items.length);
   });
 
   it("keeps undelivered messages a failure re-read found while the bind snapshot was out", async () => {
@@ -15282,8 +15300,13 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
         ctx: { itemId: null },
         streamedItemId: "rs_thought",
       });
+      const bubbles = buildBubbles(blocks, null);
+      expect(bubbles.find((bubble) => bubble.kind === "assistant")?.itemIds).toContain(
+        "rs_thought",
+      );
+      // Placed the way the transcript does, from the fetched order extended by live blocks.
       const placed = withUncommittedUserBubbles(
-        buildBubbles(blocks, null),
+        bubbles,
         [],
         [
           {
@@ -15294,6 +15317,8 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
           },
         ],
         null,
+        [],
+        orderedTranscriptItemIds(useChatStore.getState().loadedItemIds, blocks),
       );
       expect(
         placed.map((bubble) => (bubble.kind === "assistant" ? "reply" : bubble.itemId)),
@@ -19072,6 +19097,60 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     return userMessage(`${prefix}_${idx.toString().padStart(4, "0")}`, `${prefix} ${idx}`);
   }
 
+  it("keeps fetched history before a reconnect page that overlaps only live items", async () => {
+    const [hidden, anchor] = [{ ...gapUser("hidden", 0), is_meta: true }, gapUser("anchor", 0)];
+    // More than a page arrived over the live stream: rendered, but never fetched.
+    const live = Array.from({ length: SESSION_HISTORY_PAGE_SIZE + 5 }, (_, i) =>
+      gapUser("live", i),
+    );
+    const gap = gapUser("gap", 0);
+    seedSession("conv_live_gap", [hidden, anchor, ...live]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_live_gap",
+      abortController: controller,
+      blocks: itemsToBlocks([hidden, anchor, ...live]),
+      loadedItemIds: [hidden.id, anchor.id],
+      hasMoreHistory: false,
+      oldestItemId: hidden.id,
+    });
+    const loop = startStreamPump("conv_live_gap", controller, setState, getState);
+    await drainAsync();
+    seedSessionItems("conv_live_gap", [hidden, anchor, ...live, gap]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.loadedItemIds.slice(0, 2)).toEqual([hidden.id, anchor.id]);
+    expect(state.loadedItemIds.at(-1)).toBe(gap.id);
+    const placed = withUncommittedUserBubbles(
+      buildBubbles(state.blocks, state.activeResponse),
+      [],
+      [
+        {
+          pendingId: "pending_first",
+          content: [],
+          precedingItemIds: [hidden.id],
+          followingItemIds: [anchor.id],
+        },
+      ],
+      null,
+      [],
+      orderedTranscriptItemIds(state.loadedItemIds, state.blocks),
+    );
+    expect(
+      placed.slice(0, 2).map((bubble) => (bubble.kind === "user" ? bubble.itemId : null)),
+    ).toEqual(["pending_first", anchor.id]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a streamed thought exactly once when its answer is still streaming across a reconnect", async () => {
     const question = gapUser("question", 0);
     const thought = {
@@ -19121,6 +19200,43 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each([5, 100])(
+    "retains hidden item ids after a reconnect gap of %i items",
+    async (gapLength) => {
+      const preGap = Array.from({ length: 30 }, (_, index) => gapUser("pre_hidden", index));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession("conv_hidden_gap", preGap);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_hidden_gap",
+        abortController: controller,
+        blocks: itemsToBlocks(windowItems),
+        loadedItemIds: windowItems.map((item) => item.id),
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+      });
+      const loop = startStreamPump("conv_hidden_gap", controller, setState, getState);
+      await drainAsync();
+      const gap = Array.from({ length: gapLength }, (_, index) => ({
+        ...gapUser("gap_hidden", index),
+        ...(index === gapLength - 2 ? { is_meta: true } : {}),
+      }));
+      seedSessionItems("conv_hidden_gap", [...preGap, ...gap]);
+      sinks[0]!.error();
+      await drainAsync();
+      const expected = gapLength > 80 ? gap.slice(-INITIAL_WINDOW_ITEMS) : [...windowItems, ...gap];
+      expect(useChatStore.getState().loadedItemIds).toEqual(expected.map((item) => item.id));
+      expect(
+        useChatStore.getState().blocks.some((block) => block.ctx.itemId === gap.at(-2)!.id),
+      ).toBe(false);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
 
   it("backfills a multi-page disconnect gap until it reaches the rendered transcript", async () => {
     // 30 committed items; the rendered window is the newest 20.

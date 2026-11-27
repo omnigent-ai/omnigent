@@ -784,6 +784,13 @@ export type AnyBlock =
   | PolicyDeniedBlock
   | ResponseEndBlock;
 
+/** The transcript items a block shows: its own, or the one its streamed reasoning became. */
+export function itemIdsShownBy(block: AnyBlock): string[] {
+  const ids = block.ctx.itemId === null ? [] : [block.ctx.itemId];
+  if (block.type === "reasoning_start" && block.streamedItemId) ids.push(block.streamedItemId);
+  return ids;
+}
+
 /** Whether a block is a pending card that parks the agent's turn until it is answered. */
 export function isPendingBlockingElicitation(block: AnyBlock): boolean {
   return block.type === "elicitation" && block.status === "pending" && block.isBlocking !== false;

@@ -58,6 +58,7 @@ import {
   extractUserText,
   isSystemBubble,
   keyboardActiveQuestionId,
+  orderedTranscriptItemIds,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
@@ -175,6 +176,7 @@ function TranscriptImpl({
   spacerMeasureRef,
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
+  const loadedItemIds = useChatStore((s) => s.loadedItemIds);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
   const failedUploads = useChatStore((s) => s.failedUploads);
   const failedInputs = useChatStore((s) => s.failedInputs);
@@ -224,9 +226,11 @@ function TranscriptImpl({
       failedInputs,
       getCurrentAuthorId(),
       failedUploads,
+      failedInputs.length > 0 ? orderedTranscriptItemIds(loadedItemIds, blocks) : [],
     );
   }, [
     blocks,
+    loadedItemIds,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,

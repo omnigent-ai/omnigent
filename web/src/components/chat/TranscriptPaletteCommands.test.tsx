@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, renderHook } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { StickToBottom } from "use-stick-to-bottom";
@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type { Bubble } from "@/lib/renderItems";
+import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
 
@@ -77,7 +78,7 @@ afterEach(() => {
   cleanup();
   scroll.state = null;
   vi.clearAllMocks();
-  useChatStore.setState({ blocks: [], conversationId: null });
+  useChatStore.setState({ blocks: [], loadedItemIds: [], failedInputs: [], conversationId: null });
   writePeerSessionMessageDisplay("collapse");
   usePaletteCommandsStore.setState({ groups: {} });
 });
@@ -185,6 +186,67 @@ function userBlock(itemId: string, content: UserMessageBlock["content"]): UserMe
 }
 
 describe("TranscriptPaletteCommands in the transcript", () => {
+  it("renders a failed send between visible messages around hydrated hidden neighbors", () => {
+    const item = (id: string, text: string, isMeta = false) => ({
+      id,
+      response_id: `response_${id}`,
+      type: "message" as const,
+      role: "user" as const,
+      status: "completed" as const,
+      content: [{ type: "input_text" as const, text }],
+      ...(isMeta ? { is_meta: true } : {}),
+    });
+    const items = [
+      item("before", "Before history"),
+      item("hidden_before", "Hidden before", true),
+      item("hidden_after", "Hidden after", true),
+      item("after", "After history"),
+    ];
+    useChatStore.setState({
+      conversationId: "c1",
+      blocks: itemsToBlocks(items),
+      loadedItemIds: items.map((entry) => entry.id),
+      failedInputs: [
+        {
+          pendingId: "pending_first",
+          content: [{ type: "input_text", text: "Lost send" }],
+          precedingItemIds: ["hidden_before"],
+          followingItemIds: ["hidden_after"],
+        },
+      ],
+    });
+    const FlagOn = withFlag(true);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/c/c1"]}>
+          <FlagOn>
+            <Transcript
+              setConversationEl={vi.fn()}
+              containerEl={null}
+              scroller={null}
+              setScroller={vi.fn()}
+              sendScrollNonce={0}
+              hasMoreHistory={false}
+              loadingMoreHistory={false}
+              isMobileViewport={false}
+              showsWorking={false}
+              agentsError={null}
+              sandboxLaunching={false}
+              spacerMeasureRef={{ current: null }}
+            />
+          </FlagOn>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const before = screen.getByText("Before history");
+    const copy = screen.getByTestId("message-undelivered");
+    const after = screen.getByText("After history");
+    expect(before.compareDocumentPosition(copy) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(copy.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(screen.queryByText("Hidden before")).toBeNull();
+    expect(screen.queryByText("Hidden after")).toBeNull();
+  });
+
   it("copies the latest prompt the transcript shows, not a hidden message from another session", async () => {
     writePeerSessionMessageDisplay("hide");
     useChatStore.setState({

@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ElicitationBlock } from "@/lib/blocks";
+import { ELICITATION_RESPONSE_PREFIX, type ElicitationBlock } from "@/lib/blocks";
 import { buildBubbles, type Bubble, type RenderItem } from "@/lib/renderItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import type { ConversationItem } from "@/lib/conversationItems";
@@ -27,7 +27,9 @@ import {
   ConversationScrollRefBridge,
   containsMermaidDiagram,
   keyboardActiveQuestionId,
+  orderedTranscriptItemIds,
   placeUndeliveredBubbles,
+  reorderCommittedRequestElicitations,
   withUncommittedUserBubbles,
 } from "./chatBubbleParts";
 
@@ -1221,6 +1223,27 @@ describe("undelivered startup messages", () => {
         { precedingItemIds: ["resource_event"], followingItemIds: ["older_reply"] },
       ),
     ).toEqual(["user_1", "pending_0", "pending_1", "error_failed", "user_2"]);
+    // Neighbors that are loaded but render nothing keep it between the messages around them,
+    // not above the whole loaded page.
+    const hiddenBefore = Array.from({ length: 20 }, (_, index) => `resource_before_${index}`);
+    const hiddenAfter = Array.from({ length: 20 }, (_, index) => `resource_after_${index}`);
+    expect(
+      withUncommittedUserBubbles(
+        committed,
+        [],
+        [
+          {
+            ...lost,
+            pendingId: "pending_0",
+            precedingItemIds: [...hiddenBefore].reverse(),
+            followingItemIds: hiddenAfter,
+          },
+        ],
+        null,
+        [],
+        ["user_1", "reply_text", "reply_tail", ...hiddenBefore, ...hiddenAfter, "user_2"],
+      ).map((bubble) => (bubble.kind === "assistant" ? bubble.stableId : bubble.itemId)),
+    ).toEqual(["user_1", "error_failed", "pending_0", "user_2"]);
   });
 
   it("stay below a reply that only reasoned, from history or streamed live", () => {
@@ -1317,21 +1340,150 @@ describe("undelivered startup messages", () => {
       ],
     },
   ])("stay outside $derived", ({ itemId, items, bubbles }) => {
-    const committed = buildBubbles(itemsToBlocks(items), null);
+    const blocks = itemsToBlocks(items);
+    const committed = buildBubbles(blocks, null);
     const label = (bubble: Bubble) =>
       bubble.kind === "assistant" ? `assistant:${bubble.stableId}` : bubble.itemId;
-    const place = (neighbors: Pick<PendingInput, "precedingItemIds" | "followingItemIds">) =>
-      withUncommittedUserBubbles(committed, [], [{ ...lost, ...neighbors }], null).map(label);
     expect(committed.map(label)).toEqual(bubbles);
-    // An earlier item that isn't loaded leaves the copy to anchor on the item's first bubble.
-    expect(place({ precedingItemIds: ["older"], followingItemIds: [itemId] })).toEqual([
-      "pending_first",
-      ...committed.map(label),
-    ]);
-    expect(place({ precedingItemIds: [itemId], followingItemIds: ["resource_event"] })).toEqual([
-      ...committed.map(label),
-      "pending_first",
-    ]);
+    // Without a loaded order (rendered ids only), and with the order the transcript passes.
+    for (const loaded of [
+      undefined,
+      orderedTranscriptItemIds(
+        items.map((item) => item.id),
+        blocks,
+      ),
+    ]) {
+      const place = (neighbors: Pick<PendingInput, "precedingItemIds" | "followingItemIds">) =>
+        withUncommittedUserBubbles(
+          committed,
+          [],
+          [{ ...lost, ...neighbors }],
+          null,
+          [],
+          loaded,
+        ).map(label);
+      // An earlier item that isn't loaded leaves the copy to anchor on the item's first bubble.
+      expect(place({ precedingItemIds: ["older"], followingItemIds: [itemId] })).toEqual([
+        "pending_first",
+        ...committed.map(label),
+      ]);
+      expect(place({ precedingItemIds: [itemId], followingItemIds: ["resource_event"] })).toEqual([
+        ...committed.map(label),
+        "pending_first",
+      ]);
+    }
+  });
+
+  describe("anchors on loaded item order", () => {
+    const user = (itemId: string): Bubble => ({ kind: "user", itemId, content: [] });
+    const shared = (stableId: string) => ({ ...errorBubble(), stableId, itemIds: ["shared"] });
+    const card: Bubble = {
+      ...errorBubble(),
+      responseId: `${ELICITATION_RESPONSE_PREFIX}one`,
+      stableId: "card",
+      items: [
+        {
+          kind: "elicitation",
+          itemId: null,
+          elicitationId: "card",
+          message: "Approve?",
+          phase: "request",
+          policyName: "policy",
+          contentPreview: "",
+          requestedSchema: {},
+          status: "responded",
+          response: { action: "accept" },
+        },
+      ],
+    };
+    // Loaded ids without a bubble stand for items the transcript hides.
+    it.each([
+      [
+        "hidden neighbors on both sides",
+        [user("before"), user("after")],
+        ["hidden_before"],
+        ["hidden_after"],
+        ["before", "hidden_before", "hidden_after", "after"],
+        ["before", "pending_first", "after"],
+      ],
+      [
+        "a send older than the loaded window",
+        [user("loaded")],
+        ["older"],
+        ["also_older"],
+        ["loaded"],
+        ["pending_first", "loaded"],
+      ],
+      [
+        "a hidden predecessor before later items",
+        [user("before"), user("later")],
+        ["hidden"],
+        [],
+        ["before", "hidden", "later"],
+        ["before", "pending_first", "later"],
+      ],
+      [
+        "a hidden predecessor with nothing rendered before it",
+        [user("later")],
+        ["hidden"],
+        [],
+        ["hidden", "later"],
+        ["pending_first", "later"],
+      ],
+      [
+        "the first send in the session",
+        [user("later")],
+        [],
+        [],
+        ["later"],
+        ["pending_first", "later"],
+      ],
+      [
+        "the first send above a notice",
+        [errorBubble(), user("later")],
+        [],
+        [],
+        ["later"],
+        ["pending_first", "error_failed", "later"],
+      ],
+      [
+        "a prompt and its reordered request card",
+        reorderCommittedRequestElicitations([user("before"), card, user("prompt")]),
+        ["hidden"],
+        ["prompt"],
+        ["before", "hidden", "prompt"],
+        ["before", "pending_first", "prompt", "card"],
+      ],
+      [
+        "after both bubbles sharing an item",
+        [shared("first"), shared("second")],
+        ["shared"],
+        [],
+        ["shared"],
+        ["first", "second", "pending_first"],
+      ],
+      [
+        "before both bubbles sharing an item",
+        [shared("first"), shared("second")],
+        [],
+        ["shared"],
+        ["shared"],
+        ["pending_first", "first", "second"],
+      ],
+    ])(
+      "places a send for %s",
+      (_case, committed, precedingItemIds, followingItemIds, loadedItemIds, expected) => {
+        const placed = placeUndeliveredBubbles(
+          committed,
+          [{ ...lost, precedingItemIds, followingItemIds }],
+          null,
+          loadedItemIds,
+        );
+        expect(
+          placed.map((bubble) => (bubble.kind === "assistant" ? bubble.stableId : bubble.itemId)),
+        ).toEqual(expected);
+      },
+    );
   });
 
   it("start a new session carrying the text and the attachments that download", async () => {

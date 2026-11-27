@@ -28,7 +28,7 @@ import type {
   ToolExecution,
   ToolResultBlock,
 } from "./blocks";
-import { isTerminalCommandInput, LIVE_ITEM_PREFIX } from "./blocks";
+import { isTerminalCommandInput, itemIdsShownBy, LIVE_ITEM_PREFIX } from "./blocks";
 import { isUserInputElicitation } from "./askUserQuestion";
 import {
   type RoutingDecisionExtras,
@@ -1182,10 +1182,7 @@ function walkBubbles(
       kind: "assistant",
       responseId: groupResponseId,
       stableId,
-      itemIds: groupBlocks.flatMap((block) => [
-        ...(block.ctx.itemId === null ? [] : [block.ctx.itemId]),
-        ...(block.type === "reasoning_start" && block.streamedItemId ? [block.streamedItemId] : []),
-      ]),
+      itemIds: groupBlocks.flatMap(itemIdsShownBy),
       ...(liveOpener !== undefined ? { liveOpener } : {}),
       lifecycle,
       error,

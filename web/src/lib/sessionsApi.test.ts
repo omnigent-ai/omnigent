@@ -496,6 +496,14 @@ describe("createSession", () => {
             preceding_item_ids: ["msg_reply", "msg_first"],
             following_item_ids: ["msg_notice"],
           },
+          // The first input in a session names no earlier items, an older server neither list.
+          {
+            pending_id: "pending_3",
+            content: [],
+            preceding_item_ids: [],
+            following_item_ids: [],
+          },
+          { pending_id: "pending_4", content: [] },
         ],
       }),
     );
@@ -512,6 +520,8 @@ describe("createSession", () => {
         precedingItemIds: ["msg_reply", "msg_first"],
         followingItemIds: ["msg_notice"],
       },
+      { pendingId: "pending_3", content: [], precedingItemIds: [], followingItemIds: [] },
+      { pendingId: "pending_4", content: [] },
     ]);
   });
 

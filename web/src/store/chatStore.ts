@@ -56,7 +56,12 @@ import type {
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
-import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
+import {
+  itemIdsShownBy,
+  LIVE_ITEM_PREFIX,
+  PENDING_FILE_PREFIX,
+  structuredErrorFields,
+} from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
@@ -812,6 +817,8 @@ export interface ConversationState {
    * `text_done` branch of `pumpStreamEvents`.
    */
   blocks: AnyBlock[];
+  /** Fetched item order, including items that do not produce blocks. */
+  loadedItemIds: string[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
   /**
@@ -2473,6 +2480,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   rewindPrefill: null,
   blocks: [],
+  loadedItemIds: [],
   pendingUserMessages: [],
   failedUploads: [],
   settledShellInputs: [],
@@ -4497,6 +4505,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
         return {
           blocks: [...unique, ...state.blocks],
+          loadedItemIds: mergeLoadedItemIds(
+            state.loadedItemIds,
+            items.map((item) => item.id),
+            "older",
+          ),
           hasMoreHistory: hasMore,
           oldestItemId: items[0]?.id ?? state.oldestItemId,
           loadingMoreHistory: false,
@@ -4545,6 +4558,35 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 }
 
 // ── Internal helpers ─────────────────────────────────────
+
+// Merge chronological id windows. Ids past the last one they share keep the incoming window's
+// side: an older page goes before what was held, a newer reconnect page after it. A newer page
+// can overlap only live blocks, never the held ids, so overlap alone can't order the two.
+function mergeLoadedItemIds(
+  existing: string[],
+  incoming: string[],
+  incomingAge: "older" | "newer",
+): string[] {
+  const positions = new Map(existing.map((id, index) => [id, index]));
+  const merged: string[] = [];
+  let existingStart = 0;
+  let incomingStart = 0;
+  for (const [index, id] of incoming.entries()) {
+    const position = positions.get(id);
+    if (position === undefined || position < existingStart) continue;
+    for (; existingStart < position; existingStart += 1) merged.push(existing[existingStart]!);
+    for (; incomingStart < index; incomingStart += 1) merged.push(incoming[incomingStart]!);
+    merged.push(id);
+    existingStart = position + 1;
+    incomingStart = index + 1;
+  }
+  const heldRest = existing.slice(existingStart);
+  const incomingRest = incoming.slice(incomingStart);
+  merged.push(
+    ...(incomingAge === "newer" ? [...heldRest, ...incomingRest] : [...incomingRest, ...heldRest]),
+  );
+  return [...new Set(merged)];
+}
 
 export function isCompactControl(
   harness: string | null | undefined,
@@ -5982,6 +6024,7 @@ async function bindStream(
           ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
           : {}),
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
+        loadedItemIds: items.map((item) => item.id),
         pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }
@@ -6864,6 +6907,7 @@ async function rehydrateWindowOnReconnect(
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
+      loadedItemIds: fresh.items.map((item) => item.id),
       hasMoreHistory: fresh.hasMore,
       oldestItemId: fresh.items[0]?.id ?? null,
       loadingMoreHistory: false,
@@ -7074,6 +7118,11 @@ async function reconcileOnReconnect(
         : currentBlocks;
     const patch: Partial<ChatState> = {
       ...statusPatchFor(s),
+      loadedItemIds: mergeLoadedItemIds(
+        s.loadedItemIds,
+        items.map((item) => item.id),
+        "newer",
+      ),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
@@ -8416,9 +8465,7 @@ export async function pumpStreamEvents(
       !block.ctx.itemId &&
       !block.streamedItemId &&
       block.ctx.responseId === responseId;
-    const names = (block: AnyBlock) =>
-      block.ctx.itemId === itemId ||
-      (block.type === "reasoning_start" && block.streamedItemId === itemId);
+    const names = (block: AnyBlock) => itemIdsShownBy(block).includes(itemId);
     if (buffer.some(names) || get().blocks.some(names)) return;
     const buffered = buffer.findLastIndex(unstamped);
     const opener = buffer[buffered];

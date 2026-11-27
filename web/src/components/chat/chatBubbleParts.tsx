@@ -93,6 +93,7 @@ import {
   imagePreview,
   isPendingBlockingElicitation,
   isTextBlock,
+  itemIdsShownBy,
   keyedAttachments,
   PENDING_FILE_PREFIX,
   slashCommandEchoItemId,
@@ -386,26 +387,62 @@ function itemSpan(spans: Map<string, BubbleSpan>, id: string): BubbleSpan | unde
   return combined;
 }
 
-// After the newest rendered item saved before the message, else before the oldest rendered one
-// saved after it. Otherwise last when nothing followed it, else first (older than what's loaded).
-// An older server names neither: above the startup failure notice, or last.
+// Snapshot item ids include entries the renderer drops; live blocks extend that order.
+export function orderedTranscriptItemIds(loadedItemIds: string[], blocks: AnyBlock[]): string[] {
+  const ids = new Set(loadedItemIds);
+  for (const block of blocks) {
+    for (const id of itemIdsShownBy(block)) ids.add(id);
+  }
+  return [...ids];
+}
+
+// A skill's typed echo and an answered card render under ids derived from their item, and
+// itemSpan already places them with it. Ordering them on their own would split the pair.
+function withoutDerivedItemIds(ids: string[]): string[] {
+  const derived = new Set(
+    ids.flatMap((id) => [slashCommandEchoItemId(id), answeredElicitationItemId(id)]),
+  );
+  return ids.filter((id) => !derived.has(id));
+}
+
 function undeliveredIndex(
   input: PendingInput,
   spans: Map<string, BubbleSpan>,
+  loadedItemIds: string[],
+  itemIndexes: Map<string, number>,
   notice: number,
   end: number,
 ): number {
   if (input.precedingItemIds === undefined) return notice === -1 ? end : notice;
+  if (input.precedingItemIds.length === 0) return 0;
+  const following = input.followingItemIds ?? [];
+  let position: number | undefined;
   for (const id of input.precedingItemIds) {
-    const span = itemSpan(spans, id);
+    const index = itemIndexes.get(id);
+    if (index !== undefined) {
+      position = index + 1;
+      break;
+    }
+  }
+  if (position === undefined) {
+    for (const id of following) {
+      const index = itemIndexes.get(id);
+      if (index !== undefined) {
+        position = index;
+        break;
+      }
+    }
+  }
+  if (position === undefined) return following.length === 0 ? end : 0;
+  for (let index = position - 1; index >= 0; index -= 1) {
+    const span = itemSpan(spans, loadedItemIds[index]!);
     if (span !== undefined) return span.last + 1;
   }
-  const following = input.followingItemIds ?? [];
-  for (const id of following) {
-    const span = itemSpan(spans, id);
+  for (let index = position; index < loadedItemIds.length; index += 1) {
+    const span = itemSpan(spans, loadedItemIds[index]!);
     if (span !== undefined) return span.first;
   }
-  return following.length === 0 ? end : 0;
+  return 0;
 }
 
 /** Place undelivered messages where they were sent, in submission order. */
@@ -413,15 +450,21 @@ export function placeUndeliveredBubbles(
   committed: Bubble[],
   failedInputs: PendingInput[],
   selfAuthor: string | null,
+  loadedItemIds?: string[],
 ): Bubble[] {
   if (failedInputs.length === 0) return committed;
   const bubbles = buildUndeliveredBubbles(failedInputs, selfAuthor);
   const spans = bubbleSpansByItemId(committed);
+  const orderedIds = withoutDerivedItemIds(loadedItemIds ?? [...spans.keys()]);
+  const itemIndexes = new Map(orderedIds.map((id, index) => [id, index]));
   const notice = committed.findIndex(isStartupFailureBubble);
   const placed = new Map<number, Bubble[]>();
   let previous = 0;
   for (const [index, input] of failedInputs.entries()) {
-    const at = Math.max(previous, undeliveredIndex(input, spans, notice, committed.length));
+    const at = Math.max(
+      previous,
+      undeliveredIndex(input, spans, orderedIds, itemIndexes, notice, committed.length),
+    );
     previous = at;
     placed.set(at, [...(placed.get(at) ?? []), bubbles[index]!]);
   }
@@ -454,6 +497,7 @@ function sendsAfter(earlier: PendingUserMessage, later: PendingUserMessage): boo
  * @param failedInputs - The snapshot's undelivered startup messages.
  * @param selfAuthor - The viewer's attribution id, or null.
  * @param failedUploads - Sends whose upload failed before posting, shown in send order.
+ * @param loadedItemIds - Ordered loaded items, including invisible ones.
  */
 export function withUncommittedUserBubbles(
   committed: Bubble[],
@@ -461,8 +505,14 @@ export function withUncommittedUserBubbles(
   failedInputs: PendingInput[],
   selfAuthor: string | null,
   failedUploads: PendingUserMessage[] = [],
+  loadedItemIds?: string[],
 ): Bubble[] {
-  const withUndelivered = placeUndeliveredBubbles(committed, failedInputs, selfAuthor);
+  const withUndelivered = placeUndeliveredBubbles(
+    committed,
+    failedInputs,
+    selfAuthor,
+    loadedItemIds,
+  );
   // Pending sends keep their own order; each parked upload goes where its send time falls.
   const uncommitted = [...withoutFailedInputs(pendingUserMessages, failedInputs)];
   for (const failed of failedUploads) {
