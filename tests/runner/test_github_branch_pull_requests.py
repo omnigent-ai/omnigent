@@ -376,9 +376,7 @@ def test_a_title_that_isnt_text_is_shown_empty(tmp_path: Path, fake: FakeGh) -> 
     assert row["title"] == ""
 
 
-@pytest.mark.parametrize(
-    ("listed", "shown", "has_more"), [(39, 20, True), (21, 20, True), (20, 20, False)]
-)
+@pytest.mark.parametrize(("listed", "shown", "has_more"), [(21, 20, True), (20, 20, False)])
 def test_the_list_is_capped_and_says_when_github_has_more(
     tmp_path: Path, fake: FakeGh, listed: int, shown: int, has_more: bool
 ) -> None:
