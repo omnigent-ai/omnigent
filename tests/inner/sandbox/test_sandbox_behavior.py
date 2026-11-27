@@ -678,14 +678,22 @@ async def test_runner_shell_retires_helper_and_owned_background_processes(
         helper = processes[0]
         assert helper.pid != file_helper.pid
         assert file_helper.poll() is None
-        descendants = psutil.Process(helper.pid).children(recursive=True)
-        sleepers = []
-        for process in descendants:
-            try:
-                if process.cmdline() == ["sleep", "30"]:
-                    sleepers.append(process)
-            except psutil.NoSuchProcess:
-                pass
+        descendants: list[psutil.Process] = []
+        sleepers: list[psutil.Process] = []
+
+        def background_sleep_started() -> bool:
+            nonlocal descendants, sleepers
+            descendants = psutil.Process(helper.pid).children(recursive=True)
+            sleepers = []
+            for process in descendants:
+                try:
+                    if process.cmdline() == ["sleep", "30"]:
+                        sleepers.append(process)
+                except psutil.NoSuchProcess:
+                    pass
+            return bool(sleepers)
+
+        await poll_until_async(background_sleep_started, timeout_s=5)
         assert sleepers
         (tmp_path / "release").touch()
         result = json.loads(await task)
