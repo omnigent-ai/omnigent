@@ -46,6 +46,9 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
 ) -> None:
     claude, tmux_binary = shutil.which("claude"), shutil.which("tmux")
     assert claude is not None and tmux_binary is not None
+    launch_model = (
+        "draft-initial-model" if draft_mode == "picker" else _PINNED_CLAUDE_MODELS["sonnet"]
+    )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     config = tmp_path / "claude-config"
@@ -149,7 +152,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         value["modelPicker"] = {
             "replaceBuiltInOptions": True,
             "options": [
-                {"model": _PINNED_CLAUDE_MODELS["sonnet"], "label": "Draft initial"},
+                {"model": launch_model, "label": "Draft initial"},
                 {"model": "draft-test-model", "label": "Draft target"},
             ],
         }
@@ -405,7 +408,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     "--settings",
                     str(settings),
                     "--model",
-                    _PINNED_CLAUDE_MODELS["sonnet"],
+                    launch_model,
                     "--strict-mcp-config",
                     "--mcp-config",
                     '{"mcpServers":{}}',
@@ -538,7 +541,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                         == editor_environment_digest
                     )
 
-                wait_status(_PINNED_CLAUDE_MODELS["sonnet"])
+                wait_status(launch_model)
                 before = (bridge_dir / bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns
                 choose("Draft target", commit=True)
                 wait_status("draft-test-model", after=before)
@@ -550,13 +553,14 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 assert len(checked) == 1 and model_switch._row_label(checked[0]) == "Draft target"
                 picker_observations.append({"kind": "current", "pane": pane()})
                 command("send-keys", "-t", target, "Escape")
+                poll_until(lambda: live_picker() is None, timeout_s=10)
                 observe_without_import()
                 choose("Draft initial", commit=False)
                 wait_status("draft-test-model")
                 observe_without_import()
                 before = (bridge_dir / bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns
                 choose("Draft initial", commit=True)
-                wait_status(_PINNED_CLAUDE_MODELS["sonnet"], after=before)
+                wait_status(launch_model, after=before)
                 observe_without_import()
                 assert saved_settings.read_bytes() == saved_contents
                 assert get_mock_message_requests(isolated_mock_llm_server_url) == []
