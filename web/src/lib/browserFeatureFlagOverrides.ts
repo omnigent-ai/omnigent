@@ -42,15 +42,23 @@ function browserFlag(name: string): BrowserFlagDefinition | undefined {
   return flagsByName.flags.get(name);
 }
 
-/** Whatever storage holds, as JSON; null where it's empty, unreadable or refused. */
-function readStoredJson(): Record<string, unknown> | null {
+/** Stored text as a JSON object; null where it's absent or malformed. */
+function parseStored(raw: string | null): Record<string, unknown> | null {
+  if (raw === null) return null;
   try {
-    const raw = window.localStorage.getItem(BROWSER_FLAG_OVERRIDES_KEY);
-    if (raw === null) return null;
     const parsed: unknown = JSON.parse(raw);
     return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whatever storage holds, as JSON; null where it's empty, malformed or refused. */
+function readStoredJson(): Record<string, unknown> | null {
+  try {
+    return parseStored(window.localStorage.getItem(BROWSER_FLAG_OVERRIDES_KEY));
   } catch {
     return null;
   }
@@ -107,11 +115,13 @@ export function browserFlagOverride(name: string): boolean | undefined {
 export function setBrowserFlagOverride(name: string, value: boolean | undefined): boolean {
   const flag = browserFlag(name);
   if (!flag || (value !== undefined && !browserOverrideAllowed(flag, value))) return false;
-  const next = Object.fromEntries(
-    Object.entries(readStoredJson() ?? {}).filter(([stored]) => stored !== name),
-  );
-  if (value !== undefined) next[name] = value;
   try {
+    // Read inside the same guard: a refused read must not pass for empty storage and drop the rest.
+    const current = parseStored(window.localStorage.getItem(BROWSER_FLAG_OVERRIDES_KEY));
+    const next = Object.fromEntries(
+      Object.entries(current ?? {}).filter(([stored]) => stored !== name),
+    );
+    if (value !== undefined) next[name] = value;
     if (Object.keys(next).length === 0) window.localStorage.removeItem(BROWSER_FLAG_OVERRIDES_KEY);
     else window.localStorage.setItem(BROWSER_FLAG_OVERRIDES_KEY, JSON.stringify(next));
   } catch {

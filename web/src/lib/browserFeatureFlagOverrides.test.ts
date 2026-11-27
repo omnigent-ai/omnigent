@@ -147,6 +147,20 @@ describe("setBrowserFlagOverride", () => {
     expect(setBrowserFlagOverride(FLAG, true)).toBe(false);
   });
 
+  it.each([
+    ["sets", true],
+    ["clears", undefined],
+  ])("%s nothing, and says so, when storage refuses the read", (_case, value) => {
+    store({ [HIDDEN]: true, [FLAG]: false });
+    const before = window.localStorage.getItem(BROWSER_FLAG_OVERRIDES_KEY);
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("denied", "SecurityError");
+    });
+    expect(setBrowserFlagOverride(FLAG, value)).toBe(false);
+    vi.mocked(Storage.prototype.getItem).mockRestore();
+    expect(window.localStorage.getItem(BROWSER_FLAG_OVERRIDES_KEY)).toBe(before);
+  });
+
   it("names the choices in the console when they change", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
     setBrowserFlagOverride(FLAG, true);
