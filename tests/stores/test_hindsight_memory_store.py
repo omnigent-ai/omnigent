@@ -32,11 +32,11 @@ def store(fake: FakeHindsight) -> MemoryStore:
 class TestHindsightMemoryStore(SearchableMemoryStoreConformance):
     """The shared backend contract against Hindsight."""
 
-    def test_each_path_is_one_replaced_document_in_the_actors_bank(
+    async def test_each_path_is_one_replaced_document_in_the_actors_bank(
         self, store: MemoryStore, fake: FakeHindsight
     ) -> None:
-        store.write(ALICE, "/projects/api/notes", "first", "Notes")
-        store.write(ALICE, "/projects/api/notes", "second")
+        await store.write(ALICE, "/projects/api/notes", "first", "Notes")
+        await store.write(ALICE, "/projects/api/notes", "second")
 
         bank = bank_id_for(0, ALICE)
         assert list(fake.banks) == [bank]
@@ -57,38 +57,38 @@ class TestHindsightMemoryStore(SearchableMemoryStoreConformance):
         digest = hashlib.sha256(b"0\0user:alice").hexdigest()[:10]
         assert bank_id_for(0, ALICE) == f"omnigent-w0-user_alice-{digest}"
 
-    def test_a_bank_is_created_once_and_a_creation_failure_is_tolerated(self) -> None:
+    async def test_a_bank_is_created_once_and_a_creation_failure_is_tolerated(self) -> None:
         fake = FakeHindsight(fail_create_bank=True)
         store = HindsightMemoryStore(fake)
 
-        store.write(ALICE, "/a", "x")
-        store.write(ALICE, "/b", "y")
+        await store.write(ALICE, "/a", "x")
+        await store.write(ALICE, "/b", "y")
 
         assert [c for c in fake.calls if c[0] == "create_bank"] == [
             ("create_bank", bank_id_for(0, ALICE))
         ]
-        assert store.get(ALICE, "/b") is not None
+        assert await store.get(ALICE, "/b") is not None
 
-    def test_workspace_scope_selects_the_bank(
+    async def test_workspace_scope_selects_the_bank(
         self, store: MemoryStore, fake: FakeHindsight
     ) -> None:
         with workspace_scope(7):
-            store.write(ALICE, "/a", "x")
+            await store.write(ALICE, "/a", "x")
 
         assert list(fake.banks) == [bank_id_for(7, ALICE)]
 
-    def test_listing_reaches_every_document_beyond_a_thousand(
+    async def test_listing_reaches_every_document_beyond_a_thousand(
         self, store: MemoryStore, fake: FakeHindsight
     ) -> None:
         bank = bank_id_for(0, ALICE)
         for i in range(1_001):
-            store.write(ALICE, f"/notes/{i:04d}", "x")
+            await store.write(ALICE, f"/notes/{i:04d}", "x")
         fake.calls.clear()
 
         seen: list[str] = []
         token = None
         while True:
-            page = store.list(ALICE, page_size=100, page_token=token)
+            page = await store.list(ALICE, page_size=100, page_token=token)
             seen.extend(e.path for e in page.entries)
             token = page.next_page_token
             if token is None:
@@ -100,16 +100,16 @@ class TestHindsightMemoryStore(SearchableMemoryStoreConformance):
             ("list_documents", bank, None)
         ] * 11
 
-    def test_a_server_returning_less_than_asked_still_pages_to_the_end(self) -> None:
+    async def test_a_server_returning_less_than_asked_still_pages_to_the_end(self) -> None:
         fake = FakeHindsight(list_limit_cap=3)
         store = HindsightMemoryStore(fake)
         for i in range(10):
-            store.write(ALICE, f"/n/{i}", "x")
+            await store.write(ALICE, f"/n/{i}", "x")
 
         seen: list[str] = []
         token = None
         while True:
-            page = store.list(ALICE, page_size=100, page_token=token)
+            page = await store.list(ALICE, page_size=100, page_token=token)
             seen.extend(e.path for e in page.entries)
             token = page.next_page_token
             if token is None:
@@ -118,21 +118,25 @@ class TestHindsightMemoryStore(SearchableMemoryStoreConformance):
         assert sorted(seen) == [f"/n/{i}" for i in range(10)]
 
     @pytest.mark.parametrize("token", ["/a", "-1", "1e3", "9" * 13])
-    def test_a_page_token_from_elsewhere_is_rejected(self, store: MemoryStore, token: str) -> None:
+    async def test_a_page_token_from_elsewhere_is_rejected(
+        self, store: MemoryStore, token: str
+    ) -> None:
         with pytest.raises(OmnigentError) as excinfo:
-            store.list(ALICE, page_token=token)
+            await store.list(ALICE, page_token=token)
         assert excinfo.value.code == ErrorCode.INVALID_INPUT
 
-    def test_search_maps_documents_back_to_paths_best_first(self, store: MemoryStore) -> None:
-        store.write(ALICE, "/a", "deploy once")
-        store.write(ALICE, "/b", "deploy deploy pipeline")
+    async def test_search_maps_documents_back_to_paths_best_first(
+        self, store: MemoryStore
+    ) -> None:
+        await store.write(ALICE, "/a", "deploy once")
+        await store.write(ALICE, "/b", "deploy deploy pipeline")
 
-        hits = store.search(ALICE, "deploy pipeline")
+        hits = await store.search(ALICE, "deploy pipeline")
 
         assert [h.entry.path for h in hits] == ["/b", "/a"]
         assert hits[0].score > hits[1].score
 
-    def test_backend_failures_become_a_clean_error_without_internals(self) -> None:
+    async def test_backend_failures_become_a_clean_error_without_internals(self) -> None:
         class Broken(FakeHindsight):
             async def aretain(self, *args, **kwargs):
                 raise RuntimeError("secret-api-key-123 rejected")
@@ -140,7 +144,7 @@ class TestHindsightMemoryStore(SearchableMemoryStoreConformance):
         store = HindsightMemoryStore(Broken())
 
         with pytest.raises(OmnigentError) as excinfo:
-            store.write(ALICE, "/a", "x")
+            await store.write(ALICE, "/a", "x")
 
         assert excinfo.value.code == ErrorCode.INTERNAL_ERROR
         assert "secret-api-key-123" not in str(excinfo.value)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import cast
 
 from sqlalchemy import CursorResult, delete, select
@@ -50,6 +51,9 @@ class SqlAlchemyMemoryStore(MemoryStore):
     Entries are read by path and listed in path order over the primary key. There
     is no search: matching text inside memory bodies would read every one of an
     actor's rows, and the bodies are stored compressed, opaque to the database.
+
+    Each operation runs its blocking database work in a worker thread through a
+    ``_*_sync`` helper, so the event loop never waits on the database.
     """
 
     def __init__(self, storage_location: str) -> None:
@@ -65,7 +69,12 @@ class SqlAlchemyMemoryStore(MemoryStore):
             self._engine, query_name_prefix="omnigent.memory_store", immediate=True
         )
 
-    def write(
+    async def write(
+        self, actor: MemoryActor, path: str, content: str, description: str | None = None
+    ) -> MemoryEntry:
+        return await asyncio.to_thread(self._write_sync, actor, path, content, description)
+
+    def _write_sync(
         self, actor: MemoryActor, path: str, content: str, description: str | None = None
     ) -> MemoryEntry:
         validate_actor(actor)
@@ -104,7 +113,10 @@ class SqlAlchemyMemoryStore(MemoryStore):
             pass
         return run_write_transaction(self._write_session, "write_memory_retry", write)
 
-    def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
+    async def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
+        return await asyncio.to_thread(self._get_sync, actor, path)
+
+    def _get_sync(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
         validate_actor(actor)
         validate_path(path)
         key = (current_workspace_id(), encode_memory_actor_type(actor.type), actor.id, path)
@@ -112,7 +124,16 @@ class SqlAlchemyMemoryStore(MemoryStore):
             row = session.get(SqlMemory, key)
             return None if row is None else _to_entity(row)
 
-    def list(
+    async def list(
+        self,
+        actor: MemoryActor,
+        path_prefix: str | None = None,
+        page_token: str | None = None,
+        page_size: int = DEFAULT_PAGE_SIZE,
+    ) -> MemoryPage:
+        return await asyncio.to_thread(self._list_sync, actor, path_prefix, page_token, page_size)
+
+    def _list_sync(
         self,
         actor: MemoryActor,
         path_prefix: str | None = None,
@@ -158,7 +179,10 @@ class SqlAlchemyMemoryStore(MemoryStore):
         next_token = entries[-1].path if len(rows) > page_size else None
         return MemoryPage(entries=entries, next_page_token=next_token)
 
-    def delete(self, actor: MemoryActor, path: str) -> bool:
+    async def delete(self, actor: MemoryActor, path: str) -> bool:
+        return await asyncio.to_thread(self._delete_sync, actor, path)
+
+    def _delete_sync(self, actor: MemoryActor, path: str) -> bool:
         validate_actor(actor)
         validate_path(path)
         workspace_id = current_workspace_id()

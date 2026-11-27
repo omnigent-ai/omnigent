@@ -176,9 +176,7 @@ def create_memory_router(
     @router.put("/memory/entry", response_model=MemoryEntryResponse)
     async def write_entry(request: Request, body: MemoryWriteRequest) -> MemoryEntryResponse:
         actor = await asyncio.to_thread(resolve_actor, request)
-        entry = await asyncio.to_thread(
-            memory_store.write, actor, body.path, body.content, body.description
-        )
+        entry = await memory_store.write(actor, body.path, body.content, body.description)
         return _entry_response(entry)
 
     @router.get("/memory/entry", response_model=MemoryEntryResponse)
@@ -186,7 +184,7 @@ def create_memory_router(
         request: Request, path: Annotated[str, Query(max_length=MAX_PATH_LENGTH)]
     ) -> MemoryEntryResponse:
         actor = await asyncio.to_thread(resolve_actor, request)
-        entry = await asyncio.to_thread(memory_store.get, actor, path)
+        entry = await memory_store.get(actor, path)
         if entry is None:
             raise OmnigentError(f"No memory at {path!r}", code=ErrorCode.NOT_FOUND)
         return _entry_response(entry)
@@ -196,9 +194,7 @@ def create_memory_router(
         request: Request, path: Annotated[str, Query(max_length=MAX_PATH_LENGTH)]
     ) -> MemoryDeleteResponse:
         actor = await asyncio.to_thread(resolve_actor, request)
-        return MemoryDeleteResponse(
-            deleted=await asyncio.to_thread(memory_store.delete, actor, path)
-        )
+        return MemoryDeleteResponse(deleted=await memory_store.delete(actor, path))
 
     @router.get("/memory/entries", response_model=MemoryEntryList)
     async def list_entries(
@@ -208,7 +204,7 @@ def create_memory_router(
         page_size: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
     ) -> MemoryEntryList:
         actor = await asyncio.to_thread(resolve_actor, request)
-        page = await asyncio.to_thread(memory_store.list, actor, prefix, page_token, page_size)
+        page = await memory_store.list(actor, prefix, page_token, page_size)
         return MemoryEntryList(
             entries=[_entry_response(entry) for entry in page.entries],
             next_page_token=page.next_page_token,
@@ -219,9 +215,7 @@ def create_memory_router(
         actor = await asyncio.to_thread(resolve_actor, request)
         if not memory_store.supports_search:
             raise OmnigentError(MEMORY_SEARCH_UNSUPPORTED, code=ErrorCode.NOT_FOUND)
-        hits = await asyncio.to_thread(
-            memory_store.search, actor, body.query, body.path_prefix, body.limit
-        )
+        hits = await memory_store.search(actor, body.query, body.path_prefix, body.limit)
         return MemorySearchResponse(
             hits=[
                 MemoryHitResponse(entry=_entry_response(hit.entry), score=hit.score)

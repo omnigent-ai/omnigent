@@ -236,6 +236,8 @@ class MemoryStore(ABC):
 
     Every method takes the ``actor`` explicitly and must call
     :func:`validate_actor` first; the workspace comes from the ambient scope.
+    The operations are coroutines. An implementation must not block the event
+    loop and should run blocking work in a thread itself.
 
     :cvar supports_search: Whether :meth:`search` is implemented. The server
         offers ``memory_search`` only for a backend that sets it.
@@ -244,7 +246,7 @@ class MemoryStore(ABC):
     supports_search: bool = False
 
     @abstractmethod
-    def write(
+    async def write(
         self, actor: MemoryActor, path: str, content: str, description: str | None = None
     ) -> MemoryEntry:
         """
@@ -259,7 +261,7 @@ class MemoryStore(ABC):
         """
 
     @abstractmethod
-    def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
+    async def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
         """
         Read one entry.
 
@@ -269,7 +271,7 @@ class MemoryStore(ABC):
         """
 
     @abstractmethod
-    def list(
+    async def list(
         self,
         actor: MemoryActor,
         path_prefix: str | None = None,
@@ -290,7 +292,7 @@ class MemoryStore(ABC):
             fewer than *page_size* entries while more remain.
         """
 
-    def search(
+    async def search(
         self,
         actor: MemoryActor,
         query: str,
@@ -313,7 +315,7 @@ class MemoryStore(ABC):
         raise OmnigentError(MEMORY_SEARCH_UNSUPPORTED, code=ErrorCode.NOT_FOUND)
 
     @abstractmethod
-    def delete(self, actor: MemoryActor, path: str) -> bool:
+    async def delete(self, actor: MemoryActor, path: str) -> bool:
         """
         Delete one entry.
 
