@@ -126,13 +126,15 @@ def test_a_branch_lists_its_pull_requests_in_the_workspaces_repository(
                 "head_ref": "feature/login",
             },
         ],
+        "has_more": False,
     }
     argv = fake.list_arguments()
     assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
     # One argument, so a branch can never be read as another flag.
     assert "--head=feature/login" in argv
     assert argv[argv.index("--state") + 1] == "all"
-    assert argv[argv.index("--limit") + 1] == str(github_search.MAX_BRANCH_PULL_REQUESTS)
+    # One past the cap, to tell a full list from a cut one.
+    assert argv[argv.index("--limit") + 1] == str(github_search.MAX_BRANCH_PULL_REQUESTS + 1)
     assert fake.calls == [argv]
 
 
@@ -166,6 +168,44 @@ def test_the_base_remote_gh_resolved_is_listed_before_origin(tmp_path: Path, fak
         upstream=f"https://github.com/{REPOSITORY}.git",
     )
     subprocess.run(["git", "config", "remote.upstream.gh-resolved", "base"], cwd=root, check=True)
+
+    github_search.branch_pull_requests(root, branch="feature/login")
+
+    argv = fake.list_arguments()
+    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
+
+
+def test_the_base_remote_gh_resolved_is_listed_before_the_branchs_tracking_remote(
+    tmp_path: Path, fake: FakeGh
+) -> None:
+    root = _checkout(
+        tmp_path,
+        origin="https://github.com/someone/example-repo.git",
+        fork="https://github.com/another/example-repo.git",
+        upstream=f"https://github.com/{REPOSITORY}.git",
+    )
+    subprocess.run(["git", "config", "branch.main.remote", "fork"], cwd=root, check=True)
+    subprocess.run(["git", "config", "remote.upstream.gh-resolved", "base"], cwd=root, check=True)
+
+    github_search.branch_pull_requests(root, branch="feature/login")
+
+    argv = fake.list_arguments()
+    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
+
+
+def test_without_a_base_remote_the_branchs_tracking_remote_is_listed(
+    tmp_path: Path, fake: FakeGh
+) -> None:
+    root = _checkout(
+        tmp_path,
+        origin="https://github.com/someone/example-repo.git",
+        fork=f"https://github.com/{REPOSITORY}.git",
+    )
+    # The checked-out branch needs a commit before git can name it.
+    identity = ["-c", "user.name=Example", "-c", "user.email=dev@example.com"]
+    commit = ["commit", "-q", "--allow-empty", "-m", "start"]
+    subprocess.run(["git", *identity, *commit], cwd=root, check=True)
+    subprocess.run(["git", "config", "branch.main.remote", "fork"], cwd=root, check=True)
 
     github_search.branch_pull_requests(root, branch="feature/login")
 
@@ -219,9 +259,20 @@ def test_the_list_is_capped_whatever_github_answers(tmp_path: Path, fake: FakeGh
     root = _checkout(tmp_path, origin=f"https://github.com/{REPOSITORY}")
     fake.listed = [_entry(number) for number in range(1, 40)]
 
-    rows = github_search.branch_pull_requests(root, branch="feature/login")["data"]
+    found = github_search.branch_pull_requests(root, branch="feature/login")
 
-    assert len(rows) == github_search.MAX_BRANCH_PULL_REQUESTS
+    assert len(found["data"]) == github_search.MAX_BRANCH_PULL_REQUESTS
+    assert found["has_more"] is True
+
+
+def test_a_list_github_didnt_cut_has_no_more(tmp_path: Path, fake: FakeGh) -> None:
+    root = _checkout(tmp_path, origin=f"https://github.com/{REPOSITORY}")
+    fake.listed = [_entry(number) for number in range(1, 21)]
+
+    found = github_search.branch_pull_requests(root, branch="feature/login")
+
+    assert len(found["data"]) == github_search.MAX_BRANCH_PULL_REQUESTS
+    assert found["has_more"] is False
 
 
 @pytest.mark.parametrize(
@@ -237,6 +288,7 @@ def test_a_workspace_without_a_repository_remote_has_none(
     assert github_search.branch_pull_requests(root, branch="main") == {
         "object": "list",
         "data": [],
+        "has_more": False,
     }
     assert fake.calls == []
 
@@ -275,17 +327,21 @@ def test_a_remote_on_the_gh_host_set_up_is_listed(
     assert [call[:2] for call in fake.calls] == [["pr", "list"]]
 
 
+@pytest.mark.parametrize(
+    "remote_repository", [REPOSITORY, "Example-Org/Example-Repo"], ids=["lower", "mixed-case"]
+)
 def test_the_list_runs_as_the_account_saved_for_the_repository(
-    tmp_path: Path, fake: FakeGh, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake: FakeGh, monkeypatch: pytest.MonkeyPatch, remote_repository: str
 ) -> None:
+    """The account is saved under the key a pull request URL gives, which is lower-cased."""
     saved: list[str] = []
 
     def preference(key: str) -> str | None:
         saved.append(key)
-        return "octocat"
+        return {f"github.com/{REPOSITORY}": "octocat"}.get(key)
 
     monkeypatch.setattr(github._config, "github_account_preference", preference)
-    root = _checkout(tmp_path, origin=f"https://github.com/{REPOSITORY}")
+    root = _checkout(tmp_path, origin=f"https://github.com/{remote_repository}")
 
     github_search.branch_pull_requests(root, branch="feature/login")
 

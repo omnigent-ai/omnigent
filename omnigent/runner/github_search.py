@@ -264,7 +264,8 @@ def _repository_token(root: str, host: str, repository: str) -> str | None:
     """The token of the account chosen for ``repository``, or ``None`` for gh's active one."""
     if github._in_sandbox():
         return None
-    login = github._config.github_account_preference(f"{host}/{repository}")
+    # Saved under the repository as a pull request URL names it, which is lower-cased.
+    login = github._config.github_account_preference(f"{host}/{repository.lower()}")
     return github._gh_auth_token(root, login, host) if login else None
 
 
@@ -283,8 +284,9 @@ def _same_repository(url: str, host: str, repository: str) -> bool:
 def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
     """The pull requests whose head is ``branch``, in the workspace's own repository.
 
-    Lists every state, newest first as GitHub orders them, up to
-    :data:`MAX_BRANCH_PULL_REQUESTS`. A workspace without a repository remote has none.
+    The most recent :data:`MAX_BRANCH_PULL_REQUESTS` in any state, newest first as GitHub
+    orders them; ``has_more`` says older ones exist. A workspace without a repository
+    remote has none.
 
     :param branch: A branch name, checked by the caller against git's ref rules.
     :raises PullRequestError: When the remote's host isn't set up for GitHub, which is
@@ -292,7 +294,7 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
     """
     found = workspace_repository(root)
     if found is None:
-        return {"object": "list", "data": []}
+        return {"object": "list", "data": [], "has_more": False}
     host, repository = found
     with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
         rc, output, _ = github._gh(
@@ -305,7 +307,8 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
                 "--state",
                 "all",
                 "--limit",
-                str(MAX_BRANCH_PULL_REQUESTS),
+                # One past the cap tells a full list from a cut one.
+                str(MAX_BRANCH_PULL_REQUESTS + 1),
                 "--json",
                 _BRANCH_FIELDS,
             ],
@@ -336,4 +339,8 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
         and entry.get("headRefName") == branch
         and _same_repository(entry["url"], host, repository)
     ]
-    return {"object": "list", "data": rows[:MAX_BRANCH_PULL_REQUESTS]}
+    return {
+        "object": "list",
+        "data": rows[:MAX_BRANCH_PULL_REQUESTS],
+        "has_more": len(entries) > MAX_BRANCH_PULL_REQUESTS,
+    }
