@@ -5261,10 +5261,18 @@ def _paste_and_submit(
             nothing_typed=True,
         )
     delivery_diagnostics.set_stage("encoding")
-    # Trailing line breaks add nothing before the submit Enter, and a third CR
-    # collapses the paste into a placeholder.
-    payload = _paste_payload_bytes(text).rstrip(b"\r")
-    if not payload:
+    payload = _paste_payload_bytes(text)
+    raw_context = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    native_session = read_claude_session_id(bridge_dir)
+    # Older terminals retain their established paste behavior. A supported,
+    # session-bound terminal must keep the saved message's trailing line breaks.
+    if not (
+        native_session
+        and raw_context.get("session_id") == native_session
+        and supports_session_only_model_switch(raw_context.get("version"))
+    ):
+        payload = payload.rstrip(b"\r")
+    if not payload.strip(b"\r"):
         raise RuntimeError(
             "The message has no text to paste into Claude Code (only line breaks or "
             "control characters). The message was not delivered."

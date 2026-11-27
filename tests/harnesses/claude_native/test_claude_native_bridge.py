@@ -5554,35 +5554,60 @@ _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
 
 
 @pytest.mark.parametrize(
-    "content,expected_payload",
+    "content,expected_payload,native_status",
     [
         # Plain single line: content bytes only; the submit Enter is a separate call.
-        ("hello world", b"hello world"),
+        ("hello world", b"hello world", None),
         # Multi-line: interior newline rides as CR inside the paste so
         # Claude's TUI keeps it as data instead of submitting per line.
-        ("line one\nline two", b"line one\rline two"),
+        ("line one\nline two", b"line one\rline two", None),
         # Exactly two line breaks stay two: a third CR tips Claude Code into
         # collapsing the paste to a "[Pasted text #N +3 lines]" placeholder.
-        ("first line\n\nthird line", b"first line\r\rthird line"),
+        ("first line\n\nthird line", b"first line\r\rthird line", None),
         # A trailing newline is dropped: it adds nothing before the submit Enter
         # and would be the third break that collapses the paste.
-        ("first line\n\nthird line\n", b"first line\r\rthird line"),
+        ("first line\n\nthird line\n", b"first line\r\rthird line", None),
         # Trailing "\" escapes an appended paste CR, not the submit Enter.
-        ("deploy to prod\\", b"deploy to prod\\\r"),
+        ("deploy to prod\\", b"deploy to prod\\\r", None),
         # A "\" the user already followed with a newline needs no extra CR.
-        ("deploy to prod\\\n", b"deploy to prod\\\r"),
+        ("deploy to prod\\\n", b"deploy to prod\\\r", None),
         # The guard looks at the encoded bytes: a dropped control byte after
         # the "\" still leaves it trailing.
-        ("deploy to prod\\\x07", b"deploy to prod\\\r"),
+        ("deploy to prod\\\x07", b"deploy to prod\\\r", None),
         # CRLF line endings coalesce to a single CR (no doubled blank line).
-        ("a\r\nb", b"a\rb"),
+        ("a\r\nb", b"a\rb", None),
         # A stray ESC in the content is dropped so it can't prematurely
         # close the bracketed-paste sequence on Claude's side.
-        ("a\x1bb", b"ab"),
+        ("a\x1bb", b"ab", None),
         # Large payload (a PR diff in a sub-agent dispatch). Must ride the
         # load-buffer file — per-byte send-keys argv tripped tmux's ~16KB
         # client→server command cap with "command too long".
-        ("x" * 100_000, b"x" * 100_000),
+        ("x" * 100_000, b"x" * 100_000, None),
+        (
+            "saved\n\nmessage\n",
+            b"saved\r\rmessage\r",
+            {"version": "2.1.323", "session_id": "native-session"},
+        ),
+        (
+            "saved\nmessage\n\n",
+            b"saved\rmessage\r\r",
+            {"version": "2.1.325", "session_id": "native-session"},
+        ),
+        (
+            "saved\nmessage\n",
+            b"saved\rmessage",
+            {"version": "2.1.322", "session_id": "native-session"},
+        ),
+        (
+            "saved\nmessage\n",
+            b"saved\rmessage",
+            {"version": "2.1.323-rc.1", "session_id": "native-session"},
+        ),
+        (
+            "saved\nmessage\n",
+            b"saved\rmessage",
+            {"version": "2.1.323", "session_id": "other-session"},
+        ),
     ],
     ids=[
         "plain",
@@ -5595,11 +5620,17 @@ _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
         "crlf",
         "embedded-esc",
         "large",
+        "supported-trailing-newline",
+        "supported-trailing-blank-line",
+        "older-status-retains-legacy",
+        "unverified-prerelease-retains-legacy",
+        "another-session-retains-legacy",
     ],
 )
 def test_inject_user_message_pastes_content_then_submits(
     content: str,
     expected_payload: bytes,
+    native_status: dict[str, str] | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5622,6 +5653,12 @@ def test_inject_user_message_pastes_content_then_submits(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+
+    if native_status is not None:
+        record_hook_event(
+            bridge_dir, {"hook_event_name": "SessionStart", "session_id": "native-session"}
+        )
+        (bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE).write_text(json.dumps(native_status))
 
     captured: list[list[str]] = []
     loaded_payloads: list[bytes] = []
