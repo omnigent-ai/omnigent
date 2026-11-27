@@ -40,6 +40,7 @@ const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
       mac,
       native,
       desktopMenu,
+      goMenu: desktopMenu,
       submitWithModEnter: false,
     })),
   ),

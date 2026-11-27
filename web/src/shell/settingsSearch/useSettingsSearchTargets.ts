@@ -47,6 +47,7 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
   const mac = environment.mac;
   const native = environment.native;
   const desktopMenu = environment.desktopMenu;
+  const goMenu = environment.goMenu;
   const submitWithModEnter = environment.submitWithModEnter;
   return useMemo(() => {
     const sections = new Map(
@@ -68,7 +69,7 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
       shortcutGroups.flatMap((group) => group.items.map((row) => [row.shortcutId, row] as const)),
     );
     const matchers = settingsSearchMatchers(
-      { mac, native, desktopMenu, submitWithModEnter },
+      { mac, native, desktopMenu, goMenu, submitWithModEnter },
       new Set(shortcutRows.keys()),
     );
     return { targets, sections, shortcutRows, matchers };
@@ -81,6 +82,7 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
     mac,
     native,
     desktopMenu,
+    goMenu,
     submitWithModEnter,
   ]);
 }

@@ -294,6 +294,11 @@ describe("desktop command bridge", () => {
     assert.equal(h.hasListener("omnigent:desktop-command"), false);
   });
 
+  it("advertises exactly the menu commands main routes to the page", () => {
+    const { DESKTOP_COMMANDS } = require("../src/desktopCommands");
+    assert.deepEqual([...loadPreload().desktop.desktopCommands], [...DESKTOP_COMMANDS]);
+  });
+
   it("reports command state as plain values and asks main to open a session window, close the window or quit", async () => {
     const h = loadPreload();
     h.desktop.setDesktopCommandState({

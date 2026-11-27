@@ -9,6 +9,7 @@ const MAC: ShortcutEnvironment = {
   mac: true,
   native: false,
   desktopMenu: false,
+  goMenu: false,
   submitWithModEnter: false,
 };
 const CONTEXT: ShortcutPageContext = {

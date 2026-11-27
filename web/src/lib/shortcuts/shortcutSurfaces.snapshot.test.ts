@@ -23,7 +23,16 @@ import { rowsForChord, searchableChords } from "@/pages/settings/search/chordQue
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
     [true, false].flatMap((desktopMenu) =>
-      [true, false].map((submitWithModEnter) => ({ mac, native, desktopMenu, submitWithModEnter })),
+      // The Go menu exists only on a shell with the command bridge.
+      (desktopMenu ? [false, true] : [false]).flatMap((goMenu) =>
+        [true, false].map((submitWithModEnter) => ({
+          mac,
+          native,
+          desktopMenu,
+          goMenu,
+          submitWithModEnter,
+        })),
+      ),
     ),
   ),
 );
@@ -42,11 +51,17 @@ const EVERYTHING_SUPPORTED: ShortcutPageContext = {
   alwaysSteer: false,
 };
 
-const environmentName = ({ mac, native, desktopMenu, submitWithModEnter }: ShortcutEnvironment) =>
+const environmentName = ({
+  mac,
+  native,
+  desktopMenu,
+  goMenu,
+  submitWithModEnter,
+}: ShortcutEnvironment) =>
   [
     mac ? "mac" : "other",
     native ? "native" : "browser",
-    desktopMenu ? "menu" : "no-menu",
+    desktopMenu ? (goMenu ? "menu+go" : "menu") : "no-menu",
     submitWithModEnter ? "mod-enter-sends" : "enter-sends",
   ].join(" ");
 
