@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ChevronRightIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { ChevronRightIcon, PlusIcon, Trash2Icon, UserIcon } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Button } from "@/components/ui/button";
@@ -193,19 +193,43 @@ export function ProjectTeamDialog({
   };
   const canRoute = project !== undefined && !shared;
   const customRuntime = Boolean(draft.agentId || draft.model || draft.effort);
-  // The Lead keeps its name, so only other roles show this field.
-  const nameField = (
-    <label className="flex flex-col gap-1 text-sm">
-      Name
-      <Input
-        data-testid="project-team-name"
-        value={draft.name}
-        maxLength={60}
-        placeholder="e.g. Designer"
-        onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-        disabled={busy}
-      />
-    </label>
+  // The header carries the member's name; any role but the Lead edits it in place.
+  const memberHeader = (
+    <div className="flex items-center gap-3" data-testid="project-team-identity">
+      {isLead || draft.name.trim() ? (
+        <PersonaAvatar name={isLead ? (selectedIdentity?.name ?? "") : draft.name} size="md" />
+      ) : (
+        <span
+          aria-hidden
+          className="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-dashed border-muted-foreground/50 text-muted-foreground"
+        >
+          <UserIcon className="size-3.5" />
+        </span>
+      )}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {isLead ? (
+          <h3 className="truncate text-base font-semibold">{selectedIdentity?.name}</h3>
+        ) : (
+          <Input
+            data-testid="project-team-name"
+            aria-label="Name"
+            value={draft.name}
+            maxLength={60}
+            placeholder="Name, e.g. Designer"
+            onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+            disabled={busy}
+            className="-ml-2 h-8 border-transparent px-2 text-base font-semibold hover:border-input md:text-base"
+          />
+        )}
+        <span className="text-xs text-muted-foreground">
+          {isLead
+            ? "Built-in coordinator · can't be renamed"
+            : editing
+              ? "Team member"
+              : "New team member"}
+        </span>
+      </div>
+    </div>
   );
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -311,6 +335,7 @@ export function ProjectTeamDialog({
               ) : (
                 <>
                   <form onSubmit={onSubmit} className="flex min-w-0 flex-col gap-3">
+                    {memberHeader}
                     {selected === null && (
                       <div
                         role="group"
@@ -344,25 +369,6 @@ export function ProjectTeamDialog({
                         </div>
                       </div>
                     )}
-                    {selectedIdentity && (
-                      <div
-                        className="flex items-center gap-2.5"
-                        data-testid="project-team-identity"
-                      >
-                        <PersonaAvatar name={selectedIdentity.name} size="md" />
-                        <div className="flex min-w-0 flex-col">
-                          <h3 className="truncate text-base font-semibold">
-                            {selectedIdentity.name}
-                          </h3>
-                          <span className="text-xs text-muted-foreground">
-                            {isLead
-                              ? "Built-in coordinator · can't be renamed"
-                              : "Team member"}
-                          </span>
-                        </div>
-                      </div>
-                    )}
-                    {!editing && nameField}
                     <label className="flex flex-col gap-1 text-sm">
                       <span className="flex flex-col">
                         <span className={editing ? "font-medium" : undefined}>
@@ -446,7 +452,6 @@ export function ProjectTeamDialog({
                         </label>
                       </div>
                     )}
-                    {editing && !isLead && nameField}
                     {/* Keyed by member so each starts collapsed. */}
                     <Collapsible
                       key={selected ?? "new"}

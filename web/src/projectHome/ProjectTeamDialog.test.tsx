@@ -55,6 +55,12 @@ describe("ProjectTeamDialog", () => {
     fireEvent.click(within(templates).getByRole("button", { name: "Designer" }));
     const designer = ROLE_TEMPLATES.find((template) => template.name === "Designer")!;
     expect(screen.getByTestId("project-team-name")).toHaveValue("Designer");
+    // A new member's name sits in the header, above the templates.
+    expect(screen.getByTestId("project-team-identity")).toHaveTextContent("New team member");
+    expect(
+      screen.getByTestId("project-team-name").compareDocumentPosition(templates) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(screen.getByTestId("project-team-persona")).toHaveValue(designer.instructions);
     expect(screen.getByTestId("project-team-owns")).toHaveValue(designer.owns);
     fireEvent.click(screen.getByTestId("project-team-save"));
@@ -177,7 +183,11 @@ describe("ProjectTeamDialog", () => {
     );
     const nav = screen.getByRole("navigation", { name: "Team members" });
     fireEvent.click(within(nav).getByText("Planner"));
-    expect(screen.getByRole("heading", { name: "Planner" })).toBeInTheDocument();
+    // The name is edited in place in the header; no second name row repeats it.
+    const header = screen.getByTestId("project-team-identity");
+    expect(within(header).getByRole("textbox", { name: "Name" })).toHaveValue("Planner");
+    expect(screen.getAllByRole("textbox", { name: "Name" })).toHaveLength(1);
+    expect(screen.queryByRole("heading", { name: "Planner" })).toBeNull();
     expect(screen.getByTestId("project-team-name")).toBeEnabled();
     expect(screen.getByTestId("project-team-timing")).toHaveTextContent(
       "Changes apply from Planner's next session.",
