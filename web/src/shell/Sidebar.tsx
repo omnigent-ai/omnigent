@@ -231,6 +231,7 @@ import {
   PROJECT_MOVE_MENU_LABELS,
 } from "./projectCommands/ordering";
 import { usePublishProjectOrdering } from "./projectCommands/projectOrderingStore";
+import { usePinOrderPaletteCommands } from "./PinOrder";
 import { useSidebarNavCommands, useSidebarNavDestinations } from "./sidebarNavCommands";
 import {
   projectListControls,
@@ -3524,6 +3525,24 @@ function ConversationList({
         isMobile ? [] : numberedSessionIds.map((id, slot): [string, number] => [id, slot]),
       ),
     [isMobile, numberedSessionIds],
+  );
+  // ⌘K moves the open pinned session through the same writes a drop on a pin makes.
+  const pinnedOrderIds = useMemo(
+    () => sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
+    [sections.pinned],
+  );
+  const movePin = (sessionId: string, targetId: string) => {
+    const writes = pinOrderWrites(sections.pinned, sessionId, targetId);
+    if (writes.length > 0) reorderPins(writes);
+  };
+  usePinOrderPaletteCommands(
+    {
+      pinnedIds: pinnedOrderIds,
+      reorderable: pinReorderEnabled,
+      saving: pinWriting,
+      move: movePin,
+    },
+    resolvedActiveId,
   );
   const pinOrder = useMemo(
     () =>
