@@ -261,7 +261,7 @@ import {
 } from "./sessionCommands/useBulkSessionPaletteCommands";
 import { nestDestinations, nestLabel } from "./nestDestinations";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
-import { useProjectActionStore } from "./projectCommands/projectActionStore";
+import { consumeProjectRename, useProjectActionStore } from "./projectCommands/projectActionStore";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
@@ -3091,11 +3091,14 @@ function ConversationList({
     if (projectHomeName !== oldName) return;
     navigate({ pathname: projectHomePath(newName), search: location.search }, { replace: true });
   });
-  // A rename from ⌘K carries the expansion over too.
+  // A rename from ⌘K carries the expansion over too, once.
+  const quickPickRenames = useQuickPickPaletteEnabled();
   const hostRename = useProjectActionStore((state) => state.lastRename);
   useEffect(() => {
-    if (hostRename) renameExpandedProject(hostRename.oldName, hostRename.newName);
-  }, [hostRename, renameExpandedProject]);
+    if (!quickPickRenames || !hostRename) return;
+    renameExpandedProject(hostRename.oldName, hostRename.newName);
+    consumeProjectRename(hostRename.key);
+  }, [quickPickRenames, hostRename, renameExpandedProject]);
 
   const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {

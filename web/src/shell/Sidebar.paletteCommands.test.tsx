@@ -16,7 +16,9 @@ import {
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 
+import { reportProjectRenamed, useProjectActionStore } from "./projectCommands/projectActionStore";
 import { projectOrderingStore } from "./projectCommands/projectOrderingStore";
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
@@ -57,6 +59,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  useProjectActionStore.setState({ request: null, lastRename: null });
   usePaletteCommandsStore.setState({ groups: {} });
 });
 
@@ -286,5 +289,34 @@ describe("the entry points and ⌘K agree", () => {
     await waitFor(() => expect(labels()).toContain("Select Sessions"));
     expect(screen.queryByTestId("project-list-actions")).toBeNull();
     expect(labels()).not.toContain("Sort Projects");
+  });
+});
+
+describe("a project renamed from ⌘K", () => {
+  const expanded = () =>
+    JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY) ?? "[]") as string[];
+
+  it("carries the folder's expansion over once, not again when the sidebar remounts", async () => {
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
+    const first = renderSidebar({ features: QUICK_PICK });
+    await screen.findByText("Alpha");
+    act(() => reportProjectRenamed("Alpha", "Gamma"));
+    await waitFor(() => expect(expanded()).toEqual(["Gamma"]));
+    first.unmount();
+
+    // Alpha is opened again afterwards, as a rename back through the folder menu leaves it.
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
+    renderSidebar({ features: QUICK_PICK });
+    await screen.findByText("Alpha");
+    await waitFor(() => expect(labels()).toContain("Collapse All Projects"));
+    expect(expanded()).toEqual(["Alpha"]);
+  });
+
+  it("leaves the expansion alone with the flag off", async () => {
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
+    act(() => reportProjectRenamed("Alpha", "Gamma"));
+    renderSidebar({ features: {} });
+    await screen.findByText("Alpha");
+    expect(expanded()).toEqual(["Alpha"]);
   });
 });

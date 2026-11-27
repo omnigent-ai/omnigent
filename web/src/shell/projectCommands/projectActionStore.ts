@@ -39,3 +39,10 @@ export function reportProjectRenamed(oldName: string, newName: string): void {
   nextKey += 1;
   useProjectActionStore.setState({ lastRename: { oldName, newName, key: nextKey } });
 }
+
+/** Mark a reported rename handled, so a remounted sidebar doesn't replay it. A newer one stays. */
+export function consumeProjectRename(key: number): void {
+  useProjectActionStore.setState((state) =>
+    state.lastRename?.key === key ? { lastRename: null } : state,
+  );
+}
