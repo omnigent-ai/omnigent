@@ -131,6 +131,15 @@ describe("markdownListStackFormat on hand-edited descriptions", () => {
     );
   });
 
+  it("ends a section without a footer at its first blank line, so a list after it isn't read as entries", () => {
+    const withoutFooter = LINEAR.replace("\n---------\n", "\n");
+    const parsed = parse(
+      withoutFooter.replace("\n## Summary", "\n- [x] tests pass\n- [ ] docs\n## Summary"),
+    );
+    expect(tolerancesOf(parsed)).toContain("footer");
+    expect(shape(parsed)).toEqual(shape(parse(withoutFooter)));
+  });
+
   it("ignores a footer inside a code block or quote above the header", () => {
     const withoutFooter = LINEAR.replace("\n---------\n", "\n");
     for (const above of ["```\n---------\n```", "> ---------"]) {

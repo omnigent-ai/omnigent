@@ -1,16 +1,5 @@
-// A stack section written as a Markdown list under one heading, the way stack tools put it
-// at the top of each PR in a stack. A format names its heading and what its producer adds;
-// output that matches the producer exactly verifies, and hand edits are tolerated for
-// navigation only.
-//
-//   ## Stack
-//   - [stack/dependency](<pr>) [[Files changed](<diff>)] ⬆️ (dependency: merge first)
-//     - [stack/base](<pr>) [[Files changed](<diff>)] [MERGED]
-//       - [**stack/current**](<pr>) [[Files changed](<diff>)] ← _this PR_
-//       - stack/unpushed
-//
-//   ---------
-//   <the user's description>
+// A stack section written as a Markdown list under one heading, as stack tools write it at the
+// top of each PR. Output matching the producer exactly verifies; hand edits serve navigation only.
 
 import { markdownLines, type MarkdownLine } from "@/lib/pullRequestStacks/markdownLines";
 import {
@@ -122,21 +111,45 @@ function readEntry(
   };
 }
 
-/** Where the section ends: the producer's footer, or for a hand-edited body, the first line that isn't an entry. */
+/**
+ * Where the section ends: the producer's footer, or for a hand-edited body, the first blank line
+ * after the entries or the first line that isn't an entry. The producer writes no blank line
+ * between entries, so a list of the user's own after one isn't read as more of the stack.
+ */
 function sectionEnd(
   lines: readonly MarkdownLine[],
   first: number,
   footerIndex: number,
 ): { end: number; tolerance: StackTolerance | null } {
   if (footerIndex !== -1) return { end: footerIndex, tolerance: null };
+  let readEntries = false;
   for (let index = first; index < lines.length; index++) {
     const text = lines[index]?.text ?? "";
-    if (text.trim() === "" || BULLET.test(text)) continue;
+    if (text.trim() === "") {
+      if (readEntries) return { end: index, tolerance: "footer" };
+      continue;
+    }
+    if (BULLET.test(text)) {
+      readEntries = true;
+      continue;
+    }
     return { end: index, tolerance: "footer" };
   }
   return { end: lines.length, tolerance: "footer" };
 }
 
+/**
+ * The stack format for `syntax`. A producer's section looks like this, under its own heading:
+ *
+ *     ## Stack
+ *     - [stack/dependency](<pr>) [[Files changed](<diff>)] ⬆️ (dependency: merge first)
+ *       - [stack/base](<pr>) [[Files changed](<diff>)] [MERGED]
+ *         - [**stack/current**](<pr>) [[Files changed](<diff>)] ← _this PR_
+ *         - stack/unpushed
+ *
+ *     ---------
+ *     <the user's description>
+ */
 export function markdownListStackFormat(syntax: MarkdownListStackSyntax): StackFormat {
   const { id, header: heading, headerSuffix, introLine, landing } = syntax;
   // The heading as a whole word, so `## Stack` never claims a `## Stacked changes` section.

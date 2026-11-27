@@ -147,12 +147,11 @@ export function exampleMergeReadinessSource(
     refresh: (queryClient) => queryClient.invalidateQueries({ queryKey: [EXAMPLE_READINESS_KEY] }),
     refreshPullRequest: (queryClient, prUrl) =>
       queryClient.invalidateQueries({ queryKey: [EXAMPLE_READINESS_KEY, prUrl] }),
-    readOf: (queryKey, prUrl) =>
-      queryKey[0] === EXAMPLE_READINESS_KEY && queryKey[1] === prUrl
-        ? queryKey[2] === "checks"
-          ? "checks"
-          : "readiness"
-        : null,
+    // A key with "checks" third is the checks read; tests that need one mount it themselves.
+    readOf: (queryKey, prUrl) => {
+      if (queryKey[0] !== EXAMPLE_READINESS_KEY || queryKey[1] !== prUrl) return null;
+      return queryKey[2] === "checks" ? "checks" : "readiness";
+    },
     present: (view) => presentMergeReadinessView(view, EXAMPLE_READINESS_WORDING),
     CredentialRenewal: ({ onRenewed }) =>
       createElement("button", { type: "button", onClick: onRenewed }, "Renew"),
