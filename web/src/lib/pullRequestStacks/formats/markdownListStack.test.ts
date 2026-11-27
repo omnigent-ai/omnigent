@@ -142,7 +142,11 @@ describe("markdownListStackFormat on hand-edited descriptions", () => {
 
   it("never verifies a section a code example holds", () => {
     // A no-break space can't close the fence, and an outdented fence opens a new one.
-    for (const before of ["```\n```\u00a0\n", "- Example\n  ```\n  sample\n```\n"]) {
+    for (const before of [
+      "```\n```\u00a0\n",
+      "- Example\n  ```\n  sample\n```\n",
+      "- Example\n   ```\n   sample\n ```\n",
+    ]) {
       expect(parse(`${before}${LINEAR}\`\`\`\n`)).toBeNull();
     }
   });

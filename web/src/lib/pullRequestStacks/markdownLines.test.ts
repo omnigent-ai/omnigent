@@ -56,6 +56,16 @@ describe("markdownLines", () => {
     expect(ended.map((line) => line.fenced)).toEqual([false, true, true, false]);
   });
 
+  it("reads a fence indented less than the list item's content as one outside the item", () => {
+    const lines = markdownLines("- Example\n   ```\n   sample\n ```\n## Stack\n");
+    expect(lines.map((line) => line.fenced)).toEqual([false, true, true, true, true]);
+  });
+
+  it("keeps a list item's fence open through lines indented as far as the item's content", () => {
+    const lines = markdownLines("- Example\n   ```\n  sample\n   ```\nafter\n");
+    expect(lines.map((line) => line.fenced)).toEqual([false, true, true, true, false]);
+  });
+
   it("leaves an unclosed fence open to the end", () => {
     expect(markdownLines("~~~\nx\n").map((line) => line.fenced)).toEqual([true, true]);
   });
