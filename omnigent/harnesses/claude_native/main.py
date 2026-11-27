@@ -1629,7 +1629,10 @@ async def claude_launch_catalog(
 
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.ensure_catalog(
-        "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+        "claude-native",
+        fingerprint,
+        lambda: claude_model_catalog(claude_config),
+        is_fingerprint_current=lambda: claude_catalog_fingerprint(claude_config) == fingerprint,
     )
 
 
