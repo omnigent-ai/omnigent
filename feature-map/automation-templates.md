@@ -225,6 +225,26 @@ to customize.
   while another was queued with "Another run was already queued behind the
   previous run." Run now always starts. A trigger has no such row. The detail
   page's Configuration lists the setting when it isn't the default.
+- **Run history chart:** with the `automation_run_history_chart` release
+  feature, the detail page of an automation that has run shows a chart above
+  its Runs list: one column per day stacked by outcome (Succeeded, Failed,
+  Skipped, In progress), over "N runs · X% success rate" for the range, or
+  the count alone until a run in it has succeeded or failed. The
+  range menu offers Last 7 days, Last 4 weeks (the default) and Last 3 months;
+  while another range loads, the last counts that loaded stay, dimmed, unless
+  they were of a range without runs. Days are the
+  browser's calendar days. Hovering a day, or focusing the chart and moving
+  through its days with the arrow keys, lists its counts, and a range
+  without runs says "No runs in the last 4 weeks." in place of the chart. A
+  range with more than 10,000 runs charts the most recent 10,000 under "Only
+  the most recent 10,000 runs in this range are counted." The
+  chart follows the Runs list, so a run that starts or finishes while the page
+  is open updates it. Someone the automation is shared with sees it too. On a
+  server that doesn't serve the counts, such as an older one, the page shows
+  the Runs list alone, even if counts were on screen. Any other failure says
+  "Couldn’t load the run chart.", or keeps the counts already on screen,
+  dimmed, under "Couldn’t refresh the run chart. These counts may be out of
+  date."
 - **MCP services:** when the server's MCP registry is on and `/v1/info` reports
   `scheduled_task_mcp_services`, Advanced has an MCP services row that opens
   the new-chat service list and its sign-in. A new automation starts with none,
@@ -293,6 +313,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   Prompt coverage includes reopening a trigger from its header, saving edited
   conditions and worker settings into it, and preserving an older trigger's hidden
   template text on instruction-only edits.
+- `web/src/components/scheduled/RunHistoryChart.test.tsx` covers the run history
+  chart: its summary, the stacked columns, a day's counts on hover and with the
+  arrow keys (`moves through the days' counts with the arrow keys`), and the note
+  on a range with more than 10,000 runs. `web/src/pages/TaskDetailPage.test.tsx`
+  (`run history chart`) covers when the page shows it, including a server that
+  doesn't serve the counts.
 - `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
   uses its own built-SPA browser contract, with a synthetic provider catalog,
   to cover repository creation, replacement, clearing, and reopening on desktop

@@ -543,6 +543,30 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
+    def list_run_statuses(
+        self,
+        scheduled_task_id: str,
+        *,
+        since: int,
+        until: int,
+        limit: int,
+    ) -> builtins.list[tuple[int, str]]:
+        """
+        Return the time and status of a task's newest runs scheduled in ``[since, until)``.
+
+        Powers the run history chart. The read must stop at *limit* runs,
+        however many the range or the task's history holds.
+
+        :param scheduled_task_id: The task whose runs to read.
+        :param since: Epoch seconds the range starts at (inclusive).
+        :param until: Epoch seconds the range ends at (exclusive).
+        :param limit: The most runs to return.
+        :returns: ``(scheduled_at, status)`` of up to *limit* runs, the ones
+            scheduled latest in the range, newest first.
+        :raises NotImplementedError: If this store does not serve the chart.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
         """

@@ -518,6 +518,80 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
   return (body.runs ?? []).map(runFromWire);
 }
 
+/** The outcomes a task's run counts are split by, in the order its chart stacks them. */
+export const RUN_OUTCOMES = ["succeeded", "failed", "skipped", "inProgress"] as const;
+
+/** How a run ended; `inProgress` covers a run that is queued, starting or running. */
+export type ScheduledTaskRunOutcome = (typeof RUN_OUTCOMES)[number];
+
+/** How many of a task's runs were scheduled on one day, by outcome. */
+export type ScheduledTaskRunStatsDay = Record<ScheduledTaskRunOutcome, number> & {
+  /** The day as an ISO date, e.g. `2026-11-04`, in the stats' timezone. */
+  date: string;
+};
+
+/** A task's runs per day over a range of days ending today, oldest day first. */
+export interface ScheduledTaskRunStats {
+  /** The IANA timezone the days are in. */
+  timezone: string;
+  /** One entry per day in the range, including days without runs. */
+  days: ScheduledTaskRunStatsDay[];
+  /**
+   * The range holds more runs than the server counts in one read. `days` then
+   * starts at the oldest run counted, and that day is counted in part.
+   */
+  truncated: boolean;
+}
+
+interface ScheduledTaskRunStatsWire {
+  timezone: string;
+  days: {
+    date: string;
+    succeeded: number;
+    failed: number;
+    skipped: number;
+    in_progress: number;
+  }[];
+  truncated?: boolean;
+}
+
+/**
+ * Count a task's runs per day and outcome (404 unless owned or shared).
+ *
+ * @param days - How many calendar days to cover, today included.
+ * @param timezone - The IANA timezone whose calendar days to count in.
+ */
+export async function getScheduledTaskRunStats(
+  id: string,
+  { days, timezone }: { days: number; timezone: string },
+): Promise<ScheduledTaskRunStats> {
+  const params = new URLSearchParams({ days: String(days), timezone });
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/run-stats?${params}`,
+  );
+  const body = await readJsonOrThrow<ScheduledTaskRunStatsWire>(res);
+  return {
+    timezone: body.timezone,
+    days: (body.days ?? []).map((day) => ({
+      date: day.date,
+      succeeded: day.succeeded,
+      failed: day.failed,
+      skipped: day.skipped,
+      inProgress: day.in_progress,
+    })),
+    truncated: body.truncated === true,
+  };
+}
+
+/**
+ * Whether a failed {@link getScheduledTaskRunStats} means the server doesn't
+ * count runs: a server from before the route answers 404, and one whose store
+ * can't count them answers 501.
+ */
+export function isRunStatsUnsupported(error: unknown): boolean {
+  return error instanceof ScheduledTaskApiError && (error.status === 404 || error.status === 501);
+}
+
 /** The latest plan within a run: its steps and each step's newest status. */
 export interface ScheduledTaskRunSteps {
   runId: string;

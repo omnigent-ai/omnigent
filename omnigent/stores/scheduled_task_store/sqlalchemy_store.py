@@ -1532,6 +1532,48 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             next_cursor = page[-1].id if has_more else None
             return [_run_to_entity(r) for r in page], next_cursor
 
+    def list_run_statuses(
+        self,
+        scheduled_task_id: str,
+        *,
+        since: int,
+        until: int,
+        limit: int,
+    ) -> builtins.list[tuple[int, str]]:
+        """Return the time and status of a task's newest runs scheduled in ``[since, until)``.
+
+        Walks ``ix_scheduled_task_runs_scheduled_task_id`` back from *until* and
+        stops at *limit* runs, so neither the range nor the task's history grows it.
+
+        :param scheduled_task_id: The task whose runs to read.
+        :param since: Epoch seconds the range starts at (inclusive).
+        :param until: Epoch seconds the range ends at (exclusive).
+        :param limit: The most runs to return.
+        :returns: ``(scheduled_at, status)`` of up to *limit* runs, the ones
+            scheduled latest in the range, newest first.
+        """
+        stmt = (
+            select(SqlScheduledTaskRun.scheduled_at, SqlScheduledTaskRun.status)
+            .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+            .where(SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id)
+            .where(SqlScheduledTaskRun.scheduled_at >= since)
+            .where(SqlScheduledTaskRun.scheduled_at < until)
+            .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
+            .limit(limit)
+            # ix_scheduled_task_runs_task_status holds both columns but can't seek
+            # the range, so MySQL could choose it and read the task's whole history.
+            .with_hint(
+                SqlScheduledTaskRun,
+                "FORCE INDEX (ix_scheduled_task_runs_scheduled_task_id)",
+                "mysql",
+            )
+        )
+        with self._session("list_task_run_statuses") as session:
+            return [
+                (scheduled_at, decode_scheduled_task_run_status(status))
+                for scheduled_at, status in session.execute(stmt)
+            ]
+
     def update_run(
         self,
         run_id: str,

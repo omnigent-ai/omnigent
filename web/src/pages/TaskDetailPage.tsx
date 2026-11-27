@@ -3,7 +3,8 @@
  * card on the `/tasks` list. Shows the task's header (title + share / edit /
  * delete / Run now), a status line (pause-resume toggle + Active/Paused pill + the
  * human-readable schedule + relative next-run), the Prompt, a Configuration
- * block with saved launch settings, and the run history.
+ * block with saved launch settings, and the run history: a chart of runs per
+ * day by outcome, where the server enables it, above the list of runs.
  *
  * All data + mutations come from the existing scheduled-tasks hooks; editing
  * reuses `CreateScheduledTaskDialog` in its edit mode. For an automation shared
@@ -40,6 +41,7 @@ import { AutomationPaletteCommands } from "@/components/scheduled/AutomationPale
 import { OVERLAP_MODE_LABELS } from "@/components/scheduled/AutomationOverlapField";
 import { retrySummary } from "@/components/scheduled/AutomationRetryField";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { RunHistoryChart } from "@/components/scheduled/RunHistoryChart";
 import { RunPullRequests } from "@/components/scheduled/RunPullRequests";
 import {
   type AutomationDetailActionId,
@@ -77,6 +79,7 @@ import {
   scheduledTaskRunsKey,
   useScheduledTaskRunPullRequests,
   useScheduledTaskRuns,
+  useScheduledTaskRunStats,
   useScheduledTaskRunSteps,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
@@ -98,6 +101,7 @@ import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { canonicalNativeHarness, nativePermissionOptions } from "@/lib/nativeHarnessModes";
 import { formatStatusEffortLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
 import { formatSessionCostUsd } from "@/lib/formatCost";
+import { DEFAULT_RUN_HISTORY_DAYS } from "@/lib/runHistory";
 import { groupRunsBySession } from "@/lib/runSessionGroups";
 import {
   describeRunFailure,
@@ -110,7 +114,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AUTOMATION_SHARE_PARAM } from "@/lib/automationFromSession";
 import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { automationShareDisabledReason, canShareAutomation } from "@/lib/permissionsApi";
-import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
+import { isRunStatsUnsupported, ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type {
   ScheduledTaskRun,
   ScheduledTaskRunPullRequest,
@@ -173,6 +177,14 @@ function TaskDetail({ taskId }: { taskId: string }) {
     info.scheduled_task_run_pull_requests === true &&
     !(task != null && isSharedWithViewer(task));
   const runPullRequests = useScheduledTaskRunPullRequests(taskId, runs, runPullRequestsEnabled);
+  // Run counts hold no session content, so a viewer gets the chart too. An
+  // automation that has never run has nothing to chart.
+  const runHistoryChartEnabled =
+    isFeatureEnabled(info, "automation_run_history_chart") && (runs?.length ?? 0) > 0;
+  const [runHistoryDays, setRunHistoryDays] = useState(DEFAULT_RUN_HISTORY_DAYS);
+  const runStats = useScheduledTaskRunStats(taskId, runHistoryDays, runs, runHistoryChartEnabled);
+  // An older server, or a store that can't count runs, gets the run list alone.
+  const showRunHistoryChart = runHistoryChartEnabled && !isRunStatsUnsupported(runStats.error);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -794,25 +806,36 @@ function TaskDetail({ taskId }: { taskId: string }) {
           No runs yet.
         </p>
       ) : (
-        <ul className="flex flex-col gap-1" data-testid="task-detail-runs">
-          {groupRunsBySession(
-            runs ?? [],
-            task.sessionMode === "continue" ? (task.sessionId ?? null) : null,
-          ).map((entry) =>
-            entry.kind === "run" ? (
-              renderRun(entry.run, true)
-            ) : (
-              <RunSessionGroup
-                key={`session:${entry.sessionId}`}
-                sessionId={entry.sessionId}
-                runs={entry.runs}
-                readOnly={readOnly}
-              >
-                {entry.runs.map((run) => renderRun(run, false))}
-              </RunSessionGroup>
-            ),
+        <>
+          {showRunHistoryChart && (
+            <RunHistoryChart
+              stats={runStats.data}
+              isError={runStats.isError}
+              isStale={runStats.isPlaceholderData}
+              days={runHistoryDays}
+              onDaysChange={setRunHistoryDays}
+            />
           )}
-        </ul>
+          <ul className="flex flex-col gap-1" data-testid="task-detail-runs">
+            {groupRunsBySession(
+              runs ?? [],
+              task.sessionMode === "continue" ? (task.sessionId ?? null) : null,
+            ).map((entry) =>
+              entry.kind === "run" ? (
+                renderRun(entry.run, true)
+              ) : (
+                <RunSessionGroup
+                  key={`session:${entry.sessionId}`}
+                  sessionId={entry.sessionId}
+                  runs={entry.runs}
+                  readOnly={readOnly}
+                >
+                  {entry.runs.map((run) => renderRun(run, false))}
+                </RunSessionGroup>
+              ),
+            )}
+          </ul>
+        </>
       )}
 
       {!readOnly && (

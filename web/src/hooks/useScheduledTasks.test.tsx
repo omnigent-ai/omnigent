@@ -19,17 +19,22 @@ import {
   useRunScheduledTaskNow,
   useScheduledTask,
   useScheduledTaskRunPullRequests,
+  retryRunStats,
   useScheduledTaskRuns,
+  useScheduledTaskRunStats,
   useScheduledTaskRunSteps,
   useScheduledTasks,
   useSharedScheduledTasks,
   useUpdateScheduledTask,
 } from "./useScheduledTasks";
 
-vi.mock("@/lib/scheduledTasksApi", () => ({
+vi.mock("@/lib/scheduledTasksApi", async (importOriginal) => ({
+  ScheduledTaskApiError: (await importOriginal<typeof api>()).ScheduledTaskApiError,
+  isRunStatsUnsupported: (await importOriginal<typeof api>()).isRunStatsUnsupported,
   listScheduledTasks: vi.fn(),
   listSharedScheduledTasks: vi.fn(),
   getScheduledTask: vi.fn(),
+  getScheduledTaskRunStats: vi.fn(),
   listScheduledTaskRuns: vi.fn(),
   listScheduledTaskRunSteps: vi.fn(),
   listScheduledTaskRunPullRequests: vi.fn(),
@@ -633,6 +638,116 @@ describe("useScheduledTaskRuns live refresh", () => {
     vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
     renderHook(() => useScheduledTaskRuns("st_1", false), { wrapper });
     expect(api.listScheduledTaskRuns).not.toHaveBeenCalled();
+  });
+});
+
+describe("useScheduledTaskRunStats", () => {
+  const stats = (succeeded: number): api.ScheduledTaskRunStats => ({
+    timezone: "UTC",
+    days: [{ date: "2026-11-04", succeeded, failed: 0, skipped: 0, inProgress: 0 }],
+    truncated: false,
+  });
+  const running: api.ScheduledTaskRun[] = [{ ...SUCCEEDED_RUN, id: "run_1", status: "running" }];
+  const succeeded: api.ScheduledTaskRun[] = [{ ...SUCCEEDED_RUN, id: "run_1" }];
+
+  it("asks for the range in the viewer's timezone, and again when a listed run changes or appears", async () => {
+    const { wrapper } = makeWrapper();
+    vi.mocked(api.getScheduledTaskRunStats)
+      .mockResolvedValueOnce(stats(0))
+      .mockResolvedValue(stats(1));
+    const { result, rerender } = renderHook(
+      ({ runs }: { runs: api.ScheduledTaskRun[] | undefined }) =>
+        useScheduledTaskRunStats("st_1", 28, runs, true),
+      { wrapper, initialProps: { runs: undefined as api.ScheduledTaskRun[] | undefined } },
+    );
+    await waitFor(() => expect(result.current.data).toEqual(stats(0)));
+    expect(api.getScheduledTaskRunStats).toHaveBeenCalledWith("st_1", {
+      days: 28,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    });
+
+    // The run list arriving, or polling without a change, is nothing new to count.
+    rerender({ runs: running });
+    rerender({ runs: [...running] });
+    expect(api.getScheduledTaskRunStats).toHaveBeenCalledTimes(1);
+
+    rerender({ runs: succeeded });
+    await waitFor(() => expect(result.current.data).toEqual(stats(1)));
+    expect(api.getScheduledTaskRunStats).toHaveBeenCalledTimes(2);
+
+    // A run that appears in the list is one more to count.
+    rerender({ runs: [{ ...SUCCEEDED_RUN, id: "run_2", status: "running" }, ...succeeded] });
+    await waitFor(() => expect(api.getScheduledTaskRunStats).toHaveBeenCalledTimes(3));
+  });
+
+  it("keeps the previous range's counts while another range loads", async () => {
+    const { wrapper } = makeWrapper();
+    let resolveWeek: (value: api.ScheduledTaskRunStats) => void = () => {};
+    vi.mocked(api.getScheduledTaskRunStats)
+      .mockResolvedValueOnce(stats(4))
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveWeek = resolve;
+        }),
+      );
+    const { result, rerender } = renderHook(
+      ({ days }: { days: number }) => useScheduledTaskRunStats("st_1", days, succeeded, true),
+      { wrapper, initialProps: { days: 28 } },
+    );
+    await waitFor(() => expect(result.current.data).toEqual(stats(4)));
+
+    rerender({ days: 7 });
+    expect(result.current.data).toEqual(stats(4));
+    expect(result.current.isPlaceholderData).toBe(true);
+    await act(async () => resolveWeek(stats(1)));
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
+    expect(result.current.data).toEqual(stats(1));
+  });
+
+  it("asks a server that doesn't count runs once, however the run list changes", async () => {
+    const { wrapper } = makeWrapper();
+    const notFound = new api.ScheduledTaskApiError("Not found", 404, null);
+    vi.mocked(api.getScheduledTaskRunStats).mockRejectedValue(notFound);
+    const { result, rerender } = renderHook(
+      ({ runs }: { runs: api.ScheduledTaskRun[] }) =>
+        useScheduledTaskRunStats("st_1", 28, runs, true),
+      { wrapper, initialProps: { runs: running } },
+    );
+    await waitFor(() => expect(result.current.error).toBe(notFound));
+
+    rerender({ runs: succeeded });
+    rerender({ runs: [{ ...SUCCEEDED_RUN, id: "run_2", status: "running" }, ...succeeded] });
+
+    expect(result.current.error).toBe(notFound);
+    expect(api.getScheduledTaskRunStats).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks again only after a failure that may end differently", () => {
+    const answer = (status: number) => new api.ScheduledTaskApiError("answered", status, null);
+
+    // A bad timezone, a missing route and a store that can't count runs answer the same again.
+    expect([400, 404, 501].map((status) => retryRunStats(0, answer(status)))).toEqual([
+      false,
+      false,
+      false,
+    ]);
+    expect([0, 2, 3].map((failures) => retryRunStats(failures, answer(500)))).toEqual([
+      true,
+      true,
+      false,
+    ]);
+    expect(retryRunStats(0, new TypeError("Failed to fetch"))).toBe(true);
+  });
+
+  it("doesn't fetch while disabled", () => {
+    const { wrapper } = makeWrapper();
+    const { rerender } = renderHook(
+      ({ runs }: { runs: api.ScheduledTaskRun[] }) =>
+        useScheduledTaskRunStats("st_1", 28, runs, false),
+      { wrapper, initialProps: { runs: running } },
+    );
+    rerender({ runs: succeeded });
+    expect(api.getScheduledTaskRunStats).not.toHaveBeenCalled();
   });
 });
 

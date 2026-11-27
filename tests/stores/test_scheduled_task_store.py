@@ -897,6 +897,73 @@ def test_list_runs_cursor_pagination(store: SqlAlchemyScheduledTaskStore) -> Non
     assert pages == 3
 
 
+def test_list_run_statuses_reads_the_newest_runs_of_a_range_up_to_its_limit(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Runs scheduled in [since, until) come back newest first, and the read stops at its limit."""
+    for seed in ("st_counted", "st_other"):
+        store.create(
+            scheduled_task_id=_uid(seed),
+            name="n",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+    runs = [
+        # Before the range, and the first second of it.
+        ("st_counted", 8999, "succeeded"),
+        ("st_counted", 9000, "succeeded"),
+        ("st_counted", 9450, "failed"),
+        ("st_counted", 9900, "skipped"),
+        ("st_counted", 10799, "running"),
+        # The range's end is exclusive, and another task's runs aren't read.
+        ("st_counted", 10800, "succeeded"),
+        ("st_other", 9000, "failed"),
+    ]
+    for index, (task, scheduled_at, status) in enumerate(runs):
+        store.create_run(
+            run_id=_uid(f"sr_counted_{index}"),
+            scheduled_task_id=_uid(task),
+            status=status,
+            scheduled_at=scheduled_at,
+        )
+
+    def read(limit: int = 10, since: int = 9000, until: int = 10800) -> list[tuple[int, str]]:
+        return store.list_run_statuses(_uid("st_counted"), since=since, until=until, limit=limit)
+
+    assert read() == [(10799, "running"), (9900, "skipped"), (9450, "failed"), (9000, "succeeded")]
+    # A limit below the range's runs keeps the ones scheduled latest.
+    assert read(limit=2) == [(10799, "running"), (9900, "skipped")]
+    assert read(since=0, until=8999) == []
+    # The same task ID in another workspace has runs of its own.
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("st_counted"),
+            name="n",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("sr_counted_w11"),
+            scheduled_task_id=_uid("st_counted"),
+            status="failed",
+            scheduled_at=9500,
+        )
+        assert read() == [(9500, "failed")]
+    assert read(limit=2) == [(10799, "running"), (9900, "skipped")]
+
+    [(_, plan)] = _bounded_run_reads(store, lambda: read(limit=2))
+    # The task-history index gives the range and the order, so the read stops at its limit.
+    _assert_seeks(
+        plan, "ix_scheduled_task_runs_scheduled_task_id", "scheduled_at>? AND scheduled_at<?"
+    )
+
+
 def test_list_runs_cursor_pagination_ties_on_scheduled_at(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:

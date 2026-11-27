@@ -16,6 +16,8 @@ import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
+  getScheduledTaskRunStats,
+  isRunStatsUnsupported,
   listScheduledTaskRunPullRequests,
   listScheduledTaskRuns,
   listScheduledTasks,
@@ -202,6 +204,62 @@ describe("listSharedScheduledTasks", () => {
       status: 403,
       code: "forbidden",
     });
+  });
+});
+
+describe("getScheduledTaskRunStats", () => {
+  it("GETs the run-stats subpath for a range and timezone and camelCases each day", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        timezone: "America/Los_Angeles",
+        days: [
+          { date: "2026-11-03", succeeded: 2, failed: 0, skipped: 1, in_progress: 0 },
+          { date: "2026-11-04", succeeded: 0, failed: 1, skipped: 0, in_progress: 3 },
+        ],
+        truncated: true,
+      }),
+    );
+
+    const stats = await getScheduledTaskRunStats("st_1", {
+      days: 28,
+      timezone: "America/Los_Angeles",
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/scheduled-tasks/st_1/run-stats?days=28&timezone=America%2FLos_Angeles",
+    );
+    expect(stats).toEqual({
+      timezone: "America/Los_Angeles",
+      days: [
+        { date: "2026-11-03", succeeded: 2, failed: 0, skipped: 1, inProgress: 0 },
+        { date: "2026-11-04", succeeded: 0, failed: 1, skipped: 0, inProgress: 3 },
+      ],
+      truncated: true,
+    });
+  });
+
+  it.each([
+    [404, true],
+    [501, true],
+    [500, false],
+  ])(
+    "fails with a %i that says whether the server counts runs at all",
+    async (status, expected) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ error: { message: "no counts" } }, { ok: false, status }),
+      );
+
+      const error = await getScheduledTaskRunStats("st_1", { days: 28, timezone: "UTC" }).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(ScheduledTaskApiError);
+      expect(isRunStatsUnsupported(error)).toBe(expected);
+    },
+  );
+
+  it("takes a request that got no answer for a failure, not an unsupported server", () => {
+    expect(isRunStatsUnsupported(new TypeError("Failed to fetch"))).toBe(false);
   });
 });
 

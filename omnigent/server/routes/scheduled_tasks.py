@@ -95,6 +95,13 @@ from omnigent.server.scheduled.rrule import (
 )
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
+from omnigent.server.scheduled.run_stats import (
+    DEFAULT_RUN_STATS_DAYS,
+    MAX_RUN_STATS_DAYS,
+    MAX_RUN_STATS_RUNS,
+    daily_run_counts,
+    run_stats_days,
+)
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
@@ -188,6 +195,31 @@ class AutomationFailurePage(BaseModel):
 
     data: list[AutomationFailure]
     next_cursor: str | None
+
+
+class ScheduledTaskRunStatsDay(BaseModel):
+    """How many of a scheduled task's runs were scheduled on one day, by outcome."""
+
+    date: str = Field(description="The day, as an ISO date in the response's timezone")
+    succeeded: int
+    failed: int
+    skipped: int
+    in_progress: int = Field(description="Runs that are queued, starting or running")
+
+
+class ScheduledTaskRunStats(BaseModel):
+    """A scheduled task's runs per day over a range of days ending today."""
+
+    timezone: str = Field(description="The IANA timezone the days are in")
+    days: list[ScheduledTaskRunStatsDay] = Field(
+        description="One entry per day, oldest first, including days without runs"
+    )
+    truncated: bool = Field(
+        description=(
+            "Whether the range holds more runs than one read counts. The days then "
+            "start at the oldest run counted, and that day is counted in part"
+        )
+    )
 
 
 # 9999-12-31T23:59:59Z, the last second ``datetime`` can format.
@@ -2179,6 +2211,61 @@ def create_scheduled_tasks_router(
                     }
                 )
         return {"runs": rows, "refresh_pending": refresh_pending, "next_cursor": next_cursor}
+
+    @router.get(
+        "/scheduled-tasks/{scheduled_task_id}/run-stats", response_model=ScheduledTaskRunStats
+    )
+    async def get_scheduled_task_run_stats(
+        request: Request,
+        scheduled_task_id: str,
+        days: int = Query(default=DEFAULT_RUN_STATS_DAYS, ge=1, le=MAX_RUN_STATS_DAYS),
+        timezone: str | None = Query(
+            default=None,
+            max_length=64,
+            description="IANA timezone whose calendar days to count in; the task's by default",
+        ),
+    ) -> ScheduledTaskRunStats:
+        """Count a scheduled task's runs per day and outcome, for its run history chart.
+
+        Authorizes like ``GET /scheduled-tasks/{id}/runs``: the owner and anyone it
+        is shared with, who already see each run's time and status. Covers the last
+        ``days`` calendar days (1-90, default 28) in ``timezone``, today included,
+        and counts every run by the day it was scheduled for, retries and Run now
+        requests included. A run that is queued, starting or running counts as
+        ``in_progress``.
+
+        One read counts at most the 10,000 runs scheduled latest in the range. If
+        the range holds more, ``truncated`` is true and ``days`` starts at the day
+        of the oldest run counted.
+
+        Unlike the run list, this doesn't fail stale running runs; one counts as
+        ``in_progress`` until a read of the task or its runs fails it.
+
+        :raises OmnigentError: 404 for a task the caller can't read; 400 for a
+            timezone that isn't a valid IANA name.
+        :raises HTTPException: 501 if the store doesn't serve the chart.
+        """
+        task, _ = await _require_readable(request, scheduled_task_id)
+        zone_name = timezone or task.timezone
+        _validate_timezone_or_400(zone_name)
+        dates, starts = run_stats_days(time.time(), ZoneInfo(zone_name), days)
+        try:
+            # One run past the limit tells a full range from a truncated one.
+            runs = await asyncio.to_thread(
+                store.list_run_statuses,
+                task.id,
+                since=starts[0],
+                until=starts[-1],
+                limit=MAX_RUN_STATS_RUNS + 1,
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=501, detail="run statistics are not supported"
+            ) from exc
+        day_counts, truncated = daily_run_counts(runs, dates, starts, MAX_RUN_STATS_RUNS)
+        return ScheduledTaskRunStats.model_validate(
+            {"timezone": zone_name, "days": day_counts, "truncated": truncated}
+        )
 
     @router.post("/scheduled-tasks/{scheduled_task_id}/run", status_code=202)
     async def run_scheduled_task_now(

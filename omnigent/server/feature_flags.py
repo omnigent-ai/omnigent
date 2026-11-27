@@ -49,6 +49,7 @@ class Feature(StrEnum):
     AUTOMATION_RETRIES = "automation_retries"
     AUTOMATION_OVERLAP_MODE = "automation_overlap_mode"
     AUTOMATION_OVERLAP_QUEUE = "automation_overlap_queue"
+    AUTOMATION_RUN_HISTORY_CHART = "automation_run_history_chart"
     SESSION_TIMERS = "session_timers"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
@@ -208,6 +209,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.27.0",
         frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.AUTOMATION_RUN_HISTORY_CHART,
+        description=(
+            "Chart of an automation's runs per day by outcome, with its success rate, "
+            "above the run list on the automation's page"
+        ),
+        owner="web",
+        review_by_release="0.27.0",
     ),
     FeatureDefinition(
         feature=Feature.SESSION_TIMERS,

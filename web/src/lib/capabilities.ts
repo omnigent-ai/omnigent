@@ -66,6 +66,7 @@ export type FeatureKey =
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
+  | "automation_run_history_chart"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
   | "chat_composer_codemirror"

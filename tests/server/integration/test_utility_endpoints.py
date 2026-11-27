@@ -97,6 +97,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "workspace_content_search": True,
         "grid_sessions_display_ui": True,
         "automations_v2": True,
+        "automation_run_history_chart": False,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
         "chat_composer_codemirror": False,

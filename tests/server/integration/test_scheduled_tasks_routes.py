@@ -2922,6 +2922,170 @@ async def test_list_runs_404_for_nonowned_task(
     assert resp.status_code == 404, resp.text
 
 
+def _run_stats_totals(stats: dict[str, Any]) -> dict[str, int]:
+    """Each outcome's runs over every day of a run-stats response."""
+    return {
+        outcome: sum(day[outcome] for day in stats["days"])
+        for outcome in ("succeeded", "failed", "skipped", "in_progress")
+    }
+
+
+async def test_run_stats_count_a_range_of_runs_per_day_and_outcome(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Every run scheduled in the range counts once, under its outcome, on one day."""
+    from datetime import date, timedelta
+    from itertools import pairwise
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    url = f"/v1/scheduled-tasks/{created['id']}/run-stats"
+    now = int(time.time())
+    day = 86400
+    seeded = [
+        (now - 60, "succeeded"),
+        (now - 120, "failed"),
+        (now - 180, "running"),
+        (now - 240, "starting"),
+        (now - 300, "scheduled"),
+        (now - 3 * day, "skipped"),
+        # Before the default 28 days.
+        (now - 40 * day, "succeeded"),
+    ]
+    for scheduled_at, status in seeded:
+        _seed_run(
+            db_uri,
+            created["id"],
+            uuid.uuid4().hex,
+            scheduled_at=scheduled_at,
+            status=status,
+            conversation_id=None,
+        )
+
+    resp = await auth_client.get(url, params={"timezone": "Asia/Tokyo"}, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    stats = resp.json()
+    assert (stats["timezone"], stats["truncated"]) == ("Asia/Tokyo", False)
+    assert _run_stats_totals(stats) == {
+        "succeeded": 1,
+        "failed": 1,
+        "skipped": 1,
+        "in_progress": 3,
+    }
+    # One entry per day, oldest first, with the days that had no runs.
+    dates = [date.fromisoformat(day["date"]) for day in stats["days"]]
+    assert len(dates) == 28
+    assert all(later - earlier == timedelta(days=1) for earlier, later in pairwise(dates))
+
+    # Without a timezone the days are the automation's, and a shorter range drops older runs.
+    recent = await auth_client.get(url, params={"days": 2}, headers=_headers())
+    assert recent.status_code == 200, recent.text
+    assert recent.json()["timezone"] == created["timezone"]
+    assert len(recent.json()["days"]) == 2
+    assert _run_stats_totals(recent.json()) == {
+        "succeeded": 1,
+        "failed": 1,
+        "skipped": 0,
+        "in_progress": 3,
+    }
+    longest = await auth_client.get(url, params={"days": 90}, headers=_headers())
+    assert _run_stats_totals(longest.json())["succeeded"] == 2
+
+
+async def test_run_stats_count_the_newest_runs_of_a_range_that_holds_more(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A range with more runs than one read counts says so and starts where the counting does."""
+    from datetime import UTC
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    monkeypatch.setattr(scheduled_tasks_routes, "MAX_RUN_STATS_RUNS", 3)
+    now = int(time.time())
+    day = 86400
+    # The read counts the first three; the fourth and the run five days back are left out.
+    seeded = [
+        (now - 60, "succeeded"),
+        (now - 120, "failed"),
+        (now - 2 * day, "succeeded"),
+        (now - 2 * day - 60, "failed"),
+        (now - 5 * day, "succeeded"),
+    ]
+    for scheduled_at, status in seeded:
+        _seed_run(
+            db_uri,
+            created["id"],
+            uuid.uuid4().hex,
+            scheduled_at=scheduled_at,
+            status=status,
+            conversation_id=None,
+        )
+
+    resp = await auth_client.get(
+        f"/v1/scheduled-tasks/{created['id']}/run-stats",
+        params={"days": 7, "timezone": "UTC"},
+        headers=_headers(),
+    )
+
+    assert resp.status_code == 200, resp.text
+    stats = resp.json()
+    assert stats["truncated"] is True
+    assert _run_stats_totals(stats) == {
+        "succeeded": 2,
+        "failed": 1,
+        "skipped": 0,
+        "in_progress": 0,
+    }
+    # The days before the oldest run counted are left out, not reported as empty.
+    oldest_counted = datetime.fromtimestamp(now - 2 * day, UTC).date()
+    assert stats["days"][0]["date"] == oldest_counted.isoformat()
+
+
+async def test_run_stats_report_a_store_that_does_not_serve_them(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    monkeypatch.setattr(
+        auth_app.state.scheduled_task_store,
+        "list_run_statuses",
+        Mock(side_effect=NotImplementedError),
+    )
+
+    resp = await auth_client.get(
+        f"/v1/scheduled-tasks/{created['id']}/run-stats", headers=_headers()
+    )
+
+    assert resp.status_code == 501, resp.text
+    assert resp.json() == {"detail": "run statistics are not supported"}
+
+
+async def test_run_stats_reject_a_bad_range_or_timezone(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    url = f"/v1/scheduled-tasks/{created['id']}/run-stats"
+
+    for days in (0, 91):
+        resp = await auth_client.get(url, params={"days": days}, headers=_headers())
+        assert resp.status_code == 422, resp.text
+    resp = await auth_client.get(url, params={"timezone": "Mars/Olympus"}, headers=_headers())
+    assert resp.status_code == 400, resp.text
+    assert "invalid timezone" in resp.text
+
+
 # ── lazy-on-read orphan backstop ─────────────────────────────────────────────
 
 
@@ -6833,7 +6997,13 @@ def _in_groups(monkeypatch: pytest.MonkeyPatch, groups: dict[str, list[str]]) ->
 
 def _read_urls(task_id: str) -> list[str]:
     url = f"/v1/scheduled-tasks/{task_id}"
-    return [url, f"{url}/runs", f"{url}/run-steps", f"{url}/run-pull-requests"]
+    return [
+        url,
+        f"{url}/runs",
+        f"{url}/run-steps",
+        f"{url}/run-pull-requests",
+        f"{url}/run-stats",
+    ]
 
 
 @pytest_asyncio.fixture()
@@ -6907,7 +7077,7 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
         return {user_id: user_id.split("@")[0].title() for user_id in user_ids}
 
     monkeypatch.setattr(SqlAlchemyPermissionStore, "display_names", display_names)
-    owned, owned_runs, owned_steps, _ = [
+    owned, owned_runs, owned_steps, _, _ = [
         (await client.get(url, headers=_headers())).json() for url in _read_urls(task_id)
     ]
     assert (owned["viewer_role"], owned["owner_display_name"]) == ("owner", None)
@@ -6938,8 +7108,8 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
             )
             patched.setattr(SessionJournalStore, "run_start_plans", refuse_session_read)
             responses = [await client.get(url, headers=recipient) for url in _read_urls(task_id)]
-        assert [r.status_code for r in responses] == [200] * 4, responses[-1].text
-        task, runs, steps, run_prs = (r.json() for r in responses)
+        assert [r.status_code for r in responses] == [200] * 5, responses[-1].text
+        task, runs, steps, run_prs, _ = (r.json() for r in responses)
         assert task == {**owned, "viewer_role": "viewer", "owner_display_name": "Alice"}
         assert runs == {
             "runs": [{**run, **without_session} for run in owned_runs["runs"]],
@@ -6963,9 +7133,35 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
     assert revoked.status_code == 204, revoked.text
     assert [(await client.get(url, headers=_BOB)).status_code for url in _read_urls(task_id)] == [
         404
-    ] * 4
+    ] * 5
     assert (await client.delete(_read_urls(task_id)[0], headers=_headers())).status_code == 200
     assert (await client.get(_read_urls(task_id)[0], headers=_CAROL)).status_code == 404
+
+
+async def test_run_stats_answer_a_recipient_as_they_answer_the_owner(
+    workflows_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Run counts are outcomes a recipient already sees in the run list."""
+    client = workflows_client
+    task_id = await _create_task(client)
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        scheduled_at=int(time.time()) - 60,
+        status="failed",
+        conversation_id=None,
+    )
+    assert (await _share(client, task_id, "bob@example.com")).status_code == 200
+    url = f"/v1/scheduled-tasks/{task_id}/run-stats"
+
+    owned = await client.get(url, headers=_headers())
+    shared = await client.get(url, headers=_BOB)
+
+    assert (owned.status_code, shared.status_code) == (200, 200), shared.text
+    counted = {"succeeded": 0, "failed": 1, "skipped": 0, "in_progress": 0}
+    assert _run_stats_totals(owned.json()) == _run_stats_totals(shared.json()) == counted
+    assert shared.json()["timezone"] == owned.json()["timezone"]
 
 
 async def test_each_run_lists_the_prs_it_created_or_worked_on(
@@ -7380,7 +7576,7 @@ async def test_agents_get_no_access_through_a_recipient(
         (await auth_client.get(url, headers=agent)).status_code for url in _read_urls(task_id)
     ]
     # Run steps need workflows, which this server leaves off.
-    assert statuses == [404] * 4
+    assert statuses == [404] * 5
     assert (await auth_client.get(_read_urls(task_id)[0], headers=_BOB)).status_code == 200
     listed = await auth_client.get("/v1/scheduled-tasks/shared", headers=agent)
     assert listed.status_code == 403, listed.text
