@@ -1,6 +1,7 @@
 // GitHub polls stop once the window has been unfocused for 2 minutes, read once each when it's
 // focused again, and keep running when the rollback flag is off.
 
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -143,16 +144,6 @@ describe("githubPollFocus", () => {
     expect(refetch).toHaveBeenCalledTimes(1);
   });
 
-  it("reschedules the polls asked while unfocused at the pause, so none waits for its next read", () => {
-    const { focus, advance, poll, blur } = focusHarness();
-    const { query, setOptions } = poll();
-    focus.pollPaused(query);
-    blur();
-    expect(focus.pollPaused(query)).toBe(false);
-    advance(UNFOCUSED_POLL_PAUSE_MS);
-    expect(setOptions).toHaveBeenCalledWith({ queryKey: ["q"], refetchInterval: 30_000 });
-  });
-
   it("releases stopped polls at focus even after the wall clock moved back", () => {
     const { focus, advance, rewind, poll, blur, refocus } = focusHarness();
     const stopped = poll();
@@ -262,27 +253,19 @@ describe("githubPollFocus", () => {
 });
 
 describe("a test reset", () => {
-  it("stops the timer, listeners and flag watch, and starts them again only at the next use", () => {
+  it("stops the timers, listeners and flag watch, and starts them again only at the next use", () => {
     const { focus, live, timers } = focusHarness({ focused: false });
-    focus.paused();
-    expect(live).toEqual({ listeners: 1, watches: 1, starts: 1 });
-    // The pause and the frame focus check.
-    expect(timers).toHaveLength(2);
-    focus.resetForTests();
-    expect(live).toMatchObject({ listeners: 0, watches: 0 });
-    expect(timers).toHaveLength(0);
-    focus.paused();
-    expect(live).toEqual({ listeners: 1, watches: 1, starts: 2 });
-  });
-
-  it("can repeat without stacking listeners or watches", () => {
-    const { focus, live } = focusHarness();
-    for (let round = 0; round < 3; round += 1) {
+    for (let start = 1; start <= 3; start += 1) {
       focus.paused();
+      expect(live).toEqual({ listeners: 1, watches: 1, starts: start });
+      // The pause and the frame focus check.
+      expect(timers).toHaveLength(2);
+      // A repeated reset stacks nothing and stops nothing twice.
       focus.resetForTests();
       focus.resetForTests();
+      expect(live).toMatchObject({ listeners: 0, watches: 0 });
+      expect(timers).toHaveLength(0);
     }
-    expect(live).toMatchObject({ listeners: 0, watches: 0, starts: 3 });
   });
 
   it.each([
@@ -403,5 +386,52 @@ describe("hearing the pause", () => {
     harness.advance(UNFOCUSED_POLL_PAUSE_MS);
     expect(harness.focus.paused()).toBe(true);
     expect(heard).not.toHaveBeenCalled();
+  });
+});
+
+describe("with a real query observer", () => {
+  it("stops the poll's interval at the pause, then reads once and polls again at focus", async () => {
+    vi.useFakeTimers();
+    let windowFocused = true;
+    let onFocus = () => {};
+    let onBlur = () => {};
+    const focus = createGitHubPollFocus({
+      focused: () => windowFocused,
+      listen: (focusListener, blurListener) => {
+        onFocus = focusListener;
+        onBlur = blurListener;
+      },
+    });
+    const client = new QueryClient();
+    const queryFn = vi.fn(async () => "list");
+    const observer = new QueryObserver(client, {
+      queryKey: ["pull-requests"],
+      queryFn,
+      refetchInterval: (query) => (focus.pollPaused(query) ? false : 30_000),
+      refetchIntervalInBackground: true,
+    });
+    const stop = observer.subscribe(() => undefined);
+    try {
+      // Blur between reads, so the pause itself has to stop the interval.
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(queryFn).toHaveBeenCalledTimes(2);
+      windowFocused = false;
+      onBlur();
+      await vi.advanceTimersByTimeAsync(UNFOCUSED_POLL_PAUSE_MS);
+      const atPause = queryFn.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(10 * UNFOCUSED_POLL_PAUSE_MS);
+      expect(queryFn).toHaveBeenCalledTimes(atPause);
+      windowFocused = true;
+      onFocus();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(queryFn).toHaveBeenCalledTimes(atPause + 1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(queryFn).toHaveBeenCalledTimes(atPause + 2);
+    } finally {
+      stop();
+      client.clear();
+      focus.resetForTests();
+      vi.useRealTimers();
+    }
   });
 });

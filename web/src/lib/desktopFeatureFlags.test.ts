@@ -70,7 +70,11 @@ function collect<T>(name: string, fallback: T, mode?: "value" | "resolved") {
   return { states, unsubscribe };
 }
 
+// Readings a test starts outside a helper, ended after it so none outlives the test.
+const readers: (() => void)[] = [];
+
 afterEach(() => {
+  for (const stop of readers.splice(0)) stop();
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
   delete (window as unknown as { omnigentNative?: unknown }).omnigentNative;
   window.localStorage.removeItem(BROWSER_FLAG_OVERRIDES_KEY);
@@ -78,12 +82,19 @@ afterEach(() => {
 });
 
 describe("subscribeDesktopFeatureFlag", () => {
-  it("follows a capable shell, starting from the provisional fallback", async () => {
+  it("follows a capable shell from the provisional fallback, unresolved until it answers", async () => {
     const shell = installShell({ names: ["gate"] });
     const { states } = collect("gate", false);
+    const readings: DesktopFeatureFlagReading<boolean>[] = [];
+    readers.push(
+      readDesktopFeatureFlag("gate", { fallback: false }, (reading) => readings.push(reading)),
+    );
     expect(states).toEqual([{ value: false, resolved: false }]);
     await vi.waitFor(() => expect(shell.subscriptions).toHaveLength(1));
     expect(shell.subscriptions[0]).toMatchObject({ name: "gate", mode: "resolved" });
+    // Subscribed with no answer yet: still provisional, though the fallback is what it'll say.
+    expect(states).toEqual([{ value: false, resolved: false }]);
+    expect(readings).toEqual([{ value: false, resolved: false, source: "pending" }]);
     shell.subscriptions[0].callback(false);
     shell.subscriptions[0].callback(true);
     expect(states).toEqual([
@@ -91,18 +102,7 @@ describe("subscribeDesktopFeatureFlag", () => {
       { value: false, resolved: true },
       { value: true, resolved: true },
     ]);
-  });
-
-  it("stays unresolved while the shell has no answer, even once it matches the fallback", async () => {
-    const shell = installShell({ names: ["gate"] });
-    const { states } = collect("gate", false);
-    await vi.waitFor(() => expect(shell.subscriptions).toHaveLength(1));
-    await new Promise((resolve) => {
-      setTimeout(resolve, 10);
-    });
-    expect(states).toEqual([{ value: false, resolved: false }]);
-    shell.subscriptions[0].callback(false);
-    expect(states.at(-1)).toEqual({ value: false, resolved: true });
+    expect(readings.at(-1)).toEqual({ value: true, resolved: true, source: "shell" });
   });
 
   it("shows nothing before the shell answers in resolved mode", async () => {
@@ -155,16 +155,23 @@ describe("subscribeDesktopFeatureFlag", () => {
     expect(early.states).toEqual([{ value: false, resolved: false }]);
   });
 
-  it("falls back when the bridge throws", async () => {
-    installShell({ names: ["gate"] });
-    const shell = (
-      window as unknown as { omnigentDesktop: { featureFlags: { subscribe: unknown } } }
-    ).omnigentDesktop;
-    shell.featureFlags.subscribe = () => {
+  it("falls back, and names why, when the bridge's subscribe throws", async () => {
+    const shell = installShell({ names: ["gate"] });
+    // Every subscribe throws, so each reader that tries falls back on its own.
+    shell.subscribe.mockImplementation(() => {
       throw new Error("bridge gone");
-    };
+    });
     const { states } = collect("gate", false, "resolved");
+    const readings: DesktopFeatureFlagReading<boolean>[] = [];
+    readers.push(
+      readDesktopFeatureFlag("gate", { fallback: false, mode: "resolved" }, (reading) =>
+        readings.push(reading),
+      ),
+    );
     await vi.waitFor(() => expect(states).toEqual([{ value: false, resolved: true }]));
+    await vi.waitFor(() =>
+      expect(readings).toEqual([{ value: false, resolved: true, source: "subscribe_threw" }]),
+    );
   });
 
   it("refuses no flag a page reads, however many consumers read the others", async () => {
@@ -380,13 +387,6 @@ describe("readDesktopFeatureFlag", () => {
     expect(readings.at(-1)).toEqual({ value: true, resolved: true, source: "shell" });
   });
 
-  it("stays pending while a subscription never answers", async () => {
-    const shell = installShell({ names: [FLAG] });
-    const { readings } = read();
-    await vi.waitFor(() => expect(shell.live()).toHaveLength(1));
-    expect(readings).toEqual([{ value: false, resolved: false, source: "pending" }]);
-  });
-
   it("logs a consumer that throws on a fallback the shell's features settle", async () => {
     installShell({ names: ["another-flag"] });
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -395,16 +395,6 @@ describe("readDesktopFeatureFlag", () => {
     });
     await vi.waitFor(() => expect(error).toHaveBeenCalled());
     error.mockRestore();
-  });
-
-  it("names a subscribe that throws", async () => {
-    const shell = installShell({ names: [FLAG] });
-    shell.subscribe.mockImplementationOnce(() => {
-      throw new Error("refused");
-    });
-    const { readings } = read("resolved");
-    await vi.waitFor(() => expect(readings).toHaveLength(1));
-    expect(readings[0]).toEqual({ value: false, resolved: true, source: "subscribe_threw" });
   });
 
   it("shares one shell subscription with the flag's other readers", async () => {

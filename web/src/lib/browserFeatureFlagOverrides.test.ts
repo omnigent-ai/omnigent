@@ -85,6 +85,11 @@ describe("browserFlagOverrides", () => {
   it("drops unknown names, hidden flags and values that aren't booleans", () => {
     store({ [FLAG]: true, [HIDDEN]: true, "not-a-flag": true, "server-ui-canvas": "on" });
     expect(browserFlagOverrides()).toEqual({ [FLAG]: true });
+    // A registered name with a wrong-typed value, on its own, so no name check can hide it.
+    for (const value of ["on", 1, null, { on: true }]) {
+      store({ [FLAG]: value });
+      expect(browserFlagOverrides(), JSON.stringify(value)).toEqual({});
+    }
   });
 
   it("reads only its own choices, even for a flag named like an object's own members", () => {
@@ -100,13 +105,6 @@ describe("browserFlagOverrides", () => {
     setBrowserFlagOverride("toString", false);
     expect(browserFlagOverride("constructor")).toBe(true);
     expect(browserFlagOverride("toString")).toBe(false);
-  });
-
-  it("drops a registered flag's value that isn't a boolean", () => {
-    for (const value of ["on", 1, null, { on: true }]) {
-      store({ [FLAG]: value });
-      expect(browserFlagOverrides(), JSON.stringify(value)).toEqual({});
-    }
   });
 
   it("gives the same object until the choices change", () => {

@@ -1,6 +1,7 @@
 // List polls slow 4 times once nobody has used the window for 3 minutes; the first input reads
 // each slowed poll that's due, once, and puts the rest back on their usual pace.
 
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -60,6 +61,8 @@ function idleHarness() {
     advance,
     poll,
     input: () => onInput(),
+    /** The input listener as this start handed it out, to call after a reset. */
+    handedOut: () => onInput,
     setEnabled: (enabled: boolean) => setEnabled(enabled),
   };
 }
@@ -110,14 +113,6 @@ describe("githubPollIdle", () => {
     }
   });
 
-  it("reschedules the polls asked while in use as it turns idle, so none waits out its old timer", () => {
-    const { idle, advance, poll } = idleHarness();
-    const { query, setOptions } = poll();
-    idle.pollFactor(query, () => true);
-    advance(IDLE_POLL_AFTER_MS);
-    expect(setOptions).toHaveBeenCalledWith({ queryKey: ["q"], refetchInterval: 30_000 });
-  });
-
   it("reads each slowed poll that's due once at the first input, and reschedules the others", () => {
     const { idle, advance, poll, input } = idleHarness();
     const due = poll();
@@ -141,11 +136,18 @@ describe("githubPollIdle", () => {
   it("tells work that paces itself when idle starts and ends", () => {
     const { idle, advance, input } = idleHarness();
     const heard = vi.fn();
-    idle.subscribe(heard);
+    const other = vi.fn();
+    const stop = idle.subscribe(heard);
+    idle.subscribe(other);
     advance(IDLE_POLL_AFTER_MS);
     expect(heard).toHaveBeenCalledTimes(1);
     input();
     expect(heard).toHaveBeenCalledTimes(2);
+    stop();
+    advance(IDLE_POLL_AFTER_MS);
+    input();
+    expect(heard).toHaveBeenCalledTimes(2);
+    expect(other).toHaveBeenCalledTimes(4);
   });
 
   it("never slows polls with the flag off, and turning it off puts slowed ones back", () => {
@@ -170,5 +172,65 @@ describe("githubPollIdle", () => {
     expect(idle.factor()).toBe(IDLE_POLL_FACTOR);
     idle.resetForTests();
     expect(idle.factor()).toBe(1);
+  });
+
+  it("ignores input and listeners from before a test reset", () => {
+    const harness = idleHarness();
+    const { idle, advance, input } = harness;
+    const heard = vi.fn();
+    idle.subscribe(heard);
+    const before = harness.handedOut();
+    idle.resetForTests();
+    expect(idle.factor()).toBe(1);
+    advance(IDLE_POLL_AFTER_MS);
+    expect(idle.factor()).toBe(IDLE_POLL_FACTOR);
+    // The old start's input arrives late: it keeps nothing in use, and old listeners hear nothing.
+    before();
+    expect(idle.factor()).toBe(IDLE_POLL_FACTOR);
+    expect(heard).not.toHaveBeenCalled();
+    input();
+    expect(idle.factor()).toBe(1);
+  });
+});
+
+describe("with a real query observer", () => {
+  it("slows the poll's interval 4 times at idle, then reads once and keeps its pace at input", async () => {
+    vi.useFakeTimers();
+    let onInput = () => {};
+    const idle = createGitHubPollIdle({
+      listen: (inputListener) => {
+        onInput = inputListener;
+      },
+    });
+    const client = new QueryClient();
+    const queryFn = vi.fn(async () => "list");
+    const observer = new QueryObserver(client, {
+      queryKey: ["pull-requests"],
+      queryFn,
+      refetchInterval: (query) => 30_000 * idle.pollFactor(query, () => true),
+      refetchIntervalInBackground: true,
+    });
+    const stop = observer.subscribe(() => undefined);
+    try {
+      // Input between reads, so idle starts between them and has to slow the interval itself.
+      await vi.advanceTimersByTimeAsync(10_000);
+      onInput();
+      await vi.advanceTimersByTimeAsync(IDLE_POLL_AFTER_MS);
+      const atIdle = queryFn.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(IDLE_POLL_FACTOR * 30_000 - 1);
+      expect(queryFn).toHaveBeenCalledTimes(atIdle);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(queryFn).toHaveBeenCalledTimes(atIdle + 1);
+      onInput();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(queryFn).toHaveBeenCalledTimes(atIdle + 2);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(queryFn).toHaveBeenCalledTimes(atIdle + 3);
+    } finally {
+      stop();
+      client.clear();
+      idle.resetForTests();
+      vi.useRealTimers();
+    }
   });
 });

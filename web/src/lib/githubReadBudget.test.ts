@@ -1,6 +1,7 @@
 // A reader's hourly budget, as answers report it: polls slow below a quarter of the reader's
 // own limit, pause below a tenth until the reset, and run as usual once it passes.
 
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -249,31 +250,6 @@ describe("githubReadBudgets and the shell's rollback flag", () => {
     }
   });
 
-  it("lets a slowed poll pace as usual at the reset, while a stopped one keeps its timer", () => {
-    vi.useFakeTimers();
-    try {
-      const { store, advance } = budgets();
-      const slowedOptions = vi.fn();
-      const stoppedOptions = vi.fn();
-      store.observe(KEY, graphql(1000));
-      store.hold(
-        { observers: [{ options: { queryKey: ["slow"] }, setOptions: slowedOptions }] },
-        store.pace(KEY),
-      );
-      store.hold(
-        { observers: [{ options: { queryKey: ["stopped"] }, setOptions: stoppedOptions }] },
-        { pace: "stopped", until: RESET },
-      );
-      const wait = RESET - START;
-      advance(wait);
-      vi.advanceTimersByTime(wait);
-      expect(slowedOptions).toHaveBeenCalledWith({ queryKey: ["slow"] });
-      expect(stoppedOptions).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   it("holds a poll slowed and then stopped only as stopped, so the reset leaves its read due", () => {
     vi.useFakeTimers();
     try {
@@ -368,5 +344,83 @@ describe("githubReadBudgets and the shell's rollback flag", () => {
     expect(fresh.pace(KEY).pace).toBe("stopped");
     deliver(false);
     expect(fresh.pace(KEY).pace).toBe("normal");
+  });
+});
+
+describe("subscribeChanges", () => {
+  it("tells each listener about every new budget and the reset, until it stops listening", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    try {
+      const store = createGitHubReadBudgets();
+      stores.push(store);
+      const heard = vi.fn();
+      const other = vi.fn();
+      const stop = store.subscribeChanges(heard);
+      store.subscribeChanges(other);
+      store.observe(KEY, graphql(1000));
+      expect(heard).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(RESET - START);
+      expect(heard).toHaveBeenCalledTimes(2);
+      stop();
+      store.observe(KEY, graphql(4000, 5000, RESET + 60 * 60_000));
+      expect(heard).toHaveBeenCalledTimes(2);
+      expect(other).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("with real query observers", () => {
+  it("polls a slowed list at its usual pace from the reset, and reads a stopped one at it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const store = createGitHubReadBudgets();
+    stores.push(store);
+    const client = new QueryClient();
+    // As a list's poll paces: slower while slowed, and only until the reset while stopped.
+    const poll = (key: string) => {
+      const queryFn = vi.fn(async () => key);
+      const observer = new QueryObserver(client, {
+        queryKey: [key],
+        queryFn,
+        refetchInterval: (query) => {
+          const pace = store.pace(key);
+          if (pace.pace === "normal") return 30_000;
+          store.hold(query, pace);
+          return pace.pace === "slow" ? 30_000 * pace.factor : Math.max(pace.until - Date.now(), 1);
+        },
+        refetchIntervalInBackground: true,
+      });
+      return { queryFn, stop: observer.subscribe(() => undefined) };
+    };
+    store.observe("slowed", graphql(1000));
+    store.observe("stopped", graphql(10));
+    // Start between slowed reads, so the reset has to restore the interval itself.
+    const late = 10_000;
+    await vi.advanceTimersByTimeAsync(late);
+    const slowed = poll("slowed");
+    const stopped = poll("stopped");
+    try {
+      await vi.advanceTimersByTimeAsync(RESET - START - late - 1);
+      expect(stopped.queryFn).toHaveBeenCalledTimes(1);
+      const beforeReset = slowed.queryFn.mock.calls.length;
+      expect(beforeReset).toBe(1 + Math.floor((RESET - START - late - 1) / 120_000));
+      await vi.advanceTimersByTimeAsync(1);
+      expect(stopped.queryFn).toHaveBeenCalledTimes(2);
+      // Its next read follows the usual interval from the reset, not the slowed one before it.
+      const atReset = slowed.queryFn.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(30_000 - 1);
+      expect(slowed.queryFn).toHaveBeenCalledTimes(atReset);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(slowed.queryFn).toHaveBeenCalledTimes(atReset + 1);
+      expect(stopped.queryFn).toHaveBeenCalledTimes(3);
+    } finally {
+      slowed.stop();
+      stopped.stop();
+      client.clear();
+      vi.useRealTimers();
+    }
   });
 });
