@@ -475,9 +475,10 @@ describe("the trees beside a Changes review", () => {
     const handle = handleOf(CHANGES_REVIEW_TREE_WIDTH);
     expect(handle).toHaveAttribute("aria-valuemin", "180");
     expect(handle).toHaveAttribute("aria-valuemax", "345");
-    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    // The tree docks at the review's right, so ArrowLeft widens it and ArrowRight narrows it.
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
     expect(widthOf(CHANGES_REVIEW_TREE_WIDTH)).toBe(240);
-    fireEvent.keyDown(handle, { key: "ArrowLeft", shiftKey: true });
+    fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
     expect(widthOf(CHANGES_REVIEW_TREE_WIDTH)).toBe(208);
     fireEvent.keyDown(handle, { key: "End" });
     expect(widthOf(CHANGES_REVIEW_TREE_WIDTH)).toBe(345);
@@ -508,20 +509,22 @@ describe("the trees beside a Changes review", () => {
   });
 
   it("end a cancelled drag where it was, and give back the page's cursor", () => {
+    // The tree docks at the right, so its width is measured from the container's right edge.
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
       left: 0,
+      right: 1000,
     } as DOMRect);
     document.body.style.cursor = "progress";
     render(<Pane spec={PULL_REQUEST_REVIEW_TREE_WIDTH} containerWidth={1000} />);
     fireEvent.pointerDown(handleOf(PULL_REQUEST_REVIEW_TREE_WIDTH));
     expect(document.body.style.cursor).toBe("col-resize");
-    fireEvent.pointerMove(window, { clientX: 400 });
+    fireEvent.pointerMove(window, { clientX: 600 });
     fireEvent.pointerCancel(window);
 
     expect(document.body.style.cursor).toBe("progress");
     expect(document.body.style.userSelect).toBe("");
     expect(readPanelSharePreference("pullRequestReviewTreeShare")).toBe(0.4);
-    fireEvent.pointerMove(window, { clientX: 300 });
+    fireEvent.pointerMove(window, { clientX: 700 });
     expect(widthOf(PULL_REQUEST_REVIEW_TREE_WIDTH)).toBe(400);
   });
 });

@@ -658,6 +658,23 @@ describe("DiffReview changed-files tree", () => {
     expect(screen.getByRole("complementary", { name: "Changed files" })).toBeVisible();
   });
 
+  it("docks the tree after the diff, under a toggle that ends the toolbar", () => {
+    render(<DiffReview {...props(ready)} />);
+    const toolbar = screen.getByRole("toolbar", { name: "Diff review" });
+    const toggle = screen.getByRole("button", { name: "Hide changed files" });
+    // The toggle sits over the tree, and what changed reads first.
+    expect(toolbar.lastElementChild).toContainElement(toggle);
+    expect(toolbar.firstElementChild).toBe(screen.getByTestId("diff-review-file-count"));
+    const column = document.querySelector("[data-diff-review-tree-column]")!;
+    const content = document.querySelector("[data-diff-review-content]")!;
+    // Showing or hiding a tree at the right leaves the code's left edge where it is.
+    expect(column.previousElementSibling).toBe(content);
+    expect(column).toHaveClass("border-l");
+    expect(within(column as HTMLElement).getByTestId("diff-review-tree-resize-handle")).toHaveClass(
+      "-left-0.5",
+    );
+  });
+
   it("offers no close button as a column, where its × only clears the search", () => {
     render(<DiffReview {...props(ready)} />);
     act(() => command("Search changed files").run());
@@ -1951,8 +1968,11 @@ describe("an opt-in presentation", () => {
     expect(edge).toHaveAttribute("tabindex", "0");
     expect(edge).toHaveAttribute("aria-valuemin", "160");
     expect(edge).toHaveAttribute("aria-valuenow", "240");
-    fireEvent.keyDown(edge, { key: "ArrowRight", shiftKey: true });
+    // The tree docks at the right, so its left edge widens it leftward.
+    fireEvent.keyDown(edge, { key: "ArrowLeft", shiftKey: true });
     expect(edge).toHaveAttribute("aria-valuenow", "272");
+    fireEvent.keyDown(edge, { key: "ArrowRight", shiftKey: true });
+    expect(edge).toHaveAttribute("aria-valuenow", "240");
   });
 });
 

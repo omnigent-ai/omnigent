@@ -26,6 +26,8 @@ const REVIEW_TREE_LIMITS = {
   label: "Resize changed files",
   keyboardStep: 12,
   largeKeyboardStep: 32,
+  // The tree docks at the review's right, so its handle is its left edge.
+  anchor: "right",
 } as const;
 
 /** The tree beside a session's Changes review. */
