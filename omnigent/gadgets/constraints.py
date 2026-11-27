@@ -370,7 +370,15 @@ class ConstraintGuard:
         rules: list[dict],
         actor: str,
         validate: Callable[[str, str, Any], None] | None = None,
+        is_current: Callable[[], bool] | None = None,
     ) -> None:
+        """
+        :param is_current: Whether these rules are still the published ones, read again
+            when the state belongs to other rules: only the published rules' writers take
+            the state over from them (rebuilding it); a writer whose rules were replaced
+            since its request was checked is refused instead. ``None``: always current.
+        """
+        self.is_current = is_current or (lambda: True)
         self.files = files
         # Raises InvalidInput when a value a rule would write breaks its collection's schema.
         self.validate = validate
@@ -414,7 +422,10 @@ class ConstraintGuard:
                 self._finish(epoch, state)
                 continue
             progress = current.get("rebuild")
-            if isinstance(progress, dict) and progress.get("digest") != self.digest:
+            foreign = (isinstance(progress, dict) and progress.get("digest") != self.digest) or (
+                current.get("rules") not in (self.digest, _STALE)
+            )
+            if foreign and not self.is_current():
                 # Rules published after this request was checked are being rebuilt: the live
                 # counts and keys are cleared meanwhile, and a write now would also land behind
                 # pages the rebuild already read. Refused before anything changes; a retry runs
@@ -575,6 +586,11 @@ class ConstraintGuard:
                     **{r["field"]: changed_id for r in rules},
                 }
                 operation["targets"] = targets
+                # And which collection: two rules on one field can target different ones.
+                operation["target_collections"] = {
+                    **operation.get("target_collections", {}),
+                    **{r["field"]: changed_collection for r in rules},
+                }
                 if any(rule["on_delete"] == "cascade" for rule in rules):
                     operation["kind"] = "delete"
                     operation.pop("fields", None)
@@ -899,8 +915,18 @@ class ConstraintGuard:
             with contextlib.suppress(NotFound):
                 self.files.delete_tree(f"{directory}/ids/{record_id}")
 
-    def _target_exists(self, collection: str, field: str, target_id: Any) -> bool:
-        """Whether the record *field* of *collection* names under a reference rule is live."""
+    def _target_exists(
+        self, collection: str, field: str, target_id: Any, target_collection: str | None = None
+    ) -> bool:
+        """Whether the record *field* of *collection* names is live: in *target_collection*,
+        the one the plan's deleted record was in, or (a plan saved without it) any
+        collection a reference rule on the field targets."""
+        if target_collection is not None:
+            if not isinstance(target_id, str):
+                return False
+            with contextlib.suppress(InvalidInput):
+                return self.data.get(target_collection, target_id) is not None
+            return False
         for rule in self.rules:
             if (
                 rule["kind"] == "reference"
@@ -947,7 +973,9 @@ class ConstraintGuard:
             field
             for field, target in targets.items()
             if _field(current.value, field) == target
-            and not self._target_exists(collection, field, target)
+            and not self._target_exists(
+                collection, field, target, operation.get("target_collections", {}).get(field)
+            )
         ]
         if not naming or not isinstance(current.value, dict):
             return {}

@@ -210,6 +210,11 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
     }
   };
   const build = async (description: string) => {
+    if (runs.delivering !== null) {
+      // The last build's message is still on its way: another would send it twice, or drop
+      // a gadget the session may be building.
+      throw new Error("The last build is still being sent to the session; try again shortly");
+    }
     const run = ++runs.run;
     const cancelled = () => run !== runs.run;
     let gadget = unfinished.current?.description === description ? unfinished.current.gadget : null;
@@ -228,6 +233,8 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
     // Cancel already deleted the unfinished gadget.
     if (cancelled()) return;
     runs.delivering = run;
+    // On its way, it may reach the session: kept rather than deleted until we know.
+    unfinished.current = { description, gadget, maybeDelivered: true };
     try {
       await openGadgetSession(gadget, composeGadgetBuildPrompt(gadget, description), navigate, {
         deliver: true,
@@ -236,17 +243,21 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
       });
     } catch (error) {
       if (!mayHaveBeenDelivered(error)) {
-        // Cancelled while it was on its way, and it never arrived: finish the cancel.
+        // It never arrived: Try again reuses it, and a cancel meanwhile is finished now.
+        if (unfinished.current?.gadget.id === gadget.id) {
+          unfinished.current = { description, gadget };
+        }
         if (cancelled()) dropUnfinished();
         throw error;
       }
-      unfinished.current = { description, gadget, maybeDelivered: true };
       throw error;
     } finally {
       if (runs.delivering === run) runs.delivering = null;
     }
-    unfinished.current = null;
-    openGadgetTab(gadget);
+    if (unfinished.current?.gadget.id === gadget.id) unfinished.current = null;
+    // Delivered after a Cancel: the session builds it, but the form the viewer reopened
+    // since stays theirs; the gadget shows up among the session's gadgets.
+    if (!cancelled()) openGadgetTab(gadget);
   };
   // Cancel leaves no half-made gadget behind, except one already being built.
   const cancel = () => {

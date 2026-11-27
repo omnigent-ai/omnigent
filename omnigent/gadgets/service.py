@@ -907,7 +907,10 @@ class GadgetService:
         return self._comment(app_id, document)
 
     def update_comment(self, app_id: str, comment_id: str, body: dict) -> dict:
-        """Edits a comment's text (its author only) or marks it draft or addressed."""
+        """Edits a comment's text (its author only) or marks it draft or addressed;
+        ``if_body`` makes the change only while the comment still reads that text (the
+        replace below is conditional on the version read, so an edit between the two is
+        refused too)."""
         gadget, permissions = self._resolve(app_id)
         self._require(permissions, "write_data")
         store = self._comments(gadget)
@@ -915,6 +918,11 @@ class GadgetService:
         if current is None:
             raise NotFound("Comment not found")
         value = dict(current.value)
+        expected = body.get("if_body")
+        if expected is not None and expected != value.get("body"):
+            # Marked addressed for text the session got: refused once it was edited since,
+            # so the edit is sent too rather than taken as dealt with.
+            raise Conflict("The comment was edited since", reason="concurrent_write")
         if "body" in body:
             text = body["body"]
             if not self.viewer.wrote(current.created_by, value.get("author_registration")):
@@ -1650,8 +1658,23 @@ class GadgetService:
                     details={"collection": dependent, "id": dependent_id},
                 )
 
+        def still_published() -> bool:
+            publication = self._publication(gadget)
+            return (
+                publication is not None
+                and publication["value"].get("revision_id") == revision["id"]
+            )
+
         guard = (
-            ConstraintGuard(files, "data/_guard", store, rules, self.viewer.user_id, validate)
+            ConstraintGuard(
+                files,
+                "data/_guard",
+                store,
+                rules,
+                self.viewer.user_id,
+                validate,
+                is_current=still_published,
+            )
             if rules
             else None
         )

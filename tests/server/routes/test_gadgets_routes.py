@@ -753,6 +753,26 @@ async def test_an_account_deleted_after_its_request_authenticated_writes_nothing
     )
 
 
+def test_a_request_that_outlived_its_account_names_no_registration(
+    stores: SimpleNamespace,
+) -> None:
+    # Authenticated as one account, whose name was then deleted and registered again: the
+    # new account's registration is not this request's.
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(stores.db_uri)
+    old = accounts.create_user_with_password("dave@example.com", "dave-hash")
+    assert accounts.delete_user("dave@example.com") is True
+    new = accounts.create_user_with_password("dave@example.com", "dave-hash-2")
+    assert new.account_generation != old.account_generation
+
+    with account_authority_scope("dave@example.com", old.account_generation):
+        assert stores.permissions.account_registrations(["dave@example.com"]) == {}
+    with account_authority_scope("dave@example.com", new.account_generation):
+        assert "dave@example.com" in stores.permissions.account_registrations(["dave@example.com"])
+
+
 async def test_a_create_waiting_too_long_for_the_owner_index_is_busy_and_retryable(
     client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

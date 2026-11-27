@@ -793,12 +793,13 @@ export async function createGadgetComment(
 export async function updateGadgetComment(
   appId: string,
   commentId: string,
-  change: { body?: string; status?: "draft" | "addressed" },
+  change: { body?: string; status?: "draft" | "addressed"; ifBody?: string },
 ): Promise<GadgetComment> {
+  const { ifBody, ...rest } = change;
   return parseComment(
     await gadgetRequest(appPath(appId, `/comments/${encodeURIComponent(commentId)}`), {
       method: "PATCH",
-      body: JSON.stringify(change),
+      body: JSON.stringify(ifBody === undefined ? rest : { ...rest, if_body: ifBody }),
     }),
   );
 }

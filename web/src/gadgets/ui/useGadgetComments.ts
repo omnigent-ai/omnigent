@@ -6,6 +6,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { Comment } from "@/hooks/useComments";
 import { randomUUID } from "@/lib/randomUUID";
+import { ApiError } from "@/lib/sessionsApi";
 import type { ActiveSelection, CommentsPanelProps } from "@/shell/CommentsPanel";
 import {
   type Gadget,
@@ -238,14 +239,25 @@ export function useGadgetComments(
         const known = drafts.filter((item) => delivered.get(item.id) === item.body);
         const fresh = drafts.filter((item) => delivered.get(item.id) !== item.body);
         const markAddressed = async (toMark: GadgetComment[]) => {
+          // Only while each still reads as it was sent: one edited meanwhile stays open, and
+          // the next Address all sends its new text.
           const results = await Promise.allSettled(
-            toMark.map((item) => updateGadgetComment(gadgetId, item.id, { status: "addressed" })),
+            toMark.map((item) =>
+              updateGadgetComment(gadgetId, item.id, {
+                status: "addressed",
+                ifBody: delivered.get(item.id) ?? item.body,
+              }),
+            ),
           );
           results.forEach((result, index) => {
             if (result.status === "fulfilled") delivered.delete(toMark[index].id);
           });
-          const failed = results.find((result) => result.status === "rejected");
-          if (failed) throw failed.reason;
+          const failed = results.find(
+            (result) =>
+              result.status === "rejected" &&
+              !(result.reason instanceof ApiError && result.reason.status === 409),
+          );
+          if (failed && failed.status === "rejected") throw failed.reason;
         };
         const remember = (sent: GadgetComment[]) => {
           for (const item of sent) delivered.set(item.id, item.body);

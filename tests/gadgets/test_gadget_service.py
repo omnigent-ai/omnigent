@@ -1428,6 +1428,85 @@ def test_a_late_rule_update_leaves_a_dependent_created_again_alone(
     assert after["value"]["state"] == "done-17"
 
 
+def test_a_late_unset_checks_the_collection_its_deleted_record_was_in(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two rules on runs.cardId target cards and runs, and both hold a record "a". Deleting
+    # cards/a must unset the run's reference even though runs/a is still there.
+    import threading
+
+    service = gadgets.service()
+    to_runs = {**_UNSET_RUN_CARD, "name": "run_run", "target": "runs"}
+    app = publish_ruled_board(service, [_UNSET_RUN_CARD, to_runs])
+    target = card(service, app, "a", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="a",
+        value={"state": "x"},
+        operation_id="run-a",
+    )
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="d",
+        value={"cardId": "a", "state": "done"},
+        operation_id="d",
+    )
+    real_apply = ConstraintGuard._apply
+    paused = threading.Event()
+    resume = threading.Event()
+    late = threading.current_thread()
+
+    def apply(self, operation):
+        if (
+            operation["kind"] == "unset"
+            and operation["id"] == "d"
+            and threading.current_thread() is not late
+            and not paused.is_set()
+        ):
+            paused.set()
+            assert resume.wait(10)
+        return real_apply(self, operation)
+
+    monkeypatch.setattr(ConstraintGuard, "_apply", apply)
+    gadget = gadgets.store.get(app["id"])
+    store = documents_module.ImmutableDocumentStore(
+        service._files(gadget), "data", limits=service_module._DATA_STORE_LIMITS
+    )
+    with ThreadPoolExecutor(1) as pool:
+        stopped = pool.submit(
+            rpc,
+            gadgets.service(),
+            app,
+            "delete",
+            id="a",
+            if_version=target["version"],
+            operation_id="a-del",
+        )
+        assert paused.wait(10)
+        # Requests checked before the delete edit another field of the run, past the
+        # store's replay window, still naming "a".
+        for edit in range(18):
+            current = store.get("runs", "d")
+            store.replace(
+                "runs",
+                "d",
+                {"cardId": "a", "state": f"s{edit}"},
+                current.version,
+                f"edit-{edit}",
+                service.viewer.user_id,
+            )
+        resume.set()
+        stopped.result(10)
+    after = _run(service, app, "d")
+    assert "cardId" not in after["value"]
+
+
 def test_a_late_unset_leaves_a_reference_restored_to_a_card_created_again(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1685,6 +1764,41 @@ def test_marking_stale_never_changes_a_sealed_epoch(gadgets: Fixture) -> None:
     assert guard._current()[1].value["rules"] == "stale"
 
 
+def test_newly_published_rules_take_over_a_rebuild_left_unfinished(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Revision A's rebuild stops part way; B is published before anything finishes it. B's
+    # writers rebuild for B rather than being refused for ever by A's leftover progress.
+    service = gadgets.service()
+    unique = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    app = publish_ruled_board(service, [unique])
+    card(service, app, "a", "todo")
+    card(service, app, "b", "todo")
+    app = _republish(
+        service, app, ruled_revision(service, app["id"], [{**unique, "message": "A"}])
+    )
+    monkeypatch.setattr(constraints_module, "REBUILD_PAGE", 1)
+    monkeypatch.setattr(constraints_module, "REBUILD_STEPS_PER_WRITE", 2)
+    with pytest.raises(Conflict):
+        card(service, app, "z", "todo")
+    monkeypatch.undo()
+    app = _republish(
+        service, app, ruled_revision(service, app["id"], [{**unique, "message": "B"}])
+    )
+
+    assert card(service, app, "c", "todo")["id"] == "c"
+    with pytest.raises(ConstraintViolation) as refused:
+        rpc(
+            service,
+            app,
+            "create",
+            id="d",
+            value={"title": "a", "column": "todo"},
+            operation_id="d-dup",
+        )
+    assert str(refused.value) == "B"
+
+
 def test_a_guarded_write_from_an_older_revision_never_lands_behind_a_rebuild(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1706,7 +1820,10 @@ def test_a_guarded_write_from_an_older_revision_never_lands_behind_a_rebuild(
     store = documents_module.ImmutableDocumentStore(
         files, "data", limits=service_module._DATA_STORE_LIMITS
     )
-    old_guard = ConstraintGuard(files, "data/_guard", store, old_rules, service.viewer.user_id)
+    # Its revision is no longer the published one.
+    old_guard = ConstraintGuard(
+        files, "data/_guard", store, old_rules, service.viewer.user_id, is_current=lambda: False
+    )
 
     with pytest.raises(Conflict):
         old_guard.write(
@@ -3098,6 +3215,27 @@ def test_session_links_show_readable_gadgets_and_route_actions(gadgets: Fixture)
     assert owner.link_session(first["id"], session, {"linked": False})["items"] == []
     with pytest.raises(InvalidInput):
         owner.session_gadgets("bad id")
+
+
+def test_a_comment_is_marked_addressed_only_while_it_reads_as_delivered(
+    gadgets: Fixture,
+) -> None:
+    owner = gadgets.service()
+    app = owner.create("Reviewed")
+    anchor = {"text": "Q3 revenue"}
+    comment = owner.create_comment(
+        app["id"], {"body": "Use last quarter", "anchor": anchor, "operation_id": "c1"}
+    )
+    owner.update_comment(app["id"], comment["id"], {"body": "Use this quarter"})
+    with pytest.raises(Conflict):
+        owner.update_comment(
+            app["id"], comment["id"], {"status": "addressed", "if_body": "Use last quarter"}
+        )
+    assert owner.list_comments(app["id"], None, 10, None)["items"][0]["status"] == "draft"
+    marked = owner.update_comment(
+        app["id"], comment["id"], {"status": "addressed", "if_body": "Use this quarter"}
+    )
+    assert marked["status"] == "addressed"
 
 
 def test_comments_are_shared_with_everyone_who_can_read_the_gadget(gadgets: Fixture) -> None:

@@ -24,8 +24,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, Response
 
+from omnigent.db.account_authority import account_generation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.gadgets.access import GadgetAccess, workspace_registrations
+from omnigent.gadgets.access import GadgetAccess, workspace_registration
 from omnigent.gadgets.actions import ACTION_STATES
 from omnigent.gadgets.constraints import ConstraintViolation
 from omnigent.gadgets.progress import SessionStateReader
@@ -275,18 +276,26 @@ def create_gadgets_router(
         # database read, so it runs in the request's worker thread.
         # Scoped to the request's workspace, so the same user ID in another workspace is
         # someone else.
-        registration = workspace_registrations(permission_store, [user_id])[user_id]
+        raw = (
+            permission_store.account_registrations([user_id]).get(user_id)
+            if permission_store is not None
+            else None
+        )
         if (
-            registration is None
+            raw is None
             and permission_store is not None
-            and user_id in permission_store.deleted_accounts([user_id])
+            and (
+                account_generation(user_id) is not None
+                or user_id in permission_store.deleted_accounts([user_id])
+            )
         ):
-            # Deleted after the request authenticated: with no registration its writes would
-            # land under a key the account's cleanup never reaches. A registration read
-            # before the deletion is covered by the deletion's own fence instead.
+            # The account this request authenticated as is gone (deleted, or its name
+            # registered again since). Its writes would land where no cleanup looks, or
+            # under the new account: refused, before the workspace names a fallback.
             raise OmnigentError(
                 "This account was deleted; sign in again", code=ErrorCode.UNAUTHORIZED
             )
+        registration = workspace_registration(raw)
         return GadgetViewer(user_id, registration)
 
     def _sessions(user_id: str) -> SessionStateReader:

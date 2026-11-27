@@ -629,6 +629,43 @@ describe("New gadget tab", () => {
     await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("3"));
   });
 
+  it("keeps a gadget whose build is still on its way after Cancel and a reopened form", async () => {
+    const created = gadgetFixture({ id: "3", name: "Incident tracker", published_revision: null });
+    vi.mocked(createGadget).mockResolvedValue(created);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(linkGadgetToSession).mockResolvedValue([BOARD, REPORT, created]);
+    let deliver: (value: "sent") => void = () => {};
+    vi.mocked(openGadgetSession).mockReturnValueOnce(
+      new Promise((resolve) => {
+        deliver = resolve;
+      }),
+    );
+    renderWithGadgets(<Rail conversationId="conv_1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    let content = await screen.findByRole("region", { name: "content" });
+    fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "An incident tracker for my team" },
+    });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    await waitFor(() => expect(openGadgetSession).toHaveBeenCalledTimes(1));
+    fireEvent.click(within(content).getByRole("button", { name: "Cancel" }));
+
+    // Reopened, and another build asked for while the first is still on its way.
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    content = await screen.findByRole("region", { name: "content" });
+    fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "A release dashboard" },
+    });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    expect(await within(content).findByText(/still being sent/)).toBeVisible();
+    deliver("sent");
+
+    await waitFor(() => expect(openGadgetSession).toHaveBeenCalledTimes(1));
+    // The session may be building the first gadget: it is kept, and sent only once.
+    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(createGadget).toHaveBeenCalledTimes(1);
+  });
+
   it("closes without building on Cancel", async () => {
     renderWithGadgets(<Rail conversationId="conv_1" />);
     fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));

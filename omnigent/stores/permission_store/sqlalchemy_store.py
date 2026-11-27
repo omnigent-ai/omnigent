@@ -1083,6 +1083,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 SqlUser.workspace_id == current_workspace_id(),
                 SqlUser.id == user_id,
                 SqlUser.deleted_at.is_(None),
+                # The account this request authenticated as, not one registered under the
+                # name since: a request that outlived its account names no registration.
+                *(
+                    [SqlUser.account_generation == generation]
+                    if (generation := account_generation(user_id)) is not None
+                    else []
+                ),
             )
             .scalar_subquery()
             for user_id in wanted

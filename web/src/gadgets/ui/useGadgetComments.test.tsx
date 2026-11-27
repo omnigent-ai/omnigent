@@ -14,6 +14,7 @@ import { gadgetCommentsMessage, useGadgetComments } from "./useGadgetComments";
 import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
 import { BridgeError } from "@/gadgets/host/gadgetBridge";
 import { GADGET_SKILL_INSTRUCTION } from "@/gadgets/host/gadgetBuild";
+import { ApiError } from "@/lib/sessionsApi";
 
 vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetApiModule>()),
@@ -205,8 +206,46 @@ describe("gadget comments", () => {
 
     act(() => delivered?.("s_new"));
     await waitFor(() =>
-      expect(updateGadgetComment).toHaveBeenCalledWith("board", "c1", { status: "addressed" }),
+      expect(updateGadgetComment).toHaveBeenCalledWith("board", "c1", {
+        status: "addressed",
+        ifBody: "Body of c1",
+      }),
     );
+  });
+
+  it("leaves a comment edited before its delivery was confirmed open with its new text", async () => {
+    vi.mocked(listGadgetComments).mockResolvedValue({ items: [comment("c1")], canComment: true });
+    // The server refuses to mark text the session didn't get: it was edited since.
+    vi.mocked(updateGadgetComment).mockRejectedValue(
+      new ApiError("The comment was edited since", 409, "CONFLICT"),
+    );
+    let delivered: ((sessionId: string) => void) | undefined;
+    const address = vi.fn(async (_message: string, onDelivered: (id: string) => void) => {
+      delivered = onDelivered;
+      return "starting" as const;
+    });
+    const { result } = renderHook(() => useGadgetComments(BOARD, address), { wrapper });
+    await waitFor(() => expect(result.current.draftCount).toBe(1));
+    act(() => result.current.panel.onAddressAll());
+    await waitFor(() => expect(result.current.panel.addressPending).toBe(false));
+    // Edited (here, in another tab) before New session gets the old text.
+    vi.mocked(listGadgetComments).mockResolvedValue({
+      items: [comment("c1", { body: "Edited text" })],
+      canComment: true,
+    });
+
+    act(() => delivered?.("s_new"));
+
+    await waitFor(() =>
+      expect(updateGadgetComment).toHaveBeenCalledWith("board", "c1", {
+        status: "addressed",
+        ifBody: "Body of c1",
+      }),
+    );
+    // Not an error, and the edited comment stays open to be sent again.
+    await waitFor(() => expect(result.current.error).toBeUndefined());
+    await waitFor(() => expect(result.current.draftCount).toBe(1));
+    vi.mocked(updateGadgetComment).mockReset();
   });
 
   it.each([
@@ -242,7 +281,10 @@ describe("gadget comments", () => {
 
     act(() => result.current.panel.onAddressAll());
     await waitFor(() =>
-      expect(updateGadgetComment).toHaveBeenCalledWith("board", "c1", { status: "addressed" }),
+      expect(updateGadgetComment).toHaveBeenCalledWith("board", "c1", {
+        status: "addressed",
+        ifBody: "Body of c1",
+      }),
     );
     expect(address).toHaveBeenCalledWith(
       expect.stringContaining("Body of c1"),
