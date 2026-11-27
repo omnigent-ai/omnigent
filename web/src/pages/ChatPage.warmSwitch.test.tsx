@@ -1,6 +1,5 @@
-// Warm session switches: a sidebar-style click switches the store with the
-// navigation, so the commit landing
-// `/c/:id` skips the hydrating placeholder and the chat surface stays mounted.
+// Warm session switches: a sidebar-style click switches the store with the navigation,
+// so the commit landing `/c/:id` skips the hydrating placeholder and the surface stays mounted.
 import { forwardRef, Profiler, useLayoutEffect } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -156,7 +155,6 @@ const CancelingHostLink = forwardRef<HTMLAnchorElement, OmnigentLinkProps>(
 );
 
 function renderPage(
-  features: Record<string, boolean>,
   qc = new QueryClient(),
   options: {
     cancelBetaNavigation?: boolean;
@@ -169,7 +167,7 @@ function renderPage(
     onCommit?: () => void;
   } = {},
 ) {
-  const info = { ...FALLBACK_SERVER_INFO, ...options.info, features };
+  const info = { ...FALLBACK_SERVER_INFO, ...options.info };
   const routing = options.routing ?? reactRouterRouting;
   const initialPath = withBasePath(
     routing.rebasePath(`/c/${options.initialConversationId ?? "conv_a"}`),
@@ -264,7 +262,7 @@ function renderWarmComposer(
     });
   }
   useChatStore.setState({ boundAgentId: "agent_example" });
-  renderPage({}, qc, {
+  renderPage(qc, {
     info: options.info,
     routing: options.routing,
     sidebar: options.sidebar,
@@ -351,7 +349,7 @@ function renderHeaderPage(
       return new Promise<Response>(() => {});
     }),
   );
-  renderPage({}, qc, {
+  renderPage(qc, {
     shell: true,
     deferNavigation,
     onCommit: () => frames.push(headerSnapshot()),
@@ -394,7 +392,7 @@ describe("ChatPage warm switch", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({}, qc);
+    renderPage(qc);
     await waitFor(() => expect(document.body.textContent).toContain("alpha transcript"));
     const surfaceBefore = transcriptNode();
     expect(surfaceBefore).not.toBeNull();
@@ -574,7 +572,7 @@ describe("ChatPage warm switch", () => {
       "fetch",
       vi.fn(() => new Promise<Response>(() => {})),
     );
-    renderPage({}, qc);
+    renderPage(qc);
     await waitFor(() => expect(document.body.textContent).toContain("alpha transcript"));
     const surfaceBefore = transcriptNode();
 
@@ -591,7 +589,7 @@ describe("ChatPage warm switch", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({}, qc, { cancelBetaNavigation: true });
+    renderPage(qc, { cancelBetaNavigation: true });
     await screen.findByText("alpha transcript");
     vi.useFakeTimers();
 
@@ -611,7 +609,7 @@ describe("ChatPage warm switch", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({}, qc, { deferNavigation: true });
+    renderPage(qc, { deferNavigation: true });
     await screen.findByText("alpha transcript");
     const surface = transcriptNode();
     vi.useFakeTimers();
@@ -638,7 +636,7 @@ describe("ChatPage warm switch", () => {
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
     seedLiveEntry("conv_c", "gamma transcript");
-    renderPage({}, qc, { deferNavigation: true });
+    renderPage(qc, { deferNavigation: true });
     await screen.findByText("alpha transcript");
     const surface = transcriptNode();
     const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
@@ -667,7 +665,7 @@ describe("ChatPage warm switch", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({}, qc);
+    renderPage(qc);
     await screen.findByText("alpha transcript");
     fireEvent.click(screen.getByRole("link", { name: "open beta" }));
     const betaSurface = transcriptNode();
@@ -702,7 +700,7 @@ describe("ChatPage warm switch", () => {
       const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
       useChatStore.setState({ send, sendSlashCommand, loadingConversation: true });
       setPendingInitialPrompt("conv_a", { text: "alpha private prompt", skill });
-      renderPage({}, qc);
+      renderPage(qc);
       expect(screen.getByText("Loading conversation…")).toBeInTheDocument();
 
       fireEvent.click(screen.getByRole("link", { name: "open beta" }));
@@ -885,7 +883,7 @@ describe("ChatPage warm switch", () => {
     const temporaryId = "temp:example";
     seedLiveEntry(temporaryId, "initial transcript");
     useChatStore.setState({ conversationId: temporaryId, boundAgentId: "agent_example" });
-    renderPage({}, qc, {
+    renderPage(qc, {
       initialConversationId: temporaryId,
       deferNavigation: true,
     });
@@ -916,7 +914,7 @@ describe("ChatPage warm switch", () => {
     seedLiveEntry("conv_b", "beta transcript");
     setSessionDraft("conv_b", { text: "beta draft", files: [] });
     useChatStore.setState({ conversationId: temporaryId, boundAgentId: "agent_example" });
-    renderPage({}, qc, { initialConversationId: temporaryId });
+    renderPage(qc, { initialConversationId: temporaryId });
     const input = screen.getByRole("textbox");
     const surface = transcriptNode();
     fireEvent.change(input, { target: { value: "temporary draft" } });
@@ -1042,7 +1040,7 @@ async function runSwitchRace(seed: number) {
       }),
   );
   const routing = seed % 2 ? reactRouterRouting : basenamedRouting("/embed");
-  renderPage({}, qc, {
+  renderPage(qc, {
     routing,
     sidebar: true,
     cancelBetaNavigation: true,
@@ -1237,7 +1235,16 @@ async function runSwitchRace(seed: number) {
   }
 }
 
+// The first steps and the last one are fixed so every seed sends, queues and commits.
+const fixedPendingSteps: Record<number, string> = {
+  0: "switch",
+  1: "send",
+  2: "queue",
+  29: "finish",
+};
+
 async function runPendingRace(seed: number) {
+  resetStreamSlotManager();
   vi.spyOn(alwaysSteer, "readAlwaysSteer").mockReturnValue(false);
   const random = raceRandom(seed);
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -1265,7 +1272,7 @@ async function runPendingRace(seed: number) {
     vi.fn(() => new Promise<Response>(() => {})),
   );
   const routing = seed % 2 ? reactRouterRouting : basenamedRouting("/embed");
-  renderPage({}, qc, { routing, deferNavigation: true });
+  renderPage(qc, { routing, deferNavigation: true });
   await screen.findByText("conv_a transcript");
   const open = {
     conv_a: screen.getByRole("link", { name: "open alpha" }),
@@ -1341,15 +1348,7 @@ async function runPendingRace(seed: number) {
   try {
     const runAction = async (step: number) => {
       const action =
-        step === 0
-          ? "switch"
-          : step === 1
-            ? "send"
-            : step === 2
-              ? "queue"
-              : step === 29
-                ? "finish"
-                : ["switch", "draft", "send", "queue", "finish"][random(5)]!;
+        fixedPendingSteps[step] ?? ["switch", "draft", "send", "queue", "finish"][random(5)]!;
       trace.push(`${step}:${action}:${router}->${visible}`);
       if (action === "switch") await switchPending();
       else if (action === "draft") typeDraft(step);
@@ -1367,8 +1366,18 @@ async function runPendingRace(seed: number) {
   }
 }
 
-const raceSeed = Number(process.env.WARM_SWITCH_RACE_SEED ?? 1);
-const raceSeedCount = Number(process.env.WARM_SWITCH_RACE_SEEDS ?? 20);
+function raceEnvInteger(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  const value = raw === undefined ? fallback : Number(raw);
+  if (!Number.isInteger(value) || value < min) {
+    throw new Error(`${name} must be an integer >= ${min}, got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+const raceSeed = raceEnvInteger("WARM_SWITCH_RACE_SEED", 1, 0);
+// At least 2 so both the browser and the pending-commit suites get a seed.
+const raceSeedCount = raceEnvInteger("WARM_SWITCH_RACE_SEEDS", 20, 2);
 const browserRaceSeedCount = Math.ceil(raceSeedCount / 5);
 
 describe("seeded warm switch race", () => {
