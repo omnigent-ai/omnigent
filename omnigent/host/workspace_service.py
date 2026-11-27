@@ -60,12 +60,15 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ListRepositoryRefsResponse,
     ListWorkingCopyChangesRequest,
     ListWorkingCopyChangesResponse,
+    PullRequestImageMetadata,
     ReadBaseFileRequest,
     ReadBaseFileResponse,
     ReadFileRequest,
     ReadFileResponse,
     ReadLinkTextRequest,
     ReadLinkTextResponse,
+    ReadPullRequestImageRequest,
+    ReadPullRequestImageResponse,
     ResolveRepositoryContextRequest,
     ResolveRepositoryContextResponse,
     ResolveWorkingCopyBaseRequest,
@@ -88,10 +91,12 @@ from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_struct
 from omnigent.host.workspace_pull_request_input import refuse_unserved_request
 from omnigent.host.workspace_pull_requests import (
+    PULL_REQUEST_METHODS,
     PULL_REQUEST_OPS,
     PullRequestCall,
     PullRequestRefused,
     run_pull_request_op,
+    run_pull_request_stream_op,
 )
 from omnigent.host.workspace_search import search_files, search_text
 from omnigent.host.workspace_tokens import new_token_key, verify_token
@@ -107,6 +112,8 @@ _MAX_PAGE_SIZE = 1000
 _IGNORED_DEADLINE_S = 10.0
 # Small enough to keep a stream responsive, large enough to keep framing cheap.
 _READ_CHUNK_BYTES = 64 * 1024
+# Image parts stay small, so reads in flight don't crowd the host tunnel's other calls.
+_IMAGE_CHUNK_BYTES = 256 * 1024
 _ERROR_CODES = {
     400: Code.INVALID_ARGUMENT,
     404: Code.NOT_FOUND,
@@ -156,7 +163,7 @@ _SERVED: dict[str, _Served] = {
     "ListBranchCommits": _Served(features=("branch_commits", "branch_commits.head"), tool="git"),
     "ResolveRepositoryContext": _Served(tool="git"),
     # Served only over the tunnel, for a call the server sent with its session.
-    **{name: _Served(tool="gh") for name in PULL_REQUEST_OPS},
+    **{name: _Served(tool="gh") for name in PULL_REQUEST_METHODS},
 }
 
 
@@ -173,7 +180,7 @@ def capabilities(*, pull_requests: bool = False) -> list[str]:
     """
     names: list[str] = []
     for name, served in _SERVED.items():
-        if name in PULL_REQUEST_OPS and not pull_requests:
+        if name in PULL_REQUEST_METHODS and not pull_requests:
             continue
         if served.tool is None or shutil.which(served.tool):
             optional = served.optional_features() if served.optional_features else ()
@@ -225,6 +232,12 @@ class WorkspaceService(WorkspaceServiceMethods):
     async def _serve_pull_request(
         self, name: str, request: Message, ctx: RequestContext | None
     ) -> Message:
+        call = self._served_pull_request_call(name, request)
+        reader = await _read(self._reader_for, ctx)
+        payload = await _read(run_pull_request_op, name, reader, call, request)
+        return WORKSPACE_METHODS[name].response_type(payload=payload_struct(payload))
+
+    def _served_pull_request_call(self, name: str, request: Message) -> PullRequestCall:
         # Refused before any reader, registry or gh work when the server sent no session.
         call = self._pull_request_call
         if call is None:
@@ -232,9 +245,24 @@ class WorkspaceService(WorkspaceServiceMethods):
                 Code.UNIMPLEMENTED, "Pull requests are served through the server's route"
             )
         refuse_unserved_request(name, request)
+        return call
+
+    async def read_pull_request_image(
+        self,
+        request: ReadPullRequestImageRequest,
+        ctx: RequestContext[ReadPullRequestImageRequest, ReadPullRequestImageResponse] | None,
+    ) -> AsyncIterator[ReadPullRequestImageResponse]:
+        name = "ReadPullRequestImage"
+        call = self._served_pull_request_call(name, request)
         reader = await _read(self._reader_for, ctx)
-        payload = await _read(run_pull_request_op, name, reader, call, request)
-        return WORKSPACE_METHODS[name].response_type(payload=payload_struct(payload))
+        image = await _read(run_pull_request_stream_op, name, reader, call, request)
+        yield ReadPullRequestImageResponse(
+            metadata=PullRequestImageMetadata(
+                content_type=image.content_type, size=len(image.data)
+            )
+        )
+        for start in range(0, len(image.data), _IMAGE_CHUNK_BYTES):
+            yield ReadPullRequestImageResponse(data=image.data[start : start + _IMAGE_CHUNK_BYTES])
 
     async def list_directory(
         self,

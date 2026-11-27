@@ -13,7 +13,8 @@ import asyncio
 import re
 import secrets
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +71,9 @@ _UPLOAD_METHOD = "UploadAttachment"
 # An auto-merge batch reads and changes each of its pull requests in turn.
 _AUTO_MERGE_REPLY_TIMEOUT_S = 120.0
 _AUTO_MERGE_METHOD = "EnableAutoMerge"
+# An image's first reply follows the account lookup (15 s), the token read (15 s),
+# the wait for a read slot (10 s) and the whole fetch (30 s).
+_IMAGE_REPLY_TIMEOUT_S = 75.0
 # The pull request methods that answer with its overview, which lists the session's PRs.
 _OVERVIEW_METHODS = frozenset({"GetPullRequest", "SetPullRequestAccount"})
 _COMMENT_WRITES = frozenset({"CreateComment", "CreateReviewThread", "ReplyToReviewThread"})
@@ -96,7 +100,17 @@ _REVIEW_WRITES = frozenset(
 _HOST_ONLY_CHANGES = frozenset({"SetPullRequestAccount"})
 # The refusal reasons a client may read; any other reason a host sends is dropped.
 PULL_REQUEST_FAILURE_REASONS = frozenset(
-    {"comment_changed", "pull_request_changed", "invalid_input", READ_ONLY_CODE_HOST_REASON}
+    {
+        "comment_changed",
+        "pull_request_changed",
+        "invalid_input",
+        READ_ONLY_CODE_HOST_REASON,
+        # Why an image can't be shown, so a client can tell "not allowed" from "try again".
+        "host_not_allowed",
+        "too_large",
+        "not_image",
+        "fetch_failed",
+    }
 )
 # The reads whose answer the server shapes for who reads it: the host account's rights.
 _VIEWER_SHAPES: dict[str, Callable[[dict[str, Any], PullRequestViewer], dict[str, Any]]] = {
@@ -204,8 +218,10 @@ class HostWorkspaceService(WorkspaceServiceMethods):
             return False
         return self._callable_methods is None or name in self._callable_methods
 
-    async def _pull_request_call(self, method: WorkspaceMethod, request: Message) -> Message:
-        """Forward a pull request call with the session and the server's vouch."""
+    async def _pull_request_vouch(
+        self, method: WorkspaceMethod, request: Message
+    ) -> tuple[PullRequestRoute, PullRequestVouch | None]:
+        """Check a pull request call's fields, then the server's vouch for every PR it names."""
         route = self._pull_requests
         if route is None:
             raise ConnectError(Code.UNIMPLEMENTED, "Pull requests aren't served on this route")
@@ -214,7 +230,28 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         except PullRequestRefused as exc:
             raise ConnectError(exc.code, exc.message, details=failure_details(exc.reason)) from exc
         # The vouch comes from the PRs the server stores, never from the request message.
-        vouch = await _vouch(route, request)
+        return route, await _vouch(route, request)
+
+    async def _pull_request_stream(
+        self, method: WorkspaceMethod, request: Message
+    ) -> AsyncGenerator[bytes, None]:
+        """Forward a streamed pull request read with the session and the server's vouch."""
+        route, vouch = await self._pull_request_vouch(method, request)
+        forwarded = self._forward(
+            method.name,
+            request,
+            session_id=route.session_id,
+            vouch=vouch,
+            timeout=_IMAGE_REPLY_TIMEOUT_S,
+        )
+        # A caller that goes away ends the call here, not when the generator is collected.
+        async with aclosing(forwarded) as messages:
+            async for message in messages:
+                yield message
+
+    async def _pull_request_call(self, method: WorkspaceMethod, request: Message) -> Message:
+        """Forward a pull request call with the session and the server's vouch."""
+        route, vouch = await self._pull_request_vouch(method, request)
         sent_at = time.time()
         changes = not method.no_side_effects
         writes = changes and method.name not in _HOST_ONLY_CHANGES
@@ -290,7 +327,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         account_rights: bool = False,
         unconfirmed: str | None = None,
         timeout: float = _REPLY_TIMEOUT_S,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes, None]:
         """Send one call to the host and yield its serialized responses.
 
         :param session_id: The authorized session, sent on pull request calls only.
@@ -362,8 +399,14 @@ def _host_forwarder(method: WorkspaceMethod) -> Callable[..., object]:
             self: HostWorkspaceService, request: Message, _ctx: RequestContext
         ) -> AsyncIterator[Message]:
             self._check_served(method)
-            async for message in self._forward(method.name, request):
-                yield method.response_type.FromString(message)
+            messages = (
+                self._pull_request_stream(method, request)
+                if method.pull_request
+                else self._forward(method.name, request)
+            )
+            async with aclosing(messages) as replies:
+                async for message in replies:
+                    yield method.response_type.FromString(message)
 
         forward_stream.__name__ = method.python_name
         return forward_stream

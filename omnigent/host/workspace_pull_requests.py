@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
@@ -21,6 +21,7 @@ from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host.frames import PullRequestVouch
 from omnigent.host.workspace_pull_request_input import PullRequestRefused
 from omnigent.runner import pr_actions, pr_resource
+from omnigent.runner.github_images import ImageRefused, PullRequestImage
 from omnigent.runner.pull_request_errors import (
     InvalidPullRequestInput,
     PullRequestError,
@@ -47,6 +48,9 @@ class PullRequestCall:
 
 # One pull request method: the reader, the call and the request, to the REST payload.
 PullRequestOp = Callable[[WorkspaceReader, PullRequestCall, Any], dict[str, Any]]
+# One streamed pull request method: the reader, the call and the request, to the bytes.
+PullRequestStreamOp = Callable[[WorkspaceReader, PullRequestCall, Any], PullRequestImage]
+_Result = TypeVar("_Result")
 
 
 def _url(request: Any) -> str | None:
@@ -329,6 +333,21 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
 }
 
 
+# The owner's: the images a pull request links to, which GitHub serves only to its viewers.
+PULL_REQUEST_STREAM_OPS: dict[str, PullRequestStreamOp] = {
+    "ReadPullRequestImage": lambda reader, call, request: pr_actions.read_pull_request_image(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        image_url=request.image_url,
+    ),
+}
+# Every pull request method this host serves, unary or streamed.
+PULL_REQUEST_METHODS: frozenset[str] = frozenset(PULL_REQUEST_OPS) | frozenset(
+    PULL_REQUEST_STREAM_OPS
+)
+
+
 def run_pull_request_op(
     name: str, reader: WorkspaceReader, call: PullRequestCall, request: Any
 ) -> dict[str, Any]:
@@ -340,10 +359,25 @@ def run_pull_request_op(
     :raises PullRequestRefused: FAILED_PRECONDITION for a PR the session doesn't link, or
         another refusal with its code and reason; UNKNOWN for a change GitHub never confirmed.
     """
+    return _under_vouch(call, lambda: PULL_REQUEST_OPS[name](reader, call, request))
+
+
+def run_pull_request_stream_op(
+    name: str, reader: WorkspaceReader, call: PullRequestCall, request: Any
+) -> PullRequestImage:
+    """Run one streamed pull request method under the server's vouch; blocking, as above.
+
+    :raises PullRequestRefused: As :func:`run_pull_request_op`; UNAVAILABLE for an image
+        GitHub didn't send, which a client may retry.
+    """
+    return _under_vouch(call, lambda: PULL_REQUEST_STREAM_OPS[name](reader, call, request))
+
+
+def _under_vouch(call: PullRequestCall, operation: Callable[[], _Result]) -> _Result:
     vouch = call.vouch or PullRequestVouch()
     with pr_resource.server_tracking(vouch.server_tracked is True, vouch.default_pr_url):
         try:
-            return PULL_REQUEST_OPS[name](reader, call, request)
+            return operation()
         except ValueError as exc:
             raise _refusal(exc) from exc
 
@@ -351,6 +385,8 @@ def run_pull_request_op(
 def _refusal(exc: ValueError) -> PullRequestRefused:
     """The Connect error for a failed operation, with the reason a client reads."""
     reason = exc.reason if isinstance(exc, PullRequestError) else None
+    if isinstance(exc, ImageRefused) and exc.reason == "fetch_failed":
+        return PullRequestRefused(Code.UNAVAILABLE, str(exc), reason)
     if isinstance(exc, UnknownOutcomeError):
         # The change may have been made: never a refusal a client would retry past.
         return PullRequestRefused(Code.UNKNOWN, str(exc), None)

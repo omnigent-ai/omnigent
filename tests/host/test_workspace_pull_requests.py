@@ -24,6 +24,7 @@ from omnigent.host.workspace_payloads import payload_dict
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.runner import (
+    github_images,
     github_lifecycle,
     github_merge_queue,
     github_resource,
@@ -31,6 +32,7 @@ from omnigent.runner import (
     github_stack,
     pr_resource,
 )
+from omnigent.runner.github_images import ImageRefused, PullRequestImage
 from omnigent.runner.pull_request_errors import (
     CommentChangedError,
     PullRequestChangedError,
@@ -39,7 +41,12 @@ from omnigent.runner.pull_request_errors import (
 )
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
-from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS, _PULL_REQUEST_READS
+from tests._helpers.connect_stream import connect_frame, end_of_stream_code
+from tests.host.test_workspace_methods import (
+    _PULL_REQUEST_OWNER_METHODS,
+    _PULL_REQUEST_OWNER_STREAMS,
+    _PULL_REQUEST_READS,
+)
 
 _SESSION = "conv_prs"
 _PR = "https://github.com/example/app/pull/7"
@@ -270,6 +277,11 @@ async def test_the_direct_socket_serves_no_pull_request_whatever_the_call_claims
             for method in _PULL_REQUEST_METHODS:
                 request = _naming_the_pr(method)
                 binary = request.SerializeToString() + b"\x78\x01"
+                if WORKSPACE_METHODS[method].streaming:
+                    assert await _stream_error(http, f"{service}/{method}", binary, forged) == (
+                        "unimplemented"
+                    ), method
+                    continue
                 response = await http.post(
                     f"{service}/{method}",
                     content=binary,
@@ -289,6 +301,18 @@ def _naming_the_pr(method: str) -> Any:
     if "pr_url" in request_type.DESCRIPTOR.fields_by_name:
         return request_type(pr_url=_PR)
     return request_type(pull_requests=[{"pr_url": _PR}])
+
+
+async def _stream_error(
+    http: httpx.AsyncClient, path: str, message: bytes, headers: dict[str, str]
+) -> str | None:
+    """A Connect streaming call's error code, from its end-of-stream message."""
+    response = await http.post(
+        path,
+        content=connect_frame(message),
+        headers={**headers, "Content-Type": "application/connect+proto"},
+    )
+    return end_of_stream_code(response.content)
 
 
 def _pr_target(**fields: Any) -> dict[str, Any]:
@@ -605,9 +629,8 @@ def test_every_owner_method_has_a_call_case() -> None:
     assert not set(_GITHUB_CHANGE_CALLS) & set(_QUEUE_CALLS)
     assert not set(_GITHUB_CHANGE_CALLS) & set(_STACK_CALLS)
     assert not set(_QUEUE_CALLS) & set(_STACK_CALLS)
-    assert set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) | {"EnableAutoMerge"} == (
-        _PULL_REQUEST_OWNER_METHODS
-    )
+    owner_unary = _PULL_REQUEST_OWNER_METHODS - _PULL_REQUEST_OWNER_STREAMS
+    assert set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) | {"EnableAutoMerge"} == owner_unary
 
 
 @pytest.mark.parametrize("method", sorted(_OWNER_CALLS))
@@ -1027,6 +1050,107 @@ async def test_the_host_refuses_an_upload_the_server_would_have(
 
     assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
     assert owner_calls == []
+
+
+_IMAGE_URL = "https://github.com/user-attachments/assets/0f1e2d3c-aaaa"
+# Over two 256 KiB parts, so the answer takes three.
+_IMAGE = PullRequestImage(content_type="image/png", data=_PNG + bytes(range(256)) * 2100)
+
+
+def _image_frame(root: Path, **fields: Any) -> HostWorkspaceCallFrame:
+    request = pb.ReadPullRequestImageRequest(**{"pr_url": _PR, "image_url": _IMAGE_URL, **fields})
+    return _frame(root, "ReadPullRequestImage", request.SerializeToString(), vouch=_VOUCHED)
+
+
+def record_image_reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    """Each image the runner was asked for: its workspace, PR and URL; each answers _IMAGE."""
+    asked: list[tuple[str, str, str]] = []
+
+    def read(root: str, reference: PullRequestRef, image_url: str) -> PullRequestImage:
+        asked.append((root, reference.url, image_url))
+        return _IMAGE
+
+    monkeypatch.setattr(github_images, "read_pull_request_image", read)
+    return asked
+
+
+@pytest.fixture
+def image_reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    return record_image_reads(monkeypatch)
+
+
+async def test_an_image_streams_its_type_and_size_then_its_bytes_in_parts(
+    tmp_path: Path, image_reads: list[tuple[str, str, str]]
+) -> None:
+    messages, code, message = await _answer(_image_frame(tmp_path))
+
+    assert code is None, message
+    assert image_reads == [(str(tmp_path.resolve()), _PR, _IMAGE_URL)]
+    replies = [pb.ReadPullRequestImageResponse.FromString(message) for message in messages]
+    assert replies[0].metadata == pb.PullRequestImageMetadata(
+        content_type="image/png", size=len(_IMAGE.data)
+    )
+    assert not any(reply.HasField("metadata") for reply in replies[1:])
+    part = 256 * 1024
+    assert [len(reply.data) for reply in replies[1:]] == [part, part, len(_IMAGE.data) - 2 * part]
+    assert b"".join(reply.data for reply in replies) == _IMAGE.data
+
+
+async def test_an_image_of_a_pr_the_session_never_recorded_isnt_read(
+    tmp_path: Path, image_reads: list[tuple[str, str, str]]
+) -> None:
+    request = pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=_IMAGE_URL)
+    _messages, code, _message = await _answer(
+        _frame(tmp_path, "ReadPullRequestImage", request.SerializeToString())
+    )
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert image_reads == []
+
+
+@pytest.mark.parametrize(
+    ("reason", "code"),
+    [
+        ("host_not_allowed", Code.FAILED_PRECONDITION),
+        ("too_large", Code.FAILED_PRECONDITION),
+        ("not_image", Code.FAILED_PRECONDITION),
+        ("fetch_failed", Code.UNAVAILABLE),
+    ],
+)
+async def test_an_image_refusal_reaches_the_server_with_its_code_and_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str, code: Code
+) -> None:
+    def refuse(_root: str, _reference: PullRequestRef, _image_url: str) -> PullRequestImage:
+        raise ImageRefused(reason)
+
+    monkeypatch.setattr(github_images, "read_pull_request_image", refuse)
+    messages, error_code, message = await _answer(_image_frame(tmp_path))
+
+    assert (messages, error_code) == ([], code.value)
+    assert message is not None
+    assert "https://" not in message
+    assert await _reason(_image_frame(tmp_path)) == (code.value, reason)
+
+
+@pytest.mark.parametrize(
+    ("fields", "refusal"),
+    [
+        ({"image_url": ""}, "Expected an image URL"),
+        (
+            {"image_url": "https://github.com/" + "a" * 2030},
+            "The image URL is longer than 2048 characters",
+        ),
+        ({"pr_url": _PR + "a" * 2048}, "The pull request URL is longer than 2048 characters"),
+    ],
+    ids=["no-url", "long-url", "long-pr-url"],
+)
+async def test_the_host_refuses_an_image_read_the_server_would_have(
+    tmp_path: Path, image_reads: list[tuple[str, str, str]], fields: dict[str, str], refusal: str
+) -> None:
+    _messages, code, message = await _answer(_image_frame(tmp_path, **fields))
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
+    assert image_reads == []
 
 
 @pytest.fixture

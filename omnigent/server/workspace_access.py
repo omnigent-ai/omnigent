@@ -86,6 +86,8 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "DequeuePullRequest": WorkspaceGate.SESSION_OWNER,
     # The stack lists the repository's other pull requests, read as the host's account.
     "GetPullRequestStack": WorkspaceGate.SESSION_OWNER,
+    # Fetched with the host account's token, which sees its private repositories' images.
+    "ReadPullRequestImage": WorkspaceGate.SESSION_OWNER,
 }
 
 

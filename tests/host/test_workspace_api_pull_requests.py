@@ -38,7 +38,7 @@ from omnigent.host.workspace_pull_request_input import (
     MAX_ATTACHMENT_NAME_CHARACTERS,
     MAX_PULL_REQUEST_URL_CHARACTERS,
 )
-from omnigent.runner import pr_resource
+from omnigent.runner import github_images, pr_resource
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server import workspace_access, workspace_api
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
@@ -1041,6 +1041,7 @@ async def test_an_old_host_behind_the_new_server_offers_no_owner_method(
     reads_only_host: None,
     host_calls: list[HostWorkspaceCallFrame],
     owner_calls: list[tuple[str, str, dict[str, Any]]],
+    image_reads: list[tuple[str, str, str]],
 ) -> None:
     """A call made anyway gets the host's UNIMPLEMENTED, which says nothing was changed."""
     monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
@@ -1049,12 +1050,22 @@ async def test_an_old_host_behind_the_new_server_offers_no_owner_method(
     listed = await client.get_capabilities(pb.GetCapabilitiesRequest())
     with pytest.raises(ConnectError) as refused:
         await client.create_comment(_CREATE_COMMENT)
+    image = pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=host_tests._IMAGE_URL)
+    with pytest.raises(ConnectError) as image_refused:
+        await _image(client, image)
 
     assert set(listed.capabilities) >= _PULL_REQUEST_READS
     assert not set(listed.capabilities) & _PULL_REQUEST_OWNER_METHODS
+    assert "ReadPullRequestImage" in _PULL_REQUEST_OWNER_METHODS
     assert refused.value.code == Code.UNIMPLEMENTED
-    assert [call.method for call in host_calls] == ["GetCapabilities", "CreateComment"]
+    assert image_refused.value.code == Code.UNIMPLEMENTED
+    assert [call.method for call in host_calls] == [
+        "GetCapabilities",
+        "CreateComment",
+        "ReadPullRequestImage",
+    ]
     assert owner_calls == []
+    assert image_reads == []
 
 
 @pytest.mark.parametrize("session_owner", [True, False], ids=["owner", "non-owner"])
@@ -1325,6 +1336,7 @@ def test_a_pull_request_failure_carries_only_its_reason() -> None:
         "pull_request_changed",
         "invalid_input",
         "read_only_code_host",
+        *github_images.IMAGE_REFUSAL_REASONS,
     } == workspace_api.PULL_REQUEST_FAILURE_REASONS
 
 
@@ -1737,3 +1749,207 @@ async def test_reads_and_the_account_choice_on_a_read_only_host_reach_the_host(
 
     assert [call.method for call in host_calls] == [method]
     assert len(owner_calls) == 1
+
+
+# -- An image read streams through the server for the session's owner. -------------------
+
+
+@pytest.fixture
+def image_reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    return host_tests.record_image_reads(monkeypatch)
+
+
+async def _image(client: Any, request: pb.ReadPullRequestImageRequest) -> bytes:
+    """Every part of an image read, joined, after checking its metadata comes first."""
+    replies = [reply async for reply in client.read_pull_request_image(request)]
+    assert replies[0].HasField("metadata")
+    assert not any(reply.HasField("metadata") for reply in replies[1:])
+    assert replies[0].metadata.size == sum(len(reply.data) for reply in replies)
+    return b"".join(reply.data for reply in replies)
+
+
+async def test_an_image_of_a_linked_pr_streams_through_the_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    image_reads: list[tuple[str, str, str]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    image = await _image(
+        client, pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=host_tests._IMAGE_URL)
+    )
+
+    assert image == host_tests._IMAGE.data
+    assert image_reads == [(str(tmp_path.resolve()), _PR, host_tests._IMAGE_URL)]
+    assert [(call.method, call.session_id) for call in host_calls] == [
+        ("ReadPullRequestImage", _SESSION)
+    ]
+
+
+async def test_an_image_of_an_unlinked_pr_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    image_reads: list[tuple[str, str, str]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+    request = pb.ReadPullRequestImageRequest(pr_url=_OTHER_PR, image_url=host_tests._IMAGE_URL)
+
+    with pytest.raises(ConnectError) as refused:
+        await _image(client, request)
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert host_calls == []
+    assert image_reads == []
+
+
+async def test_an_image_read_with_no_url_is_refused_before_the_vouch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    with pytest.raises(ConnectError) as refused:
+        await _image(client, pb.ReadPullRequestImageRequest(pr_url=_PR))
+
+    assert (refused.value.code, refused.value.message) == (
+        Code.INVALID_ARGUMENT,
+        "Expected an image URL",
+    )
+    assert _failure_reasons(refused.value) == ["invalid_input"]
+    assert store.reads == 0
+    assert host_calls == []
+
+
+async def test_an_image_refusal_reaches_the_client_with_its_reason_and_no_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(_root: str, _reference: Any, _image_url: str) -> Any:
+        raise github_images.ImageRefused("host_not_allowed")
+
+    monkeypatch.setattr(github_images, "read_pull_request_image", refuse)
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+    signed = "https://private-user-images.githubusercontent.com/1/a.png?jwt=secret"
+
+    with pytest.raises(ConnectError) as refused:
+        await _image(client, pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=signed))
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert refused.value.message == "GitHub won't show images from that address."
+    assert _failure_reasons(refused.value) == ["host_not_allowed"]
+
+
+def _image_stream(tunnel: _Tunnel) -> Any:
+    request = pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=host_tests._IMAGE_URL)
+    return tunnel.service.read_pull_request_image(request, None)  # type: ignore[call-arg]
+
+
+async def test_a_host_failure_after_the_first_part_ends_the_image_read(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path)
+    stream = _image_stream(tunnel)
+    first = asyncio.create_task(anext(stream))
+    await tunnel.frame_sent()
+    request_id = tunnel.sent[0].request_id
+    metadata = pb.ReadPullRequestImageResponse(
+        metadata=pb.PullRequestImageMetadata(content_type="image/png", size=10)
+    )
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(request_id=request_id, message=metadata.SerializeToString()),
+    )
+    assert (await first).metadata.size == 10
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=request_id,
+            done=True,
+            error_code="unavailable",
+            error_message="GitHub couldn't load that image. Try again.",
+            error_reason="fetch_failed",
+        ),
+    )
+
+    with pytest.raises(ConnectError) as failed:
+        await anext(stream)
+
+    assert failed.value.code == Code.UNAVAILABLE
+    assert _failure_reasons(failed.value) == ["fetch_failed"]
+    assert tunnel.host.pending_workspace_calls == {}
+
+
+async def test_an_image_read_waits_its_own_time_for_each_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first reply follows the PR read and the whole fetch, past a read's 30 s."""
+    monkeypatch.setattr(workspace_api, "_IMAGE_REPLY_TIMEOUT_S", 0.05)
+    tunnel = _tunnel(tmp_path)
+
+    # Bounded here, so a read waiting only a read's 30 s fails the test at once.
+    with pytest.raises(ConnectError) as lost:
+        await asyncio.wait_for(anext(_image_stream(tunnel)), timeout=5.0)
+
+    assert (lost.value.code, lost.value.message) == (
+        Code.DEADLINE_EXCEEDED,
+        "The session's host did not answer",
+    )
+
+
+async def test_an_image_part_after_the_metadata_waits_the_images_time_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Long enough to deliver the metadata under load; the part after it never comes.
+    monkeypatch.setattr(workspace_api, "_IMAGE_REPLY_TIMEOUT_S", 0.5)
+    tunnel = _tunnel(tmp_path)
+    stream = _image_stream(tunnel)
+    first = asyncio.create_task(anext(stream))
+    await tunnel.frame_sent()
+    metadata = pb.ReadPullRequestImageResponse(
+        metadata=pb.PullRequestImageMetadata(content_type="image/png", size=10)
+    )
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id, message=metadata.SerializeToString()
+        ),
+    )
+    await first
+
+    with pytest.raises(ConnectError) as lost:
+        await asyncio.wait_for(anext(stream), timeout=5.0)
+
+    assert lost.value.code == Code.DEADLINE_EXCEEDED
+
+
+def test_the_first_image_reply_wait_covers_every_phase_of_the_host_read() -> None:
+    """Account lookup, token read, slot wait and fetch all come before the metadata."""
+    from omnigent.runner import github_resource
+
+    phases = (
+        github_resource._PR_EDIT_REQUEST_SECONDS
+        + github_images._READ_TOKEN_SECONDS
+        + github_images.SLOT_WAIT_SECONDS
+        + github_images.FETCH_DEADLINE_SECONDS
+    )
+    assert phases < workspace_api._IMAGE_REPLY_TIMEOUT_S
+
+
+async def test_a_caller_that_leaves_an_image_read_ends_its_call(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path)
+    stream = _image_stream(tunnel)
+    first = asyncio.create_task(anext(stream))
+    await tunnel.frame_sent()
+    metadata = pb.ReadPullRequestImageResponse(
+        metadata=pb.PullRequestImageMetadata(content_type="image/png", size=10)
+    )
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id, message=metadata.SerializeToString()
+        ),
+    )
+    await first
+
+    await stream.aclose()
+
+    assert tunnel.host.pending_workspace_calls == {}

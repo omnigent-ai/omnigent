@@ -1,10 +1,10 @@
-"""Review, comment and merge queue changes, and the stack read, on the session's selected
-pull request.
+"""Review, comment, merge queue, stack and image calls on the session's selected pull request.
 
-These are the wrappers the workspace API's review, merge queue and stack methods call.
-Each checks its fields and the session's link to a GitHub pull request, then runs the
-GitHub code in :mod:`omnigent.runner.github_reviews`,
-:mod:`omnigent.runner.github_merge_queue` or :mod:`omnigent.runner.github_stack`.
+These are the wrappers the workspace API's review, merge queue, stack and image methods
+call. Each checks its fields and the session's link to a GitHub pull request, then runs
+the GitHub code in :mod:`omnigent.runner.github_reviews`,
+:mod:`omnigent.runner.github_merge_queue`, :mod:`omnigent.runner.github_stack` or
+:mod:`omnigent.runner.github_images`.
 """
 
 from __future__ import annotations
@@ -12,12 +12,14 @@ from __future__ import annotations
 from typing import Any
 
 from omnigent.runner import (
+    github_images,
     github_lifecycle,
     github_merge_queue,
     github_reviews,
     github_stack,
     pr_resource,
 )
+from omnigent.runner.github_images import PullRequestImage
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
     COMMENT_REVIEW_EVENT,
@@ -429,3 +431,10 @@ def enable_auto_merge(
             )
         )
     return github_lifecycle.enable_auto_merge(root, batch)
+
+
+def read_pull_request_image(
+    root: str, *, session_id: str | None, pr_url: str | None, image_url: str
+) -> PullRequestImage:
+    """The attachment image at ``image_url`` on the selected pull request's host."""
+    return github_images.read_pull_request_image(root, _target(session_id, pr_url), image_url)

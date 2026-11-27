@@ -31,6 +31,10 @@ MAX_ATTACHMENT_NAME_CHARACTERS = 255
 MAX_PULL_REQUEST_URL_CHARACTERS = 2048
 # GitHub label names are at most 50 characters; a search needs no more than a few.
 MAX_LABEL_SEARCH_CHARACTERS = 256
+MAX_IMAGE_URL_CHARACTERS = 2048
+_LONG_PULL_REQUEST_URL = (
+    f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
+)
 
 # Each review method's allowed events; the others carry none.
 _EVENTS: dict[str, frozenset[str]] = {
@@ -99,15 +103,20 @@ def refuse_unserved_request(method: str, request: Any) -> None:
         reason = f"The label search is longer than {MAX_LABEL_SEARCH_CHARACTERS} characters"
     elif method == "EnableAutoMerge":
         reason = _auto_merge_refusal(request)
+    elif method == "ReadPullRequestImage":
+        if not request.image_url:
+            reason = "Expected an image URL"
+        elif len(request.image_url) > MAX_IMAGE_URL_CHARACTERS:
+            reason = f"The image URL is longer than {MAX_IMAGE_URL_CHARACTERS} characters"
+        elif len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+            reason = _LONG_PULL_REQUEST_URL
     elif method == "UploadAttachment":
         if not request.name.strip():
             reason = "Expected the file's name"
         elif len(request.name) > MAX_ATTACHMENT_NAME_CHARACTERS:
             reason = f"The file's name is longer than {MAX_ATTACHMENT_NAME_CHARACTERS} characters"
         elif len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
-            reason = (
-                f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
-            )
+            reason = _LONG_PULL_REQUEST_URL
         elif not request.content:
             reason = "The attachment is empty"
         elif len(request.content) > MAX_ATTACHMENT_BYTES:
