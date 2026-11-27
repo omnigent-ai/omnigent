@@ -15,6 +15,8 @@
 const { FLOATING_COMPOSER_SIZE, placeFloatingComposer } = require("./floating_composer_frame");
 
 const FLOATING_COMPOSER_PATH = "/compose/floating";
+/** Sent to the panel's page each time the panel takes the keyboard, so its prompt does too. */
+const FLOATING_COMPOSER_SHOWN_CHANNEL = "omnigent:floating-composer:shown";
 const FRAME_SETTINGS_KEY = "floating_composer_frames";
 const SESSION_PATH = /^\/c\/[A-Za-z0-9_-]{1,128}$/;
 /** App pages the panel's own links lead to; they open in a main window. */
@@ -41,8 +43,59 @@ function floatingComposerAppPagePath(pagePath) {
   return typeof pagePath === "string" && APP_PAGE_PATHS.has(pagePath) ? pagePath : null;
 }
 
+/** The most a launch's attachments may total; the panel checks the same cap before reading them. */
+const FLOATING_LAUNCH_MAX_BYTES = 25 * 1024 * 1024;
+
+/**
+ * The first message a panel launch hands to a main window, rebuilt from its checked fields, or
+ * null. A skill launch carries no attachments, as the panel's own delivery sends none.
+ *
+ * @param {unknown} message
+ * @returns {{ text: string, skill: { name: string, args: string } | null, files: { name: string, type: string, bytes: Uint8Array }[] } | null}
+ */
+function floatingComposerLaunchMessage(message) {
+  if (!message || typeof message !== "object") return null;
+  const { text } = message;
+  const skill = message.skill ?? null;
+  if (typeof text !== "string") return null;
+  if (skill !== null) {
+    if (
+      typeof skill !== "object" ||
+      typeof skill.name !== "string" ||
+      typeof skill.args !== "string"
+    ) {
+      return null;
+    }
+    // The page's store drops a blank prompt, so a blank skill launch can't be sent.
+    if (text.trim() === "") return null;
+    return { text, skill: { name: skill.name, args: skill.args }, files: [] };
+  }
+  if (!Array.isArray(message.files)) return null;
+  const files = [];
+  let totalBytes = 0;
+  for (const file of message.files) {
+    if (
+      !file ||
+      typeof file.name !== "string" ||
+      typeof file.type !== "string" ||
+      !(file.bytes instanceof Uint8Array)
+    ) {
+      return null;
+    }
+    totalBytes += file.bytes.byteLength;
+    if (totalBytes > FLOATING_LAUNCH_MAX_BYTES) return null;
+    files.push({ name: file.name, type: file.type, bytes: file.bytes });
+  }
+  if (text.trim() === "" && files.length === 0) return null;
+  return { text, skill: null, files };
+}
+
 /** How long the panel takes to fade in when it opens; closing is instant. */
 const FLOATING_COMPOSER_FADE_MS = 120;
+/** How long an open waits for a page still loading to say it's ready before showing anyway. */
+const FLOATING_COMPOSER_READY_FALLBACK_MS = 1000;
+/** How long the app stays quiet after a page can render the panel before it's built hidden. */
+const FLOATING_COMPOSER_PRELOAD_DELAY_MS = 3000;
 /** Each panel's current fade, so reopening mid-fade stops the one before. */
 const fades = new WeakMap();
 
@@ -118,6 +171,7 @@ function floatingComposerWindowOptions() {
  *   isCurrent: (panel: import("electron").BrowserWindow, serverUrl: string) => boolean,
  *   quitting: () => boolean,
  *   present?: (panel: import("electron").BrowserWindow, show: () => void) => void,
+ *   readyFallbackMs?: number,
  * }} deps `isCurrent` says whether a panel still shows its server's panel page; `present`
  *   puts a hidden panel on screen, such as with a fade, by calling `show`.
  */
@@ -131,6 +185,23 @@ function createFloatingComposerController(deps) {
   const pickerOpen = new Set();
   /** Each panel's pending debounced frame save. */
   const saveTimers = new Map();
+  /** Panels whose current document said its composer rendered; this ends with the document. */
+  const ready = new Set();
+  /** Panels built hidden ahead of an open, and never shown since. */
+  const unshown = new Set();
+  /** Opens waiting for a loading page: the panel → its fallback timer. */
+  const pendingReveals = new Map();
+  /**
+   * Panels the user has open, on screen or waiting for their page, in the order opened. An open
+   * ends three ways: putting the panel away, launching from it, or clicking an Omnigent window.
+   */
+  const open = new Set();
+
+  function cancelReveal(panel) {
+    const timer = pendingReveals.get(panel);
+    if (timer !== undefined) clearTimeout(timer);
+    pendingReveals.delete(panel);
+  }
 
   function cancelSave(panel) {
     const timer = saveTimers.get(panel);
@@ -172,7 +243,11 @@ function createFloatingComposerController(deps) {
 
   function discard(serverUrl, panel) {
     cancelSave(panel);
+    cancelReveal(panel);
     pickerOpen.delete(panel);
+    ready.delete(panel);
+    unshown.delete(panel);
+    open.delete(panel);
     if (panels.get(serverUrl) === panel) panels.delete(serverUrl);
     if (!panel.isDestroyed()) panel.destroy();
   }
@@ -180,6 +255,8 @@ function createFloatingComposerController(deps) {
   function hide(panel, { resetFrame = false } = {}) {
     for (const [serverUrl, candidate] of panels) {
       if (candidate !== panel || panel.isDestroyed()) continue;
+      cancelReveal(panel);
+      open.delete(panel);
       // A picker its page never reported closed must not keep it up on a later open.
       pickerOpen.delete(panel);
       panel.hide();
@@ -193,6 +270,23 @@ function createFloatingComposerController(deps) {
   function isPanel(win) {
     for (const panel of panels.values()) if (panel === win) return true;
     return false;
+  }
+
+  /**
+   * Give the panel the keyboard. For a panel-type window this makes it key without activating
+   * the app, so no other Omnigent window comes forward; putting it away hands the keyboard back
+   * to whatever app had it.
+   */
+  function takeKeyboard(panel) {
+    if (panel.isDestroyed()) return;
+    panel.webContents.focus();
+    // To its current document only; a page still loading focuses its prompt once it renders.
+    if (!panel.webContents.isDestroyed()) panel.webContents.send(FLOATING_COMPOSER_SHOWN_CHANNEL);
+  }
+
+  function serverUrlFor(win) {
+    for (const [serverUrl, panel] of panels) if (panel === win) return serverUrl;
+    return null;
   }
 
   function panelFor(serverUrl) {
@@ -219,10 +313,14 @@ function createFloatingComposerController(deps) {
     };
     panel.on("moved", scheduleSave);
     panel.on("resized", scheduleSave);
-    // A new document, or a renderer that went away, can't still have the picker open.
-    panel.webContents.on("did-navigate", () => pickerOpen.delete(panel));
-    panel.webContents.on("render-process-gone", () => pickerOpen.delete(panel));
-    // ⌘W hides the panel like Escape, keeping its draft; only quitting closes it.
+    // A new document, or a renderer that went away, can't still have the picker open or be ready.
+    const endDocument = () => {
+      pickerOpen.delete(panel);
+      ready.delete(panel);
+    };
+    panel.webContents.on("did-navigate", endDocument);
+    panel.webContents.on("render-process-gone", endDocument);
+    // ⌘W puts the panel away like Escape, keeping its draft; only quitting closes it.
     panel.on("close", (event) => {
       if (deps.quitting()) return;
       event.preventDefault();
@@ -230,11 +328,26 @@ function createFloatingComposerController(deps) {
     });
     panel.on("closed", () => {
       cancelSave(panel);
+      cancelReveal(panel);
       if (panels.get(serverUrl) === panel) panels.delete(serverUrl);
       pickerOpen.delete(panel);
+      ready.delete(panel);
+      unshown.delete(panel);
+      open.delete(panel);
     });
     panels.set(serverUrl, panel);
     return panel;
+  }
+
+  function reveal(serverUrl, panel) {
+    cancelReveal(panel);
+    if (panel.isDestroyed()) return;
+    // A document that has been on screen reopens at once, even one that never says it's ready.
+    ready.add(panel);
+    panel.setBounds(targetFrame(serverUrl));
+    if (deps.present) deps.present(panel, () => panel.showInactive());
+    else panel.showInactive();
+    takeKeyboard(panel);
   }
 
   function targetFrame(serverUrl) {
@@ -249,8 +362,8 @@ function createFloatingComposerController(deps) {
 
   return {
     /**
-     * Show the panel for `serverUrl` as the key window without activating the app. If it is
-     * already visible but not focused, focus it.
+     * Open the panel for `serverUrl` as the key window without activating the app. A panel
+     * already open (on screen or waiting for its page) takes the keyboard again.
      *
      * @param {string} serverUrl
      * @returns {"shown" | "focused" | "unavailable"}
@@ -258,18 +371,63 @@ function createFloatingComposerController(deps) {
     show(serverUrl) {
       if (typeof serverUrl !== "string" || serverUrl.length === 0) return "unavailable";
       const panel = panelFor(serverUrl);
+      // The user asked for this panel, so it's kept; other servers' builds ahead and waiting
+      // opens are dropped.
+      unshown.delete(panel);
+      for (const [otherUrl, other] of [...panels]) {
+        if (other === panel) continue;
+        if (pendingReveals.has(other)) {
+          cancelReveal(other);
+          open.delete(other);
+        }
+        if (unshown.has(other)) discard(otherUrl, other);
+      }
+      // The latest open goes last, so a press while it's open comes back to it.
+      open.delete(panel);
+      open.add(panel);
       if (panel.isVisible()) {
-        // A visible panel that lost focus needs an explicit focus; showInactive won't key it.
-        panel.moveTop();
-        panel.focus();
-        panel.webContents.focus();
+        takeKeyboard(panel);
         return "focused";
       }
-      panel.setBounds(targetFrame(serverUrl));
-      if (deps.present) deps.present(panel, () => panel.showInactive());
-      else panel.showInactive();
-      panel.webContents.focus();
+      // A page still loading shows once it's ready, or after a moment if it never says so.
+      if (ready.has(panel)) reveal(serverUrl, panel);
+      else if (!pendingReveals.has(panel)) {
+        const timer = setTimeout(
+          () => reveal(serverUrl, panel),
+          deps.readyFallbackMs ?? FLOATING_COMPOSER_READY_FALLBACK_MS,
+        );
+        timer.unref?.();
+        pendingReveals.set(panel, timer);
+      }
       return "shown";
+    },
+
+    /**
+     * Build the panel for `serverUrl` hidden, so the next open shows a page that's already
+     * loaded. At most one panel waits unshown: another server's is let go first.
+     *
+     * @param {string} serverUrl
+     */
+    preload(serverUrl) {
+      const existing = panels.get(serverUrl);
+      if (existing && !existing.isDestroyed() && deps.isCurrent(existing, serverUrl)) return;
+      for (const [otherUrl, panel] of [...panels]) {
+        if (otherUrl !== serverUrl && unshown.has(panel)) discard(otherUrl, panel);
+      }
+      unshown.add(panelFor(serverUrl));
+    },
+
+    /** Let go of `serverUrl`'s panel if it was built ahead and never shown. */
+    releaseUnshown(serverUrl) {
+      const panel = panels.get(serverUrl);
+      if (panel && unshown.has(panel)) discard(serverUrl, panel);
+    },
+
+    /** The panel's current document rendered its composer: an open waiting on it shows now. */
+    markReady(panel) {
+      if (!isPanel(panel) || panel.isDestroyed()) return;
+      ready.add(panel);
+      if (pendingReveals.has(panel)) reveal(serverUrlFor(panel), panel);
     },
 
     /**
@@ -281,6 +439,12 @@ function createFloatingComposerController(deps) {
      * @returns {boolean} whether `panel` is one of this controller's
      */
     hide,
+
+    /** The server of the panel the user has open now, or null; ⇧⌘Space then goes back to it. */
+    openServerUrl() {
+      const latest = [...open].at(-1);
+      return latest === undefined ? null : serverUrlFor(latest);
+    },
 
     /**
      * Close every panel whose server matches, such as on sign-out; the next open builds a
@@ -303,8 +467,15 @@ function createFloatingComposerController(deps) {
 
     /** One of Omnigent's own windows took focus: visible panels hide, like a click-away. */
     mainWindowFocused() {
+      // An open still waiting on its page is dropped too: the user moved on.
+      for (const panel of [...pendingReveals.keys()]) {
+        cancelReveal(panel);
+        open.delete(panel);
+      }
       for (const [serverUrl, panel] of panels) {
         if (panel.isDestroyed() || !panel.isVisible() || pickerOpen.has(panel)) continue;
+        // The user chose that window; it keeps the focus.
+        open.delete(panel);
         panel.hide();
         rememberFrame(serverUrl, panel);
       }
@@ -321,20 +492,53 @@ function createFloatingComposerController(deps) {
     isPanel,
 
     /** The server a panel is bound to, set by main when it built the panel, never by its page. */
-    serverUrlFor(win) {
-      for (const [serverUrl, panel] of panels) if (panel === win) return serverUrl;
-      return null;
+    serverUrlFor,
+  };
+}
+
+/**
+ * Builds a panel hidden once the app has been quiet for a while, so ⇧⌘Space shows a page that
+ * has already loaded. Each `schedule` restarts the wait; an open before it ends cancels it. A
+ * panel lost later is built by the next open, or ahead after the next announcement.
+ *
+ * @param {{
+ *   target: () => string | null,
+ *   preload: (serverUrl: string) => void,
+ *   delayMs?: number,
+ * }} deps `target` is the server to build for when the wait ends, or null for none.
+ */
+function createFloatingComposerPreloader(deps) {
+  let timer = null;
+  const cancel = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  return {
+    schedule() {
+      cancel();
+      timer = setTimeout(() => {
+        timer = null;
+        const serverUrl = deps.target();
+        if (serverUrl !== null) deps.preload(serverUrl);
+      }, deps.delayMs ?? FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+      timer.unref?.();
     },
+    cancel,
   };
 }
 
 module.exports = {
   FLOATING_COMPOSER_FADE_MS,
+  FLOATING_COMPOSER_PRELOAD_DELAY_MS,
+  FLOATING_COMPOSER_READY_FALLBACK_MS,
   FLOATING_COMPOSER_PATH,
+  FLOATING_COMPOSER_SHOWN_CHANNEL,
   FRAME_SETTINGS_KEY,
   createFloatingComposerController,
+  createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerLaunchMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 };

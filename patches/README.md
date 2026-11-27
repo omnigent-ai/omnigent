@@ -53,6 +53,6 @@ throws a `DiffMissingRowError` whose `missingRow` names the row's type and which
 short, and `FileDiff` hands any render error to a new `onRenderError(error, fileDiff)` option
 instead, when one is set. `CodeView` passes it through as a shared item callback. The review
 shows a note in place of that file's diff and logs the failure's shape to the console.
-Remove these hunks once upstream lets a caller own render errors. Once the diff
-review lands, validate with `DiffReview.library.test.tsx` ("a file the library
-can't draw").
+Remove these hunks once upstream lets a caller own render errors.
+`renderErrorHandling.test.ts` fails if a version bump drops them, and
+`DiffReview.library.test.tsx` ("a file the library can't draw") covers the review's use.

@@ -7,6 +7,8 @@
 
 "use strict";
 
+const { hasHostLocalAccess } = require("./hostIdentity");
+
 const crypto = require("node:crypto");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
@@ -23,7 +25,11 @@ const { routedGate, viewElsewhere } = require("./browserTabs");
 const { buildDesignModeScript } = require("./designModeScript");
 const { isBrowserViewFocused, registerDesignToolsIpc } = require("./designTools");
 
-const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const {
+  SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
+} = require("./hostIdentity");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
@@ -385,6 +391,13 @@ function makeDesignModeInputHandler(gestureState, isAgentInput = () => false) {
  * @param {(event: Electron.IpcMainInvokeEvent) => boolean} [deps.showsServerForEvent]
  *        Whether the sender's window still shows its server's page. Pushes to a
  *        window that navigated to a foreign page are dropped at send time.
+ * @param {(event: Electron.IpcMainInvokeEvent, url: string, opts: object) =>
+ *          Promise<boolean>} [deps.requestPreviewHostForEvent]
+ *        After a blocked navigation, asks whether the session's host may open
+ *        localhost pages; true asks the renderer to refresh provenance before retrying.
+ * @param {(event: Electron.IpcMainInvokeEvent, url: string, opts: object) =>
+ *          Promise<boolean>} [deps.requestTrustedRemoteHostForEvent]
+ *        Same, for a host the user trusts explicitly instead of over SSH.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -393,6 +406,8 @@ function registerBrowserIpc({
   getAgentContextForEvent = () => null,
   recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
+  requestPreviewHostForEvent = async () => false,
+  requestTrustedRemoteHostForEvent = async () => false,
   // The window with a tab's one page (browserTabs.js).
   routeViewForEvent = () => null,
   whileOpeningView = (handler) => handler, // the page's window while it opens
@@ -448,7 +463,7 @@ function registerBrowserIpc({
     if (!entry) return { error: "No browser view" };
     const context = entry.agentContext;
     if (context?.revoked) return { error: "The previous browser page is no longer available" };
-    if (context?.hostIsThisMachine === true) {
+    if (hasHostLocalAccess(context)) {
       const opts = args?.opts;
       if (
         opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
@@ -458,10 +473,7 @@ function registerBrowserIpc({
         return { error: "Current session host is required to read this browser view" };
       }
       const currentContext = getAgentContextForEvent(event, opts);
-      if (
-        opts.sourceHostId !== context.sourceHostId ||
-        currentContext?.hostIsThisMachine !== true
-      ) {
+      if (opts.sourceHostId !== context.sourceHostId || !hasHostLocalAccess(currentContext)) {
         // A tab check (browser_tabs list / select) only reads: it refuses the
         // tab but leaves its page, which may still hold the user's work.
         if (args?.action === "check_page") {
@@ -490,7 +502,8 @@ function registerBrowserIpc({
     if (pastAgentDeadline(opts)) {
       return { ok: false, created: false, superseded: false, error: PAGE_TIMEOUT_ERROR };
     }
-    const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
+    const isCurrentNavigation =
+      g.registry.beginAgentNavigation(conversationId, opts?.navigationRetryToken) ?? (() => false);
     const cancelled = {
       ok: false,
       created: false,
@@ -503,6 +516,7 @@ function registerBrowserIpc({
     // A forwarded agent navigation also ends at its caller's deadline.
     const isCurrent = () =>
       isCurrentNavigation() && isPinnedOriginSender(event) && !pastAgentDeadline(opts);
+    if (!isCurrent()) return cancelled;
     const navigate = async (registry) => {
       // Main validates the renderer-supplied host; opts only route.
       const agentContext = getAgentContextForEvent(event, opts);
@@ -528,6 +542,7 @@ function registerBrowserIpc({
     let r = await navigate(g.registry);
     if (!isCurrent()) return cancelled;
     let recovered = false;
+    let recoveryRequested = false;
     if (!r.ok && opts?.agent) {
       try {
         recovered = await recoverAgentNavigationForEvent(
@@ -536,12 +551,52 @@ function registerBrowserIpc({
           opts?.sourceHostId,
           opts?.rememberedArcaHostId,
           opts?.sourceIsArcaHost,
+          () => {
+            recoveryRequested = true;
+          },
         );
       } catch {
         recovered = false;
       }
     }
+    // Typed URLs and links reach here too; the question names the session's host, not the page.
+    // SSH verification runs first when the renderer offered it; explicit trust
+    // is the fallback for hosts with no SSH destination, such as sandboxes.
+    let previewAllowed = false;
+    if (
+      !r.ok &&
+      r.localhostBlocked === true &&
+      opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+      !recovered &&
+      isCurrent()
+    ) {
+      try {
+        if (opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL) {
+          previewAllowed = (await requestPreviewHostForEvent(event, url, opts)) === true;
+        }
+        if (
+          !previewAllowed &&
+          !recoveryRequested &&
+          isCurrent() &&
+          opts?.trustedRemotePreviewProtocol === TRUSTED_REMOTE_PREVIEW_PROTOCOL
+        ) {
+          previewAllowed = (await requestTrustedRemoteHostForEvent(event, url, opts)) === true;
+        }
+      } catch {
+        previewAllowed = false;
+      }
+    }
     if (!isCurrent()) return cancelled;
+    if (previewAllowed) {
+      // Consent may outlive a session-host change; the renderer must resolve it again.
+      return {
+        ok: false,
+        created: false,
+        retryWithFreshHost: true,
+        navigationRetryToken: isCurrentNavigation.retryToken,
+        error: "Localhost access allowed; refresh the session host before retrying.",
+      };
+    }
     if (recovered) {
       // Recovery updates main-owned identity, so rebuild the context and ask
       // the registry to evaluate the same navigation once more.
@@ -568,12 +623,18 @@ function registerBrowserIpc({
             opts?.sourceHostId,
             opts?.rememberedArcaHostId,
             opts?.sourceIsArcaHost,
+            r.localhostBlocked === true,
+            opts?.trustedRemotePreviewProtocol,
           )
         : null;
     return {
       ok: r.ok,
       created: r.created ?? false,
       ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
+      ...(r.ok && r.entry?.agentContext?.hostIsSshPreview ? { sshPreviewHost: true } : {}),
+      ...(r.ok && r.entry?.agentContext?.hostIsTrustedRemotePreview
+        ? { trustedRemotePreviewHost: true }
+        : {}),
       error: hint ? `${r.error} ${hint}` : r.error,
     };
   };
@@ -623,6 +684,14 @@ function registerBrowserIpc({
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     return g.registry.setRecentSessionSwitchSupported(!!args?.supported);
+  });
+
+  // The app chords a focused page hands to this renderer. Like Ctrl+Tab, none
+  // are taken from the page until a renderer that handles them asks.
+  ipcMain.handle("omnigent:browser-set-forwarded-chords", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.setForwardedChords(args?.chords);
   });
 
   // Turn Cmd/Ctrl-clicked page links into new tabs only while a compatible
@@ -734,6 +803,8 @@ function registerBrowserIpc({
     return {
       exists: true,
       hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
+      ...(entry.agentContext?.hostIsSshPreview ? { sshPreviewHost: true } : {}),
+      ...(entry.agentContext?.hostIsTrustedRemotePreview ? { trustedRemotePreviewHost: true } : {}),
       url,
       title: viewTitle(webContents), // "" once the page is gone
       ...(pendingUrl ? { pendingUrl } : {}),
@@ -761,7 +832,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goBack(entry.view.webContents);
+    if (goBack(entry.view.webContents)) g.registry.beginAgentNavigation?.(args.conversationId);
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -770,7 +841,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goForward(entry.view.webContents);
+    if (goForward(entry.view.webContents)) g.registry.beginAgentNavigation?.(args.conversationId);
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -780,6 +851,7 @@ function registerBrowserIpc({
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
+      g.registry.beginAgentNavigation?.(args.conversationId);
       entry.view.webContents.reload();
     } catch {
       /* destroyed */

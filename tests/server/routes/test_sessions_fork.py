@@ -936,6 +936,7 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         assert response.status_code == 200, response.text
         return response.json()
 
+    # The PR panel reads this as the session-owner signal too, so it must stay is_session_owner.
     assert (await snapshot(owner))["side_chat_allowed"] is True
     # An admin sees owner level but, without the owner grant, no side chats.
     assert (await snapshot(admin))["permission_level"] == LEVEL_OWNER

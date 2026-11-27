@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import functools
 import itertools
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.inner.claude_model_access import ClaudeModelAccess
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.tool_dispatch import UnknownSessionWorkspace
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
@@ -220,6 +222,7 @@ from omnigent.runner.subagent_work import (
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
 )
+from omnigent.runtime import routing_stamp, set_remote_routing_available
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -841,6 +844,7 @@ class TurnDispatch:
     :param instructions: System prompt for the LLM.
     :param agent_version: Spec version for invalidation.
     :param spawn_env: Harness subprocess environment overrides.
+    :param spec_entry: This turn's selected spec after its start policy completed.
     :param client_side_tool_names: Names of request-supplied
         client-side tools for this turn (e.g. ``{"Read", "Glob"}``).
         These are executed by the caller, not the runner, so the
@@ -854,7 +858,44 @@ class TurnDispatch:
     instructions: str | None = None
     agent_version: int | None = None
     spawn_env: dict[str, str] | None = None
+    spec_entry: _SpecEntry | None = None
     client_side_tool_names: frozenset[str] = frozenset()
+
+
+@dataclasses.dataclass(frozen=True)
+class _HarnessLaunch:
+    """Keep a selected worker's environment and gated spec together for its turn."""
+
+    harness: str
+    spawn_env: dict[str, str] | None
+    spec_entry: _SpecEntry | None
+
+
+class _CopyOnWriteSetupError(ValueError):
+    """Distinguish disposable-workspace refusal from other launch validation."""
+
+
+def _agent_start_policy_failure(exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=403,
+        content={
+            "error": "agent_start_policy_unevaluable",
+            "detail": _client_safe_error_detail(exc, context="agent start policy"),
+        },
+    )
+
+
+def _copy_on_write_setup_failure(session_id: str, exc: ValueError) -> JSONResponse:
+    _logger.warning("copy_on_write setup failed for %s", session_id, exc_info=exc)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "copy_on_write_setup_failed",
+            "detail": _client_safe_error_detail(exc, context="copy_on_write setup"),
+            "hint": "Use executor.harness=openai-agents; start a new session after "
+            "changing copy_on_write paths.",
+        },
+    )
 
 
 @dataclasses.dataclass
@@ -1051,6 +1092,15 @@ def _response_failed_event(
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
+def _is_mcp_tool_schema(schema: object) -> bool:
+    """Whether *schema* is an MCP tool, whose name is namespaced ``server__tool``."""
+    return (
+        isinstance(schema, dict)
+        and isinstance(schema.get("name"), str)
+        and "__" in cast(str, schema.get("name"))
+    )
+
+
 def _inject_mcp_schemas(
     event_body: _JsonObject,
     mcp_schemas: list[_JsonObject],
@@ -1239,6 +1289,8 @@ def _harness_error_response_error(response: object) -> dict[str, str]:
     if isinstance(payload, dict):
         raw_detail = payload.get("detail")
         raw_code = payload.get("error")
+        if isinstance(raw_code, dict):
+            return _normalize_turn_error(raw_code)
         detail = raw_detail.strip() if isinstance(raw_detail, str) else ""
         code = raw_code.strip() if isinstance(raw_code, str) else ""
         if code == ErrorCode.SESSION_AGENT_MISSING:
@@ -1472,6 +1524,26 @@ def create_runner_app(
     # every spec-derived read (native-vs-SDK checks above all) still answers
     # with the harness the spec declared, which a routed session is not on.
     _session_harness_overrides: dict[str, str] = {}
+    _session_spec_start_harness: dict[str, tuple[_SpecEntry, str]] = {}
+
+    def _gated_session_spec_entry(
+        session_id: str, harness: str | None = None
+    ) -> _SpecEntry | None:
+        """Reuse only this exact entry's completed gate for the selected harness."""
+        entry = _session_spec_cache.get(session_id)
+        provenance = _session_spec_start_harness.get(session_id)
+        if entry is None or provenance is None or provenance[0] is not entry:
+            return None
+        spec = _unwrap_resolved_spec(entry)
+        if spec is None:
+            return None
+        selected = (
+            canonicalize_harness(harness)
+            if harness
+            else _session_harness_name(session_id, spec=spec)
+        )
+        return entry if provenance[1] == selected else None
+
     # session_id → effective revision of the bundle and MCP selections
     _session_agent_revisions: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
@@ -1563,6 +1635,8 @@ def create_runner_app(
     # warns again for the new pair rather than inheriting the old one's silence.
     _instruction_delivery_warned: dict[str, set[tuple[str, InstructionDelivery]]] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
+    # session_id → the routing availability its built-in schemas were built under.
+    _session_tool_schemas_routing: dict[str, bool] = {}
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
 
@@ -1737,9 +1811,12 @@ def create_runner_app(
 
     # Sessions whose Claude pane reports a background shell still running after
     # its turn ended. Real work: it keeps the runner and its sandbox up, but only
-    # while that session's native pane exists, so a lost "stopped" edge cannot
-    # pin either.
+    # while that session's native pane exists, which the pane reaper bounds, so a
+    # lost "stopped" edge cannot pin either.
     _sessions_with_background_shell: set[str] = set()
+    # When a background shell became the only work sparing each native pane.
+    _background_shell_pane_hold_since: dict[str, float] = {}
+    app.state.background_shell_pane_hold_since = _background_shell_pane_hold_since
 
     _human_wait_hold_s = _resolve_human_wait_hold_s()
     # Dialog each native turn is parked on: its latest ``running`` edge's
@@ -2233,6 +2310,7 @@ def create_runner_app(
             _sessions_with_background_shell.add(session_id)
         else:
             _sessions_with_background_shell.discard(session_id)
+            _background_shell_pane_hold_since.pop(session_id, None)
         background_reports.report(session_id, running)
 
     resource_registry.set_session_background_publisher(_publish_session_background)
@@ -2746,10 +2824,30 @@ def create_runner_app(
             )
         return None
 
-    async def _session_runtime_cwd(session_id: str) -> Path | None:
+    async def _session_explicit_workspace(
+        session_id: str,
+    ) -> Path | UnknownSessionWorkspace | None:
+        """
+        The session's own server-stored workspace.
+
+        :returns: The workspace, ``None`` when the session has none, or
+            ``UNKNOWN_SESSION_WORKSPACE`` when its metadata could not be read.
+        """
+        from omnigent.runner.tool_dispatch import UNKNOWN_SESSION_WORKSPACE
+
         workspace = await _session_workspace_value(session_id)
         if workspace and workspace.strip():
             return Path(workspace.strip()).expanduser().resolve()
+        # A successful read is cached, even an empty one; an uncached session's
+        # metadata was unreadable (or superseded mid-read), so its boundary is unknown.
+        if session_id not in _session_workspace_cache:
+            return UNKNOWN_SESSION_WORKSPACE
+        return None
+
+    async def _session_runtime_cwd(session_id: str) -> Path | None:
+        explicit = await _session_explicit_workspace(session_id)
+        if isinstance(explicit, Path):
+            return explicit
         return runner_workspace.resolve() if runner_workspace is not None else None
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
@@ -2771,6 +2869,7 @@ def create_runner_app(
         global _server_version, _server_accepts_inferred_status
         global _server_accepts_input_only_failures
         _server_version = envelope.server_version
+        set_remote_routing_available(envelope.smart_routing_available)
         _server_accepts_inferred_status = envelope.accepts_inferred_status
         _server_accepts_input_only_failures = envelope.accepts_input_only_failures
         if _server_accepts_input_only_failures:
@@ -2868,6 +2967,15 @@ def create_runner_app(
     from omnigent.entities.environment_filesystem import (
         ResourceError,
     )
+    from omnigent.runner.policy import AgentStartPolicyError
+
+    @app.exception_handler(AgentStartPolicyError)
+    async def _handle_agent_start_policy_error(
+        request: Request,
+        exc: AgentStartPolicyError,
+    ) -> JSONResponse:
+        del request
+        return _agent_start_policy_failure(exc)
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -3155,10 +3263,10 @@ def create_runner_app(
         resource_registry.set_client_surface(
             session_id, surface_labels.get(CLIENT_SURFACE_LABEL_KEY)
         )
-        if init_context.envelope is not None:
-            _note_session_harness_override(
-                session_id, init_context.envelope.snapshot.harness_override
-            )
+        if init_context.envelope is not None and _note_session_harness_override(
+            session_id, init_context.envelope.snapshot.harness_override
+        ):
+            spec_cache_generation += 1
 
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
@@ -3210,10 +3318,11 @@ def create_runner_app(
             )
             harness_name = canonicalize_harness(raw_harness) or raw_harness
 
+            from omnigent.inner.sandbox import HarnessSandboxValidationError
             from omnigent.runner.policy import AgentStartPolicyError
 
             try:
-                _start_data = await _evaluate_agent_start_gate(spec, harness_name)
+                spec = await _apply_agent_start_gate(spec, harness_name)
             except AgentStartPolicyError as exc:
                 # The gate raises without logging; this is the single record of
                 # the failure. exc_info keeps any underlying policy traceback.
@@ -3229,16 +3338,8 @@ def create_runner_app(
                         reason=exc.reason,
                     ),
                 )
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "error": "agent_start_policy_unevaluable",
-                        "detail": str(exc),
-                    },
-                )
-            if _start_data is not None:
-                _apply_sandbox_override_from_start_data(spec, _start_data)
-
+                return _agent_start_policy_failure(exc)
+            spec_entry = _rewrap_like(spec_entry, spec, _resolved_spec_workdir(spec_entry))
             await _ensure_session_subagent_router(
                 session_id,
                 harness_name,
@@ -3267,11 +3368,26 @@ def create_runner_app(
                     model_override=_model_override,
                     resource_registry=resource_registry,
                 )
-            except OmnigentError as exc:
-                # The relay also needs the failure when init precedes the first turn.
-                _publish_turn_status(
-                    session_id, "failed", error={"code": exc.code, "message": str(exc)}
+            except (OmnigentError, HarnessSandboxValidationError) as exc:
+                policy_error = exc.__cause__ if isinstance(exc, OmnigentError) else exc
+                error_code = (
+                    exc.code if isinstance(exc, OmnigentError) else ErrorCode.INVALID_INPUT
                 )
+                error = {
+                    "code": error_code,
+                    "message": (
+                        _client_safe_error_detail(exc, context="harness sandbox validation")
+                        if isinstance(policy_error, HarnessSandboxValidationError)
+                        else str(exc)
+                    ),
+                }
+                # The relay also needs the failure when init precedes the first turn.
+                _publish_turn_status(session_id, "failed", error=error)
+                if isinstance(policy_error, HarnessSandboxValidationError):
+                    return JSONResponse(
+                        status_code=exc.http_status if isinstance(exc, OmnigentError) else 400,
+                        content={"error": error, "detail": error["message"]},
+                    )
                 raise
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
@@ -3285,6 +3401,7 @@ def create_runner_app(
             # runs on what it resolved — the next spec read re-resolves.
             if _session_cache_generation_is_current(session_id, spec_cache_generation):
                 _session_spec_cache[session_id] = spec_entry
+                _session_spec_start_harness[session_id] = (spec_entry, harness_name)
         else:
             if spec_resolver is not None:
                 # spec_resolver was configured but returned no spec for this
@@ -3588,6 +3705,13 @@ def create_runner_app(
                     return PreLaunchResult(needs_terminal=needs)
 
                 _launch_pre = _antigravity_pre_launch
+
+                async def _antigravity_resolve_spec() -> AgentSpec | None:
+                    return await _native_runtime._antigravity_startup_agent_spec(
+                        session_id, _resolve_session_agent_spec_or_none
+                    )
+
+                _launch_resolve_spec = _antigravity_resolve_spec
 
             elif harness_name == "pi-native":
                 # pi resolves its spec unwrapped — a resolution error surfaces as
@@ -4212,6 +4336,7 @@ def create_runner_app(
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
 
         _session_spec_cache.pop(session_id, None)
+        _session_spec_start_harness.pop(session_id, None)
         _session_root_spec_cache.pop(session_id, None)
         if spec_workdir_cleanup is not None:
             await spec_workdir_cleanup(session_id)
@@ -4229,6 +4354,7 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _session_tool_schemas_routing.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
@@ -4299,7 +4425,7 @@ def create_runner_app(
                     extra={"session_id": conv_id},
                 )
 
-    def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
+    def _note_session_harness_override(conv_id: str, harness_override: str | None) -> bool:
         """Record the harness a session was forwarded, so reads match the run.
 
         A routed child arrives with ``harness_override`` naming a harness its
@@ -4308,13 +4434,19 @@ def create_runner_app(
 
         :param conv_id: Session/conversation id, e.g. ``"conv_child456"``.
         :param harness_override: The forwarded override, e.g. ``"codex"``.
-        :returns: None.
+        :returns: Whether changing the target retired the effective spec cache.
         """
         if not harness_override or harness_override == "auto":
-            return
+            return False
+        if _session_harness_overrides.get(conv_id) == harness_override:
+            return False
+        _session_spec_cache.pop(conv_id, None)
+        _session_spec_start_harness.pop(conv_id, None)
+        _session_cache_generations[conv_id] = _session_cache_generation(conv_id) + 1
         _session_harness_overrides[conv_id] = harness_override
+        return True
 
-    def _session_harness_name(conv_id: str) -> str | None:
+    def _session_harness_name(conv_id: str, *, spec: AgentSpec | None = None) -> str | None:
         # The override wins: a routed session runs the harness the server
         # pinned, not the one its spec declares. Reading the spec here left a
         # sub-agent whose spec says ``claude-native`` looking native while it
@@ -4326,10 +4458,10 @@ def create_runner_app(
         )
         if override and override != "auto":
             return canonicalize_harness(override) or override
-        spec = _session_spec_cache.get(conv_id)
-        if spec is None:
+        entry = spec if spec is not None else _session_spec_cache.get(conv_id)
+        if entry is None:
             return None
-        h = spec.executor.config.get("harness") or spec.executor.type
+        h = entry.executor.config.get("harness") or entry.executor.type
         return canonicalize_harness(h) or h
 
     def _native_turn_outcome_is_forwarder_confirmed(conv_id: str) -> bool:
@@ -4710,6 +4842,30 @@ def create_runner_app(
         )
         if known:
             _publish_turn_status(conv_id, "idle")
+
+    async def _settle_codex_native_stop(conv_id: str) -> None:
+        """
+        Publish ``idle`` once a Stop has ended a Codex-native turn that Codex itself never ran.
+
+        Codex's own turn events close a Codex session's ``running`` edge, so a turn
+        stopped before its message reached Codex (held while Codex was starting) has
+        nothing else to close it. A turn Codex accepted keeps its own lifecycle.
+
+        :param conv_id: Session whose turn the Stop ended.
+        """
+        if _session_harness_name(conv_id) != "codex-native":
+            return
+        state = await _codex_native_bridge_state_for_session(
+            conv_id, action="stop", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None and state.active_turn_id is not None:
+            return
+        # Checked after the await, with no await before the publish: a turn that
+        # started meanwhile keeps its own status.
+        if conv_id in _active_turns or _session_message_buffers.get(conv_id):
+            return
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        resource_registry.note_external_session_status(conv_id, "idle")
 
     def _on_proxy_stream_end(
         conv_id: str,
@@ -5777,6 +5933,7 @@ def create_runner_app(
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
+        effective_spec_entry: _SpecEntry | None = None,
     ) -> None:
         import json as _json
 
@@ -5792,7 +5949,11 @@ def create_runner_app(
         workflows_enabled = await server_workflows_enabled(server_client)
 
         try:
-            spec_entry = await _resolve_session_spec_entry(session_id)
+            spec_entry = (
+                effective_spec_entry
+                if effective_spec_entry is not None
+                else await _resolve_session_spec_entry(session_id)
+            )
         except OmnigentError:
             # Resolution failed; this is not the same as a session that
             # resolves to no spec. A relay already serving the session was
@@ -5830,6 +5991,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.routing_available == routing_stamp()
             and known_bridge_dir is None
         ):
             return
@@ -5852,6 +6014,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.routing_available == routing_stamp()
             and current.bridge_dir == bridge_dir
         ):
             return
@@ -5862,6 +6025,7 @@ def create_runner_app(
         )
 
         relay_spec = _unwrap_spec_entry(spec_entry)
+        relay_routing = routing_stamp()
         relay_schemas: list[_JsonObject] = filter_workflow_tool_schemas(
             build_native_relay_tool_schemas(relay_spec),
             enabled=workflows_enabled,
@@ -5890,6 +6054,7 @@ def create_runner_app(
                 current is not None
                 and current.spec_entry is spec_entry
                 and current.workflows_enabled == workflows_enabled
+                and current.routing_available == routing_stamp()
                 and current.bridge_dir == bridge_dir
             ):
                 return
@@ -6035,6 +6200,7 @@ def create_runner_app(
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             workflows_enabled=workflows_enabled,
+            routing_available=relay_routing,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -6160,7 +6326,8 @@ def create_runner_app(
                 )
                 if not owns_active_turn:
                     return
-                error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
+                detail = _client_safe_error_detail(exc, context="turn setup")
+                error: dict[str, object] = {"message": f"turn setup failed: {detail}"}
                 if not handed_off[0]:
                     identity = _input_identity(msg_body)
                     if identity:
@@ -6215,14 +6382,19 @@ def create_runner_app(
         conv: str,
         handed_off: list[bool],
     ) -> None:
-        _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
+        _dispatched_agent_id = cast(
+            str | None, msg_body.get("agent_id")
+        ) or _session_agent_ids.get(conv)
         await _sync_session_agent(
             conv, _dispatched_agent_id, cast(str | None, msg_body.get("agent_revision"))
         )
+        _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
+        spec_cache_generation = _session_cache_generation(conv)
 
-        cached_spec_entry = _session_spec_cache.get(conv)
+        cached_spec_entry = _gated_session_spec_entry(conv)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
+        needs_start_gate = False
         if cached_spec is None and spec_resolver is not None:
             _aid = _dispatched_agent_id
             if _aid:
@@ -6231,10 +6403,12 @@ def create_runner_app(
                     if isinstance(resolved, ResolvedSpec):
                         cached_spec = _unwrap_resolved_spec(resolved)
                         cached_spec_workdir = _resolved_spec_workdir(resolved)
-                        _session_spec_cache[conv] = resolved
+                        cached_spec_entry = resolved
+                        needs_start_gate = True
                     elif resolved is not None:
                         cached_spec = resolved
-                        _session_spec_cache[conv] = resolved
+                        cached_spec_entry = resolved
+                        needs_start_gate = True
                 except (httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "Spec resolution failed for %s",
@@ -6245,7 +6419,8 @@ def create_runner_app(
             else:
                 try:
                     cached_spec = await _resolve_session_agent_spec(conv)
-                    cached_spec_workdir = _resolved_spec_workdir(_session_spec_cache.get(conv))
+                    cached_spec_entry = _session_spec_cache.get(conv)
+                    cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
                 except (OmnigentError, httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "On-demand agent resolution failed for %s",
@@ -6253,10 +6428,6 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
-
-        # The resolver branches above write straight into the cache, so the
-        # entry read at the top of this block can already be stale.
-        cached_spec_entry = _session_spec_cache.get(conv, cached_spec_entry)
 
         _sa_name = await _recover_sub_agent_name(conv)
         # The child's workdir is rooted before _spec_with_workdir_paths below,
@@ -6269,20 +6440,17 @@ def create_runner_app(
                     _warn_unresolved_sub_agent(conv, _sa_name)
             else:
                 cached_spec_entry = sub_entry
-                cached_spec = _unwrap_resolved_spec(sub_entry)
+                sub_spec = _unwrap_resolved_spec(sub_entry)
+                needs_start_gate = needs_start_gate or sub_spec is not cached_spec
+                cached_spec = sub_spec
                 cached_spec_workdir = _resolved_spec_workdir(sub_entry)
-                _session_spec_cache[conv] = sub_entry
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
-        if cached_spec is not None:
-            cached_spec_entry = _rewrap_like(cached_spec_entry, cached_spec, cached_spec_workdir)
-            _session_spec_cache[conv] = cached_spec_entry
 
         harness_name: str | None = None
         raw_harness: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
-        _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
         if cached_spec is not None:
             # The session's recorded override outranks the spec (mirrors
             # _initialize_session): the native terminal forward carries no
@@ -6296,6 +6464,12 @@ def create_runner_app(
                 or cached_spec.executor.type
             )
             harness_name = canonicalize_harness(raw_harness) or raw_harness
+            if needs_start_gate:
+                cached_spec = await _apply_agent_start_gate(cached_spec, harness_name)
+            cached_spec_entry = _rewrap_like(cached_spec_entry, cached_spec, cached_spec_workdir)
+            if _session_cache_generation_is_current(conv, spec_cache_generation):
+                _session_spec_cache[conv] = cached_spec_entry
+                _session_spec_start_harness[conv] = (cached_spec_entry, harness_name)
 
         if conv not in _session_histories:
             _session_histories[conv] = (
@@ -6354,6 +6528,7 @@ def create_runner_app(
             agent_id=_dispatched_agent_id,
             harness=harness_name,
             spawn_env=spawn_env,
+            spec_entry=cached_spec_entry,
             has_mcp_servers=(
                 (cached_spec is not None and bool(cached_spec.mcp_servers))
                 or msg_body.get("has_mcp_servers") is True
@@ -6443,7 +6618,22 @@ def create_runner_app(
         if instructions:
             harness_body["instructions"] = instructions
 
-        if conv not in _session_tool_schemas:
+        # Built-in schemas depend on this process's routing answer, which a later
+        # session-init envelope can change. Rebuild only this session's built-ins
+        # when the answer it was built under has moved, keeping its MCP entries and
+        # hash so discovery is not repeated. Nothing shared is cleared, so another
+        # session's in-flight MCP discovery is never disturbed.
+        routing_now = routing_stamp()
+        routing_stale = (
+            conv in _session_tool_schemas
+            and _session_tool_schemas_routing.get(conv) != routing_now
+        )
+        if conv not in _session_tool_schemas or routing_stale:
+            kept_mcp = (
+                [t for t in _session_tool_schemas.get(conv, []) if _is_mcp_tool_schema(t)]
+                if routing_stale
+                else []
+            )
             all_tools: list[_JsonObject] = []
             if cached_spec is not None:
                 try:
@@ -6468,7 +6658,9 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
-            _session_tool_schemas[conv] = all_tools
+            # Stamped before the MCP await below, so a flip during discovery is seen next turn.
+            _session_tool_schemas[conv] = all_tools + kept_mcp
+            _session_tool_schemas_routing[conv] = routing_now
 
         if cached_spec and cached_spec.mcp_servers:
             from omnigent.runner.mcp_manager import compute_spec_hash
@@ -6488,11 +6680,7 @@ def create_runner_app(
                     _builtin_tools = [
                         t
                         for t in _session_tool_schemas.get(conv, [])
-                        if not (
-                            isinstance(t, dict)
-                            and isinstance(t.get("name"), str)
-                            and "__" in cast(str, t.get("name"))
-                        )
+                        if not _is_mcp_tool_schema(t)
                     ]
                     _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
                     _session_mcp_spec_hash[conv] = _mcp_hash
@@ -6591,7 +6779,10 @@ def create_runner_app(
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
             write_mcp_bridge_config(antigravity_bdir)
             await _ensure_comment_relay_started(
-                conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
+                conv,
+                explicit_bridge_dir=antigravity_bdir,
+                await_notify=False,
+                session_labels=antigravity_labels,
             )
         elif harness_name == "hermes":
             from omnigent.harnesses.hermes_native.bridge import (
@@ -6691,14 +6882,47 @@ def create_runner_app(
         dispatch: TurnDispatch | None = None,
     ) -> Response:
         stream_turn_epoch = _turn_bind_epoch.get(conv_id, 0)
+
+        async def failed_spec_stream(error_type: str, message: str) -> AsyncIterator[bytes]:
+            if _turn_bind_epoch.get(conv_id, 0) != stream_turn_epoch:
+                return
+            error = {"message": message, "type": error_type, "undelivered": True}
+            identity = _input_identity(body)
+            _publish_event(conv_id, _response_failed_payload(error, input_identity=identity))
+            _on_proxy_stream_end(conv_id, error=error)
+            yield _response_failed_event(error, input_identity=identity)
+
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
-        spawn_env = (
-            dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
-        )
+        spawn_env = dispatch.spawn_env if dispatch else None
+        legacy_model_env: dict[str, str] = {}
+        if dispatch is None and body.get("spawn_env") is not None:
+            try:
+                compatible_env = _compatible_stream_spawn_env(
+                    harness_name or "", body["spawn_env"]
+                )
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": (
+                            "spawn_env must be an object. A model override must be a string "
+                            "without NUL characters."
+                        ),
+                    },
+                )
+            if compatible_env and body.get("model_override") is None:
+                legacy_model_env = compatible_env
+                body = {**body, "model_override": next(iter(compatible_env.values()))}
+        selected_spec_entry = dispatch.spec_entry if dispatch else None
         _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
         # Shared agent-change invalidation for both dispatch paths.
-        _ds_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
+        _ds_agent_id = (
+            dispatch.agent_id
+            if dispatch
+            else cast(str | None, body.get("agent_id")) or _session_agent_ids.get(conv_id)
+        )
         await _sync_session_agent(
             conv_id,
             _ds_agent_id,
@@ -6706,26 +6930,39 @@ def create_runner_app(
         )
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
-        if not harness_name:
-            _agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
+        if not harness_name or (dispatch is None and spec_resolver is not None):
+            from omnigent.runner.policy import AgentStartPolicyError
+
+            _agent_id = _ds_agent_id
+            spec_cache_generation = _session_cache_generation(conv_id)
             _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
-                harness_name, spawn_env = await _resolve_harness_config(
+                launch = await _resolve_harness_launch(
                     resource_registry=resource_registry,
                     agent_id=_agent_id,
                     spec_resolver=spec_resolver,
                     session_id=conv_id,
                     model_override=cast(str | None, body.get("model_override")),
-                    # Session-recorded override first (the note above already
-                    # folded in any body value): a body without one must not
-                    # drop the turn back onto the spec's harness.
+                    # Explicit stream selection wins; otherwise retain the
+                    # session override when the turn body omits it.
                     harness_override=(
-                        _session_harness_overrides.get(conv_id)
+                        harness_name
+                        or _session_harness_overrides.get(conv_id)
                         or cast(str | None, body.get("harness_override"))
                     ),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
+                    effective_spec_entry=_gated_session_spec_entry(conv_id, harness_name),
                 )
+                harness_name, spawn_env = launch.harness, launch.spawn_env
+                selected_spec_entry = launch.spec_entry
+                if selected_spec_entry is not None and _session_cache_generation_is_current(
+                    conv_id, spec_cache_generation
+                ):
+                    _session_spec_cache[conv_id] = selected_spec_entry
+                    _session_spec_start_harness[conv_id] = (selected_spec_entry, harness_name)
+            except AgentStartPolicyError as exc:
+                return _agent_start_policy_failure(exc)
             except SessionAgentMissingError:
                 return JSONResponse(
                     status_code=410,
@@ -6734,13 +6971,46 @@ def create_runner_app(
                         "detail": SESSION_AGENT_MISSING_MESSAGE,
                     },
                 )
-            except (httpx.HTTPError, RuntimeError) as exc:
+            except _CopyOnWriteSetupError as exc:
+                return _copy_on_write_setup_failure(conv_id, exc)
+            except (ValueError, OmnigentError) as exc:
+                detail = _client_safe_error_detail(exc, context="harness config")
                 return JSONResponse(
-                    status_code=503,
+                    status_code=exc.http_status if isinstance(exc, OmnigentError) else 400,
                     content={
-                        "error": "spec_resolver_failed",
-                        "detail": _spec_resolve_error_detail(exc),
+                        "error": {
+                            "code": exc.code
+                            if isinstance(exc, OmnigentError)
+                            else "invalid_input",
+                            "message": detail,
+                        },
+                        "detail": detail,
                     },
+                )
+            except (httpx.HTTPError, RuntimeError) as exc:
+                if not harness_name:
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "spec_resolver_failed",
+                            "detail": _spec_resolve_error_detail(exc),
+                        },
+                    )
+                _logger.warning(
+                    "turn spec resolution failed before harness acquisition for %s",
+                    conv_id,
+                    exc_info=True,
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "runner_turn_spec_resolution_failed",
+                    },
+                )
+                return StreamingResponse(
+                    failed_spec_stream(
+                        type(exc).__name__, "Failed to resolve the agent spec for this turn."
+                    ),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
         from omnigent.sandbox.copy_on_write import (
             SHARED_ENVIRONMENT_VAR,
@@ -6749,9 +7019,11 @@ def create_runner_app(
             validate_copy_on_write_harness,
         )
 
-        stream_spec_entry = _session_spec_cache.get(conv_id) or _session_root_spec_cache.get(
-            conv_id
-        )
+        stream_spec_entry = selected_spec_entry
+        if stream_spec_entry is None:
+            stream_spec_entry = _session_spec_cache.get(conv_id) or _session_root_spec_cache.get(
+                conv_id
+            )
         stream_spec = _unwrap_resolved_spec(stream_spec_entry)
         if stream_spec is None and _ds_agent_id and spec_resolver is not None:
             generation = _session_cache_generation(conv_id)
@@ -6782,16 +7054,7 @@ def create_runner_app(
                 spawn_env = dict(spawn_env or {})
                 spawn_env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
             except ValueError as exc:
-                _logger.warning("copy_on_write setup failed for %s", conv_id, exc_info=True)
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "copy_on_write_setup_failed",
-                        "detail": _client_safe_error_detail(exc, context="copy_on_write setup"),
-                        "hint": "Use executor.harness=openai-agents; start a new session after "
-                        "changing copy_on_write paths.",
-                    },
-                )
+                return _copy_on_write_setup_failure(conv_id, exc)
 
         if spawn_env is None:
             spawn_env = await _resolve_native_spawn_env(
@@ -6800,6 +7063,9 @@ def create_runner_app(
                 server_client=server_client,
                 optional_labels=startup_labels,
             )
+
+        if legacy_model_env and spec_resolver is None:
+            spawn_env = {**(spawn_env or {}), **legacy_model_env}
 
         agent_version = (
             dispatch.agent_version if dispatch else cast(int | None, body.get("agent_version"))
@@ -6819,13 +7085,21 @@ def create_runner_app(
                     harness_name,
                     NativeLaunchContext(
                         session_id=conv_id,
+                        agent_spec=selected_spec_entry,
                         resource_registry=resource_registry,
                         publish_event=_publish_event,
                         server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
+                        ensure_comment_relay=functools.partial(
+                            _ensure_comment_relay_started,
+                            effective_spec_entry=selected_spec_entry,
+                        ),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
-                    resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
+                    resolve_agent_spec=(
+                        None
+                        if selected_spec_entry is not None
+                        else lambda: _resolve_session_agent_spec_or_none(conv_id)
+                    ),
                     reraise=True,
                 )
             except Exception as exc:
@@ -6859,16 +7133,17 @@ def create_runner_app(
 
         _turn_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
         _has_mcp_hint = dispatch.has_mcp_servers if dispatch else body.get("has_mcp_servers")
-        _turn_spec: object | None = None
-        _turn_spec_entry: object | None = None
-        _turn_spec_resolved = False
+        _turn_spec: object | None = _unwrap_resolved_spec(selected_spec_entry)
+        _turn_spec_entry: object | None = selected_spec_entry
+        _turn_spec_resolved = selected_spec_entry is not None
         _mcp_schemas: list[_JsonObject] = []
         _mcp_tool_names: set[str] = set()
         _eager_spec_error: tuple[str, str] | None = None
         if _has_mcp_hint is True and _turn_agent_id:
-            _turn_spec_entry = _session_spec_cache.get(conv_id) or _session_root_spec_cache.get(
-                conv_id
-            )
+            if _turn_spec_entry is None:
+                _turn_spec_entry = _session_spec_cache.get(
+                    conv_id
+                ) or _session_root_spec_cache.get(conv_id)
             _turn_spec = _unwrap_resolved_spec(_turn_spec_entry)
             if _turn_spec is None and spec_resolver is not None:
                 generation = _session_cache_generation(conv_id)
@@ -6990,25 +7265,8 @@ def create_runner_app(
                 return
 
             if _eager_spec_error is not None:
-                _err_type, _err_msg = _eager_spec_error
-                _error = {
-                    "message": _err_msg,
-                    "type": _err_type,
-                    "undelivered": True,
-                }
-                _fail = _response_failed_payload(
-                    _error,
-                    input_identity=turn_input_identity,
-                )
-                _publish_event(conv_id, _fail)
-                _on_proxy_stream_end(
-                    conv_id,
-                    error=_error,
-                )
-                yield _response_failed_event(
-                    _error,
-                    input_identity=turn_input_identity,
-                )
+                async for failure in failed_spec_stream(*_eager_spec_error):
+                    yield failure
                 return
 
             # Compose instructions for direct-stream turns (dispatch is None;
@@ -7016,7 +7274,11 @@ def create_runner_app(
             _instr_body = body
             if dispatch is None:
                 with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
-                    _instr_entry_ds = await _resolve_session_spec_entry(conv_id)
+                    _instr_entry_ds = (
+                        selected_spec_entry
+                        if selected_spec_entry is not None
+                        else await _resolve_session_spec_entry(conv_id)
+                    )
                     _instr_spec_ds = _unwrap_resolved_spec(_instr_entry_ds)
                     if _instr_spec_ds is not None:
                         _per_req_instr = cast(str | None, body.get("instructions"))
@@ -7448,7 +7710,7 @@ def create_runner_app(
                                 if is_action_required(event):
                                     tool_name = get_tool_name(event)
                                     is_mcp = tool_name in _mcp_tool_names
-                                    _spec_for_dispatch_hint = _unwrap_resolved_spec(
+                                    _spec_for_dispatch_hint = _turn_spec or _unwrap_resolved_spec(
                                         _session_spec_cache.get(conv_id)
                                     )
                                     _is_spec_local = _is_spec_local_native_python_tool(
@@ -7557,9 +7819,7 @@ def create_runner_app(
                                                     ),
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
-                                                    effective_harness=_session_harness_name(
-                                                        conv_id
-                                                    ),
+                                                    effective_harness=harness_name,
                                                     wake_on_async_result=_wake_on_async_result,
                                                     caller_user_id=(
                                                         _caller_user_id
@@ -8296,6 +8556,8 @@ def create_runner_app(
             )
             if not _had_live_turn:
                 _settle_stop_without_turn(conversation_id)
+            else:
+                await _settle_codex_native_stop(conversation_id)
             return Response(status_code=204)
 
         if body_type == "external_session_status":
@@ -8487,6 +8749,8 @@ def create_runner_app(
             )
             if not _had_live_turn:
                 _settle_stop_without_turn(conversation_id)
+            else:
+                await _settle_codex_native_stop(conversation_id)
             return Response(status_code=204)
 
         if body_type == "effort_change":
@@ -8840,16 +9104,17 @@ def create_runner_app(
             _session_workspace_cache[session_id] = snapshot.workspace
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
-        if session_id in _session_spec_cache:
-            return _session_spec_cache[session_id]
+        if (cached_entry := _gated_session_spec_entry(session_id)) is not None:
+            return cached_entry
         if spec_resolver is None:
             _session_spec_cache[session_id] = None
+            _session_spec_start_harness.pop(session_id, None)
             return None
         lock = _session_spec_locks.setdefault(session_id, asyncio.Lock())
         generation = _session_cache_generation(session_id)
         async with lock:
-            if session_id in _session_spec_cache:
-                return _session_spec_cache[session_id]
+            if (cached_entry := _gated_session_spec_entry(session_id)) is not None:
+                return cached_entry
             snapshot = await _session_snapshot(session_id)
             if not snapshot.ok:
                 raise OmnigentError(
@@ -8892,8 +9157,16 @@ def create_runner_app(
                     else:
                         spec_entry = sub_entry
                         _session_sub_agent_resolved[session_id] = True
+            spec = _unwrap_resolved_spec(spec_entry)
+            harness: str | None = None
+            if spec is not None:
+                harness = cast(str, _session_harness_name(session_id, spec=spec))
+                spec = await _apply_agent_start_gate(spec, harness)
+                spec_entry = _rewrap_like(spec_entry, spec, _resolved_spec_workdir(spec_entry))
             if _session_cache_generation_is_current(session_id, generation):
                 _session_spec_cache[session_id] = spec_entry
+                if harness is not None:
+                    _session_spec_start_harness[session_id] = (spec_entry, harness)
             return spec_entry
 
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
@@ -9197,6 +9470,7 @@ def create_runner_app(
 
     def _clear_session_agent_caches(session_id: str) -> None:
         _session_spec_cache.pop(session_id, None)
+        _session_spec_start_harness.pop(session_id, None)
         _session_root_spec_cache.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_agent_revisions.pop(session_id, None)
@@ -9208,6 +9482,7 @@ def create_runner_app(
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
+        _session_tool_schemas_routing.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
@@ -9370,6 +9645,7 @@ def create_runner_app(
         _session_harness_name=_session_harness_name,
         _session_inboxes=_session_inboxes,
         _session_runtime_cwd=_session_runtime_cwd,
+        _session_explicit_workspace=_session_explicit_workspace,
         _session_spec_cache=_session_spec_cache,
         filesystem_registry=filesystem_registry,
         mcp_execution_registry=mcp_execution_registry,
@@ -9501,6 +9777,7 @@ def create_runner_app(
         )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
+            BACKGROUND_SHELL_PANE_HOLD_S,
             PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
             PaneRef,
@@ -9568,6 +9845,17 @@ def create_runner_app(
             return False
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
+            conv_id = pane.conversation_id
+            if await _native_pane_busy_without_shell(pane):
+                _background_shell_pane_hold_since.pop(conv_id, None)
+                return True
+            if conv_id not in _sessions_with_background_shell:
+                return False
+            now = time.monotonic()
+            held_since = _background_shell_pane_hold_since.setdefault(conv_id, now)
+            return now - held_since < BACKGROUND_SHELL_PANE_HOLD_S
+
+        async def _native_pane_busy_without_shell(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)
@@ -9727,7 +10015,35 @@ async def _resolve_harness_config(
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
     resource_registry: SessionResourceRegistry | None = None,
+    effective_spec_entry: _SpecEntry | None = None,
 ) -> tuple[str, dict[str, str] | None]:
+    """Resolve worker settings for callers that do not dispatch a conversation turn."""
+    launch = await _resolve_harness_launch(
+        agent_id=agent_id,
+        spec_resolver=spec_resolver,
+        session_id=session_id,
+        model_override=model_override,
+        harness_override=harness_override,
+        sub_agent_name=sub_agent_name,
+        cwd=cwd,
+        resource_registry=resource_registry,
+        effective_spec_entry=effective_spec_entry,
+    )
+    return launch.harness, launch.spawn_env
+
+
+async def _resolve_harness_launch(
+    *,
+    agent_id: str | None,
+    spec_resolver: SpecResolver | None,
+    session_id: str | None = None,
+    model_override: str | None = None,
+    harness_override: str | None = None,
+    sub_agent_name: str | None = None,
+    cwd: Path | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
+    effective_spec_entry: _SpecEntry | None = None,
+) -> _HarnessLaunch:
     """Resolve harness type + spawn-env from the agent spec.
 
     :param agent_id: Agent id to resolve the spec for.
@@ -9749,13 +10065,17 @@ async def _resolve_harness_config(
         so the spawn-env advertises the child's bundle rather than the
         parent's. ``None`` for top-level sessions.
     :param cwd: Runtime working directory for harnesses that need it.
-    :returns: ``(harness, spawn_env)`` derived from the resolved spec.
+    :param effective_spec_entry: Trusted selected spec with launch transforms applied.
+    :returns: Selected harness, spawn environment, and the gated spec that owns them.
     :raises RuntimeError: When a spec_resolver is configured but the spec
         cannot be resolved. Callers catch this to surface a clean error
         rather than spawning an invalid harness subprocess.
     """
-    if agent_id and spec_resolver:
+    spec_entry = effective_spec_entry
+    if spec_entry is None and agent_id and spec_resolver:
         spec_entry = await spec_resolver(agent_id, session_id)
+    if spec_entry is not None:
+        needs_start_gate = effective_spec_entry is None
         spec = _unwrap_resolved_spec(spec_entry)
         workdir = _resolved_spec_workdir(spec_entry)
         if spec is not None:
@@ -9767,19 +10087,24 @@ async def _resolve_harness_config(
             # The child's bundle dir comes from the same resolution, so the
             # spawn-env below advertises the child's bundle — not the
             # parent's, whose skills and tools the child has no claim to.
-            if sub_agent_name:
+            if sub_agent_name and (effective_spec_entry is None or spec.name != sub_agent_name):
                 sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
                     spec_entry, sub_agent_name
                 )
                 if sub_entry is None:
                     _warn_unresolved_sub_agent(session_id, sub_agent_name)
                 else:
-                    spec = _unwrap_resolved_spec(sub_entry)
+                    sub_spec = _unwrap_resolved_spec(sub_entry)
+                    needs_start_gate = needs_start_gate or sub_spec is not spec
+                    spec_entry = sub_entry
+                    spec = sub_spec
                     workdir = _resolved_spec_workdir(sub_entry)
             raw_harness = (
                 harness_override or spec.executor.config.get("harness") or spec.executor.type
             )
             harness = canonicalize_harness(raw_harness) or raw_harness
+            if needs_start_gate:
+                spec = await _apply_agent_start_gate(spec, harness)
             spawn_env = _build_spawn_env_from_spec(
                 spec,
                 raw_harness,
@@ -9789,7 +10114,7 @@ async def _resolve_harness_config(
                 session_id=session_id,
                 resource_registry=resource_registry,
             )
-            return harness, spawn_env
+            return _HarnessLaunch(harness, spawn_env, _rewrap_like(spec_entry, spec, workdir))
 
     if spec_resolver is not None:
         # spec_resolver is configured but either agent_id was not provided or
@@ -9807,7 +10132,7 @@ async def _resolve_harness_config(
 
     # Fallback for tests that register a custom harness in _HARNESS_MODULES
     # (spec_resolver is None in the test runner).
-    return "runner-test-default", None
+    return _HarnessLaunch("runner-test-default", None, None)
 
 
 # The per-harness env var that carries the model into the spawn-env (SDK /
@@ -9835,6 +10160,19 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "copilot": "HARNESS_COPILOT_MODEL",
 }
 _HARNESS_MODEL_ENV_KEY = model_env_keys()
+
+
+def _compatible_stream_spawn_env(harness: str, value: object) -> dict[str, str]:
+    """Keep legacy model overrides without accepting launcher or policy settings."""
+    if not isinstance(value, dict):
+        raise ValueError("spawn_env must be an object")
+    model_key = _HARNESS_MODEL_ENV_KEY.get(canonicalize_harness(harness) or harness)
+    if model_key is None or model_key not in value:
+        return {}
+    model = value[model_key]
+    if not isinstance(model, str) or "\0" in model:
+        raise ValueError("spawn_env model override must be a string without NUL characters")
+    return {model_key: model}
 
 
 class _SpawnEnvBuilder(Protocol):
@@ -9916,9 +10254,9 @@ def _build_spawn_env_from_spec(
     :param session_id: Session/conversation id, used to hand the harness
         this session's subagent-routing endpoint. ``None`` omits it.
     :param model_override: The per-session ``/model`` override, e.g.
-        ``"claude-sonnet-4-6"``, or ``None``. When set, it overrides the
-        ``HARNESS_<H>_MODEL`` the builder baked in (spec model / provider
-        default / catalog default) so ``/model`` actually takes effect on
+        ``"claude-sonnet-4-6"``, or ``None``. When set, it selects the effective
+        executor model before provider defaults or catalog discovery, so
+        ``/model`` actually takes effect on
         the SDK / in-process harnesses. (The native CLIs honor the override
         via ``--model`` in :func:`_build_claude_native_base_args`; the
         SDK harnesses have no such arg, so the override must land in the
@@ -9939,7 +10277,10 @@ def _build_spawn_env_from_spec(
         )
     from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
 
-    validate_copy_on_write_harness(getattr(spec, "os_env", None), harness)
+    try:
+        validate_copy_on_write_harness(getattr(spec, "os_env", None), harness)
+    except ValueError as exc:
+        raise _CopyOnWriteSetupError(str(exc)) from exc
     effective_spec = spec
     from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
 
@@ -9964,8 +10305,7 @@ def _build_spawn_env_from_spec(
     if model_override is not None:
         executor = getattr(spec, "executor", None)
         if (
-            harness == "acp"
-            and not has_inference_bindings
+            not has_inference_bindings
             and dataclasses.is_dataclass(spec)
             and dataclasses.is_dataclass(executor)
         ):
@@ -10074,21 +10414,24 @@ def _build_spawn_env_from_spec(
         and spec.os_env.sandbox is not None
         and any(p.copy_on_write for p in spec.os_env.sandbox.write_path_specs)
     ):
-        if resource_registry is None or session_id is None:
-            raise ValueError("copy_on_write harnesses require a session resource registry")
         from omnigent.sandbox.copy_on_write import (
             SHARED_ENVIRONMENT_VAR,
             export_shared_environment,
         )
 
-        environment = resource_registry.resolve_environment(
-            session_id, DEFAULT_ENVIRONMENT_ID, spec
-        )
-        policy = getattr(environment, "sandbox", None)
-        if policy is None:
-            raise ValueError("copy_on_write requires a local sandbox environment")
-        environment.prepare_sandbox(policy)
-        env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
+        try:
+            if resource_registry is None or session_id is None:
+                raise ValueError("copy_on_write harnesses require a session resource registry")
+            environment = resource_registry.resolve_environment(
+                session_id, DEFAULT_ENVIRONMENT_ID, spec
+            )
+            policy = getattr(environment, "sandbox", None)
+            if policy is None:
+                raise ValueError("copy_on_write requires a local sandbox environment")
+            environment.prepare_sandbox(policy)
+            env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
+        except ValueError as exc:
+            raise _CopyOnWriteSetupError(str(exc)) from exc
 
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a
@@ -10143,21 +10486,21 @@ def _build_spawn_env_from_spec(
 # ── Agent-start policy gate ────────────────────────────────────────────
 
 
-async def _evaluate_agent_start_gate(
+async def _apply_agent_start_gate(
     spec: AgentSpec,
     harness: str,
-) -> Mapping[str, object] | None:
-    """Collect the policies' launch transforms for the synthetic start probe.
+) -> AgentSpec:
+    """Apply launch-policy transforms before deriving a worker's spawn environment.
 
-    Returns the composed replacement payload (``enforce_sandbox`` forcing a
-    sandbox) or ``None``. DENY/ASK verdicts never gate agent start; see
+    Preserve the declared spec so non-idempotent transforms apply once per
+    resolution. DENY/ASK verdicts never gate agent start; see
     :meth:`RunnerToolPolicyGate.evaluate_agent_start`.
     """
     from omnigent.runner.policy import RunnerToolPolicyGate
 
     gate = RunnerToolPolicyGate.from_spec(spec)
     if gate.is_empty:
-        return None
+        return spec
 
     sandbox_dict: _JsonObject | None = None
     if spec.os_env is not None and spec.os_env.sandbox is not None:
@@ -10165,13 +10508,17 @@ async def _evaluate_agent_start_gate(
 
         sandbox_dict = cast(_JsonObject, encode_sandbox_spec(spec.os_env.sandbox))
 
-    return await gate.evaluate_agent_start(
+    start_data = await gate.evaluate_agent_start(
         {
             "agent_name": getattr(spec, "name", None) or "",
             "harness": harness,
             "sandbox": sandbox_dict,
         },
     )
+    if start_data is not None:
+        spec = dataclasses.replace(spec, os_env=copy.deepcopy(spec.os_env))
+        _apply_sandbox_override_from_start_data(spec, start_data)
+    return spec
 
 
 def _apply_sandbox_override_from_start_data(

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { planOpen, type OpenState } from "../planOpen";
 import {
+  allPullRequestsChosen,
+  changesComparisonShown,
   changesFileInNewTab,
   changesOverview,
   fileTabFileChosen,
@@ -84,13 +86,62 @@ describe("Files tab", () => {
 });
 
 describe("Changes tab", () => {
-  it("goes back to the overview from a file", () => {
+  it("goes back to the overview from a file, keeping the visit's comparison", () => {
     expect(changesOverview({ kind: "changes", path: "a.go" })).toEqual({
       type: "navigate",
       place: { kind: "changes" },
       replace: false,
     });
     expect(changesOverview({ kind: "changes" })).toEqual({ type: "none" });
+    const comparison = { kind: "saved", intent: "branch-point" } as const;
+    expect(changesOverview({ kind: "changes", path: "a.go", comparison })).toMatchObject({
+      place: { kind: "changes", comparison },
+    });
+  });
+
+  it("records a comparison the person picked as a step, and any other in place", () => {
+    const shown = { kind: "typed", base: "v1", head: "" } as const;
+    const current = { kind: "changes", path: "a.go" } as const;
+    expect(changesComparisonShown(current, shown, true)).toEqual({
+      type: "navigate",
+      place: { kind: "changes", path: "a.go", comparison: shown },
+      replace: false,
+    });
+    expect(changesComparisonShown(current, shown, false)).toMatchObject({
+      replace: true,
+    });
+  });
+
+  it("keeps the folder whose review showed the comparison, and drops it for the workspace", () => {
+    const shown = { kind: "saved", intent: "head" } as const;
+    const worktree = "/repo/.worktrees/feature";
+    const inFolder = changesComparisonShown({ kind: "changes" }, shown, true, worktree);
+    expect(inFolder).toMatchObject({
+      place: { kind: "changes", comparison: shown, comparisonRoot: worktree },
+    });
+    const backHome = changesComparisonShown(
+      { kind: "changes", comparison: shown, comparisonRoot: worktree },
+      shown,
+      true,
+    );
+    expect(backHome).toEqual({
+      type: "navigate",
+      place: { kind: "changes", comparison: shown },
+      replace: false,
+    });
+    // A file's own tab and the overview keep the visit's folder with its comparison.
+    const visit = {
+      kind: "changes" as const,
+      path: "a.go",
+      comparison: shown,
+      comparisonRoot: worktree,
+    };
+    expect(changesOverview({ ...visit })).toMatchObject({
+      place: { comparison: shown, comparisonRoot: worktree },
+    });
+    expect(changesFileInNewTab({ ...visit }, "b.go", { background: false })).toMatchObject({
+      link: { place: { path: "b.go", comparison: shown, comparisonRoot: worktree } },
+    });
   });
 });
 
@@ -116,6 +167,14 @@ describe("pull request tab", () => {
       replace: false,
     });
     expect(pullRequestSectionChosen(page, "summary")).toEqual({ type: "none" });
+  });
+
+  it("shows the session's list of pull requests in its own tab, not this one", () => {
+    expect(allPullRequestsChosen()).toEqual({
+      type: "open",
+      link: { place: { kind: "pulls" } },
+      options: { opener: "user", disposition: "focus" },
+    });
   });
 });
 
@@ -182,6 +241,24 @@ describe("changesFileInNewTab", () => {
       type: "open",
       link: { place: { kind: "changes", path: "b.go", fileTab: true } },
       options: { opener: "user", disposition: "focus", reuse: "same-place", keepSelection: false },
+    });
+  });
+
+  it("gives the file the comparison picked over a linked range, not the range", () => {
+    const lastCommit = { kind: "saved", intent: "head" } as const;
+    const picked = changesComparisonShown(
+      { kind: "changes", range: { base: "v1.2" } },
+      lastCommit,
+      true,
+    );
+    expect(picked).toEqual({
+      type: "navigate",
+      place: { kind: "changes", comparison: lastCommit },
+      replace: false,
+    });
+    const place = { kind: "changes", comparison: lastCommit } as const;
+    expect(changesFileInNewTab(place, "b.go", { background: true })).toMatchObject({
+      link: { place: { kind: "changes", path: "b.go", fileTab: true, comparison: lastCommit } },
     });
   });
 });

@@ -118,3 +118,27 @@ it.each(["hidden", "blurred", "elsewhere"] as const)(
     mobileTarget.remove();
   },
 );
+
+it("gives the host and its desktop place no box in the contents layout", () => {
+  const mobileTarget = document.createElement("div");
+  document.body.appendChild(mobileTarget);
+  const slot = (mobile: boolean) => (
+    <div data-testid="row">
+      <ResponsiveViewerSlot mobile={mobile} mobileTarget={mobileTarget} layout="contents">
+        <aside>Sidebar</aside>
+      </ResponsiveViewerSlot>
+    </div>
+  );
+  const { rerender } = render(slot(false));
+  const sidebar = screen.getByText("Sidebar");
+  const host = sidebar.parentElement!;
+  expect(host).toHaveClass("contents");
+  expect(host.parentElement).toHaveClass("contents");
+  expect(host.parentElement!.parentElement).toBe(screen.getByTestId("row"));
+
+  rerender(slot(true));
+  expect(screen.getByText("Sidebar")).toBe(sidebar);
+  expect(host.parentElement).toBe(mobileTarget);
+  cleanup();
+  mobileTarget.remove();
+});

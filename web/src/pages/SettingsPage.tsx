@@ -42,6 +42,8 @@ import {
   useRef,
   useState,
 } from "react";
+import { paneCornersSetting } from "@/shell/settingsCommands";
+import { usePaneCorners } from "@/shell/useFloatingPanes";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import {
@@ -61,13 +63,10 @@ import {
   FoldVerticalIcon,
   MessagesSquareIcon,
   MinusIcon,
-  MonitorIcon,
-  MoonIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   PinIcon,
   PlusIcon,
-  SunIcon,
   SquareCheckIcon,
   SquareIcon,
   TerminalIcon,
@@ -112,8 +111,10 @@ import {
   ADMIN_VIEW_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_IN_DESKTOP_APP_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  PROACTIVE_AGENT_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
@@ -127,6 +128,7 @@ import {
   HIDE_UNCONFIGURED_HARNESSES_ENTRY,
   PEER_SESSION_MESSAGES_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
+  PANE_CORNERS_ENTRY,
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
@@ -162,6 +164,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { BrowserAgentToolsSettingsGroup } from "@/components/BrowserPane/agentTools/BrowserAgentToolsSettingsGroup";
+import { TrustedRemoteHostsSettingsGroup } from "@/components/BrowserPane/agentTools/TrustedRemoteHostsSettingsGroup";
 import {
   Select,
   SelectContent,
@@ -180,7 +183,6 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
-import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, signOutOfBrowserSession } from "@/lib/accountsApi";
 import {
   beginGithubConnect,
@@ -260,7 +262,6 @@ import {
   writeCodeBlockWordWrap,
 } from "@/lib/codeWrapPreferences";
 import {
-  readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
   writeTerminalThemeMode,
   type TerminalThemeMode,
@@ -326,7 +327,13 @@ import {
   type DefaultWorkspaceTab,
 } from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
-import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { useAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  THEME_MODE_OPTIONS,
+  TERMINAL_THEME_OPTIONS,
+  themeModeLabel,
+} from "@/components/theme/themeModeOptions";
+import { useTerminalThemeMode } from "@/components/theme/useTerminalIsDark";
 import {
   readOpenSubagentsInPanel,
   writeOpenSubagentsInPanel,
@@ -359,14 +366,16 @@ import {
   notifyHiddenPickerAgentsChanged,
 } from "@/lib/pickerEntryVisibility";
 import {
-  applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
-  readThemePalette,
   type ThemeSelection,
-  writeThemePalette,
 } from "@/lib/themePalette";
+import {
+  commitThemePalette,
+  reloadThemePalette,
+  useThemePaletteSelection,
+} from "@/store/themePalette";
 import {
   applyCustomTheme,
   createCustomThemeFromPalette,
@@ -391,10 +400,16 @@ import {
   resetCliPath,
   supportsBrowser,
   supportsGlobalShortcut,
+  supportsWidenWindowForRightSidebar,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import {
+  desktopAppHandoffSupported,
+  readOpenInDesktopApp,
+  writeOpenInDesktopApp,
+} from "@/lib/desktopAppHandoff";
 import { readOpenLinksInApp, writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
 import { cn } from "@/lib/utils";
@@ -404,8 +419,10 @@ import {
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
+import { SearchableShortcutsList } from "./settings/SearchableShortcutsList";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
+import { WidenWindowForRightSidebarControl } from "./settings/WidenWindowForRightSidebarControl";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -530,18 +547,6 @@ function Section({
   );
 }
 
-const themeCards: { mode: ThemeMode; label: string; icon: typeof SunIcon }[] = [
-  { mode: "system", label: "System", icon: MonitorIcon },
-  { mode: "light", label: "Light", icon: SunIcon },
-  { mode: "dark", label: "Dark", icon: MoonIcon },
-];
-
-const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof SunIcon }[] = [
-  { mode: "auto", label: "Match app", icon: MonitorIcon },
-  { mode: "light", label: "Light", icon: SunIcon },
-  { mode: "dark", label: "Dark", icon: MoonIcon },
-];
-
 const transcriptViewCards: {
   value: TranscriptViewDefault;
   label: string;
@@ -662,11 +667,11 @@ function ModeControl() {
           value={mode}
           onSelect={(next) => setTheme(next)}
           componentId="settings.appearance.theme_mode"
-          items={themeCards.map((card) => ({
-            value: card.mode,
-            testId: `theme-${card.mode}`,
-            label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
-            icon: card.icon,
+          items={THEME_MODE_OPTIONS.map((option) => ({
+            value: option.mode,
+            testId: `theme-${option.mode}`,
+            label: themeModeLabel(option.mode, followsHost),
+            icon: option.icon,
           }))}
         />
       </SettingsOwner>
@@ -676,11 +681,7 @@ function ModeControl() {
 
 /** Terminal light/dark/match-app theme — its own section. */
 function TerminalThemeControl() {
-  const [mode, setMode] = useState(() => readTerminalThemeMode());
-  const choose = useCallback((next: TerminalThemeMode) => {
-    setMode(next);
-    writeTerminalThemeMode(next);
-  }, []);
+  const mode = useTerminalThemeMode();
   return (
     <SettingsItem entry={TERMINAL_THEME_ENTRY} className="flex items-center justify-between gap-4">
       <SettingsEntryLabel entry={TERMINAL_THEME_ENTRY} className="flex-1" />
@@ -688,17 +689,65 @@ function TerminalThemeControl() {
         <IconSegmentedControl<TerminalThemeMode>
           labelledBy={settingsLabelId(TERMINAL_THEME_ENTRY)}
           value={mode}
-          onSelect={choose}
+          onSelect={writeTerminalThemeMode}
           componentId="settings.appearance.terminal_theme"
-          items={terminalThemeCards.map((card) => ({
-            value: card.mode,
-            testId: `terminal-theme-${card.mode}`,
-            label: card.label,
-            icon: card.icon,
+          items={TERMINAL_THEME_OPTIONS.map((option) => ({
+            value: option.mode,
+            testId: `terminal-theme-${option.mode}`,
+            label: option.label,
+            icon: option.icon,
           }))}
         />
       </SettingsOwner>
     </SettingsItem>
+  );
+}
+
+/** Floating panes or sharp corners on this device; the same setting ⌘K's Pane corners row offers. */
+function PaneCornersControl() {
+  const paneCorners = usePaneCorners();
+  const setting = paneCornersSetting(paneCorners);
+  const current = setting.choices.find((choice) => choice.value === setting.current);
+  return (
+    <SettingsItem entry={PANE_CORNERS_ENTRY} className="flex items-center justify-between gap-4">
+      <SettingsEntryLabel entry={PANE_CORNERS_ENTRY} className="flex-1" />
+      <SettingsOwner entry={PANE_CORNERS_ENTRY}>
+        <Select
+          value={setting.current}
+          onValueChange={(next) => void setting.choose(next)}
+          componentId="settings.appearance.pane_corners"
+          valueHasNoPii
+        >
+          <SelectTrigger
+            {...settingsControlProps(PANE_CORNERS_ENTRY)}
+            data-testid="pane-corners-select"
+            className="w-full sm:w-56"
+          >
+            <SelectValue>{current?.label}</SelectValue>
+          </SelectTrigger>
+          <SelectContent {...settingsOverlayProps(PANE_CORNERS_ENTRY)}>
+            {setting.choices.map((choice) => (
+              <SelectItem
+                key={choice.value}
+                value={choice.value}
+                data-testid={`pane-corners-${choice.value}`}
+              >
+                {choice.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </SettingsOwner>
+    </SettingsItem>
+  );
+}
+
+function PaneCornersRow() {
+  if (!usePaneCorners().available) return null;
+  return (
+    <div className="mt-4 border-t border-border pt-4">
+      <PaneCornersControl />
+    </div>
   );
 }
 
@@ -901,15 +950,14 @@ function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now
   // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
   const isDark = useResolvedThemeMode() === "dark";
-  const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
+  // Shared with the theme picker, so a palette chosen there shows here.
+  const selection = useThemePaletteSelection();
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
 
   const choose = useCallback(
     (next: ThemeSelection) => {
       if (next === "custom") applyCustomTheme(customTheme);
-      setSelection(next);
-      writeThemePalette(next);
-      applyThemePalette(next);
+      commitThemePalette(next);
     },
     [customTheme],
   );
@@ -935,9 +983,7 @@ function ColorThemeControl() {
       setCustomTheme(next);
       writeCustomTheme(next);
       applyCustomTheme(next);
-      setSelection("custom");
-      writeThemePalette("custom");
-      applyThemePalette("custom");
+      commitThemePalette("custom");
     },
     [customTheme, selection],
   );
@@ -1249,8 +1295,7 @@ function AppearanceSection() {
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
 
-    writeThemePalette(DEFAULT_PALETTE);
-    applyThemePalette(DEFAULT_PALETTE);
+    commitThemePalette(DEFAULT_PALETTE);
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
@@ -1339,7 +1384,7 @@ function AppearanceSection() {
       if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
       applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
-      applyThemePalette(readThemePalette());
+      reloadThemePalette();
       applyCustomTheme(readCustomTheme());
 
       setIsImportDialogOpen(false);
@@ -1361,6 +1406,7 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <ColorThemeControl />
             </div>
+            <PaneCornersRow />
           </SettingsGroup>
 
           <SettingsGroup title="Chat defaults" testId="settings-group-chat">
@@ -1929,18 +1975,14 @@ function DatabricksIntegrationControl() {
  * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
-  const [value, setValue] = useState(() => readAlwaysSteer());
-  const toggle = useCallback((next: boolean) => {
-    setValue(next);
-    writeAlwaysSteer(next);
-  }, []);
+  const value = useAlwaysSteer();
   return (
     <SettingsItem entry={ALWAYS_STEER_ENTRY} className="flex items-start justify-between gap-6">
       <SettingsEntryLabel entry={ALWAYS_STEER_ENTRY} className="flex-1" />
       <Switch
         {...settingsControlProps(ALWAYS_STEER_ENTRY)}
         checked={value}
-        onCheckedChange={toggle}
+        onCheckedChange={writeAlwaysSteer}
         data-testid="always-steer-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.always_steer"
@@ -2030,6 +2072,35 @@ function OpenLinksInAppControl() {
         data-testid="open-links-in-app-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.open_links_in_app"
+      />
+    </SettingsItem>
+  );
+}
+
+/**
+ * Whether a conversation link opened in this browser moves to the running
+ * desktop app. Ordinary browsers only; off until the user accepts the page's offer.
+ */
+function OpenInDesktopAppControl() {
+  const [enabled, setEnabled] = useState(readOpenInDesktopApp);
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenInDesktopApp(next);
+  }, []);
+
+  return (
+    <SettingsItem
+      entry={OPEN_IN_DESKTOP_APP_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={OPEN_IN_DESKTOP_APP_ENTRY} className="flex-1" />
+      <Switch
+        {...settingsControlProps(OPEN_IN_DESKTOP_APP_ENTRY)}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-in-desktop-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_in_desktop_app"
       />
     </SettingsItem>
   );
@@ -2187,7 +2258,7 @@ function ProactiveAgentGroup() {
   if (!available) return null;
   return (
     <SettingsGroup title={PROACTIVE_AGENT_DISPLAY_NAME} testId="settings-group-proactive-agent">
-      <ProactiveAgentSettingControl scope="me" />
+      <ProactiveAgentSettingControl scope="me" entry={PROACTIVE_AGENT_ENTRY} />
     </SettingsGroup>
   );
 }
@@ -2195,6 +2266,8 @@ function ProactiveAgentGroup() {
 function GeneralSection() {
   const info = useServerInfo();
   const titleInstructions = info !== "loading" && info.session_title_instructions === true;
+  const globalShortcut = supportsGlobalShortcut();
+  const widenWindowForRightSidebar = supportsWidenWindowForRightSidebar();
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-6">
@@ -2229,14 +2302,25 @@ function GeneralSection() {
             <OpenLinksInAppControl />
           </SettingsGroup>
         )}
+        {desktopAppHandoffSupported() && (
+          <SettingsGroup title="Conversation links" testId="settings-group-conversation-links">
+            <OpenInDesktopAppControl />
+          </SettingsGroup>
+        )}
         <BrowserAgentToolsSettingsGroup />
-        {supportsGlobalShortcut() && (
+        <TrustedRemoteHostsSettingsGroup />
+        {(globalShortcut || widenWindowForRightSidebar) && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
-            <GlobalShortcutControl />
-            {isFeatureEnabled(info, "floating_composer") && (
+            {globalShortcut && <GlobalShortcutControl />}
+            {globalShortcut && isFeatureEnabled(info, "floating_composer") && (
               // Empty, and hidden, unless the shell can change the panel's shortcut by id.
               <div className="mt-4 border-t border-border pt-4 empty:hidden">
                 <GlobalShortcutControl shortcutId="floatingComposer" />
+              </div>
+            )}
+            {widenWindowForRightSidebar && (
+              <div className={cn(globalShortcut && "mt-4 border-t border-border pt-4")}>
+                <WidenWindowForRightSidebarControl />
               </div>
             )}
           </SettingsGroup>
@@ -2676,7 +2760,7 @@ function StepperButton({
 function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList variant="settings" />
+      <SearchableShortcutsList />
     </Section>
   );
 }

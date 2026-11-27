@@ -10,15 +10,18 @@ const mocks = vi.hoisted(() => ({
   retry: vi.fn(),
   showLastCommit: vi.fn(),
   compareAgain: vi.fn(),
+  compareRevisions: vi.fn(),
+  commands: vi.fn(() => [] as unknown[]),
 }));
 
 vi.mock("@/hooks/useWorkingCopyChanges", () => ({
   useWorkingCopyChanges: mocks.changes,
-  useWorkingCopyBaseCommands: () => [],
+  useWorkingCopyBaseCommands: () => mocks.commands(),
   workingCopyComparisonActions: () => ({
     retry: mocks.retry,
     showLastCommit: mocks.showLastCommit,
     compareAgain: mocks.compareAgain,
+    compareRevisions: mocks.compareRevisions,
   }),
 }));
 vi.mock("./workingCopyBase", () => ({ useWorkingCopyBase: mocks.base }));
@@ -40,6 +43,7 @@ function changes(overrides: Partial<WorkingCopyChanges> = {}): WorkingCopyChange
     generation: 3,
     permitted: true,
     accessEpoch: 0,
+    choices: 0,
     readable: true,
     ...overrides,
   };
@@ -94,5 +98,27 @@ describe("useLocalComparison", () => {
     );
     renderHook(() => useLocalComparison("s1", { active: true })).result.current.view.retry();
     expect(mocks.retry).toHaveBeenCalledOnce();
+  });
+
+  it("applies a comparison through the menu's own commands, only where the menu would", () => {
+    const run = vi.fn();
+    mocks.commands.mockReturnValue([
+      { id: "compare-head", label: "", name: "", unavailableReason: null, run },
+      { id: "compare-branch-point", label: "", name: "", unavailableReason: "No", run: vi.fn() },
+    ]);
+    mocks.base.mockReturnValue(null);
+    mocks.changes.mockReturnValue(changes({ revisionSupport: { kind: "checking" } }));
+    const { choice } = renderHook(() => useLocalComparison("s1", { active: true })).result.current;
+    const head = { kind: "saved", intent: "head" } as const;
+    const typed = { kind: "typed", base: "v1", head: "" } as const;
+    expect(choice.availability(head)).toBe("now");
+    expect(choice.availability({ kind: "saved", intent: "branch-point" })).toEqual({
+      unavailable: "No",
+    });
+    expect(choice.availability(typed)).toBe("later");
+    choice.choose(head);
+    expect(run).toHaveBeenCalledOnce();
+    choice.choose(typed);
+    expect(mocks.compareRevisions).toHaveBeenCalledWith({ base: "v1", head: "" });
   });
 });

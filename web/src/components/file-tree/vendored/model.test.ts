@@ -345,8 +345,11 @@ describe("git status", () => {
     const state = resolveFileTreeGitStatusState([
       { path: "src/components/Button.tsx", status: "modified" },
       { path: "build/", status: "ignored" },
+      { path: "lib/cache/", status: "ignored" },
+      { path: "docs/notes.log", status: "ignored" },
     ])!;
 
+    // Ignored entries aren't changes: `lib/` and `docs/` get no dot.
     expect([...state.directoriesWithChanges]).toEqual(["src/", "src/components/"]);
     expect(effectiveGitStatus(state, "src/components/Button.tsx", [])).toBe("modified");
     expect(effectiveGitStatus(state, "build/out.js", ["build/"])).toBe("ignored");

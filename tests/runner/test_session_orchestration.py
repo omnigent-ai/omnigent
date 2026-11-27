@@ -194,7 +194,10 @@ async def test_runner_disabled_message_never_contacts_server(monkeypatch):
                 conversation_id="manager",
             )
         )
-    assert result == {"error": "Messaging other sessions is disabled on this runner"}
+    assert result == {
+        "error": "Messaging other sessions is disabled on this runner",
+        "delivery": "refused",
+    }
 
 
 @pytest.mark.asyncio
@@ -449,7 +452,10 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
             server_client=client,
             conversation_id="manager",
         )
-    assert "do not automatically resend" in result
+    assert json.loads(result) == {
+        "error": "Delivery could not be confirmed; do not automatically resend",
+        "delivery": "unconfirmed",
+    }
     assert len(requests) == (2 if after_routing else 1)
 
 
@@ -497,6 +503,8 @@ async def test_same_host_first_task_failure_returns_created_session(status, monk
         assert result["initial_message"]["denied"] is True
     if status == "runner_disabled":
         assert "disabled on this runner" in result["initial_message"]["error"]
+    expected_delivery = "unconfirmed" if status == 502 else "refused"
+    assert result["initial_message"]["delivery"] == expected_delivery
     assert len(requests) == (1 if status == "runner_disabled" else 2)
 
 
@@ -565,6 +573,8 @@ async def test_independent_creation_uncertain_result_is_not_retried(
         assert "host_id" not in result
     assert "conversation_id" not in result
     assert len(requests) == 1
+    # A managed create outwaits a slow server before calling the result uncertain.
+    assert requests[0].extensions["timeout"]["read"] == (120.0 if placement == "managed" else 30.0)
 
 
 @pytest.mark.asyncio
@@ -713,7 +723,10 @@ async def test_message_destination_accepts_supported_session_ids(spelling):
             f"http://server/v1/sessions/{expected_id}/events"
         ]
     else:
-        assert result == {"error": "Provide a valid session_id (UUID or numeric managed ID)"}
+        assert result == {
+            "error": "Provide a valid session_id (UUID or numeric managed ID)",
+            "delivery": "refused",
+        }
         assert requests == []
 
 
@@ -739,7 +752,8 @@ async def test_message_content_validation_is_distinct_from_invalid_id(message):
             )
         )
     assert result == {
-        "error": f"Provide a non-blank message of 1–{SESSION_MESSAGE_MAX_CHARS} characters"
+        "error": f"Provide a non-blank message of 1–{SESSION_MESSAGE_MAX_CHARS} characters",
+        "delivery": "refused",
     }
 
 

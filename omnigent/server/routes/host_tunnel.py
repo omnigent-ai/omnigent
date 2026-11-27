@@ -238,10 +238,11 @@ def create_host_tunnel_router(
         2. Accept the WS upgrade.
         3. Receive the ``host.hello`` frame.
         4. Validate ``frame_protocol_version`` (strict-major).
-        5. Upsert in the ``hosts`` DB table.
-        6. Register in the :class:`HostRegistry`.
-        7. Start sender, receiver, and ping loops.
-        8. On disconnect: deregister, set offline in DB.
+        5. Refuse an older host while a newer one is live on the same id.
+        6. Upsert in the ``hosts`` DB table.
+        7. Register in the :class:`HostRegistry`.
+        8. Start sender, receiver, and ping loops.
+        9. On disconnect: deregister, set offline in DB.
         """
         # Legacy hosts dial in with ``host_<hex>`` — normalise to the stored
         # bare form. Malformed ids are refused here because WebSocket routes
@@ -426,6 +427,44 @@ def create_host_tunnel_router(
                 )
                 await _send_connection_error(ws, stage="protocol", error=error)
                 await ws.close(code=4002, reason=error)
+                return
+
+            stage = "duplicate_host"
+            # Server-provisioned sandboxes are replaced by the server itself.
+            newer = (
+                None
+                if managed_token is not None
+                else host_registry.live_newer_duplicate(
+                    host_id,
+                    frame,
+                    tunnel_owner,
+                    max_silence_s=PING_INTERVAL_S * PING_MISS_THRESHOLD,
+                )
+            )
+            if newer is not None:
+                _logger.warning(
+                    "Refusing host %s version %s (name=%s): version %s (name=%s) is "
+                    "already connected with this host id",
+                    host_id,
+                    frame.version,
+                    frame.name,
+                    newer.hello.version,
+                    newer.hello.name,
+                )
+                # Non-retryable, so a host that understands the frame exits
+                # instead of reconnecting.
+                await _send_connection_error(
+                    ws,
+                    stage="duplicate_host",
+                    error=(
+                        f"A newer Omnigent host ({newer.hello.version}, "
+                        f"{newer.hello.name!r}) is already connected with this "
+                        f"host id, so this older host ({frame.version}) was "
+                        "refused. Stop this host process; only one host per "
+                        "host id can be connected."
+                    ),
+                )
+                await ws.close(code=4009, reason="older duplicate host")
                 return
 
             stage = "registration"

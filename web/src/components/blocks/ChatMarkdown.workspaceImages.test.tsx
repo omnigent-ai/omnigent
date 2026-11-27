@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
+import { captureDownloads } from "@/test/downloadTestHelpers";
 import { BlockRenderer } from "./BlockRenderer";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
@@ -59,6 +60,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   URL.createObjectURL = ORIGINAL_CREATE;
   URL.revokeObjectURL = ORIGINAL_REVOKE;
   vi.unstubAllGlobals();
@@ -123,6 +125,44 @@ describe("assistant workspace markdown images", () => {
     },
   );
 
+  it("saves the loaded image from its download button without reading it again", async () => {
+    let respond: (response: Response) => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        }),
+    );
+    const clicked = captureDownloads();
+    renderMarkdown("![Screenshot](/workspace/project/shots/shot.png)");
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("button", { name: "Download image: shot.png" })).toBeNull();
+    respond(imageResponse());
+    fireEvent.click(await screen.findByRole("button", { name: "Download image: shot.png" }));
+
+    expect(createObjectURL.mock.calls[1][0]).toBe(createObjectURL.mock.calls[0][0]);
+    expect(clicked).toEqual([["blob:workspace-image-2", "shot.png"]]);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("still saves the image from an open preview after its message scrolls away", async () => {
+    const clicked = captureDownloads();
+    const result = renderMarkdown("![Screenshot](/workspace/project/shot.png)");
+    fireEvent.click(await screen.findByRole("button", { name: "Zoom image: Screenshot" }));
+
+    // A virtualized transcript unmounts the row, which revokes its object URL.
+    result.update("No image here");
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-image-1");
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Download image: shot.png" }),
+    );
+
+    expect(createObjectURL.mock.calls[1][0]).toMatchObject({ size: 8, type: "image/png" });
+    expect(clicked).toEqual([["blob:workspace-image-2", "shot.png"]]);
+  });
+
   it("loads a typed WebP blob when MIME metadata is absent", async () => {
     const content =
       "UklGRj4AAABXRUJQVlA4IDIAAADQAQCdASoBAAEAAUAmJaACdLoB+AADsAD+6SIf+8+fufP3" +
@@ -179,6 +219,75 @@ describe("assistant workspace markdown images", () => {
     await waitFor(() => expect(document.body.textContent).toMatch(/shot\.png|Image blocked/));
     expect(fetchMock).not.toHaveBeenCalled();
     expect(document.querySelector("img")).toBeNull();
+  });
+
+  it("opens an image outside the workspace in the file viewer only when clicked", async () => {
+    VIEWER.openFile.mockClear();
+    renderMarkdown("![Screenshot](/workspace/project-worktrees/worker/shot.png)");
+
+    const chip = await screen.findByRole("button", { name: "Open Screenshot (shot.png)" });
+    expect(VIEWER.openFile).not.toHaveBeenCalled();
+    fireEvent.click(chip);
+
+    expect(VIEWER.openFile).toHaveBeenCalledOnce();
+    expect(VIEWER.openFile).toHaveBeenCalledWith("/workspace/project-worktrees/worker/shot.png");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(document.querySelector("img")).toBeNull();
+  });
+
+  it("opens a workspace image whose preview failed in the file viewer", async () => {
+    VIEWER.openFile.mockClear();
+    let finishRequest!: (response: Response) => void;
+    const request = new Promise<Response>((resolve) => {
+      finishRequest = resolve;
+    });
+    fetchMock.mockReturnValue(request);
+    renderMarkdown("![Screenshot](/workspace/project/shots/shot.png)");
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await act(async () => {
+      finishRequest(new Response("missing", { status: 404 }));
+      await request;
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open Screenshot (shot.png)" }));
+
+    expect(VIEWER.openFile).toHaveBeenCalledOnce();
+    expect(VIEWER.openFile).toHaveBeenCalledWith("shots/shot.png");
+  });
+
+  it("names the open button by its filename when the image has no alt text", async () => {
+    renderMarkdown("![](/workspace/project-worktrees/worker/shot.png)");
+    expect(await screen.findByRole("button", { name: "Open shot.png" })).toHaveTextContent(
+      "shot.png",
+    );
+  });
+
+  it.each(["/workspace/project-worktrees/worker/.env", "diagram.svg"])(
+    "keeps a non-raster image path %s inert",
+    async (path) => {
+      renderMarkdown(`![Screenshot](${path})`);
+      expect(await screen.findByRole("img", { name: "Screenshot" })).toBeVisible();
+      expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
+    },
+  );
+
+  it.each(["../shot.png", "/workspace/project/../shot.png"])(
+    "keeps an unresolvable image path %s inert",
+    async (path) => {
+      renderMarkdown(`![Screenshot](${path})`);
+      expect(await screen.findByRole("img", { name: "Screenshot" })).toHaveTextContent("shot.png");
+      expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
+    },
+  );
+
+  it("keeps a side chat's unpreviewable image inert in its parent's viewer", async () => {
+    workspaceEnvironment.mockReturnValue({ data: { root: "/workspace/side", home: "/home/user" } });
+    fetchMock.mockResolvedValue(new Response("missing", { status: 404 }));
+    renderMarkdown("![Screenshot](/workspace/side/shot.png)", { scopedId: "session-side" });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    expect(await screen.findByRole("img", { name: "Screenshot" })).toHaveTextContent("shot.png");
+    expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
   });
 
   it("keeps images disabled for other markdown surfaces", async () => {

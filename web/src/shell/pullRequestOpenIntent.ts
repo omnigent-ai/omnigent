@@ -8,7 +8,7 @@ import type { KeyboardEvent, MouseEvent } from "react";
 import { OWNS_COMMAND_ENTER_ATTRIBUTE } from "@/hooks/useApproveHotkey";
 import { isMacPlatform } from "@/lib/hotkeys";
 import type { KeyChordInput } from "@/lib/shortcuts/chord";
-import { matchesShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 export type PullRequestOpenIntent = "here" | "background" | "foreground";
 

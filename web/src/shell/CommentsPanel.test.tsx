@@ -422,6 +422,16 @@ describe("CommentsPanel show more / less", () => {
   });
 });
 
+describe("CommentsPanel emoji shortcodes", () => {
+  it("shows :shortcode: emoji as glyphs and edits the body as typed", () => {
+    renderGated({ canEdit: true, comments: [makeCommentWithBody("c1", "Ship it :rocket:")] });
+    expect(screen.getByText("Ship it 🚀")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByRole("textbox")).toHaveValue("Ship it :rocket:");
+  });
+});
+
 // ── Resize affordance (desktop-only width handle) ───────────────────────────
 //
 // The panel is resizable on desktop via a left-edge drag handle, and stacks

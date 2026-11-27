@@ -341,17 +341,7 @@ def search_indexed_paths(
     q = query.strip().lower()
     if not q:
         return []
-    inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include]
-    exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude]
-
-    def kept(rel: str) -> bool:
-        parts = rel.split("/")
-        ancestors = ("/".join(parts[:i]) for i in range(1, len(parts) + 1))
-        if any(r.match(a) for a in ancestors for r in exc):
-            return False
-        if kept_path is not None and not kept_path(rel):
-            return False
-        return not inc or any(r.match(rel) for r in inc)
+    kept = indexed_path_filter(include, exclude, kept_path)
 
     # A directory whose path contains q is a prefix of every file under it,
     # so only files that match can contribute matching directories.
@@ -376,30 +366,76 @@ def search_indexed_paths(
     for rel in sorted(candidates):
         if not kept(rel):
             continue
-        st = _lstat_beneath(root, rel)
-        if st is None:
-            continue
-        if stat.S_ISLNK(st.st_mode):
-            if describe_link is not None and not candidates[rel]:
-                entries.append(describe_link(rel, st))
-                if len(entries) >= limit:
-                    break
-            continue
-        # A submodule is one index entry but a directory on disk.
-        is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)
-        entries.append(
-            FilesystemEntry(
-                id=rel,
-                name=rel.rsplit("/", 1)[-1],
-                path=rel,
-                type="directory" if is_dir else "file",
-                bytes=None if is_dir else st.st_size,
-                modified_at=int(st.st_mtime),
-            )
+        entry = describe_indexed_path(
+            root, rel, listed_directory=candidates[rel], describe_link=describe_link
         )
+        if entry is None:
+            continue
+        entries.append(entry)
         if len(entries) >= limit:
             break
     return entries
+
+
+def indexed_path_filter(
+    include: Sequence[str],
+    exclude: Sequence[str],
+    kept_path: Callable[[str], bool] | None = None,
+) -> Callable[[str], bool]:
+    """Whether an indexed path passes the globs and *kept_path*, as the walk's would.
+
+    :param include: Pre-split include globs; when any, a path must match one.
+    :param exclude: Pre-split exclude globs; an excluded directory takes its
+        whole subtree with it, as the walk's pruning does.
+    :param kept_path: Returns False for a path to leave out.
+    """
+    inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include]
+    exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude]
+
+    def kept(rel: str) -> bool:
+        parts = rel.split("/")
+        ancestors = ("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+        if any(r.match(a) for a in ancestors for r in exc):
+            return False
+        if kept_path is not None and not kept_path(rel):
+            return False
+        return not inc or any(r.match(rel) for r in inc)
+
+    return kept
+
+
+def describe_indexed_path(
+    root: Path,
+    rel: str,
+    *,
+    listed_directory: bool = False,
+    describe_link: Callable[[str, os.stat_result], FilesystemEntry] | None = None,
+) -> FilesystemEntry | None:
+    """Describe an indexed path from its own ``lstat``, never through a symlink.
+
+    :param root: Absolute directory *rel* is relative to.
+    :param listed_directory: The path is a directory of indexed files.
+    :param describe_link: Describes a file that is a symlink; without it, such
+        paths are left out.
+    :returns: The entry, or ``None`` when the path is gone or is a link left out.
+    """
+    st = _lstat_beneath(root, rel)
+    if st is None:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        if describe_link is not None and not listed_directory:
+            return describe_link(rel, st)
+        return None
+    # A submodule is one index entry but a directory on disk.
+    is_dir = listed_directory or stat.S_ISDIR(st.st_mode)
+    return FilesystemEntry(
+        id=rel,
+        name=rel.rsplit("/", 1)[-1],
+        path=rel,
+        type="directory" if is_dir else "file",
+        bytes=None if is_dir else st.st_size,
+        modified_at=int(st.st_mtime),
+    )
 
 
 def merge_entries(

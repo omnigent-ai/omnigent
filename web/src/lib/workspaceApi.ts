@@ -10,6 +10,7 @@ import {
   ContentEncoding,
   EntryType,
   FileSearchMode,
+  SearchOrder,
   WorkspaceService,
   type ComparisonSchema,
   type Entry,
@@ -19,17 +20,19 @@ import {
   type ListWorkingCopyChangesResponse,
   type ResolveRepositoryContextResponse,
   type WorkingCopyBase,
+  PullRequestFailureSchema,
 } from "@/gen/omnigent/api/workspace/v1alpha1/workspace_pb";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type { ContentSearchResult } from "@/lib/contentSearch";
+import type { RevisionSpec } from "@/lib/customComparison";
 import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { splitGlobList } from "@/lib/globList";
 import { workspaceSocketBridge, type WorkspaceSocketRequest } from "@/lib/nativeBridge";
 
-type WorkspaceClient = Client<typeof WorkspaceService>;
-type Route = "direct" | "server";
-type Method = keyof typeof WorkspaceService.method;
+export type WorkspaceClient = Client<typeof WorkspaceService>;
+export type Route = "direct" | "server";
+export type Method = keyof typeof WorkspaceService.method;
 /** What a Git comparison compares; see `Comparison` in workspace.proto. */
 export type ComparisonInit = MessageInitShape<typeof ComparisonSchema>;
 
@@ -92,13 +95,7 @@ function routeKey(route: Route, sessionId: string, sshTarget?: string | null): s
 }
 
 function routesFor(sessionId: string, sshTarget?: string | null): Route[] {
-  const info = getCachedServerInfo() ?? "loading";
-  const routes: Route[] = [];
-  if (workspaceSocketBridge() && isFeatureEnabled(info, "workspace_direct_access")) {
-    routes.push("direct");
-  }
-  if (isFeatureEnabled(info, "workspace_api_server_access")) routes.push("server");
-  return routes.filter(
+  return enabledWorkspaceRoutes().filter(
     (route) => (failedUntil.get(routeKey(route, sessionId, sshTarget)) ?? 0) <= Date.now(),
   );
 }
@@ -224,10 +221,12 @@ async function callOn<T>(
     const grant = await abortable(pending, signal);
     return await call(directClient(grant, send, sshTarget));
   } catch (error) {
-    // The host accepted the token if it answered about the request or method.
+    // The host accepted the token if it answered about the request or method, unless
+    // the token predates a pull request the session has linked since.
     const answered =
       error instanceof ConnectError &&
-      (answerCodes.has(error.code) || error.code === Code.Unimplemented);
+      (answerCodes.has(error.code) || error.code === Code.Unimplemented) &&
+      !pullRequestNotGranted(error);
     // Drop only the grant this read used; a parallel read may have renewed it.
     if (!answered && !signal?.aborted && grants.get(sessionId)?.pending === pending) {
       grants.delete(sessionId);
@@ -285,6 +284,41 @@ function routeCapabilities(
   return entry.pending;
 }
 
+const NO_CAPABILITIES: ReadonlySet<string> = new Set();
+// Failures of the route that carried GetCapabilities, not answers from its host.
+const ROUTE_FAILURE_CODES: ReadonlySet<Code> = new Set([
+  Code.Unavailable,
+  Code.Canceled,
+  Code.DeadlineExceeded,
+  Code.Unauthenticated,
+  Code.Unknown,
+]);
+
+/**
+ * A route's capabilities for a baseline method that only uses optional features: a host
+ * that answers GetCapabilities with an error still serves the method, just without them,
+ * for as long as an Unimplemented answer would be kept. A route that can't be reached
+ * fails, so the caller moves on to the next one.
+ */
+async function optionalCapabilities(
+  route: Route,
+  sessionId: string,
+  sshTarget: string | null | undefined,
+  signal: AbortSignal | undefined,
+): Promise<ReadonlySet<string>> {
+  try {
+    return await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (!(error instanceof ConnectError) || ROUTE_FAILURE_CODES.has(error.code)) throw error;
+    capabilities.set(routeKey(route, sessionId, sshTarget), {
+      pending: Promise.resolve(NO_CAPABILITIES),
+      expiresAtMs: Date.now() + ROUTE_RETRY_MS,
+    });
+    return NO_CAPABILITIES;
+  }
+}
+
 function concat(chunks: Uint8Array[]): Uint8Array {
   const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
   let offset = 0;
@@ -334,34 +368,65 @@ export interface ListedEntry {
   modified_at: number | null;
   /** The deepest directory of a single-child chain, when the host reports it. */
   leaf_directory_path?: string;
+  /** Git ignores the entry, as a host offering the "gitignore" feature reports. */
+  ignored?: true;
+}
+
+/** How a directory is listed. */
+export interface ListDirectoryOptions {
+  signal?: AbortSignal;
+  /** Leave out entries Git ignores, where the host can tell; others list them all. */
+  hideIgnored?: boolean;
+  /** Ask the host to report each single-folder chain's end, where it offers that. */
+  collapseSingleChildDirectories?: boolean;
 }
 
 const LIST_PAGE_SIZE = 1000;
+/** The ListDirectory feature that fills each entry's `leaf_directory_path`. */
+const DIRECTORY_CHAINS = "list_directory.collapse_single_child_directories";
+/** The ListDirectory feature that marks, and can leave out, what Git ignores. */
+const IGNORED_FEATURE = "gitignore";
 
 async function listDirectory(
   client: WorkspaceClient,
   path: string,
   maxEntries: number,
-  signal?: AbortSignal,
+  { signal, hideIgnored = false, collapseSingleChildDirectories = false }: ListDirectoryOptions,
 ): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
   const data: ListedEntry[] = [];
+  // A host whose token's entry was deleted starts its listing over, resending what it gave.
+  const held = new Set<string>();
   let pageToken = "";
+  // A host that hands back a token already asked for is cycling; stop before asking again.
+  const requested = new Set<string>();
   // Each page needs the token the previous one returned.
   /* oxlint-disable no-await-in-loop */
   do {
+    requested.add(pageToken);
     const page = await client.listDirectory(
-      { path, pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length), pageToken },
+      {
+        path,
+        pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length),
+        pageToken,
+        collapseSingleChildDirectories,
+        hideIgnored,
+      },
       { signal },
     );
-    // A host that hands back the token it was given is resending a page; stop before keeping it.
-    if (pageToken && page.nextPageToken === pageToken) break;
-    data.push(...page.entries.map(listedEntry));
+    // A page ending on a token already asked for resends one the listing holds; stop before keeping it.
+    if (page.nextPageToken && requested.has(page.nextPageToken)) break;
+    const fresh = page.entries.filter((entry) => !held.has(entry.path));
+    for (const entry of fresh) held.add(entry.path);
+    data.push(...fresh.map(listedEntry));
     pageToken = page.nextPageToken;
     // A page that adds nothing would never end the listing; report the rest as more.
-    if (page.entries.length === 0) break;
+    if (fresh.length === 0) break;
   } while (pageToken && data.length < maxEntries);
   /* oxlint-enable no-await-in-loop */
-  return { data, hasMore: pageToken !== "" };
+  // A host may ignore the page size; keep to the caller's limit and report the rest as more.
+  const overLimit = data.length > maxEntries;
+  if (overLimit) data.length = maxEntries;
+  return { data, hasMore: overLimit || pageToken !== "" };
 }
 
 interface CallOptions {
@@ -369,6 +434,8 @@ interface CallOptions {
   sshTarget?: string | null;
   /** Optional features of `method` the call relies on, e.g. "search_files.substring". */
   features?: readonly string[];
+  /** Optional features the call uses when the route's host lists them; `call` is told which. */
+  usesFeatures?: readonly string[];
   /** Codes that answer the request rather than fail the route. */
   answerCodes?: ReadonlySet<Code>;
   /** Throw an answer to the caller, for methods REST can't answer instead. */
@@ -390,11 +457,12 @@ interface CallOptions {
 async function viaWorkspaceApi<T>(
   sessionId: string,
   method: Method,
-  call: (client: WorkspaceClient) => Promise<T>,
+  call: (client: WorkspaceClient, served: ReadonlySet<string>) => Promise<T>,
   {
     signal,
     sshTarget,
     features = [],
+    usesFeatures = [],
     answerCodes = ANSWER_CODES,
     throwAnswers = false,
   }: CallOptions = {},
@@ -407,12 +475,22 @@ async function viaWorkspaceApi<T>(
     const unsupportedKey = `${key}:${method}`;
     if ((unsupportedUntil.get(unsupportedKey) ?? 0) > Date.now()) continue;
     try {
+      let served: ReadonlySet<string> = NO_CAPABILITIES;
       if (checked) {
-        const served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+        served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
         const required = [capabilityName(method), ...features];
         if (!required.every((name) => served.has(name))) continue;
+      } else if (usesFeatures.length > 0) {
+        served = await optionalCapabilities(route, sessionId, sshTarget, signal);
       }
-      return await callOn(route, sessionId, call, signal, sshTarget, answerCodes);
+      return await callOn(
+        route,
+        sessionId,
+        (client) => call(client, served),
+        signal,
+        sshTarget,
+        answerCodes,
+      );
     } catch (error) {
       signal?.throwIfAborted();
       if (error instanceof UnusableAnswerError) {
@@ -445,27 +523,40 @@ async function viaWorkspaceApi<T>(
 
 /**
  * List a workspace directory through the workspace API, in the REST listing's
- * shape and order (ascending by path), reading pages up to `maxEntries`.
+ * shape and order (ascending by path), reading pages up to `maxEntries`. Where the
+ * route's host offers it, each directory whose only entry is a directory carries the
+ * end of that chain as `leaf_directory_path`, so the tree shows "a/b/c" on one row.
  *
  * :param sessionId: The session whose workspace to list.
  * :param path: Workspace-relative directory, ``""`` for the root.
  * :param maxEntries: Stop after this many entries, e.g. ``1000``; must be positive.
- * :returns: The entries and whether more remain, or null when the caller
- *     should list through REST (see :func:`readFileViaWorkspaceApi`).
+ * :param options: ``hideIgnored`` leaves out what Git ignores, where the host can tell.
+ * :returns: The entries, whether more remain and whether Git-ignored ones were left
+ *     out, or null when the caller should list through REST (see :func:`readFileViaWorkspaceApi`).
  */
 export function listDirectoryViaWorkspaceApi(
   sessionId: string,
   path: string,
   maxEntries: number,
   signal?: AbortSignal,
-): Promise<{ data: ListedEntry[]; hasMore: boolean } | null> {
+  { hideIgnored = false }: Omit<ListDirectoryOptions, "signal"> = {},
+): Promise<{ data: ListedEntry[]; hasMore: boolean; ignoredHidden?: true } | null> {
   // The host reads a page size of 0 as its default, so a 0 limit would still return entries.
   if (!(maxEntries > 0)) return Promise.reject(new RangeError("maxEntries must be positive"));
   return viaWorkspaceApi(
     sessionId,
     "listDirectory",
-    (client) => listDirectory(client, path, maxEntries, signal),
-    { signal },
+    async (client, served) => {
+      // Only a host offering the feature leaves ignored entries out; others list them all.
+      const ignoredHidden = hideIgnored && served.has(IGNORED_FEATURE);
+      const listed = await listDirectory(client, path, maxEntries, {
+        signal,
+        hideIgnored: ignoredHidden,
+        collapseSingleChildDirectories: served.has(DIRECTORY_CHAINS),
+      });
+      return ignoredHidden ? { ...listed, ignoredHidden: true as const } : listed;
+    },
+    { signal, usesFeatures: [DIRECTORY_CHAINS, ...(hideIgnored ? [IGNORED_FEATURE] : [])] },
   );
 }
 
@@ -505,6 +596,7 @@ function listedEntry(entry: Entry): ListedEntry {
     bytes: entry.size === undefined ? null : Number(entry.size),
     modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
     ...(entry.leafDirectoryPath ? { leaf_directory_path: entry.leafDirectoryPath } : {}),
+    ...(entry.ignored ? { ignored: true as const } : {}),
   };
 }
 
@@ -526,6 +618,8 @@ export interface FileSearchOptions {
   exclude: string;
   /** Maximum entries, 1 to 500. */
   limit: number;
+  /** Search what Git ignores too, as REST does; otherwise only what Git lists. */
+  includeGitIgnored?: boolean;
 }
 
 /**
@@ -539,7 +633,7 @@ export interface FileSearchOptions {
 export function searchFilesViaWorkspaceApi(
   sessionId: string,
   query: string,
-  { path, include, exclude, limit }: FileSearchOptions,
+  { path, include, exclude, limit, includeGitIgnored = true }: FileSearchOptions,
   signal?: AbortSignal,
 ): Promise<FoundEntries | null> {
   return viaWorkspaceApi(
@@ -554,8 +648,8 @@ export function searchFilesViaWorkspaceApi(
           path,
           include: splitGlobList(include),
           exclude: splitGlobList(exclude),
-          // The REST search walks ignored files too, so they stay findable.
-          includeGitIgnored: true,
+          // The REST search walks ignored files too, so by default they stay findable.
+          includeGitIgnored,
         },
         { signal },
       );
@@ -573,6 +667,86 @@ export function searchFilesViaWorkspaceApi(
   );
 }
 
+export interface RankedWorkspaceFile {
+  /** Path relative to the searched directory. */
+  entry: ListedEntry;
+  /** Higher is better; zero when a blank query lists files in path order. */
+  score: number;
+  /** UTF-16 indices of the path's matched characters, ascending, for highlighting. */
+  matchedIndices: number[];
+}
+
+export interface RankedWorkspaceFiles {
+  files: RankedWorkspaceFile[];
+  /** More files matched than were returned. */
+  hasMore: boolean;
+  /** Some files weren't searched, so a missing file may still exist. */
+  truncated: boolean;
+}
+
+export interface RankedFileSearchOptions {
+  /** Workspace-relative directory to search under, ``""`` for the root. */
+  path: string;
+  /** Maximum files, 1 to 10,000. */
+  limit: number;
+  /** Also rank files Git ignores. */
+  includeGitIgnored: boolean;
+}
+
+/**
+ * Rank workspace files against a fuzzy query through the workspace API, best
+ * first. A blank query lists files in path order, for a picker's first view.
+ *
+ * :returns: The files, or null when the caller should use another route: see
+ *     :func:`viaWorkspaceApi`, or the host doesn't rank paths ("search_files.fuzzy",
+ *     plus "search_files.browse" for a blank query), or its file list is being built.
+ */
+export function rankFilesViaWorkspaceApi(
+  sessionId: string,
+  query: string,
+  { path, limit, includeGitIgnored }: RankedFileSearchOptions,
+  signal?: AbortSignal,
+): Promise<RankedWorkspaceFiles | null> {
+  const blank = query.trim() === "";
+  return viaWorkspaceApi(
+    sessionId,
+    "searchFiles",
+    async (client) => {
+      const response = await client.searchFiles(
+        { query, mode: FileSearchMode.FUZZY, maximumResults: limit, path, includeGitIgnored },
+        { signal },
+      );
+      if (response.refreshing) return null;
+      return {
+        files: response.results.flatMap((result) =>
+          result.entry
+            ? [
+                {
+                  entry: listedEntry(result.entry),
+                  score: result.score,
+                  matchedIndices: result.matchedIndices,
+                },
+              ]
+            : [],
+        ),
+        hasMore: response.truncated,
+        truncated: response.indexIncomplete || response.untrackedUnavailable,
+      };
+    },
+    {
+      signal,
+      features: blank ? ["search_files.fuzzy", "search_files.browse"] : ["search_files.fuzzy"],
+    },
+  );
+}
+
+export interface TextSearchPriority {
+  /** Workspace-relative files searched first, the most important first; 16 at most are used. */
+  focusedPaths: string[];
+  /** What changed folders are measured against; the last commit by default. */
+  changedAgainst?: ComparisonKind;
+}
+
 export interface TextSearchOptions {
   caseSensitive: boolean;
   /** Read the query as a ripgrep regular expression. */
@@ -580,6 +754,11 @@ export interface TextSearchOptions {
   /** Comma-separated globs; an include also searches files ignore rules skip. */
   include: string;
   exclude: string;
+  /**
+   * Search these first, then the folders with the most changes, then the rest.
+   * A host without "text_search_priority" ignores it and returns matches in walk order.
+   */
+  priority?: TextSearchPriority;
 }
 
 /**
@@ -594,7 +773,7 @@ export interface TextSearchOptions {
 export function searchTextViaWorkspaceApi(
   sessionId: string,
   query: string,
-  { caseSensitive, regex, include, exclude }: TextSearchOptions,
+  { caseSensitive, regex, include, exclude, priority }: TextSearchOptions,
   signal?: AbortSignal,
 ): Promise<ContentSearchResult | null> {
   const info = getCachedServerInfo() ?? "loading";
@@ -607,7 +786,18 @@ export function searchTextViaWorkspaceApi(
       const result: ContentSearchResult = { matches: [], truncated: false, warning: null };
       let done = false;
       const stream = client.searchText(
-        { query, caseSensitive, regularExpression: regex, include, exclude },
+        {
+          query,
+          caseSensitive,
+          regularExpression: regex,
+          include,
+          exclude,
+          ...(priority && {
+            order: SearchOrder.PRIORITY,
+            focusedPaths: priority.focusedPaths,
+            changedAgainst: priority.changedAgainst,
+          }),
+        },
         { signal },
       );
       for await (const message of stream) {
@@ -640,40 +830,55 @@ export function searchTextViaWorkspaceApi(
 // request the host rejects throws its ConnectError, whose message says why.
 const GIT_OPTIONS = { throwAnswers: true } as const;
 
-/** The optional features a comparison relies on: a host may serve the method without them. */
-function comparisonFeatures(comparison: ComparisonInit): string[] {
-  return comparison.kind === ComparisonKind.REVISIONS ? ["revision_comparison"] : [];
+/** The feature a request naming a repository folder needs; an older host would answer for the workspace. */
+const REPOSITORY_FEATURE = "comparison.repository";
+
+function repositoryFeatures(repository: string): string[] {
+  return repository ? [REPOSITORY_FEATURE] : [];
 }
 
-/** Resolve a comparison's base and head commits. */
+/** The optional features a comparison relies on: a host may serve the method without them. */
+function comparisonFeatures(comparison: ComparisonInit, repository: string): string[] {
+  return [
+    ...(comparison.kind === ComparisonKind.REVISIONS ? ["revision_comparison"] : []),
+    ...repositoryFeatures(repository),
+  ];
+}
+
+/**
+ * Resolve a comparison's base and head commits. `repository`, a folder relative to the
+ * workspace such as a worktree inside it, compares that repository; empty for the workspace.
+ */
 export function resolveWorkingCopyBaseViaWorkspaceApi(
   sessionId: string,
   comparison: ComparisonInit,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<WorkingCopyBase | null> {
   return viaWorkspaceApi(
     sessionId,
     "resolveWorkingCopyBase",
     async (client) => {
-      const response = await client.resolveWorkingCopyBase({ comparison }, { signal });
+      const response = await client.resolveWorkingCopyBase({ comparison, repository }, { signal });
       if (!response.base) throw new UnusableAnswerError("The workspace API sent no base");
       return response.base;
     },
-    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison, repository) },
   );
 }
 
-/** List the files a comparison changes, with its resolved base. */
+/** List the files a comparison changes, with its resolved base; paths are `repository`'s. */
 export function listWorkingCopyChangesViaWorkspaceApi(
   sessionId: string,
   comparison: ComparisonInit,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListWorkingCopyChangesResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listWorkingCopyChanges",
-    (client) => client.listWorkingCopyChanges({ comparison }, { signal }),
-    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
+    (client) => client.listWorkingCopyChanges({ comparison, repository }, { signal }),
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison, repository) },
   );
 }
 
@@ -688,12 +893,18 @@ export function readBaseFileViaWorkspaceApi(
   sessionId: string,
   file: { commit: string; path: string; object: string },
   signal?: AbortSignal,
+  repository = "",
 ): Promise<FileContentResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "readBaseFile",
-    (client) => collectFile(file.path, client.readBaseFile(file, { signal })),
-    { ...GIT_OPTIONS, signal, answerCodes: FILE_STATE_ANSWER_CODES },
+    (client) => collectFile(file.path, client.readBaseFile({ ...file, repository }, { signal })),
+    {
+      ...GIT_OPTIONS,
+      signal,
+      answerCodes: FILE_STATE_ANSWER_CODES,
+      features: repositoryFeatures(repository),
+    },
   );
 }
 
@@ -719,26 +930,42 @@ export function readLinkTextViaWorkspaceApi(
 export function listRepositoryRefsViaWorkspaceApi(
   sessionId: string,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListRepositoryRefsResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listRepositoryRefs",
-    (client) => client.listRepositoryRefs({}, { signal }),
-    { ...GIT_OPTIONS, signal },
+    (client) => client.listRepositoryRefs({ repository }, { signal }),
+    { ...GIT_OPTIONS, signal, features: repositoryFeatures(repository) },
   );
 }
 
-/** The commits HEAD has beyond its merge base with `baseRevision`, newest first. */
+/**
+ * The commits `range.head` (HEAD when empty) has beyond its merge base with `range.base`, newest
+ * first. A named head is asked of a host that lists one; an older one would list HEAD's.
+ */
 export function listBranchCommitsViaWorkspaceApi(
   sessionId: string,
-  baseRevision: string,
+  range: RevisionSpec,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListBranchCommitsResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listBranchCommits",
-    (client) => client.listBranchCommits({ baseRevision }, { signal }),
-    { ...GIT_OPTIONS, signal, features: ["branch_commits"] },
+    (client) =>
+      client.listBranchCommits(
+        { baseRevision: range.base, headRevision: range.head, repository },
+        { signal },
+      ),
+    {
+      ...GIT_OPTIONS,
+      signal,
+      features: [
+        ...(range.head ? ["branch_commits", "branch_commits.head"] : ["branch_commits"]),
+        ...repositoryFeatures(repository),
+      ],
+    },
   );
 }
 
@@ -753,4 +980,188 @@ export function resolveRepositoryContextViaWorkspaceApi(
     (client) => client.resolveRepositoryContext({}, { signal }),
     { ...GIT_OPTIONS, signal },
   );
+}
+
+// A pull request call's refusals are its answer: a denied caller, a moved head or bad
+// input is shown as is, never retried on another route or through REST.
+const PULL_REQUEST_ANSWER_CODES: ReadonlySet<Code> = new Set([
+  ...ANSWER_CODES,
+  Code.FailedPrecondition,
+  Code.PermissionDenied,
+]);
+/** The routes this app's flags and shell turn on, most direct first, whatever has failed. */
+export function enabledWorkspaceRoutes(): Route[] {
+  const info = getCachedServerInfo() ?? "loading";
+  const routes: Route[] = [];
+  if (workspaceSocketBridge() && isFeatureEnabled(info, "workspace_direct_access")) {
+    routes.push("direct");
+  }
+  if (isFeatureEnabled(info, "workspace_api_server_access")) routes.push("server");
+  return routes;
+}
+/** The machine-readable reason a refused pull request call carries, e.g. "pull_request_changed". */
+export function pullRequestFailureReason(error: unknown): string | null {
+  if (!(error instanceof ConnectError)) return null;
+  return error.findDetails(PullRequestFailureSchema)[0]?.reason ?? null;
+}
+/**
+ * The direct host refused a pull request its token doesn't list, e.g. one linked
+ * after the token was signed. The host checks this before it acts.
+ */
+function pullRequestNotGranted(error: unknown): boolean {
+  return (
+    error instanceof ConnectError &&
+    error.code === Code.FailedPrecondition &&
+    pullRequestFailureReason(error) === "pull_request_not_granted"
+  );
+}
+/**
+ * Read through a pull request method of the workspace API, on the first route whose
+ * host lists it for this caller.
+ *
+ * Resolves `null` when no route serves the method, or the route is away, so the
+ * caller reads through REST. A refusal (see `PULL_REQUEST_ANSWER_CODES`) is thrown,
+ * and no other route is tried. Only for reads: a read is safe to repeat elsewhere.
+ * A pull request the direct token doesn't list gets one fresh token and one retry.
+ */
+export async function callPullRequestMethod<T>(
+  sessionId: string,
+  method: Method,
+  call: (client: WorkspaceClient) => Promise<T>,
+  { signal }: { signal?: AbortSignal } = {},
+): Promise<T | null> {
+  const options = { signal, answerCodes: PULL_REQUEST_ANSWER_CODES, throwAnswers: true };
+  try {
+    return await viaWorkspaceApi(sessionId, method, call, options);
+  } catch (error) {
+    // The refusal dropped the token, so the same route is tried with a fresh one.
+    if (!pullRequestNotGranted(error)) throw error;
+    return viaWorkspaceApi(sessionId, method, call, options);
+  }
+}
+/** A route of the session whose host answered its capability check. */
+export interface ServingRoute {
+  route: Route;
+  /** Names this route for the session; it stays the same when the session moves to another host. */
+  key: string;
+  served: ReadonlySet<string>;
+}
+/** The session's routes that answered their capability check, and why the rest didn't. */
+export interface RouteAnswers {
+  /** In the order calls try them. */
+  serving: ServingRoute[];
+  /** One per route that couldn't say what it serves, such as one that's away. */
+  failures: unknown[];
+}
+/**
+ * Ask each of the session's routes what its host serves, sharing the cached capability
+ * checks that calls make.
+ */
+export async function servingRoutes(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<RouteAnswers> {
+  const answers = await Promise.all(
+    routesFor(sessionId).map(async (route) => {
+      try {
+        const served = await abortable(routeCapabilities(route, sessionId), signal);
+        return { route, key: routeKey(route, sessionId), served };
+      } catch (error) {
+        signal?.throwIfAborted();
+        return { error };
+      }
+    }),
+  );
+  return {
+    serving: answers.filter((answer): answer is ServingRoute => "served" in answer),
+    failures: answers.flatMap((answer) => ("error" in answer ? [answer.error] : [])),
+  };
+}
+/** The name `GetCapabilities` lists `method` by, e.g. "GetPullRequest". */
+export function workspaceMethodName(method: Method): string {
+  return capabilityName(method);
+}
+/**
+ * A write whose route failed after the request left, so the host may have acted on it.
+ * It's never sent again: the caller re-reads to see whether it landed.
+ */
+export class PullRequestMaybeSentError extends Error {
+  constructor(cause: unknown) {
+    super("This may have been sent. Refresh to check.", { cause });
+    this.name = "PullRequestMaybeSentError";
+  }
+}
+/**
+ * Send a pull request write through the workspace API, at most once.
+ *
+ * The route is the first whose host lists `method` for this caller. A failure before
+ * the request is sent, such as a route that can't say what it serves, moves on to the
+ * next route. The same goes for an answer that the host didn't act on: `UNIMPLEMENTED`,
+ * or a direct token the host refused before dispatch (expired, or not listing the pull
+ * request), which gets one fresh grant on the same route. A refusal is thrown as is.
+ * Any other failure, a cancel after the request left included, is thrown as
+ * {@link PullRequestMaybeSentError}, and the write isn't
+ * retried anywhere, REST included, since many writes (comments, reactions) would land
+ * twice. That includes a connection refused after the capability check: neither route
+ * tells it apart from one dropped mid-call, so it stays on the safe side.
+ *
+ * Resolves `null` only when no route served the method and nothing was sent, so the
+ * caller writes through REST.
+ */
+export async function callPullRequestWrite<T>(
+  sessionId: string,
+  method: Method,
+  call: (client: WorkspaceClient) => Promise<T>,
+  { signal }: { signal?: AbortSignal } = {},
+): Promise<T | null> {
+  // Each route's attempt must settle before the next is tried.
+  /* oxlint-disable no-await-in-loop */
+  for (const route of routesFor(sessionId)) {
+    const key = routeKey(route, sessionId);
+    if ((unsupportedUntil.get(`${key}:${method}`) ?? 0) > Date.now()) continue;
+    let served: ReadonlySet<string>;
+    try {
+      served = await abortable(routeCapabilities(route, sessionId), signal);
+    } catch {
+      signal?.throwIfAborted();
+      continue; // nothing was sent
+    }
+    if (!served.has(capabilityName(method))) continue;
+    for (let attempt = 0; ; attempt++) {
+      // Set once the request is handed to the route; before that, nothing was sent.
+      let sent = false;
+      const send = (client: WorkspaceClient) => {
+        sent = true;
+        return call(client);
+      };
+      try {
+        return await callOn(route, sessionId, send, signal, null, PULL_REQUEST_ANSWER_CODES);
+      } catch (error) {
+        if (!sent) {
+          signal?.throwIfAborted();
+          break; // no grant or no shell, so nothing was sent
+        }
+        // Cancelling stops the wait, not the host, which may still act on the request.
+        if (signal?.aborted) throw new PullRequestMaybeSentError(error);
+        const code = error instanceof ConnectError ? error.code : null;
+        // Refused before dispatch, and the refusal dropped the token: one fresh one.
+        if (route === "direct" && pullRequestNotGranted(error) && attempt === 0) continue;
+        if (code !== null && PULL_REQUEST_ANSWER_CODES.has(code)) throw error;
+        if (code === Code.Unimplemented) {
+          unsupportedUntil.set(`${key}:${method}`, Date.now() + ROUTE_RETRY_MS);
+          break; // the host answered without acting
+        }
+        // The host checks a direct token before it dispatches, so a refused one sent nothing.
+        if (route === "direct" && code === Code.Unauthenticated && attempt === 0) {
+          // A restarted host may serve other methods, so its capabilities are read again.
+          capabilities.delete(key);
+          continue;
+        }
+        if (code === Code.Unauthenticated) throw error;
+        throw new PullRequestMaybeSentError(error);
+      }
+    }
+  }
+  /* oxlint-enable no-await-in-loop */
+  return null;
 }

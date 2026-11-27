@@ -11,6 +11,8 @@ import type { DiffReviewProps } from "@/components/diff-review/DiffReview";
 import type { DiffReviewToolbarProps } from "@/components/diff-review/DiffReviewToolbar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkingCopyChanges } from "@/hooks/useWorkingCopyChanges";
+import { comparisonChoiceOf } from "@/lib/comparisonChoice";
+import type { ComparisonAvailability } from "@/shell/useVisitComparison";
 import { localComparisonView, type LocalComparisonInput } from "@/lib/localComparison";
 import {
   type BranchPointComparison,
@@ -85,6 +87,7 @@ function changes(overrides: Partial<WorkingCopyChanges> = {}): WorkingCopyChange
     generation: 1,
     permitted: true,
     accessEpoch: 0,
+    choices: 0,
     readable: true,
     ...overrides,
   };
@@ -134,7 +137,13 @@ function source(shared: WorkingCopyChanges, overrides: Partial<LocalComparisonIn
     },
     ...overrides,
   });
-  return { changes: shared, view, automatic };
+  const choice = {
+    shown: comparisonChoiceOf(overrides.intent ?? "head", shared.custom),
+    settled: shared.workspace !== null,
+    availability: (): ComparisonAvailability => "now",
+    choose: vi.fn(),
+  };
+  return { changes: shared, view, automatic, choice };
 }
 
 let client = new QueryClient();

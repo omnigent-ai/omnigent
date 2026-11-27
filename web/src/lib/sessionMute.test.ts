@@ -4,14 +4,20 @@ import {
   canFlagUnread,
   clearSessionMuteState,
   isConversationMuted,
+  isInMutedProject,
+  isSessionMuted,
   MUTE_REINDEX_GRACE_MS,
   muteReadMarker,
   MUTED_LABEL_KEY,
   onMuteRecheck,
   reconcileMuteLabel,
+  setMutedProjects,
   settleMuteSave,
   showsUnreadFor,
+  useMutedProjects,
 } from "./sessionMute";
+import { act, renderHook } from "@testing-library/react";
+import { PROJECT_LABEL_KEY } from "./sessionListCache";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -138,5 +144,68 @@ describe("session mute store", () => {
     expect(showsUnreadFor(row(true), true)).toBe(false);
     expect(canFlagUnread(row(false))).toBe(true);
     expect(canFlagUnread(row(true))).toBe(false);
+  });
+});
+
+describe("project mute", () => {
+  const VIEWER = "alice@example.com";
+  const projects = [
+    { id: "p-muted", name: "Factory", muted: true },
+    { id: "p-loud", name: "Coordination", muted: false },
+    // A label-only folder can't store a mute, so it never counts.
+    { id: null, name: "Legacy", muted: true },
+  ];
+
+  it("mutes the viewer's sessions in a muted project's folder, by id or legacy label", () => {
+    setMutedProjects(projects, VIEWER);
+    const filed = { id: "a", labels: {}, project_id: "p-muted", owner: VIEWER };
+    const labeled = { id: "b", labels: { [PROJECT_LABEL_KEY]: "Factory" }, owner: VIEWER };
+    // Single-user rows carry no owner and read as the viewer's own.
+    const unowned = { id: "c", labels: {}, project_id: "p-muted" };
+    for (const session of [filed, labeled, unowned]) {
+      expect(isInMutedProject(session)).toBe(true);
+      expect(isConversationMuted(session)).toBe(true);
+      expect(isSessionMuted(session)).toBe(false);
+      expect(showsUnreadFor(session, true)).toBe(false);
+      expect(canFlagUnread(session)).toBe(false);
+    }
+    // A collaborator's legacy label can name the viewer's project without filing into it.
+    const shared = {
+      id: "d",
+      labels: { [PROJECT_LABEL_KEY]: "Factory" },
+      owner: "bob@example.com",
+    };
+    const elsewhere = { id: "e", labels: {}, project_id: "p-loud", owner: VIEWER };
+    const unfiled = { id: "f", labels: {}, owner: VIEWER };
+    const legacy = { id: "g", labels: { [PROJECT_LABEL_KEY]: "Legacy" }, owner: VIEWER };
+    for (const session of [shared, elsewhere, unfiled, legacy]) {
+      expect(isConversationMuted(session)).toBe(false);
+    }
+  });
+
+  it("re-renders subscribers only when the muted set or viewer changes", () => {
+    const { result } = renderHook(() => useMutedProjects());
+    expect(result.current).toEqual([]);
+    act(() => setMutedProjects(projects, VIEWER));
+    const first = result.current;
+    expect(first).toEqual([{ id: "p-muted", name: "Factory" }]);
+    act(() =>
+      setMutedProjects(
+        projects.map((project) => ({ ...project })),
+        VIEWER,
+      ),
+    );
+    expect(result.current).toBe(first);
+    // Identity resolving later changes whose sessions count, so subscribers recheck.
+    act(() => setMutedProjects(projects, "bob@example.com"));
+    expect(result.current).not.toBe(first);
+    act(() =>
+      setMutedProjects(
+        projects.map((project) => ({ ...project, muted: false })),
+        VIEWER,
+      ),
+    );
+    expect(result.current).toEqual([]);
+    expect(isConversationMuted({ id: "a", labels: {}, project_id: "p-muted" })).toBe(false);
   });
 });

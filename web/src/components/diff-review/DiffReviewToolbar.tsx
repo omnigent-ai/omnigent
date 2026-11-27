@@ -22,6 +22,7 @@ import { PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { type DiffReviewBase, DiffReviewBaseMenu } from "./DiffReviewBaseMenu";
 import type { DiffReviewCommand, DiffReviewCommandId } from "./diffReviewCommands";
+import { DiffReviewOptions } from "./DiffReviewOptions";
 import { LanguageBreakdown } from "./LanguageBreakdown";
 import {
   hasActiveFilters,
@@ -38,7 +39,6 @@ const VIEW_BUTTONS: readonly DiffReviewCommandId[] = [
   "cycle-test-files",
   "toggle-layout",
   "toggle-whitespace",
-  "toggle-wrap",
   "toggle-collapse-all",
 ];
 
@@ -110,6 +110,7 @@ export function DiffReviewToolbar({
   const ownedFiles = byId.get("toggle-owned-files");
   const filterButton = useRef<HTMLButtonElement>(null);
   const viewCommands = VIEW_BUTTONS.flatMap((id) => byId.get(id) ?? []);
+  const collapseAll = byId.get("toggle-collapse-all");
   return (
     <div
       role="toolbar"
@@ -180,9 +181,21 @@ export function DiffReviewToolbar({
         </DropdownMenu>
       )}
       {compact ? (
-        <ViewOptionsMenu commands={viewCommands} />
+        <>
+          <DiffReviewOptions sort={byId.get("sort-files")} wrap={byId.get("toggle-wrap")} />
+          <ViewOptionsMenu commands={viewCommands} />
+        </>
       ) : (
-        viewCommands.map((command) => <ToolbarButton key={command.id} command={command} />)
+        <>
+          {viewCommands
+            .filter((command) => command.id !== "toggle-collapse-all")
+            .map((command) => (
+              <ToolbarButton key={command.id} command={command} />
+            ))}
+          {/* Sorting and wrapping share one popover. */}
+          <DiffReviewOptions sort={byId.get("sort-files")} wrap={byId.get("toggle-wrap")} />
+          {collapseAll && <ToolbarButton command={collapseAll} />}
+        </>
       )}
       {/* The source's controls wrap as one group, and within it once the group can't fit a row. */}
       {extra && (

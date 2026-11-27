@@ -21,6 +21,10 @@ describe("placeIdentity", () => {
       { kind: "pull", url: "https://github.com/o/r/pull/1", view: "commits" },
       "pull:https://github.com/o/r/pull/1",
     ],
+    [
+      { kind: "pull", url: "https://github.com/o/r/pull/1", view: "commits", list: true },
+      "pull-list:https://github.com/o/r/pull/1",
+    ],
     [{ kind: "terminal", key: "k" }, "terminal:k"],
     [{ kind: "agents" }, "agents"],
     [{ kind: "tasks" }, "tasks"],

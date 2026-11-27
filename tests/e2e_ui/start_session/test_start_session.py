@@ -1121,6 +1121,9 @@ async def _drive_landing_clears_after_navigating_away(
             await landing_input.fill(message)
             await page.get_by_test_id("new-chat-landing-submit").click()
             await poll_until_async(lambda: len(create_bodies) == 1)
+            # The router can defer the temporary chat; leaving before it renders would keep
+            # the submitted landing mounted, text and all, rather than test a remount.
+            await expect(landing_input).to_have_count(0, timeout=30_000)
 
             # Detour through another session and come straight back, all
             # while the create is still bootstrapping.
@@ -1421,11 +1424,12 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
                 );"""
             )
 
-            # ChatPage and Sidebar warm the shared host-query cache while the
-            # stub exposes only the Mac. No landing draft exists on this path.
+            # ChatPage and Sidebar warm the shared host-query cache (one
+            # request) while the stub exposes only the Mac. No landing draft
+            # exists on this path.
             await page.goto(f"{base_url}/c/{session_id}")
             await page.get_by_test_id("new-chat-button").wait_for(state="visible", timeout=30_000)
-            await poll_until_async(lambda: route_state["requests"] >= 2)
+            await poll_until_async(lambda: route_state["requests"] >= 1)
 
             # NewChat mounts with cached Mac-only data and completes another
             # Mac-only request. Neither snapshot may silently replace the saved

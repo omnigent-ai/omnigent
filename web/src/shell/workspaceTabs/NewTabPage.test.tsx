@@ -7,7 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { workspaceOpenCommands, type WorkspaceCommandFacts } from "@/shell/workspaceCommands/model";
 import { HIDDEN, unavailableBecause } from "@/store/paletteCommands";
 
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 
 import { NewTabPage, type NewTabPlace, type NewTabRecent } from "./NewTabPage";
 
@@ -136,6 +136,7 @@ describe("NewTabPage", () => {
   it("opens the workspace text search from Search text, with its shortcut, and leaves the tab", async () => {
     const { onTextSearch, onOpenPlace, onRunCommand } = renderPage({ textSearch: true });
     const row = screen.getByRole("option", { name: /^Search text/ });
+    expect(row).not.toHaveAttribute("data-layout", "card");
     expect(row).toHaveTextContent(shortcutKeys("palette.text")!.join(""));
     await userEvent.click(row);
     expect(onTextSearch).toHaveBeenCalledTimes(1);
@@ -180,6 +181,24 @@ describe("NewTabPage", () => {
     expect(onRunCommand).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "shell", shell: "sh" }),
     );
+  });
+
+  it("goes back to the apps with Backspace on the chooser's empty query, without dismissing", async () => {
+    const { onPlaceChange, onDismiss } = renderPage({ facts: manyShellFacts });
+    await userEvent.click(screen.getByRole("option", { name: /Choose shell/ }));
+    expect(onPlaceChange).toHaveBeenLastCalledWith({ kind: "new", app: "terminal" });
+    await userEvent.keyboard("{Backspace}");
+    expect(onPlaceChange).toHaveBeenLastCalledWith({ kind: "new" });
+    expect(onDismiss).not.toHaveBeenCalled();
+  });
+
+  it("marks Choose shell… as opening a page of its own", () => {
+    renderPage({ facts: manyShellFacts });
+    const chooser = screen.getByRole("option", { name: /Choose shell/ });
+    expect(chooser.querySelector(".lucide-chevron-right")).not.toBeNull();
+    expect(
+      screen.getByRole("option", { name: /^Terminal/ }).querySelector(".lucide-chevron-right"),
+    ).toBeNull();
   });
 
   it("opens straight into the chooser for omnigent://new?app=terminal and follows outside place changes", async () => {
@@ -277,6 +296,10 @@ describe("NewTabPage sections", () => {
     expect(options[0]).toHaveTextContent("Side chat");
     expect(options.at(-1)).toHaveTextContent("Pull Requests");
     expect(labelsIn(groups()[0]!)).toEqual(["Side chat", "Diffs", "Files", "Pull Requests"]);
+    const cards = Array.from(document.querySelectorAll("[data-layout=card]")).map(
+      (card) => card.querySelector("[data-slot=quick-pick-label]")?.textContent,
+    );
+    expect(cards).toEqual(["Side chat", "Diffs", "Files", "Pull Requests"]);
     expect(screen.getAllByRole("option", { name: /^Pull Requests/ })[0]).toHaveTextContent(
       "Review the pull requests for this workspace",
     );
@@ -358,6 +381,19 @@ describe("NewTabPage sections", () => {
     await userEvent.keyboard("{Enter}");
     expect(onRunCommand).toHaveBeenCalledWith(expect.objectContaining({ kind: "shell" }));
     expect(onOpenRecent).not.toHaveBeenCalled();
+  });
+
+  it("ranks across sections, so a recent place matching the query exactly comes before an app that only starts with it", async () => {
+    const { onOpenRecent } = renderPage({
+      recents: [{ identity: "files:docs/pull", label: "pull", icon: null }],
+    });
+    await userEvent.type(appList()!, "pull");
+    const labels = screen
+      .getAllByRole("option")
+      .map((option) => option.querySelector("[data-slot=quick-pick-label]")?.textContent);
+    expect(labels.slice(0, 2)).toEqual(["pull", "Pull Requests"]);
+    await userEvent.keyboard("{Enter}");
+    expect(onOpenRecent).toHaveBeenCalledWith("files:docs/pull");
   });
 
   it("goes to a recent place that is the best match for the query", async () => {

@@ -291,6 +291,7 @@ describe.each([
   "scheduled_task_harness_settings",
   "scheduled_task_approval_skipping_modes",
   "scheduled_task_subhour",
+  "scheduled_task_subhour_new_sandbox",
   "scheduled_task_trigger_headers",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
@@ -299,6 +300,7 @@ describe.each([
   "scheduled_task_run_pull_requests",
   "proactive_agent_available",
   "session_create_workflow_id",
+  "scheduled_task_workflow_id",
   "workflow_sharing",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([

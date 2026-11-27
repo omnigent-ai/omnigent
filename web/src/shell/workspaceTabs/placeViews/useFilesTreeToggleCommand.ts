@@ -7,7 +7,7 @@ import { useEffect, useRef } from "react";
 
 import { hotkeyAvailability, useHotkeyCommand } from "@/hooks/useHotkeyCommand";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { matchesShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 import type { WorkspaceSidebarState } from "../WorkspaceSidebarLayout";
 

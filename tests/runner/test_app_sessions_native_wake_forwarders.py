@@ -905,6 +905,8 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         "different_thread",
         "launch_error",
         "launch_cancelled",
+        "rotated",
+        "rotated_exited",
     ],
 )
 @pytest.mark.asyncio
@@ -918,6 +920,9 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
 
     session_id = "a3f4361a350851cfb9eb3db2bf2b0380"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    # A forwarder rotation onto a fresh thread's session keeps the backend keyed by session_id.
+    rotated_session_id = "5c0e2f8b9d7a4e61b3f2a1c0d9e8f7a6"
+    rotated_thread_id = "019e96aa-0be2-7343-8d3b-6f914d6093a1"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
@@ -936,7 +941,10 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             :returns: HTTP 200 response carrying launch config or items.
             """
             del kwargs
-            if url == f"/v1/sessions/{session_id}/items":
+            if url in {
+                f"/v1/sessions/{session_id}/items",
+                f"/v1/sessions/{rotated_session_id}/items",
+            }:
                 return httpx.Response(
                     200,
                     json={
@@ -950,6 +958,17 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
                             }
                         ],
                         "has_more": False,
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            if url == f"/v1/sessions/{rotated_session_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "external_session_id": rotated_thread_id,
+                        "labels": {
+                            codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id
+                        },
                     },
                     request=httpx.Request("GET", url),
                 )
@@ -1111,27 +1130,30 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
         bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
         assert bridge_state is not None
-        if recovery_state == "exited":
+        rotated = recovery_state in {"rotated", "rotated_exited"}
+        recovered_session_id = rotated_session_id if rotated else session_id
+        if recovery_state in {"exited", "rotated_exited"}:
             original_server.proc.returncode = 1
         elif recovery_state == "forwarder_done":
             original_forwarder.cancel()
             await asyncio.gather(original_forwarder, return_exceptions=True)
         elif recovery_state == "missing_bridge":
             codex_native_bridge.clear_bridge_state(bridge_dir)
-        elif recovery_state == "different_thread":
+        if recovery_state == "different_thread" or rotated:
             codex_native_bridge.write_bridge_state(
                 bridge_dir,
                 codex_native_bridge.CodexNativeBridgeState(
-                    session_id=session_id,
+                    session_id=rotated_session_id if rotated else session_id,
                     socket_path=bridge_state.socket_path,
-                    thread_id="another-thread",
+                    thread_id=rotated_thread_id if rotated else "another-thread",
                     codex_home=bridge_state.codex_home,
                     cwd=bridge_state.cwd,
                 ),
             )
+        recovered_bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
 
         recovery = runner_app_mod._auto_create_codex_terminal(
-            session_id,
+            recovered_session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
             agent_spec=agent_spec,
@@ -1147,7 +1169,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             await recovery
         await asyncio.sleep(0)
 
-        reused = recovery_state in {"live", "launch_error", "launch_cancelled"}
+        reused = recovery_state in {"live", "launch_error", "launch_cancelled", "rotated"}
         assert len(app_servers) == (1 if reused else 2)
         assert len(runs) == (1 if reused else 2)
         assert runs[0].cancelled is not reused
@@ -1155,26 +1177,32 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is original_server
             assert runner_app_mod._AUTO_FORWARDER_TASKS[session_id] is original_forwarder
             assert not original_server.closed
-            assert codex_native_bridge.read_bridge_state(bridge_dir) == bridge_state
+            assert codex_native_bridge.read_bridge_state(bridge_dir) == recovered_bridge_state
         else:
-            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is app_servers[1]
+            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[recovered_session_id] is app_servers[1]
             assert runs[1].cancelled is False
+        recovered_thread_id = rotated_thread_id if rotated else thread_id
         assert len(launched_specs) == 2
-        for spec in launched_specs:
+        for spec, launched_thread_id in zip(
+            launched_specs, [thread_id, recovered_thread_id], strict=True
+        ):
             assert spec.keep_alive_after_exit is True
-            assert thread_id in spec.args
+            assert launched_thread_id in spec.args
             assert "check_for_update_on_startup=false" in spec.args
             assert spec.env["CODEX_HOME"] == str(original_server.codex_home)
         live_runs = [run for run in runs if not run.cancelled]
         # Exactly one live forwarder mirrors the thread for the session.
         assert len(live_runs) == 1
-        registered = runner_app_mod._AUTO_FORWARDER_TASKS.get(session_id)
+        registered = runner_app_mod._AUTO_FORWARDER_TASKS.get(
+            session_id if reused else recovered_session_id
+        )
         assert registered is live_runs[0].task
         # Still running: a done survivor would leave the session unmirrored.
         assert not registered.done()
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
-        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        for registered_session_id in (session_id, rotated_session_id):
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(registered_session_id, None)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(registered_session_id, None)
         await _drain_forwarder_runs(runs)
 
 

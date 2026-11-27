@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
 
 from omnigent.server.routes.scheduled_tasks import (
+    _DETAILS_WITHOUT_WORKFLOW_MSG,
+    _PROMPT_OR_WORKFLOW_MSG,
+    _PROMPT_WITH_WORKFLOW_MSG,
     CreateScheduledTaskRequest,
     _resolve_create_timezone,
 )
@@ -94,3 +98,19 @@ def test_a_reminder_that_does_not_fit_is_rejected(fields: dict[str, str]) -> Non
 def test_an_unknown_kind_is_rejected() -> None:
     with pytest.raises(ValidationError, match="kind"):
         CreateScheduledTaskRequest(**_BODY, kind="trigger")
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"workflow_id": "0123456789abcdef0123456789abcdef"}, _PROMPT_WITH_WORKFLOW_MSG),
+        ({"workflow_details": "Only bugs"}, _DETAILS_WITHOUT_WORKFLOW_MSG),
+        ({"prompt": None}, _PROMPT_OR_WORKFLOW_MSG),
+    ],
+    ids=["prompt-with-workflow", "details-without-workflow", "neither"],
+)
+def test_a_create_names_either_a_prompt_or_a_workflow(
+    fields: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=re.escape(message)):
+        CreateScheduledTaskRequest(**{**_BODY, **fields})

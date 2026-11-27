@@ -2,6 +2,8 @@
 // history visits that record them. Pure types plus the reuse key, so the link
 // parser, the tab store and the history store all share one definition.
 
+import type { ComparisonChoice } from "@/lib/comparisonChoice";
+
 /** A workspace tab's stable ID, unique within its session. */
 export type TabId = string;
 
@@ -36,6 +38,10 @@ export type WorkspacePlace =
       line?: LineRange;
       comment?: string;
       range?: ExplicitRange;
+      /** The session's comparison this visit showed; showing the visit again applies it. */
+      comparison?: ComparisonChoice;
+      /** The folder, absolute, whose review showed `comparison`; absent for the workspace. */
+      comparisonRoot?: string;
       fileTab?: true;
     }
   | { kind: "pulls" }
@@ -47,6 +53,8 @@ export type WorkspacePlace =
       commit?: string;
       path?: string;
       line?: LineRange;
+      /** The session's pull requests show beside it, and choosing one shows it in this tab. */
+      list?: true;
     }
   | { kind: "terminal"; key: string }
   | { kind: "agents" }
@@ -103,7 +111,8 @@ export function placeIdentity(place: WorkspacePlace): string | null {
     case "pulls":
       return "pulls";
     case "pull":
-      return `pull:${place.url}`;
+      // A pull request beside the list never stands in for its own tab, nor it for the list.
+      return place.list ? `pull-list:${place.url}` : `pull:${place.url}`;
     case "terminal":
       return `terminal:${place.key}`;
     case "agents":

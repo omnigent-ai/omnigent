@@ -1,5 +1,5 @@
 // What makes the CodeMirror viewer an editor: undo history, the editing
-// commands and keys of other code editors, bracket closing and matching, ⌘S to
+// commands and keys of other code editors, bracket closing, ⌘S to
 // save, and change and blur reports to the save logic.
 
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
@@ -10,7 +10,6 @@ import {
   redoSelection,
   undoSelection,
 } from "@codemirror/commands";
-import { bracketMatching } from "@codemirror/language";
 import {
   Compartment,
   EditorState,
@@ -70,7 +69,6 @@ export function editability(
   if (!editable) return [EditorState.readOnly.of(true), keymap.of(editorCommandKeymap(false))];
   return [
     undoHistory.of(history()),
-    bracketMatching(),
     closeBrackets(),
     languageEditing(path),
     keymap.of([

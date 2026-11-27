@@ -79,6 +79,35 @@ async def test_framework_skills_load_only_when_server_and_tool_group_enable_them
                 assert "not found" in result
 
 
+@pytest.mark.parametrize("workflows_enabled", [False, True])
+@pytest.mark.parametrize("memory_on", [False, True])
+def test_memory_import_skill_loads_only_with_the_memory_tool_group(
+    tmp_path: Path,
+    isolated_home: Path,
+    memory_on: bool,
+    workflows_enabled: bool,
+) -> None:
+    """``import-memory`` follows the memory group and does not need workflows."""
+    spec = AgentSpec(
+        spec_version=1,
+        skills_filter="none",
+        tool_groups=ToolGroupsConfig(memory=memory_on),
+    )
+
+    result = _execute_skill_tool(
+        "load_skill",
+        {"name": "import-memory"},
+        agent_spec=spec,
+        runner_workspace=tmp_path,
+        workflows_enabled=workflows_enabled,
+    )
+
+    if memory_on:
+        assert "# Import Claude Code's or Codex's memory" in result
+    else:
+        assert "not found" in result
+
+
 @pytest.mark.parametrize("name", ["example", "workflow"])
 def test_read_skill_file_resolves_host_scope_skill(
     tmp_path: Path,

@@ -7,8 +7,22 @@ import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
-import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
+
+// The QuickPick palette and its theme picker load only with quick_pick_palette, so the
+// default bundle keeps the flagged code, and what it imports, out of the first load. The
+// palette mounts closed when the flag resolves, to start loading before use.
+const QuickPickCommandPalette = lazy(() =>
+  import("./QuickPickCommandPalette").then((module) => ({
+    default: module.QuickPickCommandPalette,
+  })),
+);
+const FeatureFlagsPicker = lazy(() =>
+  import("./FeatureFlagsPicker").then((module) => ({ default: module.FeatureFlagsPicker })),
+);
+const ThemePicker = lazy(() =>
+  import("./ThemePicker").then((module) => ({ default: module.ThemePicker })),
+);
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
 const ImportContextPreview = import.meta.env.DEV
@@ -23,6 +37,8 @@ export interface AppShellOverlaysProps {
   setCommandPaletteOpen: (open: boolean) => void;
   toggleLeftSidebar: () => void;
   toggleRightPanel: () => void;
+  /** Switches the open palette to searching sessions only. */
+  goToSession: () => void;
   gridRoute: boolean;
   allConversations: Conversation[] | undefined;
   serverConversationId: string | undefined;
@@ -42,15 +58,15 @@ export function AppShellOverlays({
   setCommandPaletteOpen,
   toggleLeftSidebar,
   toggleRightPanel,
+  goToSession,
   gridRoute,
   allConversations,
   serverConversationId,
   updateOverlayHeight,
 }: AppShellOverlaysProps) {
   // Both palettes take the same props; the flag picks one for ⌘K and the session switcher.
-  const Palette = isFeatureEnabled(serverInfo, "quick_pick_palette")
-    ? QuickPickCommandPalette
-    : CommandPalette;
+  const quickPick = isFeatureEnabled(serverInfo, "quick_pick_palette");
+  const Palette = quickPick ? QuickPickCommandPalette : CommandPalette;
   return (
     <>
       {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
@@ -68,15 +84,25 @@ export function AppShellOverlays({
           and in embedded mode — the sidebar's "Search" button opens it
           there even though the ⌘K hotkey is disabled (it belongs to the
           host page). */}
-      <Palette
-        key={sessionSearch ? "sessions" : "commands"}
-        sessionsOnly={sessionSearch}
-        open={commandPaletteOpen}
-        onOpenChange={setCommandPaletteOpen}
-        onToggleLeftSidebar={toggleLeftSidebar}
-        onToggleRightSidebar={toggleRightPanel}
-        rightSidebarShortcutEnabled={!gridRoute}
-      />
+      <Suspense fallback={null}>
+        <Palette
+          key={sessionSearch ? "sessions" : "commands"}
+          sessionsOnly={sessionSearch}
+          open={commandPaletteOpen}
+          onOpenChange={setCommandPaletteOpen}
+          onToggleLeftSidebar={toggleLeftSidebar}
+          onToggleRightSidebar={toggleRightPanel}
+          rightSidebarShortcutEnabled={!gridRoute}
+          onGoToSession={goToSession}
+        />
+      </Suspense>
+      {/* ⌘K's theme and UI feature-flag pickers. */}
+      {quickPick && (
+        <Suspense fallback={null}>
+          <ThemePicker />
+          <FeatureFlagsPicker />
+        </Suspense>
+      )}
       <RecentSessionsSwitcher
         conversations={allConversations}
         activeSessionId={serverConversationId ?? null}

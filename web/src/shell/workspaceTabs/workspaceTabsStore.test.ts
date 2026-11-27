@@ -9,6 +9,7 @@ import {
   type WorkspaceTabsSessionState,
 } from "./workspaceTabsPersistence";
 import {
+  ALREADY_CLOSING_REASON,
   createWorkspaceTabsStore,
   isOnlyEmptyNewTab,
   LAST_NEW_TAB_REASON,
@@ -87,6 +88,60 @@ describe("opening", () => {
     expect(store.tabs().map((tab) => tab.id)).toEqual(["F", "n1", "P"]);
     expect(store.history.serialize().visits).toHaveLength(2);
     expect(save).toHaveBeenCalled();
+    expectInvariant(store);
+  });
+
+  it("marks a fresh landing for each open and history step, and none for a click on a tab", async () => {
+    let choices = 0;
+    const { store } = makeStore({ choiceCount: () => choices });
+    expect(store.landing("P")).toBeUndefined();
+    await store.open({ place: { kind: "pulls" } }, { opener: "user" });
+    const opened = store.landing("P");
+    expect(opened).toEqual({ settled: false, choices: 0, folders: 0 });
+    store.select("F");
+    expect(store.landing("F")).toBeUndefined();
+    // Each landing keeps the session's choice count as it lands.
+    choices = 3;
+    await store.go("back");
+    expect(store.selectedTabId()).toBe("P");
+    expect(store.landing("P")).not.toBe(opened);
+    expect(store.landing("P")).toEqual({ settled: false, choices: 3, folders: 0 });
+  });
+
+  it("stamps each landing with the session's folder moves, so a folder chosen since wins", async () => {
+    let folders = 2;
+    const { store } = makeStore({ folderCount: () => folders });
+    await store.open({ place: { kind: "pulls" } }, { opener: "user" });
+    expect(store.landing("P")).toMatchObject({ folders: 2 });
+    folders = 5;
+    store.select("F");
+    await store.go("back");
+    expect(store.landing("P")).toMatchObject({ folders: 5 });
+    folders = 6;
+    await store.go("forward");
+    expect(store.landing(store.selectedTabId()!)).toMatchObject({ settled: false, folders: 6 });
+  });
+
+  it("brings a Diffs tab forward without the comparison it showed before, for the session's own", async () => {
+    const { store } = makeStore();
+    const diffFile: WorkspacePlace = { kind: "changes", path: "a.go", fileTab: true };
+    const branch = { kind: "saved", intent: "branch-point" } as const;
+    const opened = await store.open(
+      { place: { ...diffFile, comparison: branch } },
+      { opener: "user", disposition: "new" },
+    );
+    store.select("F");
+    await store.open(
+      { place: diffFile },
+      { opener: "user", disposition: "focus", reuse: "same-place" },
+    );
+    expect(store.selectedTab()).toMatchObject({ id: opened.ok && opened.tabId });
+    expect(store.selectedTab()?.place).toEqual(diffFile);
+    expect(store.landing(store.selectedTabId()!)).toEqual({
+      settled: false,
+      choices: 0,
+      folders: 0,
+    });
     expectInvariant(store);
   });
 
@@ -349,6 +404,14 @@ describe("closing and reopening", () => {
   });
 });
 
+/** A shell's tab the user opened, `id` showing shell `key`. */
+const userShellTab = (id: string, key: string): WorkspaceTab => ({
+  id,
+  place: { kind: "terminal", key },
+  binding: { kind: "terminal", key },
+  openedBy: "user",
+});
+
 describe("shells", () => {
   const shell: WorkspaceTab = {
     id: "T",
@@ -381,11 +444,290 @@ describe("shells", () => {
     ).resolves.toEqual({ ok: false, reason: "That shell has ended." });
   });
 
+  describe("moving between a split's shells", () => {
+    const [left, right, other] = [
+      userShellTab("A", "a"),
+      userShellTab("B", "b"),
+      userShellTab("C", "c"),
+    ];
+    const split = ["A", "B"];
+
+    it("selects the other shell's tab in place of the current step", async () => {
+      const { store } = makeStore({ initial: initial([files, left, right], "F") });
+      expect(store.select("A")).toBe(true);
+      expect(store.selectAmong("B", split)).toBe(true);
+      expect(store.selectedTabId()).toBe("B");
+      expectInvariant(store);
+      // The plain select's step stays one step: Back goes where it went from A.
+      expect(store.history.state.visits.map((visit) => visit.tabId)).toEqual(["F", "B"]);
+      await store.go("back");
+      expect(store.selectedTabId()).toBe("F");
+    });
+
+    it("keeps a plain select made meanwhile, of a tab outside the split", () => {
+      const { store } = makeStore({ initial: initial([files, left, right, other], "A") });
+      expect(store.select("C")).toBe(true);
+      expect(store.selectAmong("B", split)).toBe(false);
+      expect(store.selectedTabId()).toBe("C");
+      expect(store.history.state.visits.map((visit) => visit.tabId)).toEqual(["A", "C"]);
+    });
+
+    it("keeps Forward", async () => {
+      const { store } = makeStore({ initial: initial([files, left, right], "F") });
+      store.select("A");
+      store.select("F");
+      await store.go("back");
+      expect(store.selectAmong("B", split)).toBe(true);
+      expect(store.history.state.visits.map((visit) => visit.tabId)).toEqual(["F", "B", "F"]);
+      await store.go("forward");
+      expect(store.selectedTabId()).toBe("F");
+    });
+
+    it("refuses a tab outside the split", () => {
+      const { store } = makeStore({ initial: initial([files, left, right, other], "A") });
+      expect(store.selectAmong("C", split)).toBe(false);
+      expect(store.selectedTabId()).toBe("A");
+    });
+  });
+
   it("drops a restored shell missing from the first loaded list", () => {
     const restored = { ...shell, openedBy: "restore" as const };
     const { store } = makeStore({ initial: initial([files, restored], "F") });
     store.setTerminalInventory({ status: "loaded", keys: [] });
     expect(store.findTab("T")).toBeUndefined();
+  });
+});
+
+describe("split groups of shells", () => {
+  const shells = [
+    files,
+    userShellTab("T1", "k1"),
+    userShellTab("T2", "k2"),
+    userShellTab("T2b", "k2"),
+  ];
+
+  it("asks once, ends each shell once in order, then removes all their tabs", async () => {
+    const { store } = makeStore({ initial: initial(shells, "T1") });
+    const confirm = vi.fn().mockResolvedValue(true);
+    const ended: string[] = [];
+    const result = await store.closeTerminalGroup(["T1", "T2", "T2b"], {
+      confirm,
+      teardownFor: async (key) => {
+        ended.push(key);
+        return true;
+      },
+    });
+    expect(result).toEqual({ ok: true });
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(ended).toEqual(["k1", "k2"]);
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["F"]);
+    expect(store.snapshot().canReopen).toBe(false);
+    expectInvariant(store);
+  });
+
+  it("ends every shell the split names, including one without a tab", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    const ended: string[] = [];
+    const result = await store.closeTerminalGroup(["T1"], {
+      terminalKeys: ["k1", "k9"],
+      teardownFor: async (key) => {
+        ended.push(key);
+        return true;
+      },
+    });
+    expect(result).toEqual({ ok: true });
+    expect(ended).toEqual(["k1", "k9"]);
+    expect(store.findTab("T1")).toBeUndefined();
+  });
+
+  it("keeps the tabs of a shell that failed to end, and names it", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    const result = await store.closeTerminalGroup(["T1", "T2", "T2b"], {
+      teardownFor: async (key) => key !== "k2",
+    });
+    expect(result).toEqual({ ok: false, failed: ["k2"] });
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["F", "T2", "T2b"]);
+  });
+
+  it("leaves a consistent strip when the selected shell ends and another won't", async () => {
+    const { store } = makeStore({ initial: initial(shells, "T1") });
+    store.select("T2");
+    store.select("T1");
+    const result = await store.closeTerminalGroup(["T1", "T2", "T2b"], {
+      teardownFor: async (key) => key !== "k2",
+    });
+    expect(result).toEqual({ ok: false, failed: ["k2"] });
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["F", "T2", "T2b"]);
+    // The selection lands on a tab that's still there, with history agreeing.
+    expect(["F", "T2", "T2b"]).toContain(store.selectedTabId());
+    expectInvariant(store);
+    expect(store.history.state.visits.some((visit) => visit.tabId === "T1")).toBe(false);
+  });
+
+  it("stops as stale when the person acts during a teardown, after removing that shell's tabs", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    const first = deferred<boolean>();
+    const ended: string[] = [];
+    const closing = store.closeTerminalGroup(["T1", "T2"], {
+      teardownFor: (key) => {
+        ended.push(key);
+        return key === "k1" ? first.promise : Promise.resolve(true);
+      },
+    });
+    await Promise.resolve();
+    await store.open({ place: { kind: "pulls" } }, { opener: "user" });
+    first.resolve(true);
+    await expect(closing).resolves.toEqual({ ok: false, stale: true });
+    expect(ended).toEqual(["k1"]);
+    expect(store.findTab("T1")).toBeUndefined();
+    expect(store.findTab("T2")).toBeDefined();
+  });
+
+  it("ends nothing when the confirm is cancelled", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    const teardownFor = vi.fn().mockResolvedValue(true);
+    await expect(
+      store.closeTerminalGroup(["T1", "T2"], { confirm: async () => false, teardownFor }),
+    ).resolves.toEqual({ ok: false, cancelled: true });
+    expect(teardownFor).not.toHaveBeenCalled();
+  });
+
+  it("ends nothing when the session or design changes while the confirm is open", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    const answer = deferred<boolean>();
+    const teardownFor = vi.fn().mockResolvedValue(true);
+    const closing = store.closeTerminalGroup(["T1", "T2"], {
+      confirm: () => answer.promise,
+      teardownFor,
+    });
+    await Promise.resolve();
+    store.invalidate();
+    answer.resolve(true);
+    await expect(closing).resolves.toEqual({ ok: false, stale: true });
+    expect(teardownFor).not.toHaveBeenCalled();
+    expect(store.findTab("T1")).toBeDefined();
+  });
+
+  it("keeps closing when the shell list catches up on its own deletions", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    store.setTerminalInventory({ status: "loaded", keys: ["k1", "k2"] });
+    const ended: string[] = [];
+    const result = await store.closeTerminalGroup(["T1", "T2", "T2b"], {
+      teardownFor: async (key) => {
+        ended.push(key);
+        // The deletion's update arrives before the request returns.
+        store.setTerminalInventory({
+          status: "loaded",
+          keys: ["k1", "k2"].filter((live) => !ended.includes(live)),
+        });
+        return true;
+      },
+    });
+    expect(result).toEqual({ ok: true });
+    expect(ended).toEqual(["k1", "k2"]);
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["F"]);
+    expectInvariant(store);
+  });
+
+  it("stops when the shell list drops a shell outside the split while it closes", async () => {
+    const other = userShellTab("T3", "k3");
+    const { store } = makeStore({ initial: initial([...shells, other], "F") });
+    store.setTerminalInventory({ status: "loaded", keys: ["k1", "k2", "k3"] });
+    const ended: string[] = [];
+    const result = await store.closeTerminalGroup(["T1", "T2"], {
+      teardownFor: async (key) => {
+        ended.push(key);
+        store.setTerminalInventory({ status: "loaded", keys: ["k2"] });
+        return true;
+      },
+    });
+    expect(result).toEqual({ ok: false, stale: true });
+    expect(ended).toEqual(["k1"]);
+  });
+
+  it("refuses a second close of the same shells while the first is still asking", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    const answer = deferred<boolean>();
+    const firstTeardown = vi.fn().mockResolvedValue(true);
+    const closing = store.closeTerminalGroup(["T1", "T2"], {
+      confirm: () => answer.promise,
+      teardownFor: firstTeardown,
+    });
+    await Promise.resolve();
+    const teardownFor = vi.fn().mockResolvedValue(true);
+    await expect(store.closeTerminalGroup(["T1", "T2"], { teardownFor })).resolves.toEqual({
+      ok: false,
+      reason: ALREADY_CLOSING_REASON,
+    });
+    answer.resolve(true);
+    await expect(closing).resolves.toEqual({ ok: true });
+    expect(teardownFor).not.toHaveBeenCalled();
+    expect(firstTeardown.mock.calls).toEqual([["k1"], ["k2"]]);
+  });
+
+  it("still names a shell that failed to end when a later change stops the close", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    const second = deferred<boolean>();
+    const closing = store.closeTerminalGroup(["T1", "T2"], {
+      teardownFor: (key) => (key === "k1" ? Promise.resolve(false) : second.promise),
+    });
+    await vi.waitFor(() => expect(store.findTab("T1")).toBeDefined());
+    await Promise.resolve();
+    await store.open({ place: { kind: "pulls" } }, { opener: "user" });
+    second.resolve(true);
+    await expect(closing).resolves.toEqual({ ok: false, stale: true, failed: ["k1"] });
+  });
+
+  it("stops when another shell starts running while it closes, with nothing removed", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    store.setTerminalInventory({ status: "loaded", keys: ["k1", "k2"] });
+    // A shell just launched: its tab shows it connecting until the list has it.
+    await store.open({ place: { kind: "terminal", key: "k3" } }, { opener: "user" });
+    const ended: string[] = [];
+    const result = await store.closeTerminalGroup(["T1", "T2"], {
+      teardownFor: async (key) => {
+        ended.push(key);
+        // The other shell shows up as running, before this close's own deletion lands.
+        store.setTerminalInventory({ status: "loaded", keys: ["k1", "k2", "k3"] });
+        return true;
+      },
+    });
+    expect(result).toEqual({ ok: false, stale: true });
+    expect(ended).toEqual(["k1"]);
+  });
+
+  it("stops when another shell starts running in the update that drops a closing one", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    store.setTerminalInventory({ status: "loaded", keys: ["k1", "k2"] });
+    await store.open({ place: { kind: "terminal", key: "k3" } }, { opener: "user" });
+    const ended: string[] = [];
+    const result = await store.closeTerminalGroup(["T1", "T2"], {
+      teardownFor: async (key) => {
+        ended.push(key);
+        // One list both drops the shell this close ended and shows the other one running.
+        store.setTerminalInventory({ status: "loaded", keys: ["k2", "k3"] });
+        return true;
+      },
+    });
+    expect(result).toEqual({ ok: false, stale: true });
+    expect(ended).toEqual(["k1"]);
+  });
+
+  it("refuses a second close of the same shells while the first is ending them", async () => {
+    const { store } = makeStore({ initial: initial(shells, "F") });
+    const first = deferred<boolean>();
+    const closing = store.closeTerminalGroup(["T1", "T2"], {
+      teardownFor: (key) => (key === "k1" ? first.promise : Promise.resolve(true)),
+    });
+    await Promise.resolve();
+    const teardownFor = vi.fn().mockResolvedValue(true);
+    await expect(store.closeTerminalGroup(["T2"], { teardownFor })).resolves.toEqual({
+      ok: false,
+      reason: ALREADY_CLOSING_REASON,
+    });
+    expect(teardownFor).not.toHaveBeenCalled();
+    first.resolve(true);
+    await expect(closing).resolves.toEqual({ ok: true });
   });
 });
 
@@ -728,6 +1070,93 @@ describe("closing races", () => {
   });
 });
 
+describe("closing a group of tabs", () => {
+  const a: WorkspaceTab = { id: "A", place: file("a.ts"), openedBy: "user" };
+  const b: WorkspaceTab = { id: "B", place: file("b.ts"), openedBy: "user" };
+  const shell: WorkspaceTab = {
+    id: "T",
+    place: { kind: "terminal", key: "k" },
+    binding: { kind: "terminal", key: "k" },
+    openedBy: "user",
+  };
+
+  it("closes the asked tabs in one commit but keeps pinned tabs and shells", async () => {
+    const { store } = makeStore({ initial: initial([files, a, b, shell, pulls], "F") });
+    store.setPinned(["B"], true);
+    const notified = vi.fn();
+    store.subscribe(notified);
+    await expect(store.closeMany(["A", "B", "T", "P"], () => undefined)).resolves.toEqual({
+      ok: true,
+    });
+    expect(notified).toHaveBeenCalledTimes(1);
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["B", "F", "T"]);
+    expectInvariant(store);
+  });
+
+  it("asks once about all unsaved edits, and Keep editing closes none", async () => {
+    const { store, dirty, requestLeave } = makeStore({ initial: initial([files, a, b], "F") });
+    dirty.add("A");
+    dirty.add("B");
+    requestLeave.mockResolvedValue("cancel");
+    const before = store.serialize();
+    await expect(store.closeMany(["A", "B"], () => undefined)).resolves.toEqual({
+      ok: false,
+      cancelled: true,
+    });
+    expect(requestLeave).toHaveBeenCalledOnce();
+    expect(requestLeave).toHaveBeenCalledWith(["A", "B"], "close");
+    expect(store.serialize()).toEqual(before);
+  });
+
+  it("closes nothing when a tab is pinned while it asks about unsaved edits", async () => {
+    const { store, dirty, requestLeave } = makeStore({ initial: initial([files, a, b], "F") });
+    dirty.add("A");
+    requestLeave.mockImplementation(async () => {
+      store.setPinned(["B"], true);
+      return "leave";
+    });
+    await expect(store.closeMany(["A", "B"], () => undefined)).resolves.toEqual({
+      ok: false,
+      stale: true,
+    });
+    expect(store.findTab("A")).toBeDefined();
+    expect(store.findTab("B")).toBeDefined();
+    expectInvariant(store);
+  });
+
+  it("selects a neighbour when the selected tab closes, and reopens each one", async () => {
+    const { store } = makeStore({ initial: initial([files, a, b], "A") });
+    await store.closeMany(["A", "B"], () => undefined);
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["F"]);
+    expect(store.selectedTabId()).toBe("F");
+    const reopened = [store.reopenClosed(), store.reopenClosed()].map(
+      (tabId) => store.findTab(tabId!)?.place,
+    );
+    expect(reopened).toEqual(expect.arrayContaining([a.place, b.place]));
+    expectInvariant(store);
+  });
+
+  it("does nothing for tabs that are gone or can't close as a group", async () => {
+    const { store, requestLeave } = makeStore({ initial: initial([files, shell], "F") });
+    const notified = vi.fn();
+    store.subscribe(notified);
+    await expect(store.closeMany(["T", "missing"], () => undefined)).resolves.toEqual({
+      ok: true,
+    });
+    expect(notified).not.toHaveBeenCalled();
+    expect(requestLeave).not.toHaveBeenCalled();
+  });
+
+  it("asks once in Close other tabs too", async () => {
+    const { store, dirty, requestLeave } = makeStore({ initial: initial([files, a, b], "F") });
+    dirty.add("A");
+    requestLeave.mockResolvedValue("leave");
+    await expect(store.closeOthers("F", () => undefined)).resolves.toEqual({ ok: true });
+    expect(requestLeave).toHaveBeenCalledOnce();
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["F"]);
+  });
+});
+
 describe("the tab cap with tabs from a newer app", () => {
   it("counts kept tabs it can't show", async () => {
     const opaque = Array.from({ length: MAX_WORKSPACE_TABS - 1 }, (_, index) => ({
@@ -1053,5 +1482,46 @@ describe("a sidebar that rests empty", () => {
     const { store } = makeStore({ initial: initial([pulls], "P") });
     await store.close("P");
     expect(isOnlyEmptyNewTab(store.tabs())).toBe(true);
+  });
+});
+
+describe("telling of opened files", () => {
+  const blank: WorkspaceTab = { id: "N", place: { kind: "new" }, openedBy: "user" };
+
+  it("tells each file an open, a navigation or a new tab lands on", async () => {
+    const onFileOpened = vi.fn();
+    const { store } = makeStore({ initial: initial([files, pulls, blank], "F"), onFileOpened });
+
+    // Opened from the Files tree, shown in the Files tab itself.
+    await store.open({ place: file("src/tree.ts") }, { opener: "user", origin: "files-tree" });
+    // Opened in a tab of its own, as a Search result does.
+    await store.open({ place: file("src/found.ts", 4) }, { opener: "user", disposition: "new" });
+    const fileTab = store.selectedTabId()!;
+    // Stepped to from a file tab's breadcrumbs.
+    await store.navigate(fileTab, file("src/next.ts"));
+    expect(store.fillNewTab("N", file("src/picked.ts"))).toBe("N");
+
+    expect(onFileOpened.mock.calls.map(([path]) => path)).toEqual([
+      "src/tree.ts",
+      "src/found.ts",
+      "src/next.ts",
+      "src/picked.ts",
+    ]);
+  });
+
+  it("tells nothing for a place without a file, or an open that didn't happen", async () => {
+    const onFileOpened = vi.fn();
+    const { store, dirty, requestLeave } = makeStore({
+      initial: initial([files, { id: "E", place: file("src/edited.ts"), openedBy: "user" }], "E"),
+      onFileOpened,
+    });
+    await store.open({ place: { kind: "files" } }, { opener: "user" });
+    await store.open({ place: { kind: "changes" } }, { opener: "user" });
+    // Keeping unsaved edits cancels the navigation, so no file opened.
+    dirty.add("E");
+    requestLeave.mockResolvedValueOnce("cancel");
+    await store.navigate("E", file("src/other.ts"));
+
+    expect(onFileOpened).not.toHaveBeenCalled();
   });
 });

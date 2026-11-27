@@ -24,6 +24,7 @@ export const FILE_COMMAND_IDS = [
   "copy-relative-path",
   "copy-previous-path",
   "copy-link",
+  "reveal",
   "open-in-vscode",
   "open-in-cursor",
 ] as const;
@@ -60,7 +61,7 @@ export const OPEN_IN_EDITOR: Record<CodeEditor, FileCommandId> = {
 /** What the actions need to know about one file or folder and where it lives. */
 export interface FileCommandFacts {
   directory: boolean;
-  /** Deleted in the working copy, so there's nothing to open or edit. */
+  /** Deleted in the working copy, so there's nothing to open, reveal, or edit. */
   deleted: boolean;
   /** Its path from the workspace root; `null` when it's outside the workspace. */
   relativePath: string | null;
@@ -74,7 +75,11 @@ export interface FileCommandFacts {
   rootable: boolean;
   /** A session is open, so a link can point at the file in it. */
   linkable: boolean;
-  /** The editors that can open it here, over SSH. */
+  /** It's on this machine and the desktop app can show it in the file manager. */
+  revealable: boolean;
+  /** This OS's file manager, such as "Finder". */
+  fileManager: string;
+  /** The editors that can open it here, locally or over SSH. */
   editors: readonly CodeEditor[];
   /** Where a pull request review opens it on its code host; absent elsewhere. */
   codeHostLink?: CodeHostFileLink | null;
@@ -156,6 +161,12 @@ export function fileCommands(facts: FileCommandFacts): FileCommand[] {
       keywords: ["url", "clipboard", "share"],
       // A link opens the file in the session's viewer, which shows files, not folders.
       availability: when(facts.linkable && facts.relativePath !== null && !facts.directory),
+    },
+    {
+      id: "reveal",
+      label: `${facts.directory ? "Open" : "Show"} in ${facts.fileManager}`,
+      keywords: ["finder", "explorer", "file manager", "reveal", "folder"],
+      availability: when(facts.revealable && present),
     },
   ];
   for (const editor of CODE_EDITORS) {

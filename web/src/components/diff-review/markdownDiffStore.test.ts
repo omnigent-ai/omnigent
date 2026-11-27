@@ -192,6 +192,32 @@ describe("MarkdownDiffStore", () => {
     });
   });
 
+  it("prepares the preview again when full text comes back after a patch it couldn't preview", async () => {
+    const { computer, calls } = manualComputer();
+    const store = new MarkdownDiffStore({ computer });
+    const full = fullDiff("Old.", "New.");
+    store.request(PATH, full);
+    await settled();
+    calls[0]!.finish();
+    await settled();
+    expect(store.states.get(PATH)).toMatchObject({ status: "ready" });
+
+    store.request(PATH, patchDiff());
+    await settled();
+    expect(store.states.get(PATH)).toEqual({
+      status: "unavailable",
+      message: NO_FULL_TEXT_MESSAGE,
+    });
+
+    // The same full text again doesn't reuse the patch's "unavailable".
+    store.request(PATH, full);
+    await settled();
+    expect(calls).toHaveLength(2);
+    calls[1]!.finish();
+    await settled();
+    expect(store.states.get(PATH)).toMatchObject({ status: "ready" });
+  });
+
   it("cancels work and stops publishing once disposed", async () => {
     const { computer, calls } = manualComputer();
     const store = new MarkdownDiffStore({ computer });

@@ -112,9 +112,12 @@ class SysSessionUpdateTool(Tool):
             "running session, including this one, keeps working. This session can archive "
             "itself, for example when its task is done: its runner stops once the current "
             "turn ends. It cannot archive a session it runs under. Sub-agent sessions "
-            "follow their parent, and a family shares "
-            "the project of the session its members list as moves_with. Call once per "
-            "session."
+            "follow their parent, so archived: true is the only change for one: it "
+            "archives any of the user's sub-agent sessions, including ones this session "
+            "started, and closes it so its parent can start a new one with the same name. "
+            "A sub-agent session cannot archive itself. "
+            "A family shares the project of the session its members list as moves_with. "
+            "Call once per session."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -219,7 +222,8 @@ class SysSessionLinkPrTool(Tool):
     def description(cls) -> str:
         return (
             "Link or unlink a GitHub pull request in a session's PR panel. "
-            "Defaults to the current session; another session requires edit access. "
+            "Defaults to the current session; another session must be one you own, "
+            "since the link runs as its host's GitHub account. "
             "Its host or runner must be online and able to read the PR. "
             "Requires scripted sessions enabled on the server and a private or "
             "read-only-shared calling session. This updates the association only."

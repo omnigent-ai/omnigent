@@ -5,6 +5,7 @@
 import {
   createContext,
   memo,
+  Fragment,
   useCallback,
   useContext,
   useEffect,
@@ -26,6 +27,7 @@ import {
   Loader2Icon,
   PencilIcon,
   SplitIcon,
+  SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -49,7 +51,7 @@ import {
   parseDesignRequest,
   type DesignRequest,
 } from "@/components/BrowserPane/designTools/parseDesignRequest";
-import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
+import { SessionMessageLabel } from "@/components/blocks/SessionMessageCard";
 import {
   BlockRenderer,
   FilePathAwareMessageResponse,
@@ -72,6 +74,7 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
+import { throttleAnimations } from "@/lib/throttledAnimations";
 import { cn } from "@/lib/utils";
 import {
   splitKnownSlashCommand,
@@ -81,7 +84,6 @@ import {
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
-import { useSessionLabel } from "@/hooks/useSessionLabel";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
@@ -91,8 +93,11 @@ import {
   isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
+  PENDING_FILE_PREFIX,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+import { isCommandListed } from "@/store/paletteCommands";
+import { forkFromResponseAvailability, userMessageLinkId } from "./messageActions";
 import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
@@ -112,6 +117,7 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+import { FailedAttachment, PendingAttachment } from "./PendingAttachment";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
 import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -121,6 +127,8 @@ import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import type { BackgroundTaskInfo, PendingInput, SessionStatus } from "@/lib/types";
 import {
@@ -155,6 +163,13 @@ export function extractUserText(content: MessageContentBlock[]): string {
   return readableSentText(userMessageBody(content)).trimEnd();
 }
 
+/** What Copy puts on the clipboard for a user message: a shell command keeps its `!`. */
+export function userBubbleCopyText(bubble: Extract<Bubble, { kind: "user" }>): string {
+  return bubble.shellCommand !== undefined
+    ? `!${bubble.shellCommand}`
+    : extractUserText(bubble.content);
+}
+
 /** A user message's text for rendering: mention markers become inline pills. */
 function userMarkdownText(content: MessageContentBlock[]): string {
   return replaceSentMentions(userMessageBody(content), mentionPillMarkdown).trimEnd();
@@ -164,28 +179,18 @@ function userMarkdownText(content: MessageContentBlock[]): string {
 function SessionMessageOriginLine({
   sourceId,
   currentSessionId,
-  className,
 }: {
   sourceId: string;
   currentSessionId: string | null;
-  className?: string;
 }) {
-  const label = useSessionLabel(sourceId, currentSessionId);
   return (
-    <div
-      data-testid="message-origin"
-      className={cn("flex shrink-0 items-center gap-1 text-xs text-muted-foreground", className)}
-    >
-      <CornerDownRightIcon className="size-3 shrink-0" />
-      <span>From</span>
-      {label ? (
-        <SessionMentionPill id={sourceId} isSubagent={label.isSubagent}>
-          @{label.title}
-        </SessionMentionPill>
-      ) : (
-        <span>another session</span>
-      )}
-    </div>
+    <SessionMessageLabel
+      sessionId={sourceId}
+      currentSessionId={currentSessionId}
+      verb="From"
+      icon={CornerDownRightIcon}
+      testId="message-origin"
+    />
   );
 }
 
@@ -310,6 +315,7 @@ export function buildPendingBubbles(
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
+      ...(p.uploadFailure !== undefined ? { uploadFailure: p.uploadFailure } : {}),
     };
   });
 }
@@ -356,6 +362,18 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
   return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
 }
 
+/** Submission order within one second: the optimistic bubble's sequence number from its temp id. */
+function sendSequence(message: PendingUserMessage): number {
+  const match = /_(\d+)$/.exec(message.tempId);
+  return match ? Number(match[1]) : 0;
+}
+
+/** Whether `later` was submitted after `earlier`: send time first, then the sequence within a second. */
+function sendsAfter(earlier: PendingUserMessage, later: PendingUserMessage): boolean {
+  const byTime = (later.createdAtS ?? 0) - (earlier.createdAtS ?? 0);
+  return byTime > 0 || (byTime === 0 && sendSequence(later) > sendSequence(earlier));
+}
+
 /**
  * Add a conversation's uncommitted user messages to its committed bubbles: the
  * undelivered startup messages, and the optimistic sends they don't replace.
@@ -364,20 +382,27 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
  * @param pendingUserMessages - The conversation's optimistic sends.
  * @param failedInputs - The snapshot's undelivered startup messages.
  * @param selfAuthor - The viewer's attribution id, or null.
+ * @param failedUploads - Sends whose upload failed before posting, shown in send order.
  */
 export function withUncommittedUserBubbles(
   committed: Bubble[],
   pendingUserMessages: PendingUserMessage[],
   failedInputs: PendingInput[],
   selfAuthor: string | null,
+  failedUploads: PendingUserMessage[] = [],
 ): Bubble[] {
   const withUndelivered = placeUndeliveredBubbles(
     committed,
     buildUndeliveredBubbles(failedInputs, selfAuthor),
   );
-  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
-  if (pending.length === 0) return withUndelivered;
-  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
+  // Pending sends keep their own order; each parked upload goes where its send time falls.
+  const uncommitted = [...withoutFailedInputs(pendingUserMessages, failedInputs)];
+  for (const failed of failedUploads) {
+    const at = uncommitted.findIndex((p) => sendsAfter(failed, p));
+    uncommitted.splice(at === -1 ? uncommitted.length : at, 0, failed);
+  }
+  if (uncommitted.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(uncommitted, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more
@@ -691,7 +716,7 @@ export function WorkingIndicator() {
     );
   }
   // Background shells outliving a finished turn keep the session in progress,
-  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // but the agent isn't thinking: show the static terminal glyph, not a spinner.
   // The main composer's pill announces the count; side chats have no pill.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
     const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
@@ -705,7 +730,7 @@ export function WorkingIndicator() {
         <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
           <MessageContent>
             <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
-              <RunningDot className="size-3.5" />
+              <SquareTerminalIcon aria-hidden strokeWidth={1.5} className="size-3.5 shrink-0" />
               <span className="text-sm font-mono">{label}</span>
             </div>
           </MessageContent>
@@ -727,7 +752,7 @@ export function WorkingIndicator() {
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
-          <div className="flex items-center gap-1.5 py-0.5">
+          <div ref={throttleAnimations} className="flex items-center gap-1.5 py-0.5">
             <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm" duration={1.5}>
               {label}
@@ -1092,8 +1117,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
   const published = usePublishedComposerCommands(sessionId);
-  const text =
-    bubble.shellCommand !== undefined ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const text = userBubbleCopyText(bubble);
   // The backend classifies the raw block, before sender and context wrappers
   // are stripped for display.
   const rawText =
@@ -1124,9 +1148,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
     useMessageActionVisibility(awaitingAgent, awaitingAgent && !text);
-  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
-    bubble.pending ? null : bubble.itemId,
-  );
+  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(userMessageLinkId(bubble));
   // Collapse long prompts by default to avoid expensive Markdown parsing and
   // a large DOM for text the user hasn't asked to read yet.
   const isLong = renderedText.length > COLLAPSE_THRESHOLD;
@@ -1247,11 +1269,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                       />
                     );
                   }
+                  if (preview.kind !== "pending") {
+                    return <ImageAttachmentPlaceholder key={key} label={preview.label} />;
+                  }
                   return (
-                    <ImageAttachmentPlaceholder
+                    <PendingAttachment
                       key={key}
-                      label={preview.label}
-                      pending={preview.kind === "pending"}
+                      messageId={bubble.itemId}
+                      fileId={img.file_id ?? ""}
+                      name={preview.label}
+                      image
+                      failure={bubble.uploadFailure}
+                      fallback={
+                        // Siblings of a failed message are not uploading: no spinner.
+                        <ImageAttachmentPlaceholder
+                          label={preview.label}
+                          pending={bubble.uploadFailure === undefined}
+                        />
+                      }
                     />
                   );
                 })}
@@ -1291,13 +1326,27 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 {fileChips.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
                     {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
-                      ({ key, item: att }) => (
-                        <AttachmentChip
-                          key={key}
-                          icon={FileTextIcon}
-                          label={attachmentLabel(att)}
-                        />
-                      ),
+                      ({ key, item: att }) => {
+                        const chip = (
+                          <AttachmentChip icon={FileTextIcon} label={attachmentLabel(att)} />
+                        );
+                        if (
+                          typeof att.file_id !== "string" ||
+                          !att.file_id.startsWith(PENDING_FILE_PREFIX)
+                        ) {
+                          return <Fragment key={key}>{chip}</Fragment>;
+                        }
+                        return (
+                          <PendingAttachment
+                            key={key}
+                            messageId={bubble.itemId}
+                            fileId={att.file_id}
+                            name={attachmentLabel(att)}
+                            failure={bubble.uploadFailure}
+                            fallback={chip}
+                          />
+                        );
+                      },
                     )}
                   </div>
                 )}
@@ -1347,6 +1396,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </div>
         </div>
+        {bubble.uploadFailure !== undefined && bubble.uploadFailure.fileId === undefined && (
+          <div className="flex justify-end pt-1">
+            <FailedAttachment name="this message" failure={bubble.uploadFailure} image={false} />
+          </div>
+        )}
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}
@@ -1472,8 +1526,10 @@ function AssistantBubble({
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   const foldNarration = useFoldAssistantNarration();
+  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const forkAvailability = forkFromResponseAvailability(forkDialog, bubble.lifecycle);
   const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
@@ -1539,6 +1595,7 @@ function AssistantBubble({
     showsWorking,
     defaultExpanded: bubble.defaultExpanded,
     foldNarration,
+    workflowsEnabled,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -1650,7 +1707,7 @@ function AssistantBubble({
                 {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                {forkDialog && isCommandListed(forkAvailability) && (
                   <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
                     <MessageAction
                       tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}

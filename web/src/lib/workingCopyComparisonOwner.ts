@@ -26,7 +26,10 @@ export interface ComparisonConsumer {
   /** Whether this view may read the workspace now: permission, serveability, environment. */
   enabled: boolean;
   sessionHostId: string | null;
-  /** The session's workspace root, once known; a typed comparison belongs to it. */
+  /**
+   * The session's workspace root, once known, also in a repository folder's review. A typed
+   * comparison belongs to it, or to the owner's folder inside it.
+   */
   root?: string | null;
 }
 
@@ -48,6 +51,8 @@ export interface ComparisonOwnerSnapshot {
   headOverride: boolean;
   /** Bumped when the session's files may be read again; readers retry then. */
   accessEpoch: number;
+  /** Bumped each time the person chooses a comparison here, even the one shown. */
+  choices: number;
 }
 
 export interface ComparisonOwnerDependencies {
@@ -55,6 +60,14 @@ export interface ComparisonOwnerDependencies {
     sessionId: string,
     options: { refresh: boolean; signal: AbortSignal; spec: RevisionSpec | null },
   ) => Promise<BranchPointListing>;
+  /**
+   * A folder relative to the workspace, such as a worktree inside it, that this owner reviews
+   * in place of the workspace. The runner lists only the workspace, so here the last commit's
+   * changes are listed by the host too.
+   */
+  repository?: string;
+  /** Which host and workspace `repository` lies in; see `workspaceKeyOf`. */
+  workspaceKey?: string;
   /** Asks whether the session's host serves comparisons, again on `ask`. */
   watchRoute: (
     target: { sessionId: string },
@@ -94,6 +107,9 @@ export const IDLE_GRACE_MS = 30_000;
 /** An unwatched session forgets its comparison and choices after this. */
 export const IDLE_TTL_MS = 10 * 60_000;
 
+/** The last commit's changes, as the host lists them for a repository folder. */
+export const LAST_COMMIT_SPEC: RevisionSpec = { base: "HEAD", head: "" };
+
 /** Problems after which polling slows, since the next list will likely be as slow. */
 const SLOW_PROBLEMS = new Set(["timeout", "too_many_files", "listing_too_large"]);
 
@@ -127,12 +143,15 @@ interface SessionState {
   idleTtlTimer: unknown;
   headOverride: boolean;
   accessEpoch: number;
+  choices: number;
   /** When the route was last asked again about a comparison policy that was off. */
   lastPolicyAskAt: number;
   /** Paths whose automatic re-list was spent; each file has its own chain. */
   recoveryUsed: Map<string, FileRecovery>;
   /** Counts lists started, so a recovery waits for one that began after it asked. */
   listSerial: number;
+  /** Which comparison `established` was listed as; a different one starts afresh. */
+  listedKey: string | null;
   /** Counts lists finished, so a reader can say which listing its read began under. */
   listsFinished: number;
   recoveryWaiters: { after: number; resolve: (relisted: boolean) => void }[];
@@ -147,8 +166,15 @@ export class WorkingCopyComparisonOwner {
   private intent: WorkingCopyBaseIntent;
   private readonly unsubscribes: (() => void)[] = [];
 
+  /** The folder relative to the workspace this owner reviews; empty for the workspace. */
+  readonly repository: string;
+  /** Which host and workspace `repository` lies in; empty for the workspace's own owner. */
+  readonly workspaceKey: string;
+
   constructor(deps: ComparisonOwnerDependencies) {
     this.deps = deps;
+    this.repository = deps.repository ?? "";
+    this.workspaceKey = deps.workspaceKey ?? "";
     this.intent = deps.readIntent();
     this.unsubscribes.push(
       deps.subscribeIntent(() => {
@@ -227,6 +253,11 @@ export class WorkingCopyComparisonOwner {
     return this.session(sessionId).snapshot;
   }
 
+  /** How many comparisons the person has chosen for the session, read without tracking it. */
+  choiceCount(sessionId: string): number {
+    return this.sessions.get(sessionId)?.snapshot.choices ?? 0;
+  }
+
   // ── Actions ───────────────────────────────────────────────────────────────
 
   /** The session's files may have changed: list again once the current list ends. */
@@ -269,6 +300,7 @@ export class WorkingCopyComparisonOwner {
   /** The person chose a base, even the current one: their override and typed comparison end. */
   chose(sessionId: string): void {
     const session = this.session(sessionId);
+    session.choices += 1;
     this.clearCustom(session);
     this.clearChoiceState(session);
     session.dirty = session.dirty || session.established === null;
@@ -283,7 +315,8 @@ export class WorkingCopyComparisonOwner {
   compareRevisions(sessionId: string, spec: RevisionSpec): void {
     const session = this.session(sessionId);
     if (!session.workspace) return;
-    this.deps.customComparisons?.write(sessionId, session.workspace, spec);
+    session.choices += 1;
+    this.deps.customComparisons?.write(sessionId, this.savedIn(session.workspace), spec);
     this.applyCustom(session, spec);
     this.clearChoiceState(session);
     session.dirty = true;
@@ -434,9 +467,11 @@ export class WorkingCopyComparisonOwner {
         idleTtlTimer: undefined,
         headOverride: false,
         accessEpoch: 0,
+        choices: 0,
         lastPolicyAskAt: Number.NEGATIVE_INFINITY,
         recoveryUsed: new Map(),
         listSerial: 0,
+        listedKey: null,
         listsFinished: 0,
         recoveryWaiters: [],
         listeners: new Set(),
@@ -456,14 +491,26 @@ export class WorkingCopyComparisonOwner {
     return this.enabledConsumers(session).length > 0;
   }
 
-  /** Whether the session shows a comparison its host lists: a typed one, or the branch point. */
-  private wantsHostComparison(session: SessionState): boolean {
-    return session.custom !== null || (this.intent !== "head" && !session.headOverride);
+  /**
+   * The comparison the session lists from its host: a typed one, the branch point (null),
+   * the last commit in a repository folder, or none (undefined) when the runner lists it.
+   */
+  private listedSpec(session: SessionState): RevisionSpec | null | undefined {
+    if (session.custom) return session.custom;
+    if (this.intent !== "head" && !session.headOverride) return null;
+    return this.repository ? LAST_COMMIT_SPEC : undefined;
   }
 
-  /** Whether the comparison this session lists, typed or the branch point, can be made now. */
+  /** Whether the session shows a comparison its host lists. */
+  private wantsHostComparison(session: SessionState): boolean {
+    return this.listedSpec(session) !== undefined;
+  }
+
+  /** Whether the comparison this session lists, named revisions or the branch point, can be made now. */
   private support(session: SessionState): BranchPointSupport {
-    return session.custom ? this.revisionSupportOf(session) : this.branchPointSupportOf(session);
+    return this.listedSpec(session)
+      ? this.revisionSupportOf(session)
+      : this.branchPointSupportOf(session);
   }
 
   private revisionSupportOf(session: SessionState): BranchPointSupport {
@@ -504,12 +551,26 @@ export class WorkingCopyComparisonOwner {
 
   private readCustom(session: SessionState): RevisionSpec | null {
     if (!session.workspace) return null;
-    return this.deps.customComparisons?.read(session.sessionId, session.workspace) ?? null;
+    return (
+      this.deps.customComparisons?.read(session.sessionId, this.savedIn(session.workspace)) ?? null
+    );
+  }
+
+  /**
+   * Where a typed comparison is saved: the workspace, or for a repository folder that folder
+   * inside it, so a folder's choice never overwrites the workspace's or another folder's.
+   */
+  private savedIn(workspace: ComparisonWorkspace): ComparisonWorkspace {
+    if (!this.repository) return workspace;
+    return {
+      hostId: workspace.hostId,
+      root: `${workspace.root.replace(/\/+$/, "")}/${this.repository}`,
+    };
   }
 
   private clearCustom(session: SessionState): void {
     if (session.workspace) {
-      this.deps.customComparisons?.clear(session.sessionId, session.workspace);
+      this.deps.customComparisons?.clear(session.sessionId, this.savedIn(session.workspace));
     }
     this.applyCustom(session, null);
   }
@@ -579,6 +640,7 @@ export class WorkingCopyComparisonOwner {
       return;
     }
     this.ensureRoute(session);
+    this.followListedComparison(session);
     if (!this.wantsHostComparison(session)) {
       this.abortList(session);
       this.deps.clearTimeout(session.pollTimer);
@@ -593,6 +655,28 @@ export class WorkingCopyComparisonOwner {
       return;
     }
     this.schedulePoll(session, consumers);
+  }
+
+  /**
+   * In a repository folder, switching between the branch point and the last commit lists the
+   * other one from the host; what was listed for the previous one goes.
+   */
+  private followListedComparison(session: SessionState): void {
+    const spec = this.listedSpec(session);
+    const key = spec === undefined ? null : JSON.stringify(spec);
+    if (session.listedKey === key) return;
+    const previous = session.listedKey;
+    session.listedKey = key;
+    if (previous === null || key === null || !this.repository) return;
+    this.abortList(session);
+    session.established = null;
+    session.problem = null;
+    session.attempted = false;
+    session.dirty = true;
+    // Recovery chains ran under the previous comparison, so the new one starts with none.
+    session.recoveryUsed.clear();
+    this.settleRecoveries(session, Number.POSITIVE_INFINITY, false);
+    this.publish(session);
   }
 
   /** Nobody may read this workspace now: stop work, then forget it if nobody returns. */
@@ -674,8 +758,9 @@ export class WorkingCopyComparisonOwner {
     if (session.established || session.connectTimedOut || session.connectTimer !== undefined) {
       return;
     }
-    // Only Automatic falls back to the last commit; a typed comparison never does.
-    if (this.intent !== "automatic" || session.custom) return;
+    // Only Automatic falls back to the last commit; a typed comparison never does, and nor
+    // does a repository folder, whose last commit the runner can't list.
+    if (this.intent !== "automatic" || session.custom || this.repository) return;
     const generation = this.generation;
     session.connectTimer = this.deps.setTimeout(() => {
       session.connectTimer = undefined;
@@ -706,7 +791,7 @@ export class WorkingCopyComparisonOwner {
     const controller = new AbortController();
     const generation = this.generation;
     const refresh = session.refreshQueued;
-    const spec = session.custom;
+    const spec = this.listedSpec(session) ?? null;
     session.inFlight = controller;
     session.dirty = false;
     session.refreshQueued = false;
@@ -785,6 +870,7 @@ export class WorkingCopyComparisonOwner {
       connectTimedOut: session.connectTimedOut,
       headOverride: session.headOverride,
       accessEpoch: session.accessEpoch,
+      choices: session.choices,
     };
   }
 
@@ -800,6 +886,7 @@ export class WorkingCopyComparisonOwner {
       previous.connectTimedOut === next.connectTimedOut &&
       previous.headOverride === next.headOverride &&
       previous.accessEpoch === next.accessEpoch &&
+      previous.choices === next.choices &&
       sameRevisions(previous.custom, next.custom) &&
       previous.workspace === next.workspace &&
       JSON.stringify(previous.support) === JSON.stringify(next.support) &&

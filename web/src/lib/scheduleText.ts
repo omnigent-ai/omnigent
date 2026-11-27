@@ -338,7 +338,9 @@ const MONTH_NAMES = [
  * formatter doesn't special-case, so a valid-but-unusual rule still renders
  * something readable rather than blank.
  */
-export function describeSchedule(rrule: string, timezone?: string): string {
+export function describeSchedule(rrule: string | null, timezone?: string): string {
+  // The server withholds a trigger automation's rule when it decides when the trigger polls.
+  if (rrule === null) return "";
   const rule = tryParse(rrule);
   if (!rule) return rrule;
   const o = rule.origOptions;
@@ -520,10 +522,11 @@ function dayLabelList(days: number[]): string {
  * `python-dateutil` evaluation localizes the rule.
  */
 export function nextRunAtMs(
-  rrule: string,
+  rrule: string | null,
   timezone: string,
   now: Date = new Date(),
 ): number | null {
+  if (rrule === null) return null;
   const base = tryParse(rrule);
   if (!base) return null;
   // rrule's `.after` treats the DTSTART/occurrences as UTC-naive wall times.

@@ -1,18 +1,28 @@
-import { cleanup, renderHook } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { QuickPick } from "@/components/ui/quick-pick";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { EmbeddedProvider } from "@/lib/embedded";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setEmbedRoot } from "@/lib/host";
 
 import { isNewSessionHotkey, useNewSessionHotkey } from "./useNewSessionHotkey";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
+const shell = vi.hoisted(() => ({ native: false }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isNativeShell: () => shell.native,
+}));
 
 afterEach(() => {
   cleanup();
   setEmbedRoot(null);
   navigate.mockReset();
+  shell.native = false;
   document.body.innerHTML = "";
 });
 
@@ -172,5 +182,85 @@ describe("useNewSessionHotkey", () => {
 
     expect(navigate).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(false);
+  });
+});
+
+describe("useNewSessionHotkey with an open pick list (native Windows/Linux)", () => {
+  it("leaves a chord a focused field already handled, even outside a pick list", () => {
+    shell.native = true;
+    renderHook(() => useNewSessionHotkey(true, false));
+    const field = document.createElement("input");
+    field.addEventListener("keydown", (keydown) => keydown.preventDefault());
+    document.body.append(field);
+    press({ key: "n", code: "KeyN", ctrlKey: true }, field);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("leaves Ctrl-N to the list's field, and still starts a session elsewhere", () => {
+    shell.native = true;
+    renderHook(() => useNewSessionHotkey(true, false));
+    const field = document.createElement("input");
+    field.setAttribute("data-pick-list-input", "");
+    document.body.append(field);
+    const ctrlN = { key: "n", code: "KeyN", ctrlKey: true };
+    expect(press(ctrlN, field).defaultPrevented).toBe(false);
+    expect(navigate).not.toHaveBeenCalled();
+    expect(press(ctrlN).defaultPrevented).toBe(true);
+    expect(navigate).toHaveBeenCalledWith("/");
+  });
+});
+
+/** The app's new-session hotkey beside a real QuickPick, as on a native Windows or Linux shell. */
+function PickerBesideHotkey(
+  props: Pick<ComponentProps<typeof QuickPick>, "label" | "presentation" | "stepsWithCtrlNP"> & {
+    rows: string[];
+  },
+) {
+  useNewSessionHotkey(true, false);
+  const { rows, ...picker } = props;
+  return (
+    <TooltipProvider>
+      <QuickPick
+        {...picker}
+        segments={[
+          {
+            sourceId: "rows",
+            ranking: "client",
+            items: rows.map((id) => ({ id, label: id, value: id })),
+          },
+        ]}
+        query=""
+        onQueryChange={vi.fn()}
+        emptyMessage="No results"
+        onAccept={vi.fn()}
+      />
+    </TooltipProvider>
+  );
+}
+
+/** Focuses the picker's field and presses Ctrl-N in it. */
+function pressCtrlNIn(label: string): HTMLElement {
+  const field = screen.getByRole("combobox", { name: label });
+  field.focus();
+  fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true });
+  return field;
+}
+
+describe("useNewSessionHotkey with a real QuickPick (native Windows/Linux)", () => {
+  it("lets Ctrl-N step a ⌘K picker without starting a session", () => {
+    shell.native = true;
+    render(<PickerBesideHotkey label="Review picker" stepsWithCtrlNP rows={["one", "two"]} />);
+    const field = pressCtrlNIn("Review picker");
+    expect(document.getElementById(field.getAttribute("aria-activedescendant")!)).toHaveTextContent(
+      "two",
+    );
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("still starts a session from a sidebar search that shows no list yet", () => {
+    shell.native = true;
+    render(<PickerBesideHotkey label="Search settings" presentation="sidebar" rows={["Theme"]} />);
+    pressCtrlNIn("Search settings");
+    expect(navigate).toHaveBeenCalledOnce();
   });
 });

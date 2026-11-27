@@ -1,6 +1,8 @@
-import type { ComponentProps } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import * as Slot from "radix-ui/slot";
 
+import { CompactShortcutKeys } from "@/components/ui/kbd";
+import { type ShortcutId, shortcutAriaKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { cn } from "@/lib/utils";
 
 export interface MenuItemProps extends ComponentProps<"div"> {
@@ -38,4 +40,60 @@ export function MenuItem({
       {...props}
     />
   );
+}
+
+/** Key caps at a menu row's end, in the command palette's style; touch screens hide them. */
+export function MenuShortcut({ keys, className }: { keys: readonly string[]; className?: string }) {
+  return (
+    <CompactShortcutKeys
+      keys={keys}
+      className={cn("ml-auto shrink-0 pl-4 pointer-coarse:hidden", className)}
+    />
+  );
+}
+
+/**
+ * A menu row's content followed by `shortcut`'s chord here, and the matching
+ * `aria-keyshortcuts`. Rows without a chord here render their content unchanged.
+ */
+export function withMenuShortcut(
+  children: ReactNode,
+  shortcut: ShortcutId | undefined,
+): { children: ReactNode; "aria-keyshortcuts"?: string } {
+  const keys = shortcut ? shortcutKeys(shortcut) : [];
+  if (!shortcut || keys.length === 0) return { children };
+  return {
+    children: (
+      <>
+        {children}
+        <MenuShortcut keys={keys} />
+      </>
+    ),
+    "aria-keyshortcuts": shortcutAriaKeys(shortcut),
+  };
+}
+
+/** Adds an accessible description and optional shortcut to a menu row. */
+export function describedWithShortcut(
+  children: ReactNode,
+  description: ReactNode,
+  descriptionId: string,
+  shortcut: ShortcutId | undefined,
+): { children: ReactNode; "aria-describedby"?: string; "aria-keyshortcuts"?: string } {
+  if (!description) return withMenuShortcut(children, shortcut);
+  const described = (
+    <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+      <span className="flex min-w-0 items-center gap-2">{children}</span>
+      {/* Hidden from the row's name; aria-describedby still reads it. */}
+      <span
+        id={descriptionId}
+        aria-hidden
+        data-slot="menu-item-description"
+        className="text-xs whitespace-normal text-muted-foreground"
+      >
+        {description}
+      </span>
+    </span>
+  );
+  return { ...withMenuShortcut(described, shortcut), "aria-describedby": descriptionId };
 }

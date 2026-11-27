@@ -142,6 +142,7 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
+    _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _CLEAR_TYPE,
@@ -206,6 +207,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _delete_session_tree_files,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -397,11 +399,6 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
         _SUBAGENT_STATUS_TYPE,
     }
 )
-
-
-# A host that confirmed the spawn has a runner process that may still be
-# booting (slow imports on a busy machine), so it earns a longer connect wait.
-_ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR = 2.0
 
 
 def _relaunch_connect_timeout_s(*, acknowledged: bool) -> float:
@@ -1734,14 +1731,15 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # Set when this message sends a file outside the default extensions, which
+        # Set when this message sends a file outside the legacy extensions, which
         # the bound runtime must be able to deliver as a file.
         outgoing_needs_delivery_capability = False
         if body.type in ("message", _SLASH_COMMAND_TYPE):
             from omnigent.inner.native_attachments import (
+                CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                 DELIVERY_KEY,
+                filesystem_attachment_capability,
                 inline_filesystem_attachment_name,
-                requires_filesystem,
                 uses_filesystem_delivery,
             )
             from omnigent.runtime.content_resolver import attachment_delivery
@@ -1778,7 +1776,10 @@ def register_events_routes(
                         stored.filename, stored.source_metadata
                     ):
                         filesystem_name = filesystem_name or stored.filename
-                        if not requires_filesystem(stored.filename):
+                        if (
+                            filesystem_attachment_capability([stored.filename])
+                            == CAP_FILESYSTEM_ATTACHMENT_DELIVERY
+                        ):
                             outgoing_needs_delivery_capability = True
                 if filesystem_name is not None:
                     await _require_filesystem_attachment_harness(conv, filesystem_name)
@@ -4534,34 +4535,12 @@ def register_events_routes(
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,
             )
-        # Session file cleanup. delete_all_for_session returns only the blob
-        # keys that became orphaned — a blob still shared by a fork in another
-        # session is not returned, so the fork's attachment survives.
+        # The subtree delete below also removes every sub-agent, so clean their
+        # files too; a blob a fork in another session still shares survives.
         if file_store is not None and artifact_store is not None:
-            orphaned_blob_keys = await asyncio.to_thread(
-                file_store.delete_all_for_session, session_id
+            await _delete_session_tree_files(
+                conversation_store, file_store, artifact_store, session_id
             )
-            # Best-effort: a backend failure on one blob must not abort the
-            # delete after the file rows are already gone.
-            failed_blob_count = 0
-            for blob_key in orphaned_blob_keys:
-                try:
-                    await asyncio.to_thread(artifact_store.delete, blob_key)
-                except Exception as exc:
-                    failed_blob_count += 1
-                    _logger.warning(
-                        "Failed to delete attachment blob %s for session %s: %s",
-                        blob_key,
-                        session_id,
-                        type(exc).__name__,
-                    )
-            if failed_blob_count:
-                _logger.warning(
-                    "Session %s deleted with %d of %d attachment blobs left behind",
-                    session_id,
-                    failed_blob_count,
-                    len(orphaned_blob_keys),
-                )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)

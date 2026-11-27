@@ -79,6 +79,10 @@ def run_migrations_online() -> None:
         )
         with connectable.connect() as conn:
             _run_with_connection(conn)
+            # A migration that commits part way, as some do on CockroachDB, leaves the
+            # rest of its work in a transaction Alembic did not begin and never commits.
+            if conn.in_transaction():
+                conn.commit()
 
 
 def _run_with_connection(connection: Connection) -> None:

@@ -50,10 +50,10 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from omnigent.harness_startup_config import resolve_harness_path
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.hermes_executor import HermesExecutor
-from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -74,51 +74,8 @@ _ENV_AGENT_NAME = "HARNESS_HERMES_AGENT_NAME"
 
 
 def _resolve_os_env() -> OSEnvSpec:
-    """
-    Resolve the inner-executor :class:`OSEnvSpec` from env config.
-
-    Reads :data:`_ENV_OS_ENV` and decodes the JSON-encoded dict
-    Omnigent serialized via :func:`dataclasses.asdict` on its
-    :class:`OSEnvSpec`. When the env var is missing or
-    malformed, falls back to ``caller_process + sandbox=none``
-    so AP-bridged tools stay enabled — matches the legacy
-    non-AP path's default for specs without an
-    ``os_env:`` block.
-
-    :returns: An :class:`OSEnvSpec` to hand to
-        :class:`HermesExecutor`.
-    """
-    raw = os.environ.get(_ENV_OS_ENV, "").strip()
-    if raw:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            _logger.warning(
-                "%s is not valid JSON (%s); falling back to default os_env",
-                _ENV_OS_ENV,
-                exc,
-            )
-            payload = None
-        if isinstance(payload, dict):
-            sandbox_payload = payload.get("sandbox")
-            sandbox = (
-                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
-            )
-            return OSEnvSpec(
-                type=str(payload.get("type", "caller_process")),
-                cwd=payload.get("cwd"),
-                sandbox=sandbox,
-                fork=bool(payload.get("fork", False)),
-            )
-    # Default: enable natives, no sandbox. Matches the simplest
-    # working config; operators who want real sandbox enforcement
-    # configure ``os_env.sandbox`` explicitly in the spec.
-    return OSEnvSpec(
-        type="caller_process",
-        cwd=None,
-        sandbox=OSEnvSandboxSpec(type="none"),
-        fork=False,
-    )
+    """Decode the supplied policy without downgrading malformed configuration."""
+    return resolve_harness_os_env(_ENV_OS_ENV)
 
 
 def _resolve_skills_filter() -> str | list[str]:

@@ -77,6 +77,9 @@ describe("row menu", () => {
     fireEvent.pointerMove(row("b.ts"));
     const trigger = screen.getByRole("button", { name: "Actions for b.ts" });
     expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+    // Only the row under the button makes room for it.
+    expect(row("b.ts").hasAttribute("data-item-has-menu-button")).toBe(true);
+    expect(row("a.ts").hasAttribute("data-item-has-menu-button")).toBe(false);
     expect(fireEvent.mouseDown(trigger)).toBe(false);
     fireEvent.click(trigger);
     expect(onRowMenu.mock.calls[0][0].path).toBe("b.ts");

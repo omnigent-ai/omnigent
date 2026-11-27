@@ -12,6 +12,9 @@ const LINE_BACKGROUND_ACROSS_INSETS =
   "calc(-1 * var(--cm-line-inset-start)) 0 0 var(--cm-line-background), " +
   "var(--cm-line-inset-end) 0 0 var(--cm-line-background)";
 
+/** How much of the code selection's wash stays while the editor isn't focused. */
+export const UNFOCUSED_SELECTION_STRENGTH = 0.72;
+
 export const codeMirrorViewerTheme: Extension = EditorView.theme({
   "&": {
     // Space between the text and the gutter or the right edge; line backgrounds reach across it.
@@ -51,7 +54,7 @@ export const codeMirrorViewerTheme: Extension = EditorView.theme({
   ".cm-activeLineGutter": { color: "var(--foreground)" },
   // The code selection is the palette's, faded where syntax colours need it.
   ".cm-selectionLayer .cm-selectionBackground": {
-    backgroundColor: "color-mix(in oklch, var(--code-selection) 72%, transparent)",
+    backgroundColor: `color-mix(in oklch, var(--code-selection) ${UNFOCUSED_SELECTION_STRENGTH * 100}%, transparent)`,
   },
   "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground": {
     backgroundColor: "var(--code-selection)",

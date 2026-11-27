@@ -411,6 +411,95 @@ async def test_mcp_services_reach_a_server_that_supports_them() -> None:
     assert body["mcp_services"] == ["github"]
 
 
+_WORKFLOW_CREATE = {
+    "name": "n",
+    "rrule": "FREQ=DAILY",
+    "agent_id": "ag_1",
+    "permission_mode": None,
+    "workflow_id": "0123456789abcdef0123456789abcdef",
+    "workflow_details": "Only bugs",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info",
+    [_Resp(body={"scheduled_task_session_modes": True}), _Resp(status_code=500)],
+    ids=["missing", "info-fails"],
+)
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("sys_scheduled_task_create", _WORKFLOW_CREATE),
+        (
+            "sys_scheduled_task_update",
+            {**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "workflow_details": "Only bugs"},
+        ),
+    ],
+)
+async def test_a_saved_workflow_is_refused_before_an_older_server_sees_it(
+    tool_name: str, arguments: dict[str, object], info: _Resp
+) -> None:
+    """The refusal gives the prompt that runs a saved workflow on such a server."""
+    client = _RecordingClient(info=info)
+    out = await _execute_scheduled_task_tool(
+        tool_name, json.dumps(arguments), server_client=client
+    )
+
+    assert [url for _, url, _ in client.calls] == ["/v1/info"]
+    error = json.loads(out)["error"]
+    assert "does not support workflow_id" in error
+    assert "'/workflow Run the saved workflow" in error
+
+
+@pytest.mark.asyncio
+async def test_a_saved_workflow_reaches_a_server_that_writes_its_prompt() -> None:
+    client = _RecordingClient(
+        _Resp(body={"id": "t1"}), info=_Resp(body={"scheduled_task_workflow_id": True})
+    )
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create", json.dumps(_WORKFLOW_CREATE), server_client=client
+    )
+    verb, url, body = client.calls[-1]
+    assert (verb, url) == ("POST", "/v1/scheduled-tasks")
+    assert "prompt" not in body
+    assert (body["workflow_id"], body["workflow_details"]) == (
+        _WORKFLOW_CREATE["workflow_id"],
+        "Only bugs",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field", ["workflow_id", "workflow_details"], ids=["stop-the-workflow", "clear-details"]
+)
+async def test_an_update_forwards_an_explicit_null_workflow_field(field: str) -> None:
+    client = _RecordingClient(
+        _Resp(body={"id": _TASK_ID}), info=_Resp(body={"scheduled_task_workflow_id": True})
+    )
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps({**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, field: None}),
+        server_client=client,
+    )
+    verb, url, body = client.calls[-1]
+    assert verb == "PATCH" and url.endswith(_TASK_ID)
+    assert body[field] is None
+    assert body["prompt"] == _REVIEW_FIELDS["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_a_create_sends_either_a_prompt_or_a_saved_workflow() -> None:
+    client = _RecordingClient(info=_Resp(body={"scheduled_task_workflow_id": True}))
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps({**_WORKFLOW_CREATE, "prompt": "Review every issue."}),
+        server_client=client,
+    )
+    assert "Leave out prompt with workflow_id" in json.loads(out)["error"]
+    assert client.calls == []
+
+
 @pytest.mark.asyncio
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
@@ -779,9 +868,9 @@ def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
     assert "base_branch" not in properties
     assert "workspace" not in schema["required"]
     assert "host_id" not in schema["required"]
+    # workflow_id can stand in for prompt; the review check requires one of them.
     assert set(schema["required"]) == {
         "name",
-        "prompt",
         "rrule",
         "agent_id",
         "permission_mode",

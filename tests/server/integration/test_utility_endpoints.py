@@ -105,12 +105,18 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "project_kanban": True,
         "project_repository_creation": True,
         "quick_pick_palette": False,
+        "workspace_sidebar_v2": False,
+        # Off: it follows workspace_sidebar_v2 while no deployment names it.
+        "floating_panes": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
         "floating_composer": False,
+        "sidebar_saved_views": False,
+        "shared_session_updates_socket": False,
+        "pull_requests_v2": False,
     }
     assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.
@@ -126,11 +132,14 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
     assert data["session_mute"] is True
+    assert data["project_mute"] is True
     # Lets sys_session_list scope archive-inclusive listings server-side.
     assert data["session_list_scoped_archives"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
+    # Without it, the automation dialog keeps new sandbox sessions hourly.
+    assert data["scheduled_task_subhour_new_sandbox"] is True
     # The one_time_automations release feature is off by default.
     assert data["scheduled_task_one_time"] is False
     # Lets the trigger form save its header; older servers would send it to the model.

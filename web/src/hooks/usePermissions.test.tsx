@@ -37,11 +37,20 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
 }));
 
 import { PINNED_CONVERSATIONS_KEY, useConversations } from "./useConversations";
-import { grantSharePermission, revokeSharePermission } from "@/lib/permissionsApi";
+import {
+  grantSharePermission,
+  LEVEL_EDIT,
+  LEVEL_OWNER,
+  LEVEL_READ,
+  revokeSharePermission,
+} from "@/lib/permissionsApi";
 import { useSession } from "./useSession";
 import {
+  pullRequestChangeAccess,
+  useCanChangePullRequests,
   useCanEdit,
   useCanStartSideChat,
+  useIsSessionOwner,
   useGrantPermission,
   useRevokePermission,
 } from "./usePermissions";
@@ -177,6 +186,22 @@ describe("useCanStartSideChat", () => {
   });
 });
 
+describe("useIsSessionOwner", () => {
+  it("is the server's answer, even against an admin's owner level", () => {
+    setHooks({ session: { ...makeSession(4), sideChatAllowed: false } });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBe(false);
+    setHooks({ session: { ...makeSession(4), sideChatAllowed: true } });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBe(true);
+  });
+
+  it("is unknown while loading or when the server doesn't say", () => {
+    setHooks({ session: null, sessionLoading: true });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBeNull();
+    setHooks({ session: makeSession(4) });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBeNull();
+  });
+});
+
 describe("share mutations refresh the session lists", () => {
   function renderWithClient<T>(hook: () => T) {
     const qc = new QueryClient();
@@ -235,5 +260,60 @@ describe("share mutations refresh the session lists", () => {
     expect(revoke.invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(
       automationKeys,
     );
+  });
+});
+
+describe("pullRequestChangeAccess", () => {
+  it.each([
+    ["is unknown while the session loads", null, true, "unknown"],
+    ["is not the owner's once a missing session settles", null, false, "not_owner"],
+    [
+      "follows the server's answer over the level",
+      { sideChatAllowed: false, permissionLevel: LEVEL_OWNER },
+      false,
+      "not_owner",
+    ],
+    [
+      "takes the server's yes",
+      { sideChatAllowed: true, permissionLevel: LEVEL_EDIT },
+      false,
+      "owner",
+    ],
+    [
+      "falls back to an owner level on older servers",
+      { permissionLevel: LEVEL_OWNER },
+      false,
+      "owner",
+    ],
+    [
+      "falls back to a lesser level on older servers",
+      { permissionLevel: LEVEL_EDIT },
+      false,
+      "not_owner",
+    ],
+  ] as const)("%s", (_label, session, isLoading, access) => {
+    expect(pullRequestChangeAccess(session as Partial<Session> as Session | null, isLoading)).toBe(
+      access,
+    );
+  });
+});
+
+describe("useCanChangePullRequests", () => {
+  it.each([
+    ["allows an owner who can edit", { ...makeSession(LEVEL_OWNER), sideChatAllowed: true }, true],
+    [
+      "refuses the server's owner with read-only access",
+      { ...makeSession(LEVEL_READ), sideChatAllowed: true },
+      false,
+    ],
+    [
+      "refuses an editor the server says isn't the owner",
+      { ...makeSession(LEVEL_EDIT), sideChatAllowed: false },
+      false,
+    ],
+    ["allows a single-user server with no levels", makeSession(null), true],
+  ] as const)("%s", (_label, session, allowed) => {
+    setHooks({ session: session as Session, conversations: [makeConv(session.permissionLevel)] });
+    expect(renderHook(() => useCanChangePullRequests("conv_1")).result.current).toBe(allowed);
   });
 });

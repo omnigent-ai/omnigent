@@ -1069,13 +1069,14 @@ class TestCodexExecutor(unittest.TestCase):
                     system_prompt="Be helpful.",
                     model="gpt-5.4-mini",
                     cwd=".",
-                    sandbox="workspace-write",
+                    sandbox="read-only",
                 )
             ]
             await inject_task
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
+            self.assertEqual(params["sandbox"], "read-only")
             self.assertNotIn("features.shell_tool", params["config"])
             if supports_direct_tools:
                 self.assertEqual(
@@ -6625,6 +6626,57 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         self.assertTrue(any("restricted reads" in line for line in logs.output), logs.output)
 
 
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize(
+    "os_env,expected_sandbox",
+    [
+        pytest.param(None, "read-only", id="default"),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(write_paths=[])), "read-only", id="read-only"
+        ),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(write_paths=["."])),
+            "workspace-write",
+            id="workspace-write",
+        ),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")),
+            "danger-full-access",
+            id="disabled",
+        ),
+    ],
+)
+def test_run_turn_tools_do_not_widen_filesystem_permissions(
+    os_env: OSEnvSpec | None, expected_sandbox: str, with_tools: bool
+) -> None:
+    async def run() -> None:
+        session = _FakeAppSession([[TurnComplete(response="done")]])
+        executor = CodexExecutor(
+            codex_path="/bin/echo",
+            os_env=os_env,
+            app_session_factory=lambda **kwargs: session,
+        )
+        tools = (
+            [{"name": "lookup", "parameters": {"type": "object", "properties": {}}}]
+            if with_tools
+            else []
+        )
+        try:
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}], tools, ""
+                )
+            ]
+            assert events == [TurnComplete(response="done")]
+            assert session.calls[0]["sandbox"] == expected_sandbox
+            assert session.calls[0]["tools"] == tools
+        finally:
+            await executor.close_session("s1")
+
+    _run(run())
+
+
 def test_run_turn_cli_config_passes_no_model_to_thread_create():
     """On the cli-config path (model_provider_override set), model=None is passed
     to thread/create so the codex binary uses its own configured model rather than
@@ -7238,9 +7290,10 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
 @pytest.fixture
 def disabled_mcp_session(tmp_path, monkeypatch):
     from omnigent import mcp_disabled_servers as disabled
-    from tests._helpers.mcp_disabled_servers import launch_activation
+    from tests._helpers.mcp_disabled_servers import isolate_codex_system_layers, launch_activation
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    isolate_codex_system_layers(monkeypatch, tmp_path / "etc-codex")
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(source_home))
@@ -7314,6 +7367,103 @@ def signed_disabled_mcp_session(disabled_mcp_session, monkeypatch):
         lambda **kwargs: CodexWorkerLaunch("/bin/echo", sandboxed=True),
     )
     return harness
+
+
+@pytest.mark.parametrize(
+    ("discovery_outcome", "allow_network"),
+    [("success", True), ("success", False), ("failure", True), ("cancelled", True)],
+    ids=["network-allowed", "network-denied", "failure", "cancelled"],
+)
+async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
+    disabled_mcp_session, tmp_path, monkeypatch, discovery_outcome, allow_network
+):
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+
+    harness = disabled_mcp_session
+    session = harness.session
+    session._os_env_spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"))
+    session._env = {"HOST_ONLY": "parent-value"}
+    launcher = tmp_path / "sandbox-launcher"
+    launch = CodexWorkerLaunch(
+        str(launcher), sandboxed=True, allow_network=allow_network, _owned_launcher=launcher
+    )
+    discovery_started = asyncio.Event()
+    discovery_pending = asyncio.Event()
+    private_homes = []
+
+    def prepare_worker(**kwargs):
+        assert kwargs["os_env"] is session._os_env_spec
+        assert kwargs["codex_path"] == "/bin/echo"
+        kwargs["worker_env"].pop("HOST_ONLY")
+        kwargs["worker_env"]["HTTPS_PROXY"] = "http://127.0.0.1:12345"
+        launcher.touch()
+        return launch
+
+    worker_prepare = Mock(side_effect=prepare_worker)
+    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", worker_prepare)
+
+    async def prepare_provider(codex_home, overrides, **kwargs):
+        private_homes.append(codex_home)
+        assert session._worker_launch is launch
+        assert launcher.exists()
+        assert (codex_home / "config.toml").is_file()
+        assert kwargs["codex_path"] == str(launcher)
+        assert kwargs["allow_discovery"] is allow_network
+        assert kwargs["cwd"] == tmp_path.resolve()
+        assert kwargs["env"] is worker_prepare.call_args.kwargs["worker_env"]
+        assert kwargs["env"] == {
+            "CODEX_HOME": str(codex_home),
+            "HTTPS_PROXY": "http://127.0.0.1:12345",
+        }
+        if discovery_outcome == "cancelled":
+            discovery_started.set()
+            await discovery_pending.wait()
+        if discovery_outcome == "failure":
+            raise RuntimeError("provider setup failed")
+        return [*overrides, 'model_provider="configured"']
+
+    provider_prepare = AsyncMock(side_effect=prepare_provider)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config",
+        provider_prepare,
+    )
+    try:
+        if discovery_outcome == "cancelled":
+            start_task = asyncio.create_task(session.start())
+            try:
+                await asyncio.wait_for(discovery_started.wait(), timeout=5)
+                start_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(start_task, timeout=5)
+            finally:
+                if not start_task.done():
+                    start_task.cancel()
+                await asyncio.gather(start_task, return_exceptions=True)
+            assert harness.spawns == []
+            harness.initialize.assert_not_awaited()
+            assert session.cleaned
+            assert not launcher.exists()
+            assert not private_homes[0].exists()
+        elif discovery_outcome == "failure":
+            with pytest.raises(RuntimeError, match="provider setup failed"):
+                await session.start()
+            assert harness.spawns == []
+            assert session.cleaned
+            assert not launcher.exists()
+        else:
+            await session.start()
+            assert str(launcher) in harness.spawns[0]
+            assert 'model_provider="configured"' in harness.spawns[0]
+            assert launcher.exists()
+        worker_prepare.assert_called_once()
+        provider_prepare.assert_awaited_once()
+        assert session._env == {"HOST_ONLY": "parent-value"}
+    finally:
+        await session.close()
+    assert not launcher.exists()
+    assert session._codex_home_dir is None
+    assert len(private_homes) == 1
+    assert not private_homes[0].exists()
 
 
 @pytest.mark.parametrize(
@@ -7426,6 +7576,68 @@ async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_s
         await harness.session.start()
     assert harness.spawns == [("/bin/echo", "app-server", "-c", "base=true")]
     assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex reads /etc layers only on POSIX")
+async def test_strict_mcp_refuses_launch_before_spawn(disabled_mcp_session):
+    from omnigent import mcp_disabled_servers as disabled
+    from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
+
+    harness = disabled_mcp_session
+    write_mcp_inheritance({"inherit": False})
+    disabled.CODEX_SYSTEM_CONFIG_PATH.parent.mkdir(parents=True)
+    disabled.CODEX_SYSTEM_CONFIG_PATH.write_text("[mcp_servers.system\n")
+    with pytest.raises(disabled.McpStrictModeError, match="codex launch"):
+        await harness.session.start()
+    assert harness.spawns == []
+
+
+@pytest.mark.parametrize("mixed_switch", [False, True], ids=["strict", "strict-and-switch"])
+async def test_strict_mcp_early_exit_keeps_disables(disabled_mcp_session, caplog, mixed_switch):
+    from omnigent import mcp_disabled_servers as disabled
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+    from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
+
+    harness = disabled_mcp_session
+    disabled.set_disabled(disabled.ServerKey("codex", "fixture"), mixed_switch)
+    write_mcp_inheritance({"inherit": False, "allow": ["fixture"] if mixed_switch else []})
+    if mixed_switch:
+        with (harness.source_home / "config.toml").open("a") as config:
+            config.write('[mcp_servers.strict_fixture]\ncommand="true"\n')
+
+    async def initialize(*_args, **_kwargs):
+        if mixed_switch and len(harness.spawns) == 2:
+            return {"result": {}}
+        harness.processes[-1].returncode = 1
+        raise BrokenPipeError
+
+    harness.initialize.side_effect = initialize
+    if mixed_switch:
+        await harness.session.start()
+        baseline = (
+            "/bin/echo",
+            "app-server",
+            "-c",
+            "base=true",
+            "-c",
+            "mcp_servers.strict_fixture.enabled=false",
+        )
+        assert harness.spawns == [(*baseline, "-c", "mcp_servers.fixture.enabled=false"), baseline]
+        assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+    else:
+        with pytest.raises(BrokenPipeError):
+            await harness.session.start()
+        assert harness.spawns == [
+            (
+                "/bin/echo",
+                "app-server",
+                "-c",
+                "base=true",
+                "-c",
+                "mcp_servers.fixture.enabled=false",
+            )
+        ]
+        assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
 
 
 @pytest.mark.parametrize("active", [None, [], ["codex"]])

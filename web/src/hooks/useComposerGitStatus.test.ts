@@ -12,6 +12,8 @@ const usePullRequestInfosMock = vi.fn<(id: string | undefined, urls: string[]) =
   () => [],
 );
 const useSessionPullRequestsMock = vi.fn(() => ({ data: undefined as unknown }));
+const refreshPullRequestsMock = vi.fn(() => Promise.resolve());
+const useRefreshPullRequestInfoMock = vi.fn((_id: string | undefined) => refreshPullRequestsMock);
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (
@@ -24,6 +26,7 @@ vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: (id: string | undefined) => usePullRequestInfoMock(id),
   usePullRequestInfos: (id: string | undefined, urls: string[]) =>
     usePullRequestInfosMock(id, urls),
+  useRefreshPullRequestInfo: (id: string | undefined) => useRefreshPullRequestInfoMock(id),
 }));
 vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => ({
   storedListToShow: (await importOriginal<typeof UseSessionPullRequestsModule>()).storedListToShow,
@@ -76,6 +79,8 @@ afterEach(() => {
   usePullRequestInfosMock.mockReturnValue([]);
   useSessionPullRequestsMock.mockReset();
   useSessionPullRequestsMock.mockReturnValue({ data: undefined });
+  refreshPullRequestsMock.mockClear();
+  useRefreshPullRequestInfoMock.mockClear();
 });
 
 const FORGE_DISPLAY = {
@@ -137,6 +142,17 @@ describe("useComposerGitStatus", () => {
     setWorktrees({ status: "ok", worktrees: [wt({ path: "C:\\Repo", branch: "feat" })] });
     setGithub(undefined);
     expect(run({ workspace: "c:/repo" }).result.current.branch).toBe("feat");
+  });
+
+  it("matches a workspace on a UNC share across separator and case differences", () => {
+    setWorktrees({
+      status: "ok",
+      worktrees: [wt({ path: "//Server/Share/repo", branch: "main" })],
+    });
+    setGithub(undefined);
+    const { result } = run({ workspace: "\\\\server\\share\\Repo\\packages\\web" });
+    expect(result.current.branchState).toBe("branch");
+    expect(result.current.branch).toBe("main");
   });
 
   it("does not match a sibling whose path is a mere prefix", () => {
@@ -540,7 +556,7 @@ describe("useComposerGitStatus", () => {
     expect(prefix()).toBe("#");
   });
 
-  it("refresh() refetches both sources and surfaces fetching", () => {
+  it("refresh() rereads both sources and surfaces fetching", () => {
     const wtRefetch = vi.fn();
     const ghRefetch = vi.fn();
     const detailRefetch = vi.fn();
@@ -557,14 +573,14 @@ describe("useComposerGitStatus", () => {
     const { result, rerender } = run();
     expect(result.current.refreshing).toBe(true);
     const refresh = result.current.refresh;
-    const latestDetailRefetch = vi.fn();
-    usePullRequestInfosMock.mockReturnValue([{ refetch: latestDetailRefetch }]);
     rerender();
     expect(result.current.refresh).toBe(refresh);
     refresh();
     expect(wtRefetch).toHaveBeenCalledTimes(1);
-    expect(ghRefetch).toHaveBeenCalledTimes(1);
+    // PR info is invalidated rather than refetched, so it reads GitHub fresh.
+    expect(useRefreshPullRequestInfoMock).toHaveBeenCalledWith("conv-1");
+    expect(refreshPullRequestsMock).toHaveBeenCalledTimes(1);
+    expect(ghRefetch).not.toHaveBeenCalled();
     expect(detailRefetch).not.toHaveBeenCalled();
-    expect(latestDetailRefetch).toHaveBeenCalledTimes(1);
   });
 });

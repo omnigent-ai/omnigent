@@ -3,6 +3,7 @@
 // (no workspace root or code hosts; see workspaceLinkResolver.ts), and
 // formatting is canonical, so parse(format(link)) gives back the same link.
 
+import { type ComparisonChoice, isWorkingCopyBaseIntent } from "@/lib/comparisonChoice";
 import { canonicalPullRequestUrl } from "@/lib/pullRequestReference";
 
 import { foldPullRequestSubpage } from "./pullRequestSubpage";
@@ -55,6 +56,16 @@ export function normalizeLinkPath(raw: string): string {
   }
   if (!absolute && segments.length === 0) refuse("Name a file or folder in the path.");
   return (absolute ? "/" : "") + segments.join("/");
+}
+
+/** `raw` as a link reads it, or null for a path a link refuses. */
+export function linkPathOrNull(raw: string): string | null {
+  try {
+    return normalizeLinkPath(raw);
+  } catch (error) {
+    if (error instanceof LinkError) return null;
+    throw error;
+  }
 }
 
 function parsePositive(value: string, name: string): number {
@@ -181,6 +192,14 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
         if (head !== null) range.head = head;
         place.range = range;
       }
+      const comparison = parseComparison(params);
+      if (comparison) place.comparison = comparison;
+      const comparisonRoot = params.path("compare-root");
+      if (comparisonRoot !== undefined) {
+        if (!comparison) refuse("A compared folder needs a comparison too.");
+        if (!comparisonRoot.startsWith("/")) refuse("A compared folder must be an absolute path.");
+        place.comparisonRoot = comparisonRoot;
+      }
       return place;
     }
     case "pulls":
@@ -217,6 +236,7 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
       const line = parseLineRange(params.get("line"), params.get("column"));
       if (path !== undefined) place.path = path;
       if (line !== undefined) place.line = line;
+      if (params.get("list") === "1") place.list = true;
       return place;
     }
     case "terminal":
@@ -319,6 +339,11 @@ function placeParams(place: WorkspacePlace): [string, string][] {
         entries.push(["base", place.range.base]);
         if (place.range.head !== undefined) entries.push(["head", place.range.head]);
       }
+      if (place.kind === "changes" && place.comparison) {
+        entries.push(...formatComparison(place.comparison));
+        if (place.comparisonRoot !== undefined)
+          entries.push(["compare-root", place.comparisonRoot]);
+      }
       if (place.kind === "changes" && place.fileTab && place.path !== undefined) {
         entries.push(["file-tab", "1"]);
       }
@@ -331,6 +356,7 @@ function placeParams(place: WorkspacePlace): [string, string][] {
       if (place.commit !== undefined) entries.push(["commit", place.commit]);
       if (place.path !== undefined) entries.push(["path", place.path]);
       if (place.line) entries.push(...formatLine(place.line));
+      if (place.list) entries.push(["list", "1"]);
       return entries;
     }
     case "search":
@@ -340,6 +366,29 @@ function placeParams(place: WorkspacePlace): [string, string][] {
     default:
       return [];
   }
+}
+
+/** A visit's comparison: `compare=` names a saved base, `compare-base=` and `compare-head=` typed ones. */
+function parseComparison(params: Params): ComparisonChoice | undefined {
+  const intent = params.get("compare");
+  const base = params.get("compare-base");
+  const head = params.get("compare-head");
+  if (intent !== null && (base !== null || head !== null)) {
+    refuse("A comparison names a saved base or a typed base and head, not both.");
+  }
+  if (head !== null && base === null) refuse("A comparison with a head needs a base too.");
+  if (intent !== null) {
+    if (!isWorkingCopyBaseIntent(intent)) refuse(`Changes can't compare with “${intent}”.`);
+    return { kind: "saved", intent };
+  }
+  return base === null ? undefined : { kind: "typed", base, head: head ?? "" };
+}
+
+function formatComparison(comparison: ComparisonChoice): [string, string][] {
+  if (comparison.kind === "saved") return [["compare", comparison.intent]];
+  const entries: [string, string][] = [["compare-base", comparison.base]];
+  if (comparison.head !== "") entries.push(["compare-head", comparison.head]);
+  return entries;
 }
 
 function placeId(place: WorkspacePlace): string | undefined {
@@ -371,7 +420,10 @@ export function formatWorkspaceLink(link: WorkspaceLink): string {
   if (link.tab !== undefined) entries.push(["tab", link.tab]);
   const id = placeId(place);
   const query = entries
-    .map(([name, value]) => `${name}=${encodeValue(value, name === "path")}`)
+    .map(
+      ([name, value]) =>
+        `${name}=${encodeValue(value, name === "path" || name === "compare-root")}`,
+    )
     .join("&");
   return `${SCHEME}${place.kind}${id === undefined ? "" : `/${encodeURIComponent(id)}`}${query ? `?${query}` : ""}`;
 }

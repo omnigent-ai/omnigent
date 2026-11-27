@@ -11,6 +11,7 @@ import {
   StateField,
   Transaction,
   type Extension,
+  type TransactionSpec,
 } from "@codemirror/state";
 import {
   Decoration,
@@ -32,6 +33,7 @@ import {
   type RefObject,
 } from "react";
 
+import type { ComposerInsert, ComposerInsertAdjustment } from "@/lib/composerMentions";
 import { cn } from "@/lib/utils";
 
 import type {
@@ -57,6 +59,12 @@ export interface CodeMirrorComposerEnvironment {
   registerSurface: (surface: ComposerEditorSurface) => () => void;
   /** Where each tagged @-mention token sits in the text, in text order. */
   findMentionTokens: (text: string, tokens: readonly string[]) => readonly TokenSpan[];
+  /** Adds the space an insert needs so the painted tokens it touches stay whole. */
+  separateMentionEdges: (
+    value: string,
+    insert: ComposerInsert,
+    tokens: readonly string[],
+  ) => ComposerInsertAdjustment | null;
   /** The class that paints a mention token, shared with the textarea's mirror. */
   mentionTokenClass: string;
   /** The class that paints the leading command, shared with the textarea's mirror. */
@@ -74,6 +82,61 @@ const COMPOSER_MAX_HEIGHT_PX = 180;
 
 /** Marks a transaction that syncs the controlled value in, which isn't a user edit. */
 const controlledUpdate = Annotation.define<true>();
+
+/** The undo or redo that made these transactions' edit, if either did. */
+function historyDirectionOfTransactions(
+  transactions: readonly Transaction[],
+): "undo" | "redo" | undefined {
+  if (transactions.some((transaction) => transaction.isUserEvent("undo"))) return "undo";
+  if (transactions.some((transaction) => transaction.isUserEvent("redo"))) return "redo";
+  return undefined;
+}
+
+/**
+ * Rewrites a user input (typing, paste, completion, dictation) in the same transaction, so undo
+ * removes the insert and any space it added together. IME composition is skipped. Only the
+ * tokens this editor paints are kept whole.
+ */
+function adjustedInsertTransaction(
+  transaction: Transaction,
+  separateMentionEdges: CodeMirrorComposerEnvironment["separateMentionEdges"],
+): TransactionSpec | Transaction {
+  if (
+    !transaction.docChanged ||
+    transaction.annotation(controlledUpdate) ||
+    !transaction.isUserEvent("input") ||
+    transaction.isUserEvent("input.type.compose")
+  ) {
+    return transaction;
+  }
+  const paintedTokens = transaction.startState.facet(mentionTokensFacet);
+  if (paintedTokens.length === 0) return transaction;
+  const inserts: { start: number; end: number; text: string }[] = [];
+  transaction.changes.iterChanges((start, end, _fromB, _toB, inserted) => {
+    inserts.push({ start, end, text: inserted.toString() });
+  });
+  const insert = inserts.length === 1 ? inserts[0] : undefined;
+  if (!insert) return transaction;
+  const adjusted = separateMentionEdges(
+    transaction.startState.doc.toString(),
+    insert,
+    paintedTokens,
+  );
+  if (!adjusted) return transaction;
+  const isolation = transaction.annotation(isolateHistory);
+  const addToHistory = transaction.annotation(Transaction.addToHistory);
+  return {
+    changes: { from: insert.start, to: insert.end, insert: adjusted.text },
+    selection: EditorSelection.cursor(insert.start + adjusted.caret),
+    userEvent: transaction.annotation(Transaction.userEvent),
+    annotations: [
+      ...(isolation === undefined ? [] : [isolateHistory.of(isolation)]),
+      ...(addToHistory === undefined ? [] : [Transaction.addToHistory.of(addToHistory)]),
+    ],
+    effects: transaction.effects,
+    scrollIntoView: transaction.scrollIntoView,
+  };
+}
 
 /** The mention tokens the editor paints; reconfigured through a compartment when they change. */
 const mentionTokensFacet = Facet.define<readonly string[], readonly string[]>({
@@ -505,6 +568,9 @@ function CodeMirrorComposer({
           keymap.of(COMPOSER_EDITING_KEYMAP),
           compartments.history.of(history()),
           EditorView.lineWrapping,
+          EditorState.transactionFilter.of((transaction) =>
+            adjustedInsertTransaction(transaction, environment.separateMentionEdges),
+          ),
           compartments.attributes.of(attributes(initial, environment)),
           compartments.placeholder.of(placeholderText(initial.placeholder ?? "")),
           compartments.theme.of(theme(initial.heightMode ?? "compact")),
@@ -517,10 +583,8 @@ function CodeMirrorComposer({
               transaction.annotation(controlledUpdate),
             );
             if (update.docChanged && fromUser) {
-              const fromHistory = update.transactions.some(
-                (transaction) => transaction.isUserEvent("undo") || transaction.isUserEvent("redo"),
-              );
-              latest.current.onChange?.({ ...event(), fromHistory });
+              const historyDirection = historyDirectionOfTransactions(update.transactions);
+              latest.current.onChange?.({ ...event(), historyDirection });
             }
             if ((update.docChanged || update.selectionSet) && fromUser) {
               latest.current.onSelect?.(event());
