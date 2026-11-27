@@ -279,10 +279,15 @@ describe("useReviewFolder", () => {
     expect(second.result.current.canChoose).toBe(true);
   });
 
-  it("keeps no list for another session's review", () => {
+  it.each([
+    ["another session", () => "conv_other"],
+    ["another host", () => ((mocks.hostId = "host_2"), SESSION)],
+    ["another workspace", () => ((mocks.workspace = "/other"), SESSION)],
+  ])("keeps no list for a review of %s", (_case, switchTo) => {
     renderHook(() => useReviewFolder(SESSION, true));
     mocks.worktreeAnswer = "unknown";
-    const other = renderHook(() => useReviewFolder("conv_other", true));
+    const session = switchTo();
+    const other = renderHook(() => useReviewFolder(session, true));
     expect(other.result.current.resolved).toBe(false);
   });
 

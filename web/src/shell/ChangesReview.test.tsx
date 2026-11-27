@@ -1475,6 +1475,7 @@ describe("a review of a worktree inside the workspace", () => {
       });
       expect(rememberedBrowseLocation("s1")).toBeNull();
       expect(onComparisonShown).not.toHaveBeenCalled();
+      expect(data.choice.choose).not.toHaveBeenCalled();
       expect(landing.settled).toBe(false);
       mocks.folder = following;
       rerender(<ChangesReview {...props} />);
