@@ -770,6 +770,36 @@ def create_scheduled_tasks_router(
             f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
         )
 
+    def _require_one_budget_per_session(
+        task_id: str, session_id: str | None, max_cost_usd: float | None, owner_id: str | None
+    ) -> None:
+        """Refuse a second automation's cost cap on a session it continues.
+
+        A session holds one automation's cap, and a fire never replaces another's, so a
+        second capped automation would fail every run without reaching the session.
+        """
+        if session_id is None or max_cost_usd is None:
+            return
+        other = next(
+            (
+                task
+                for task in store.list(owner_user_id=owner_id)
+                if task.id != task_id
+                and task.session_mode == "continue"
+                and task.session_id == session_id
+                and task.max_cost_usd is not None
+            ),
+            None,
+        )
+        if other is not None:
+            raise OmnigentError(
+                f"The automation {other.name!r} already continues this session with its own "
+                "cost cap, and a session can carry only one automation's cap. Remove this "
+                "task's cost budget so it runs under that cap, or continue a different "
+                "session.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
     def _require_mcp_services_fit_session(
         request: Request, session: Conversation, services: tuple[str, ...]
     ) -> None:
@@ -1142,6 +1172,9 @@ def create_scheduled_tasks_router(
                     ),
                 )
                 _require_mcp_services_fit_session(request, picked, mcp_services)
+                _require_one_budget_per_session(
+                    task_id, body.session_id, body.max_cost_usd, owner_id
+                )
                 # The session cannot move, so the task routes every run to its host.
                 if host_id is None and body.execution_target != "managed_sandbox":
                     host_id = picked.host_id
@@ -1922,6 +1955,13 @@ def create_scheduled_tasks_router(
                 if name in fields
             },
         )
+        if {"session_id", "session_mode", "max_cost_usd"}.intersection(fields):
+            _require_one_budget_per_session(
+                existing.id,
+                continuing.session_id if continuing.session_mode == "continue" else None,
+                fields.get("max_cost_usd", existing.max_cost_usd),
+                owner_id,
+            )
         if fields.get("session_id") is not None:
             picked = await _require_continuable(request, continuing)
             _require_mcp_services_fit_session(

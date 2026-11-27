@@ -3750,6 +3750,45 @@ async def test_create_can_continue_a_session_the_owner_picked(
             assert "which skips approval" in picked.json()["error"]["message"]
 
 
+async def test_only_one_automation_continuing_a_session_can_cap_its_cost(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # A fire never replaces another automation's cap, so a second capped one would
+    # fail every run; it's refused when it's set up instead.
+    session_id = _owned_session(db_uri)
+    hourly = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_mode="continue", session_id=session_id, max_cost_usd=3),
+        headers=_headers(),
+    )
+    assert hourly.status_code == 200, hourly.text
+
+    refused = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_mode="continue", session_id=session_id, max_cost_usd=3),
+        headers=_headers(),
+    )
+    assert refused.status_code == 400
+    assert (
+        "already continues this session with its own cost cap"
+        in (refused.json()["error"]["message"])
+    )
+
+    # Without a cap of its own it runs under the first one's.
+    daily = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_mode="continue", session_id=session_id),
+        headers=_headers(),
+    )
+    assert daily.status_code == 200, daily.text
+    url = f"/v1/scheduled-tasks/{daily.json()['id']}"
+    capped = await auth_client.patch(url, json={"max_cost_usd": 3}, headers=_headers())
+    assert capped.status_code == 400
+    # Edits that don't add a cap still go through.
+    renamed = await auth_client.patch(url, json={"name": "daily"}, headers=_headers())
+    assert renamed.status_code == 200, renamed.text
+
+
 async def test_a_picked_session_must_run_the_saved_mcp_services(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
