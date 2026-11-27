@@ -5,6 +5,7 @@ import {
   AVAILABLE,
   type CommandAvailability,
   HIDDEN,
+  isCommandAvailable,
   unavailableBecause,
 } from "@/store/paletteCommands";
 
@@ -59,12 +60,25 @@ export function pinOrderCommands(facts: PinOrderFacts): PinOrderCommand[] {
   const index = facts.reorderable ? facts.pinnedIds.indexOf(facts.sessionId) : -1;
   return PIN_ORDER_COMMAND_IDS.map((id) => {
     const targetId = index < 0 ? null : (targetFor(id, facts.pinnedIds, index) ?? null);
-    const availability =
-      targetId === null
-        ? HIDDEN
-        : facts.saving
-          ? unavailableBecause(PIN_ORDER_SAVING_REASON)
-          : AVAILABLE;
-    return { id, label: LABELS[id], availability, targetId };
+    return { id, label: LABELS[id], availability: availabilityFor(targetId, facts), targetId };
   });
+}
+
+function availabilityFor(targetId: string | null, facts: PinOrderFacts) {
+  if (targetId === null) return HIDDEN;
+  if (facts.saving) return unavailableBecause(PIN_ORDER_SAVING_REASON);
+  return AVAILABLE;
+}
+
+/**
+ * The pin `command` would move its session to now, or null once that move no longer applies:
+ * the session was unpinned, the order changed its target, or a pin write is saving.
+ */
+export function currentPinMoveTarget(
+  command: Pick<PinOrderCommand, "id" | "targetId">,
+  facts: PinOrderFacts,
+): string | null {
+  const fresh = pinOrderCommands(facts).find((candidate) => candidate.id === command.id);
+  if (!fresh?.targetId || fresh.targetId !== command.targetId) return null;
+  return isCommandAvailable(fresh.availability) ? fresh.targetId : null;
 }

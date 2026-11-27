@@ -4,9 +4,14 @@
 import { ArrowDownIcon, ArrowUpIcon, ArrowUpToLineIcon, type LucideIcon } from "lucide-react";
 import { useMemo, useRef } from "react";
 
-import { isCommandAvailable, type PaletteCommand } from "@/store/paletteCommands";
+import type { PaletteCommand } from "@/store/paletteCommands";
 
-import { type PinOrderCommand, type PinOrderCommandId, pinOrderCommands } from "./pinOrderCommands";
+import {
+  currentPinMoveTarget,
+  type PinOrderCommand,
+  type PinOrderCommandId,
+  pinOrderCommands,
+} from "./pinOrderCommands";
 import { useQuickPickPaletteCommands } from "./screenCommands/useQuickPickPaletteCommands";
 
 /** The Pinned section's order and the move that rewrites it, from the sidebar list. */
@@ -38,7 +43,7 @@ export function pinOrderPaletteCommands(
   run: (command: PinOrderCommand) => void,
 ): PaletteCommand[] {
   return commands.map((command) => ({
-    // The target is part of the id, so a row accepted after the order changed does nothing.
+    // The target is part of the id, so ⌘K drops a row once the order changes its target.
     id: `sidebar.pin-order.${command.id}:${sessionId}:${command.targetId}`,
     label: command.label,
     icon: ICONS[command.id],
@@ -67,10 +72,10 @@ export function usePinOrderPaletteCommands(order: PinOrder, sessionId: string | 
     () =>
       sessionId
         ? pinOrderPaletteCommands(commands, sessionId, (command) => {
+            // Read against the order now, so a row kept past a change does nothing.
             const current = latest.current;
-            if (!command.targetId || !isCommandAvailable(command.availability)) return;
-            if (current.saving || !current.pinnedIds.includes(command.targetId)) return;
-            current.move(sessionId, command.targetId);
+            const targetId = currentPinMoveTarget(command, { ...current, sessionId });
+            if (targetId) current.move(sessionId, targetId);
           })
         : NO_COMMANDS,
     // `signature` stands for `commands`.
