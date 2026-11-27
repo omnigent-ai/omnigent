@@ -111,6 +111,7 @@ class BwrapShellRequest:
         command_env: dict[str, str],
         timeout: int,
         max_output: int,
+        output_encoding: str,
         spawn: Callable[[list[str], dict[str, str], tuple[int, ...]], subprocess.Popen[bytes]],
     ) -> BwrapRequestResult:
         launcher = request_launcher(policy, launch_env)
@@ -125,6 +126,7 @@ class BwrapShellRequest:
             "cwd": str(cwd),
             "env": command_env,
             "report_encoding": True,
+            "output_encoding": output_encoding,
         }
         if policy.egress_relay_port is not None or policy.egress_socket_path is not None:
             if policy.egress_relay_port is None or policy.egress_socket_path is None:

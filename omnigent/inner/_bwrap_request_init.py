@@ -7,6 +7,7 @@ an isolated interpreter without importing the application's dependency tree.
 from __future__ import annotations
 
 import array
+import codecs
 import ctypes
 import json
 import locale
@@ -54,6 +55,7 @@ class _RequestConfig:
     env: dict[str, str]
     relay: _RelayConfig | None = None
     report_encoding: bool = False
+    output_encoding: str | None = None
 
 
 def _read_request_config(descriptor: int) -> _RequestConfig:
@@ -67,6 +69,7 @@ def _read_request_config(descriptor: int) -> _RequestConfig:
     env = config.get("env")
     relay = config.get("relay")
     report_encoding = config.get("report_encoding", False)
+    output_encoding = config.get("output_encoding")
     if (
         not isinstance(token, str)
         or len(token) != 64
@@ -94,6 +97,17 @@ def _read_request_config(descriptor: int) -> _RequestConfig:
         raise ValueError("Request environment is invalid")
     if not isinstance(report_encoding, bool):
         raise ValueError("Request output encoding option is invalid")
+    if output_encoding is not None:
+        if (
+            not isinstance(output_encoding, str)
+            or not output_encoding.isascii()
+            or not 1 <= len(output_encoding) <= 128
+        ):
+            raise ValueError("Request output encoding is invalid")
+        try:
+            codecs.lookup(output_encoding)
+        except LookupError as exc:
+            raise ValueError("Request output encoding is invalid") from exc
     relay_config = None
     if relay is not None:
         if not isinstance(relay, dict):
@@ -116,7 +130,13 @@ def _read_request_config(descriptor: int) -> _RequestConfig:
             raise ValueError("Request relay configuration is invalid")
         relay_config = _RelayConfig(source, port, socket_path)
     return _RequestConfig(
-        token.encode("ascii"), tuple(argv), cwd, dict(env), relay_config, report_encoding
+        token.encode("ascii"),
+        tuple(argv),
+        cwd,
+        dict(env),
+        relay_config,
+        report_encoding,
+        output_encoding,
     )
 
 
@@ -176,7 +196,9 @@ def _run_request(control: socket.socket, config: _RequestConfig) -> None:
     try:
         ready = _READY + config.token
         if config.report_encoding:
-            encoding = "utf-8" if sys.flags.utf8_mode else locale.getencoding()
+            encoding = config.output_encoding or (
+                "utf-8" if sys.flags.utf8_mode else locale.getencoding()
+            )
             ready += b":" + encoding.encode("ascii")
         sent = control.sendmsg(
             [ready],

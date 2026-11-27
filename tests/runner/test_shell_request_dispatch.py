@@ -422,6 +422,10 @@ print(json.dumps({
 
 
 @pytest.mark.skipif(not _LIVE_LINUX, reason="requires Linux and Bubblewrap")
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_SHELL_LATENCY_EVIDENCE") != "1",
+    reason="opt-in latency evidence; lifecycle correctness runs independently",
+)
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 async def test_real_runner_shell_reuse_records_latency_against_disposable_calls(
@@ -477,7 +481,9 @@ async def test_real_runner_shell_reuse_records_latency_against_disposable_calls(
 
 
 @pytest.mark.skipif(not _LIVE_LINUX, reason="requires Linux and Bubblewrap")
-@pytest.mark.parametrize("mode", ["large-success", "large-error", "timeout-invalid"])
+@pytest.mark.parametrize(
+    "mode", ["large-success", "large-error", "timeout-invalid", "utf8-disabled", "utf8-enabled"]
+)
 @pytest.mark.asyncio
 @pytest.mark.timeout(45)
 async def test_real_runner_shell_bounds_output_and_preserves_invalid_byte_timeouts(
@@ -487,6 +493,11 @@ async def test_real_runner_shell_bounds_output_and_preserves_invalid_byte_timeou
 
     monkeypatch.setenv("LC_ALL", "C.UTF-8")
     spec = _spec(tmp_path)
+    if mode.startswith("utf8-"):
+        monkeypatch.setenv("LC_ALL", "C")
+        monkeypatch.setenv("PYTHONUTF8", "0" if mode == "utf8-disabled" else "1")
+        assert spec.os_env is not None and spec.os_env.sandbox is not None
+        spec.os_env.sandbox.env_passthrough = ["PYTHONUTF8"]
     _require_request_launcher(spec, tmp_path)
     observations: list[tuple[CapturedOutput, CapturedOutput]] = []
     original_result = BoundedPipeCapture.result
@@ -502,6 +513,8 @@ import os, sys, time
 if sys.argv[1] == "timeout-invalid":
     os.write(1, b"\\xff")
     time.sleep(30)
+elif sys.argv[1].startswith("utf8-"):
+    os.write(1, b"\\xc3\\xa9")
 else:
     for _ in range(32):
         os.write(1, b"x" * 8192)
@@ -524,7 +537,27 @@ else:
         )
         assert len(observations) == 1
         stdout, stderr = observations[0]
-        if mode == "timeout-invalid":
+        if mode.startswith("utf8-"):
+            disposable = json.loads(
+                await _execute_os_env_tool(
+                    "sys_os_shell",
+                    {
+                        "command": shlex.join([sys.executable, "-I", "-S", "-c", command, mode]),
+                        "timeout": 15,
+                    },
+                    agent_spec=spec,
+                    conversation_id="disposable-encoding",
+                )
+            )
+            if mode == "utf8-disabled":
+                assert stdout.decoding_error is not None
+                assert result == disposable
+                assert result["error"].startswith("os_env helper exception:")
+            else:
+                assert stdout.decoding_error is None
+                assert result == disposable
+                assert result["stdout"] == "\u00e9" and result["exit_code"] == 0
+        elif mode == "timeout-invalid":
             assert stdout.decoding_error is not None
             assert result == {
                 "stdout": "",

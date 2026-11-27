@@ -10,6 +10,7 @@ import contextlib
 import errno
 import functools
 import json
+import locale
 import logging
 import os
 import shutil
@@ -88,7 +89,7 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # Ops without side effects: safe to send again if the helper died before replying.
-_REPLAY_SAFE_OPS = frozenset({"read"})
+_REPLAY_SAFE_OPS = frozenset({"read", "shell_encoding"})
 
 logger = logging.getLogger(__name__)
 
@@ -467,6 +468,7 @@ class _HelperProcessClient:
         self._launch: tuple[Callable[[], object], object] | None = None
         self._launch_env: dict[str, str] | None = None
         self._prepared: _PreparedHelper | None = None
+        self._shell_encoding: str | None = None
         # Parent-held containment handle from the sandbox backend's
         # post_spawn hook (e.g. a Windows Job Object). Closed in
         # ``_stop_locked`` to tear down the helper's process tree.
@@ -557,6 +559,13 @@ class _HelperProcessClient:
 
             raise RequestCancelled("Shell request was cancelled before preparation")
         self._ensure_started_locked()
+        encoding = self._shell_encoding
+        if encoding is None:
+            metadata = self._request_locked({"op": "shell_encoding"}, allow_retry=True)
+            encoding = metadata.get("encoding")
+            if not isinstance(encoding, str):
+                return {"error": "Failed to read the OS helper's shell-output encoding"}
+            self._shell_encoding = encoding
         assert self._prepared is not None
         prepared = self._prepared
         env = _child_shell_env(prepared.env)
@@ -570,6 +579,7 @@ class _HelperProcessClient:
                 command_env=env,
                 timeout=timeout,
                 max_output=max_output,
+                output_encoding=encoding,
                 spawn=self._spawn_shell_request,
             )
             if completed.encoding is None:
@@ -969,6 +979,7 @@ class _HelperProcessClient:
         self._launch = None
         self._launch_env = None
         self._prepared = None
+        self._shell_encoding = None
         try:
             if proc is None:
                 return
@@ -1482,6 +1493,8 @@ def _handle_helper_request(
     sandbox: SandboxPolicy,
 ) -> OpResult:
     op = request.get("op")
+    if op == "shell_encoding":
+        return {"encoding": "utf-8" if sys.flags.utf8_mode else locale.getencoding()}
     if op == "git":
         from omnigent.runtime.filesystem_registry import (
             _LOCK_FREE_GIT_READ_OPTIONS,

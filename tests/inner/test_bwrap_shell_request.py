@@ -208,6 +208,7 @@ def _launch(case: _LaunchCase, cwd: Path) -> BwrapRequestResult:
         command_env={"HTTP_PROXY": "http://omnigent:broker-secret@127.0.0.1:1234"},
         timeout=7,
         max_output=17,
+        output_encoding="ascii",
         spawn=case.spawn,
     )
 
@@ -219,6 +220,7 @@ def test_launch_delivers_private_config_and_preserves_the_relay_until_owner_comp
     assert _launch(case, tmp_path) == BwrapRequestResult(b"done\r\n", b"", 0, False, "utf-8")
     assert case.config["env"] == {"HTTP_PROXY": "http://omnigent:broker-secret@127.0.0.1:1234"}
     assert case.config["report_encoding"] is True
+    assert case.config["output_encoding"] == "ascii"
     assert case.config["relay"] == {
         "source": str(Path(shell_request.__file__).with_name("egress") / "relay.py"),
         "port": 1234,
@@ -339,6 +341,16 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
     monkeypatch.setattr(helper, "_ensure_started_locked", start)
     request = shell_request.BwrapShellRequest()
     encoding = "utf-8" if ending in {"decode", "timeout-invalid"} else "iso8859-1"
+    monkeypatch.setattr(
+        os_env_module, "sys", SimpleNamespace(flags=SimpleNamespace(utf8_mode=encoding == "utf-8"))
+    )
+    monkeypatch.setattr(os_env_module.locale, "getencoding", lambda: encoding)
+    metadata = MagicMock(
+        side_effect=lambda request, **_kwargs: os_env_module._handle_helper_request(
+            request=request, cwd=tmp_path, shell_path="/bin/sh", sandbox=prepared.sandbox
+        )
+    )
+    monkeypatch.setattr(helper, "_request_locked", metadata)
     limit = 16 if ending == "nonzero" else 4
 
     def capture(raw: bytes) -> CapturedOutput:
@@ -367,6 +379,8 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
         assert options["policy"] is prepared.sandbox
         assert options["cwd"] == tmp_path
         assert options["max_output"] == limit
+        assert options["output_encoding"] == encoding
+        metadata.assert_called_once_with({"op": "shell_encoding"}, allow_retry=True)
         assert options["launch_env"] == prepared.env
         assert "UNGRANTED_SECRET" not in options["command_env"]
         assert "PYTHONPATH" not in options["command_env"]
@@ -458,6 +472,7 @@ async def test_close_cancels_the_active_request_and_retains_brokers_until_retire
 ) -> None:
     helper = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=_policy(tmp_path))
     helper._prepared = _PreparedHelper(_policy(tmp_path), tmp_path, {"PATH": os.defpath})
+    helper._shell_encoding = "utf-8"
     monkeypatch.setattr(helper, "_ensure_started_locked", lambda: None)
     request = shell_request.BwrapShellRequest()
     started, cancelled, retire, stopped = (threading.Event() for _ in range(4))
