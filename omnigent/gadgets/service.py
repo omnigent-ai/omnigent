@@ -1250,7 +1250,7 @@ class GadgetService:
         value = {
             "session_id": current.value.get("session_id") if current is not None else None,
             "viewer": self.viewer.user_id,
-            "open": open_records[-MAX_OPEN_ACTIONS:],
+            "open": open_records,
         }
         if current is None:
             store.create("viewers", self.viewer.key, value, operation_id, self.viewer.user_id)
@@ -1341,10 +1341,9 @@ class GadgetService:
             if record.get("id") in progress
             and progress[record["id"]]["progress"].status in OPEN_STATUSES
         ]
-        if existing is not None:
-            document = existing
-        else:
-            # Refused before it is accepted: the viewer record follows at most this many, and
+
+        def refuse_if_full() -> None:
+            # Refused before it is followed: the viewer record follows at most this many, and
             # an action it no longer follows could neither be delivered nor tracked.
             if len(still_open) >= MAX_OPEN_ACTIONS:
                 raise CapacityExceeded(
@@ -1352,6 +1351,11 @@ class GadgetService:
                     "ask again once one of them has finished",
                     details={"reason": "too_many_open_actions", "limit": MAX_OPEN_ACTIONS},
                 )
+
+        if existing is not None:
+            document = existing
+        else:
+            refuse_if_full()
             value = {
                 "action": name,
                 "params": params,
@@ -1372,6 +1376,9 @@ class GadgetService:
             # (finished actions leave the viewer record): the first receipt, sent nowhere again.
             return {**document.to_dict(), "merged": False, "delivered": True}
         if not tracked:
+            # A retry whose first try never got followed counts against the limit too, so
+            # following it never pushes out another open action.
+            refuse_if_full()
             record = {"id": document.id, "digest": digest, "requested_at": int(time.time())}
             # Bounded and stable per request: the caller's operation ID may already use the
             # store's whole length limit.

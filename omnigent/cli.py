@@ -13237,17 +13237,18 @@ def _migration_gadget_location(
 ) -> str | None:
     """The gadget directory ``migrate-accounts-to-oidc`` checks, or ``None`` for none.
 
-    The server's own location, as ``omnigent server`` resolves it from its config. A
-    guess would be unsafe: a server configured elsewhere leaves the default directory
-    empty or absent, and remapping one of its gadget owners cuts them off from their
-    gadgets, so without --config, --gadget-dir or --no-gadgets the command stops.
+    The server's own location, from --gadget-dir or a --config that sets
+    gadget_location; a config without one is refused, since its default depends on the
+    server's data directory. With none of the options (the command's form from before
+    gadgets) this machine's default directory is checked when it exists, and a warning
+    says gadgets went unchecked when it doesn't.
 
     :param gadget_dir: ``--gadget-dir``, which must exist.
     :param config_path: ``--config``, the server's config file.
     :param no_gadgets: ``--no-gadgets``: the server never kept gadgets.
     :returns: The directory to check; ``None`` with ``--no-gadgets``. A configured
         location that doesn't exist holds no gadgets, so the caller skips it.
-    :raises click.UsageError: When the location can't be established.
+    :raises click.UsageError: When a given option can't establish the location.
     """
     if no_gadgets and (gadget_dir is not None or config_path is not None):
         raise click.UsageError("--no-gadgets can't be combined with --config or --gadget-dir")
@@ -13277,10 +13278,19 @@ def _migration_gadget_location(
             "depends on its data directory: pass --gadget-dir with the server's gadget "
             "directory, or --no-gadgets if it never kept any"
         )
-    raise click.UsageError(
-        "can't tell where the server keeps gadgets: pass --config with the server's config "
-        "file, --gadget-dir with its gadget directory, or --no-gadgets if it never kept any"
+    # None of them, as before gadgets existed: check this machine's default directory when
+    # it is there, and otherwise say plainly that gadgets went unchecked.
+    location = _default_gadget_location()
+    if Path(location).is_dir():
+        return location
+    click.echo(
+        f"WARNING: no gadget directory at {location}, so gadget owners were not checked. "
+        "If the server keeps gadgets elsewhere, pass --gadget-dir with its gadget directory "
+        "(or --config with a config that sets gadget_location) before running with --commit; "
+        "pass --no-gadgets to silence this for a server that never kept any.",
+        err=True,
     )
+    return None
 
 
 @debug.command("migrate-accounts-to-oidc")
@@ -13376,8 +13386,9 @@ def debug_migrate_accounts_to_oidc(
     refused, and their rows stay as they are. Delete or hand off those
     gadgets first, then run it again. Say where the server keeps them
     with --config (when it sets gadget_location) or --gadget-dir, or pass
-    --no-gadgets for a server that never kept any; with none of these the
-    command stops before changing anything.
+    --no-gadgets for a server that never kept any. With none of these it
+    checks this machine's default gadget directory, or warns that gadgets
+    went unchecked when there is none.
 
     \b
     IMPORTANT: always back up your database before running with

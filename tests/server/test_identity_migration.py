@@ -409,7 +409,7 @@ def test_cli_dry_run_by_default(db_uri: str) -> None:
 
     result = CliRunner().invoke(
         cli,
-        ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com", "--no-gadgets"],
+        ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com"],
     )
 
     assert result.exit_code == 0, result.output
@@ -437,7 +437,6 @@ def test_cli_commit_applies(db_uri: str) -> None:
             "--domain",
             "example.com",
             "--commit",
-            "--no-gadgets",
         ],
     )
 
@@ -624,30 +623,37 @@ def test_cli_stops_when_the_config_does_not_name_an_existing_gadget_directory(
     assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
 
 
-def test_cli_stops_when_it_cant_tell_where_the_server_keeps_gadgets(
-    db_uri: str, tmp_path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("has_default_dir", [False, True], ids=["no_default", "default"])
+def test_cli_without_a_gadget_option_works_as_before_gadgets(
+    db_uri: str, tmp_path, monkeypatch: pytest.MonkeyPatch, has_default_dir: bool
 ) -> None:
-    """Without --config, --gadget-dir or --no-gadgets the command changes nothing: the
-    default directory may be absent because the server keeps its gadgets elsewhere."""
+    """The command's form from before gadgets still runs: it checks this machine's default
+    gadget directory when there is one, and otherwise warns that gadgets went unchecked."""
     from omnigent.stores.gadget_store.local import LocalGadgetStore
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
-    store = LocalGadgetStore(str(tmp_path / "elsewhere"))
     account_store = SqlAlchemyAccountStore(db_uri)
     account_store.create_user_with_password("alice", hash_password("password123"))
-    gadget = _gadget_service(db_uri, store, "alice").create("Synthetic board")
-    assert not (tmp_path / "data" / "gadgets").exists()
+    account_store.create_user_with_password("bob", hash_password("password123"))
+    if has_default_dir:
+        store = LocalGadgetStore(str(tmp_path / "data" / "gadgets"))
+        _gadget_service(db_uri, store, "alice").create("Synthetic board")
 
     result = CliRunner().invoke(
         cli,
         ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com", "--commit"],
     )
 
-    assert result.exit_code != 0
-    assert "where the server keeps gadgets" in result.output
-    assert account_store.get_user("alice") is not None
-    assert account_store.get_user("alice@example.com") is None
-    assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
+    assert result.exit_code == 0, result.output
+    assert account_store.get_user("bob@example.com") is not None
+    if has_default_dir:
+        # Alice owns a gadget there, so she is refused rather than cut off from it.
+        assert "REFUSED (has gadgets" in result.output
+        assert account_store.get_user("alice") is not None
+        assert "WARNING" not in result.output
+    else:
+        assert "gadget owners were not checked" in result.output
+        assert account_store.get_user("alice@example.com") is not None
 
 
 def test_cli_refuses_no_gadgets_with_a_gadget_location(db_uri: str, tmp_path) -> None:

@@ -2319,6 +2319,45 @@ def test_an_action_past_the_open_limit_is_refused_before_it_is_accepted(
     assert again["merged"] is False
 
 
+def test_a_retried_action_never_pushes_out_another_open_one(gadgets: Fixture) -> None:
+    service = gadgets.service()
+    app = publish_actions_board(service)
+    service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+    limit = service_module.MAX_OPEN_ACTIONS
+
+    def ask(card_id: str, operation_id: str) -> dict:
+        return service.request_action(
+            app["id"],
+            {"action": "run_card", "params": {"cardId": card_id}, "operation_id": operation_id},
+        )
+
+    for number in range(limit - 2):
+        ask(f"c{number}", f"r{number}")
+    # The first try of "late" saves its ledger entry, then fails to save the viewer record.
+    failed = {"once": False}
+
+    def fail_viewer_save(path: str) -> None:
+        if "viewers" in path and not failed["once"]:
+            failed["once"] = True
+            raise OSError("viewer record not saved")
+
+    gadgets.store.before_create = fail_viewer_save
+    with pytest.raises(OSError):
+        ask("late", "r-late")
+    gadgets.store.before_create = None
+    # Another request takes the last free place meanwhile.
+    ask("other", "r-other")
+    ask("filler", "r-filler")
+
+    with pytest.raises(CapacityExceeded):
+        ask("late", "r-late")
+    # Every action that was followed still is, and can still be delivered.
+    tracked = {item["id"] for item in service.action_progress(app["id"], [])["items"]}
+    assert len(tracked) == limit
+    for action_id in tracked:
+        service.record_delivery(app["id"], action_id, {"session_id": "s_gadget"})
+
+
 @pytest.mark.parametrize(
     "request_body",
     [
