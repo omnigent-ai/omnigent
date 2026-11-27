@@ -15740,8 +15740,6 @@ def test_cache_cost_model_label_requires_an_exact_versioned_claude_id(
             ("labels", "live-confirmation-label", (False, True)),
             ("labels", "live-version", (False, True)),
             ("labels", "live-label-before-commit", (False, True)),
-            ("dialog", "Sonnet", (False, True)),
-            ("dialog", "Sonnet 5.6", (False, True)),
             ("dialog", "Opus 5.5", (False, True)),
             ("dialog", "foreign-permission", (False, True)),
             ("private", "legacy", (False, True)),

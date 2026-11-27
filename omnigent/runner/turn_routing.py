@@ -1566,9 +1566,8 @@ async def _apply_routed_model(
                 exc_info=True,
             )
             return False
-        if hold_deadline is not None and (
-            read_pending_replay(bridge_dir) != pending
-            or not turn_routing_marker_present(bridge_dir, session_id)
+        if read_pending_replay(bridge_dir) != pending or not turn_routing_marker_present(
+            bridge_dir, session_id
         ):
             return False
         break

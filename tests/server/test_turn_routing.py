@@ -1507,8 +1507,13 @@ async def test_replay_deduplicates_an_already_scheduled_prompt(
     assert read_pending_replay(tmp_path) is None
 
 
-async def test_replay_hold_keeps_a_replacement_pending_prompt_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("selection", ["held", "immediate"])
+@pytest.mark.parametrize("replacement", ["pending-record", "block-marker"])
+async def test_replay_keeps_replaced_prompt_ownership_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selection: str,
+    replacement: str,
 ) -> None:
     from omnigent.harnesses.claude_native import bridge
 
@@ -1516,20 +1521,29 @@ async def test_replay_hold_keeps_a_replacement_pending_prompt_untouched(
     write_pending_replay(
         tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
     )
+    original = read_pending_replay(tmp_path)
+    assert original is not None
     client = _FakeServerClient()
     attempts = 0
 
     def select(_bridge: Path, **kwargs: object) -> bridge.ClaudeModelSwitchResult:
         nonlocal attempts
         attempts += 1
-        write_pending_replay(
-            tmp_path,
-            session_id="conv_1",
-            prompt="replacement",
-            blocked_turn_id=None,
-            model="private-model",
+        if replacement == "pending-record":
+            write_pending_replay(
+                tmp_path,
+                session_id="conv_1",
+                prompt="replacement",
+                blocked_turn_id=None,
+                model="private-model",
+            )
+        else:
+            (tmp_path / MARKER_FILE).unlink()
+        if selection == "held":
+            raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+        return bridge.ClaudeModelSwitchResult(
+            "private-model", "private-model", "private-model", "private-model", "native-session"
         )
-        raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
 
     monkeypatch.setattr(bridge, "inject_model_command", select)
     await asyncio.wait_for(
@@ -1548,7 +1562,12 @@ async def test_replay_hold_keeps_a_replacement_pending_prompt_untouched(
     assert attempts == 1
     assert not client.posts
     pending = read_pending_replay(tmp_path)
-    assert pending is not None and pending.prompt == "replacement"
+    if replacement == "pending-record":
+        assert pending is not None and pending.prompt == "replacement"
+        assert turn_routing_marker_present(tmp_path, "conv_1")
+    else:
+        assert pending == original
+        assert not turn_routing_marker_present(tmp_path, "conv_1")
 
 
 @pytest.mark.parametrize(
