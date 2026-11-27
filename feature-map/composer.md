@@ -333,7 +333,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   opens and focuses the new-session composer in browsers. Native shells use
   ⌘/Ctrl+N. Embedded apps require focus inside the app. Where that chord is
   Ctrl+N, an open pick list that steps on Ctrl-N keeps it. In the Windows and
-  Linux desktop app the menu's New Session accelerator still takes Ctrl+N first.
+  Linux desktop app the menu's New Session accelerator yields Ctrl+N while a
+  pick list has focus, and takes it otherwise.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn. Mod+Enter inverts Always steer for one
   message: with it on, the draft waits in the queue until the turn ends; with it

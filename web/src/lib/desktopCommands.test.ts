@@ -41,6 +41,14 @@ async function flushReports(): Promise<void> {
   await Promise.resolve();
 }
 
+/** The last reported pick-list focus, once a focus event or the list's attribute has reported. */
+async function settledPickListFocused(): Promise<boolean | undefined> {
+  // The event or attribute queues a report on one microtask, which runs on the next.
+  await flushReports();
+  await flushReports();
+  return setDesktopCommandState.mock.lastCall?.[0].pickListFocused;
+}
+
 beforeEach(() => {
   listener = null;
   installShell();
@@ -195,24 +203,18 @@ describe("useDesktopCommand", () => {
     const field = document.createElement("input");
     const other = document.createElement("input");
     document.body.append(field, other);
-    const lastPickListFocused = async () => {
-      // A focus event or the list's attribute queues a report on the next microtask.
-      await flushReports();
-      await flushReports();
-      return setDesktopCommandState.mock.lastCall?.[0].pickListFocused;
-    };
-    expect(await lastPickListFocused()).toBe(false);
+    expect(await settledPickListFocused()).toBe(false);
 
     field.focus();
     field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
-    expect(await lastPickListFocused()).toBe(true);
+    expect(await settledPickListFocused()).toBe(true);
     // The list closing drops its attribute, with the field still focused.
     field.removeAttribute(PICK_LIST_INPUT_ATTRIBUTE);
-    expect(await lastPickListFocused()).toBe(false);
+    expect(await settledPickListFocused()).toBe(false);
     field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
-    expect(await lastPickListFocused()).toBe(true);
+    expect(await settledPickListFocused()).toBe(true);
     other.focus();
-    expect(await lastPickListFocused()).toBe(false);
+    expect(await settledPickListFocused()).toBe(false);
   });
 
   it("corrects a report left by a removed pick list on the next Ctrl-N or Ctrl-P", async () => {
@@ -220,20 +222,15 @@ describe("useDesktopCommand", () => {
     const field = document.createElement("input");
     field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
     document.body.append(field);
-    const settle = async () => {
-      await flushReports();
-      await flushReports();
-      return setDesktopCommandState.mock.lastCall?.[0].pickListFocused;
-    };
     field.focus();
-    expect(await settle()).toBe(true);
+    expect(await settledPickListFocused()).toBe(true);
     // Removing the focused field moves focus to the body without a focus event.
     field.remove();
-    await settle();
+    await settledPickListFocused();
     document.body.dispatchEvent(
       new KeyboardEvent("keydown", { key: "n", code: "KeyN", ctrlKey: true, bubbles: true }),
     );
-    expect(await settle()).toBe(false);
+    expect(await settledPickListFocused()).toBe(false);
   });
 
   it("coalesces a burst of registrations into one report", async () => {

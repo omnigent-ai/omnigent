@@ -10,6 +10,7 @@ import {
   APP_SHORTCUT_BINDINGS,
   codeMirrorKeys,
   matchesShortcut,
+  menuShortcutChords,
   type ShortcutEnvironment,
   type ShortcutPageContext,
   type ShortcutId,
@@ -23,16 +24,14 @@ import { rowsForChord, searchableChords } from "@/pages/settings/search/chordQue
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
     [true, false].flatMap((desktopMenu) =>
-      // The Go menu exists only on a shell with the command bridge.
-      (desktopMenu ? [false, true] : [false]).flatMap((goMenu) =>
-        [true, false].map((submitWithModEnter) => ({
-          mac,
-          native,
-          desktopMenu,
-          goMenu,
-          submitWithModEnter,
-        })),
-      ),
+      // Without the Go menu; "a shell that routes Go" below covers what it moves.
+      [true, false].map((submitWithModEnter) => ({
+        mac,
+        native,
+        desktopMenu,
+        goMenu: false,
+        submitWithModEnter,
+      })),
     ),
   ),
 );
@@ -51,17 +50,11 @@ const EVERYTHING_SUPPORTED: ShortcutPageContext = {
   alwaysSteer: false,
 };
 
-const environmentName = ({
-  mac,
-  native,
-  desktopMenu,
-  goMenu,
-  submitWithModEnter,
-}: ShortcutEnvironment) =>
+const environmentName = ({ mac, native, desktopMenu, submitWithModEnter }: ShortcutEnvironment) =>
   [
     mac ? "mac" : "other",
     native ? "native" : "browser",
-    desktopMenu ? (goMenu ? "menu+go" : "menu") : "no-menu",
+    desktopMenu ? "menu" : "no-menu",
     submitWithModEnter ? "mod-enter-sends" : "enter-sends",
   ].join(" ");
 
@@ -142,5 +135,24 @@ describe("shortcut surfaces", () => {
       ...APP_SHORTCUT_BINDINGS.map(({ id }) => searchLine(id, environment, listed)),
     ]);
     await expect(`${lines.join("\n")}\n`).toMatchFileSnapshot("./shortcutSurfaces.golden.txt");
+  });
+
+  it("move only Back and Forward to a shell that routes Go, which then owns their chords", () => {
+    const listed = new Set<ShortcutId>(APP_SHORTCUT_BINDINGS.map((binding) => binding.id));
+    for (const environment of ENVIRONMENTS.filter(({ desktopMenu }) => desktopMenu)) {
+      const goMenu = { ...environment, goMenu: true };
+      const changed = IDS.filter(
+        (id) =>
+          surfaceLine(id, environment) !== surfaceLine(id, goMenu) ||
+          (listed.has(id) &&
+            searchLine(id, environment, listed) !== searchLine(id, goMenu, listed)),
+      );
+      expect(changed, environmentName(environment)).toEqual(["history.back", "history.forward"]);
+      for (const id of changed) {
+        // The menu's accelerator takes the chord, so the page neither matches nor shows it.
+        expect(activeShortcutChords(id, goMenu)).toEqual([]);
+        expect(menuShortcutChords(id, goMenu)).toHaveLength(1);
+      }
+    }
   });
 });

@@ -77,3 +77,9 @@ def test_a_shell_that_lists_the_go_menu_owns_back_and_forward(
     # The menu's Go Back reaches the page as a command.
     page.evaluate("window.__menuCommand('go-back')")
     expect(page).to_have_url(f"{live_server}/", timeout=10_000)
+    # ⌘] is the menu's too, and its Go Forward steps back to Settings.
+    page.keyboard.press("Meta+BracketRight")
+    page.wait_for_timeout(300)
+    expect(page).to_have_url(f"{live_server}/")
+    page.evaluate("window.__menuCommand('go-forward')")
+    expect(page).to_have_url(settings_url, timeout=10_000)
