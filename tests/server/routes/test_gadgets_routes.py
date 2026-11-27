@@ -27,7 +27,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.gadget_store.local import LocalGadgetStore
-from tests.gadgets.grant_store import GadgetGrantStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -44,7 +44,7 @@ _ACTION = {
 
 @pytest.fixture()
 def stores(db_uri: str, tmp_path: Path) -> SimpleNamespace:
-    permissions = GadgetGrantStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
     for user in (ALICE, BOB):
         permissions.ensure_user(user)
     return SimpleNamespace(

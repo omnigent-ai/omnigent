@@ -26,6 +26,7 @@ from omnigent.db.account_authority import (
     require_active_account,
 )
 from omnigent.db.db_models import (
+    SqlGadgetShare,
     SqlScheduledTask,
     SqlScheduledTaskShare,
     SqlSessionPermission,
@@ -43,6 +44,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import (
     Account,
+    GadgetPermission,
     ResolvedAccess,
     ScheduledTaskPermission,
     SessionPermission,
@@ -60,6 +62,7 @@ from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.permission_store import (
     MAX_GRANTEE_ID_CHARS,
     MAX_GRANTS_PAGE_SIZE,
+    MAX_SHARED_GADGETS_PAGE_SIZE,
     MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE,
     MAX_SHARED_WORKFLOWS_PAGE_SIZE,
     PermissionStore,
@@ -77,6 +80,7 @@ assert all(
     for column in (
         SqlScheduledTaskShare.__table__.c.user_id,
         SqlWorkflowShare.__table__.c.user_id,
+        SqlGadgetShare.__table__.c.user_id,
         SqlUser.__table__.c.id,
     )
 )
@@ -172,7 +176,12 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
 
 def _upsert_grant(
     dialect: str,
-    model: (type[SqlSessionPermission] | type[SqlScheduledTaskShare] | type[SqlWorkflowShare]),
+    model: (
+        type[SqlSessionPermission]
+        | type[SqlScheduledTaskShare]
+        | type[SqlWorkflowShare]
+        | type[SqlGadgetShare]
+    ),
     key: dict[str, str],
     level: int,
     *,
@@ -275,6 +284,17 @@ def _require_storable_workflow_grant(user_id: str, level: int) -> None:
     )
 
 
+def _require_storable_gadget_grant(user_id: str, level: int) -> None:
+    """Refuse a gadget grant the share table cannot hold or the store must never hold."""
+    _require_storable_grant(
+        user_id,
+        level,
+        levels=session_sharing.GADGET_GRANT_LEVELS,
+        resource="A gadget",
+        kinds="Gadgets",
+    )
+
+
 def _lock_live_scheduled_task(session: Session, scheduled_task_id: str, grantee: str) -> None:
     """Lock a task's row before its grant rows, the order account deletion also takes.
 
@@ -319,7 +339,9 @@ def _lock_workflow(session: Session, workflow_id: str, grantee: str) -> None:
         )
 
 
-_GrantRow = TypeVar("_GrantRow", SqlSessionPermission, SqlScheduledTaskShare, SqlWorkflowShare)
+_GrantRow = TypeVar(
+    "_GrantRow", SqlSessionPermission, SqlScheduledTaskShare, SqlWorkflowShare, SqlGadgetShare
+)
 _Grant = TypeVar("_Grant")
 
 
@@ -357,7 +379,7 @@ def _grant_page(
     return [to_entity(row) for row in page], next_cursor
 
 
-_ShareModel = type[SqlScheduledTaskShare] | type[SqlWorkflowShare]
+_ShareModel = type[SqlScheduledTaskShare] | type[SqlWorkflowShare] | type[SqlGadgetShare]
 
 
 def _delete_grant_batch(
@@ -611,6 +633,42 @@ def delete_grants_on_workflows(
             )
             deleted += len(user_ids)
     return deleted
+
+
+def delete_deleted_account_gadget_grants(
+    session_maker: NamedManagedSessionMaker, user_id: str, *, batch_size: int
+) -> int:
+    """Delete the gadget grants a deleted account held, one bounded batch per transaction.
+
+    Walks ``ix_gadget_shares_user_id``. Each batch first locks the account and stops
+    once the name belongs to a live account again, whose grants are its own.
+    """
+    return _delete_grants_in_batches(
+        session_maker,
+        "delete_deleted_account_gadget_grant_batch",
+        model=SqlGadgetShare,
+        match=SqlGadgetShare.user_id == user_id,
+        key_column=SqlGadgetShare.gadget_id,
+        batch_size=batch_size,
+        proceed=_account_is_deleted(user_id),
+    )
+
+
+def holds_gadget_grants(session: Session, user_id: str) -> bool:
+    """Whether any gadget grant to *user_id* remains in the workspace, in one indexed probe."""
+    return session.execute(
+        select(
+            exists().where(
+                SqlGadgetShare.workspace_id == current_workspace_id(),
+                SqlGadgetShare.user_id == user_id,
+            )
+        )
+    ).scalar_one()
+
+
+def _to_gadget_permission(row: SqlGadgetShare) -> GadgetPermission:
+    """Convert a :class:`SqlGadgetShare` ORM row to a domain entity."""
+    return GadgetPermission(user_id=row.user_id, gadget_id=row.gadget_id, level=row.level)
 
 
 def _to_workflow_permission(row: SqlWorkflowShare) -> WorkflowPermission:
@@ -1642,4 +1700,147 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Delete every grant on a workflow, one batch per transaction. See base class."""
         return delete_workflow_grants(
             self._session_immediate, workflow_id, batch_size=self._cleanup_batch_size
+        )
+
+    # ── Gadget grants ─────────────────────────────────────────────────────
+
+    @property
+    def supports_gadget_grants(self) -> bool:
+        """Grants persist in ``gadget_shares``. See base class."""
+        return True
+
+    def grant_for_gadget(
+        self, user_id: str, gadget_id: str, level: int, *, ensure_minimum: bool = False
+    ) -> GadgetPermission:
+        """Upsert a gadget grant. See base class for contract.
+
+        Locks the grantee's account, then the grant row. The gadget lives in the
+        gadget store, so the caller has checked it exists and refused its owner.
+
+        :raises OmnigentError: ``INVALID_INPUT`` for an over-wide ID, a reserved
+            grantee or a level outside
+            :data:`~omnigent.server.session_sharing.GADGET_GRANT_LEVELS`; the
+            account errors of :meth:`grant`.
+        """
+        _require_storable_gadget_grant(user_id, level)
+
+        def write(session: Session) -> int:
+            require_active_account(session, user_id)
+            session.execute(
+                _upsert_grant(
+                    self._engine.dialect.name,
+                    SqlGadgetShare,
+                    {"gadget_id": gadget_id, "user_id": user_id},
+                    level,
+                    ensure_minimum=ensure_minimum,
+                )
+            )
+            grant_row = (
+                SqlGadgetShare.workspace_id == current_workspace_id(),
+                SqlGadgetShare.gadget_id == gadget_id,
+                SqlGadgetShare.user_id == user_id,
+            )
+            # The stored key's collation may match a reserved ID the fast path let through.
+            reserved = session.execute(
+                select(SqlGadgetShare.user_id).where(
+                    *grant_row, SqlGadgetShare.user_id.in_(sorted(_RESERVED_GRANTEES))
+                )
+            ).first()
+            if reserved is not None:
+                raise _reserved_grantee_error(user_id, "A gadget")
+            return session.execute(select(SqlGadgetShare.level).where(*grant_row)).scalar_one()
+
+        stored_level = run_write_transaction(
+            self._session_immediate, "grant_gadget_permission", write
+        )
+        return GadgetPermission(user_id=user_id, gadget_id=gadget_id, level=stored_level)
+
+    def revoke_for_gadget(self, user_id: str, gadget_id: str) -> bool:
+        """Remove a gadget grant. See base class for contract."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlGadgetShare).where(
+                        SqlGadgetShare.workspace_id == current_workspace_id(),
+                        SqlGadgetShare.gadget_id == gadget_id,
+                        SqlGadgetShare.user_id == user_id,
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "revoke_gadget_permission", write)
+
+    def list_for_gadget(
+        self,
+        gadget_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[GadgetPermission], str | None]:
+        """Return a gadget's grants with cursor pagination. See base class."""
+        with self._session("list_gadget_permissions") as session:
+            return _grant_page(
+                session,
+                SqlGadgetShare,
+                SqlGadgetShare.gadget_id == gadget_id,
+                _to_gadget_permission,
+                limit=limit,
+                after_user_id=after_user_id,
+            )
+
+    def resolve_gadget_access(self, principals: Sequence[str], gadget_id: str) -> int | None:
+        """Return the highest level any principal holds. See base class for contract."""
+        if not principals:
+            return None
+        with self._session("resolve_gadget_access") as session:
+            return session.execute(
+                select(func.max(SqlGadgetShare.level)).where(
+                    SqlGadgetShare.workspace_id == current_workspace_id(),
+                    SqlGadgetShare.gadget_id == gadget_id,
+                    SqlGadgetShare.user_id.in_(list(principals)),
+                )
+            ).scalar_one()
+
+    def list_gadgets_shared_with(
+        self,
+        principals: Sequence[str],
+        *,
+        limit: int = 50,
+        after_gadget_id: str | None = None,
+    ) -> tuple[list[str], str | None]:
+        """Page the gadgets shared with any principal. See base class for contract.
+
+        Each principal walks ``ix_gadget_shares_user_id`` past the cursor for at most
+        ``limit + 1`` rows.
+        """
+        if not 1 <= limit <= MAX_SHARED_GADGETS_PAGE_SIZE:
+            raise OmnigentError(
+                f"limit must be between 1 and {MAX_SHARED_GADGETS_PAGE_SIZE}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not principals:
+            return [], None
+        with self._session("list_gadgets_shared_with_caller") as session:
+            scanned, has_more = _shared_resource_ids(
+                session,
+                SqlGadgetShare.user_id,
+                SqlGadgetShare.gadget_id,
+                principals,
+                after=after_gadget_id,
+                limit=limit,
+            )
+        return scanned, scanned[-1] if has_more and scanned else None
+
+    def delete_for_gadget(self, gadget_id: str) -> int:
+        """Delete every grant on a gadget, one batch per transaction. See base class."""
+        return _delete_grants_in_batches(
+            self._session_immediate,
+            "delete_gadget_grant_batch",
+            model=SqlGadgetShare,
+            match=SqlGadgetShare.gadget_id == gadget_id,
+            key_column=SqlGadgetShare.user_id,
+            batch_size=self._cleanup_batch_size,
         )
