@@ -523,13 +523,10 @@ class _HelperProcessClient:
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
 
+        encoded_request = json.dumps(payload) + "\n"
         try:
-            self._proc.stdin.write(json.dumps(payload) + "\n")
+            self._proc.stdin.write(encoded_request)
             self._proc.stdin.flush()
-        except OSError as exc:
-            # The helper never received the request, so any op can be sent again.
-            return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
-        try:
             line = self._proc.stdout.readline()
             if not line:
                 raise RuntimeError(self._helper_exit_detail_locked())
