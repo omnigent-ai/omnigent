@@ -137,6 +137,7 @@ import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { canFlagUnread, isConversationMuted, showsUnreadFor } from "@/lib/sessionMute";
 import {
   Link,
+  ScopedStableNavigation,
   useLocation,
   useNavigate,
   useParams,
@@ -218,7 +219,7 @@ import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
-import { useSessionActions } from "./useSessionActions";
+import { SessionActionsProvider, useSessionActions } from "./useSessionActions";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
@@ -515,7 +516,9 @@ function SidebarRowDataProvider({
                   <RowActivationContext.Provider value={onActivate}>
                     <SessionReorderContext.Provider value={onReorder}>
                       <NestMoveContext.Provider value={nestMoves}>
-                        {children}
+                        <ScopedStableNavigation>
+                          <SessionActionsProvider>{children}</SessionActionsProvider>
+                        </ScopedStableNavigation>
                       </NestMoveContext.Provider>
                     </SessionReorderContext.Provider>
                   </RowActivationContext.Provider>

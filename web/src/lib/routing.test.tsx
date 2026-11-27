@@ -1,14 +1,195 @@
-import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
-import { MemoryRouter, type To, useLocation, useNavigate } from "react-router-dom";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import {
+  createContext,
+  createRef,
+  memo,
+  startTransition,
+  Suspense,
+  useCallback,
+  useContext,
+  useState,
+} from "react";
+import { MemoryRouter, Route, Routes, type To, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   basenamedRouting,
   Link as RoutingLink,
   reactRouterRouting,
   RoutingProvider,
+  ScopedStableNavigation,
+  useNavigate as useAppNavigate,
   useReplaceSearchParams,
 } from "./routing";
 import { setOmnigentHostConfig } from "@/lib/host";
+
+describe("scoped event navigation", () => {
+  afterEach(cleanup);
+
+  it.each(["", "/mount"])("keeps consumers idle and navigation current under '%s'", (basename) => {
+    const renders = vi.fn();
+    const anchor = createRef<HTMLAnchorElement>();
+    const Consumer = memo(function Consumer() {
+      renders();
+      const navigate = useAppNavigate();
+      return (
+        <>
+          <RoutingLink ref={anchor} to="/c/linked/view">
+            Linked session
+          </RoutingLink>
+          <button type="button" onClick={() => navigate("../relative")}>
+            Relative
+          </button>
+          <button type="button" onClick={() => navigate("../peer", { relative: "path" })}>
+            Path relative
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate({ search: "?latest=1" }, { replace: true, state: "kept" })}
+          >
+            Query
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate({ pathname: "/c/object/view", hash: "#reply" })}
+          >
+            Absolute object
+          </button>
+          <button type="button" onClick={() => navigate(-1)}>
+            Back
+          </button>
+          <button type="button" onClick={() => navigate(1)}>
+            Forward
+          </button>
+        </>
+      );
+    });
+    function LocationAndSwitch() {
+      const location = useLocation();
+      const navigate = useNavigate();
+      return (
+        <>
+          <output>
+            {location.pathname}
+            {location.search}
+            {location.hash}|{location.state}
+          </output>
+          <button type="button" onClick={() => navigate(`${basename}/c/second/view`)}>
+            Switch
+          </button>
+        </>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={[`${basename}/c/first/view`]}>
+        <LocationAndSwitch />
+        <RoutingProvider value={basename ? basenamedRouting(basename) : reactRouterRouting}>
+          <Routes>
+            <Route path={`${basename}/c/:conversationId`}>
+              <Route
+                path="*"
+                element={
+                  <ScopedStableNavigation>
+                    <Consumer />
+                  </ScopedStableNavigation>
+                }
+              />
+            </Route>
+          </Routes>
+        </RoutingProvider>
+      </MemoryRouter>,
+    );
+    const expectLocation = (suffix: string) =>
+      expect(screen.getByRole("status").textContent).toBe(`${basename}${suffix}`);
+    const click = (name: string) => fireEvent.click(screen.getByRole("button", { name }));
+    expect(anchor.current).toBe(screen.getByRole("link", { name: "Linked session" }));
+    expect(anchor.current).toHaveAttribute("href", `${basename}/c/linked/view`);
+    click("Switch");
+    expectLocation("/c/second/view|");
+    click("Relative");
+    expectLocation("/c/second/relative|");
+    click("Path relative");
+    expectLocation("/c/second/peer|");
+    click("Query");
+    expectLocation("/c/second/peer?latest=1|kept");
+    click("Back");
+    expectLocation("/c/second/relative|");
+    click("Forward");
+    expectLocation("/c/second/peer?latest=1|kept");
+    click("Absolute object");
+    expectLocation("/c/object/view#reply|");
+    fireEvent.click(anchor.current!);
+    expectLocation("/c/linked/view|");
+    expect(renders).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the latest committed injected callback without leaking suspended renders", () => {
+    const Version = createContext("committed");
+    const calls = vi.fn();
+    const suspended = vi.fn();
+    const pending = new Promise<never>(() => {});
+    const routing = {
+      ...reactRouterRouting,
+      useNavigate: () => {
+        const version = useContext(Version);
+        return useCallback(
+          (to: To | number) => {
+            calls(version, to);
+          },
+          [version],
+        );
+      },
+    };
+    let retainedNavigate: ReturnType<typeof useAppNavigate>;
+    const Consumer = memo(function Consumer() {
+      retainedNavigate = useAppNavigate();
+      return null;
+    });
+    function SuspendPending() {
+      if (useContext(Version) === "pending") {
+        suspended();
+        throw pending;
+      }
+      return null;
+    }
+    function Host() {
+      const [version, setVersion] = useState("committed");
+      return (
+        <>
+          <button type="button" onClick={() => startTransition(() => setVersion("pending"))}>
+            Suspend
+          </button>
+          <button type="button" onClick={() => setVersion("latest")}>
+            Commit
+          </button>
+          <Suspense fallback="Waiting">
+            <Version.Provider value={version}>
+              <RoutingProvider value={routing}>
+                <ScopedStableNavigation>
+                  <Consumer />
+                  <SuspendPending />
+                </ScopedStableNavigation>
+              </RoutingProvider>
+            </Version.Provider>
+          </Suspense>
+        </>
+      );
+    }
+    render(<Host />);
+    const navigate = retainedNavigate!;
+    fireEvent.click(screen.getByRole("button", { name: "Suspend" }));
+    expect(suspended).toHaveBeenCalled();
+    act(() => {
+      navigate("/c/first");
+    });
+    expect(calls).toHaveBeenLastCalledWith("committed", "/c/first");
+    fireEvent.click(screen.getByRole("button", { name: "Commit" }));
+    expect(retainedNavigate!).toBe(navigate);
+    act(() => {
+      navigate(-1);
+    });
+    expect(calls).toHaveBeenLastCalledWith("latest", -1);
+  });
+});
 
 // `basenamedRouting` is the embed seam: it rebases web's absolute
 // navigation targets under the host mount path so links land under

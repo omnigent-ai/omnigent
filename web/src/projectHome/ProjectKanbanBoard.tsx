@@ -77,7 +77,7 @@ import {
   statusBucket,
   type StatusBucket,
 } from "@/shell/sidebarNav";
-import { useSessionActions } from "@/shell/useSessionActions";
+import { SessionActionsProvider, useSessionActions } from "@/shell/useSessionActions";
 import { showsUnreadFor } from "@/lib/sessionMute";
 import {
   SessionEnvironmentLabel,
@@ -513,12 +513,14 @@ function DraggableKanbanCard({
       </Link>
       {/* Siblings of the card's link, since links can't nest interactive content. */}
       {!isDragging && (
-        <KanbanCardMenu
-          card={card}
-          projectName={projectName}
-          alwaysShown={menuAlwaysShown}
-          onLeave={selected ? onCloseQuickView : undefined}
-        />
+        <SessionActionsProvider>
+          <KanbanCardMenu
+            card={card}
+            projectName={projectName}
+            alwaysShown={menuAlwaysShown}
+            onLeave={selected ? onCloseQuickView : undefined}
+          />
+        </SessionActionsProvider>
       )}
       {quickViewHref !== undefined && !isDragging && (
         <Tooltip>

@@ -17,6 +17,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { SCHEDULED_TASKS_KEY } from "@/hooks/useScheduledTasks";
 
 // Controllable delete mutation, declared via vi.hoisted so the vi.mock
 // factory (hoisted above imports) can reference it. Tests flip
@@ -221,7 +222,7 @@ function renderSidebarRouted(path: string) {
       <LocationProbe />
     </>
   );
-  return render(
+  const renderTree = () => (
     <QueryClientProvider client={qc}>
       <SidebarDataProvider>
         <TooltipProvider>
@@ -229,12 +230,15 @@ function renderSidebarRouted(path: string) {
             <Routes>
               <Route path="/" element={tree} />
               <Route path="/c/:conversationId" element={tree} />
+              <Route path="/tasks/*" element={tree} />
             </Routes>
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const view = render(renderTree());
+  return { ...view, queryClient: qc, rerenderTree: () => view.rerender(renderTree()) };
 }
 
 /** Confirm a Delete from `row`'s kebab menu. */
@@ -270,6 +274,18 @@ describe("active-session redirect on delete", () => {
 
     // conv_2 is untouched, so the user stays in the chat they're reading —
     // a redirect here would yank them out of an unrelated session.
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
+  });
+
+  it("does not leave the current session when deleting its previously active neighbor", () => {
+    mockConversations([CONV, CONV_OTHER]);
+    renderSidebarRouted("/c/conv_1");
+    fireEvent.click(screen.getByRole("link", { name: /Other Session/ }));
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
+
+    fireDeleteFrom(screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement);
+
+    expect(mocks.del.mutate).toHaveBeenCalledWith({ id: "conv_1", deleteBranch: false });
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
   });
 });
@@ -352,6 +368,37 @@ describe("deleting a session an automation runs from", () => {
       expect(mocks.del.mutate).toHaveBeenCalledWith({ id: "conv_1", deleteBranch: false }),
     );
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
+  });
+
+  it("finishes deletion and cache updates without navigating after its row unmounts", async () => {
+    let finish = () => {};
+    vi.mocked(deleteScheduledTask).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+    );
+    mockConversations([AUTOMATION_SOURCE, CONV_OTHER]);
+    const view = renderSidebarRouted("/tasks/st_1");
+    view.queryClient.setQueryData(SCHEDULED_TASKS_KEY, [{ id: "st_1" }]);
+    const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
+    fireEvent.pointerDown(within(row).getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("delete-conversation"));
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Delete both" }),
+    );
+    expect(deleteScheduledTask).toHaveBeenCalledWith("st_1");
+
+    mockConversations([CONV_OTHER]);
+    view.rerenderTree();
+    expect(screen.queryByRole("link", { name: /My Session/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Other Session/ })).toBeInTheDocument();
+    await act(async () => {
+      finish();
+    });
+
+    expect(mocks.del.mutate).toHaveBeenCalledWith({ id: "conv_1", deleteBranch: false });
+    expect(view.queryClient.getQueryData(SCHEDULED_TASKS_KEY)).toEqual([]);
+    expect(screen.getByTestId("loc")).toHaveTextContent("/tasks/st_1");
   });
 
   it("deletes the session alone when automations are off for the caller", () => {

@@ -2,7 +2,14 @@
 // fork, automation, stop, archive, delete, leave), shared by the sidebar row and
 // the project board's cards so both menus confirm and act the same way.
 
-import { useState, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { GitBranchIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -31,6 +38,20 @@ import { useNavigate } from "@/lib/routing";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+
+const DeleteSourceAutomationsContext = createContext<ReturnType<
+  typeof useDeleteSourceAutomations
+> | null>(null);
+
+/** Share route-aware session actions across one list's rows. */
+export function SessionActionsProvider({ children }: { children: ReactNode }) {
+  const deleteSourceAutomations = useDeleteSourceAutomations();
+  return (
+    <DeleteSourceAutomationsContext.Provider value={deleteSourceAutomations}>
+      {children}
+    </DeleteSourceAutomationsContext.Provider>
+  );
+}
 
 export interface SessionActions {
   setShareOpen: (open: boolean) => void;
@@ -95,7 +116,15 @@ export function useSessionActions({
   const gitBranch = conversation.git_branch ?? null;
   // Deleting a session an automation runs from deletes the automation first.
   const automationSourceOf = automationDeletedWith(serverInfo, conversation);
-  const deleteSourceAutomations = useDeleteSourceAutomations();
+  const deleteSourceAutomations = useContext(DeleteSourceAutomationsContext);
+  if (!deleteSourceAutomations) throw new Error("SessionActionsProvider is required");
+  const mountedRef = useRef(false);
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   function confirmDelete() {
     // Fire-and-forget: close the dialog and drop the row immediately so the
@@ -117,7 +146,7 @@ export function useSessionActions({
 
   // "Delete both": the automation first, so no run starts from a missing session.
   async function deleteWithAutomation(taskId: string, deleteLocalBranch: boolean) {
-    if (!(await deleteSourceAutomations([taskId], [conversation.id]))) {
+    if (!(await deleteSourceAutomations!([taskId], [conversation.id], () => mountedRef.current))) {
       showToast("Couldn't delete the automation, so the session was kept");
       return;
     }

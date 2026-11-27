@@ -140,6 +140,37 @@ describe("useDeleteSourceAutomations", () => {
     expect(queryClient.getQueryData(SCHEDULED_TASKS_KEY)).toEqual([{ id: "st_3" }]);
   });
 
+  it.each(["/c/conv_1", "/tasks/st_1"])(
+    "checks caller lifetime after deletion completes on %s without skipping cache updates",
+    async (path) => {
+      let finish = () => {};
+      deleteScheduledTask.mockReturnValue(
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+      );
+      const result = renderDelete(path);
+      let mounted = true;
+      const shouldNavigate = vi.fn(() => mounted);
+      let removal = Promise.resolve(true);
+      act(() => {
+        removal = result.current.remove(["st_1"], ["conv_1"], shouldNavigate);
+      });
+      expect(shouldNavigate).not.toHaveBeenCalled();
+      mounted = false;
+      await act(async () => {
+        finish();
+        await expect(removal).resolves.toBe(true);
+      });
+      expect(shouldNavigate).toHaveBeenCalledOnce();
+      expect(result.current.location.pathname).toBe(path);
+      expect(queryClient.getQueryData(SCHEDULED_TASKS_KEY)).toEqual([
+        { id: "st_2" },
+        { id: "st_3" },
+      ]);
+    },
+  );
+
   it.each([
     ["a server error", new scheduledTasksApi.ScheduledTaskApiError("boom", 500, null)],
     // Automations turned off for the caller: the gate's 404 deleted nothing.
