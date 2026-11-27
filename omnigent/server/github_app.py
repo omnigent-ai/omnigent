@@ -30,13 +30,17 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jwt
 
+from omnigent.git_providers.github_host import GitHubHost, github_host_from_env
+
 _logger = logging.getLogger(__name__)
 
-_AUTHORIZE_ENDPOINT = "https://github.com/login/oauth/authorize"
+# Relative to the configured host's web URL (github.com by default, or a GitHub
+# Enterprise Server host; see :mod:`omnigent.git_providers.github_host`).
+_AUTHORIZE_PATH = "/login/oauth/authorize"
 
 # App JWTs are accepted for up to 10 minutes by GitHub; use a small skew
 # on the issued-at to tolerate minor clock drift between us and GitHub.
@@ -82,6 +86,8 @@ class GitHubAppConfig:
     :param private_key: RSA private key PEM for the app JWT, or ``None``.
     :param redirect_uri: OAuth callback URL registered on the App.
     :param slug: App slug used to build the ``install_url``, or ``None``.
+    :param github: The GitHub host the App lives on: github.com by default, or
+        a GitHub Enterprise Server host from ``OMNIGENT_GITHUB_HOST``.
 
     Token-at-rest encryption is not configured here: stored tokens are
     encrypted by the shared credential store's cipher
@@ -94,13 +100,14 @@ class GitHubAppConfig:
     private_key: str | None
     redirect_uri: str
     slug: str | None
+    github: GitHubHost = field(default_factory=GitHubHost)
 
     @property
     def install_url(self) -> str | None:
         """The App's public installation URL, or ``None`` when no slug."""
         if not self.slug:
             return None
-        return f"https://github.com/apps/{self.slug}/installations/new"
+        return f"{self.github.web_url}/apps/{self.slug}/installations/new"
 
     def mint_app_jwt(self) -> str:
         """Mint a short-lived RS256 app JWT signed with the private key.
@@ -164,8 +171,9 @@ class GitHubAppConfig:
         :returns: A validated config, or ``None`` when GitHub App
             integration is not configured.
         :raises RuntimeError: When a private key path is set but
-            unreadable — a misconfiguration the operator should fix
-            rather than silently run without app-level calls.
+            unreadable, or ``OMNIGENT_GITHUB_HOST`` /
+            ``OMNIGENT_GITHUB_API_URL`` is malformed — misconfigurations the
+            operator should fix rather than silently run against the wrong host.
         """
         client_id = os.environ.get("OMNIGENT_GITHUB_APP_CLIENT_ID", "").strip()
         client_secret = os.environ.get("OMNIGENT_GITHUB_APP_CLIENT_SECRET", "").strip()
@@ -195,6 +203,11 @@ class GitHubAppConfig:
                         f"OMNIGENT_GITHUB_APP_PRIVATE_KEY_PATH={key_path!r} is unreadable: {exc}"
                     ) from exc
 
+        try:
+            github = github_host_from_env()
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
         return GitHubAppConfig(
             app_id=os.environ.get("OMNIGENT_GITHUB_APP_ID", "").strip() or None,
             client_id=client_id,
@@ -202,6 +215,7 @@ class GitHubAppConfig:
             private_key=private_key,
             redirect_uri=redirect_uri,
             slug=os.environ.get("OMNIGENT_GITHUB_APP_SLUG", "").strip() or None,
+            github=github,
         )
 
 
@@ -220,7 +234,8 @@ def build_authorize_url(config: GitHubAppConfig, *, state: str) -> str:
 
     :param config: The GitHub App config.
     :param state: An opaque, signed state string (see the routes module).
-    :returns: The full ``https://github.com/login/oauth/authorize?…`` URL.
+    :returns: The full authorize URL, e.g.
+        ``https://github.com/login/oauth/authorize?…``.
     """
     from urllib.parse import urlencode
 
@@ -229,7 +244,7 @@ def build_authorize_url(config: GitHubAppConfig, *, state: str) -> str:
         "redirect_uri": config.redirect_uri,
         "state": state,
     }
-    return f"{_AUTHORIZE_ENDPOINT}?{urlencode(params)}"
+    return f"{config.github.web_url}{_AUTHORIZE_PATH}?{urlencode(params)}"
 
 
 def token_set_from_payload(payload: dict) -> GitHubTokenSet:

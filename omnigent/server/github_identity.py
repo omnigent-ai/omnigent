@@ -13,6 +13,7 @@ import httpx
 
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.db.utils import now_epoch
+from omnigent.git_providers.github_host import DEFAULT_HOST
 from omnigent.server.github_app import GitHubAppError
 from omnigent.server.github_app_client import GitHubAppClient
 
@@ -106,16 +107,28 @@ async def resolve_github_credential(
     token plus the attribution metadata git needs (``username``/``login``), or
     ``None`` when the owner has not linked GitHub. The ``owner``/``login`` let
     the host attribute commits to the human, decoupled from the push credential.
+
+    On a GitHub Enterprise Server deployment the payload also names the
+    ``host``, so the sandbox scopes its credential helper and ``gh`` config to
+    it; github.com payloads carry no ``host`` key, exactly as before.
     """
     token = await resolve_access_token(user_id, store=store, client=client)
     if token is None:
         return None
     connection = await _run_sync(store.get, user_id)
-    return {
+    payload: dict[str, object] = {
         "username": _GIT_TOKEN_USERNAME,
         "token": token,
         "login": connection.github_login if connection is not None else None,
     }
+    # The client can be absent where no token refresh is possible (a
+    # non-expiring token), or a duck-typed stand-in without a host (embedding
+    # deployments and test doubles inject their own); both mean github.com,
+    # as before.
+    github_host = getattr(getattr(client, "github", None), "host", None) or DEFAULT_HOST
+    if github_host != DEFAULT_HOST:
+        payload["host"] = github_host
+    return payload
 
 
 async def _run_sync(func, /, *args, **kwargs):

@@ -59,6 +59,8 @@ from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import click
 
+from omnigent.git_providers.github_host import DEFAULT_HOST as DEFAULT_GITHUB_HOST
+from omnigent.git_providers.github_host import github_host_from_env
 from omnigent.host.identity import (
     HOST_ID_ENV_VAR,
     HOST_NAME_ENV_VAR,
@@ -478,6 +480,7 @@ def _render_workspace_prep_command(
     server_url: str,
     host_id: str,
     host_config: dict[str, object] | None = None,
+    github_host: str | None = None,
 ) -> list[str]:
     """
     Render the init container command that prepares the workspace.
@@ -496,19 +499,32 @@ def _render_workspace_prep_command(
     :param host_config: Deployment-supplied config content to merge in (lands
         under the same config directory seen by the host container), or
         ``None``.
+    :param github_host: The GitHub host the clone's credential broker is scoped
+        to, or ``None`` to read this server's ``OMNIGENT_GITHUB_HOST`` (github.com
+        when unset). The launcher renders in the server process, so the server's
+        setting is the one that applies.
     :returns: The ``["bash", "-lc", script]`` command.
+    :raises ValueError: When ``OMNIGENT_GITHUB_HOST`` is malformed.
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repos:
         # Keep the launch token in the init container's environment: the helper
         # reads it in-process instead of persisting it or putting it in argv.
+        if github_host is None:
+            github_host = github_host_from_env().host
+        # github.com keeps the historical helper byte for byte; a GitHub
+        # Enterprise Server host is passed explicitly so the helper vends only
+        # there.
+        host_args = (
+            "" if github_host == DEFAULT_GITHUB_HOST else f"'--github-host',{github_host!r},"
+        )
         helper_source = (
             "import os,sys; from omnigent.git_credential_github import main; "
             f"sys.exit(main(['--server',{server_url!r},'--host-id',{host_id!r},"
-            f"'--host-token',os.environ[{HOST_TOKEN_ENV_VAR!r}],*sys.argv[1:]]))"
+            f"'--host-token',os.environ[{HOST_TOKEN_ENV_VAR!r}],{host_args}*sys.argv[1:]]))"
         )
         helper = f"!python3 -Ic {shlex.quote(helper_source)}"
-        helper_key = "credential.https://github.com.helper"
+        helper_key = f"credential.https://{github_host}.helper"
         expected_helpers = ["", helper]
         wire = (
             "import os,subprocess,sys; import omnigent.git_credential_github as g; "

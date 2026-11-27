@@ -507,3 +507,15 @@ def test_registry_records_the_provider(tmp_path: Path) -> None:
 def test_non_git_schemes_and_non_github_project_paths_are_rejected(url: str) -> None:
     assert PROVIDER.parse_remote_url(url, EnvInstances()) is None
     assert resolve_remote(url) is None
+
+
+def test_configured_enterprise_host_is_github(monkeypatch, tmp_path) -> None:
+    # OMNIGENT_GITHUB_HOST (the server's GitHub App host) claims that host, with
+    # gh's hosts file isolated so a developer's real gh config can't leak in.
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("GH_HOST", raising=False)
+    monkeypatch.delenv("OMNIGENT_GITHUB_HOST", raising=False)
+    assert not PROVIDER.matches_host("ghe.example.com", EnvInstances())
+    monkeypatch.setenv("OMNIGENT_GITHUB_HOST", "ghe.example.com")
+    assert PROVIDER.matches_host("GHE.example.com", EnvInstances())
+    assert PROVIDER.matches_host("github.com", EnvInstances())

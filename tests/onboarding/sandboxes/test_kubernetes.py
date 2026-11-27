@@ -1220,6 +1220,38 @@ def test_render_workspace_prep_command(
     assert script.count("python3 -c") == (1 if expect_clone else 0)
 
 
+def test_workspace_prep_scopes_clone_broker_to_enterprise_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With OMNIGENT_GITHUB_HOST set, the clone's broker is scoped to that host."""
+    repos = [
+        RepoWorkspace(url="https://ghe.example.com/org/app.git", branch=None, repo_name="app")
+    ]
+    monkeypatch.setenv("OMNIGENT_GITHUB_HOST", "ghe.example.com")
+    script = k8s._render_workspace_prep_command("/ws", repos, "http://srv.example.com", "h1")[2]
+    assert "credential.https://ghe.example.com.helper" in script
+    # The helper is told the host (it's nested in shell quoting, so match the
+    # flag and the host separately).
+    assert "--github-host" in script
+    assert script.count("ghe.example.com") >= 2
+    assert "credential.https://github.com.helper" not in script
+
+
+def test_workspace_prep_default_host_render_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset, the render is exactly the github.com one, with no --github-host."""
+    repos = [RepoWorkspace(url="https://github.com/org/app.git", branch=None, repo_name="app")]
+    monkeypatch.delenv("OMNIGENT_GITHUB_HOST", raising=False)
+    from_env = k8s._render_workspace_prep_command("/ws", repos, "http://srv.example.com", "h1")
+    explicit = k8s._render_workspace_prep_command(
+        "/ws", repos, "http://srv.example.com", "h1", github_host="github.com"
+    )
+    assert from_env == explicit
+    assert "--github-host" not in from_env[2]
+    assert "credential.https://github.com.helper" in from_env[2]
+
+
 def test_new_pod_name_and_token_secret_name() -> None:
     """Pod names are DNS-label-safe and the token Secret is the name + suffix."""
     name = k8s._new_pod_name("Managed-ABC_123!")

@@ -122,3 +122,30 @@ def test_persist_failure_still_returns_refreshed_token() -> None:
     store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 60))
     store.raise_on_update = True
     assert _resolve(store, _Client(result=_fresh("ghu_new"))) == "ghu_new"
+
+
+class _HostClient(_Client):
+    def __init__(self, host: str) -> None:
+        super().__init__()
+        from omnigent.git_providers.github_host import parse_github_host
+
+        self.github = parse_github_host(host, None)
+
+
+def _credential(client: _Client) -> dict[str, object] | None:
+    store = _Store(_Conn("ghu_live", None, None))
+    return asyncio.run(
+        gi.resolve_github_credential("u@example.com", store=store, client=client)  # type: ignore[arg-type]
+    )
+
+
+def test_credential_payload_names_enterprise_host() -> None:
+    payload = _credential(_HostClient("ghe.example.com"))
+    assert payload is not None
+    assert payload["host"] == "ghe.example.com"
+    assert payload["token"] == "ghu_live"
+
+
+def test_credential_payload_has_no_host_for_github_com() -> None:
+    payload = _credential(_HostClient("github.com"))
+    assert payload == {"username": "x-access-token", "token": "ghu_live", "login": "octocat"}
