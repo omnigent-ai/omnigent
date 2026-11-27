@@ -83,8 +83,12 @@ pub fn run(
         eprintln!("omnidev: ignoring OMNIGENT_AUTH_TOKEN; use --databricks-profile instead");
     }
     let mut vite = if prod {
-        // Outside omnigent/server/static so the local server's bundled UI is untouched.
-        let out_dir = paths::default_pod_dir(&repo_root)?.join("web-ui-prod");
+        // Outside omnigent/server/static; per server, since the bundle inlines the workspace flag
+        // and a build empties its dir under any preview still serving it.
+        let out_dir = paths::default_pod_dir(&repo_root)?.join(format!(
+            "web-ui-prod-{}",
+            paths::short_hash(server.url.as_bytes())
+        ));
         let out_dir = out_dir.to_string_lossy();
         eprintln!(
             "Building this checkout's production UI for {}",

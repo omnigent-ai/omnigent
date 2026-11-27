@@ -212,7 +212,7 @@ omnidev ui --prod --server http://localhost:9000   # production build via `vite 
 - Vite runs in the foreground with `--open`, so its own shortcuts work (`h`
   lists them). It runs `pnpm install` first when web deps are missing or stale.
 - `--prod` runs `vite build` with the same server env, so the workspace flag is
-  inlined, into the pod dir's `web-ui-prod/`, then serves it with `vite preview`.
+  inlined, into the pod dir's `web-ui-prod-<server-hash>/`, then serves it with `vite preview`.
 
 ## Managing your omnigent install
 
