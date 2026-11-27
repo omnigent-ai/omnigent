@@ -140,6 +140,20 @@ describe("markdownListStackFormat on hand-edited descriptions", () => {
     expect(shape(parsed)).toEqual(shape(parse(withoutFooter)));
   });
 
+  it("ends the entries at a blank line even with a footer, so a list after it is never verified", () => {
+    const personalList = parse(
+      LINEAR.replace(
+        "\n---------\n",
+        "\n- [fix/related](https://github.com/acme/app/pull/90)\n---------\n",
+      ),
+    );
+    expect(personalList?.trust).toBe("tolerated");
+    expect(tolerancesOf(personalList)).toContain("unexpected-line");
+    expect(personalList?.nodes.map((node) => node.branch)).not.toContain("fix/related");
+    expect(shape(personalList)).toEqual(shape(parse(LINEAR)));
+    expect(parse(LINEAR)?.trust).toBe("verified");
+  });
+
   it("never verifies a section a code example holds", () => {
     // A no-break space can't close the fence, and an outdented fence opens a new one.
     for (const before of [

@@ -199,7 +199,15 @@ export function markdownListStackFormat(syntax: MarkdownListStackSyntax): StackF
     const read: ReadEntry[] = [];
     for (let index = first; index < end; index++) {
       const line = lines[index] as MarkdownLine;
-      if (line.text.trim() === "") continue;
+      if (line.text.trim() === "") {
+        if (read.length === 0) continue;
+        // The producer writes no blank line between entries, only one before its footer, so
+        // anything after a blank line is the user's own and keeps the section from verifying.
+        if (lines.slice(index, end).some((rest) => rest.text.trim() !== "")) {
+          tolerate("unexpected-line");
+        }
+        break;
+      }
       const bullet = BULLET.exec(line.text);
       // Entries end at the first other line, so a later rule can't pull the user's own lists in.
       if (!bullet || line.fenced || line.quoted) {
