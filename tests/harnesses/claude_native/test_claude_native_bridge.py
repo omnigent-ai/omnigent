@@ -6092,9 +6092,12 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
     lease_inode = lease_path.stat().st_ino
     original_lifecycle = json.loads(lifecycle_path.read_text())
     config_bytes = (bridge_dir / "bridge.json").read_bytes()
+    original_token = json.loads(config_bytes)["token"]
     current_session = "conv_rotated" if reactivation == "new-session" else "conv_owned"
     try:
         request_claude_bridge_deletion(bridge_dir, "conv_owned")
+        config_bytes = (bridge_dir / "bridge.json").read_bytes()
+        assert "token" not in json.loads(config_bytes)
         pending = json.loads(lifecycle_path.read_text())
         assert pending["incarnation"] == original_lifecycle["incarnation"]
         assert pending["delete_for_session"] == "conv_owned"
@@ -6110,10 +6113,7 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
             prepare_bridge_dir(current_session, bridge_id="conv_owned", workspace=tmp_path)
             reactivated = json.loads(lifecycle_path.read_text())
             assert "delete_for_session" not in reactivated
-            assert (
-                json.loads((bridge_dir / "bridge.json").read_text())["token"]
-                == json.loads(config_bytes)["token"]
-            )
+            assert json.loads((bridge_dir / "bridge.json").read_text())["token"] != original_token
             assert bridge_dir.stat().st_ino == bridge_inode
             assert claim.stat().st_ino == claim_inode
             assert lease_path.stat().st_ino == lease_inode
@@ -6794,9 +6794,10 @@ def test_claude_bridge_deletion_preserves_standalone_settings_owners(
         if owner == "live-lease":
             fd = os.open(unknown, os.O_RDWR)
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        config_bytes = (bridge_dir / "bridge.json").read_bytes()
         assert not baseline.with_suffix(".request.lock").exists()
         request_claude_bridge_deletion(bridge_dir, "conv_uncertain")
+        config_bytes = (bridge_dir / "bridge.json").read_bytes()
+        assert "token" not in json.loads(config_bytes)
         request.close()
         assert has_live_claude_settings_owners(bridge_dir)
         assert (bridge_dir / "bridge.json").read_bytes() == config_bytes
@@ -6869,7 +6870,13 @@ def test_claude_settings_session_rotation_preserves_ownership(
         if pending_deletion:
             request_claude_bridge_deletion(bridge_dir, "conv_old")
         pending = lifecycle_path.read_bytes()
-        claude_native_bridge.write_active_session_id(bridge_dir, "conv_old")
+        if pending_deletion:
+            config = (bridge_dir / "bridge.json").read_bytes()
+            with pytest.raises(ValueError, match="expired"):
+                claude_native_bridge.write_active_session_id(bridge_dir, "conv_old")
+            assert (bridge_dir / "bridge.json").read_bytes() == config
+        else:
+            claude_native_bridge.write_active_session_id(bridge_dir, "conv_old")
         assert lifecycle_path.read_bytes() == pending
         if lifecycle_state == "malformed":
             lifecycle_path.write_text("{")
@@ -6879,7 +6886,14 @@ def test_claude_settings_session_rotation_preserves_ownership(
             lifecycle_path.write_text(json.dumps(damaged))
 
         if switch == "write_active_session_id":
-            claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+            if pending_deletion:
+                before_rotation = lifecycle_path.read_bytes()
+                with pytest.raises(ValueError, match="expired"):
+                    claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+                assert lifecycle_path.read_bytes() == before_rotation
+                prepare_bridge_dir("conv_new", bridge_id="bridge_rotation", workspace=tmp_path)
+            else:
+                claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
         else:
             prepare_bridge_dir("conv_new", bridge_id="bridge_rotation", workspace=tmp_path)
 
@@ -6888,7 +6902,9 @@ def test_claude_settings_session_rotation_preserves_ownership(
         assert json.loads(rotated)["admission_epoch"] != json.loads(pending)["admission_epoch"]
         assert "delete_for_session" not in json.loads(rotated)
         assert bridge_dir.stat().st_ino == bridge_inode
-        assert json.loads((bridge_dir / "bridge.json").read_text())["token"] == token
+        assert (json.loads((bridge_dir / "bridge.json").read_text())["token"] != token) is (
+            pending_deletion
+        )
         with pytest.raises(ValueError, match="expired"):
             acquire_claude_settings_request(bridge_dir, request.generation)
         with pytest.raises(ValueError, match="expired"):
@@ -7208,6 +7224,8 @@ def test_claude_bridge_deletion_io_failure_releases_settings_fds(
             assert not dispatch.exists()
     else:
         request_claude_bridge_deletion(bridge_dir, "conv_io")
+        config_bytes = (bridge_dir / "bridge.json").read_bytes()
+        assert "token" not in json.loads(config_bytes)
 
         def fail_remove(_path: Path):
             raise OSError("directory removal failed")
