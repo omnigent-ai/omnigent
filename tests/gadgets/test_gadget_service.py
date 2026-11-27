@@ -804,6 +804,141 @@ def test_rule_state_is_bounded_by_its_bytes_not_a_record_count(
     )
 
 
+_ITEMS_WITH_PARENT = {"type": "object", "properties": {"parent": {"type": "string"}}}
+
+
+def _publish_any_board(
+    service: GadgetService, constraints: list, items: dict | None = None
+) -> dict:
+    """A board whose ``parents`` (and ``items``, unless given) take any JSON value."""
+    app = service.create("Synthetic open board")
+    revision = service.create_revision(
+        app["id"],
+        {
+            "html": "<main>Synthetic open board</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read", "data.write"],
+            "collections": {"parents": {}, "items": items if items is not None else {}},
+            "constraints": constraints,
+        },
+    )["id"]
+    return service.publish(app["id"], {"revision_id": revision, "if_version": None})
+
+
+def _put(service: GadgetService, app: dict, collection: str, record_id: str, value, op: str):  # type: ignore[no-untyped-def]
+    return rpc(
+        service, app, "create", collection=collection, id=record_id, value=value, operation_id=op
+    )
+
+
+@pytest.mark.parametrize("on_delete", ["restrict", "cascade", "unset"])
+def test_a_reference_to_a_record_whose_value_is_null_follows_its_delete_rule(
+    gadgets: Fixture, on_delete: str
+) -> None:
+    # A record whose value is null is live: replacing a parent's value with null is no
+    # delete, and deleting a parent whose value is null still applies the rule.
+    service = gadgets.service()
+    rule = {
+        "name": "item_parent",
+        "kind": "reference",
+        "collection": "items",
+        "field": "parent",
+        "target": "parents",
+        "on_delete": on_delete,
+    }
+    app = _publish_any_board(service, [rule], _ITEMS_WITH_PARENT)
+    parent = _put(service, app, "parents", "p", {"name": "P"}, "p")
+    _put(service, app, "items", "i", {"parent": "p", "n": 1}, "i")
+
+    nulled = rpc(
+        service,
+        app,
+        "replace",
+        collection="parents",
+        id="p",
+        value=None,
+        if_version=parent["version"],
+        operation_id="p-null",
+    )
+    assert nulled["value"] is None
+    assert rpc(service, app, "get", collection="items", id="i")["value"] == {"parent": "p", "n": 1}
+
+    if on_delete == "restrict":
+        with pytest.raises(ConstraintViolation):
+            rpc(
+                service,
+                app,
+                "delete",
+                collection="parents",
+                id="p",
+                if_version=nulled["version"],
+                operation_id="p-del",
+            )
+        return
+    rpc(
+        service,
+        app,
+        "delete",
+        collection="parents",
+        id="p",
+        if_version=nulled["version"],
+        operation_id="p-del",
+    )
+    left = rpc(service, app, "get", collection="items", id="i")
+    if on_delete == "cascade":
+        assert left is None
+    else:
+        assert left["value"] == {"n": 1}
+
+
+def test_an_unfiltered_record_limit_counts_every_value(gadgets: Fixture) -> None:
+    service = gadgets.service()
+    limit = {"name": "two", "kind": "max_records", "collection": "items", "max": 2}
+    app = _publish_any_board(service, [limit])
+    seven = _put(service, app, "items", "a", 7, "a")
+    _put(service, app, "items", "b", None, "b")
+    with pytest.raises(ConstraintViolation):
+        _put(service, app, "items", "c", [], "c")
+    # Replacing a record with a scalar frees no place; deleting one does.
+    rpc(
+        service,
+        app,
+        "replace",
+        collection="items",
+        id="a",
+        value={"x": 1},
+        if_version=seven["version"],
+        operation_id="a-obj",
+    )
+    with pytest.raises(ConstraintViolation):
+        _put(service, app, "items", "c", "text", "c2")
+    current = rpc(service, app, "get", collection="items", id="a")
+    rpc(
+        service,
+        app,
+        "delete",
+        collection="items",
+        id="a",
+        if_version=current["version"],
+        operation_id="a-del",
+    )
+    assert _put(service, app, "items", "c", "text", "c3")["id"] == "c"
+    # Published again, the rules recount the same way.
+    revision = service.create_revision(
+        app["id"],
+        {
+            "html": "<main>Synthetic open board</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read", "data.write"],
+            "collections": {"parents": {}, "items": {}},
+            "constraints": [{**limit, "message": "Two at most."}],
+        },
+    )["id"]
+    app = _republish(service, app, revision)
+    with pytest.raises(ConstraintViolation):
+        _put(service, app, "items", "d", 0, "d")
+
+
 @pytest.mark.parametrize("on_delete", ["restrict", "cascade", "unset"])
 def test_a_reference_rule_checks_targets_and_applies_its_delete_rule(
     gadgets: Fixture, on_delete: str

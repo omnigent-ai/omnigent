@@ -168,7 +168,7 @@ def _holds_gadget_data(user: SqlUser, gadget_store: GadgetStore | None) -> bool:
     Their own gadgets and shelf are in *gadget_store*, owned under their username's
     registration. The shelf counts only while it holds something: unpinning and hiding
     leave its documents behind, empty, and those strand nothing. Each check reads at most
-    a page; a page of sessions that continues counts as holding data.
+    a few pages; more empty session documents than that count as holding data.
     """
     if gadget_store is None:
         return False
@@ -189,16 +189,24 @@ def _holds_gadget_data(user: SqlUser, gadget_store: GadgetStore | None) -> bool:
         pins = shelf.get("pins", "all")
         if pins is not None and pins.value.get("items"):
             return True
-        page = shelf.list("sessions", limit=_SHELF_SESSIONS_CHECKED)
+        # Emptying a session's list removes its document, so a live one with gadgets is
+        # data; empty ones left by older builds are passed over, a bounded number of pages.
+        cursor = None
+        for _ in range(_SHELF_PAGES_CHECKED):
+            page = shelf.list("sessions", limit=_SHELF_SESSIONS_PER_PAGE, cursor=cursor)
+            if any(document.value.get("gadgets") for document in page.items):
+                return True
+            cursor = page.next_cursor
+            if cursor is None:
+                return False
     except NotFound:
         return False
-    if page.next_cursor is not None:
-        return True
-    return any(document.value.get("gadgets") for document in page.items)
+    return True  # More empty documents than one check reads: treated as in use.
 
 
-# Session documents of a shelf one check reads; a shelf with more is treated as in use.
-_SHELF_SESSIONS_CHECKED = 50
+# A shelf's session documents one check reads: pages, and documents per page.
+_SHELF_PAGES_CHECKED = 4
+_SHELF_SESSIONS_PER_PAGE = 50
 
 
 def remap_identities(

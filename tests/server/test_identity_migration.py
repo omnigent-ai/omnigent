@@ -185,6 +185,34 @@ def test_remap_goes_ahead_once_a_user_deleted_their_gadgets_and_cleared_the_shel
     assert accounts.get_user("alice@example.com") is not None
 
 
+@pytest.mark.parametrize("sessions", [49, 50, 51])
+def test_remap_goes_ahead_after_gadgets_were_shown_and_hidden_beside_many_sessions(
+    db_uri: str, tmp_path, sessions: int
+) -> None:
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", hash_password("password123"))
+    alice = _gadget_service(db_uri, store, "alice")
+    board = alice.create("Synthetic board")
+    for n in range(sessions):
+        session_id = f"s{n:03d}" + "0" * 28
+        alice.link_session(board["id"], session_id, {"linked": True})
+        alice.link_session(board["id"], session_id, {"linked": False})
+    alice.delete(board["id"])
+
+    report = remap_identities(
+        get_or_create_engine(db_uri),
+        {"alice": "alice@example.com"},
+        dry_run=False,
+        gadget_store=store,
+    )
+
+    assert report.refused_gadgets == []
+    assert accounts.get_user("alice@example.com") is not None
+
+
 def account_store_ids(db_uri: str) -> set[str]:
     """Every user ID in the default workspace."""
     with Session(get_or_create_engine(db_uri)) as session:

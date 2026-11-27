@@ -108,6 +108,17 @@ _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _EPOCH = re.compile(r"^e[0-9]{6,12}$")
 
 
+class _Absent:
+    """No record: what a create replaces and a delete leaves. Distinct from a record whose
+    JSON value is ``null``, which is live."""
+
+    def __repr__(self) -> str:
+        return "<absent>"
+
+
+_ABSENT: Any = _Absent()
+
+
 def _epoch_name(number: int) -> str:
     return f"e{number:06d}"
 
@@ -504,12 +515,12 @@ class ConstraintGuard:
         if primary["kind"] == "create":
             if existing is not None:
                 return None
-            before = None
+            before = _ABSENT
         else:
             if existing is None or existing.version != primary["if_version"]:
                 return None
             before = existing.value
-        after = primary.get("value") if primary["kind"] != "delete" else None
+        after = primary.get("value") if primary["kind"] != "delete" else _ABSENT
         generation = int(state.get("ref_generation", 0))
         plan = _Plan(
             counts=dict(state.get("counts", {})),
@@ -517,7 +528,7 @@ class ConstraintGuard:
             operations=[primary],
         )
         # The records this plan deletes or updates, and their planned operation and value.
-        gone: set[tuple[str, str]] = {(collection, record_id)} if after is None else set()
+        gone: set[tuple[str, str]] = {(collection, record_id)} if after is _ABSENT else set()
         planned: dict[tuple[str, str], tuple[dict, Any]] = {}
         queue: list[tuple[str, str, Any, Any]] = [(collection, record_id, before, after)]
         changes: list[tuple[str, str, Any, Any]] = []
@@ -527,8 +538,8 @@ class ConstraintGuard:
             for rule in self.rules:
                 if rule["collection"] == changed_collection:
                     self._check(rule, plan, changed_id, old, new)
-            if old is None or new is not None:
-                continue
+            if old is _ABSENT or new is not _ABSENT:
+                continue  # Only a record that was there and is deleted meets inbound rules.
             # Every reference rule on the deleted record, gathered per dependent first, so
             # a dependent referencing it through several fields meets all of their rules.
             effects: dict[tuple[str, str], tuple[Document, list[dict]]] = {}
@@ -567,7 +578,7 @@ class ConstraintGuard:
                     operation.pop("fields", None)
                     gone.add(key)
                     planned[key] = (operation, None)
-                    queue.append((key[0], dependent.id, current, None))
+                    queue.append((key[0], dependent.id, current, _ABSENT))
                 else:
                     fields = sorted({*operation.get("fields", []), *(r["field"] for r in rules)})
                     operation["kind"], operation["fields"] = "unset", fields
@@ -734,6 +745,10 @@ class ConstraintGuard:
 
     @staticmethod
     def _matches(rule: dict, value: Any) -> bool:
+        if value is _ABSENT:
+            return False
+        if not rule["where"]:
+            return True  # Every live record counts, whatever its value, null included.
         return isinstance(value, dict) and all(
             key in value and value[key] == expected and type(value[key]) is type(expected)
             for key, expected in rule["where"].items()

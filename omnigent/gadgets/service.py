@@ -808,6 +808,18 @@ class GadgetService:
                 self._register_gadget_session(gadget, session_id)
         else:
             shown = [value for value in shown if value != app_id]
+            if not shown and current is not None:
+                # Nothing left beside the session: removed rather than kept empty, so a
+                # live session document always means gadgets shown there.
+                self._shelf.delete(
+                    "sessions",
+                    key,
+                    current.version,
+                    "sessions-" + _digest([current.version, "removed"]),
+                    self.viewer.user_id,
+                )
+                self._after_owned_write()
+                return self.session_gadgets(session_id)
         self._save_shelf("sessions", key, current, {"session_id": session_id, "gadgets": shown})
         return self.session_gadgets(session_id)
 
