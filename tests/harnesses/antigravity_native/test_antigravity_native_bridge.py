@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import shlex
+import stat
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +34,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     seed_isolated_agy_home,
     send_interaction_keys_via_tui,
     update_conversation_id,
+    write_agent_instructions,
     write_bridge_state,
     write_mcp_bridge_config,
     write_mcp_config,
@@ -450,6 +453,113 @@ def test_update_conversation_id_returns_false_and_warns_when_no_state(
         record.levelno == logging.WARNING and "agy_conv_new" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_update_conversation_id_expect_placeholder_replaces_a_placeholder(
+    bridge_dir: Path,
+) -> None:
+    """With ``expect_placeholder`` an ``agy_conv_*`` placeholder is still replaced."""
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="conv_test", conversation_id="agy_conv_seed"),
+    )
+    assert update_conversation_id(bridge_dir, "conv_agy_real", expect_placeholder=True) is True
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "conv_agy_real"
+
+
+def test_update_conversation_id_expect_placeholder_keeps_a_real_id(bridge_dir: Path) -> None:
+    """
+    With ``expect_placeholder`` a real id already in state is never replaced.
+
+    Guards the race between a cold-start and the reader's placeholder recovery:
+    the writer that loses must not clobber the other's live binding.
+    """
+    _seed_active_turn(bridge_dir, "turn_live")
+    assert update_conversation_id(bridge_dir, "conv_agy_other", expect_placeholder=True) is False
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "conv_agy_test"
+    assert state.active_turn_id == "turn_live"
+
+
+@pytest.mark.parametrize(
+    ("second_writer", "expected_results", "expected_conversation_id"),
+    [
+        pytest.param(
+            "update", {"first": True, "second": False}, "conv_agy_first", id="racing-update"
+        ),
+        pytest.param("recreate", {"first": True}, "agy_conv_relaunch", id="terminal-recreation"),
+    ],
+)
+def test_update_conversation_id_expect_placeholder_serializes_racing_writers(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_writer: str,
+    expected_results: dict[str, bool],
+    expected_conversation_id: str,
+) -> None:
+    """
+    A guarded update paused before its write holds off other bridge-state writers.
+    A second update waits and keeps the first's id; a terminal recreation waits,
+    then clears and reseeds, so its new placeholder survives.
+
+    Guards cold-start vs reader recovery, and a recovery worker that outlives its
+    cancelled reader: all are threads of one process.
+    """
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="conv_test", conversation_id="agy_conv_seed"),
+    )
+    first_is_writing = threading.Event()
+    release_first = threading.Event()
+    original_write = _mod.write_bridge_state
+
+    def paused_write(path: Path, state: AntigravityNativeBridgeState) -> None:
+        if state.conversation_id == "conv_agy_first":
+            first_is_writing.set()
+            assert release_first.wait(5), "the first writer was never released"
+        original_write(path, state)
+
+    monkeypatch.setattr(_mod, "write_bridge_state", paused_write)
+    results: dict[str, bool] = {}
+
+    def write(name: str) -> None:
+        results[name] = update_conversation_id(
+            bridge_dir, f"conv_agy_{name}", expect_placeholder=True
+        )
+
+    def recreate_terminal() -> None:
+        clear_bridge_state(bridge_dir)
+        write_bridge_state(
+            bridge_dir,
+            AntigravityNativeBridgeState(
+                session_id="conv_test", conversation_id="agy_conv_relaunch"
+            ),
+        )
+
+    first = threading.Thread(target=write, args=("first",))
+    if second_writer == "update":
+        second = threading.Thread(target=write, args=("second",))
+    else:
+        second = threading.Thread(target=recreate_terminal)
+    try:
+        first.start()
+        assert first_is_writing.wait(5)
+        second.start()
+        second.join(0.3)
+        assert second.is_alive(), "the second writer must wait for the first to finish"
+    finally:
+        release_first.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+
+    assert results == expected_results
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == expected_conversation_id
 
 
 # ---------------------------------------------------------------------------
@@ -997,31 +1107,45 @@ def test_inject_user_message_via_tui_raises_when_session_dies_before_submit(
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
 
 
+@pytest.mark.parametrize("background_widget", [False, True])
 def test_inject_user_message_via_tui_raises_when_paste_never_renders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    background_widget: bool,
 ) -> None:
     """A successful tmux paste command is not enough; the draft must render."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
 
+    sep = "─" * 60
+    pane = f"draft message\n{sep}\n> \n{sep}"
+    if background_widget:
+        pane += f"\n  ● pytest running\n{sep}"
+    pane += "\n? for shortcuts"
+    enters: list[str] = []
+
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Pane stays empty even after paste-buffer returns successfully."""
         del kwargs
+        if cmd[-1] == "Enter":
+            enters.append("Enter")
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> \n? for shortcuts", stderr="")
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="did not render the pasted message"):
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+    assert not enters
 
 
+@pytest.mark.parametrize("wrapped_tail", [False, True])
 def test_inject_user_message_via_tui_raises_when_turn_never_starts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    wrapped_tail: bool,
 ) -> None:
     """
     If no turn ever starts after the submit attempts, the delivery raises.
@@ -1032,7 +1156,21 @@ def test_inject_user_message_via_tui_raises_when_turn_never_starts(
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    tui = {"pane": "> \n? for shortcuts"}
+    sep = "─" * 60
+    footer = (
+        f"\n{sep}\n  ● pytest running\n{sep}\n? for shortcuts"
+        if wrapped_tail
+        else "\n? for shortcuts"
+    )
+    content = (
+        "Inspect these observations "
+        + "compare temperature and humidity " * 12
+        + "then summarize the final observations."
+        if wrapped_tail
+        else "draft message"
+    )
+    tui = {"pane": f"{sep}\n> {footer}"}
+    enters: list[str] = []
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Pane never leaves idle — the submit never starts a turn."""
@@ -1040,12 +1178,20 @@ def test_inject_user_message_via_tui_raises_when_turn_never_starts(
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = "> draft message\n? for shortcuts"
+            draft = (
+                "> then summarize the final\n  observations."
+                if wrapped_tail
+                else "> draft message"
+            )
+            tui["pane"] = f"{sep}\n{draft}{footer}"
+        if cmd[-1] == "Enter":
+            enters.append("Enter")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="draft is still visible"):
-        inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+        inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    assert enters
 
 
 def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> None:
@@ -1076,23 +1222,77 @@ def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
     assert not _mod._draft_in_input_region(submitted, "Find the current weather", baseline)
 
 
+_LONG_PASTE_CONTENT = "\n".join(
+    ["Find the current weather and inspect these observations"]
+    + [f"Observation {index}: compare temperature and humidity" for index in range(16)]
+    + ["Summarize the observations and finish the report"]
+)
+_LONG_PASTE_TAIL = _LONG_PASTE_CONTENT.splitlines()[-1]
+_PASTE_COMPOSERS = {
+    "ordinary": f"> {_LONG_PASTE_CONTENT.splitlines()[0]}",
+    "collapsed": "  [Pasted text #1 +18 lines]",
+    "scrolled": f"> ↑ 17 more lines\n  {_LONG_PASTE_TAIL}",
+    "wrapped-tail": f"> {_LONG_PASTE_TAIL[:14]}\n  {_LONG_PASTE_TAIL[14:]}",
+}
+
+
+def _paste_pane(composer: str, *, background_widget: bool, footer: str = "? for shortcuts") -> str:
+    """Render a composer below transcript history and above an optional task widget."""
+    sep = "─" * 60
+    pane = f"{sep}\n> previous prompt\n{sep}\n{composer}\n{sep}"
+    if background_widget:
+        pane += f"\n  ● pytest running\n{sep}"
+    return pane + "\n" + footer
+
+
+@pytest.mark.parametrize("draft_style", list(_PASTE_COMPOSERS))
+@pytest.mark.parametrize("background_widget", [False, True])
+def test_draft_in_input_region_detects_hidden_and_wrapped_pastes(
+    draft_style: str, background_widget: bool
+) -> None:
+    """Layout variants recognize a changed draft and reject unchanged or cleared regions."""
+    empty = _paste_pane("> ", background_widget=background_widget)
+    baseline = _mod._agy_input_region(empty)
+    rendered = _PASTE_COMPOSERS[draft_style]
+    pane = _paste_pane(rendered, background_widget=background_widget)
+    assert _mod._agy_input_region(pane) == rendered
+    needles = _mod._submit_needles(_LONG_PASTE_CONTENT)
+    extra_needles = tuple(needles[1:])
+    assert _mod._draft_in_input_region(pane, needles[0], baseline, extra_needles)
+    assert not _mod._draft_in_input_region(pane, needles[0], rendered, extra_needles)
+    assert not _mod._draft_in_input_region(empty, needles[0], baseline, extra_needles)
+    if draft_style == "wrapped-tail":
+        assert not _mod._draft_in_input_region(pane, needles[0], baseline)
+    elif draft_style == "ordinary":
+        assert _mod._draft_in_input_region(pane, needles[0], baseline)
+
+
+@pytest.mark.parametrize(("needle", "matches"), [("temperature", True), ("temperament", False)])
+def test_needle_matches_candidates_across_a_mid_word_wrap(needle: str, matches: bool) -> None:
+    assert _mod._needle_matches_candidates(needle, ["The tempe", "rature is stable"]) is matches
+
+
+@pytest.mark.parametrize(
+    ("draft_style", "background_widget"),
+    [
+        pytest.param("collapsed", True, id="collapsed-widget"),
+        pytest.param("wrapped-tail", False, id="wrapped-tail"),
+    ],
+)
 def test_inject_user_message_via_tui_submits_a_collapsed_paste(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    draft_style: str,
+    background_widget: bool,
 ) -> None:
-    """
-    A multi-line prompt agy collapses is still submitted, not reported as lost.
-
-    Reproduces the polly sub-agent dispatch: the task prompt is long enough that
-    agy shows only the placeholder, which previously failed the render gate and
-    raised "did not render the pasted message" while the draft sat in the
-    composer.
-    """
+    """Hidden or wrapped draft text submits once even above a background widget."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    content = "\n".join(f"Find the current weather line {i}" for i in range(1, 19))
-    tui = {"pane": "> \n? for shortcuts"}
+    rendered = _paste_pane(_PASTE_COMPOSERS[draft_style], background_widget=background_widget)
+    submitted = _paste_pane("> ", background_widget=background_widget, footer="esc to cancel")
+    tui = {"pane": _paste_pane("> ", background_widget=background_widget)}
+    captures: list[str] = []
     enters = {"n": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -1101,18 +1301,21 @@ def test_inject_user_message_via_tui_submits_a_collapsed_paste(
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
+            captures.append(tui["pane"])
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = "> [Pasted text #1 +18 lines]\n? for shortcuts"
+            tui["pane"] = rendered
         if cmd[-1] == "Enter":
+            assert rendered in captures, "observe the rendered draft before Enter"
             enters["n"] += 1
-            tui["pane"] = "> \nesc to cancel"
+            tui["pane"] = submitted
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    inject_user_message_via_tui(bridge_dir, content=_LONG_PASTE_CONTENT, timeout_s=0.5)
 
-    assert enters["n"] == 1, "the collapsed draft should submit on the first Enter"
+    assert enters["n"] == 1, "the rendered draft should submit on the first Enter"
+    assert captures[-1] == submitted, "observe the consumed draft after Enter"
 
 
 # ---------------------------------------------------------------------------
@@ -1429,8 +1632,69 @@ def test_inject_user_message_via_tui_short_message_raises_when_not_submitted(
 # ---------------------------------------------------------------------------
 
 
+def test_write_agent_instructions_refreshes_only_the_owned_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Always-on startup text is private and coexists with the user's rules."""
+    bridge_dir = tmp_path / "bridge"
+    rules_dir = agy_gemini_dir(bridge_dir) / "config" / "rules"
+    rules_dir.mkdir(parents=True)
+    user_rule = rules_dir / "user-rule.md"
+    user_rule.write_text("Keep the user's rule.", encoding="utf-8")
+    instructions = "  Authored instructions.  \n\nFramework guidance."
+
+    path = write_agent_instructions(bridge_dir, instructions)
+
+    assert path == rules_dir / "omnigent_instructions.md"
+    assert path.read_text(encoding="utf-8") == (
+        "---\ntrigger: always_on\n---\n\n" + instructions + "\n"
+    )
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert write_agent_instructions(bridge_dir, "Updated on resume.") == path
+    assert "Updated on resume." in path.read_text(encoding="utf-8")
+    assert "Authored instructions." not in path.read_text(encoding="utf-8")
+    previous = path.read_bytes()
+
+    def fail_replace(*_args: object) -> None:
+        raise PermissionError("read-only startup rule")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.harnesses.antigravity_native.bridge.os.replace", fail_replace)
+        with pytest.raises(PermissionError, match="read-only startup rule"):
+            write_agent_instructions(bridge_dir, "Replacement must not be visible.")
+    assert path.read_bytes() == previous
+    assert {entry.name for entry in rules_dir.iterdir()} == {path.name, user_rule.name}
+    assert write_agent_instructions(bridge_dir, None) is None
+    assert not path.exists()
+    assert user_rule.read_text(encoding="utf-8") == "Keep the user's rule."
+
+
+@pytest.mark.parametrize("linked_dir", ["gemini", "rules", "cyclic-rules"])
+def test_write_agent_instructions_never_follows_rules_outside_the_bridge(
+    tmp_path: Path, linked_dir: str
+) -> None:
+    """A linked user configuration must not receive a generated startup rule."""
+    bridge_dir = tmp_path / "bridge"
+    gemini_dir = agy_gemini_dir(bridge_dir)
+    real_rules = tmp_path / "real-rules"
+    real_rules.mkdir()
+    link = gemini_dir if linked_dir == "gemini" else gemini_dir / "config" / "rules"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(
+        link.name if linked_dir == "cyclic-rules" else real_rules, target_is_directory=True
+    )
+
+    expected_errors = (ValueError, OSError) if linked_dir == "cyclic-rules" else (ValueError,)
+    with pytest.raises(expected_errors) as raised:
+        write_agent_instructions(bridge_dir, "Startup text.")
+    if isinstance(raised.value, ValueError):
+        assert "isolated Gemini dir" in str(raised.value)
+
+    assert list(real_rules.iterdir()) == []
+
+
 def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
-    """build_mcp_config emits the shared serve-mcp relay command + enabledTools."""
+    """build_mcp_config emits the shared serve-mcp relay command without enabledTools."""
     config = build_mcp_config(tmp_path, python_executable="python-test")
     server = config["mcpServers"]["omnigent"]
     assert server["command"] == "python-test"
@@ -1442,12 +1706,9 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
         "--bridge-dir",
         str(tmp_path),
     ]
-    # agy's auto-approve allowlist is the enabledTools key (not cursor's autoApprove).
-    assert "sys_session_send" in server["enabledTools"]
-    assert "sys_os_shell" in server["enabledTools"]
-    assert "sys_terminal_launch" in server["enabledTools"]
-    assert "sys_list_models" in server["enabledTools"]
-    assert server["enabledTools"] == sorted(server["enabledTools"])
+    # enabledTools is a visibility allowlist in agy and must stay omitted so
+    # dynamically advertised relay tools (browser, memory, automations) stay visible.
+    assert "enabledTools" not in server
     assert server["env"]["TMPDIR"]
     # The relay's HOME and data dir are pinned to the runner's so its bridge-root
     # validation matches where the bridge dir lives, even if a future agy launch
@@ -1747,7 +2008,146 @@ def test_seed_isolated_agy_home_never_clobbers_existing_isolated_settings(
 
     seed_isolated_agy_home(bridge_dir)
 
-    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {"model": "session-pick"}
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["model"] == "session-pick"
+    assert "theme" not in isolated
+    assert isolated["permissions"]["allow"] == ["mcp(omnigent/*)"]
+
+
+def test_seed_isolated_agy_home_merges_omnigent_mcp_allow_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP allow-rule merges into permissions.allow idempotently without mutating real home."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_payload = {
+        "theme": "dark",
+        "permissions": {
+            "allow": ["mcp(other/*)"],
+            "ask": ["shell(git push *)", "mcp(omnigent/*)"],
+            "deny": ["shell(rm -rf *)", "mcp(omnigent/memory_search)"],
+        },
+    }
+    real_settings.write_text(json.dumps(real_payload), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["theme"] == "dark"
+    assert isolated["permissions"] == {
+        "allow": ["mcp(other/*)", "mcp(omnigent/*)"],
+        "ask": ["shell(git push *)", "mcp(omnigent/*)"],
+        "deny": ["shell(rm -rf *)", "mcp(omnigent/memory_search)"],
+    }
+    assert json.loads(real_settings.read_text(encoding="utf-8")) == real_payload
+
+
+@pytest.mark.parametrize("fault", ["read", "replace"])
+def test_relay_permissions_preserve_settings_and_remove_temporary_files_after_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    settings = agy_gemini_dir(bridge_dir) / "antigravity-cli/settings.json"
+    settings.parent.mkdir(parents=True)
+    original = b'{"theme":"dark","permissions":{"deny":["mcp(other/write)"]}}'
+    settings.write_bytes(original)
+    read_text = Path.read_text
+
+    def read(path: Path, *args: object, **kwargs: object) -> str:
+        if path == settings:
+            raise PermissionError("settings are unreadable")
+        return read_text(path, *args, **kwargs)
+
+    def replace(*_args: object) -> None:
+        raise OSError("replacement failed")
+
+    if fault == "read":
+        monkeypatch.setattr(Path, "read_text", read)
+    else:
+        monkeypatch.setattr(_mod.os, "replace", replace)
+
+    _mod._seed_isolated_agy_mcp_permissions(bridge_dir)
+
+    assert settings.read_bytes() == original
+    assert list(settings.parent.iterdir()) == [settings]
+
+
+@pytest.mark.parametrize("escaped_parent", ["gemini", "cli"])
+def test_relay_permissions_leave_settings_outside_the_bridge_unchanged(
+    tmp_path: Path, escaped_parent: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    gemini_dir = agy_gemini_dir(bridge_dir)
+    outside = tmp_path / "outside"
+    settings = outside / (
+        "antigravity-cli/settings.json" if escaped_parent == "gemini" else "settings.json"
+    )
+    settings.parent.mkdir(parents=True)
+    original = b'{"theme":"dark","permissions":{"allow":["mcp(other/read)"]}}'
+    settings.write_bytes(original)
+    linked = gemini_dir if escaped_parent == "gemini" else gemini_dir / "antigravity-cli"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside, target_is_directory=True)
+
+    _mod._seed_isolated_agy_mcp_permissions(bridge_dir)
+
+    assert settings.read_bytes() == original
+    assert list(settings.parent.iterdir()) == [settings]
+
+
+def test_seed_isolated_agy_home_populates_empty_settings_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty or whitespace-only settings.json still receives the Omnigent allow-rule."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text("  \n", encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["permissions"] == {"allow": ["mcp(omnigent/*)"]}
+
+
+@pytest.mark.parametrize(
+    "raw_content",
+    [
+        "{not valid json",
+        "[]",
+        json.dumps({"permissions": "not-an-object"}),
+        json.dumps({"permissions": {"allow": "not-a-list"}}),
+    ],
+    ids=["invalid-json", "non-object-root", "non-object-permissions", "non-list-allow"],
+)
+def test_seed_isolated_agy_home_leaves_malformed_settings_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw_content: str
+) -> None:
+    """Malformed or unexpected-shape isolated settings.json is left untouched."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text(raw_content, encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    assert iso_settings.read_text(encoding="utf-8") == raw_content
 
 
 def test_seed_isolated_agy_home_prefers_real_onboarding_marker(
@@ -2838,3 +3238,42 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_submit_needles_for_long_single_paragraph() -> None:
+    """A long single-line paragraph yields both head and tail needles."""
+    content = (
+        "Here is a long prompt that tests how agy handles text when a single "
+        "long paragraph overflows the composer viewport and scrolls. "
+        "Some technical parameters and instructions are included to ensure "
+        "multiple chunks can be sampled across the entire prompt body."
+    )
+    needles = _mod._submit_needles(content)
+    assert len(needles) >= 2
+    assert needles[0] == "Here is a long prompt th"
+    assert needles[-1] == "the entire prompt body."
+    assert _mod._submit_needle(content) == needles[0]
+
+
+def test_draft_detected_when_single_long_paragraph_scrolled_with_more_lines() -> None:
+    """A single long paragraph whose start scrolled out behind '↑ 2 more lines' is detected."""
+    sep = "─" * 60
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}\n? for shortcuts")
+    content = (
+        "Here is a long prompt that tests how agy handles text when a single "
+        "long paragraph overflows the composer viewport and scrolls. "
+        "Some technical parameters and instructions are included to ensure "
+        "multiple chunks can be sampled across the entire prompt body."
+    )
+    needles = _mod._submit_needles(content)
+    pane = (
+        f"{sep}\n"
+        f"> ↑ 2 more lines\n"
+        f"  multiple chunks can be sampled\n"
+        f"{sep}\n"
+        f"Gemini 3.8 Flash · high"
+    )
+    region = _mod._agy_input_region(pane)
+    assert all(needle not in region for needle in needles)
+    assert _mod._draft_in_input_region(pane, needles[0], baseline, tuple(needles[1:]))
+    assert not _mod._draft_in_input_region(pane, needles[0], region, tuple(needles[1:]))

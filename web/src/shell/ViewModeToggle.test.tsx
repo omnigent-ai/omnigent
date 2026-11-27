@@ -208,6 +208,36 @@ describe("ViewModeToggle", () => {
   });
 });
 
+describe("ViewModeToggle in the chat pane's strip", () => {
+  function renderPaneToggle(ctx: TerminalFirstContextValue) {
+    return render(
+      <TooltipProvider>
+        <TerminalFirstContextProvider value={ctx}>
+          <ViewModeToggle variant="pane" />
+        </TerminalFirstContextProvider>
+      </TooltipProvider>,
+    );
+  }
+
+  it("draws a recessed track sized to the strip's row, with the active segment lit", () => {
+    renderPaneToggle(makeCtx({ view: "terminal" }));
+    const track = screen.getByRole("group", { name: "Switch between chat and terminal" });
+    expect(track).toHaveAttribute("data-variant", "pane");
+    expect(track).toHaveClass("view-mode-track");
+    expect(track).not.toHaveClass("w-[74px]");
+    expect(terminalSegment()).toHaveAttribute("data-active");
+    expect(terminalSegment()).toHaveClass("view-mode-segment", "h-5");
+    expect(chatSegment()).not.toHaveAttribute("data-active");
+  });
+
+  it("switches views as the header's switch does", () => {
+    const ctx = makeCtx();
+    renderPaneToggle(ctx);
+    fireEvent.click(terminalSegment());
+    expect(ctx.setView).toHaveBeenCalledWith("terminal");
+  });
+});
+
 describe("ViewModeMenuItems", () => {
   it("renders Chat and Terminal entries for terminal-first sessions", () => {
     renderMenuItems(makeCtx());

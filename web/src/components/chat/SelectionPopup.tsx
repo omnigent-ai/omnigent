@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { CornerUpLeftIcon, MessagesSquareIcon } from "lucide-react";
+import { CornerUpLeftIcon, MessageSquarePlusIcon, MessagesSquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
 
@@ -68,15 +68,58 @@ export function SelectionPopup({
 
   if (!popupPos) return null;
 
+  const act = (handler: (text: string) => void) => {
+    const text = selectedTextRef.current;
+    if (!text) return;
+    handler(text);
+    window.getSelection()?.removeAllRanges();
+    setPopupPos(null);
+    selectedTextRef.current = "";
+  };
+  return (
+    <SelectionPopupActions
+      position={popupPos}
+      onReply={() => act(onReply)}
+      onAskInSideChat={onAskInSideChat ? () => act(onAskInSideChat) : undefined}
+    />
+  );
+}
+
+// Override shared-variant translucent hover — these buttons float over text.
+const FLOATING_BUTTON_CLASS =
+  "gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110";
+
+// Prevent the mousedown from clearing the selection before it is read.
+function keepSelection(event: React.MouseEvent) {
+  event.preventDefault();
+}
+
+/**
+ * The popup's buttons on their own, for a selection tracked elsewhere, such as text selected
+ * inside a sandboxed gadget frame. `position` is the selection's top center in viewport
+ * coordinates.
+ */
+export function SelectionPopupActions({
+  position,
+  onReply,
+  onAskInSideChat,
+  onAddComment,
+}: {
+  position: { x: number; y: number };
+  onReply: () => void;
+  onAskInSideChat?: () => void;
+  /** Comments on the selection, like a file's Add comment. */
+  onAddComment?: () => void;
+}) {
   // Panel containment changes the fixed-position origin; use the viewport.
   return createPortal(
     <div
       style={{
         position: "fixed",
-        // Translate left by 50% to center the button over the midpoint of the
+        // Translate left by 50% to center the buttons over the midpoint of the
         // selection, and up by 100% + 6px to sit just above the selection rect.
-        left: popupPos.x,
-        top: popupPos.y,
+        left: position.x,
+        top: position.y,
         transform: "translate(-50%, calc(-100% - 6px))",
         zIndex: 50,
       }}
@@ -85,21 +128,9 @@ export function SelectionPopup({
         type="button"
         variant="secondary"
         size="sm"
-        // Override shared-variant translucent hover — this button floats over text.
-        className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
-        onMouseDown={(e) => {
-          // Prevent the mousedown from clearing the selection before we read it.
-          e.preventDefault();
-        }}
-        onClick={() => {
-          const text = selectedTextRef.current;
-          if (text) {
-            onReply(text);
-            window.getSelection()?.removeAllRanges();
-            setPopupPos(null);
-            selectedTextRef.current = "";
-          }
-        }}
+        className={FLOATING_BUTTON_CLASS}
+        onMouseDown={keepSelection}
+        onClick={onReply}
       >
         <CornerUpLeftIcon className="size-3.5" />
         Reply ↵
@@ -109,22 +140,25 @@ export function SelectionPopup({
           type="button"
           variant="secondary"
           size="sm"
-          className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
-          onMouseDown={(e) => {
-            e.preventDefault();
-          }}
-          onClick={() => {
-            const text = selectedTextRef.current;
-            if (text) {
-              onAskInSideChat(text);
-              window.getSelection()?.removeAllRanges();
-              setPopupPos(null);
-              selectedTextRef.current = "";
-            }
-          }}
+          className={FLOATING_BUTTON_CLASS}
+          onMouseDown={keepSelection}
+          onClick={onAskInSideChat}
         >
           <MessagesSquareIcon className="size-3.5" />
           Ask in side chat
+        </Button>
+      ) : null}
+      {onAddComment ? (
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          className={FLOATING_BUTTON_CLASS}
+          onMouseDown={keepSelection}
+          onClick={onAddComment}
+        >
+          <MessageSquarePlusIcon className="size-3.5" />
+          Add comment
         </Button>
       ) : null}
     </div>,

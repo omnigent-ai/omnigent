@@ -1,8 +1,8 @@
 """A held Claude permission prompt returns to the web after its bearer lapses.
 
 Real server (accounts auth), runner, Claude CLI, tmux, and hooks. Arranged:
-scripted Anthropic responses, a 60s runner-token TTL, a server restart to cut
-the held poll, and a sign-in stored the way ``omnigent login`` stores it.
+scripted Anthropic responses, a 60s runner-token TTL, and a server restart to
+cut the held poll. The runner renews the hook's bearer; nobody signs in.
 """
 
 from __future__ import annotations
@@ -413,8 +413,9 @@ def test_permission_prompt_returns_to_web_after_bearer_lapse(
             time.sleep(_RUNNER_TOKEN_TTL_S + 5)
             server.stop()
             server.start()
-            # The hook reconnects with a dead bearer and cannot mint another:
-            # the user has not signed in on this machine.
+            # The hook reconnects with its dead bearer, which the server rejects.
+            # The user has not signed in on this machine, so it can't mint one;
+            # it takes the bearer the runner renewed in its header snapshot.
             _wait(
                 lambda: server.access_log_has(
                     f"/v1/sessions/{session_id}/hooks/permission-request", 401
@@ -422,34 +423,12 @@ def test_permission_prompt_returns_to_web_after_bearer_lapse(
                 "the server to reject the hook's lapsed bearer",
                 timeout=90,
             )
-            time.sleep(5)
-            assert not _read_prompts(client, session_id), "The card outlived its rejected hook"
-            assert not scripted.results, "Claude answered the Read without a verdict"
-
-            # The user signs in, as `omnigent login` would store it.
-            login = _login(server.url)
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "import sys, time\n"
-                    "from omnigent.cli_auth import store_token\n"
-                    "store_token(sys.argv[1], sys.argv[2], sys.argv[3],"
-                    " time.time() + float(sys.argv[4]))\n",
-                    server.url,
-                    login["token"],
-                    _OWNER,
-                    str(login["expires_in"]),
-                ],
-                env=runner_env,
-                check=True,
-                timeout=30,
-            )
             back = _wait(
                 lambda: _read_prompts(client, session_id),
-                "the Read card to return after sign-in",
+                "the Read card to return with the runner's renewed bearer",
                 timeout=90,
             )[0]
+            assert not scripted.results, "Claude answered the Read without a verdict"
             assert back["elicitation_id"] == first["elicitation_id"], (first, back)
             client.post(
                 f"/v1/sessions/{session_id}/elicitations/{back['elicitation_id']}/resolve",

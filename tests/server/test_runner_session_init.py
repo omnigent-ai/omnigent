@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -22,6 +23,9 @@ from omnigent.runner.session_init_protocol import (
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+from omnigent.runtime import _globals
+from omnigent.runtime.caps import RuntimeCaps
+from omnigent.server.routing_backend import RoutingBackends
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
@@ -78,6 +82,10 @@ async def test_initializer_shares_result_for_one_tunnel_generation(
         "omnigent.server.runner_session_init._read_build_info", lambda: (123.0, "a" * 40)
     )
     caplog.set_level(logging.INFO, logger="omnigent.server.runner_session_init")
+    # A routing server, so the envelope's routing answer is the one under test.
+    monkeypatch.setattr(
+        _globals, "_caps", RuntimeCaps(routing_backends=RoutingBackends(local=Mock()))
+    )
     registry = _Registry()
     client = _Client()
     initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
@@ -103,6 +111,7 @@ async def test_initializer_shares_result_for_one_tunnel_generation(
     assert initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     assert len(client.calls) == 1
     assert client.calls[0]["session_init"]["snapshot"]["workspace"] == "/tmp/workspace"
+    assert client.calls[0]["session_init"]["smart_routing_available"] is True
 
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert cached is first_response
@@ -295,27 +304,106 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
     assert metadata.fork_source_external_id == "src-claude-sid"
 
 
+def test_init_envelope_carries_the_sessions_own_cost(db_uri: str) -> None:
+    """The runner restores a cold-resumed Claude's running cost from the envelope.
+
+    Drives the real store so the value is the one ``session_usage`` persists.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    agent = agent_store.create(generate_agent_id(), "claude-native-ui", "bundle/loc")
+    session = conversation_store.create_conversation(agent_id=agent.id, workspace="/tmp/ws")
+    conversation_store.set_session_usage(session.id, {"total_cost_usd": 1.25})
+    stored = conversation_store.get_conversation(session.id)
+    assert stored is not None
+
+    envelope = parse_runner_session_init_envelope(
+        build_runner_session_init_payload(stored, server_version="0.6.0.dev0")
+    )
+
+    assert envelope is not None
+    assert envelope.snapshot.own_cost_usd == 1.25
+    from omnigent.runner.app import _claude_launch_metadata_from_envelope
+
+    assert _claude_launch_metadata_from_envelope(envelope).resume_cost_usd == 1.25
+
+
+@pytest.mark.parametrize(
+    "session_usage",
+    [{}, {"total_cost_usd": 0}, {"total_cost_usd": 10**400}],
+    ids=["absent", "zero", "overflow"],
+)
+def test_init_envelope_omits_a_cost_it_cannot_restore(session_usage: dict[str, Any]) -> None:
+    """Only a positive cost that fits a float is restored into Claude."""
+    envelope = parse_runner_session_init_envelope(
+        build_runner_session_init_payload(
+            replace(_conversation(), session_usage=session_usage), server_version="0.6.0.dev0"
+        )
+    )
+
+    assert envelope is not None
+    assert envelope.snapshot.own_cost_usd is None
+
+
 @pytest.mark.asyncio
-async def test_recovery_has_own_readiness_and_stable_identity_across_failed_posts() -> None:
+@pytest.mark.parametrize("trigger", ["child_recovery", "host_recovery"])
+async def test_recovery_has_own_readiness_and_stable_identity_across_failed_posts(
+    trigger: str,
+) -> None:
     registry, client = _Registry(), _Client()
     client.release.set()
     initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
     conv = _conversation()
+    prompt = "[System: session resumed]\nCheck the task checkpoint before continuing."
     await initializer.initialize(conv, client, timeout=10)  # type: ignore[arg-type]
     client.status_code = 500
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv,
+        client,
+        timeout=10,
+        resume_interrupted_turn=True,
+        recovery_prompt=prompt,
+        trigger=trigger,
+    )
     first_id = client.calls[-1]["session_init"]["recovery_id"]
     client.status_code = 201
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv,
+        client,
+        timeout=10,
+        resume_interrupted_turn=True,
+        recovery_prompt=prompt,
+        trigger=trigger,
+    )
     assert len(client.calls) == 3
     assert first_id and client.calls[-1]["session_init"]["recovery_id"] == first_id
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    assert all(call["session_init"]["recovery_prompt"] == prompt for call in client.calls[1:])
+    envelope = parse_runner_session_init_envelope(client.calls[-1])
+    assert envelope is not None and envelope.recovery_prompt == prompt
+    assert envelope.require_recovery_admission is (trigger == "host_recovery")
+    assert not client.calls[0]["session_init"]["require_recovery_admission"]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv,
+        client,
+        timeout=10,
+        resume_interrupted_turn=True,
+        recovery_prompt=prompt,
+        trigger=trigger,
+    )
     assert len(client.calls) == 3
     # A later binding back to this live runner starts a distinct recovery.
     initializer.invalidate_session(conv.id)
     assert not initializer.is_initialized(conv, client)  # type: ignore[arg-type]
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv,
+        client,
+        timeout=10,
+        resume_interrupted_turn=True,
+        recovery_prompt=prompt,
+        trigger=trigger,
+    )
     assert client.calls[-1]["session_init"]["recovery_id"] != first_id
+    assert client.calls[-1]["session_init"]["recovery_prompt"] == prompt
     assert initializer.is_initialized(conv, client)  # type: ignore[arg-type]
 
 

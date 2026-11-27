@@ -9,14 +9,23 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
+from omnigent.host.frames import (
+    CAP_MEMORY_IMPORT_SKILL,
+    CAP_WORKFLOWS,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
+    encode_host_frame,
+)
+from omnigent.memory_availability import without_memory_tools
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
+from omnigent.spec.skill_sources import framework_skills
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore
@@ -135,6 +144,9 @@ def create_skills_router(
             if host is not None:
                 raise host_absent_error(host)
             raise HTTPException(status_code=503, detail="session host is offline")
+        workflows_enabled = CAP_WORKFLOWS in conn.hello.capabilities and getattr(
+            request.app.state, "feature_flags", FeatureFlags()
+        ).enabled(Feature.WORKFLOWS)
         result = await request_host_skills(
             host_registry=host_registry,
             host_conn=conn,
@@ -145,6 +157,7 @@ def create_skills_router(
             agent_version=agent_version,
             sub_agent_name=sub_agent_name,
             skills_filter=spec.skills_filter if spec is not None else "all",
+            workflows_enabled=workflows_enabled,
         )
         if result.status != "ok":
             raise HTTPException(
@@ -170,6 +183,25 @@ def create_skills_router(
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
+            # The stored spec doesn't know whether this server has memory; the runner's
+            # copy turns the memory group off the same way. An older host's runner
+            # has no memory skill to load, so it is listed only for hosts that ship it.
+            memory_available = getattr(request.app.state, "memory_available", None)
+            framework_spec = (
+                spec
+                if memory_available is not None
+                and memory_available()
+                and CAP_MEMORY_IMPORT_SKILL in conn.hello.capabilities
+                else without_memory_tools(spec)
+            )
+            # Framework skills come last, as in resolve_session_skills; the menu lists
+            # only those people invoke.
+            listed = reserved | {skill.name for skill in skills}
+            skills += [
+                SkillSummary(name=skill.name, description=skill.description)
+                for skill in framework_skills(framework_spec, workflows_enabled=workflows_enabled)
+                if skill.user_invocable and skill.name not in listed
+            ]
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router
@@ -186,6 +218,7 @@ async def request_host_skills(
     agent_version: str | None = None,
     sub_agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    workflows_enabled: bool = False,
 ) -> HostSkillsResultFrame:
     """Request skill metadata over the host tunnel, with bounded waiting and cleanup."""
     request_id = secrets.token_hex(8)
@@ -204,6 +237,7 @@ async def request_host_skills(
                     agent_version=agent_version,
                     sub_agent_name=sub_agent_name,
                     skills_filter=skills_filter,
+                    workflows_enabled=workflows_enabled,
                 )
             ),
         )

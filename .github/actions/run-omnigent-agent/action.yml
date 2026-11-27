@@ -57,7 +57,7 @@ runs:
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ inputs.workdir }}/.venv
-        key: venv-${{ runner.os }}-${{ hashFiles(format('{0}/.python-version', inputs.workdir)) }}-${{ hashFiles(format('{0}/uv.lock', inputs.workdir)) }}
+        key: venv-${{ runner.os }}-${{ hashFiles(format('{0}/.python-version', inputs.workdir)) }}-${{ hashFiles(format('{0}/uv.lock', inputs.workdir)) }}-${{ hashFiles(format('{0}/uv.toml', inputs.workdir)) }}
 
     - name: Install dependencies
       shell: bash
@@ -66,7 +66,7 @@ runs:
       run: uv sync --extra all
 
     - name: Install Claude Code CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
       with:
         harness: claude
         version: ${{ inputs.claude-code-version }}

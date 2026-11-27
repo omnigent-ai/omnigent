@@ -6,6 +6,8 @@ import os
 import platform
 import plistlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from omnigent.cli_invocation import WRAPPER_COMMAND_ENV
 from omnigent.process_logging import data_dir
 
 LAUNCHD_LABEL = "ai.omnigent.host"
@@ -62,9 +65,41 @@ def _service_for_current_platform() -> HostService:
     )
 
 
-def _service_command(server_url: str | None) -> list[str]:
+def _wrapper_command(environment: Mapping[str, str]) -> list[str] | None:
+    """Return the configured CLI wrapper, resolved to an absolute path.
+
+    A wrapper's cache venv can be deleted between boots, so don't pin its interpreter.
+    """
+    configured = environment.get(WRAPPER_COMMAND_ENV, "").strip()
+    if not configured:
+        return None
+    try:
+        executable, *arguments = shlex.split(configured)
+    except ValueError as exc:
+        raise HostServiceError(f"Cannot parse {WRAPPER_COMMAND_ENV}={configured!r}.") from exc
+    resolved = shutil.which(executable, path=environment.get("PATH"))
+    if resolved is None:
+        raise HostServiceError(
+            f"Cannot find {executable!r} from {WRAPPER_COMMAND_ENV} on PATH; "
+            "the host service launches through it."
+        )
+    # Resolve parent traversal through symlinks, preserving the wrapper's final symlink.
+    try:
+        parent = os.path.realpath(os.path.dirname(resolved), strict=True)
+    except OSError as exc:
+        raise HostServiceError(f"Cannot resolve wrapper directory for {executable!r}.") from exc
+    absolute = os.path.join(parent, os.path.basename(resolved))
+    if shutil.which(absolute) is None:
+        raise HostServiceError(f"Cannot execute the resolved wrapper {absolute!r}.")
+    return [absolute, *arguments]
+
+
+def _service_command(server_url: str | None, environment: Mapping[str, str]) -> list[str]:
     """Build the persistent service entry-point command."""
     mode = ["--server", server_url] if server_url else ["--local"]
+    wrapper = _wrapper_command(environment)
+    if wrapper is not None:
+        return [*wrapper, "host-service-entry", *mode]
     return [sys.executable, "-P", "-m", "omnigent.host.service_entry", *mode]
 
 
@@ -74,8 +109,11 @@ def _clean_environment(environment: Mapping[str, str]) -> dict[str, str]:
     for key, value in environment.items():
         if not _ENV_NAME_RE.fullmatch(key):
             raise HostServiceError(f"Cannot persist invalid environment variable name {key!r}.")
-        if "\x00" in value or "\n" in value or "\r" in value:
-            raise HostServiceError(f"Cannot persist multiline environment variable {key!r}.")
+        # launchd plists turn a carriage return into a newline; NUL cannot reach a process env.
+        if "\x00" in value or "\r" in value:
+            raise HostServiceError(
+                f"Cannot persist environment variable {key!r} containing NUL or a carriage return."
+            )
         cleaned[key] = value
     return dict(sorted(cleaned.items()))
 
@@ -106,7 +144,9 @@ def _launchd_payload(
 
 def _systemd_quote(value: str, *, escape_dollar: bool = False) -> str:
     """Quote one systemd unit value without invoking a shell."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    escaped = (
+        value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("%", "%%")
+    )
     if escape_dollar:
         escaped = escaped.replace("$", "$$")
     return f'"{escaped}"'
@@ -130,7 +170,11 @@ def _systemd_unit(
         "[Service]",
         "Type=simple",
         *env_lines,
-        "ExecStart=" + " ".join(_systemd_quote(part, escape_dollar=True) for part in command),
+        # systemd expands dollars in arguments, but treats argv[0] literally.
+        "ExecStart="
+        + " ".join(
+            _systemd_quote(part, escape_dollar=index > 0) for index, part in enumerate(command)
+        ),
         "Restart=on-failure",
         "RestartPreventExitStatus=78 143",
         "RestartSec=10s",
@@ -278,6 +322,20 @@ def _forget_service(service: HostService) -> None:
         ) from exc
 
 
+def validate_user_host_service(
+    server_url: str | None,
+    *,
+    environment: Mapping[str, str],
+) -> None:
+    """Raise :class:`HostServiceError` if the host service cannot be defined.
+
+    :param server_url: Remote server URL, or ``None`` for local mode.
+    :param environment: Environment the service would persist.
+    """
+    _service_for_current_platform()
+    _service_command(server_url, _clean_environment(environment))
+
+
 def enable_user_host_service(
     server_url: str | None,
     *,
@@ -285,8 +343,8 @@ def enable_user_host_service(
 ) -> HostService:
     """Install, enable, and start the current user's host service."""
     service = _service_for_current_platform()
-    command = _service_command(server_url)
     clean_environment = _clean_environment(environment)
+    command = _service_command(server_url, clean_environment)
     if service.kind == "launchd":
         content = _launchd_payload(
             service,

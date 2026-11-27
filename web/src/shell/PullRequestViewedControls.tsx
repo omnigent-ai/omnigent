@@ -2,6 +2,7 @@
 // checkbox in each file's header, and the progress and "Hide viewed" row in the toolbar.
 // The Changes tab renders them only while viewed state is available.
 
+import type { RefObject } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Progress } from "@/components/ui/progress";
@@ -41,6 +42,7 @@ export function PullRequestViewedProgress({
   mobile,
   hideViewed,
   onHideViewedChange,
+  rowRef,
 }: {
   viewedCount: number;
   totalCount: number;
@@ -50,9 +52,14 @@ export function PullRequestViewedProgress({
   mobile: boolean;
   hideViewed: boolean;
   onHideViewedChange: (hide: boolean) => void;
+  /** Lets the Changes tab find the "Hide viewed" box to focus. */
+  rowRef: RefObject<HTMLDivElement | null>;
 }) {
   return (
-    <div className="flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground">
+    <div
+      ref={rowRef}
+      className="flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground"
+    >
       <span>{`${viewedCount} / ${totalCount} files viewed${partial ? " (partial)" : ""}`}</span>
       {!mobile && (
         <Progress

@@ -278,12 +278,64 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
     return [s for s in _dedup(provider(native_ctx)) if s.user_invocable]
 
 
+# Skills Omnigent ships, each for agents that have the tool group it drives.
+FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
+_FRAMEWORK_SKILL_GROUPS = {
+    "workflow": "journal",
+    "save-workflow": "journal",
+    "import-memory": "memory",
+    "gadget": "gadgets",
+}
+# These also need the server's workflows feature; the others follow their tool group alone
+# (the runner turns ``gadgets`` off for a server without gadgets).
+WORKFLOW_FRAMEWORK_SKILLS = frozenset({"workflow", "save-workflow"})
+
+
+def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
+    """Names of the skills Omnigent ships for the agent's tool groups, e.g. ``["workflow"]``.
+
+    Each lives in ``FRAMEWORK_SKILLS_DIR / name``. Without a spec, return every
+    framework name so reused bundles can remove disabled framework-owned links.
+    """
+    return [
+        name
+        for name, group in _FRAMEWORK_SKILL_GROUPS.items()
+        if spec is None or getattr(spec.tool_groups, group)
+    ]
+
+
+def framework_skills(spec: AgentSpec, *, workflows_enabled: bool = False) -> list[SkillSpec]:
+    """The skills Omnigent ships for the agent's tool groups, e.g. ``workflow``.
+
+    Like bundled skills, they ignore ``skills_filter``; an agent drops one by
+    turning its tool group off, e.g. ``tool_groups.journal: false``. A memory
+    skill follows the memory group alone, so a caller whose server has no memory
+    must turn that group off first (``omnigent.memory_availability``).
+
+    :param workflows_enabled: Whether the server offers workflows; required for
+        the workflow skills only.
+    """
+    names = {
+        name
+        for name in framework_skill_names(spec)
+        if workflows_enabled or name not in WORKFLOW_FRAMEWORK_SKILLS
+    }
+    if not names or not FRAMEWORK_SKILLS_DIR.is_dir():
+        return []
+    return [
+        skill
+        for skill in _discover_skills(FRAMEWORK_SKILLS_DIR, skipped=[])
+        if skill.name in names
+    ]
+
+
 def resolve_session_skills(
     spec: AgentSpec,
     roots: tuple[Path, ...],
     bundle_dir: Path | None,
     *,
     warnings: list[str] | None = None,
+    workflows_enabled: bool = False,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation."""
     from omnigent.harness_aliases import canonicalize_harness
@@ -315,6 +367,12 @@ def resolve_session_skills(
         if resolved_dir is not None:
             seen_dirs.add(resolved_dir)
         merged.append(skill)
+    # Last, so an agent's or user's own skill of the same name wins.
+    merged.extend(
+        skill
+        for skill in framework_skills(spec, workflows_enabled=workflows_enabled)
+        if skill.user_invocable and skill.name not in seen
+    )
     return merged
 
 
@@ -430,6 +488,31 @@ def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
     return hashlib.sha256(json.dumps([key, kind, source]).encode()).hexdigest()
 
 
+def _trusted_plugin_roots(plugins_root: Path) -> tuple[Path, ...]:
+    """The resolved plugins root and any usable user-linked shared cache target."""
+    # Profile managers (e.g. ccs) symlink ``plugins/cache`` to a cache shared
+    # across config dirs; its target is as trusted as the root that links it.
+    plugin_roots = [plugins_root]
+    cache_link = plugins_root / "cache"
+    try:
+        if cache_link.is_symlink():
+            # Strict: a non-strict resolve can lexically collapse ``..`` past a
+            # loop and name a real directory the link can't actually reach.
+            cache_target = cache_link.resolve(strict=True)
+            if cache_target.is_dir():
+                plugin_roots.append(cache_target)
+            else:
+                _log.warning(
+                    "Ignoring plugins cache %s: target %s is not a directory",
+                    cache_link,
+                    cache_target,
+                )
+    except (OSError, RuntimeError) as exc:
+        # A loop or dangling link raises here; the root alone keeps other plugins usable.
+        _log.warning("Ignoring unresolvable plugins cache %s: %s", cache_link, exc)
+    return tuple(plugin_roots)
+
+
 def _plugin_install_paths(
     ctx: SkillSourceContext, enabled: set[str] | None = None
 ) -> dict[str, Path]:
@@ -440,11 +523,9 @@ def _plugin_install_paths(
     plugins = data.get("plugins")
     if not isinstance(plugins, dict):
         return {}
-    # installPath values from installed_plugins.json are trusted only within
-    # the Claude plugins cache root; anything pointing elsewhere is logged and
-    # skipped so a tampered/odd manifest can't turn an arbitrary directory into
-    # a discovery root.
+    # Only user-owned plugin roots can become discovery roots.
     plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
+    plugin_roots = _trusted_plugin_roots(plugins_root)
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
         if (enabled is not None and key not in enabled) or not isinstance(entries, list):
@@ -459,15 +540,42 @@ def _plugin_install_paths(
             # A relative installPath is resolved against the plugins root
             # (its only sensible base), never the runner's cwd.
             path_obj = Path(path)
-            resolved = (path_obj if path_obj.is_absolute() else plugins_root / path_obj).resolve()
-            if not resolved.is_relative_to(plugins_root):
+            try:
+                resolved = (
+                    path_obj if path_obj.is_absolute() else plugins_root / path_obj
+                ).resolve()
+            except (OSError, RuntimeError) as exc:
                 _log.warning(
-                    "Skipping plugin %r: installPath %r is outside %s",
+                    "Skipping entry for plugin %r: installPath %r is unresolvable: %s",
                     key,
                     path,
-                    plugins_root,
+                    exc,
                 )
-                break
+                continue
+            if not any(resolved.is_relative_to(root) for root in plugin_roots):
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath is outside the trusted roots",
+                    key,
+                )
+                continue
+            # Python 3.13+ returns a dead path for a symlink loop instead of
+            # raising; only an existing directory can be the plugin's install.
+            # On 3.12, ``is_dir`` raises for an unsearchable parent directory.
+            try:
+                is_dir = resolved.is_dir()
+            except OSError as exc:
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is unreadable: %s",
+                    key,
+                    path,
+                    exc,
+                )
+                continue
+            if not is_dir:
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is not a directory", key, path
+                )
+                continue
             out[key] = resolved
             break
     return out

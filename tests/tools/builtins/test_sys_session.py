@@ -1440,6 +1440,8 @@ def test_session_list_schema_exposes_bounded_pagination() -> None:
     assert properties["cursor"]["type"] == "string"
     # Trigger-template managers pass it to find workers they archived.
     assert properties["include_archived"]["type"] == "boolean"
+    # Own sessions by default; other users' shared sessions only on request.
+    assert properties["visibility"]["enum"] == ["mine", "shared", "all"]
 
 
 def test_close_unknown_conversation_id_returns_not_found(

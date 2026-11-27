@@ -32,7 +32,8 @@ from pathlib import Path
 import pytest
 
 from omnigent.entities import Conversation
-from omnigent.runtime.policies.builder import build_policy_engine
+from omnigent.entities.pagination import PagedList, paginate_in_memory
+from omnigent.runtime.policies.builder import build_policy_engine, load_verified_session_tree
 from omnigent.spec.parser import parse
 from omnigent.spec.types import (
     AgentSpec,
@@ -41,6 +42,7 @@ from omnigent.spec.types import (
     Phase,
     PhaseSelector,
 )
+from omnigent.stores.conversation_store import SPAWN_TREE_READ_CAP
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -326,6 +328,148 @@ llm:
     )
 
     assert engine.usage["total_cost_usd"] == pytest.approx(expected_cost)
+
+
+def test_build_pricing_uses_named_provider_executor_auth(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session on a named provider seeds the cost gate at that provider's rate.
+
+    ``executor.auth`` names a non-default provider, so budget pricing must use
+    its rate ($10/M), not the anthropic family default's ($1/M).
+    """
+    agent_dir = _write_spec(
+        tmp_path,
+        """
+spec_version: 1
+name: named-provider-pricing
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+  auth:
+    type: provider
+    name: expensive-named
+llm:
+  model: self-hosted-model
+""",
+    )
+    spec = parse(agent_dir)
+    conv = conversation_store.create_conversation()
+
+    provider_config = {
+        "providers": {
+            "cheap-default": {
+                "kind": "local",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://cheap.example/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+                },
+            },
+            "expensive-named": {
+                "kind": "local",
+                "anthropic": {
+                    "base_url": "https://expensive.example/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
+                },
+            },
+        }
+    }
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: provider_config,
+    )
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+    engine.record_usage(
+        input_tokens=1_000_000,
+        output_tokens=0,
+        total_tokens=1_000_000,
+    )
+
+    # Named provider rate ($10/M), not the cheap family default ($1/M).
+    assert engine.usage["total_cost_usd"] == pytest.approx(10.0)
+
+
+def test_build_subagent_prices_on_its_own_named_provider(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A named sub-agent seeds its cost gate at ITS provider's rate, not the root's.
+
+    The root runs on the cheap default. The child spec pins the expensive named
+    provider, so its engine must price at $10/M even though the root's own
+    executor (and the family default) would give $1/M.
+    """
+    from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig, ProviderAuth
+
+    leaf = AgentSpec(
+        spec_version=1,
+        name="leaf",
+        executor=ExecutorSpec(
+            auth=ProviderAuth(name="expensive-named"), config={"harness": "claude-sdk"}
+        ),
+        llm=LLMConfig(model="self-hosted-model"),
+    )
+    root = AgentSpec(
+        spec_version=1,
+        name="root",
+        executor=ExecutorSpec(
+            auth=ProviderAuth(name="cheap-default"), config={"harness": "claude-sdk"}
+        ),
+        llm=LLMConfig(model="self-hosted-model"),
+        sub_agents=[leaf],
+    )
+    provider_config = {
+        "providers": {
+            "cheap-default": {
+                "kind": "local",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://cheap.example/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+                },
+            },
+            "expensive-named": {
+                "kind": "local",
+                "anthropic": {
+                    "base_url": "https://expensive.example/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
+                },
+            },
+        }
+    }
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: provider_config,
+    )
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title=_sub_agent_title(),
+        sub_agent_name="leaf",
+    )
+
+    engine = build_policy_engine(
+        spec=root,
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    engine.record_usage(input_tokens=1_000_000, output_tokens=0, total_tokens=1_000_000)
+
+    assert engine.usage["total_cost_usd"] == pytest.approx(10.0)
 
 
 def test_build_resolves_model_none_without_llm_or_override(
@@ -1210,6 +1354,86 @@ def test_build_issues_one_read_and_one_tree_scan(
     # A conversation read is a triplet (row + metadata + labels), and so is the
     # tree scan; the preload removes one whole triplet.
     assert len(executed) == (3 if preloaded else 6), [q[:80] for q in executed]
+
+
+def test_tree_load_reads_a_wide_tree_in_one_unpaged_scan(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A tree wider than a 100-row page still loads in one scan, unpaged.
+
+    Every policy check loads its session's spawn tree, so each further page
+    is paid on every tool call, and a paged tree costs the builder one more
+    confirming read.
+    """
+    root = conversation_store.create_conversation(title="wide-root")
+    for index in range(150):
+        conversation_store.create_conversation(
+            kind="sub_agent", parent_conversation_id=root.id, sub_agent_name=f"worker-{index}"
+        )
+
+    with _count_sql(conversation_store) as statements:
+        verified = load_verified_session_tree(root.id, conversation_store, root.id)
+
+    tree_scans = [q for q in statements if "root_conversation_id = " in " ".join(q.split())]
+    assert len(verified.rows) == 151
+    assert len(tree_scans) == 1, tree_scans
+    assert verified.paged is False
+
+
+class _InMemorySpawnTree:
+    """
+    One spawn tree held in memory and listed through the shared in-memory paginator.
+
+    The page boundary sits past 2,000 sub-agents, and writing that many rows
+    through a real store takes seconds; the tree load needs only the listing.
+    """
+
+    def __init__(self, sub_agents: int) -> None:
+        self.rows = [
+            Conversation(id="root", created_at=0, updated_at=0, root_conversation_id="root")
+        ]
+        self.rows += [
+            Conversation(
+                id=f"sub-{index:05d}",
+                created_at=0,
+                updated_at=0,
+                root_conversation_id="root",
+                kind="sub_agent",
+                parent_conversation_id="root",
+            )
+            for index in range(sub_agents)
+        ]
+        self.listings = 0
+
+    def list_conversations(
+        self, *, limit: int, after: str | None = None, **filters: object
+    ) -> PagedList[Conversation]:
+        self.listings += 1
+        return paginate_in_memory(
+            self.rows, lambda row: row.id, limit=limit, after=after, order="asc"
+        )
+
+
+@pytest.mark.parametrize(
+    ("sub_agents", "listings"),
+    [(SPAWN_TREE_READ_CAP, 1), (SPAWN_TREE_READ_CAP + 1, 2)],
+    ids=["at-the-cap", "one-past-the-cap"],
+)
+def test_tree_load_pages_only_past_one_bounded_tree_read(sub_agents: int, listings: int) -> None:
+    """
+    A tree one bounded tree read covers loads in one listing; one more row pages, in full.
+
+    Only a paged tree triggers the builder's confirming read, so the cutoff is
+    the root plus the sub-agent cap, and nothing past it may be dropped.
+    """
+    store = _InMemorySpawnTree(sub_agents)
+
+    verified = load_verified_session_tree("root", store, "root")  # type: ignore[arg-type]
+
+    assert [row.id for row in verified.rows] == [row.id for row in store.rows]
+    assert store.listings == listings
+    assert verified.paged is (listings > 1)
 
 
 def test_build_counts_archived_spend_and_inherits_approval(

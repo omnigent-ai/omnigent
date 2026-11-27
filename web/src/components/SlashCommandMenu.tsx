@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CircleAlertIcon,
+  CircleXIcon,
   CommandIcon,
   LoaderCircleIcon,
   PlugIcon,
@@ -11,7 +12,7 @@ import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 
 /**
@@ -28,11 +29,13 @@ import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/compact": "Compact conversation context to free up space",
   "/clear": "Clear the context and continue in a new chat on the same machine",
+  "/rewind": "Rewind the conversation to an earlier prompt and edit it",
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
   "/mcp": "Show MCP servers enabled for this session",
   "/permissions": "Change the approval mode for this session",
+  "/goal": "View or set the goal for this session",
   "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
@@ -161,13 +164,29 @@ export function rankedSlashCommandNames(
 /** Registry connection state for a `/mcp` row; host and custom rows have none. */
 export type McpServerConnection = "connected" | "sign-in-required" | "unavailable";
 
+/** The connection a session's running harness holds for a `/mcp` row. */
+export interface McpLiveConnection {
+  /**
+   * `connected`, `failed`, `needs-auth`, `pending`, `disabled`, or `not-loaded` when the
+   * harness's answer omits the server; others show as-is.
+   */
+  status: string;
+  error?: string | null;
+}
+
 /** One row of the `/mcp` inventory. */
 export interface McpServerRow {
+  /** Unique among the rows when two share a name; defaults to `name`. */
+  key?: string;
   name: string;
   description?: string | null;
   connection?: McpServerConnection;
   /** How a `sign-in-required` row signs in; absent rows offer no action. */
   signIn?: McpSignIn;
+  /** What the session's harness reports right now; absent when it reports nothing. */
+  live?: McpLiveConnection;
+  /** The harness's name for this server, for Reconnect; set only with a reported `live`. */
+  liveName?: string;
 }
 
 /**
@@ -189,11 +208,37 @@ const MCP_CONNECTION_LABEL: Record<McpServerConnection, string> = {
   unavailable: "Not available to your account",
 };
 
+// Maps, because a harness status such as `constructor` must not match an object key.
+const MCP_LIVE_LABEL = new Map<string, string>([
+  ["connected", "Connected"],
+  ["failed", "Failed"],
+  ["needs-auth", "Needs sign-in"],
+  ["pending", "Connecting…"],
+  ["disabled", "Disabled"],
+  // The harness answered without this server: it is not loaded in the session.
+  ["not-loaded", "Not loaded"],
+]);
+
+const MCP_LIVE_TONE = new Map<string, string>([
+  ["failed", "text-destructive"],
+  ["needs-auth", "text-amber-600 dark:text-amber-500"],
+]);
+
+/** Live states a Reconnect can change, as in Claude Code's own `/mcp`. */
+const MCP_RECONNECTABLE = new Set(["failed", "needs-auth"]);
+
+function mcpLiveLabel(live: McpLiveConnection): string {
+  const label = MCP_LIVE_LABEL.get(live.status) ?? live.status;
+  return live.status === "failed" && live.error ? `${label}: ${live.error}` : label;
+}
+
 interface SlashCommandMenuProps {
   /** The text typed after the leading ``/``, used to filter suggestions. */
   query: string;
   /** Index of the currently highlighted suggestion (-1 = none). */
   activeIndex: number;
+  /** Opens below the prompt's first line when the composer sits at the window top. */
+  placement?: "above" | "below";
   /** Called when the user selects a command (click or keyboard). */
   onSelect: (cmd: string) => void;
   /**
@@ -225,10 +270,31 @@ interface SlashCommandMenuProps {
   /** Row whose sign-in popup is open, if any. */
   mcpAuthorizingName?: string | null;
   mcpSignInError?: McpSignInError | null;
+  /** Reconnect a failed or needs-sign-in row in the session's harness, by its `liveName`. */
+  onMcpReconnect?: (liveName: string) => void;
+  /** `liveName` of the row reconnecting now, if any. */
+  mcpReconnectingName?: string | null;
+  /** A reconnect that failed, keyed by `liveName`. */
+  mcpReconnectError?: McpSignInError | null;
 }
 
-function McpConnectionIcon({ connection }: { connection?: McpServerConnection }) {
-  if (connection === "sign-in-required")
+function McpConnectionIcon({
+  connection,
+  live,
+}: {
+  connection?: McpServerConnection;
+  live?: McpLiveConnection;
+}) {
+  if (live?.status === "failed")
+    return <CircleXIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-destructive" />;
+  if (live?.status === "pending")
+    return (
+      <LoaderCircleIcon
+        aria-hidden="true"
+        className="mt-0.5 size-3.5 shrink-0 animate-spin text-muted-foreground"
+      />
+    );
+  if (live?.status === "needs-auth" || connection === "sign-in-required")
     return (
       <TriangleAlertIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
     );
@@ -239,14 +305,43 @@ function McpConnectionIcon({ connection }: { connection?: McpServerConnection })
         className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
       />
     );
+  const connected = live ? live.status === "connected" : connection === "connected";
   return (
     <PlugIcon
       aria-hidden="true"
       className={cn(
         "mt-0.5 size-3.5 shrink-0",
-        connection === "connected" ? "text-emerald-500" : "text-muted-foreground",
+        connected ? "text-emerald-500" : "text-muted-foreground",
       )}
     />
+  );
+}
+
+function McpReconnectAction({
+  server,
+  reconnecting,
+  disabled,
+  onReconnect,
+}: {
+  server: McpServerRow;
+  reconnecting: boolean;
+  /** Any row is reconnecting: the harness handles one control request at a time. */
+  disabled: boolean;
+  onReconnect: (liveName: string) => void;
+}) {
+  const liveName = server.liveName;
+  if (liveName === undefined) return null;
+  return (
+    <button
+      type="button"
+      data-testid={`mcp-reconnect-${server.name}`}
+      disabled={disabled}
+      className="flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-0.5 text-xs text-foreground hover:bg-muted disabled:opacity-60 dark:hover:bg-muted/50"
+      onClick={() => onReconnect(liveName)}
+    >
+      {reconnecting && <LoaderCircleIcon aria-hidden="true" className="size-3 animate-spin" />}
+      {reconnecting ? "Reconnecting…" : "Reconnect"}
+    </button>
   );
 }
 
@@ -308,6 +403,9 @@ interface McpServerRowsProps {
   onSignIn?: (name: string) => void;
   authorizingName?: string | null;
   signInError?: McpSignInError | null;
+  onReconnect?: (liveName: string) => void;
+  reconnectingName?: string | null;
+  reconnectError?: McpSignInError | null;
 }
 
 function McpServerRows({
@@ -316,8 +414,17 @@ function McpServerRows({
   onSignIn,
   authorizingName,
   signInError,
+  onReconnect,
+  reconnectingName,
+  reconnectError,
 }: McpServerRowsProps) {
-  if (!servers?.length && !status) {
+  // With live status unavailable no row carries the harness's name, so the
+  // refusal shows for the panel rather than being lost.
+  const unmatchedReconnectError =
+    reconnectError && !servers?.some((server) => server.liveName === reconnectError.name)
+      ? reconnectError
+      : null;
+  if (!servers?.length && !status && !unmatchedReconnectError) {
     return (
       <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
         No MCP servers enabled for this session.
@@ -328,14 +435,21 @@ function McpServerRows({
     <>
       {servers?.map((server) => {
         const needsSignIn = server.connection === "sign-in-required";
+        const live = server.live;
+        const liveTrouble = live !== undefined && MCP_RECONNECTABLE.has(live.status);
+        const rowReconnectError =
+          // Once the row recovers, an old failure no longer describes it.
+          liveTrouble && reconnectError && reconnectError.name === server.liveName
+            ? reconnectError
+            : null;
         return (
           <div
-            key={server.name}
+            key={server.key ?? server.name}
             data-testid={`mcp-server-row-${server.name}`}
             className="rounded-md px-2 py-1.5"
           >
             <div className="flex items-start gap-2">
-              <McpConnectionIcon connection={server.connection} />
+              <McpConnectionIcon connection={server.connection} live={live} />
               <div className="min-w-0 flex-1">
                 <div className="text-ui text-foreground">{server.name}</div>
                 {server.description && (
@@ -350,7 +464,19 @@ function McpServerRows({
                       needsSignIn ? "text-amber-600 dark:text-amber-500" : "text-muted-foreground",
                     )}
                   >
+                    {live ? "Account: " : ""}
                     {MCP_CONNECTION_LABEL[server.connection]}
+                  </div>
+                )}
+                {live && (
+                  <div
+                    data-testid={`mcp-live-status-${server.name}`}
+                    className={cn(
+                      "break-words text-xs leading-4",
+                      MCP_LIVE_TONE.get(live.status) ?? "text-muted-foreground",
+                    )}
+                  >
+                    In this session: {mcpLiveLabel(live)}
                   </div>
                 )}
               </div>
@@ -362,15 +488,38 @@ function McpServerRows({
                   onSignIn={onSignIn}
                 />
               )}
+              {/* Signing in comes first; the row offers Reconnect once the account is connected. */}
+              {liveTrouble && !needsSignIn && onReconnect && (
+                <McpReconnectAction
+                  server={server}
+                  reconnecting={Boolean(reconnectingName) && reconnectingName === server.liveName}
+                  disabled={Boolean(reconnectingName)}
+                  onReconnect={onReconnect}
+                />
+              )}
             </div>
             {signInError?.name === server.name && (
               <div role="alert" className="mt-1 pl-5 text-xs leading-4 text-destructive">
                 {signInError.message}
               </div>
             )}
+            {rowReconnectError && (
+              <div role="alert" className="mt-1 pl-5 text-xs leading-4 text-destructive">
+                Reconnect failed: {rowReconnectError.message}
+              </div>
+            )}
           </div>
         );
       })}
+      {unmatchedReconnectError && (
+        <div
+          role="alert"
+          data-testid="mcp-reconnect-error"
+          className="break-words px-2 py-1 text-xs leading-4 text-destructive"
+        >
+          Reconnecting {unmatchedReconnectError.name} failed: {unmatchedReconnectError.message}
+        </div>
+      )}
       {status && (
         <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
           {status}
@@ -464,12 +613,12 @@ function MenuRowButton({
   const { name, isBuiltin } = row;
   const descriptionRef = useRef<HTMLSpanElement>(null);
   const hoverTimerRef = useRef<number | undefined>(undefined);
-  const coarsePointer = useIsCoarsePointer();
-  // A highlight resting on a cut-off row opens its tooltip, except on touch screens where most
+  const mobileViewport = useIsMobileViewport();
+  // A highlight resting on a cut-off row opens its tooltip, except in the mobile layout where most
   // rows are cut off; a highlight move or new description closes it and drops a pending hover.
   useEffect(() => {
     const timer =
-      active && !coarsePointer
+      active && !mobileViewport
         ? window.setTimeout(
             () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
             DESCRIPTION_TOOLTIP_DELAY_MS,
@@ -481,7 +630,7 @@ function MenuRowButton({
       hoverTimerRef.current = undefined;
       onTooltipOpenChange(name, false);
     };
-  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange, row.description]);
+  }, [active, activeIndex, mobileViewport, name, onTooltipOpenChange, row.description]);
   const tooltipRef = useRef<HTMLDivElement>(null);
   // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
   useEffect(() => {
@@ -589,11 +738,13 @@ function MenuRowButton({
  * Only commands whose name (sans ``/``) contains the current query as a
  * case-insensitive substring are shown.
  * Positioned via ``absolute bottom-full`` relative to the rounded
- * composer container. Exported for direct unit testing.
+ * composer container, or below its first line when ``placement`` is
+ * ``below``. Exported for direct unit testing.
  */
 export function SlashCommandMenu({
   query,
   activeIndex,
+  placement = "above",
   onSelect,
   commands,
   builtinNames = DEFAULT_BUILTIN_NAMES,
@@ -609,6 +760,9 @@ export function SlashCommandMenu({
   onMcpSignIn,
   mcpAuthorizingName,
   mcpSignInError,
+  onMcpReconnect,
+  mcpReconnectingName,
+  mcpReconnectError,
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query, builtinNames, labels);
   const listRef = useRef<HTMLDivElement>(null);
@@ -634,6 +788,9 @@ export function SlashCommandMenu({
         onSignIn={onMcpSignIn}
         authorizingName={mcpAuthorizingName}
         signInError={mcpSignInError}
+        onReconnect={onMcpReconnect}
+        reconnectingName={mcpReconnectingName}
+        reconnectError={mcpReconnectError}
       />
     );
   if (matchedNames.length === 0 && skillsStatus == null) return null;
@@ -662,10 +819,16 @@ export function SlashCommandMenu({
     <TooltipProvider>
       <div
         data-testid="slash-command-menu"
-        className="menu-surface mobile-menu-glass absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
+        className={cn(
+          "menu-surface mobile-menu-glass absolute right-0 left-0 z-30 w-full rounded-[16px] border border-border bg-popover p-2 shadow-menu",
+          placement === "above"
+            ? "bottom-full mb-2 overflow-hidden"
+            : "top-11 flex max-h-[calc(100%-2.75rem)] flex-col overflow-hidden",
+        )}
       >
         <MobileMenuGlassSurface />
-        <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
+        {/* The list is the only scroller, also when the menu is capped below the prompt. */}
+        <div ref={listRef} className="max-h-[22rem] min-h-0 overflow-y-auto">
           {builtinRows.length > 0 && sectionHeader("Commands")}
           {builtinRows.map((row) => (
             <MenuRowButton

@@ -109,8 +109,9 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     # At rest on a desktop viewport the row is fully transparent — the
     # timestamp must not permanently occupy visual space.
     expect(user_row).to_have_css("opacity", "0")
-    # The compact user footer reserves its 20px height while hidden.
-    assert round(user_row.bounding_box()["height"]) == 20
+    # The compact user footer, which also holds the always-visible steering
+    # note, reserves its 20px height while the actions are hidden.
+    assert round(user_row.locator("..").bounding_box()["height"]) == 20
 
     user_bubble.hover()
     expect(user_row).to_have_css("opacity", "1")

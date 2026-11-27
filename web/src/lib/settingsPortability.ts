@@ -7,16 +7,28 @@
 // holds a non-default value.
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
+import {
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
+  notifyCodeBlockWordWrapChanged,
+} from "./codeWrapPreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import {
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
   notifyFoldAssistantNarrationChanged,
 } from "./foldNarrationPreferences";
 import {
+  notifyPeerSessionMessageDisplayChanged,
+  PEER_SESSION_MESSAGES_STORAGE_KEY,
+} from "./peerSessionMessagePreferences";
+import {
   notifyProjectFolderPaginationChanged,
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
 } from "./projectFolderPaginationPreferences";
+import {
+  notifySessionRowQuickActionsChanged,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+} from "./sessionRowQuickActionsPreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
@@ -25,7 +37,9 @@ import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
 } from "./sessionWorkspaceState";
+import { notifyTerminalThemeChanged } from "./terminalThemePreferences";
 import {
+  notifyWorkspaceTabPreferencesChanged,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
@@ -38,6 +52,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:code-font-size",
   "omnigent:code-font-family",
   "omnigent:code-font-weight",
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
   "omnigent:terminal-theme",
   "omnigent:ui-theme-palette",
   "omnigent:custom-theme",
@@ -47,8 +62,10 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  PEER_SESSION_MESSAGES_STORAGE_KEY,
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
@@ -175,11 +192,16 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyHiddenPickerAgentsChanged();
   notifyProjectFolderPaginationChanged();
   notifyFoldAssistantNarrationChanged();
+  notifyCodeBlockWordWrapChanged();
+  notifyPeerSessionMessageDisplayChanged();
+  notifySessionRowQuickActionsChanged();
+  notifyTerminalThemeChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);
   if (previousDefault !== readDefaultWorkspaceTab()) {
     resetSessionWorkspaceTabSelections();
   }
+  notifyWorkspaceTabPreferencesChanged();
   return count;
 }

@@ -17,6 +17,7 @@
  *    detached on hide and destroyed only on explicit close.
  */
 
+const { randomUUID } = require("node:crypto");
 const {
   checkAgentNavigation,
   isAgentConnectionAllowed,
@@ -26,8 +27,18 @@ const {
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const { isDesktopOpenRequest } = require("./desktopOpenServer");
+const { createAgentNavigation } = require("./agentNavigation");
+const { hasHostLocalAccess } = require("./hostIdentity");
+const { agentInputInFlight } = require("./browserInput");
+const {
+  forwardedKeydown,
+  matchesForwardedChord,
+  normalizeForwardedChords,
+} = require("./browserForwardedChords");
 
-const DEFAULT_CAP = 10;
+// Each view is a separate renderer process; the cap bounds memory per window.
+const DEFAULT_CAP = 20;
 
 // Map WebSocket handshakes onto the HTTP URL rules.
 function httpUrlForWebSocket(url) {
@@ -82,6 +93,10 @@ function createBrowserViewRegistry({
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
   isHostFocused = () => true,
+  // Give the shell window keyboard focus, for a chord forwarded from a page.
+  focusHost = () => {},
+  // Which keys write text depends on the OS (AltGr arrives as Ctrl+Alt off the Mac).
+  platform = process.platform,
   // Desktop affordances for the pane's context menu; injected so the registry
   // stays Electron-free. No-op defaults keep tests and non-menu hosts simple.
   openUrlExternal = () => {}, // (url) => shell.openExternal(url)
@@ -94,6 +109,7 @@ function createBrowserViewRegistry({
   resolveHost = lookupHostAddresses,
   resolveProxy = async () => "DIRECT",
   cap = DEFAULT_CAP,
+  historyLoadTimeoutMs = 10_000,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
@@ -101,19 +117,25 @@ function createBrowserViewRegistry({
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
 
-  function beginAgentNavigation(conversationId) {
-    const generation = Symbol();
+  // A continuation consumes its original generation without superseding a newer navigation.
+  function beginAgentNavigation(conversationId, retryToken) {
+    if (retryToken !== undefined && pendingNavigations.get(conversationId) !== retryToken) {
+      return null;
+    }
+    const generation = randomUUID();
     pendingNavigations.set(conversationId, generation);
-    return () => pendingNavigations.get(conversationId) === generation;
+    return Object.assign(() => pendingNavigations.get(conversationId) === generation, {
+      retryToken: generation,
+    });
   }
   const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
 
   function needsAgentViewRevocation(entry, nextContext) {
     const context = entry?.agentContext;
     return (
-      context?.hostIsThisMachine === true &&
+      hasHostLocalAccess(context) &&
       (context.revoked ||
-        !nextContext?.hostIsThisMachine ||
+        !hasHostLocalAccess(nextContext) ||
         nextContext.sourceHostId !== context.sourceHostId)
     );
   }
@@ -142,6 +164,13 @@ function createBrowserViewRegistry({
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
   let recentSessionSwitchSupported = false;
+  // The app chords the renderer handles itself; none until a renderer that handles them asks.
+  let forwardedChords = [];
+  // The list a started host navigation set aside, until a new document commits or the old one stays.
+  let heldForwardedChords = null;
+  // Set by an SPA that opens `browser-open-tab` requests as new tabs; an older
+  // SPA would drop them, so modifier-clicks navigate in place until declared.
+  let openTabSupported = false;
 
   // Apply the current suppress flag to the active view (no-op with none active).
   function applyActiveVisibility() {
@@ -225,13 +254,13 @@ function createBrowserViewRegistry({
     return { ok: true, entry, created: true };
   }
 
-  // Popups stay in this view: an agent-visited page opening the user's system
-  // browser is an abuse vector. Programmatic loadURL skips will-navigate,
-  // so enforce navigation policy here too when enabled.
+  // Popups never open the system browser (an abuse vector for agent-visited
+  // pages): background-tab clicks go to a supporting renderer as new tabs, others
+  // load in this view. loadURL skips will-navigate, so enforce policy here.
   function installWindowOpenPolicy(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
-    wc.setWindowOpenHandler(({ url }) => {
+    wc.setWindowOpenHandler(({ url, disposition }) => {
       let parsed;
       try {
         parsed = new URL(url);
@@ -254,7 +283,12 @@ function createBrowserViewRegistry({
           return { action: "deny" };
         }
       }
+      if (disposition === "background-tab" && openTabSupported) {
+        sendToRenderer("browser-open-tab", { conversationId: entry.conversationId, url });
+        return { action: "deny" };
+      }
       try {
+        beginAgentNavigation(entry.conversationId);
         wc.loadURL(url);
       } catch {
         /* view destroyed mid-click */
@@ -272,6 +306,8 @@ function createBrowserViewRegistry({
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     wc.on("context-menu", (_event, params) => {
+      // An agent's right-click opens the page's own menu, never the shell's.
+      if (entry.suppressContextMenuUntil > Date.now()) return;
       const items = [];
       if (params.linkURL) {
         if (/^https?:\/\//i.test(params.linkURL)) {
@@ -314,9 +350,14 @@ function createBrowserViewRegistry({
           url: targetUrl,
           error: verdict.error,
         });
+        // Lets agent history navigation report the block.
+        if (event?.isMainFrame !== false) entry.agentNavBlockedError = verdict.error;
       }
     };
-    wc.on("will-navigate", guard);
+    wc.on("will-navigate", (event, targetUrl) => {
+      beginAgentNavigation(conversationId);
+      guard(event, targetUrl);
+    });
     wc.on("will-redirect", guard);
     // Subframe navigations (iframes) can also reach an internal host; guard them
     // too. Older Electron may not emit this event — harmless if it never fires.
@@ -361,10 +402,55 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
+  function setOpenTabSupported(supported) {
+    openTabSupported = !!supported;
+    return { ok: true };
+  }
+
+  // During a host navigation an update waits with the held list: the old renderer that sent it
+  // may stay, and a replacement document asks for its own keys.
+  function setForwardedChords(chords) {
+    const chordList = normalizeForwardedChords(chords);
+    if (heldForwardedChords !== null) heldForwardedChords = chordList;
+    else forwardedChords = chordList;
+    return { ok: true, count: chordList.length };
+  }
+
+  // A navigation may replace the renderer with a bundle that never asks, so pages keep their
+  // keys until it ends; a navigation that supersedes another keeps the list already held.
+  function holdForwardedChords() {
+    if (heldForwardedChords === null) heldForwardedChords = forwardedChords;
+    forwardedChords = [];
+  }
+
+  // The navigation ended: `restore` when the old renderer stayed, so its keys work again.
+  function releaseForwardedChords(restore) {
+    if (heldForwardedChords === null) return;
+    if (restore) forwardedChords = heldForwardedChords;
+    heldForwardedChords = null;
+  }
+
+  // Hand the renderer's app chords to it, focused, so ⌘K acts as if the page weren't there.
+  function forwardAppChord(event, input) {
+    if (!matchesForwardedChord(forwardedChords, input, platform)) return false;
+    event.preventDefault();
+    focusHost();
+    sendToRenderer("browser-forwarded-input", forwardedKeydown(input));
+    return true;
+  }
+
   function attachRecentSessionInput(entry) {
-    const wc = entry.view && entry.view.webContents;
+    // Another view taking keys for the page (the design tools' overlay) forwards them too.
+    entry.forwardRecentSessionInput = (wc) => forwardRecentSessionInputFrom(entry, wc);
+    forwardRecentSessionInputFrom(entry, entry.view && entry.view.webContents);
+  }
+
+  function forwardRecentSessionInputFrom(entry, wc) {
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
+      // An agent's key presses are for the page, never the shell.
+      if (agentInputInFlight(wc)) return;
+      if (forwardAppChord(event, input)) return;
       if (!recentSessionSwitchSupported) return;
       const type =
         input && input.type === "keyDown"
@@ -416,6 +502,15 @@ function createBrowserViewRegistry({
     });
   }
 
+  // Agent viewport sizing and back / forward / reload.
+  const agentNavigation = createAgentNavigation({
+    entries,
+    isActive: (conversationId) => activeConversationId === conversationId,
+    checkAgentNavigationFor,
+    historyLoadTimeoutMs,
+    beginAgentNavigation,
+  });
+
   function entryForWebContents(webContentsId) {
     for (const entry of entries.values()) {
       try {
@@ -462,6 +557,8 @@ function createBrowserViewRegistry({
   // IP literals and exact loopback names need only the URL check; `*.localhost`
   // must also be on a direct route so a proxy never receives the request.
   async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+    // A page in an embedded browser pane must not steer the user's main window.
+    if (isDesktopOpenRequest(url)) return true;
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
@@ -747,6 +844,7 @@ function createBrowserViewRegistry({
     needsAgentViewRevocation,
     revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
+    ...agentNavigation,
     shouldCancelAgentRequest,
     agentRequestHeaders,
     shouldCancelAgentResponse,
@@ -754,6 +852,10 @@ function createBrowserViewRegistry({
     setSuppressed,
     cancelRecentSessionSwitch,
     setRecentSessionSwitchSupported,
+    setForwardedChords,
+    holdForwardedChords,
+    releaseForwardedChords,
+    setOpenTabSupported,
     close,
     closeAll,
     // Introspection

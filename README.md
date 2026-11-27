@@ -223,9 +223,35 @@ local server (pass `--force` to stop them immediately); the next `omni` command
 brings the server back up on the new version. Source checkouts update with
 `git pull` instead. Silence the notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
 
+If a `uv tool` install fails to start a sandbox with a `mutable hard-link alias`
+error, reinstall its dependencies as copies. The check depends on the installed
+runtime layout, including installations made by older releases:
+
+```bash
+uv tool upgrade --reinstall --link-mode copy omnigent
+```
+
 The check queries your configured package index — honoring `UV_INDEX_URL` /
 `PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
 mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
+
+**Nightly builds.** Every night (about 04:30 UTC) the newest commit on `main`
+with green CI is tagged as a `vX.Y.Z.devYYYYMMDD` prerelease. Nightlies are git
+tags, not PyPI releases, so installing one builds from source and needs `git`,
+Node.js 22+, and `pnpm`:
+
+```bash
+omni upgrade --nightly          # move onto the newest nightly
+omni upgrade --nightly --check  # report whether a newer nightly is out
+```
+
+A nightly install shows no release notice, and plain `omni upgrade` keeps it on
+its current tag, so rerun `omni upgrade --nightly` (or schedule
+[`scripts/update_nightly.sh`](scripts/update_nightly.sh)) to stay current. When
+the desktop app starts a local server it uses your installed `omni`, so it
+serves the nightly web UI; the desktop app itself updates only with stable
+releases. To return to the latest stable release, rerun the install script
+above (with the same `--extra` flags, if any).
 
 </details>
 
@@ -304,6 +330,28 @@ omnigent pi                          # Pi
 omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
 ```
 
+<details>
+<summary>Forward variables from your shell to one session</summary>
+
+Sessions run under the host daemon, which may have started from a different
+shell, so your terminal's variables don't reach the agent by default. To
+forward specific ones to the session you're launching, list their names:
+
+```bash
+OMNIGENT_SESSION_ENV_PASSTHROUGH=TERMINAL_PANE_SOCKET,TOOL_TOKEN omnigent claude
+```
+
+The values go only to the runner this command launches, through an owner-only
+file the local daemon deletes at launch. They aren't sent to the server or
+stored. They become part of that runner's environment, so the agent and any
+stdio MCP server that declares `env` inherit them too. A session whose runner is
+already running keeps its original values, and a runner the server relaunches
+later (for example, after an idle timeout) starts without them. Names starting
+with `OMNIGENT` and `RUNNER_SERVER_URL` are rejected. Forwarding isn't
+available on Windows yet.
+
+</details>
+
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 
@@ -364,12 +412,11 @@ inference config: Omnigent then writes a session-private Jcode config and
 forwards the agent's `model`. Jcode's ACP server ignores session-scoped MCP
 servers, so Omnigent's MCP tools are not offered to it.
 
-Use the vendor login rather than an API key. A builtin ACP row has no
-`env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
-credential allowlist, so exporting it in your shell does not reach the agent.
-If you need the key route, pass it explicitly with
-`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
-declares the passthrough.
+Use the vendor login or explicitly forward an API key. The builtin Grok row
+declares `XAI_API_KEY` for runner-to-Grok forwarding. Host-to-runner forwarding
+still requires `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`; exporting the key
+in your host shell alone does not reach a host-managed runner. Custom `acp:`
+agents can declare their own passthrough variables.
 
 </details>
 
@@ -386,6 +433,12 @@ omnigent run examples/deep-research/
 omnigent run examples/polly/ --harness <harness>
 omnigent run examples/debby/ --harness <harness>
 ```
+
+Add `-p "your prompt"` to run headlessly. The CLI waits up to 30 minutes for
+first-turn recovery or additional asynchronous turns. Set
+`OMNIGENT_HEADLESS_TIMEOUT_S` to a positive finite number of seconds for that
+invocation to change this wait budget; separate process or job deadlines still
+apply.
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
 She's the tech lead: she plans, delegates the work to coding sub-agents
@@ -475,11 +528,79 @@ session_title_instructions: |
 Server operators can set the same key in the YAML passed to
 `omnigent server --config`.
 
+Each user can also add personal requirements under Settings → General →
+**Title instructions** in the web UI, up to 4,000 characters. The server stores
+them per user and adds them after the server's `session_title_instructions`
+when titling that user's sessions; where the two conflict, the personal ones
+win. Leave the field blank to use only the server setting or the default
+prompt. Runners older than this server accept at most 4,000 characters, so for
+them the server shortens longer guidance: it drops the language rule first,
+then the server's instructions, and keeps the personal ones.
+
 Claude Code sessions generate titles with the `haiku` model alias. If that
 model answers the message instead of returning a title, set
 `OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL` to another Claude model alias, such as
 `sonnet`, in the environment of the `omnigent` or `omnigent host` process that
 runs the session.
+
+</details>
+
+<details>
+<summary>Limit which MCP servers launched agents load</summary>
+
+By default, Claude Code and Codex sessions that Omnigent launches load the same
+MCP servers as the CLI on its own. To restrict inherited file-configured servers to Omnigent's tools plus
+servers you name (within the limits below), add this to `~/.omnigent/config.yaml`:
+
+```yaml
+mcp:
+  inherit: false
+  allow: [github] # optional; Omnigent's own `omnigent` server is always kept
+harness:
+  codex-native:
+    mcp:
+      inherit: true # optional per-harness override
+```
+
+This applies to `omnigent claude`, `omnigent codex`, and Claude/Codex SDK
+sessions started on this machine, including new sessions and cold resumes.
+Claude receives an `allowedMcpServers` setting, plus a `deniedMcpServers`
+entry for each other entry in the `allowedMcpServers` lists of your user,
+project, local and managed Claude settings (project and local files are read
+from the launch directory, its Git root and, for a linked worktree, the main
+checkout); Claude would otherwise combine those
+lists with Omnigent's. Servers other than allowed ones in `managed-mcp.json` are
+denied by name, since Claude does not apply the allowlist to them. This also covers
+`managedMcpServers` in managed settings and their drop-ins. A `serverUrl`
+entry stops the launch when an allowed server uses HTTP or SSE, even if the
+URL pattern differs: Claude then admits remote servers by URL alone and ignores
+their names. Any `serverCommand` entry also stops the launch: Claude admits stdio
+servers by command alone, which would bypass the names or reject Omnigent's relay. Codex
+receives `-c mcp_servers.<name>.enabled=false` for every other server it would
+load from the system, user, trusted project, command-line, and managed config
+layers; a managed `enabled = true` for any other server stops the launch, since
+that layer outranks the override. For host-launched native Claude sessions,
+Claude's settings are read for the launched CLI's working directory and
+environment, including a configured `env -C` or `CLAUDE_CONFIG_DIR` wrapper.
+Strict mode refuses `env` wrapper forms whose launch environment cannot be resolved.
+Arbitrary Claude launcher scripts can change that context or discard injected settings;
+strict discovery does not inspect them. Use Claude directly or a supported `env` wrapper
+when relying on the allowlist.
+A file-managed `allowManagedMcpServersOnly: true` also stops strict launches,
+because Claude can ignore the invocation allowlist. These checks inspect managed
+settings files and their drop-ins. Claude remote, MDM and Windows registry
+managed-policy sources are not inspected.
+If one of those Claude settings or
+Codex config files exists but cannot be read or parsed, or a `-c mcp_servers`
+override is not a TOML table, the launch stops with an error naming it. A malformed `inherit` or `allow` value is
+ignored with a warning, so `inherit: false` with an invalid `allow` allows only
+`omnigent`; an unreadable `config.yaml` inherits everything. Your own Claude
+and Codex configuration files are not modified, and project
+`.omnigent/config.yaml` files cannot change this setting. Per-harness keys are
+`claude-native`, `claude-sdk` (or `claude`), `codex-native`, and `codex`.
+Claude plugin MCP servers cannot be allowlisted by name, so strict mode blocks
+them. Codex plugin MCP servers are not discovered, so strict mode does not
+disable them.
 
 </details>
 

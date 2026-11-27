@@ -1,4 +1,5 @@
 import userEvent from "@testing-library/user-event";
+import type { Element as HastElement, Root as HastRoot } from "hast";
 import {
   cleanup,
   fireEvent,
@@ -12,9 +13,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import type { AnyBlock } from "@/lib/blocks";
+import { CODE_BLOCK_WORD_WRAP_STORAGE_KEY, readCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import { setEmbedRoot } from "@/lib/host";
 import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
+import { ShellCommandContext } from "@/shell/ShellCommandContext";
 import { Reasoning, ReasoningContent } from "./reasoning";
 import {
   hasOpenCodeFence,
@@ -29,6 +32,7 @@ const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype,
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
 
 afterEach(() => {
+  localStorage.removeItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY);
   setEmbedRoot(null);
   vi.unstubAllGlobals();
   cleanup();
@@ -123,6 +127,46 @@ describe("MessageResponse", () => {
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
   });
 
+  describe("rehypePluginsAfterSanitizing", () => {
+    // Puts a remote image where the text says IMAGE, which hardening would otherwise block.
+    const addImage = () => (tree: HastRoot) => {
+      const replace = (parent: HastRoot | HastElement) => {
+        parent.children = parent.children.map((child) =>
+          child.type === "text" && child.value === "IMAGE"
+            ? {
+                type: "element",
+                tagName: "img",
+                properties: { src: "https://example.com/added.png", alt: "added" },
+                children: [],
+              }
+            : child,
+        ) as typeof parent.children;
+        for (const child of parent.children) if (child.type === "element") replace(child);
+      };
+      replace(tree);
+    };
+    const PLUGINS = [addImage];
+
+    it("runs the caller's plugins once sanitizing and hardening are done", async () => {
+      render(<MessageResponse rehypePluginsAfterSanitizing={PLUGINS}>IMAGE</MessageResponse>);
+      expect(await screen.findByRole("img", { name: "added" })).toHaveAttribute(
+        "src",
+        "https://example.com/added.png",
+      );
+    });
+
+    // Without the prop, "blocks external image markdown and renders a placeholder" covers this.
+    it("keeps blocking external images with an empty list", async () => {
+      render(
+        <MessageResponse rehypePluginsAfterSanitizing={[]}>
+          {"![leak](https://attacker.example/pixel.png) IMAGE"}
+        </MessageResponse>,
+      );
+      expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
+      expect(screen.queryByRole("img")).toBeNull();
+    });
+  });
+
   describe("allowGitHubAttachmentImages", () => {
     const asset = "https://github.com/user-attachments/assets/381e47c8-e3f1-4c3e-9b3d-aac5cfb3557b";
 
@@ -183,6 +227,52 @@ describe("MessageResponse", () => {
       expect(await screen.findByText("[Image blocked: shot]")).toBeTruthy();
     });
 
+    it.each([
+      ["its own paragraph", `Demo:\n\n${asset}\n\nAfter`],
+      ["its own line", `Demo:\n${asset}\nAfter`],
+    ])("plays a bare GitHub attachment URL on %s as a video", async (_case, markdown) => {
+      render(<MessageResponse allowGitHubAttachmentImages>{markdown}</MessageResponse>);
+
+      await screen.findByText(/Demo:/);
+      const video = document.querySelector("video");
+      expect(video).toHaveAttribute("src", asset);
+      expect(video).toHaveAttribute("controls");
+      expect(video).toHaveAttribute("preload", "metadata");
+      expect(screen.queryByRole("link")).toBeNull();
+    });
+
+    it.each([
+      ["a titled link", `[clip](${asset})`],
+      ["a URL inside a sentence", `See ${asset} for the clip`],
+      ["another host", "https://attacker.example/clip.mp4"],
+      ["a query string", `${asset}?q=secret`],
+    ])("leaves %s a link", async (_case, markdown) => {
+      render(<MessageResponse allowGitHubAttachmentImages>{markdown}</MessageResponse>);
+
+      expect(await screen.findByRole("link")).toBeTruthy();
+      expect(document.querySelector("video")).toBeNull();
+    });
+
+    it("doesn't treat a raw parked-video tag as a GitHub video", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {
+            'before <omnigent-github-video src="https://evil.example/x.mp4"></omnigent-github-video>'
+          }
+        </MessageResponse>,
+      );
+
+      await screen.findByText(/before/);
+      expect(document.querySelector("video")).toBeNull();
+    });
+
+    it("leaves a bare GitHub attachment URL a link without the option", async () => {
+      render(<MessageResponse>{asset}</MessageResponse>);
+
+      expect(await screen.findByRole("link", { name: asset })).toHaveAttribute("href", asset);
+      expect(document.querySelector("video")).toBeNull();
+    });
+
     it("leaves links as the default renderer treats them", async () => {
       render(
         <MessageResponse allowGitHubAttachmentImages>
@@ -192,6 +282,54 @@ describe("MessageResponse", () => {
 
       expect(await screen.findByText(/\[blocked\]/)).toHaveTextContent("docs [blocked]");
       expect(screen.getByRole("link", { name: "root" })).toHaveAttribute("href", "/README.md");
+    });
+  });
+
+  describe("Omnigent session deep links", () => {
+    const sessionLink = "omnigent://127.0.0.1:53694/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
+
+    it.each([
+      ["a markdown link", `[the worker chat](${sessionLink})`, "the worker chat"],
+      ["an autolink", `<${sessionLink}>`, sessionLink],
+      ["a raw HTML anchor", `<a href="${sessionLink}">worker</a>`, "worker"],
+    ])("keeps %s clickable", async (_case, markdown, name) => {
+      render(<MessageResponse>{markdown}</MessageResponse>);
+
+      const link = await screen.findByRole("link", { name });
+      expect(link).toHaveAttribute("href", sessionLink);
+      expect(screen.queryByText(/\[blocked\]/)).toBeNull();
+    });
+
+    it("keeps a session link clickable among file links", async () => {
+      render(<MessageResponse markFileLinks>{`[worker](${sessionLink})`}</MessageResponse>);
+
+      expect(await screen.findByRole("link", { name: "worker" })).toHaveAttribute(
+        "href",
+        sessionLink,
+      );
+    });
+
+    it.each([
+      ["another custom scheme", "vscode://file/tmp/x.py"],
+      ["another Omnigent path", "omnigent://127.0.0.1:53694/settings"],
+      ["the server root", "omnigent://127.0.0.1:53694/"],
+      ["a nested chat path", "omnigent://127.0.0.1:53694/c/abc/files"],
+      ["a query string", `${sessionLink}?desktop_ack=1:${"a".repeat(64)}`],
+      ["an empty query", `${sessionLink}?`],
+      ["a fragment", `${sessionLink}#x`],
+      ["credentials", "omnigent://user:secret@127.0.0.1:53694/c/abc"],
+      ["no host", "omnigent:///c/abc"],
+      ["a malformed host", "omnigent://%/c/abc"],
+      ["an out-of-range port", "omnigent://127.0.0.1:99999/c/abc"],
+      ["an encoded id", "omnigent://127.0.0.1:53694/c/a%2Fb"],
+      ["a dot segment", "omnigent://127.0.0.1:53694/settings/../c/abc"],
+      ["an encoded dot segment", "omnigent://127.0.0.1:53694/x/%2e%2e/c/abc"],
+      ["an uppercase scheme", sessionLink.replace("omnigent", "OMNIGENT")],
+    ])("still blocks %s", async (_case, href) => {
+      render(<MessageResponse>{`[target](${href})`}</MessageResponse>);
+
+      expect(await screen.findByText(/\[blocked\]/)).toHaveTextContent("target [blocked]");
+      expect(screen.queryByRole("link", { name: "target" })).toBeNull();
     });
   });
 
@@ -285,8 +423,10 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
         const overlay = exit.parentElement!;
         expect(overlay.parentElement).toBe(embedded ? root : document.body);
         expect(overlay.querySelector('svg[id^="mermaid-"]')?.outerHTML).toBe(svg.outerHTML);
+        expect(document.documentElement).toHaveAttribute("data-fullscreen-overlay-open");
         fireEvent.click(exit);
         expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+        expect(document.documentElement).not.toHaveAttribute("data-fullscreen-overlay-open");
         fireEvent.click(screen.getByTitle("View fullscreen"));
         fireEvent.keyDown(window, { key: "Escape" });
         expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
@@ -477,10 +617,14 @@ describe("MessageResponse table fullscreen", () => {
     fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
 
     const dialog = within(embedRoot).getByRole("dialog", { name: "View fullscreen" });
+    // Marks a full-window view, which clears the window's top inset (index.css).
+    expect(dialog).toHaveAttribute("data-fullscreen-overlay");
+    expect(document.documentElement).toHaveAttribute("data-fullscreen-overlay-open");
     expect(within(dialog).getByRole("cell", { name: "Alpha" })).toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Exit fullscreen" }));
     expect(within(embedRoot).queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+    expect(document.documentElement).not.toHaveAttribute("data-fullscreen-overlay-open");
     embedRoot.remove();
   });
 
@@ -534,6 +678,26 @@ describe("MessageResponse code-block copy", () => {
     expect(block).toHaveClass("chat-code-wrap");
   });
 
+  it("applies one block's wrap toggle to every code block and keeps it after a remount", async () => {
+    const markdown = "```ts\nconst first = 1;\n```\n\n```py\nsecond = 2\n```";
+    const firstRender = render(<MessageResponse>{markdown}</MessageResponse>);
+    const toggles = await screen.findAllByRole("button", { name: "Toggle word wrap" });
+    expect(toggles).toHaveLength(2);
+
+    fireEvent.click(toggles[0]!);
+    for (const toggle of toggles) expect(toggle).toHaveAttribute("aria-pressed", "false");
+    for (const block of firstRender.container.querySelectorAll(".chat-code-block")) {
+      expect(block).not.toHaveClass("chat-code-wrap");
+    }
+
+    // A fresh render stands in for a refresh or another session's transcript.
+    firstRender.unmount();
+    render(<MessageResponse>{"```sh\necho later\n```"}</MessageResponse>);
+    const laterToggle = await screen.findByRole("button", { name: "Toggle word wrap" });
+    expect(laterToggle).toHaveAttribute("aria-pressed", "false");
+    expect(readCodeBlockWordWrap()).toBe(false);
+  });
+
   it("copies the exact fenced code text through the fallback path", async () => {
     const copiedText: string[] = [];
     Object.defineProperty(Navigator.prototype, "clipboard", {
@@ -572,6 +736,57 @@ describe("MessageResponse code-block copy", () => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
+  });
+});
+
+describe("MessageResponse shell drafts", () => {
+  it("requires chat opt-in and opens the exact shell code through an icon-only control", async () => {
+    const open = vi.fn();
+    const command = "printf 'hello\\n'\npwd\n";
+    const response = (allowShellCommands: boolean, language = "bash") => (
+      <ShellCommandContext.Provider value={{ open, disabled: false }}>
+        <MessageResponse allowShellCommands={allowShellCommands}>
+          {`\`\`\`${language}\n${command}\`\`\``}
+        </MessageResponse>
+      </ShellCommandContext.Provider>
+    );
+    const { rerender } = render(response(false));
+    expect(screen.queryByRole("button", { name: "Open in a new shell" })).toBeNull();
+
+    rerender(response(true));
+    const button = await screen.findByRole("button", { name: "Open in a new shell" });
+    expect(button.textContent).toBe("");
+    expect(button).toHaveAttribute("title", "Open in a new shell");
+    fireEvent.click(button);
+    expect(open).toHaveBeenCalledExactlyOnceWith(command, "bash");
+    expect(screen.getByRole("button", { name: "Copy Code" })).toBeInTheDocument();
+
+    rerender(response(true, "python"));
+    expect(screen.queryByRole("button", { name: "Open in a new shell" })).toBeNull();
+  });
+
+  it("disables the action for streaming, incomplete, empty, or unavailable shell drafts", async () => {
+    const open = vi.fn();
+    const complete = "```sh\nprintf hello\n```";
+    const { rerender } = render(<></>);
+    for (const [source, isStreaming, disabled] of [
+      [complete, true, false],
+      ["```sh\nprintf hello", false, false],
+      ["```sh\n  \n```", false, false],
+      [complete, false, true],
+    ] as const) {
+      rerender(
+        <ShellCommandContext.Provider value={{ open, disabled }}>
+          <MessageResponse allowShellCommands isStreaming={isStreaming} mode="static">
+            {source}
+          </MessageResponse>
+        </ShellCommandContext.Provider>,
+      );
+      const button = await screen.findByRole("button", { name: "Open in a new shell" });
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+    }
+    expect(open).not.toHaveBeenCalled();
   });
 });
 

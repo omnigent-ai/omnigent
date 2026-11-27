@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.host.frames import HostSkillsFrame
+from omnigent.memory_availability import MEMORY_HEADER, without_memory_tools
 from omnigent.spec import load
 from omnigent.spec.skill_sources import (
     resolve_harness_skills,
@@ -50,7 +51,7 @@ class HostSkillDiscovery:
         self._lock = threading.Lock()
         # Each entry: expiry, catalog, and the warnings that make the catalog incomplete.
         self._cache: OrderedDict[
-            tuple[str | tuple[str, ...] | None, ...],
+            tuple[str | tuple[str, ...] | bool | None, ...],
             tuple[float, list[dict[str, str]], list[str]],
         ] = OrderedDict()
 
@@ -69,6 +70,7 @@ class HostSkillDiscovery:
             frame.agent_id,
             frame.agent_version,
             frame.sub_agent_name,
+            frame.workflows_enabled,
             tuple(frame.skills_filter)
             if isinstance(frame.skills_filter, list)
             else frame.skills_filter,
@@ -106,10 +108,17 @@ class HostSkillDiscovery:
                         expand_env=response.headers.get("X-Agent-Session-Scoped") == "false",
                         prune_invalid_sub_agents=True,
                     )
+                    # Same rule as the runner: a missing header means no memory.
+                    if response.headers.get(MEMORY_HEADER) != "1":
+                        spec = without_memory_tools(spec)
                     if frame.sub_agent_name:
                         spec, directory = _subagent_bundle(spec, directory, frame.sub_agent_name)
                     skills = resolve_session_skills(
-                        spec, (root, directory), directory, warnings=problems
+                        spec,
+                        (root, directory),
+                        directory,
+                        warnings=problems,
+                        workflows_enabled=frame.workflows_enabled,
                     )
             result = [
                 {"name": skill.name, "description": skill.description}

@@ -13,6 +13,7 @@ const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 
 const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry");
+const { DESKTOP_OPEN_PORTS } = require("../src/desktopOpenServer");
 const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
 
 /** Build a registry with spy-backed injected deps. Returns the registry plus
@@ -45,6 +46,34 @@ function makeRegistry() {
   });
   return { registry, sent, attached, detached, visibility };
 }
+
+describe("browserViewRegistry — view cap", () => {
+  it("opens 20 views per window by default and refuses the 21st until one closes", () => {
+    const { registry, sent } = makeRegistry();
+    assert.equal(registry.cap, 20);
+    const ids = Array.from({ length: 20 }, (_, index) => `browser-tab:conv_1:tab${index}`);
+    for (const id of ids) {
+      assert.equal(registry.openOrNavigate(id, "https://example.com").ok, true, id);
+    }
+    assert.equal(registry.size(), 20);
+
+    const refused = registry.openOrNavigate("browser-tab:conv_1:extra", "https://example.com");
+    assert.deepEqual(refused, {
+      ok: false,
+      error: "browser view cap reached — close one",
+      cap: 20,
+    });
+    assert.equal(registry.has("browser-tab:conv_1:extra"), false);
+    assert.equal(sent.filter((s) => s.channel === "browser-view-created").length, 20);
+
+    registry.close(ids[0]);
+    assert.equal(
+      registry.openOrNavigate("browser-tab:conv_1:extra", "https://example.com").ok,
+      true,
+    );
+    assert.equal(registry.size(), 20);
+  });
+});
 
 describe("browserViewRegistry — first-navigate activation signal", () => {
   let ctx;
@@ -158,6 +187,7 @@ describe("browserViewRegistry — first-navigate activation signal", () => {
 function makeRecentSessionInputRegistry({
   isHostFocused = () => true,
   supportsRecentSessionSwitch = true,
+  focusHost = () => {},
 } = {}) {
   const listeners = new Map();
   const sent = [];
@@ -177,12 +207,114 @@ function makeRecentSessionInputRegistry({
     detachFromHost() {},
     sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
     isHostFocused,
+    focusHost,
+    platform: "darwin",
   });
   registry.openOrNavigate("conv_1", "https://example.com");
   registry.setActive("conv_1");
   registry.setRecentSessionSwitchSupported(supportsRecentSessionSwitch);
   return { registry, listeners, sent };
 }
+
+describe("browserViewRegistry — app chords a page hands to the shell", () => {
+  const COMMAND_K = { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false };
+
+  function press(listeners, input) {
+    let prevented = false;
+    listeners.get("before-input-event")(
+      { preventDefault: () => (prevented = true) },
+      { type: "keyDown", ...input },
+    );
+    return prevented;
+  }
+
+  it("takes no key from a page until the renderer lists its chords", () => {
+    const { listeners, sent } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+    });
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), false);
+    assert.deepEqual(
+      sent.filter((item) => item.channel === "browser-forwarded-input"),
+      [],
+    );
+  });
+
+  it("hands a listed chord to the focused shell, and other keys to the page", () => {
+    let focused = 0;
+    const { registry, listeners, sent } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+      focusHost: () => (focused += 1),
+    });
+    assert.deepEqual(registry.setForwardedChords([COMMAND_K]), { ok: true, count: 1 });
+    const forwarded = () => sent.filter((item) => item.channel === "browser-forwarded-input");
+
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), true);
+    assert.equal(focused, 1);
+    assert.deepEqual(forwarded()[0].payload, {
+      type: "keydown",
+      key: "k",
+      code: "KeyK",
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      metaKey: true,
+      repeat: false,
+    });
+    assert.equal(press(listeners, { key: "j", code: "KeyJ", meta: true }), false);
+    assert.equal(
+      press(listeners, { key: "k", code: "KeyK", meta: true, isComposing: true }),
+      false,
+    );
+
+    // An empty list, which main sets when the renderer is replaced, hands every key back.
+    registry.setForwardedChords([]);
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), false);
+    assert.equal(forwarded().length, 1);
+  });
+
+  it("holds the list through a navigation, restoring it only when the old renderer stays", () => {
+    const { registry, listeners } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+      focusHost: () => {},
+    });
+    const commandK = () => press(listeners, { key: "k", code: "KeyK", meta: true });
+    registry.setForwardedChords([COMMAND_K]);
+
+    // A navigation superseded by another still restores the first list.
+    registry.holdForwardedChords();
+    registry.holdForwardedChords();
+    assert.equal(commandK(), false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
+
+    // A new document drops the held list, and a later stop doesn't bring it back.
+    registry.holdForwardedChords();
+    registry.releaseForwardedChords(false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), false);
+
+    // An update during a navigation waits: it applies if the old renderer stays...
+    registry.holdForwardedChords();
+    assert.deepEqual(registry.setForwardedChords([COMMAND_K]), { ok: true, count: 1 });
+    assert.equal(commandK(), false);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), true);
+    registry.holdForwardedChords();
+    registry.setForwardedChords([]);
+    registry.releaseForwardedChords(true);
+    assert.equal(commandK(), false);
+
+    // ...and goes with it when a new document replaces it.
+    registry.holdForwardedChords();
+    registry.setForwardedChords([COMMAND_K]);
+    registry.releaseForwardedChords(false);
+    assert.equal(commandK(), false);
+    registry.setForwardedChords([COMMAND_K]);
+    assert.equal(commandK(), true);
+  });
+});
 
 describe("browserViewRegistry — recent-session input forwarding", () => {
   it("leaves page shortcuts untouched until the renderer advertises support", () => {
@@ -445,11 +577,31 @@ function makeEventCapturingRegistry(extra = {}) {
       return ev;
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
-    windowOpen: (url) => windowOpenHandler({ url }),
+    windowOpen: (url, disposition) => windowOpenHandler({ url, disposition }),
   };
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("invalidates continuations on page-initiated navigation, but not redirects", () => {
+    const { registry, fire, windowOpen, loaded } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv", "https://example.com", undefined, { agent: true });
+    const pending = registry.beginAgentNavigation("conv");
+    fire("will-redirect", "https://example.com/redirect");
+    assert.equal(pending(), true);
+    fire("will-navigate", "https://example.com/newer");
+    assert.equal(pending(), false);
+    assert.equal(registry.beginAgentNavigation("conv", pending.retryToken), null);
+
+    const popupPending = registry.beginAgentNavigation("conv");
+    registry.setOpenTabSupported(true);
+    windowOpen("https://example.com/background", "background-tab");
+    assert.equal(popupPending(), true, "a separate tab does not supersede this view");
+    windowOpen("https://example.com/popup", "foreground-tab");
+    assert.equal(loaded.at(-1), "https://example.com/popup");
+    assert.equal(popupPending(), false);
+    assert.equal(registry.beginAgentNavigation("conv", popupPending.retryToken), null);
+  });
+
   it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {
     let eligible = true;
     const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };
@@ -620,6 +772,14 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(await registry.shouldCancelAgentRequest(frame), false);
     assert.equal(await registry.shouldCancelAgentResponse(frame), false);
     assert.equal(fire("will-frame-navigate", frame.url).prevented, false);
+    // A pane allowed to load a local server still can't hand a conversation to the main window.
+    for (const port of DESKTOP_OPEN_PORTS) {
+      for (const route of ["open-conversation", "status"]) {
+        const handoff = { ...frame, url: `http://127.0.0.1:${port}/${route}`, resourceType: "xhr" };
+        // oxlint-disable-next-line no-await-in-loop -- Sequential by design: one request at a time.
+        assert.equal(await registry.shouldCancelAgentRequest(handoff), true, handoff.url);
+      }
+    }
     registry.openOrNavigate("remote", "https://example.com", undefined, { agent: true });
     assert.equal(
       await registry.shouldCancelAgentRequest({ ...frame, webContentsId: idOf("remote") }),
@@ -1364,6 +1524,61 @@ describe("browserViewRegistry — child window.open is denied (S3)", () => {
     assert.deepEqual(windowOpen("file:///etc/passwd"), { action: "deny" });
     assert.deepEqual(windowOpen("javascript:alert(1)"), { action: "deny" });
     assert.deepEqual(loaded, []);
+  });
+
+  it("asks a supporting renderer for a new tab for a Cmd/Ctrl-clicked link only", () => {
+    const { registry, windowOpen, loaded, sent } = makeEventCapturingRegistry();
+    const viewId = "browser-tab:conv_1:tab_1";
+    registry.openOrNavigate(viewId, "https://example.com/", undefined, { agent: true });
+    const openTabRequests = () => sent.filter((s) => s.channel === "browser-open-tab");
+    loaded.length = 0;
+
+    assert.deepEqual(windowOpen("https://example.com/older-ui", "background-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(loaded, ["https://example.com/older-ui"], "an older UI keeps in-place loads");
+
+    registry.setOpenTabSupported(true);
+    loaded.length = 0;
+    assert.deepEqual(windowOpen("https://example.com/new-tab", "background-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(windowOpen("https://example.com/blank-target", "foreground-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(windowOpen("https://example.com/new-window", "new-window"), {
+      action: "deny",
+    });
+    assert.deepEqual(loaded, [
+      "https://example.com/blank-target",
+      "https://example.com/new-window",
+    ]);
+    assert.deepEqual(openTabRequests(), [
+      {
+        channel: "browser-open-tab",
+        payload: { conversationId: viewId, url: "https://example.com/new-tab" },
+      },
+    ]);
+
+    registry.setOpenTabSupported(false);
+    loaded.length = 0;
+    windowOpen("https://example.com/after-reload", "background-tab");
+    assert.deepEqual(loaded, ["https://example.com/after-reload"]);
+    assert.equal(openTabRequests().length, 1);
+  });
+
+  it("applies the popup policy before forwarding a Cmd/Ctrl-clicked link", () => {
+    const { registry, windowOpen, loaded, sent } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    registry.setOpenTabSupported(true);
+    loaded.length = 0;
+    windowOpen("http://169.254.169.254/latest/meta-data/", "background-tab");
+    windowOpen("file:///etc/passwd", "background-tab");
+    assert.deepEqual(loaded, []);
+    assert.deepEqual(
+      sent.map((s) => s.channel).filter((channel) => channel.startsWith("browser-")),
+      ["browser-view-created", "browser-nav-blocked"],
+    );
   });
 });
 

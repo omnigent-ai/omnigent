@@ -172,7 +172,8 @@ const getTokensCacheKey = (code: string, language: CodeLanguage) => {
   return `${language}:${code.length}:${start}:${end}`;
 };
 
-const getHighlighter = (
+/** The shared Shiki highlighter for one language, loading its grammar on first use. */
+export const getHighlighter = (
   language: CodeLanguage,
 ): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
   const cached = highlighterCache.get(language);
@@ -309,7 +310,7 @@ const CodeBlockBody = memo(
       >
         <code
           className={cn(
-            "font-mono text-ui",
+            "literal-code font-mono text-ui",
             showLineNumbers && "[counter-increment:line_0] [counter-reset:line]",
           )}
         >

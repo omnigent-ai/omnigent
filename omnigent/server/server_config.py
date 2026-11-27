@@ -120,37 +120,48 @@ def automation_trigger_poll_minutes(config: Mapping[str, Any]) -> int:
     return value
 
 
-def session_title_instructions(config: Mapping[str, Any]) -> str | None:
-    """Return validated additional guidance for automatic session titles.
+def normalize_session_title_instructions(raw: object, *, source: str) -> str | None:
+    """Validate custom title guidance from the server config or a user setting.
 
-    The setting is server-owned metadata rather than part of an agent spec.
-    Invalid values fail open to the default title prompt so a config typo can
-    never prevent a user turn from starting.
+    Invalid values fail open to the default title prompt so a typo can never
+    prevent a user turn from starting.
 
-    :param config: Loaded server config containing the optional
-        ``session_title_instructions`` top-level key.
-    :returns: Stripped custom instructions, or ``None`` when unset or invalid.
+    :param raw: Candidate guidance, e.g. ``"Prefix titles with the date."``.
+    :param source: Where the value came from, used in warnings, e.g.
+        ``"server config session_title_instructions"``.
+    :returns: Stripped instructions, or ``None`` when unset or invalid.
     """
-    raw = config.get(SESSION_TITLE_INSTRUCTIONS_KEY)
     if raw is None:
         return None
     if not isinstance(raw, str):
-        logger.warning(
-            "server config %s must be a string — using default title instructions",
-            SESSION_TITLE_INSTRUCTIONS_KEY,
-        )
+        logger.warning("%s must be a string — using default title instructions", source)
         return None
     value = raw.strip()
     if not value:
         return None
     if len(value) > SESSION_TITLE_INSTRUCTIONS_MAX_CHARS:
         logger.warning(
-            "server config %s exceeds %d characters — using default title instructions",
-            SESSION_TITLE_INSTRUCTIONS_KEY,
+            "%s exceeds %d characters — using default title instructions",
+            source,
             SESSION_TITLE_INSTRUCTIONS_MAX_CHARS,
         )
         return None
     return value
+
+
+def session_title_instructions(config: Mapping[str, Any]) -> str | None:
+    """Return validated additional guidance for automatic session titles.
+
+    The setting is server-owned metadata rather than part of an agent spec.
+
+    :param config: Loaded server config containing the optional
+        ``session_title_instructions`` top-level key.
+    :returns: Stripped custom instructions, or ``None`` when unset or invalid.
+    """
+    return normalize_session_title_instructions(
+        config.get(SESSION_TITLE_INSTRUCTIONS_KEY),
+        source=f"server config {SESSION_TITLE_INSTRUCTIONS_KEY}",
+    )
 
 
 @dataclass(frozen=True)
@@ -876,3 +887,28 @@ def branding_logo_asset(variant: str = "main") -> BrandingAsset | None:
 def branding_config() -> dict[str, Any]:
     """Branding block surfaced by ``GET /v1/info`` for the web UI."""
     return load_branding_snapshot().config()
+
+
+def read_only_code_hosts(config: Mapping[str, Any]) -> tuple[str, ...]:
+    """Host patterns whose pull requests this server serves read-only.
+
+    :param config: Loaded server config with the optional ``read_only_code_hosts`` key, a
+        list of host names where ``*`` matches any run of characters, such as
+        ``["*.code.example.com"]``. Their pull requests can be read, but they offer no write
+        capabilities and the server refuses their writes. A URL or a path isn't a host name
+        and is ignored.
+    """
+    from omnigent.server.read_only_code_hosts import is_host_pattern, parse_patterns
+
+    raw = config.get("read_only_code_hosts")
+    if "read_only_code_hosts" in config and not isinstance(raw, list):
+        logger.warning("server config read_only_code_hosts=%r is not a list, ignoring", raw)
+        return ()
+    for entry in raw or ():
+        if not is_host_pattern(entry):
+            logger.warning(
+                "server config read_only_code_hosts entry %r is not a host name, such as "
+                "code.example.com, ignoring",
+                entry,
+            )
+    return parse_patterns(raw)

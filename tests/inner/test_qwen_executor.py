@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
@@ -403,7 +404,7 @@ def test_sandbox_launch_path_wraps_active_policy(
             allow_network=True,
         )
 
-    def _fake_launcher(target: str, sandbox: SandboxPolicy) -> str:
+    def _fake_launcher(target: str, sandbox: SandboxPolicy, **_kwargs: object) -> str:
         captured["target"] = target
         captured["policy"] = sandbox
         return "/fake/launcher"
@@ -427,26 +428,6 @@ def test_sandbox_launch_path_wraps_active_policy(
     assert policy.spawn_env_allowlist is not None
     assert "PATH" in policy.spawn_env_allowlist
     assert "OPENAI_BASE_URL" in policy.spawn_env_allowlist
-
-
-def test_sandbox_launch_path_falls_back_when_backend_unavailable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    """A backend failure degrades to the bare binary, never blocks startup."""
-    from omnigent.inner import sandbox as sandbox_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-
-    def _boom(_os_env, _cwd) -> None:
-        raise NotImplementedError("no bwrap on this platform")
-
-    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _boom)
-
-    executor = QwenExecutor(
-        cwd=str(tmp_path),
-        qwen_path="/usr/bin/qwen",
-        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
-    )
-    assert executor._sandbox_launch_path(["PATH"]) == "/usr/bin/qwen"
 
 
 @pytest.mark.asyncio
@@ -2392,3 +2373,48 @@ async def test_ensure_initialized_image_capability_defaults_false() -> None:
     await executor._ensure_initialized()
     assert executor._initialized is True
     assert executor._image_supported is False
+
+
+@pytest.mark.parametrize("input_item_id", ["msg_current", None])
+@pytest.mark.parametrize("content", ["current", [], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("fresh_session", [False, True], ids=["warm", "history-replay"])
+@pytest.mark.asyncio
+async def test_prompt_includes_input_item_metadata(input_item_id, content, fresh_session) -> None:
+    """Every ACP prompt names the initiating item or explicitly sends null."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "acp-session"
+    executor._proc = MagicMock(returncode=None)
+    executor._system_prompt_sent = not fresh_session
+    prompts = []
+
+    async def send(message):
+        prompts.append(message)
+        executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = send
+    tail = {"type": "message", "role": "user", "content": content}
+    if input_item_id is not None:
+        tail["id"] = input_item_id
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "old reply"},
+            tail,
+        ],
+        preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
+    )
+    events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(prompts) == 1
+    assert prompts[0]["method"] == "session/prompt"
+    assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: input_item_id}
+    if fresh_session:
+        assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+    else:
+        assert prompts[0]["params"]["prompt"] == [
+            {"type": "text", "text": content if isinstance(content, str) else ""}
+        ]

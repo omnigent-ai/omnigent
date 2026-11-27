@@ -1,35 +1,27 @@
-import { type RefObject, useEffect, useId, useState } from "react";
+import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
-import { authenticatedFetch } from "@/lib/identity";
+import {
+  type ContentMatch,
+  contentSearchProblem,
+  type ContentSearchInput,
+  EMPTY_CONTENT_SEARCH,
+  runContentSearch,
+} from "@/lib/contentSearch";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import type { OpenFileOptions } from "./FileViewerContext";
 import { cn } from "@/lib/utils";
+import { useTextSearchFocus } from "@/store/fileFinder";
 
-interface ContentMatch {
-  path: string;
-  line: number;
-  column: number;
-  text: string;
-  match_start: number;
-  match_end: number;
-}
-
-interface ContentSearchResult {
-  matches: ContentMatch[];
-  truncated: boolean;
-  warning: string | null;
-}
-
-interface ContentSearchInput {
-  query: string;
-  caseSensitive: boolean;
-  regex: boolean;
-  include: string;
-  exclude: string;
-}
+import {
+  type ContentSearchAnswer,
+  type ContentSearchHandOff,
+  contentSearchHandOffKey,
+  contentSearchInputKey,
+  contentSearchResultKey,
+} from "./contentSearchCache";
 
 export function ContentSearchPanel({
   conversationId,
@@ -40,10 +32,14 @@ export function ContentSearchPanel({
   onFileSelect: (path: string, options?: OpenFileOptions) => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }) {
+  const ownInputRef = useRef<HTMLInputElement | null>(null);
+  const fieldRef = inputRef ?? ownInputRef;
+  // Go to File's "Open in Search" shows this page ready to type into.
+  useTextSearchFocus(conversationId, fieldRef);
   const queryClient = useQueryClient();
   const cachedInput = useQuery<ContentSearchInput>({
-    queryKey: ["content-search-input", conversationId],
-    initialData: { query: "", caseSensitive: false, regex: false, include: "", exclude: "" },
+    queryKey: contentSearchInputKey(conversationId),
+    initialData: EMPTY_CONTENT_SEARCH,
     enabled: false,
     gcTime: Infinity,
   });
@@ -51,37 +47,47 @@ export function ContentSearchPanel({
   const [showFilters, setShowFilters] = useState(false);
   const filtersId = useId();
   const { query, caseSensitive, regex, include, exclude } = input;
+  const wholeWord = input.wholeWord === true;
+  // The same checks Go to File's text search makes, such as Whole word's length limit.
+  const problem = contentSearchProblem(input);
+  const canSearch = query.trim() !== "" && problem === null;
+  // A search handed over while the page shows, such as Go to File's "Open in Search",
+  // replaces what was typed here.
+  const handOff = useQuery<ContentSearchHandOff | null>({
+    queryKey: contentSearchHandOffKey(conversationId),
+    initialData: null,
+    enabled: false,
+  });
+  const handed = handOff.data;
+  // Set with the handed input, so the search runs once the page holds it.
+  const [runHanded, setRunHanded] = useState(false);
   useEffect(() => {
-    queryClient.setQueryData(["content-search-input", conversationId], input);
+    if (!handed) return;
+    setInput(handed.input);
+    if (handed.input.include.trim() || handed.input.exclude.trim()) setShowFilters(true);
+    if (handed.run) setRunHanded(true);
+    queryClient.setQueryData(contentSearchHandOffKey(conversationId), null);
+  }, [conversationId, handed, queryClient]);
+  useEffect(() => {
+    queryClient.setQueryData(contentSearchInputKey(conversationId), input);
   }, [conversationId, input, queryClient]);
   const search = useQuery({
-    queryKey: ["content-search-result", conversationId],
+    queryKey: contentSearchResultKey(conversationId),
     enabled: false,
     gcTime: Infinity,
     retry: false,
     // Keep the latest search, including in-flight work, when its panel unmounts.
-    queryFn: async (): Promise<ContentSearchResult & { query: string }> => {
-      const params = new URLSearchParams({
-        q: query,
-        case_sensitive: String(caseSensitive),
-        regex: String(regex),
-        include,
-        exclude,
-      });
-      const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/default/content-search?${params}`,
-      );
-      const body = await response.json().catch(() => null);
-      if (!response.ok || body?.error || !Array.isArray(body?.matches)) {
-        throw new Error(
-          (typeof body?.error === "string" ? body.error : body?.error?.message) ||
-            (typeof body?.detail === "string" ? body.detail : null) ||
-            "Content search is unavailable. Check that the runner is online and up to date.",
-        );
-      }
-      return { ...body, query };
+    queryFn: async (): Promise<ContentSearchAnswer> => {
+      const result = await runContentSearch(conversationId, input);
+      return { ...result, query };
     },
   });
+  const refetchSearch = search.refetch;
+  useEffect(() => {
+    if (!runHanded) return;
+    setRunHanded(false);
+    if (canSearch) void refetchSearch();
+  }, [runHanded, canSearch, refetchSearch]);
   const files = new Map<string, ContentMatch[]>();
   for (const match of search.data?.matches ?? []) {
     const matches = files.get(match.path) ?? [];
@@ -95,13 +101,13 @@ export function ContentSearchPanel({
         className="space-y-2 border-b border-border p-3"
         onSubmit={(event) => {
           event.preventDefault();
-          if (query.trim() && !search.isFetching) void search.refetch();
+          if (canSearch && !search.isFetching) void search.refetch();
         }}
       >
         <div className="flex gap-2">
           <div className="flex flex-1">
             <Input
-              ref={inputRef}
+              ref={fieldRef}
               aria-label="Search file contents"
               placeholder="Search file contents"
               type="search"
@@ -124,7 +130,7 @@ export function ContentSearchPanel({
               <FilterIcon className="size-4" />
             </Button>
           </div>
-          <Button type="submit" disabled={!query.trim() || search.isFetching}>
+          <Button type="submit" disabled={!canSearch || search.isFetching}>
             <SearchIcon className="size-4" />
             Search
           </Button>
@@ -141,12 +147,25 @@ export function ContentSearchPanel({
           <label className="flex items-center gap-1.5">
             <input
               type="checkbox"
+              checked={wholeWord}
+              onChange={(event) => setInput({ ...input, wholeWord: event.target.checked })}
+            />
+            Whole word
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              type="checkbox"
               checked={regex}
               onChange={(event) => setInput({ ...input, regex: event.target.checked })}
             />
             Regular expression
           </label>
         </div>
+        {problem && (
+          <p role="alert" className="text-xs text-destructive">
+            {problem}
+          </p>
+        )}
         <div id={filtersId} hidden={!showFilters} className="space-y-2 text-xs">
           <label className="block space-y-1">
             <span>Include</span>

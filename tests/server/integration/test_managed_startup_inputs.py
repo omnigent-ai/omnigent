@@ -26,6 +26,7 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
@@ -44,6 +45,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
@@ -145,6 +147,35 @@ async def _create(env: _Env, *, name: str = "startup-probe", **options: Any) -> 
     )
     assert response.status_code == 201, response.text
     return response.json()["id"]
+
+
+async def test_workflow_plan_is_available_while_managed_first_input_waits_for_host(
+    startup_env: _Env,
+) -> None:
+    startup_env.app.state.feature_flags = resolve_feature_flags({"OMNIGENT_FEATURES": "workflows"})
+    saved = await startup_env.client.post(
+        "/v1/workflows",
+        json={
+            "name": "Review changes",
+            "description": "Review the local changes.",
+            "steps": [
+                {"id": "review", "name": "Review the diff", "goal": "Identify regressions."}
+            ],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    workflow = saved.json()
+    session_id = await _create(startup_env, workflow_id=workflow["id"])
+    assert len(startup_env.conv_store.list_pending_inputs(session_id)) == 1
+    journal = await startup_env.client.get(f"/v1/sessions/{session_id}/journal")
+    assert journal.status_code == 200, journal.text
+    plan = journal.json()["data"][1]
+    assert plan["workflow_id"] == workflow["id"]
+    assert plan["content"]["steps"] == workflow["steps"]
+    assert plan["content"]["source"] == "workflow"
+    runs = await startup_env.client.get(f"/v1/workflows/{workflow['id']}/runs")
+    assert runs.status_code == 200, runs.text
+    assert [run["session_id"] for run in runs.json()["data"]] == [session_id]
 
 
 def _bind(env: _Env, session_id: str):
@@ -332,9 +363,142 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         await runner.aclose()
 
 
-@pytest.mark.parametrize("bundled", [False, True])
+@pytest.mark.parametrize("child", [False, True], ids=["managed", "child"])
+async def test_cancelled_bundled_create_finishes_only_without_parent(
+    startup_env: _Env,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    child: bool,
+) -> None:
+    env = startup_env
+    observer = SqlAlchemyConversationStore(db_uri)
+    metadata = {"host_type": "managed", "initial_input": _INPUT}
+    runner = None
+    if child:
+        agent = await create_test_agent(env.client)
+        parent = await env.client.post("/v1/sessions", json={"agent_id": agent["id"]})
+        assert parent.status_code == 201, parent.text
+        parent_id = parent.json()["id"]
+        observer.set_runner_id(parent_id, "parent-runner")
+        metadata["parent_session_id"] = parent_id
+        runner = _stub_runner(monkeypatch, [])
+
+    launched = asyncio.Event()
+    launch = routes_core._run_managed_launch
+
+    async def capture_launch(**kwargs: Any) -> None:
+        launched.set()
+        await launch(**kwargs)
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", capture_launch)
+    startup = env.app.state.startup_inputs
+    enqueue = startup.enqueue
+    saving: asyncio.Queue[str] = asyncio.Queue()
+    release_save = asyncio.Event()
+    interrupted = []
+
+    async def held_enqueue(session_id: str, *args: Any, **kwargs: Any) -> Any:
+        assert observer.get_conversation(session_id) is not None
+        assert observer.list_pending_inputs(session_id) == []
+        saving.put_nowait(session_id)
+        try:
+            await release_save.wait()
+        except asyncio.CancelledError:
+            interrupted.append(session_id)
+            raise
+        return await enqueue(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(startup, "enqueue", held_enqueue)
+    unattended_before = routes_core._unattended_work.copy()
+    request = asyncio.create_task(
+        env.client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={"bundle": ("agent.tar.gz", build_agent_bundle("bundled"), "application/gzip")},
+        )
+    )
+    try:
+        session_id = await asyncio.wait_for(saving.get(), timeout=5)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        release_save.set()
+        if child:
+            assert interrupted == [session_id]
+            conv = observer.get_conversation(session_id)
+            assert conv.parent_conversation_id == parent_id and conv.runner_id == "parent-runner"
+            assert observer.list_pending_inputs(session_id) == []
+            assert not launched.is_set()
+            assert env.app.state.managed_launches.get(session_id) is None
+        else:
+            assert interrupted == []
+            await asyncio.wait_for(launched.wait(), timeout=5)
+            [pending] = observer.list_pending_inputs(session_id)
+            assert pending.data.content == _INPUT["data"]["content"]
+            monkeypatch.setattr(startup, "enqueue", enqueue)
+            followup = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+            assert followup.status_code == 202, followup.text
+            assert len(observer.list_pending_inputs(session_id)) == 2
+    finally:
+        release_save.set()
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+        await poll_until_async(
+            lambda: not routes_core._unattended_work.difference(unattended_before), timeout_s=5
+        )
+        if runner is not None:
+            await runner.aclose()
+    if not child:
+        assert "failed after its request was cancelled" not in caplog.text
+
+
+async def test_cancelled_bundled_validation_leaves_no_session(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sandbox_inference
+
+    env = startup_env
+    before = {conv.id for conv in env.conv_store.list_conversations().data}
+    validating = asyncio.Event()
+    prepare = sandbox_inference.prepare_create_inference
+
+    async def held_validation(*args: Any, **kwargs: Any) -> Any:
+        validating.set()
+        await asyncio.Future()
+        return await prepare(*args, **kwargs)
+
+    monkeypatch.setattr(sandbox_inference, "prepare_create_inference", held_validation)
+    unattended_before = routes_core._unattended_work.copy()
+    request = asyncio.create_task(
+        env.client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({"host_type": "managed", "initial_input": _INPUT})},
+            files={"bundle": ("agent.tar.gz", build_agent_bundle("bundled"), "application/gzip")},
+        )
+    )
+    try:
+        await asyncio.wait_for(validating.wait(), timeout=5)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert not routes_core._unattended_work.difference(unattended_before)
+        assert {conv.id for conv in env.conv_store.list_conversations().data} == before
+    finally:
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("bundled", "cancelled"), [(False, False), (True, False), (False, True), (True, True)]
+)
 async def test_multipart_input_keeps_attachment_in_session_namespace(
-    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch, bundled: bool
+    startup_env: _Env,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bundled: bool,
+    cancelled: bool,
 ) -> None:
     env = startup_env
     agent = await create_test_agent(env.client)
@@ -360,17 +524,51 @@ async def test_multipart_input_keeps_attachment_in_session_namespace(
         )
     else:
         metadata["agent_id"] = agent["id"]
-    response = await env.client.post(
+    create = env.client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},
         files=files,
     )
-    assert response.status_code == 201, response.text
+    if cancelled:
+        uploading: list[str] = []
+        release_upload = asyncio.Event()
+        upload = env.app.state.initial_file_upload
+
+        async def held_upload(request: Any, session_id: str, file: Any) -> dict[str, Any]:
+            assert SqlAlchemyConversationStore(db_uri).get_conversation(session_id) is not None
+            assert not file.file.closed
+            uploading.append(session_id)
+            await release_upload.wait()
+            assert not file.file.closed
+            return await upload(request, session_id, file)
+
+        monkeypatch.setattr(env.app.state, "initial_file_upload", held_upload)
+        unattended_before = routes_core._unattended_work.copy()
+        request = asyncio.create_task(create)
+        try:
+            await poll_until_async(lambda: uploading, timeout_s=5)
+            # The client gives up before the parsed upload is stored.
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            [session_id] = uploading
+        finally:
+            release_upload.set()
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+            await poll_until_async(
+                lambda: not routes_core._unattended_work.difference(unattended_before), timeout_s=5
+            )
+        assert "failed after its request was cancelled" not in caplog.text
+    else:
+        response = await create
+        assert response.status_code == 201, response.text
+        session_id = response.json()["session_id" if bundled else "id"]
     await poll_until_async(lambda: bool(launches), timeout_s=5)
     assert [repo.url for repo in launches[0]["repos"]] == repositories
-    session_id = response.json()["session_id" if bundled else "id"]
     snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
     blocks = snapshot["pending_inputs"][0]["content"]
+    assert blocks[1:] == _INPUT["data"]["content"]
     assert blocks[0]["type"] == "input_file" and blocks[0]["filename"] == "context.txt"
     stored = SqlAlchemyFileStore(db_uri).get(blocks[0]["file_id"], session_id=session_id)
     assert stored is not None and stored.session_id == session_id
@@ -1242,7 +1440,8 @@ async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input
     env = startup_env
     session_id = await _create(env)
 
-    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=5)
+    # The drain precedes the launch's five-second failure-recording window.
+    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=budget(10.0))
 
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"
@@ -1342,6 +1541,66 @@ async def test_native_receipt_wakes_the_host_worker(
     assert env.conv_store.list_pending_inputs(session_id) == []
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and woken == [conv.host_id]
+
+
+async def test_unconfirmed_native_submission_stops_holding_later_inputs(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A submitted input the CLI never echoes is failed, so later messages are not held."""
+    env = startup_env
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", 0)
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    entry = _bind(env, session_id)
+    startup = env.app.state.startup_inputs
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": _TEXT}], stable_id=entry.id
+    )
+
+    async def dispatch(context: StartupInputContext, session_id: str, _: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id)
+        return {"queued": True, "pending_id": pending_id}
+
+    startup.dispatch = dispatch
+    woken: list[str] = []
+    monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", woken.append)
+    await startup._deliver(env.app, session_id, entry)
+    await asyncio.gather(*startup._receipt_watches)
+
+    [failed] = env.conv_store.list_pending_inputs(session_id)
+    assert failed.id == entry.id and failed.status == "failed"
+    assert not await startup.has_undelivered(session_id)
+    assert pending_inputs.pending_id_for_stable_id(session_id, entry.id) is None
+    [notice] = env.conv_store.list_items(session_id).data
+    assert isinstance(notice.data, ErrorData) and notice.data.code == "startup_input_failed"
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and woken == [conv.host_id]
+
+
+async def test_confirmed_native_submission_is_not_failed_by_its_receipt_watch(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = startup_env
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    entry = _bind(env, session_id)
+    startup = env.app.state.startup_inputs
+
+    async def dispatch(context: StartupInputContext, session_id: str, _: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id)
+        return {"queued": True, "pending_id": "pending"}
+
+    startup.dispatch = dispatch
+    await startup._deliver(env.app, session_id, entry)
+    pending_inputs.reset_for_tests()
+    await _simulate_transcript_forwarder_echo(env.client, session_id, _TEXT)
+    assert env.conv_store.list_pending_inputs(session_id) == []
+
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", 0)
+    await startup._expire_unconfirmed(session_id, entry.id, "pending")
+    assert not [
+        item
+        for item in env.conv_store.list_items(session_id).data
+        if isinstance(item.data, ErrorData)
+    ]
 
 
 async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:

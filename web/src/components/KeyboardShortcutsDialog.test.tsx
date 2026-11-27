@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 
 import {
   KeyboardShortcutsDialog,
@@ -33,6 +34,7 @@ vi.mock("@/lib/nativeBridge", () => ({
   isElectronShell: () => isElectronShell(),
   supportsBrowser: () => supportsBrowser(),
   supportsDesktopCommands: () => supportsDesktopCommands(),
+  shellRoutesDesktopCommands: () => false,
   // DialogContent (rendered here) reads isIOSShell to size modals for the iOS
   // keyboard; this suite exercises the browser path, so it's always false.
   isIOSShell: () => false,
@@ -83,11 +85,11 @@ describe("KeyboardShortcutsList composer rows", () => {
     expect(keysFor("New line in message")).toEqual(["↵"]);
   });
 
-  it("does not advertise inactive composer chords on touch-primary devices", () => {
+  it("does not advertise inactive composer chords in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 
@@ -98,7 +100,11 @@ describe("KeyboardShortcutsList composer rows", () => {
 
 describe("KeyboardShortcutsList settings layout", () => {
   it("groups shortcut rows into settings cards", () => {
-    render(<KeyboardShortcutsList variant="settings" />);
+    render(
+      <MemoryRouter>
+        <KeyboardShortcutsList variant="settings" />
+      </MemoryRouter>,
+    );
 
     const heading = screen.getByRole("heading", { name: "General" });
     const list = heading.closest("section")?.querySelector("ul");
@@ -148,10 +154,15 @@ describe("KeyboardShortcutsDialog", () => {
   });
 
   it("keeps native new-session keys and updates the Settings reference", () => {
-    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    const settingsList = () => (
+      <MemoryRouter>
+        <KeyboardShortcutsList variant="settings" />
+      </MemoryRouter>
+    );
+    const { rerender } = render(settingsList());
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     isNativeShell.mockReturnValue(true);
-    rerender(<KeyboardShortcutsList variant="settings" />);
+    rerender(settingsList());
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "N"]);
     expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "B"]);
     expect(keysFor("Toggle workspace sidebar")).toEqual(["Ctrl", "⇧", "B"]);
@@ -173,6 +184,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
     expect(keysFor("Rename current session")).toEqual(["Ctrl", "Alt", "R"]);
+    expect(keysFor("Mark current session unread or read")).toEqual(["Ctrl", "Alt", "U"]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
@@ -225,21 +237,21 @@ describe("KeyboardShortcutsDialog", () => {
   it("shows the pinned-session shortcut with the Alt chord in a plain browser", () => {
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–9)").closest("li");
     expect(row).toBeTruthy();
-    // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…0 chip.
+    // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…9 chip.
     expect(within(row!).getByText("Alt")).toBeTruthy();
-    expect(within(row!).getByText("1…0")).toBeTruthy();
+    expect(within(row!).getByText("1…9")).toBeTruthy();
   });
 
   it("shows the pinned-session shortcut without Alt in the Electron shell", () => {
     isNativeShell.mockReturnValue(true);
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–9)").closest("li");
     expect(row).toBeTruthy();
     expect(within(row!).queryByText("Alt")).toBeNull();
-    expect(within(row!).getByText("1…0")).toBeTruthy();
+    expect(within(row!).getByText("1…9")).toBeTruthy();
   });
 
   it("shows the recent-session switcher and Back/Forward only in Electron", () => {
@@ -297,11 +309,11 @@ describe("KeyboardShortcutsList question rows", () => {
     expect(keysFor("Cancel pending question")).toEqual(["Esc"]);
   });
 
-  it("hides the question keys on touch-primary devices", () => {
+  it("hides the question keys in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 

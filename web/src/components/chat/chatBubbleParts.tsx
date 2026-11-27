@@ -5,6 +5,7 @@
 import {
   createContext,
   memo,
+  Fragment,
   useCallback,
   useContext,
   useEffect,
@@ -17,12 +18,16 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  ChevronRightIcon,
+  ChevronUpIcon,
   CopyIcon,
+  CornerDownRightIcon,
   FileTextIcon,
-  FolderIcon,
   Link2Icon,
   Loader2Icon,
+  PencilIcon,
   SplitIcon,
+  SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -38,6 +43,15 @@ import {
   type MessageResponseProps,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
+import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
+import { DesignRequestBody } from "@/components/BrowserPane/designTools/DesignRequestMessage";
+import {
+  clipDesignRequest,
+  parseDesignRequest,
+  type DesignRequest,
+} from "@/components/BrowserPane/designTools/parseDesignRequest";
+import { SessionMessageLabel } from "@/components/blocks/SessionMessageCard";
 import {
   BlockRenderer,
   FilePathAwareMessageResponse,
@@ -50,7 +64,7 @@ import {
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
+import { ActivityNotice } from "@/components/blocks/TaskActivityMessage";
 import {
   isSystemUserContent,
   parseSystemMessage,
@@ -59,24 +73,38 @@ import {
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
+import { formatMessageTimestamp } from "@/lib/relativeTime";
+import { throttleAnimations } from "@/lib/throttledAnimations";
 import { cn } from "@/lib/utils";
-import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
+import {
+  splitKnownSlashCommand,
+  splitNativeShellCommand,
+  usePublishedComposerCommands,
+} from "@/components/composer/composerHighlight";
+import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
+import { mentionPillMarkdown } from "@/lib/mentionPills";
+import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
   imagePreview,
+  isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
+  PENDING_FILE_PREFIX,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { isCommandListed } from "@/store/paletteCommands";
+import { forkFromResponseAvailability, userMessageLinkId } from "./messageActions";
+import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { supersedePlanStop } from "@/store/planStops";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
   ConversationScopeContext,
@@ -89,23 +117,24 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+import { FailedAttachment, PendingAttachment } from "./PendingAttachment";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
+import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
+import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
-import type { PendingInput, SessionStatus } from "@/lib/types";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
+import type { BackgroundTaskInfo, PendingInput, SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
   type TranscriptScrollbarDragDetail,
 } from "@/pages/TranscriptScrollbar";
-
-// Matches both wordings the native executors emit: "[Attached: <path>]"
-// (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
-// is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\][ \t]*(?:\r?\n)*/g;
 
 const COLLAPSE_THRESHOLD = 12000;
 
@@ -118,57 +147,103 @@ function sliceByCodePoint(str: string, limit: number): string {
 // value and UserBubble reads it, so the gate lives in one place.
 export const SessionSharedContext = createContext(false);
 
+/** A user message's raw text, minus runtime context and any sender prefix. */
+function userMessageBody(content: MessageContentBlock[]): string {
+  const text = stripAutomationContext(joinTextBlocks(content));
+  return codexAsyncQuestionReplyText(splitSessionMessageOrigin(text)?.body ?? text);
+}
+
+/** The sending session of a user message another session sent, or null. */
+export function userMessageOrigin(content: MessageContentBlock[]): SessionMessageOrigin | null {
+  return splitSessionMessageOrigin(stripAutomationContext(joinTextBlocks(content)));
+}
+
+/** A user message's text for reading and copying: mention markers become ``@name``. */
 export function extractUserText(content: MessageContentBlock[]): string {
-  return stripAutomationContext(
-    content
-      .filter(isTextBlock)
-      .map((c) => c.text)
-      .join(""),
-  )
-    .replace(ATTACHED_RE, "")
-    .trimEnd();
+  return readableSentText(userMessageBody(content)).trimEnd();
 }
 
-// An absolute filesystem path in any form a native executor might materialize
-// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
-// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
-// reliably tells a materialized upload apart from a tagged workspace file
-// regardless of the host OS the runner happens to be on.
-function isAbsolutePath(p: string): boolean {
-  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+/** What Copy puts on the clipboard for a user message: a shell command keeps its `!`. */
+export function userBubbleCopyText(bubble: Extract<Bubble, { kind: "user" }>): string {
+  return bubble.shellCommand !== undefined
+    ? `!${bubble.shellCommand}`
+    : extractUserText(bubble.content);
 }
 
-/**
- * Pull the paths out of the "[Attached: …]" markers an "@"-mention adds to a
- * user message, so the bubble can show what was attached (the marker text
- * itself is stripped from the rendered text by {@link extractUserText}). A
- * trailing "/" marks a folder. Returns [] for ordinary messages.
- */
-function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
-  const text = content
+/** A user message's text for rendering: mention markers become inline pills. */
+function userMarkdownText(content: MessageContentBlock[]): string {
+  return replaceSentMentions(userMessageBody(content), mentionPillMarkdown).trimEnd();
+}
+
+/** "From @<sender>" above a message another session sent with ``sys_session_message``. */
+function SessionMessageOriginLine({
+  sourceId,
+  currentSessionId,
+}: {
+  sourceId: string;
+  currentSessionId: string | null;
+}) {
+  return (
+    <SessionMessageLabel
+      sessionId={sourceId}
+      currentSessionId={currentSessionId}
+      verb="From"
+      icon={CornerDownRightIcon}
+      testId="message-origin"
+    />
+  );
+}
+
+/** A collapsed message from another session: its sender and first line, expandable. */
+function CollapsedSessionMessage({
+  bubble,
+  origin,
+  text,
+  currentSessionId,
+  onExpand,
+}: {
+  bubble: Extract<Bubble, { kind: "user" }>;
+  origin: SessionMessageOrigin;
+  text: string;
+  currentSessionId: string | null;
+  onExpand: () => void;
+}) {
+  const preview = text.split("\n").find((line) => line.trim().length > 0) ?? "";
+  return (
+    <Message
+      from="user"
+      data-testid="message-bubble"
+      data-role="user"
+      data-user-message-id={bubble.itemId}
+      data-message-id={bubble.itemId}
+      className="max-w-[640px]"
+    >
+      <div
+        data-testid="collapsed-session-message"
+        className="ml-auto flex w-fit max-w-full items-center gap-2 rounded-lg bg-muted px-3 py-1.5"
+      >
+        <SessionMessageOriginLine sourceId={origin.sourceId} currentSessionId={currentSessionId} />
+        <button
+          type="button"
+          onClick={onExpand}
+          aria-expanded={false}
+          aria-label="Show message"
+          data-testid="expand-session-message"
+          className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <span className="min-w-0 truncate">{preview}</span>
+          <ChevronRightIcon className="size-3 shrink-0" />
+        </button>
+      </div>
+    </Message>
+  );
+}
+
+function joinTextBlocks(content: MessageContentBlock[]): string {
+  return content
     .filter(isTextBlock)
     .map((c) => c.text)
     .join("");
-  const out: MentionItem[] = [];
-  for (const m of text.matchAll(ATTACHED_RE)) {
-    const raw = m[1].trim();
-    if (!raw) continue;
-    // Absolute path → a materialized upload, already shown via its file block.
-    if (isAbsolutePath(raw)) continue;
-    // Split a trailing ":start-end" line span back out so the chip can show
-    // it without truncation (it's the whole point of a partial-file attach).
-    const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
-    if (range) {
-      out.push({
-        path: range[1],
-        isDir: false,
-        lineRange: { start: Number(range[2]), end: Number(range[3]) },
-      });
-    } else {
-      out.push({ path: raw.replace(/\/$/, ""), isDir: raw.endsWith("/") });
-    }
-  }
-  return out;
 }
 
 /** Joins all `kind: "text"` items into a single markdown string for copying. */
@@ -234,11 +309,13 @@ export function buildPendingBubbles(
       pending: true,
       ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
       ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
+      ...(p.posted === true ? { accepted: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
+      ...(p.uploadFailure !== undefined ? { uploadFailure: p.uploadFailure } : {}),
     };
   });
 }
@@ -285,6 +362,18 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
   return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
 }
 
+/** Submission order within one second: the optimistic bubble's sequence number from its temp id. */
+function sendSequence(message: PendingUserMessage): number {
+  const match = /_(\d+)$/.exec(message.tempId);
+  return match ? Number(match[1]) : 0;
+}
+
+/** Whether `later` was submitted after `earlier`: send time first, then the sequence within a second. */
+function sendsAfter(earlier: PendingUserMessage, later: PendingUserMessage): boolean {
+  const byTime = (later.createdAtS ?? 0) - (earlier.createdAtS ?? 0);
+  return byTime > 0 || (byTime === 0 && sendSequence(later) > sendSequence(earlier));
+}
+
 /**
  * Add a conversation's uncommitted user messages to its committed bubbles: the
  * undelivered startup messages, and the optimistic sends they don't replace.
@@ -293,20 +382,27 @@ export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble
  * @param pendingUserMessages - The conversation's optimistic sends.
  * @param failedInputs - The snapshot's undelivered startup messages.
  * @param selfAuthor - The viewer's attribution id, or null.
+ * @param failedUploads - Sends whose upload failed before posting, shown in send order.
  */
 export function withUncommittedUserBubbles(
   committed: Bubble[],
   pendingUserMessages: PendingUserMessage[],
   failedInputs: PendingInput[],
   selfAuthor: string | null,
+  failedUploads: PendingUserMessage[] = [],
 ): Bubble[] {
   const withUndelivered = placeUndeliveredBubbles(
     committed,
     buildUndeliveredBubbles(failedInputs, selfAuthor),
   );
-  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
-  if (pending.length === 0) return withUndelivered;
-  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
+  // Pending sends keep their own order; each parked upload goes where its send time falls.
+  const uncommitted = [...withoutFailedInputs(pendingUserMessages, failedInputs)];
+  for (const failed of failedUploads) {
+    const at = uncommitted.findIndex((p) => sendsAfter(failed, p));
+    uncommitted.splice(at === -1 ? uncommitted.length : at, 0, failed);
+  }
+  if (uncommitted.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(uncommitted, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more
@@ -491,22 +587,47 @@ export function isBackgroundTasksOnly(
 }
 
 /**
+ * Waiting only on background agents a FINISHED claude-native turn left running.
+ * The turn is over, so this replaces the shimmer; a dialog or a new local send
+ * wins.
+ */
+export function isBackgroundAgentsOnly(
+  sessionStatus: SessionStatus,
+  agents: readonly BackgroundTaskInfo[],
+  blockedOn: string | null,
+  localSending: boolean,
+): boolean {
+  return sessionStatus === "waiting" && agents.length > 0 && !blockedOn && !localSending;
+}
+
+/**
+ * What the session still waits on, e.g. "Background agent running: Audit the
+ * auth flow", or "2 background agents running" when there are several.
+ */
+export function backgroundAgentsLabel(agents: readonly BackgroundTaskInfo[]): string {
+  if (agents.length !== 1) return `${agents.length} background agents running`;
+  const description = agents[0]?.description?.trim();
+  return description ? `Background agent running: ${description}` : "Background agent running";
+}
+
+/**
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
- * a local send in flight.
+ * a local send in flight. Shared by the transcript's working shimmer and the
+ * composer's background-task tally, so the two surfaces never disagree.
  */
 export function computeIsTurnActive(sessionStatus: SessionStatus, localSending: boolean): boolean {
   return computeIsWorking(sessionStatus) || localSending;
 }
 
-function useAgentTurnActive(): boolean {
+export function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
   return computeIsTurnActive(sessionStatus, localSending);
 }
 
-/** Whether any elicitation card is still awaiting the user's answer. */
+/** Whether any elicitation card still parks the turn on the user's answer. */
 function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
-  return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
+  return blocks.some(isPendingBlockingElicitation);
 }
 
 /**
@@ -547,6 +668,9 @@ export function WorkingIndicator() {
   const scopedConversationId = useContext(ConversationScopeContext);
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBackgroundAgents = useChatStore((s) => s.backgroundAgents);
+  const rootSessionStatus = useChatStore((s) => s.sessionStatus);
+  const rootLocalSending = useChatStore((s) => s.status === "streaming");
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
   const rootHasOwnPendingElicitation = useChatStore((s) =>
     hasPendingOwnElicitation(s.blocks, s.conversationId),
@@ -562,8 +686,37 @@ export function WorkingIndicator() {
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
+  const backgroundAgents = scopedConversationId
+    ? scopedState.backgroundAgents
+    : rootBackgroundAgents;
+  const waitsOnBackgroundAgents = isBackgroundAgentsOnly(
+    scopedConversationId ? scopedState.sessionStatus : rootSessionStatus,
+    backgroundAgents,
+    blockedOn,
+    scopedConversationId ? scopedState.status === "streaming" : rootLocalSending,
+  );
+  if (waitsOnBackgroundAgents) {
+    // The turn ended and the composer is free, but the session isn't idle:
+    // name the agent it still waits on rather than shimmering "Working…".
+    const label = backgroundAgentsLabel(backgroundAgents);
+    return (
+      <>
+        <span role="status" aria-live="polite" className="sr-only">
+          {label}
+        </span>
+        <Message from="assistant" data-testid="background-agents-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex min-w-0 items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5 shrink-0" />
+              <span className="truncate text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
   // Background shells outliving a finished turn keep the session in progress,
-  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // but the agent isn't thinking: show the static terminal glyph, not a spinner.
   // The main composer's pill announces the count; side chats have no pill.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
     const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
@@ -577,7 +730,7 @@ export function WorkingIndicator() {
         <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
           <MessageContent>
             <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
-              <RunningDot className="size-3.5" />
+              <SquareTerminalIcon aria-hidden strokeWidth={1.5} className="size-3.5 shrink-0" />
               <span className="text-sm font-mono">{label}</span>
             </div>
           </MessageContent>
@@ -599,7 +752,7 @@ export function WorkingIndicator() {
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
-          <div className="flex items-center gap-1.5 py-0.5">
+          <div ref={throttleAnimations} className="flex items-center gap-1.5 py-0.5">
             <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm" duration={1.5}>
               {label}
@@ -723,21 +876,7 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
 
 function formatBubbleTimestamp(epochSeconds: number | undefined): string | null {
   if (epochSeconds === undefined || epochSeconds === 0) return null;
-  const d = new Date(epochSeconds * 1000);
-  const now = new Date();
-  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  if (
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate()
-  ) {
-    return time;
-  }
-  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  if (d.getFullYear() !== now.getFullYear()) {
-    return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${time}`;
-  }
-  return `${date}, ${time}`;
+  return formatMessageTimestamp(epochSeconds);
 }
 
 // Memoized so a streaming delta (which rebuilds the whole bubble array) only
@@ -764,7 +903,7 @@ export const BubbleView = memo(
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "subagent_activity") {
-      return <SubagentActivityMessage data={bubble.data} />;
+      return <ActivityNotice data={bubble.data} />;
     }
     if (bubble.kind === "routing_decision") {
       return (
@@ -864,6 +1003,30 @@ const USER_MESSAGE_REMARK_REHYPE_OPTIONS: MessageResponseProps["remarkRehypeOpti
   },
 };
 
+/** A user message's text as Markdown, as the bubble renders it. */
+function UserMessageMarkdown({ text, leadingCommand }: { text: string; leadingCommand?: string }) {
+  return (
+    <FilePathAwareMessageResponse
+      className="text-message"
+      breaks
+      mode="static"
+      linkPullRequestRefs
+      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+      renderLocalReviewComment={renderLocalReviewComment}
+      leadingCommand={leadingCommand}
+    >
+      {text}
+    </FilePathAwareMessageResponse>
+  );
+}
+
+/** A design-tool message's card, its words rendered like any user message's. */
+function DesignRequestCard({ request }: { request: DesignRequest }) {
+  return (
+    <DesignRequestBody request={request} words={<UserMessageMarkdown text={request.request} />} />
+  );
+}
+
 /**
  * Copy a deep link to this message (``?message=<id>`` on the session URL).
  * Same confirmation UX as {@link useCopyMessage}.
@@ -934,9 +1097,12 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
       ? "opacity-100"
       : isMobile
         ? "invisible opacity-0"
-        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
   };
 }
+
+// How a composer reply quote is serialized into the sent text (see serializeReplyDraft).
+const REPLY_QUOTE_PARAGRAPH = /(^|\n\n)> /;
 
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
@@ -944,44 +1110,93 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const editSentMessage = useContext(EditSentMessageContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
   //   imported inline data URI, an in-flight upload chip, or a placeholder
   //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
-  const isShellCommand = bubble.shellCommand !== undefined;
-  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const published = usePublishedComposerCommands(sessionId);
+  const text = userBubbleCopyText(bubble);
+  // The backend classifies the raw block, before sender and context wrappers
+  // are stripped for display.
+  const rawText =
+    bubble.content.length === 1 && bubble.content[0]?.type === "input_text"
+      ? bubble.content[0].text
+      : null;
+  // An optimistic `!cmd` has no shellCommand until the terminal mirror lands.
+  const isShellCommand =
+    bubble.shellCommand !== undefined ||
+    (bubble.pending === true &&
+      published?.nativeShell != null &&
+      rawText !== null &&
+      splitNativeShellCommand(rawText, published.nativeShell) !== null);
+  const origin = isShellCommand ? null : userMessageOrigin(bubble.content);
+  const collapsesOrigin = usePeerSessionMessageDisplay() === "collapse" && origin !== null;
+  const [originExpanded, setOriginExpanded] = useState(false);
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
-  // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
-  // markers (no input_file block), so surface them as chips.
-  const mentionedChips = isShellCommand ? [] : extractAttachedPaths(bubble.content);
+  // "@"-tagged files and sessions ride in as text markers; render them as
+  // inline pills where they sit in the sentence.
+  const renderedText = isShellCommand ? text : userMarkdownText(bubble.content);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
   const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
-    useMessageActionVisibility(awaitingAgent, awaitingAgent && !text);
-  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
-    bubble.pending ? null : bubble.itemId,
-  );
+    useMessageActionVisibility(awaitingAgent, awaitingAgent);
+  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(userMessageLinkId(bubble));
   // Collapse long prompts by default to avoid expensive Markdown parsing and
   // a large DOM for text the user hasn't asked to read yet.
-  const isLong = text.length > COLLAPSE_THRESHOLD;
+  const isLong = renderedText.length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
-  const visibleText = isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text;
+  const visibleText = isCollapsed
+    ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
+    : renderedText;
+  // Another session's message reaches the agent as plain input, and attachments or a reply
+  // quote make a send an ordinary message, so none of these is a command.
+  const command =
+    !isShellCommand &&
+    origin === null &&
+    published &&
+    images.length === 0 &&
+    fileChips.length === 0 &&
+    !REPLY_QUOTE_PARAGRAPH.test(renderedText)
+      ? splitKnownSlashCommand(visibleText, published.commandNames)
+      : null;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
-  if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
+  // Another session's message is never one: it keeps its sender attribution.
+  if (!origin && images.length === 0 && fileChips.length === 0) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
+  }
+  // Parsed from the rendered text, so its words keep their mention pills.
+  const designRequest = isShellCommand || origin ? null : parseDesignRequest(renderedText);
+  if (origin && collapsesOrigin && !originExpanded) {
+    return (
+      <CollapsedSessionMessage
+        bubble={bubble}
+        origin={origin}
+        text={text}
+        currentSessionId={sessionId ?? null}
+        onExpand={() => setOriginExpanded(true)}
+      />
+    );
   }
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
+  // Edit copies the text of a message you sent, shared session or not; single-user
+  // messages carry no author. A pending message counts once the server has it.
+  const canEdit =
+    editSentMessage !== null &&
+    (!bubble.pending || bubble.accepted === true) &&
+    (author === undefined || author === getCurrentUserId()) &&
+    text.trim().length > 0;
 
   return (
     <Message
@@ -1054,17 +1269,30 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                       />
                     );
                   }
+                  if (preview.kind !== "pending") {
+                    return <ImageAttachmentPlaceholder key={key} label={preview.label} />;
+                  }
                   return (
-                    <ImageAttachmentPlaceholder
+                    <PendingAttachment
                       key={key}
-                      label={preview.label}
-                      pending={preview.kind === "pending"}
+                      messageId={bubble.itemId}
+                      fileId={img.file_id ?? ""}
+                      name={preview.label}
+                      image
+                      failure={bubble.uploadFailure}
+                      fallback={
+                        // Siblings of a failed message are not uploading: no spinner.
+                        <ImageAttachmentPlaceholder
+                          label={preview.label}
+                          pending={bubble.uploadFailure === undefined}
+                        />
+                      }
                     />
                   );
                 })}
               </div>
             )}
-            {(text || fileChips.length > 0 || mentionedChips.length > 0) && (
+            {(text || fileChips.length > 0) && (
               <MessageContent
                 data-testid="user-message-content"
                 className={flashing ? "animate-message-highlight" : undefined}
@@ -1074,44 +1302,52 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                   showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
                 }
               >
+                {origin && (
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <SessionMessageOriginLine
+                      sourceId={origin.sourceId}
+                      currentSessionId={sessionId ?? null}
+                    />
+                    {collapsesOrigin && (
+                      <button
+                        type="button"
+                        onClick={() => setOriginExpanded(false)}
+                        aria-expanded
+                        aria-label="Collapse message"
+                        data-testid="collapse-session-message"
+                        className="text-muted-foreground transition-colors hover:text-foreground"
+                      >
+                        <ChevronUpIcon className="size-3" />
+                      </button>
+                    )}
+                  </div>
+                )}
                 {/* Non-image file chips */}
                 {fileChips.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
                     {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
-                      ({ key, item: att }) => (
-                        <AttachmentChip
-                          key={key}
-                          icon={FileTextIcon}
-                          label={attachmentLabel(att)}
-                        />
-                      ),
+                      ({ key, item: att }) => {
+                        const chip = (
+                          <AttachmentChip icon={FileTextIcon} label={attachmentLabel(att)} />
+                        );
+                        if (
+                          typeof att.file_id !== "string" ||
+                          !att.file_id.startsWith(PENDING_FILE_PREFIX)
+                        ) {
+                          return <Fragment key={key}>{chip}</Fragment>;
+                        }
+                        return (
+                          <PendingAttachment
+                            key={key}
+                            messageId={bubble.itemId}
+                            fileId={att.file_id}
+                            name={attachmentLabel(att)}
+                            failure={bubble.uploadFailure}
+                            fallback={chip}
+                          />
+                        );
+                      },
                     )}
-                  </div>
-                )}
-                {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-                {mentionedChips.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5">
-                    {mentionedChips.map((item) => (
-                      <span
-                        key={mentionItemPath(item)}
-                        className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                      >
-                        {item.isDir ? (
-                          <FolderIcon className="size-3 shrink-0" />
-                        ) : (
-                          <FileTextIcon className="size-3 shrink-0" />
-                        )}
-                        <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                          @{item.path}
-                          {item.isDir ? "/" : ""}
-                        </span>
-                        {item.lineRange && (
-                          <span className="shrink-0">
-                            :{item.lineRange.start}-{item.lineRange.end}
-                          </span>
-                        )}
-                      </span>
-                    ))}
                   </div>
                 )}
                 {/* Render user text as markdown, matching the assistant bubble.
@@ -1126,15 +1362,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         <pre className="whitespace-pre-wrap break-words font-mono text-sm">
                           <code>{visibleText}</code>
                         </pre>
+                      ) : designRequest ? (
+                        <DesignRequestCard
+                          request={
+                            isCollapsed
+                              ? clipDesignRequest(designRequest, COLLAPSE_THRESHOLD)
+                              : designRequest
+                          }
+                        />
                       ) : (
-                        <FilePathAwareMessageResponse
-                          className="text-message"
-                          breaks
-                          mode="static"
-                          remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                        >
-                          {visibleText}
-                        </FilePathAwareMessageResponse>
+                        <UserMessageMarkdown text={visibleText} leadingCommand={command?.token} />
                       )}
                       {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
@@ -1159,6 +1396,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </div>
         </div>
+        {bubble.uploadFailure !== undefined && bubble.uploadFailure.fileId === undefined && (
+          <div className="flex justify-end pt-1">
+            <FailedAttachment name="this message" failure={bubble.uploadFailure} image={false} />
+          </div>
+        )}
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}
@@ -1172,13 +1414,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </div>
         )}
         {visibilityToggle}
-        <div
-          id={actionsId}
-          className={cn(
-            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
-            visibilityClassName,
-          )}
-        >
+        <div className="flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0">
+          {/* A mid-turn message can wait minutes behind a long tool call and must
+              not look delivered, so its whole footer stays visible until read. */}
           {awaitingAgent && (
             <span
               className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
@@ -1188,37 +1426,57 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               The agent will read this after its current step
             </span>
           )}
-          {ts && (
-            <span
-              className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
-              data-testid="message-timestamp"
-            >
-              {ts}
-            </span>
-          )}
-          <MessageActions className="shrink-0">
-            {text && (
-              <MessageAction
-                tooltip="Copy"
-                size="icon-xxs"
-                className="[@media(pointer:coarse)]:size-8"
-                onClick={handleCopy}
-                componentId="chat.message.copy_user"
+          <div
+            id={actionsId}
+            className={cn("flex shrink-0 items-center gap-3", visibilityClassName)}
+          >
+            {ts && (
+              <span
+                className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
+                data-testid="message-timestamp"
               >
-                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-              </MessageAction>
+                {ts}
+              </span>
             )}
-            <MessageAction
-              tooltip={isLinkCopied ? "Copied!" : "Copy link"}
-              size="icon-xxs"
-              className="[@media(pointer:coarse)]:size-8"
-              data-testid="copy-message-link"
-              disabled={bubble.pending}
-              onClick={handleCopyLink}
-            >
-              {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
-            </MessageAction>
-          </MessageActions>
+            <MessageActions className="shrink-0">
+              {text && (
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  className="max-md:size-8"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_user"
+                >
+                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                </MessageAction>
+              )}
+              {canEdit && (
+                <MessageAction
+                  tooltip="Edit and resend"
+                  size="icon-xxs"
+                  className="max-md:size-8"
+                  onClick={() =>
+                    editSentMessage({
+                      text: isShellCommand ? text : userMessageBody(bubble.content),
+                    })
+                  }
+                  componentId="chat.message.edit_user"
+                >
+                  <PencilIcon size={14} />
+                </MessageAction>
+              )}
+              <MessageAction
+                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+                size="icon-xxs"
+                className="max-md:size-8"
+                data-testid="copy-message-link"
+                disabled={bubble.pending}
+                onClick={handleCopyLink}
+              >
+                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+              </MessageAction>
+            </MessageActions>
+          </div>
         </div>
       </div>
     </Message>
@@ -1255,7 +1513,7 @@ function AssistantBubble({
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
   const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
   const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
-  // A pending elicitation means the turn is parked awaiting the user — still in
+  // A pending blocking elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
   const hasPendingElicitation = scopedConversationId
     ? hasPendingElicitationBlock(scopedState.blocks)
@@ -1268,8 +1526,10 @@ function AssistantBubble({
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   const foldNarration = useFoldAssistantNarration();
+  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const forkAvailability = forkFromResponseAvailability(forkDialog, bubble.lifecycle);
   const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
@@ -1293,11 +1553,13 @@ function AssistantBubble({
           current.sessionStatus === "running" ||
           current.sessionStatus === "waiting" ||
           current.pendingUserMessages.length > 0 ||
-          current.blocks.some((block) => block.type === "elicitation" && block.status === "pending")
+          current.blocks.some(isPendingBlockingElicitation)
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
+        const endPlanStop = supersedePlanStop(conversationId);
         await continueFailedTurn(conversationId);
+        endPlanStop();
         return;
       }
       try {
@@ -1333,6 +1595,7 @@ function AssistantBubble({
     showsWorking,
     defaultExpanded: bubble.defaultExpanded,
     foldNarration,
+    workflowsEnabled,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -1434,7 +1697,7 @@ function AssistantBubble({
                   <MessageAction
                     tooltip="Copy"
                     size="icon-xxs"
-                    className="[@media(pointer:coarse)]:size-8"
+                    className="max-md:size-8"
                     onClick={handleCopy}
                     componentId="chat.message.copy_assistant"
                   >
@@ -1444,7 +1707,7 @@ function AssistantBubble({
                 {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                {forkDialog && isCommandListed(forkAvailability) && (
                   <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
                     <MessageAction
                       tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
@@ -1486,7 +1749,7 @@ function AssistantBubble({
         )}
         {trailingNotices.map((notice, index) =>
           notice.kind === "subagent_activity" ? (
-            <SubagentActivityMessage
+            <ActivityNotice
               key={notice.itemId ?? `subagent-activity-${index}`}
               data={notice.data}
             />

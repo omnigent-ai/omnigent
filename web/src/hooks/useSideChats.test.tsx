@@ -1,4 +1,5 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   readSessionWorkspaceState,
@@ -86,13 +87,23 @@ describe("side-chat soft tabs", () => {
       openSideChats: ["conv_b1"],
       selectedSideChatId: "conv_b1",
     });
-    const { result, rerender } = renderHook(({ id }) => useSideChats(id), {
-      initialProps: { id: "session-a" },
-    });
+    // Every committed selection, so the switch can't commit session-a's tabs first.
+    const committed: (string | null)[] = [];
+    const { result, rerender } = renderHook(
+      ({ id }) => {
+        const sideChats = useSideChats(id);
+        useLayoutEffect(() => {
+          committed.push(sideChats.selected);
+        });
+        return sideChats;
+      },
+      { initialProps: { id: "session-a" } },
+    );
     expect(result.current.tabs).toEqual(["conv_a1"]);
     rerender({ id: "session-b" });
     expect(result.current.tabs).toEqual(["conv_b1"]);
     expect(result.current.selected).toBe("conv_b1");
+    expect(committed).toEqual(["conv_a1", "conv_b1"]);
   });
 
   it("persists tabs and selection across remount, isolated per session", () => {

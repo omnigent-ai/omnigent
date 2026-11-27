@@ -391,6 +391,30 @@ def get_runner_id() -> str | None:
     return _globals._runner_id
 
 
+def set_remote_routing_available(available: bool) -> None:
+    """Record the attached server's routing availability, creating caps lazily.
+
+    Runners never call :func:`init`, which would replace the caps object.
+
+    :param available: The server's answer from the session-init envelope.
+    """
+    get_caps().remote_routing_available = available
+
+
+def routing_stamp() -> bool:
+    """Whether this process can route, read the same way by every tool surface.
+
+    Each runner-side consumer that caches or pins a tool list, grant set, or
+    relay advertisement records this value and re-reads it on use, so a change
+    from a session-init envelope reaches all of them through one read.
+
+    :returns: ``True`` when this process's caps can route, locally or via the server.
+    """
+    from omnigent.server.routing_backend import routing_available
+
+    return routing_available(get_caps())
+
+
 def set_harness_process_manager(manager: HarnessProcessManager | None) -> None:
     """
     Set the AP-wide :class:`HarnessProcessManager` singleton.

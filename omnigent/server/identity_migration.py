@@ -25,6 +25,13 @@ User-id-bearing columns rewritten (the full set as of this schema):
 - ``policies.created_by``
 - ``hosts.user_id`` (unique-constraint part)
 
+Gadgets are not moved: their ownership, shelves and authorship live in the gadget store
+under the old username's registration, outside these tables. A user who holds gadget data
+(owned gadgets or a shelf) is refused before anything of
+theirs changes, so the remap never strands it; the operator deletes or hands off those
+gadgets first. Comments and actions the user wrote on other people's gadgets keep their
+text but are no longer theirs to edit after a remap.
+
 Ordering within a mapping is load-bearing: the new ``users`` row is
 created first (so FK-bearing children can point at it), children are
 repointed next, and the old ``users`` row is deleted last (so the
@@ -52,6 +59,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.query_context import query_name_scope
 from omnigent.server.auth import _RESERVED_USERS
+from omnigent.stores.gadget_store import GadgetStore, NotFound
 
 
 def _lock_host_collisions_and_check_tombstones(
@@ -98,6 +106,8 @@ class RemapReport:
     :param refused: ``old -> new`` pairs skipped because ``new`` already
         existed as a distinct user and ``force`` was not set, e.g.
         ``["alice -> bob@example.com"]``.
+    :param refused_gadgets: ``old -> new`` pairs skipped because ``old`` holds gadget
+        data the remap cannot move, e.g. ``["alice -> alice@example.com"]``.
     :param committed: ``True`` if the transaction was committed,
         ``False`` for a dry run (changes rolled back).
     """
@@ -106,6 +116,7 @@ class RemapReport:
     per_table: dict[str, int] = field(default_factory=dict)
     skipped_missing: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
+    refused_gadgets: list[str] = field(default_factory=list)
     committed: bool = False
 
     def _bump(self, table: str, n: int = 1) -> None:
@@ -151,12 +162,77 @@ def build_domain_mapping(engine: Engine, domain: str) -> dict[str, str]:
     return mapping
 
 
+def _holds_gadget_data(user: SqlUser, gadget_store: GadgetStore | None) -> bool:
+    """Whether *user* has gadget data a remap would strand.
+
+    Their own gadgets and shelf are in *gadget_store*, owned under their username's
+    registration. The shelf counts only while it pins or shows a gadget that still exists:
+    unpinning, hiding and deleting a gadget leave its documents and IDs behind, and those
+    strand nothing. Each check reads at most
+    a few pages; more empty session documents than that count as holding data.
+    """
+    if gadget_store is None:
+        return False
+    from omnigent.db.account_authority import account_registration
+    from omnigent.gadgets.access import workspace_registration
+    from omnigent.gadgets.documents import ImmutableDocumentStore
+    from omnigent.gadgets.service import _STATE_STORE_LIMITS, SHELF_ROOT
+
+    registration = workspace_registration(account_registration(user.created_at))
+    if gadget_store.owns_any(user.id, owner_registration=registration):
+        return True
+    shelf = ImmutableDocumentStore(
+        gadget_store.user_files(user.id, owner_registration=registration),
+        SHELF_ROOT,
+        limits=_STATE_STORE_LIMITS,
+    )
+    try:
+
+        def any_live(ids: list) -> bool:
+            # Pins and session lists keep the IDs of gadgets deleted since; only a gadget
+            # still there would be stranded.
+            wanted = [i for i in ids if isinstance(i, str)]
+            return bool(wanted) and bool(gadget_store.get_many(wanted))
+
+        pins = shelf.get("pins", "all")
+        items = pins.value.get("items") if pins is not None else None
+        if isinstance(items, list) and any_live(
+            [item.get("id") for item in items if isinstance(item, dict)]
+        ):
+            return True
+        # Emptying a session's list removes its document, so a live one with gadgets is
+        # data; empty ones left by older builds are passed over, a bounded number of pages.
+        cursor = None
+        for _ in range(_SHELF_PAGES_CHECKED):
+            page = shelf.list("sessions", limit=_SHELF_SESSIONS_PER_PAGE, cursor=cursor)
+            shown = [
+                gadget_id
+                for document in page.items
+                if isinstance(document.value.get("gadgets"), list)
+                for gadget_id in document.value["gadgets"]
+            ]
+            if any_live(shown):
+                return True
+            cursor = page.next_cursor
+            if cursor is None:
+                return False
+    except NotFound:
+        return False
+    return True  # More empty documents than one check reads: treated as in use.
+
+
+# A shelf's session documents one check reads: pages, and documents per page.
+_SHELF_PAGES_CHECKED = 4
+_SHELF_SESSIONS_PER_PAGE = 50
+
+
 def remap_identities(
     engine: Engine,
     mapping: dict[str, str],
     *,
     dry_run: bool = True,
     force: bool = False,
+    gadget_store: GadgetStore | None = None,
 ) -> RemapReport:
     """Rewrite user-identity strings across the database in one transaction.
 
@@ -181,6 +257,8 @@ def remap_identities(
     :param dry_run: When ``True`` (default), all changes are rolled back
         and the report reflects what *would* happen. ``False`` commits.
     :param force: Allow merging onto an existing distinct ``new`` user.
+    :param gadget_store: The server's gadget store, to refuse users who own gadgets or
+        have a shelf (see the module docstring). ``None`` skips that check.
     :returns: A :class:`RemapReport` describing the outcome.
     """
     report = RemapReport(mapping=dict(mapping))
@@ -198,6 +276,10 @@ def remap_identities(
             old_user = session.get(SqlUser, (current_workspace_id(), old_id))
             if old_user is None:
                 report.skipped_missing.append(old_id)
+                continue
+
+            if _holds_gadget_data(old_user, gadget_store):
+                report.refused_gadgets.append(f"{old_id} -> {new_id}")
                 continue
 
             new_user = session.get(SqlUser, (current_workspace_id(), new_id))

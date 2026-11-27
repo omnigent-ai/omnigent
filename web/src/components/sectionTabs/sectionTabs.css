@@ -1,0 +1,45 @@
+/* A view's section tabs, as the PR page and the Diffs view show them: each at its label's width
+   with an icon, the shown one underlined in the accent. The live row and its measuring copies
+   share this scope, so a narrow pane drops the icons from both and they always measure alike. */
+@container (width < 28rem) {
+  [data-section-tabs][data-narrow="drop-icons"] [data-section-icon] {
+    display: none;
+  }
+}
+/* Where labels give way instead, each tab is its icon; the label stays as its accessible name. */
+@container (width < 40rem) {
+  [data-section-tabs][data-narrow="drop-labels"] [data-section-label] {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+/* The shown section's underline slides from tab to tab. Until it's placed, each tab draws its
+   own, so the first frame already shows one; then it takes over and moves with the selection. */
+[data-section-tabs] [data-tab-indicator] {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 2px;
+  width: var(--tab-indicator-width, 0);
+  transform: translate(var(--tab-indicator-x, 0), var(--tab-indicator-y, 0));
+  opacity: 0;
+  pointer-events: none;
+}
+[data-section-tabs][data-indicator-placed] [data-tab-indicator] {
+  opacity: 1;
+  transition:
+    transform 200ms cubic-bezier(0.2, 0.7, 0.3, 1),
+    width 200ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+[data-section-tabs][data-indicator-placed] > [role="tab"]::after {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-section-tabs][data-indicator-placed] [data-tab-indicator] {
+    transition: none;
+  }
+}

@@ -47,6 +47,7 @@ from omnigent.inner.seatbelt_sandbox import (
     _interpreter_install_root,
     _per_user_dyld_cache_subpath,
     _quote,
+    _resolve_grant,
     _resolve_root,
     _symlink_hop_literals,
 )
@@ -222,6 +223,24 @@ def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     )
     policy = backend.resolve(spec, Path.cwd())
     assert policy.cwd_allow_hidden == [".cache", ".npmrc"]
+
+
+@pytest.mark.parametrize(
+    ("allow_hidden", "warns"), [([".git"], True), (["*"], True), (None, False)]
+)
+def test_resolve_warns_when_cwd_allow_hidden_exposes_git(
+    allow_hidden: list[str] | None, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exposing ``.git`` to the agent is logged; the default allowlist is silent."""
+    if sys.platform != "darwin":
+        pytest.skip("seatbelt resolver requires macOS host")
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt", cwd_allow_hidden=allow_hidden),
+    )
+    with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+        _make_backend().resolve(spec, Path.cwd())
+    assert any(".git" in record.message for record in caplog.records) is warns
 
 
 def test_resolve_env_passthrough_propagates_to_policy() -> None:
@@ -573,16 +592,21 @@ def test_profile_emits_extra_read_roots(tmp_path: Path) -> None:
     assert expected in profile
 
 
+@pytest.mark.parametrize("broker_socket", [False, True])
 def test_profile_network_section_for_allow_network_true_no_egress(
     tmp_path: Path,
+    broker_socket: bool,
 ) -> None:
     """
-    ``allow_network=True`` and no egress rules → ``(allow network*)``
-    is emitted so the helper sees the host's full network stack.
+    A broker socket keeps direct networking denied even with allow_network enabled.
     """
+    socket_path = str(tmp_path / "broker.sock")
     policy = _make_policy(tmp_path, allow_network=True)
+    policy.tcp_egress_socket_path = socket_path if broker_socket else None
     profile = _build_profile(policy, tmp_path.resolve(strict=False))
-    assert "(allow network*)" in profile
+    assert ("(allow network*)" in profile) is not broker_socket
+    if broker_socket:
+        assert f'(path-literal "{socket_path}")' in profile
 
 
 def test_profile_network_section_for_allow_network_false_no_egress(
@@ -600,6 +624,31 @@ def test_profile_network_section_for_allow_network_false_no_egress(
     assert "(allow network-bind" not in profile
     assert "(allow network-outbound" not in profile
     assert "(allow network-inbound" not in profile
+
+
+def test_profile_collapses_nested_credential_file_denials_without_losing_socket_rules(
+    tmp_path: Path,
+) -> None:
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    nested = protected / "settings.json"
+    nested.write_text("{}")
+    external = tmp_path / "external.json"
+    external.write_text("{}")
+    alias = protected / "external-link"
+    alias.symlink_to(external)
+    policy = _make_policy(tmp_path)
+    policy.credential_source_paths = [nested, protected, alias]
+
+    profile = _build_profile(policy, tmp_path)
+
+    file_deny = "(deny file-read* file-write* (subpath {}))"
+    socket_deny = "(deny network-outbound (remote unix-socket (path-literal {})))"
+    assert profile.count(file_deny.format(_quote(str(protected)))) == 1
+    assert file_deny.format(_quote(str(nested))) not in profile
+    assert file_deny.format(_quote(str(external))) in profile
+    for source in (nested, protected, external):
+        assert socket_deny.format(_quote(str(source))) in profile
 
 
 def test_profile_denies_unix_control_socket_after_allow_network(
@@ -1227,6 +1276,113 @@ def test_helper_boots_when_interpreter_lives_under_home_uv_layout(
         )
     finally:
         _shutil.rmtree(fake_install_root, ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="darwin_seatbelt requires macOS")
+@pytest.mark.parametrize("argument_selector", [38, 49], ids=["procargs", "procargs2"])
+def test_sibling_cannot_read_process_arguments(tmp_path: Path, argument_selector: int) -> None:
+    """A generic sandbox must not recover another process's proxy capability."""
+    import errno
+    import json
+    import os
+    import shutil
+    import subprocess
+    from textwrap import dedent
+
+    from tests._helpers.live_server import terminate_process
+
+    if shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not on PATH")
+
+    victim_directory = tmp_path / "victim"
+    victim_directory.mkdir()
+    sibling_directory = tmp_path / "sibling"
+    sibling_directory.mkdir()
+    capability = "http://omnigent:synthetic-proxy-capability@127.0.0.1:1"
+    capability_file = victim_directory / "proxy-capability"
+    capability_file.write_text(capability)
+    capability_file.chmod(0o600)
+    environment = {"PATH": os.defpath}
+    victim = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        env={**environment, "HTTPS_PROXY": capability},
+    )
+    try:
+        probe = dedent("""\
+            import ctypes, json, os, sys
+            from pathlib import Path
+
+            library = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+            library.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p,
+                ctypes.c_size_t]
+            result = {}
+            for name, selectors in [('arguments', [1, int(sys.argv[2]), int(sys.argv[1])]),
+                                    ('argmax', [1, 8])]:
+                mib = (ctypes.c_int * len(selectors))(*selectors)
+                buffer = ctypes.create_string_buffer(os.sysconf('SC_ARG_MAX'))
+                size = ctypes.c_size_t(len(buffer))
+                ctypes.set_errno(0)
+                status = library.sysctl(mib, len(selectors), buffer,
+                    ctypes.byref(size), None, 0)
+                result[name] = {'status': status, 'errno': ctypes.get_errno(),
+                    'has_capability': b'HTTPS_PROXY=http://omnigent:synthetic-proxy-capability@'
+                        in buffer.raw[:size.value] if status == 0 else False}
+            try:
+                Path(sys.argv[3]).read_bytes()
+                result['file_errno'] = 0
+            except OSError as error:
+                result['file_errno'] = error.errno
+            print(json.dumps(result))
+            """)
+        arguments = [
+            sys.executable,
+            "-I",
+            "-c",
+            probe,
+            str(victim.pid),
+            str(argument_selector),
+            str(capability_file),
+        ]
+        parent = subprocess.run(
+            arguments, env=environment, capture_output=True, text=True, timeout=15, check=True
+        )
+        parent_result = json.loads(parent.stdout)
+        if argument_selector == 38 and parent_result["arguments"]["status"] != 0:
+            assert parent_result["arguments"]["errno"] in (
+                errno.EINVAL,
+                errno.ENOENT,
+                errno.ENOTSUP,
+            )
+            pytest.skip("legacy KERN_PROCARGS is unavailable")
+        assert parent_result["arguments"] == {"status": 0, "errno": 0, "has_capability": True}
+        assert parent_result["file_errno"] == 0
+
+        # No model authority or shared grants: the baseline profile owns this boundary.
+        policy = _make_policy(sibling_directory, allow_network=True)
+        wrapped = _make_backend().wrap_launcher_argv(arguments, policy, sibling_directory)
+        sibling = subprocess.run(
+            wrapped,
+            cwd=sibling_directory,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        sibling_result = json.loads(sibling.stdout)
+        assert sibling_result["arguments"] == {
+            "status": -1,
+            "errno": errno.EPERM,
+            "has_capability": False,
+        }
+        assert sibling_result["file_errno"] == errno.EPERM
+        assert sibling_result["argmax"] == {"status": 0, "errno": 0, "has_capability": False}
+    finally:
+        terminate_process(victim, timeout_s=5)
+        if victim.stdin is not None:
+            victim.stdin.close()
 
 
 def test_ensure_executable_visible_two_hop_proxy_finds_cpython_install_root(
@@ -2689,3 +2845,36 @@ def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_seatbelt(
         "Target ran but didn't reach the scratch-write marker; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Grant containment (pure path resolution; runs on any platform)
+# ---------------------------------------------------------------------------
+
+
+def test_seatbelt_grant_through_symlink_out_of_cwd_is_rejected(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside its working directory"):
+        _resolve_grant(cwd, "linked/secret")
+
+
+def test_seatbelt_mask_through_symlink_out_of_cwd_still_resolves(tmp_path: Path) -> None:
+    """Masks only deny access, so a symlink that leaves cwd must not fail resolution."""
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    assert _resolve_root(cwd, "linked/secret") == outside / "secret"
+
+
+def test_seatbelt_grant_inside_cwd_resolves_through_contained_symlink(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    target = cwd / "target"
+    target.mkdir(parents=True)
+    (cwd / "linked").symlink_to(target, target_is_directory=True)
+    assert _resolve_grant(cwd, "linked/secret") == target / "secret"

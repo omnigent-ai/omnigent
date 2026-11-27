@@ -39,6 +39,9 @@ for maintainers instead of inventing an exception or a speculative blocker.
   needed for deterministic pagination. Avoid redundant and unused indexes.
 - Keep every new column value **below 16,384 bytes**, including serialization
   and encoding overhead. Store large payloads in the artifact store.
+- Declare a new binary column with a length-bounded type on engines that have
+  one: `VARBINARY(n)` or `BINARY(n)` on MySQL, never a BLOB-family type. An
+  application-side cap supplements the declared bound; it does not replace it.
 - Use compact types, explicit nullability, binary UUIDs, and exact numeric
   representations. Avoid the prohibited types and constraints below.
 - Treat encryptable data as opaque and keep its storage format unambiguous.
@@ -225,12 +228,17 @@ defaults, sample data, nullability, and current usage are not upper bounds.
 An unbounded type without such enforcement is blocking. Require a strict byte
 cap or move the payload to the artifact store with a small database reference.
 Passing the size check does not permit a type prohibited elsewhere in this guide.
+In particular, a binary column must also satisfy the declared-type rule under
+"Opaque binary payloads": where the engine has a length-bounded binary type, the
+column's own type must carry the bound, and an application-side cap alone does
+not pass.
 
 | Definition or enforced storage limit | Size-policy result |
 | --- | --- |
 | At most 16,383 bytes on every write path | Passes the size check |
 | At most 16,384 bytes | Blocking: includes the prohibited boundary |
 | Unbounded binary without a byte cap | Blocking |
+| BLOB-family column with only an application-side byte cap, on an engine that has `VARBINARY` | Blocking: see "Opaque binary payloads" |
 | 4,096 characters at up to four bytes each, without a byte cap | Blocking: permits 16,384 bytes |
 
 **Recommended:** Keep columns as short as the application needs. Choose string
@@ -272,6 +280,7 @@ and downstream tools.
 | `FLOAT` or `DOUBLE` | Use an appropriately sized integer, scaled integer, or `DECIMAL` with deliberate precision and scale. Binary floating point cannot represent most decimal fractions exactly. |
 | Native SQL `ENUM` | Use compact integer codes with a single application/protobuf definition and stable numeric values. Avoid string spellings, capitalization errors, and conflicting lexical versus enum ordering. |
 | `LONGBLOB` or `LONGTEXT` | These permit excessively large values. Use bounded fields or artifact storage. |
+| `BLOB` or `MEDIUMBLOB`, including SQLAlchemy `LargeBinary` without a MySQL variant | Use `VARBINARY(n)`, or `BINARY(n)` for fixed-size values, with `n` at most 16,383. In SQLAlchemy, `LargeBinary()` and `LargeBinary(n)` both render as BLOB types on MySQL; declare the bound with `with_variant(VARBINARY(n), "mysql")`, as `Uuid16` does with `BINARY(16)`. Engines whose binary type has no length (`BYTEA`, SQLite `BLOB`) take the same cap from application validation. |
 | Native SQL `JSON` | Normalize repeated entries into a child table, or use a bounded opaque binary representation when relational access is unnecessary. |
 | `TEXT` or `MEDIUMTEXT` | Use bounded strings for actual text, or a bounded binary payload for serialized/compressed data. Charset checks on text columns are incompatible with arbitrary compressed or encrypted bytes. |
 | String UUIDs | Use 16-byte binary UUID storage. In Omnigent, reuse `Uuid16` and its dialect variants rather than storing formatted UUID strings. |
@@ -290,12 +299,25 @@ database browsing.
 
 ### Opaque binary payloads
 
-**Recommended:** Avoid BLOB and MEDIUMBLOB when structured columns or artifact
-storage suffice. Depending on engine and row format, large values can require
-off-page I/O, increase cache pressure, and force disk-backed temporary tables.
-Full-row binary logging can copy an unchanged payload every time another field
-in the row changes. If a binary column is needed, enforce the strict size cap
-above, far below its type's nominal capacity.
+**Required:** A new binary column must declare its bound in the column type on
+every supported engine that has a length-bounded binary type. On MySQL that is
+`VARBINARY(n)`, or `BINARY(n)` for fixed-size values, with `n` at most 16,383;
+`BLOB`, `MEDIUMBLOB`, and `LONGBLOB` are not permitted for new columns, whatever
+the application checks. On engines without such a type (`BYTEA`, SQLite `BLOB`)
+the size cap above, enforced on every write path, is the bound. A bare
+SQLAlchemy `LargeBinary()` therefore fails this rule unless the definition
+carries a `VARBINARY` or `BINARY` variant for MySQL. Also account for MySQL's
+aggregate row-size limit (65,535 bytes across all of a row's columns): several
+individually compliant `VARBINARY(n)` columns can exceed it together, so reduce
+the declared bounds, split the row, or use artifact storage when they would.
+Existing BLOB columns are in scope only when the PR changes their definition.
+
+**Recommended:** Prefer structured columns or artifact storage when they
+suffice. Depending on engine and row format, large values can require off-page
+I/O, increase cache pressure, and force disk-backed temporary tables. Full-row
+binary logging can copy an unchanged payload every time another field in the
+row changes. Keep the declared bound as small as the payload needs, far below
+the 16,383-byte maximum where possible.
 
 **Required:** Do not filter on BLOB payloads in `WHERE` clauses. Extract queried
 attributes into dedicated typed columns where they are not encryptable. Do not
@@ -321,8 +343,9 @@ inspection. Compression does not replace an enforced stored-byte limit.
 even when encryption is currently disabled. Do not index it or build filters and
 features that will fail once encryption is enabled.
 
-Store such data as bounded binary/BLOB bytes, with an explicit envelope such as
-a protobuf `oneof` distinguishing plaintext from ciphertext. Include the
+Store such data as bounded binary bytes in a column declared per "Opaque binary
+payloads" (`VARBINARY(n)` on MySQL), with an explicit envelope such as a
+protobuf `oneof` distinguishing plaintext from ciphertext. Include the
 encryption configuration/metadata needed to interpret the encrypted variant.
 The structure must make the variant clear without parsing arbitrary payload
 headers, keep at most one representation, and require readers to handle both.

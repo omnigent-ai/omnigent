@@ -54,7 +54,7 @@ def touch_project_page(
     project = f"Project {uuid.uuid4().hex[:6]}"
     context = browser.new_context(
         has_touch=True,
-        viewport={"width": 767, "height": 720},
+        viewport={"width": 1180, "height": 720},
     )
     try:
         page = context.new_page()
@@ -138,21 +138,21 @@ def test_click_dismissing_menu_does_not_toggle_then_next_click_toggles(
     expect(page.get_by_test_id("rename-project")).not_to_be_visible()
     expect(header).to_have_attribute("aria-expanded", before)
 
-    header.click()
+    header.locator("[data-section-toggle]").first.click()
     expect(header).to_have_attribute("aria-expanded", flipped)
 
 
 def test_left_click_still_toggles_the_folder(project_page: tuple[Page, str]) -> None:
-    """Plain left-click still expands and collapses the folder."""
+    """Left-clicking the chevron expands and collapses the folder."""
     page, project = project_page
     header = _folder_header(page, project)
     before = _expanded(header)
     flipped = "false" if before == "true" else "true"
 
     expect(header).to_have_attribute("data-slot", "context-menu-trigger")
-    header.click()
+    header.locator("[data-section-toggle]").first.click()
     expect(header).to_have_attribute("aria-expanded", flipped)
-    header.click()
+    header.locator("[data-section-toggle]").first.click()
     expect(header).to_have_attribute("aria-expanded", before)
 
 

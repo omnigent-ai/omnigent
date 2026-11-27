@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
 from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
@@ -31,7 +32,6 @@ from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
-    _claude_launch_permission_mode,
     _load_claude_launch_metadata,
     _load_legacy_claude_launch_metadata,
     _routed_spawn_launch_args,
@@ -744,12 +744,19 @@ def test_routed_spawn_launch_args_gate_is_off_without_auto_harness() -> None:
         (["--model", "opus"], None),
         (["--permission-mode", "auto", "--permission-mode="], "auto"),
         (["--dangerously-skip-permissions"], "bypassPermissions"),
+        # Claude applies the last mode it reads, in either spelling...
+        (["--permission-mode", "auto", "--permission-mode=plan"], "plan"),
+        # ...but the bypass flag wins over any mode.
+        (["--permission-mode", "auto", "--dangerously-skip-permissions"], "bypassPermissions"),
+        # Text after the ``--`` terminator is the prompt, not options.
+        (["--permission-mode", "plan", "--", "--permission-mode=auto"], "plan"),
+        (["--permission-mode", "plan", "--", "--dangerously-skip-permissions"], "plan"),
     ],
 )
 def test_claude_launch_permission_mode_logs_only_known_values(
     args: list[str], expected: str | None
 ) -> None:
-    assert _claude_launch_permission_mode(args) == expected
+    assert claude_launch_permission_mode(args) == expected
 
 
 async def test_claude_launch_metadata_log_includes_permission_mode(
@@ -1290,6 +1297,14 @@ def test_claude_terminal_launch_env_keeps_pre_wrapper_env_for_unparsed_env_forms
     ]
     assert values and all(value not in caplog.text for value in values)
 
+    from omnigent.mcp_disabled_servers import McpStrictModeError
+
+    with pytest.raises(McpStrictModeError, match="configured env wrapper") as refused:
+        orchestration._claude_terminal_launch_env(
+            TerminalEnvSpec(command="env", args=args), require_resolved=True
+        )
+    assert all(value not in str(refused.value) for value in values)
+
 
 def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
     tmp_path: Path,
@@ -1382,29 +1397,44 @@ async def _auto_create_claude_terminal_for_test(
     )
 
 
+@pytest.mark.parametrize("portable_skill", [True, False], ids=["portable-skill", "no-skills"])
 async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    portable_skill: bool,
 ) -> None:
     """
     Terminal auto-create hands the pane's launch env to trust seeding.
 
     A launch-only ``CLAUDE_CONFIG_DIR`` (here from an ``env`` wrapper) must
     reach the seeder, and seeding must happen before the terminal launches.
+    The portable-skill ``--add-dir`` overlay is trusted only when it is passed.
+
+    :param portable_skill: Whether the workspace has a portable skill to stage.
     """
     from unittest.mock import Mock
 
     from omnigent.runner.resource_registry import SessionResourceRegistry
 
-    seeded: list[tuple[Path, dict[str, str] | None]] = []
+    seeded: list[tuple[Path, dict[str, str] | None, tuple[Path, ...]]] = []
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
-    def record_seed(workspace: Path, env: dict[str, str] | None = None) -> None:
+    def record_seed(
+        workspace: Path,
+        env: dict[str, str] | None = None,
+        *,
+        added_dirs: tuple[Path, ...] = (),
+    ) -> None:
         registry.launch_required_terminal.assert_not_called()
-        seeded.append((workspace, env))
+        seeded.append((workspace, env, added_dirs))
 
+    if portable_skill:
+        skill = bridge_dir / ".agents" / "skills" / "portable" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: portable\ndescription: Portable skill\n---\nBody.\n")
+    monkeypatch.setenv("HOME", str(bridge_dir / "home"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", record_seed
@@ -1427,11 +1457,18 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
         )
 
     assert len(seeded) == 1
-    workspace, env = seeded[0]
+    workspace, env, added_dirs = seeded[0]
     assert workspace == Path(bridge_dir).resolve()
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
     registry.launch_required_terminal.assert_awaited_once()
+    launch_args = registry.launch_required_terminal.await_args.kwargs["spec"].args
+    if portable_skill:
+        overlay = launch_args[launch_args.index("--add-dir") + 1]
+        assert added_dirs == (Path(overlay),)
+    else:
+        assert "--add-dir" not in launch_args
+        assert added_dirs == ()
 
 
 async def test_auto_create_claude_terminal_logs_stage_timings(
@@ -1533,7 +1570,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     async def record_turn_shutdown(_session_id: str, router: object) -> None:
         shutdowns.append(("turn", router))
 
-    def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
+    def failing_seed(*_args: object, **_kwargs: object) -> None:
         raise ValueError("config is not a JSON object")
 
     monkeypatch.setattr(
@@ -1608,7 +1645,7 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
     async def record_turn_shutdown(_session_id: str, _router: object) -> None:
         shutdowns.append("turn")
 
-    def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
+    def failing_seed(*_args: object, **_kwargs: object) -> None:
         raise ValueError("config is not a JSON object")
 
     monkeypatch.setattr(
@@ -1637,8 +1674,14 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
 
 
 @pytest.mark.parametrize(
-    "config_dir,legacy_in_cwd,expected",
-    [("relcfg", False, "sub/relcfg/.claude.json"), ("", True, "sub/.config.json")],
+    "config_dir,legacy_in_cwd,expected,wrapped,user_only",
+    [
+        ("relcfg", False, "sub/relcfg/.claude.json", True, False),
+        ("", True, "sub/.config.json", True, False),
+        ("relcfg", False, "sub/relcfg/.claude.json", True, True),
+        ("relcfg", False, "relcfg/.claude.json", False, True),
+    ],
+    ids=["relative-config", "empty-config", "wrapped-user-scopes", "direct-user-scopes"],
 )
 async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_dir(
     bridge_dir: Path,
@@ -1647,12 +1690,15 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     config_dir: str,
     legacy_in_cwd: bool,
     expected: str,
+    wrapped: bool,
+    user_only: bool,
 ) -> None:
     """
     ``env -C`` and a relative or empty ``CLAUDE_CONFIG_DIR`` compose in auto-create.
 
     The wrapper moves Claude's cwd first; the config dir then resolves against
-    that cwd, and the trust key names it. The real seeder writes the file.
+    that cwd, and the trust key names it. The real seeder writes the file, and
+    strict MCP mode reads the settings that cwd and config dir select.
 
     :param config_dir: ``CLAUDE_CONFIG_DIR`` assigned by the wrapper.
     :param legacy_in_cwd: Whether a legacy ``.config.json`` exists in the cwd.
@@ -1662,26 +1708,59 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     from unittest.mock import Mock
 
     from omnigent.runner.resource_registry import SessionResourceRegistry
+    from tests._helpers.mcp_disabled_servers import (
+        isolate_claude_settings,
+        write_mcp_inheritance,
+    )
 
-    workspace = tmp_path / "workspace"
+    workspace = isolate_claude_settings(monkeypatch, tmp_path / "workspace")
     (workspace / "sub").mkdir(parents=True)
     if legacy_in_cwd:
         (workspace / "sub" / ".config.json").write_text("{}")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    if wrapped:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", config_dir)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
+    write_mcp_inheritance({"inherit": False})
+    inherited = {
+        workspace / "sub/.claude/settings.json": "launch_project",
+        (workspace / "sub" if wrapped else workspace)
+        / config_dir
+        / "settings.json": "launch_user",
+        workspace / ".claude/settings.json": "workspace_project",
+    }
+    for path, name in inherited.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "{invalid project JSON"
+            if user_only and name != "launch_user"
+            else json.dumps({"allowedMcpServers": [{"serverName": name}]})
+        )
     monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
     monkeypatch.setattr(
-        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+        "omnigent.harness_startup_config.resolve_harness_command",
+        lambda *_a, **_k: "env" if wrapped else "claude",
     )
-    monkeypatch.setattr(
-        "omnigent.harness_startup_config.resolve_harness_args",
-        lambda _harness, cli_args, cfg=None: [
+
+    def launch_args(_harness, cli_args, cfg=None):
+        scopes = ["--setting-sources", "project", "--setting-sources=user"] if user_only else []
+        if not wrapped:
+            return [*scopes, *cli_args]
+        return [
             "-C",
             "sub",
+            *(["--"] if user_only else []),
             f"CLAUDE_CONFIG_DIR={config_dir}",
             "claude",
+            *scopes,
             *cli_args,
-        ],
+        ]
+
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        launch_args,
     )
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
@@ -1693,8 +1772,49 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
         )
 
     data = json.loads((workspace / expected).read_text())
-    assert data["projects"][str((workspace / "sub").resolve())]["hasTrustDialogAccepted"] is True
+    launch_cwd = workspace / "sub" if wrapped else workspace
+    assert data["projects"][str(launch_cwd.resolve())]["hasTrustDialogAccepted"] is True
     assert not (tmp_path / "home" / ".claude.json").exists()
+    launch_args = registry.launch_required_terminal.call_args.kwargs["spec"].args
+    settings = json.loads(Path(launch_args[launch_args.index("--settings") + 1]).read_text())
+    # ``workspace`` is the launch cwd's Git root, which Claude also reads.
+    denied = (
+        ["launch_user"] if user_only else ["launch_user", "launch_project", "workspace_project"]
+    )
+    assert settings["deniedMcpServers"] == [{"serverName": name} for name in denied]
+
+
+async def test_auto_create_claude_terminal_refuses_unresolved_strict_mcp_wrapper(
+    bridge_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Strict discovery refuses an unresolved wrapper before seeding or launching."""
+    from unittest.mock import Mock
+
+    from omnigent.mcp_disabled_servers import McpStrictModeError
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    write_mcp_inheritance({"inherit": False})
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        lambda _harness, cli_args, cfg=None: ["-v", "claude", *cli_args],
+    )
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {}
+
+    with pytest.raises(McpStrictModeError, match="configured env wrapper"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id="strict_unresolved_wrapper",
+            workspace=bridge_dir,
+            registry=registry,
+        )
+
+    registry.launch_required_terminal.assert_not_called()
 
 
 @pytest.mark.parametrize(

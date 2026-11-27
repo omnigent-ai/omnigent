@@ -30,6 +30,11 @@ export interface FileDiffResponse {
   baseline_state?: "unknown";
   /** Current file content, or null for deleted files. */
   after: string | null;
+  /**
+   * Client-side: when this request started (`Date.now()`). The content is at
+   * least as new as this moment, unlike the cache's response-arrival time.
+   */
+  requestedAt?: number;
 }
 
 class FileDiffError extends Error {
@@ -41,13 +46,19 @@ class FileDiffError extends Error {
   }
 }
 
-async function fetchFileDiff(conversationId: string, path: string): Promise<FileDiffResponse> {
+/** Fetch one file's before/after content. Throws with the server's reason on failure. */
+export async function fetchFileDiff(
+  conversationId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<FileDiffResponse> {
   // Encode each path segment individually so slashes remain structural.
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
     `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/diff/${encodedPath}`;
-  const res = await authenticatedFetch(url);
+  const requestedAt = Date.now();
+  const res = await authenticatedFetch(url, signal ? { signal } : undefined);
   if (!res.ok) {
     // Surface the server's reason (e.g. "git status timed out after 5.0s")
     // so the diff view shows what actually went wrong rather than a bare
@@ -61,7 +72,12 @@ async function fetchFileDiff(conversationId: string, path: string): Promise<File
     }
     throw new FileDiffError(message, res.status);
   }
-  return (await res.json()) as FileDiffResponse;
+  return { ...((await res.json()) as FileDiffResponse), requestedAt };
+}
+
+/** The query key a file's diff is cached under, shared by every diff surface. */
+export function fileDiffQueryKey(conversationId: string | undefined, path: string | null) {
+  return ["file-diff", conversationId, path] as const;
 }
 
 /**
@@ -87,7 +103,7 @@ export function useFileDiff(
     previousUpdate.current = changedFiles.dataUpdatedAt;
     if (refreshed && changedFiles.isSuccess && path) {
       void queryClient.invalidateQueries({
-        queryKey: ["file-diff", conversationId, path],
+        queryKey: fileDiffQueryKey(conversationId, path),
         exact: true,
       });
     }
@@ -99,7 +115,7 @@ export function useFileDiff(
     options.requested && changedFiles.data === undefined && !changedFiles.isError;
 
   return useQuery({
-    queryKey: ["file-diff", conversationId, path],
+    queryKey: fileDiffQueryKey(conversationId, path),
     queryFn: () => fetchFileDiff(conversationId!, path!),
     enabled:
       !!conversationId &&

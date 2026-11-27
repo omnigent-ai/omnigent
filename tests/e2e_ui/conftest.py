@@ -58,13 +58,17 @@ import pytest
 from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import (
+    COMPAT_SERVER_VERSION_ENV,
     apply_runner_env,
     apply_server_env,
     compat_runner_cwd,
     compat_server_cwd,
+    compat_server_python,
+    meets_min_server_version,
     runner_executable,
     server_executable,
 )
+from tests._helpers.mock_llm import mock_llm_answers
 from tests._helpers.native_session import create_native_session
 from tests._helpers.operator_agents import operator_agent_store, post_operator_session
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
@@ -150,12 +154,21 @@ def open_right_rail(page: Page) -> None:
     on the desktop viewport these tests run at, so the generous timeout covers
     the changed-files / terminals detection that gates the button.
 
+    With floating panes the header hides Collapse right panel while the rail is open, so the
+    rail's own Collapse right panel says it's open there.
+
     :param page: Playwright page already navigated to a ``/c/{id}`` route.
     :returns: None. Leaves the Workspace rail open.
     """
-    toggle = page.locator(
-        'button[aria-label="Expand right panel"], button[aria-label="Collapse right panel"]'
-    ).first
+    toggle = (
+        page.locator(
+            'header.chat-header button[aria-label="Expand right panel"], '
+            'header.chat-header button[aria-label="Collapse right panel"], '
+            'aside[aria-label="Workspace"] button[aria-label="Collapse right panel"]'
+        )
+        .filter(visible=True)
+        .first
+    )
     expect(toggle).to_be_visible(timeout=60_000)
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
@@ -599,13 +612,8 @@ def mock_llm_server_url(
     # Wait for the mock server to be ready
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
-            if resp.status_code == 200:
-                break
-        except httpx.ConnectError:
-            # Expected while the mock server is still booting.
-            pass
+        if mock_llm_answers(base_url):
+            break
         time.sleep(0.1)
     else:
         proc.kill()
@@ -649,12 +657,14 @@ def configure_mock_llm(
         ``error``, ``status_code``, ``delay``, ``truncate_after``
         (emit only N SSE events then end the stream, dropping the
         completion event — a mid-stream fault for exercising the SPA's
-        stream error/recovery UI).
+        stream error/recovery UI), ``stop_reason`` (override the terminal
+        Anthropic ``stop_reason`` on ``/v1/messages``, e.g. ``"max_tokens"``
+        for a reply cut off by the model's output-token limit).
     :param key: Queue key — typically the model name baked into the
         agent spec. Omitting it allocates an independent content queue when
         ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace
         existing queues. The helper in ``tests/e2e/conftest.py`` instead uses
-        the match token as its explicit key and has no ``required_tools`` parameter.
+        the match token as its explicit key.
     :param match: Optional substring to match against the user text for
         content-based routing (in addition to model-name routing).
     :param required_tools: Only consume responses when these tools are advertised.
@@ -688,7 +698,9 @@ def reset_mock_llm(mock_url: str) -> None:
     resp.raise_for_status()
 
 
-def seed_committed_items(session_id: str, items: list[Any]) -> None:
+def seed_committed_items(
+    session_id: str, items: list[Any], *, database_uri: str | None = None
+) -> None:
     """Append committed ``NewConversationItem``s straight into the store.
 
     For tests that need a settled transcript to act on but not the model's
@@ -702,6 +714,8 @@ def seed_committed_items(session_id: str, items: list[Any]) -> None:
     :param session_id: Session to append to, e.g. ``"conv_abc123"``.
     :param items: ``omnigent.entities.NewConversationItem`` values, in
         transcript order.
+    :param database_uri: Store of a server the test started itself, e.g.
+        ``"sqlite:////tmp/server.db"``; defaults to ``live_server``'s.
     :raises RuntimeError: If the server under test isn't one we spawned
         (``--ui-base-url``), so its database isn't reachable from here.
     """
@@ -709,7 +723,7 @@ def seed_committed_items(session_id: str, items: list[Any]) -> None:
         SqlAlchemyConversationStore,
     )
 
-    database_uri = _server_state.get("database_uri")
+    database_uri = database_uri or _server_state.get("database_uri")
     if not database_uri:
         raise RuntimeError(
             "seeding needs the spawned server's database; it is "
@@ -724,6 +738,7 @@ def seed_committed_turn(
     prompt: str,
     reply: str,
     response_id: str = "resp_seeded",
+    database_uri: str | None = None,
 ) -> None:
     """Write one committed user+assistant exchange straight into the store.
 
@@ -736,6 +751,7 @@ def seed_committed_turn(
     :param reply: Assistant message text, e.g. ``"pong"``.
     :param response_id: Response id shared by both items — per-message
         actions pass it as the turn anchor (e.g. a fork's truncation point).
+    :param database_uri: Passed to :func:`seed_committed_items`.
     """
     from omnigent.entities import MessageData, NewConversationItem
 
@@ -757,6 +773,7 @@ def seed_committed_turn(
                 ),
             ),
         ],
+        database_uri=database_uri,
     )
 
 
@@ -1108,6 +1125,20 @@ def live_server(
     # drop PYTHONPATH so the pinned old build in the compat venv resolves
     # instead of being shadowed by the worktree.
     apply_server_env(env, _REPO_ROOT)
+    # The shared server keeps per-task timers; dedicated v2 suites start their own.
+    # Pre-0.22 compatibility servers already default to the timers.
+    features = env.get("OMNIGENT_FEATURES", "")
+    compat_version = env.get(COMPAT_SERVER_VERSION_ENV) or "0"
+    # Workflow scenarios opt in only on servers that recognize the flag.
+    if "workflows" not in features and (
+        compat_server_python() is None or meets_min_server_version(compat_version, "0.23.0")
+    ):
+        features = ",".join(filter(None, (features, "workflows")))
+    env["OMNIGENT_FEATURES"] = features
+    if "automations_v2" not in features and (
+        compat_server_python() is None or meets_min_server_version(compat_version, "0.22.0")
+    ):
+        env["OMNIGENT_FEATURES"] = ",".join(filter(None, (features, "-automations_v2")))
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     server_argv = [
         server_executable(),

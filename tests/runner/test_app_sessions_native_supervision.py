@@ -323,6 +323,75 @@ async def test_stop_session_cancels_inprocess_turn() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+async def test_cancel_relays_terminal_the_harness_sends_after_acknowledging(
+    event_type: str,
+) -> None:
+    """A turn's own ``response.cancelled`` relays before the cancel floor fires.
+
+    The in-process harness acknowledges an interrupt once its executor stops and
+    streams the terminal, which carries the turn's usage, just afterwards.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    usage = {"input_tokens": 50, "output_tokens": 25, "total_tokens": 75}
+    gate = asyncio.Event()
+    app, _pm, harness = _build_interrupt_app(
+        gate,
+        sse_frames=[
+            _sse({"type": "response.created", "response": {"id": "resp_stop"}}),
+            _sse(
+                {
+                    "type": "response.cancelled",
+                    "response": {"id": "resp_stop", "status": "cancelled", "usage": usage},
+                }
+            ),
+        ],
+    )
+    acknowledge = harness.post
+
+    async def acknowledge_then_finish(
+        url: str, *, json: dict[str, Any], timeout: Any = None
+    ) -> Any:
+        response = await acknowledge(url, json=json, timeout=timeout)
+        if json.get("type") == "interrupt":
+            asyncio.get_running_loop().call_later(0.05, gate.set)
+        return response
+
+    harness.post = acknowledge_then_finish  # type: ignore[method-assign]
+
+    async with _runner_client(app) as client:
+        conv_id = f"terminal-relay-{event_type}"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "do something"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+
+        cancel_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": event_type},
+        )
+        assert cancel_resp.status_code == 204, cancel_resp.text
+        published = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    terminals = [event for event in published if event.get("type") == "response.cancelled"]
+    assert [event["response"].get("usage") for event in terminals] == [usage]
+
+
+@pytest.mark.asyncio
 async def test_interrupt_during_setup_phase_recovers_stuck_turn() -> None:
     """Interrupt during the setup phase finalizes the turn — the session isn't stuck.
 
@@ -2930,6 +2999,28 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         # decide whether a PTY watcher owns this session's status.
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
     )
+    browser_labels: list[object] = []
+    relay_labels = {"omnigent.test/source": "first-turn-fallback"}
+    if harness == "antigravity-native":
+        from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+        from omnigent.tools import browser_agent_tools
+
+        async def labels(**_kwargs: Any) -> dict[str, str]:
+            return relay_labels
+
+        async def skip_auto_create(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("exercise the first-turn relay fallback")
+
+        async def filter_browser_tools(schemas: Any, **kwargs: Any) -> Any:
+            browser_labels.append(kwargs.get("session_labels"))
+            return schemas
+
+        monkeypatch.setattr(agy_bridge, "_BRIDGE_ROOT", tmp_path / "agy-bridges")
+        monkeypatch.setattr(runner_app, "_session_labels_for_runner_spawn", labels)
+        monkeypatch.setattr(runner_app, "_auto_create_antigravity_terminal", skip_auto_create)
+        monkeypatch.setattr(
+            browser_agent_tools, "filter_native_relay_browser_tools", filter_browser_tools
+        )
     stream_finished = asyncio.Event()
     harness_client = _ScriptedHarnessClient([], stream_finished=stream_finished)
     app = create_runner_app(
@@ -2992,6 +3083,8 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         # DELETE cancels the background turn so it can't outlive the test.
         await client.delete(f"/v1/sessions/{session_id}")
 
+    if harness == "antigravity-native":
+        assert browser_labels == [relay_labels]
     assert statuses == expected_statuses, (
         f"harness={harness}: expected runner turn lifecycle statuses "
         f"{expected_statuses!r}, got {statuses!r}. Claude-native must rely "

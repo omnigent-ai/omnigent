@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import gzip
 import hashlib
 import io
 import json
@@ -89,6 +91,42 @@ def _reject_escaping_cwd(cwd: str | None) -> None:
         )
 
 
+def _grant_escapes_workspace(grant: str) -> bool:
+    """Whether an ``os_env.sandbox`` path grant would resolve outside the workspace.
+
+    Like :func:`_cwd_escapes_workspace`, and also rejects a leading ``~``: the
+    runner expands grants with ``os.path.expanduser`` (see
+    ``omnigent.inner.sandbox._resolve_grant_root``), so ``~`` maps to the host
+    home directory.
+    """
+    return grant.startswith("~") or _cwd_escapes_workspace(grant)
+
+
+def _reject_escaping_sandbox_grants(os_env: OSEnvSpec | None) -> None:
+    """Reject absolute or escaping ``os_env.sandbox`` path grants in an uploaded spec.
+
+    ``read_paths``, ``write_paths``, and ``write_files`` become host bind mounts
+    under ``linux_bwrap`` and file-tool reach grants under ``sandbox.type=none``,
+    so they must stay inside the session workspace, as ``os_env.cwd`` does.
+    Direct in-process callers may bypass this via ``enforce_handler_allowlist=False``.
+    """
+    sandbox = os_env.sandbox if os_env is not None else None
+    if sandbox is None:
+        return
+    grants = [
+        *(("read_paths", root) for root in sandbox.read_paths or []),
+        *(("write_paths", grant.path) for grant in sandbox.write_path_specs),
+        *(("write_files", root) for root in sandbox.write_files or []),
+    ]
+    for field, grant in grants:
+        if _grant_escapes_workspace(grant):
+            raise OmnigentError(
+                f"agent os_env.sandbox.{field} entries must be relative paths "
+                f"within the workspace (no absolute paths, '~', or '..'); got {grant!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+
 def _reject_uploaded_escaping_cwd(spec: AgentSpec) -> None:
     """Validate working directories in the agent, its terminals, and all sub-agents."""
     _reject_escaping_cwd(spec.os_env.cwd if spec.os_env is not None else None)
@@ -97,6 +135,16 @@ def _reject_uploaded_escaping_cwd(spec: AgentSpec) -> None:
             _reject_escaping_cwd(terminal.os_env.cwd)
     for sub in spec.sub_agents:
         _reject_uploaded_escaping_cwd(sub)
+
+
+def _reject_uploaded_escaping_sandbox_grants(spec: AgentSpec) -> None:
+    """Validate sandbox path grants in the agent, its terminals, and all sub-agents."""
+    _reject_escaping_sandbox_grants(spec.os_env)
+    for terminal in (spec.terminals or {}).values():
+        if isinstance(terminal.os_env, OSEnvSpec):
+            _reject_escaping_sandbox_grants(terminal.os_env)
+    for sub in spec.sub_agents:
+        _reject_uploaded_escaping_sandbox_grants(sub)
 
 
 def validate_agent_bundle(
@@ -127,8 +175,10 @@ def validate_agent_bundle(
     :returns: The validated :class:`AgentSpec`.
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
-        names an unregistered handler, ``os_env.cwd`` is an absolute or
-        escaping path, or a tool declares a server-side callable or Python/TS source file.
+        names an unregistered handler, ``os_env.cwd`` or an
+        ``os_env.sandbox`` grant (``read_paths`` / ``write_paths`` /
+        ``write_files``) is an absolute or escaping path, or a tool declares a
+        server-side callable or Python/TS source file.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -165,6 +215,9 @@ def validate_agent_bundle(
         # Terminals and nested agents can override the session working directory.
         _reject_uploaded_escaping_cwd(spec)
 
+        # Sandbox grants are host bind mounts or reach grants, so they get the same containment.
+        _reject_uploaded_escaping_sandbox_grants(spec)
+
         # Server-side callables and source-file tools require operator-authored bundles.
         _reject_uploaded_callable_tools(spec)
 
@@ -184,7 +237,168 @@ def agent_needs_own_copy(agent: Agent, user_id: str | None) -> bool:
     return agent.created_by != user_id
 
 
-def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id: str) -> str:
+def redacted_agent_bundle(
+    agent_name: str, source_bundle: bytes, *, operator_authored: bool = False
+) -> bytes:
+    """Retain the agent name and validated harness without copying source content."""
+    try:
+        spec = validate_agent_bundle(
+            source_bundle, enforce_handler_allowlist=not operator_authored
+        )
+    except Exception:  # noqa: BLE001 - any parser error can echo source config, incl. secrets
+        raise OmnigentError(
+            "Agent bundle cannot be redacted", code=ErrorCode.INTERNAL_ERROR
+        ) from None
+
+    executor: dict[str, object] = {"type": spec.executor.type}
+    if spec.executor.type == "omnigent":
+        executor["config"] = {"harness": spec.executor.config["harness"]}
+    config = json.dumps(
+        {
+            "spec_version": 1,
+            "name": agent_name,
+            "executor": executor,
+        }
+    ).encode("utf-8")
+    output = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w") as archive,
+    ):
+        member = tarfile.TarInfo("config.yaml")
+        member.size = len(config)
+        member.mode = 0o644
+        archive.addfile(member, io.BytesIO(config))
+    return output.getvalue()
+
+
+def bundle_without_tool_groups(source_bundle: bytes, groups: frozenset[str]) -> bytes:
+    """*source_bundle* with *groups* taken out of every agent spec's ``tool_groups``.
+
+    For runners released before those groups: their spec parser refuses a ``tool_groups``
+    key it doesn't know, so an author's opt-out would stop the session from starting. Such
+    a runner offers none of those tools anyway, so dropping the key loses nothing. The
+    specs are the files the loader reads (:func:`_spec_member_names`); other files, a
+    nested ``assets/config.yaml`` included, are copied unchanged, and a bundle whose specs
+    name none of *groups* is returned as it is.
+    """
+    import yaml
+
+    from omnigent.spec.parser import _ConfigYamlLoader
+
+    def stripped(data: bytes) -> bytes | None:
+        try:
+            config = yaml.load(data.decode("utf-8"), Loader=_ConfigYamlLoader)
+        except (UnicodeDecodeError, yaml.YAMLError):
+            return None  # Not ours to fix; the runner reports it as it would have.
+        tool_groups = config.get("tool_groups") if isinstance(config, dict) else None
+        if not isinstance(tool_groups, dict) or not groups & tool_groups.keys():
+            return None
+        kept = {key: value for key, value in tool_groups.items() if key not in groups}
+        if kept:
+            config["tool_groups"] = kept
+        else:
+            del config["tool_groups"]
+        return yaml.safe_dump(config, sort_keys=False, allow_unicode=True).encode("utf-8")
+
+    with (
+        gzip.GzipFile(fileobj=io.BytesIO(source_bundle)) as source,
+        tarfile.open(fileobj=source, mode="r") as archive,
+    ):
+        members = [
+            (member, archive.extractfile(member).read() if member.isfile() else None)  # type: ignore[union-attr]
+            for member in archive.getmembers()
+        ]
+    specs = _spec_member_names(members)
+    changed = False
+    rewritten = []
+    for member, data in members:
+        if data is not None and _member_path(member.name) in specs:
+            replacement = stripped(data)
+            if replacement is not None:
+                member = copy.copy(member)
+                member.size = len(replacement)
+                data = replacement
+                changed = True
+        rewritten.append((member, data))
+    if not changed:
+        return source_bundle
+    output = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w") as archive,
+    ):
+        for member, data in rewritten:
+            archive.addfile(member, io.BytesIO(data) if data is not None else None)
+    return output.getvalue()
+
+
+def _member_path(name: str) -> str:
+    """A tar member's path relative to the bundle root, without a leading ``./``."""
+    return posixpath.normpath(name).lstrip("/") if name not in ("", ".") else ""
+
+
+def _spec_member_names(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> set[str]:
+    """The members the spec loader reads as agent specs, by its own rules.
+
+    ``config.yaml`` at the root and in each sub-agent directory (``agents/<dir>/``, at any
+    depth). A root without ``config.yaml`` is a single-file bundle instead: its one
+    root-level ``.yaml`` or ``.yml`` agent spec (a mapping with a name and a prompt, and no
+    ``spec_version``), as :func:`omnigent.spec._find_omnigent_yaml_in_dir` picks it.
+    """
+    import yaml
+
+    from omnigent.spec._omnigent_compat import (
+        _OMNIGENT_DISCRIMINATOR_KEY,
+        _OMNIGENT_NAME_KEY,
+        _OMNIGENT_SYSTEM_PROMPT_KEYS,
+    )
+
+    files = {_member_path(member.name): data for member, data in members if data is not None}
+    specs = {
+        path
+        for path in files
+        if path == "config.yaml"
+        or (path.endswith("/config.yaml") and _is_sub_agent_dir(path.rsplit("/", 1)[0]))
+    }
+    if "config.yaml" in files:
+        return specs
+    candidates = []
+    for path, data in files.items():
+        if "/" in path or PurePosixPath(path).suffix.lower() not in (".yaml", ".yml"):
+            continue
+        try:
+            raw = yaml.safe_load(data.decode("utf-8"))  # type: ignore[union-attr]
+        except (UnicodeDecodeError, yaml.YAMLError):
+            continue
+        if (
+            isinstance(raw, dict)
+            and _OMNIGENT_DISCRIMINATOR_KEY not in raw
+            and _OMNIGENT_NAME_KEY in raw
+            and _OMNIGENT_SYSTEM_PROMPT_KEYS & raw.keys()
+        ):
+            candidates.append(path)
+    if len(candidates) == 1:
+        specs.add(candidates[0])
+    return specs
+
+
+def _is_sub_agent_dir(directory: str) -> bool:
+    """Whether *directory* is ``agents/<dir>``, or one nested in another sub-agent's."""
+    parts = directory.split("/")
+    return (
+        len(parts) >= 2 and len(parts) % 2 == 0 and all(part == "agents" for part in parts[0::2])
+    )
+
+
+def copy_agent_bundle(
+    artifact_store: ArtifactStore,
+    location: str,
+    new_agent_id: str,
+    *,
+    redacted_name: str | None = None,
+    operator_authored: bool = False,
+) -> str:
     """Store a copy of the bundle at *location* under *new_agent_id*; return its location."""
     try:
         data = artifact_store.get(location)
@@ -195,6 +409,8 @@ def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id
         raise OmnigentError(
             SESSION_AGENT_BUNDLE_MISSING_MESSAGE, code=ErrorCode.SESSION_AGENT_MISSING
         ) from exc
+    if redacted_name is not None:
+        data = redacted_agent_bundle(redacted_name, data, operator_authored=operator_authored)
     new_location = bundle_location(new_agent_id, data)
     artifact_store.put(new_location, data)
     return new_location

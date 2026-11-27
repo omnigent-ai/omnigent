@@ -17,6 +17,7 @@ from omnigent.server.scheduled.rrule import (
     MIN_INTERVAL_SECONDS,
     RRuleValidationError,
     get_next_fire_time,
+    is_one_time_rule,
     validate_rrule,
 )
 
@@ -106,8 +107,7 @@ def test_default_timezone_is_utc_semantics() -> None:
 
 
 def test_validate_accepts_hourly_cadence() -> None:
-    # FREQ=HOURLY = exactly 3600s. The floor is a strict `<`, so a gap equal to
-    # the floor passes: `3600 < 3600` is False.
+    # FREQ=HOURLY = 3600s, above the 600s floor.
     trig = validate_rrule("FREQ=HOURLY")
     assert trig.rule == "FREQ=HOURLY"
     # The trigger can compute a next fire.
@@ -125,15 +125,9 @@ def test_validate_accepts_weekly_weekdays() -> None:
 
 
 def test_validate_rejects_every_minute() -> None:
-    # FREQ=MINUTELY = 60s < 3600s floor.
+    # FREQ=MINUTELY = 60s < 600s floor.
     with pytest.raises(RRuleValidationError):
         validate_rrule("FREQ=MINUTELY")
-
-
-def test_validate_rejects_half_hour_cadence() -> None:
-    # FREQ=MINUTELY;INTERVAL=30 = 1800s < 3600s floor.
-    with pytest.raises(RRuleValidationError):
-        validate_rrule("FREQ=MINUTELY;INTERVAL=30")
 
 
 def test_validate_rejects_secondly_cadence() -> None:
@@ -153,6 +147,50 @@ def test_validate_rejects_fires_only_once() -> None:
         validate_rrule("FREQ=DAILY;COUNT=1")
 
 
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=DAILY;COUNT=1",
+        "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
+        "RRULE:freq=yearly;bymonth=2;bymonthday=29;count=01",
+    ],
+)
+def test_validate_accepts_explicit_one_time_rule_when_allowed(rule: str) -> None:
+    assert validate_rrule(rule, allow_single_fire=True).rule == rule
+    # Without the opt-in the legacy "fires only once" check still applies.
+    with pytest.raises(RRuleValidationError, match="fires only once"):
+        validate_rrule(rule)
+
+
+@pytest.mark.parametrize(
+    "rule,message",
+    [
+        # Fires once only because UNTIL is tight: a misconfigured recurrence.
+        ("FREQ=DAILY;UNTIL=20160101T120000Z", "fires only once"),
+        # COUNT=1 does not rescue a rule with no occurrence at all.
+        ("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30;COUNT=1", "never fires"),
+    ],
+)
+def test_single_fire_opt_in_still_rejects_accidental_rules(rule: str, message: str) -> None:
+    with pytest.raises(RRuleValidationError, match=message):
+        validate_rrule(rule, allow_single_fire=True)
+
+
+@pytest.mark.parametrize(
+    "rule,expected",
+    [
+        ("FREQ=DAILY;COUNT=1", True),
+        ("COUNT=1;FREQ=DAILY", True),
+        ("rrule:FREQ=DAILY; COUNT=001", True),
+        ("FREQ=DAILY;COUNT=10", False),
+        ("FREQ=DAILY;COUNT=2", False),
+        ("FREQ=DAILY", False),
+    ],
+)
+def test_is_one_time_rule(rule: str, expected: bool) -> None:
+    assert is_one_time_rule(rule) is expected
+
+
 def test_validate_rejects_never_fires() -> None:
     # UNTIL in the past (relative to the fixed 2016 anchor) -> zero occurrences.
     with pytest.raises(RRuleValidationError):
@@ -170,7 +208,7 @@ def test_validate_floor_is_deterministic() -> None:
 
 
 def test_min_interval_constant() -> None:
-    assert MIN_INTERVAL_SECONDS == 3600
+    assert MIN_INTERVAL_SECONDS == 600
 
 
 @pytest.mark.parametrize(
@@ -427,21 +465,14 @@ def test_legacy_search_horizon_remains_midnight_based() -> None:
     assert get_next_fire_time(rule, after, UTC, anchor=after) == _dt(2034, 1, 1, 1)
 
 
-@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox", None])
-@pytest.mark.parametrize("session_mode", ["new", "continue"])
 @pytest.mark.parametrize("minutes", [1, 5, 9, 10, 11, 15, 30, 59, 60])
-def test_minimum_interval_depends_on_execution(execution_target, session_mode, minutes):
-    minimum = 10 if execution_target == "connected_host" or session_mode == "continue" else 60
-    options = {
-        "execution_target": execution_target,
-        "session_mode": session_mode,
-    }
+def test_minimum_interval_is_ten_minutes(minutes):
     rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
-    if minutes < minimum:
-        with pytest.raises(RRuleValidationError, match=f"Minimum interval is {minimum} minutes"):
-            validate_rrule(rule, **options)
+    if minutes < 10:
+        with pytest.raises(RRuleValidationError, match="Minimum interval is 10 minutes"):
+            validate_rrule(rule)
     else:
-        assert validate_rrule(rule, **options).rule == rule
+        assert validate_rrule(rule).rule == rule
 
 
 @pytest.mark.parametrize(
@@ -453,9 +484,9 @@ def test_minimum_interval_depends_on_execution(execution_target, session_mode, m
         ("FREQ=SECONDLY;INTERVAL=599", False),
     ],
 )
-def test_continued_session_checks_actual_gaps(rule, allowed):
+def test_minimum_interval_checks_actual_gaps(rule, allowed):
     if allowed:
-        assert validate_rrule(rule, session_mode="continue").rule == rule
+        assert validate_rrule(rule).rule == rule
     else:
         with pytest.raises(RRuleValidationError, match="Minimum interval is 10 minutes"):
-            validate_rrule(rule, session_mode="continue")
+            validate_rrule(rule)
