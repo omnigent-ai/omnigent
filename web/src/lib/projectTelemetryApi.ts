@@ -36,7 +36,10 @@ export interface TelemetryThroughput {
   merged_prs: number | null;
   /** Distinct commits landed in the window; null when the project never landed one. */
   changes_landed?: number | null;
+  /** Tickets reopened after finishing or sent back from review, in the window. */
   rework_tickets: number | null;
+  rework_reopened_tickets?: number | null;
+  rework_sent_back_tickets?: number | null;
   time_to_merged_median_hours: number | null;
   spend_usd: number | null;
   review_rounds_per_shipped_ticket: number | null;

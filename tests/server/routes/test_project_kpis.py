@@ -16,6 +16,7 @@ from omnigent.server.project_kpis import (
     KpiInputs,
     MetricSeries,
     MetricValue,
+    SeriesItem,
     compute_metrics,
     hours_to_final_stage,
     kpi_rows,
@@ -73,10 +74,48 @@ def test_rework_counts_backward_moves_and_reopens_in_the_window() -> None:
         "forward-only": [_entry("open", recent, created=True), _entry("merged", recent + 5)],
         "long-ago": [_entry("code_review", OLD), _entry("open", OLD + 1)],
     }
-    rework = MetricSeries("distinct", items=rework_items(histories, ORDER))
+    stages = [{"id": stage, "is_complete": stage == "merged"} for stage in ORDER]
+    rework = MetricSeries("distinct", items=rework_items(histories, stages))
     # A ticket sent back twice counts once.
     assert _window(rework, period) == 2
     assert _window(rework, status_period("all", NOW)) == 3
+
+
+def test_rework_skips_routine_back_moves_and_names_each_reason() -> None:
+    names = [
+        ("open", "Pending"),
+        ("in_progress", "Working"),
+        ("code_review", "Review"),
+        ("done", "Verified"),
+        ("implemented", "Landed"),
+        ("merged", "Merged"),
+    ]
+    stages = [{"id": i, "name": n, "is_complete": i == "merged"} for i, n in names]
+
+    def moves(*stage_ids: str) -> list[dict]:
+        first, *rest = stage_ids
+        return [
+            _entry(first, NOW - 100, created=True),
+            *(
+                _entry(stage, NOW - 99 + index, complete=stage == "merged")
+                for index, stage in enumerate(rest)
+            ),
+        ]
+
+    histories = {
+        # Rebased after verification: back to Review for re-approval, then on. Routine.
+        "rebased": moves("open", "in_progress", "code_review", "done", "code_review", "done"),
+        # Landed before verified (the stage order changed later). Routine.
+        "old-order": moves("open", "code_review", "implemented", "done", "merged"),
+        "changes-requested": moves("open", "in_progress", "code_review", "in_progress"),
+        "reopened": moves("open", "in_progress", "merged", "open"),
+        "clean": moves("open", "in_progress", "code_review", "done", "implemented", "merged"),
+    }
+    items = rework_items(histories, stages)
+    assert sorted((item.key, item.detail["reason"]) for item in items) == [
+        ("changes-requested", "sent_back"),
+        ("reopened", "reopened"),
+    ]
 
 
 def test_time_to_merged_uses_tickets_now_in_the_final_stage() -> None:
@@ -703,3 +742,24 @@ async def test_trends_endpoint_matches_the_drilldown_day_by_day(
         )
         drill = [day["value"] for day in items.json()["days"]]
         assert drill == [day[field or metric] for day in body["days"]]
+
+
+def test_telemetry_splits_rework_by_reason_within_the_window() -> None:
+    from omnigent.server.routes.project_telemetry import rework_split
+
+    def move(key: str, reason: str, at: int) -> SeriesItem:
+        return SeriesItem(at, key, "ticket", detail={"reason": reason})
+
+    series = MetricSeries(
+        "distinct",
+        items=[
+            move("a", "reopened", NOW - HOUR),
+            move("a", "reopened", NOW - 2 * HOUR),
+            move("b", "sent_back", NOW - HOUR),
+            move("c", "sent_back", OLD),
+        ],
+    )
+    assert rework_split(series, status_period("7d", NOW)) == {
+        "rework_reopened_tickets": 1,
+        "rework_sent_back_tickets": 1,
+    }

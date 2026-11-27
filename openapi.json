@@ -18326,6 +18326,32 @@
             "description": "Moves into a review stage per shipped ticket. A review stage is one whose ID or name contains 'review'; null when the project has none.",
             "title": "Review Rounds Per Shipped Ticket"
           },
+          "rework_reopened_tickets": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Of those, tickets moved out of a completed stage.",
+            "title": "Rework Reopened Tickets"
+          },
+          "rework_sent_back_tickets": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Of those, tickets sent from review to an earlier stage.",
+            "title": "Rework Sent Back Tickets"
+          },
           "rework_tickets": {
             "anyOf": [
               {
@@ -18336,6 +18362,7 @@
                 "type": "null"
               }
             ],
+            "description": "Tickets reopened after finishing or sent back from review, in the window.",
             "title": "Rework Tickets"
           },
           "spend_usd": {

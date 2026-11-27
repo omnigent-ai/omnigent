@@ -7,8 +7,9 @@ the on-target check uses (today is still in progress, so it's left out).
 - ``merged_prs`` and ``spend_usd`` are the Summary's PRs-merged and spend sources.
 - ``tickets_shipped`` counts distinct tickets moved into a completed stage, like
   the Summary's tickets done.
-- ``rework_tickets`` counts distinct tickets with a backward move: to an earlier
-  stage in the project's current order, or out of a completed stage.
+- ``rework_tickets`` counts distinct tickets reopened after finishing (moved out of a
+  completed stage) or sent back from review (from a review stage to an earlier working
+  stage). Moves back into review or verification, such as after a rebase, don't count.
 - ``time_to_merged_*`` use tickets now in the final completed stage, dated by
   their latest move there: hours from creation to that move. The median is the
   usual middle value; p90 is nearest-rank.
@@ -206,33 +207,53 @@ def _no_member(entry: dict[str, Any]) -> MemberKey | None:
     return None
 
 
+def review_stage_ids(stages: list[dict[str, Any]]) -> set[str]:
+    """Stages whose ID or name contains "review", as for review rounds."""
+    return {
+        str(stage["id"])
+        for stage in stages
+        if "review" in str(stage["id"]).lower() or "review" in str(stage.get("name", "")).lower()
+    }
+
+
 def rework_items(
-    histories: StageHistories, stage_order: list[str], member_of: MemberOfMove = _no_member
+    histories: StageHistories, stages: list[dict[str, Any]], member_of: MemberOfMove = _no_member
 ) -> list[SeriesItem]:
-    """Each backward move (see the module docstring), credited to whoever made it."""
-    rank = {stage_id: index for index, stage_id in enumerate(stage_order)}
+    """Each rework move (see the module docstring), credited to whoever made it.
+
+    ``detail["reason"]`` is ``reopened`` (out of a completed stage) or ``sent_back`` (from
+    a review stage to an earlier stage that isn't a review or completed one). Other
+    backward moves, like re-verifying or re-reviewing after a rebase, aren't rework.
+    """
+    rank = {str(stage["id"]): index for index, stage in enumerate(stages)}
+    review = review_stage_ids(stages)
     items: list[SeriesItem] = []
     for ticket_id, history in histories.items():
         for before, after in itertools.pairwise(history):
-            reopened = before["is_complete"] and not after["is_complete"]
-            earlier = (
-                before["stage_id"] in rank
-                and after["stage_id"] in rank
-                and rank[after["stage_id"]] < rank[before["stage_id"]]
-            )
-            if reopened or earlier:
-                items.append(
-                    SeriesItem(
-                        after["at"],
-                        ticket_id,
-                        "ticket",
-                        member=member_of(after),
-                        detail={
-                            "from_stage_id": before["stage_id"],
-                            "to_stage_id": after["stage_id"],
-                        },
-                    )
+            if before["is_complete"] and not after["is_complete"]:
+                reason = "reopened"
+            elif (
+                before["stage_id"] in review
+                and after["stage_id"] not in review
+                and not after["is_complete"]
+                and rank.get(after["stage_id"], len(rank)) < rank.get(before["stage_id"], -1)
+            ):
+                reason = "sent_back"
+            else:
+                continue
+            items.append(
+                SeriesItem(
+                    after["at"],
+                    ticket_id,
+                    "ticket",
+                    member=member_of(after),
+                    detail={
+                        "reason": reason,
+                        "from_stage_id": before["stage_id"],
+                        "to_stage_id": after["stage_id"],
+                    },
                 )
+            )
     return items
 
 
@@ -562,9 +583,8 @@ def load_series(
         if ticket_metrics - {"tickets_shipped"}:
             stages = inputs.stages()
             if "rework_tickets" in ticket_metrics:
-                order = [str(stage["id"]) for stage in stages]
                 series["rework_tickets"] = MetricSeries(
-                    "distinct", items=rework_items(histories, order, member_of)
+                    "distinct", items=rework_items(histories, stages, member_of)
                 )
             final = next(
                 (str(stage["id"]) for stage in reversed(stages) if stage.get("is_complete")),

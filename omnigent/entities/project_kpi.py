@@ -63,11 +63,12 @@ KPI_METRICS: tuple[KpiMetric, ...] = (
     ),
     KpiMetric(
         id="rework_tickets",
-        label="Rework",
+        label="Rework (reopened or sent back)",
         unit="count",
         description=(
-            "Distinct tickets moved back to an earlier stage in the window: reopened "
-            "after completion or sent back from review."
+            "Distinct tickets in the window reopened after finishing, or sent back from "
+            "review to an earlier working stage. Re-review or re-verify moves after a "
+            "rebase don't count."
         ),
     ),
     KpiMetric(

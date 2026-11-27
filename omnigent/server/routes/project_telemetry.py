@@ -19,6 +19,7 @@ from omnigent.server.project_kpis import (
     changes_landed_total,
     compute_metrics,
     has_landed_commits,
+    items_in_range,
     load_series,
     role_series,
     window_value,
@@ -144,7 +145,15 @@ class Throughput(BaseModel):
         default=None,
         description="Distinct commits landed in the window; null if the project never landed one.",
     )
-    rework_tickets: float | None
+    rework_tickets: float | None = Field(
+        description="Tickets reopened after finishing or sent back from review, in the window."
+    )
+    rework_reopened_tickets: int | None = Field(
+        default=None, description="Of those, tickets moved out of a completed stage."
+    )
+    rework_sent_back_tickets: int | None = Field(
+        default=None, description="Of those, tickets sent from review to an earlier stage."
+    )
     time_to_merged_median_hours: float | None
     spend_usd: float | None
     review_rounds_per_shipped_ticket: float | None = Field(
@@ -268,6 +277,19 @@ class TelemetryOverview(BaseModel):
     projects: list[ProjectTelemetry]
 
 
+def rework_split(series: Any, period: Any) -> dict[str, int | None]:
+    """Distinct tickets in the window per rework reason."""
+    if not series.available:
+        return {"rework_reopened_tickets": None, "rework_sent_back_tickets": None}
+    in_window = items_in_range(series, period.since_epoch, period.until_epoch + 1)
+    return {
+        f"rework_{reason}_tickets": len(
+            {item.key for item in in_window if item.detail.get("reason") == reason}
+        )
+        for reason in ("reopened", "sent_back")
+    }
+
+
 @dataclass(frozen=True)
 class RoleScope:
     """One role's share of the project: its tickets, its root sessions and their spend."""
@@ -332,6 +354,7 @@ def create_project_telemetry_router(
         )
         stage_ages = ticket_store.ticket_stage_ages(project.id, user_id=user_id)
         if role is None:
+            series = load_series(["rework_tickets"], inputs)
             values = compute_metrics(THROUGHPUT_METRICS, inputs)
             spend_totals = _measure(active.spend, "spend", project, period)
             spend = spend_totals.total / 100 if spend_totals.available else None
@@ -366,6 +389,7 @@ def create_project_telemetry_router(
             },
             "spend_usd": spend,
             "changes_landed": landed,
+            **rework_split(series["rework_tickets"], period),
             **review_rounds_and_stalled(role_histories, stages(), stage_ages, period),
         }
 
