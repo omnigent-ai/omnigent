@@ -5,7 +5,7 @@
 import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
 import { createHeldPolls, pollingObserver, type HeldPoll } from "@/lib/heldPolls";
 
-/** How long the window goes without pointer, key, wheel or scroll input before it counts as idle. */
+/** How long the window goes without pointer, key or wheel input before it counts as idle. */
 export const IDLE_POLL_AFTER_MS = 3 * 60_000;
 
 /** How much slower an idle window's list polls run. */
@@ -14,16 +14,19 @@ export const IDLE_POLL_FACTOR = 4;
 /** The rollback flag: off, list polls keep their pace however long nobody uses the window. */
 export const GITHUB_IDLE_PACING_FLAG = "github-idle-pacing";
 
-const INPUT_EVENTS = ["pointerdown", "pointermove", "keydown", "wheel", "scroll"] as const;
+// A person's input only: `scroll` also fires for the app's own scrolling, such as following
+// streamed output, while the scrolling a person does arrives as wheel, key or pointer input.
+export const IDLE_INPUT_EVENTS = ["pointerdown", "pointermove", "keydown", "wheel"] as const;
 
 export function createGitHubPollIdle({
   // Read each time, so a faked clock counts too.
   now = () => Date.now(),
   listen = (inputListener) => {
     const options = { capture: true, passive: true } as const;
-    for (const type of INPUT_EVENTS) window.addEventListener(type, inputListener, options);
+    for (const type of IDLE_INPUT_EVENTS) window.addEventListener(type, inputListener, options);
     return () => {
-      for (const type of INPUT_EVENTS) window.removeEventListener(type, inputListener, options);
+      for (const type of IDLE_INPUT_EVENTS)
+        window.removeEventListener(type, inputListener, options);
     };
   },
   setTimer = (callback, ms) => setTimeout(callback, ms),

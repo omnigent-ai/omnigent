@@ -3,7 +3,12 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { IDLE_POLL_AFTER_MS, IDLE_POLL_FACTOR, createGitHubPollIdle } from "./githubPollIdle";
+import {
+  IDLE_INPUT_EVENTS,
+  IDLE_POLL_AFTER_MS,
+  IDLE_POLL_FACTOR,
+  createGitHubPollIdle,
+} from "./githubPollIdle";
 
 function idleHarness() {
   let clock = 1_000_000;
@@ -72,6 +77,37 @@ describe("githubPollIdle", () => {
     advance(1);
     expect(idle.pollFactor(query, () => true)).toBe(IDLE_POLL_FACTOR);
     expect(idle.factor()).toBe(IDLE_POLL_FACTOR);
+  });
+
+  it("counts a person's input through the window, never the app's own scrolling", () => {
+    let clock = 1_000_000;
+    const idle = createGitHubPollIdle({ now: () => clock, setTimer: () => 0 as never });
+    const log = document.createElement("div");
+    document.body.append(log);
+    try {
+      idle.factor();
+      const setOptions = vi.fn();
+      const query = { observers: [{ options: { refetchInterval: 30_000 }, setOptions }] };
+      // Streamed output scrolls the log into view every few seconds; nobody touches the window.
+      for (let elapsed = 0; elapsed < IDLE_POLL_AFTER_MS; elapsed += 5_000) {
+        clock += 5_000;
+        log.dispatchEvent(new Event("scroll"));
+      }
+      expect(idle.pollFactor(query, () => true)).toBe(IDLE_POLL_FACTOR);
+      log.dispatchEvent(new Event("scroll"));
+      expect(idle.factor()).toBe(IDLE_POLL_FACTOR);
+      expect(setOptions).not.toHaveBeenCalled();
+      // Each input a person gives wakes it.
+      for (const type of IDLE_INPUT_EVENTS) {
+        clock += IDLE_POLL_AFTER_MS;
+        expect(idle.factor()).toBe(IDLE_POLL_FACTOR);
+        log.dispatchEvent(new Event(type, { bubbles: true }));
+        expect(idle.factor(), type).toBe(1);
+      }
+    } finally {
+      log.remove();
+      idle.resetForTests();
+    }
   });
 
   it("reschedules the polls asked while in use as it turns idle, so none waits out its old timer", () => {
