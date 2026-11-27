@@ -31,6 +31,9 @@ from omnigent.server.project_reliability import (
 
 #: A card never reads as stalled sooner than this, whatever the stage's loop threshold.
 CARD_STALL_MIN_S = 2 * 3600
+#: How long a card may wait before it reads as waiting too long, by kind. A
+#: ``waiting`` wake-up has its own time, so it never ages.
+LONG_WAIT_S = {"land": 24 * 3600, "sign_off": 48 * 3600, "person": 48 * 3600}
 _NEEDS_HUMAN_LABEL = "needs-human"
 
 
@@ -163,6 +166,21 @@ def ticket_wait(ticket: Mapping[str, Any], project: Any) -> dict[str, Any] | Non
     if values.get("verified") == approved:
         return {"kind": "land", "on": []}
     return None
+
+
+def wait_clock(
+    wait: dict[str, Any], ticket: Mapping[str, Any], workers: Collection[WorkerState]
+) -> dict[str, Any]:
+    """Add ``since`` and ``after_s`` to *wait*, so the board can tell when it ran too long.
+
+    ``since`` is when the ask was raised, for a person, else the latest change to the
+    ticket or its workers; ``after_s`` is ``None`` for kinds that never age.
+    """
+    raised = (
+        (ticket.get("waiting_on") or {}).get("raised_at") if wait["kind"] == "person" else None
+    )
+    since = raised or max([int(ticket.get("updated_at") or 0), *(w.updated_at for w in workers)])
+    return {**wait, "since": int(since), "after_s": LONG_WAIT_S.get(wait["kind"])}
 
 
 def ticket_working(workers: Sequence[WorkerState]) -> dict[str, Any] | None:

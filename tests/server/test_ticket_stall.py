@@ -15,6 +15,7 @@ from omnigent.server.ticket_stall import (
     ticket_stall,
     ticket_wait,
     ticket_working,
+    wait_clock,
 )
 
 STAGES = [
@@ -161,3 +162,15 @@ def test_only_started_unfinished_stages_wait_or_stall() -> None:
         True,
         False,
     ]
+
+
+def test_a_wait_ages_from_its_ask_or_the_latest_change() -> None:
+    land = wait_clock({"kind": "land", "on": []}, _ticket(), [_worker(updated_at=1_500)])
+    assert land == {"kind": "land", "on": [], "since": 1_500, "after_s": 24 * 3600}
+    asked = _ticket(updated_at=9_000, waiting_on={"reason": "ask", "raised_at": 2_000})
+    assert wait_clock({"kind": "person", "on": []}, asked, [])["since"] == 2_000
+    assert wait_clock({"kind": "sign_off", "on": ["risk-ok"]}, _ticket(), [])["after_s"] == (
+        48 * 3600
+    )
+    planned = wait_clock({"kind": "until", "on": ["2026-11-27T10:00Z go"]}, _ticket(), [])
+    assert planned["after_s"] is None

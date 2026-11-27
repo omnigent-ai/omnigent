@@ -115,7 +115,14 @@ export interface ProjectTicket {
    * `until`: a `waiting` wake-up (`on` holds its value); `sign_off`: approved work missing
    * the labels in `on`; `land`: approved and verified, waiting its turn to land.
    */
-  wait?: { kind: "person" | "until" | "sign_off" | "land"; on: string[] } | null;
+  wait?: {
+    kind: "person" | "until" | "sign_off" | "land";
+    on: string[];
+    /** Unix seconds the wait began: the ask, else the ticket's or its workers' last change. */
+    since?: number;
+    /** Seconds before the wait reads as too long; null for kinds that never age. */
+    after_s?: number | null;
+  } | null;
   /** Board lists: a worker at work on the ticket; `since` is null when unknown. */
   working?: { name: string; since: number | null } | null;
   /** Whether the landed commit runs in this server; absent when unknown. Single-ticket reads. */

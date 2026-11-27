@@ -71,7 +71,7 @@ describe("stalled cards", () => {
       "Stalled · no one on this for 2h",
     );
     expect(screen.getByTestId("ticket-status-popover").textContent).toContain(
-      "Stalled · no one on this for 2h",
+      "nothing has changed for 2h",
     );
     fireEvent.click(screen.getByRole("button", { name: "Wake the Lead" }));
     await waitFor(() =>
@@ -108,18 +108,11 @@ describe("stalled cards", () => {
       label: "Waiting on risk-ok",
     });
     expect(waiting({ kind: "land", on: [] })).toMatchObject({ label: "Waiting to land" });
-    expect(
-      waiting(
-        { kind: "person", on: [] },
-        {
-          waiting_on: {
-            reason: "ask",
-            responders: ["viewer@example.com"],
-            raised_by_user_id: null,
-          },
-        },
-      ),
-    ).toMatchObject({ label: "Waiting on you" });
+    const asked = {
+      waiting_on: { reason: "ask", responders: ["viewer@example.com"], raised_by_user_id: null },
+    };
+    // The card's "Needs …" chip already says so; no icon repeats it until it runs long.
+    expect(waiting({ kind: "person", on: [] }, asked)).toBeNull();
     expect(waiting({ kind: "until", on: ["2026-11-27T10:00Z release is out"] })).toMatchObject({
       detail: "release is out",
     });
@@ -129,6 +122,40 @@ describe("stalled cards", () => {
       "Waiting on product-ok",
     );
     expect(screen.queryByTestId("ticket-stalled")).toBeNull();
+  });
+
+  it("flag a wait that ran too long, count it as stuck and offer Wake", async () => {
+    const threeDaysAgo = NOW_MS / 1000 - 3 * 24 * 3600;
+    const long = {
+      ...ticket,
+      stall: null,
+      wait: { kind: "land" as const, on: [], since: threeDaysAgo, after_s: 24 * 3600 },
+    };
+    expect(ticketStalled(long, NOW_MS)).toBe(true);
+    expect(ticketStalled({ ...long, wait: { ...long.wait, after_s: null } }, NOW_MS)).toBe(false);
+    expect(
+      cardStatus(
+        { ...long, wait: { kind: "person", on: [], since: threeDaysAgo, after_s: 48 * 3600 } },
+        NOW_MS,
+        "viewer@example.com",
+      ),
+    ).toMatchObject({ kind: "long_wait", label: "Waiting on a person · for 3d" });
+    vi.mocked(api.commentOnTicket).mockResolvedValue(ticket);
+    renderFooter(long);
+    expect(screen.getByTestId("ticket-stalled")).toHaveAttribute(
+      "aria-label",
+      "Waiting to land · for 3d",
+    );
+    expect(screen.getByTestId("ticket-status-popover").textContent).toContain(
+      "Nothing has moved for 3d",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Wake the Lead" }));
+    await waitFor(() =>
+      expect(api.commentOnTicket).toHaveBeenCalledWith("project", "stuck", {
+        text: "@Lead this ticket has been waiting to land for 3d. Please find out why and get it moving.",
+        kind: "comment",
+      }),
+    );
   });
 
   it("say how long a worker has been at it", () => {

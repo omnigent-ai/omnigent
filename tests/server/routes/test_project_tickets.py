@@ -1321,7 +1321,13 @@ async def test_board_cards_carry_a_stall_clock_and_who_is_working(
     patched = await project_client.patch(f"{base}/{ticket['id']}", json=gated)
     assert patched.status_code == 200, patched.text
     page = (await project_client.get(base)).json()["data"]
-    assert card(ticket["id"])["wait"] == {"kind": "sign_off", "on": ["risk-ok"]}
+    wait = card(ticket["id"])["wait"]
+    assert {key: wait[key] for key in ("kind", "on", "after_s")} == {
+        "kind": "sign_off",
+        "on": ["risk-ok"],
+        "after_s": 48 * 3600,
+    }
+    assert wait["since"] >= ticket["updated_at"]
     assert card(ticket["id"])["stall"] is None
     await project_client.patch(f"{base}/{ticket['id']}", json={"labels": []})
     ticket_routes._session_status_cache[worker.id] = "running"

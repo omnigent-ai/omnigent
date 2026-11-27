@@ -8,12 +8,21 @@ import type { ProjectTicket } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 import { useProjectRecord } from "./useProjectAgentSession";
 import { useTicketActions } from "./useProjectTickets";
-import { routerLabel, ticketStalled, wakeRouterComment } from "./ticketStall";
+import { routerLabel, ticketStalled, waitTooLong, wakeRouterComment } from "./ticketStall";
 import { needsWhom } from "./ticketWaitingOn";
 
-/** What a card's status icon says: stalled, waiting on something, or nothing. */
+/**
+ * What a card's status icon says. `stalled` and `long_wait` are stuck: they count
+ * toward the stalled chip and offer Wake the Lead; `waiting` is a quiet, expected wait.
+ */
 export type CardStatus =
-  | { kind: "stalled"; since: number; idleFor: string }
+  | {
+      kind: "stalled" | "long_wait";
+      label: string;
+      detail: string;
+      idleFor: string;
+      waitingOn?: string;
+    }
   | { kind: "waiting"; label: string; detail: string };
 
 /** "Waiting until Nov 27, 10:00 AM" from a `waiting` label's "<ISO time> <note>". */
@@ -24,36 +33,63 @@ function untilLabel(value: string): { label: string; detail: string } {
   return { label, detail: note.join(" ") || "A planned wait; the work picks up then." };
 }
 
+/** What the wait is for, as the card names it, and why it usually takes a while. */
+function waitText(
+  ticket: ProjectTicket,
+  viewer: string | null,
+): { label: string; detail: string } | null {
+  const wait = ticket.wait;
+  if (!wait) return null;
+  if (wait.kind === "person") {
+    const whom = needsWhom(ticket.waiting_on, viewer);
+    const named = whom?.kind === "other" && whom.title.startsWith("Waiting on");
+    const label =
+      whom?.kind === "you" ? "Waiting on you" : named ? whom.title : "Waiting on a person";
+    return { label, detail: "It picks up once they answer on the ticket." };
+  }
+  if (wait.kind === "until") return untilLabel(wait.on[0] ?? "");
+  if (wait.kind === "sign_off")
+    return {
+      label: `Waiting on ${wait.on.join(", ")}`,
+      detail: "Reviewed and approved; it lands once a person adds the sign-off.",
+    };
+  return {
+    label: "Waiting to land",
+    detail: "Approved and verified; it lands in turn, often after other tickets.",
+  };
+}
+
 export function cardStatus(
   ticket: ProjectTicket,
   nowMs: number,
   viewer: string | null,
 ): CardStatus | null {
   const wait = ticket.wait;
-  if (wait) {
-    if (wait.kind === "person") {
-      const whom = needsWhom(ticket.waiting_on, viewer);
-      const named = whom?.kind === "other" && whom.title.startsWith("Waiting on");
-      const label =
-        whom?.kind === "you" ? "Waiting on you" : named ? whom.title : "Waiting on a person";
-      return { kind: "waiting", label, detail: "It picks up once they answer on the ticket." };
-    }
-    if (wait.kind === "until") return { kind: "waiting", ...untilLabel(wait.on[0] ?? "") };
-    if (wait.kind === "sign_off")
+  const text = waitText(ticket, viewer);
+  if (wait && text) {
+    const idleFor = wait.since !== undefined ? relativeTime(wait.since * 1000, nowMs) : "";
+    if (waitTooLong(ticket, nowMs))
       return {
-        kind: "waiting",
-        label: `Waiting on ${wait.on.join(", ")}`,
-        detail: "Reviewed and approved; it lands once a person adds the sign-off.",
+        kind: "long_wait",
+        label: `${text.label} · for ${idleFor}`,
+        detail: `Nothing has moved for ${idleFor}, longer than this usually takes.`,
+        idleFor,
+        waitingOn: text.label,
       };
-    return {
-      kind: "waiting",
-      label: "Waiting to land",
-      detail: "Approved and verified; it lands in turn, often after other tickets.",
-    };
+    // The card's "Needs …" chip already says it waits on a person.
+    if (wait.kind === "person") return null;
+    const detail =
+      idleFor && idleFor !== "now" ? `${text.detail} Waiting ${idleFor} so far.` : text.detail;
+    return { kind: "waiting", label: text.label, detail };
   }
   if (!ticket.stall || !ticketStalled(ticket, nowMs)) return null;
-  const since = ticket.stall.idle_since * 1000;
-  return { kind: "stalled", since, idleFor: relativeTime(since, nowMs) };
+  const idleFor = relativeTime(ticket.stall.idle_since * 1000, nowMs);
+  return {
+    kind: "stalled",
+    label: `Stalled · no one on this for ${idleFor}`,
+    detail: `No agent is running and nothing has changed for ${idleFor}.`,
+    idleFor,
+  };
 }
 
 /** Holds the card footer's room for the status icon, which is drawn over it. */
@@ -66,9 +102,10 @@ export function TicketCardStatusSpace({ ticket, nowMs }: { ticket: ProjectTicket
 const HOVER_CLOSE_MS = 150;
 
 /**
- * A small icon in the card's footer row: amber when the work stalled, muted when it
- * waits on something. Hovering, or tapping on a phone, opens the reason, and for a
- * stall Wake the Lead, which posts the viewer's comment @mentioning the router.
+ * A small icon in the card's footer row: amber when the work stalled or a wait ran
+ * too long, muted for an expected wait. Hovering, or tapping on a phone, opens the
+ * reason, and for stuck work Wake the Lead, which posts the viewer's comment
+ * @mentioning the router.
  */
 export function TicketCardStatus({ ticket, nowMs }: { ticket: ProjectTicket; nowMs: number }) {
   const status = cardStatus(ticket, nowMs, getCurrentUserId());
@@ -89,24 +126,25 @@ function StatusPopover({ ticket, status }: { ticket: ProjectTicket; status: Card
       closeTimer.current = setTimeout(() => setOpen(false), HOVER_CLOSE_MS);
     },
   };
-  const stalled = status.kind === "stalled";
-  const label = stalled ? `Stalled · no one on this for ${status.idleFor}` : status.label;
+  const stuck = status.kind !== "waiting";
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <button
           type="button"
           {...hover}
-          data-testid={stalled ? "ticket-stalled" : "ticket-waiting"}
-          aria-label={label}
+          data-testid={stuck ? "ticket-stalled" : "ticket-waiting"}
+          data-status={status.kind}
+          aria-label={status.label}
           className={cn(
-            "inline-flex size-6 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring",
-            stalled
+            // A 40px touch area around the 24px icon, without moving anything.
+            "relative inline-flex size-6 shrink-0 items-center justify-center rounded-full outline-none after:absolute after:-inset-2 after:content-[''] focus-visible:ring-2 focus-visible:ring-ring pointer-fine:after:hidden",
+            stuck
               ? "bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 dark:text-amber-300"
               : "text-muted-foreground hover:bg-muted",
           )}
         >
-          {stalled ? (
+          {status.kind === "stalled" ? (
             <CirclePauseIcon aria-hidden className="size-4" />
           ) : (
             <HourglassIcon aria-hidden className="size-3.5" />
@@ -121,8 +159,8 @@ function StatusPopover({ ticket, status }: { ticket: ProjectTicket; status: Card
         data-testid="ticket-status-popover"
         onOpenAutoFocus={(event) => event.preventDefault()}
       >
-        {status.kind === "stalled" ? (
-          <StalledDetail ticket={ticket} status={status} />
+        {status.kind !== "waiting" ? (
+          <StuckDetail ticket={ticket} status={status} />
         ) : (
           <div className="space-y-1 text-sm">
             <p className="font-medium">{status.label}</p>
@@ -134,12 +172,12 @@ function StatusPopover({ ticket, status }: { ticket: ProjectTicket; status: Card
   );
 }
 
-function StalledDetail({
+function StuckDetail({
   ticket,
   status,
 }: {
   ticket: ProjectTicket;
-  status: Extract<CardStatus, { kind: "stalled" }>;
+  status: Extract<CardStatus, { kind: "stalled" | "long_wait" }>;
 }) {
   const { comment } = useTicketActions(ticket.project_id);
   // The board page already loads this record, so the popover adds no request.
@@ -148,12 +186,8 @@ function StalledDetail({
   return (
     <div className="space-y-2 text-sm">
       <div className="space-y-1">
-        <p className="font-medium text-amber-800 dark:text-amber-300">
-          Stalled · no one on this for {status.idleFor}
-        </p>
-        <p className="text-muted-foreground">
-          No agent is running and nothing has changed since {absoluteTime(status.since)}.
-        </p>
+        <p className="font-medium text-amber-800 dark:text-amber-300">{status.label}</p>
+        <p className="text-muted-foreground">{status.detail}</p>
       </div>
       <Button
         size="sm"
@@ -164,7 +198,10 @@ function StalledDetail({
         onClick={() =>
           comment.mutate({
             id: ticket.id,
-            body: { text: wakeRouterComment(router, status.idleFor), kind: "comment" },
+            body: {
+              text: wakeRouterComment(router, status.idleFor, status.waitingOn),
+              kind: "comment",
+            },
           })
         }
       >

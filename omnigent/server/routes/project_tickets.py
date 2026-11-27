@@ -103,6 +103,7 @@ from omnigent.server.ticket_stall import (
     ticket_stall,
     ticket_wait,
     ticket_working,
+    wait_clock,
 )
 from omnigent.server.ticket_summary import TicketSummarizer, build_ticket_summarizer
 from omnigent.server.usage_events import record_usage_event
@@ -768,11 +769,12 @@ def create_project_tickets_router(
                     or (sid in sessions and sessions[sid].archived is not None)
                     for sid in linked.session_ids
                 )
-                ticket["wait"] = (
+                wait = (
                     ticket_wait(ticket, board.project)
                     if in_working_stage(board.stages, ticket["stage_id"])
                     else None
                 )
+                ticket["wait"] = wait_clock(wait, ticket, workers) if wait else None
                 ticket["stall"] = (
                     None
                     if ticket["wait"] is not None
