@@ -297,4 +297,25 @@ describe("useReviewFolder", () => {
     render(<Harness active={false} />);
     expect(paletteLabels()).not.toContain("Choose Folder for Diffs…");
   });
+
+  it("keeps the shown review's commands while another Diffs tab of the session is hidden or closed", () => {
+    // Two Diffs tabs of one session stay mounted; the earlier one is shown again, then the
+    // hidden one closes.
+    function TwoReviews({ shown, both }: { shown: "first" | "second"; both: boolean }) {
+      return (
+        <>
+          <Harness active={shown === "first"} />
+          {both ? <Harness active={shown === "second"} /> : null}
+        </>
+      );
+    }
+    const view = render(<TwoReviews shown="second" both />);
+    expect(paletteLabels()).toContain("Choose Folder for Diffs…");
+    view.rerender(<TwoReviews shown="first" both />);
+    expect(paletteLabels()).toContain("Choose Folder for Diffs…");
+    view.rerender(<TwoReviews shown="first" both={false} />);
+    expect(paletteLabels()).toContain("Choose Folder for Diffs…");
+    view.unmount();
+    expect(paletteLabels()).not.toContain("Choose Folder for Diffs…");
+  });
 });
