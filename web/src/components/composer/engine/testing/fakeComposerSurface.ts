@@ -7,7 +7,7 @@ import {
 export interface FakeComposerSurface extends ComposerEditorSurface {
   value: string;
   /** Calls to `insertText`, in order. */
-  readonly inserts: { text: string; start: number; end: number }[];
+  readonly inserts: { text: string; start: number; end: number; separateUndo?: boolean }[];
   readonly reveals: number;
   /** Stop `composerTargetOf` from finding this surface. */
   unregister: () => void;
@@ -60,12 +60,12 @@ export function createFakeComposerSurface(
     blur() {
       element.blur();
     },
-    insertText(text, start, end) {
+    insertText(text, start, end, options) {
       if (locked) return false;
       // Clamped as the real surface clamps, and recorded clamped.
       const from = clamp(start);
       const to = clamp(end);
-      inserts.push({ text, start: from, end: to });
+      inserts.push({ text, start: from, end: to, separateUndo: options?.separateUndo });
       surface.value = surface.value.slice(0, from) + text + surface.value.slice(to);
       selection = [from + text.length, from + text.length];
       return true;

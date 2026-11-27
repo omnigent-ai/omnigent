@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { sentXhrs } from "@/test/fetchBackedXhr";
+
 import {
   getCliServerUrl,
   hostFetch,
@@ -210,5 +212,102 @@ describe("isHostRoutingEnabled", () => {
     vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
     const { isHostRoutingEnabled } = await import("./host");
     expect(isHostRoutingEnabled()).toBe(true);
+  });
+});
+
+describe("hostFetch upload progress", () => {
+  it("sends through XMLHttpRequest with the headers and body, answering with a Response", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('{"id":"file_1"}', { status: 201, headers: { "X-Reply": "yes" } }),
+    );
+    const onUploadProgress = vi.fn();
+    const body = new Blob(["abc"]);
+
+    const res = await hostFetch(
+      "/v1/upload",
+      { method: "POST", body, headers: { "X-Custom": "kept" } },
+      { onUploadProgress },
+    );
+
+    const xhr = sentXhrs.at(-1)!;
+    expect(xhr.method).toBe("POST");
+    expect(xhr.requestHeaders.get("X-Custom")).toBe("kept");
+    expect(xhr.body).toBe(body);
+    expect(res.status).toBe(201);
+    expect(res.headers.get("X-Reply")).toBe("yes");
+    expect(await res.json()).toEqual({ id: "file_1" });
+    expect(onUploadProgress).toHaveBeenLastCalledWith(3, 3);
+  });
+
+  it("reports a server error as a Response rather than a rejection", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('{"detail":"Too big"}', { status: 413 }),
+    );
+    const res = await hostFetch(
+      "/v1/upload",
+      { method: "POST", body: "x" },
+      {
+        onUploadProgress: vi.fn(),
+      },
+    );
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ detail: "Too big" });
+  });
+
+  it("rejects as a network failure when the response status cannot form a Response", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      status: 0,
+      statusText: "",
+      headers: new Headers(),
+      arrayBuffer: async () => new ArrayBuffer(0),
+    } as unknown as Response);
+
+    await expect(
+      hostFetch("/v1/upload", { method: "POST", body: "x" }, { onUploadProgress: vi.fn() }),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it("passes the request's credentials mode through to the request", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+
+    await hostFetch(
+      "/v1/upload",
+      { method: "POST", body: "x", credentials: "include" },
+      { onUploadProgress: vi.fn() },
+    );
+
+    expect(fetchSpy.mock.calls[0]![1]).toMatchObject({ credentials: "include" });
+  });
+
+  it("rejects with the signal's reason when the caller aborts", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => new Promise<Response>(() => {}));
+    const controller = new AbortController();
+    const pending = hostFetch(
+      "/v1/upload",
+      { method: "POST", body: "x", signal: controller.signal },
+      { onUploadProgress: vi.fn() },
+    );
+
+    const reason = new DOMException("Stopped", "AbortError");
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  it("leaves an embedding's fetcher in charge, with no XMLHttpRequest and no progress", async () => {
+    vi.resetModules();
+    const fresh = await import("./host");
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    fresh.setOmnigentHostConfig({ fetcher });
+    const sentBefore = sentXhrs.length;
+    const onUploadProgress = vi.fn();
+
+    await fresh.hostFetch("/v1/upload", { method: "POST", body: "x" }, { onUploadProgress });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(sentXhrs.length).toBe(sentBefore);
+    expect(onUploadProgress).not.toHaveBeenCalled();
   });
 });

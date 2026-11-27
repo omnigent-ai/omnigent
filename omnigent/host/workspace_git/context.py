@@ -630,6 +630,7 @@ def _context_from(
         remotes=remotes,
         unsupported_remote_count=unsupported_remote_count,
         truncated_remotes=truncated_remotes,
+        workspace_prefix=repository.prefix,
     )
     resolution = None
     if branch is not None and observation.push_fields is not None:

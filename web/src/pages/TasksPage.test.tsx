@@ -14,6 +14,24 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { showToast } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type * as AutomationListPaletteCommandsModule from "@/components/scheduled/automationListPaletteCommands";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
+
+// Counts renders of the list's ⌘K commands, which render nothing themselves.
+const listPaletteCommands = vi.hoisted(() => ({ renders: 0 }));
+vi.mock("@/components/scheduled/automationListPaletteCommands", async (importOriginal) => {
+  const original = await importOriginal<typeof AutomationListPaletteCommandsModule>();
+  return {
+    ...original,
+    AutomationListPaletteCommands: (
+      props: Parameters<typeof original.AutomationListPaletteCommands>[0],
+    ) => {
+      listPaletteCommands.renders += 1;
+      return original.AutomationListPaletteCommands(props);
+    },
+  };
+});
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
@@ -39,6 +57,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialPrompt,
     initialTrigger,
     initialTemplateId,
+    initialSchedule,
     sessionLink,
     editingTask,
     onCreated,
@@ -50,6 +69,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialPrompt?: string;
     initialTrigger?: string | null;
     initialTemplateId?: string;
+    initialSchedule?: string;
     sessionLink?: string;
     editingTask?: ScheduledTask | null;
   }) =>
@@ -60,6 +80,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-initial-prompt={initialPrompt ?? ""}
         data-initial-trigger={initialTrigger ?? ""}
         data-initial-template={initialTemplateId ?? ""}
+        data-initial-schedule={initialSchedule ?? ""}
         data-session-link={sessionLink ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
@@ -1129,5 +1150,66 @@ describe("trigger templates", () => {
     selectView("Your automations");
     expect(screen.getByText("No automations yet")).toBeVisible();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+  });
+});
+
+describe("a link that opens New automation", () => {
+  it("opens it filled in once, and New afterwards starts empty", async () => {
+    setTasks([]);
+    renderPage(
+      `/tasks?new=1&name=${encodeURIComponent("Weekly digest")}&prompt=${encodeURIComponent(
+        "Summarize the board",
+      )}&schedule=${encodeURIComponent("FREQ=WEEKLY;BYDAY=MO")}`,
+    );
+
+    const dialog = await screen.findByTestId("manual-dialog-open");
+    expect(dialog).toHaveAttribute("data-initial-name", "Weekly digest");
+    expect(dialog).toHaveAttribute("data-initial-prompt", "Summarize the board");
+    expect(dialog).toHaveAttribute("data-initial-schedule", "FREQ=WEEKLY;BYDAY=MO");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-name", "");
+  });
+});
+
+describe("the list's actions in ⌘K", () => {
+  const withQuickPick = (on: boolean) => ({
+    ...TRIGGER_INFO,
+    features: { ...TRIGGER_INFO.features, quick_pick_palette: on },
+  });
+  /** Markup without React's generated ids, which count every `useId` call in the tree. */
+  const markup = (element: HTMLElement) => element.innerHTML.replace(/:r[0-9a-z]+:/g, ":id:");
+  const command = (label: string) =>
+    registeredPaletteCommands().find((candidate) => candidate.label === label);
+
+  beforeEach(() => {
+    listPaletteCommands.renders = 0;
+  });
+  afterEach(() => usePaletteCommandsStore.setState({ groups: {} }));
+
+  it("mounts nothing with quick_pick_palette off, and the page renders the same", () => {
+    setTasks([task()]);
+    const { container, unmount } = renderPage("/tasks", "", withQuickPick(false));
+    const withoutCommands = markup(container);
+    expect(listPaletteCommands.renders).toBe(0);
+    expect(registeredPaletteCommands()).toEqual([]);
+    unmount();
+
+    // The commands render nothing themselves, so turning the flag on changes no markup.
+    const { container: withFlag } = renderPage("/tasks", "", withQuickPick(true));
+    expect(listPaletteCommands.renders).toBeGreaterThan(0);
+    expect(markup(withFlag)).toBe(withoutCommands);
+  });
+
+  it("runs the row menu's Pause and the New button's editor from ⌘K", () => {
+    setTasks([task()]);
+    renderPage("/tasks", "", withQuickPick(true));
+    act(() => command("Pause “Nightly triage”")!.run());
+    expect(mutate).toHaveBeenCalledWith({ id: "st_1", input: { state: "paused" } });
+    expect(command("Delete “Nightly triage”")).toBeUndefined();
+    act(() => command("New automation…")!.run());
+    expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();
   });
 });

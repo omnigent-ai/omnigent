@@ -16,6 +16,7 @@ import type { RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { findPmRangeForComment } from "./TipTapEditorHelpers";
+import { REVEAL_DECORATION_SPEC } from "./TipTapRevealDecoration";
 
 export const commentDecorationKey = new PluginKey<DecorationSet>("commentDecoration");
 
@@ -44,10 +45,15 @@ function buildDecorations(
       activeSelection?.start_index === comment.start_index &&
       activeSelection?.end_index === comment.end_index;
     decos.push(
-      Decoration.inline(range.from, range.to, {
-        class: isActive ? "md-comment md-comment-active" : "md-comment",
-        "data-comment-id": comment.id,
-      }),
+      Decoration.inline(
+        range.from,
+        range.to,
+        {
+          class: isActive ? "md-comment md-comment-active" : "md-comment",
+          "data-comment-id": comment.id,
+        },
+        isActive ? REVEAL_DECORATION_SPEC : undefined,
+      ),
     );
   }
 

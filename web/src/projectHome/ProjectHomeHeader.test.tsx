@@ -2,6 +2,9 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import {
   ProjectBoardSearch,
@@ -179,5 +182,67 @@ describe("ProjectNewSessionButton", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "New session" }));
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/\?project=Payments$/);
+  });
+});
+
+describe("the project's ⌘K commands", () => {
+  function renderTitle(flag: boolean) {
+    const info = { ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: flag } };
+    render(
+      <CapabilitiesProvider info={info}>
+        <MemoryRouter initialEntries={["/projects/Payments"]}>
+          <TooltipProvider>
+            {mocks.isMobile ? (
+              <ProjectHomeHeaderActions projectName="Payments" />
+            ) : (
+              <ProjectHomeTitle projectName="Payments" />
+            )}
+          </TooltipProvider>
+          <LocationProbe />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+  }
+  const commands = () =>
+    Object.values(usePaletteCommandsStore.getState().groups).flatMap((group) => group.commands);
+  const run = (label: string) =>
+    act(() =>
+      commands()
+        .find((command) => command.label === label)!
+        .run(),
+    );
+
+  afterEach(() => usePaletteCommandsStore.setState({ groups: {} }));
+
+  it("runs the header's own handlers, each once the palette has closed", () => {
+    renderTitle(true);
+    expect(commands().map((command) => command.label)).toEqual([
+      "New session in this project",
+      "Project settings…",
+      "Rename project…",
+      "Delete project…",
+    ]);
+    expect(commands().every((command) => command.movesFocus)).toBe(true);
+    run("Project settings…");
+    run("Rename project…");
+    run("Delete project…");
+    expect(mocks.actions.openSettings).toHaveBeenCalledTimes(1);
+    expect(mocks.actions.openRename).toHaveBeenCalledTimes(1);
+    expect(mocks.actions.openDelete).toHaveBeenCalledTimes(1);
+    run("New session in this project");
+    expect(useProjectComposerStore.getState().open).toBe(true);
+  });
+
+  it("starts a phone's session in the full-screen composer, as its button does", () => {
+    mocks.isMobile = true;
+    renderTitle(true);
+    run("New session in this project");
+    expect(screen.getByTestId("location")).toHaveTextContent("/?project=Payments");
+    expect(useProjectComposerStore.getState().open).toBe(false);
+  });
+
+  it("offers nothing with the flag off", () => {
+    renderTitle(false);
+    expect(commands()).toEqual([]);
   });
 });

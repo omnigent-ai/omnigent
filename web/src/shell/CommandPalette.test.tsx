@@ -1,12 +1,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import type { ComponentProps, ReactNode } from "react";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
+import { type ComponentProps, type ReactNode, useState } from "react";
+import { toast } from "sonner";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import * as host from "@/lib/host";
+import { resetUiFeatureOverridesForTests } from "@/lib/uiFeatureOverrides";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
+import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
+import { useWorkspaceHistoryCommands } from "./workspaceCommands/useWorkspaceHistoryCommands";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -25,6 +31,12 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
   useProjects: (...args: unknown[]) => useProjects(...args),
+}));
+
+let sidebarSessions: { pages: { data: unknown[] }[] } | undefined;
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof SidebarDataModule>()),
+  useOptionalLoadedConversations: () => sidebarSessions,
 }));
 
 function conv(
@@ -66,7 +78,8 @@ function searchPages(...pages: (ReturnType<typeof conv> & Partial<Conversation>)
   return { data: { pages: pages.map((data) => ({ data })) } };
 }
 
-const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8 };
+// ⌘K's own search keeps archived sessions, as the server does by default.
+const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8, includeArchived: true };
 
 /** Find a session row by its full label text even when the highlighter has
     split it around a <mark> (so the text lives across several nodes). */
@@ -97,6 +110,7 @@ function withQueryClient(queryClient = new QueryClient()) {
 
 beforeEach(() => {
   navigate.mockClear();
+  sidebarSessions = undefined;
   useConversations.mockReset();
   useSessionSearch.mockReset();
   useProjects.mockReturnValue({ data: [] });
@@ -104,7 +118,12 @@ beforeEach(() => {
   setSessions([]);
   setSearchGroups({});
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // QuickPick records accepted commands under Recent; a later case starts without them.
+  localStorage.clear();
+  resetUiFeatureOverridesForTests();
+});
 
 /** Every non-empty live region's text, so both palettes' status messages read the same. */
 const announced = () =>
@@ -116,7 +135,7 @@ const announced = () =>
 
 describe("CommandPalette — sessions", () => {
   it.each([false, true])(
-    "requests active sessions and keeps owned and shared results (sessionsOnly=%s)",
+    "keeps owned and shared sessions, and archived ones only in ⌘K (sessionsOnly=%s)",
     (sessionsOnly) => {
       const sessions = [
         { ...conv("owned", "Owned session"), owner: "current-user", permission_level: 4 },
@@ -126,12 +145,83 @@ describe("CommandPalette — sessions", () => {
       setSessions(sessions);
       renderPalette({ sessionsOnly });
 
-      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", !sessionsOnly, { enabled: true });
       expect(screen.getByText("Owned session")).toBeTruthy();
       expect(screen.getByText("Shared session")).toBeTruthy();
-      expect(screen.queryByText("Archived session")).toBeNull();
+      if (sessionsOnly) {
+        expect(screen.queryByText("Archived session")).toBeNull();
+      } else {
+        expect(labelRow("Archived session").closest('[role="option"]')?.textContent).toContain(
+          "Archived",
+        );
+      }
     },
   );
+
+  it("lists a just-archived session first among the recent sessions and opens it", () => {
+    // Archiving bumps updated_at, so the session lands above older activity.
+    setSessions([
+      ...Array.from({ length: 5 }, (_, index) => ({
+        ...conv(`active-${index}`, `Active ${index}`),
+        updated_at: 10 - index,
+      })),
+      { ...conv("mistake", "Archived too early"), archived: true, updated_at: 20 },
+    ]);
+    const { onOpenChange } = renderPalette();
+
+    const rows = screen
+      .getAllByRole("option")
+      .map((option) => option.textContent ?? "")
+      .filter((text) => text.includes("Active") || text.includes("Archived too early"));
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toContain("Archived too early");
+    expect(rows[0]).toContain("Archived");
+    expect(rows.slice(1).some((text) => text.includes("Archived"))).toBe(false);
+    expect(screen.queryByText("Active 4")).toBeNull();
+
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/mistake");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("shows the sidebar's loaded sessions until the archived-inclusive list loads", () => {
+    sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
+    useConversations.mockReturnValue({ data: undefined, isFetching: true });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />, { wrapper: withQueryClient() });
+
+    expect(screen.getByText("Cached session")).toBeTruthy();
+
+    // Once loaded, the list replaces the sidebar's rows, even when it's empty.
+    setSessions([]);
+    rerender(<CommandPalette {...props} />);
+    expect(screen.queryByText("Cached session")).toBeNull();
+  });
+
+  it("doesn't fill Find a session's list from the sidebar", () => {
+    sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
+    useConversations.mockReturnValue({ data: undefined, isFetching: true });
+    renderPalette({ sessionsOnly: true });
+
+    expect(screen.queryByText("Cached session")).toBeNull();
+  });
+
+  it("keeps the row of a session opened from the recent list for the sidebar to list", () => {
+    const archived = { ...conv("archived", "Archived session"), archived: true, owner: "me" };
+    setSessions([archived]);
+    const queryClient = new QueryClient();
+    renderPalette({}, queryClient);
+
+    fireEvent.click(labelRow("Archived session"));
+
+    expect(navigate).toHaveBeenCalledWith("/c/archived");
+    expect(queryClient.getQueryData(["conversation-backfill", "archived"])).toEqual(archived);
+  });
 
   it.each([false, true])(
     "shows project and parent context without needing the parent in results (sessionsOnly=%s)",
@@ -228,7 +318,8 @@ describe("CommandPalette — sessions", () => {
     ]);
     const { onOpenChange } = renderPalette({ sessionsOnly: true });
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "fxprs" } });
-    expect(screen.getByText("Fix the parser")).toBeTruthy();
+    // By name: a palette that marks each fuzzy-matched letter splits the label's text.
+    expect(screen.getByRole("option", { name: /Fix the parser/ })).toBeTruthy();
     expect(screen.queryByText("Deploy API")).toBeNull();
     expect(screen.queryByText("Unrelated")).toBeNull();
     expect(screen.queryByText("Go to Inbox")).toBeNull();
@@ -412,7 +503,7 @@ describe("CommandPalette — sessions", () => {
       setSessions([conv("c1", "Fix the parser")]);
       renderPalette();
 
-      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", true, { enabled: true });
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
@@ -602,6 +693,53 @@ describe("CommandPalette — match preview", () => {
   });
 });
 
+describe("CommandPalette — focus as it closes", () => {
+  /** A palette ⌘K opens from a terminal's input, with no trigger button, as the app does. */
+  function ShortcutOpenedPalette() {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <textarea
+          aria-label="Terminal input"
+          onKeyDown={(event) => {
+            if (event.metaKey && event.key === "k") setOpen(true);
+          }}
+        />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  async function openFromTerminal() {
+    render(<ShortcutOpenedPalette />, { wrapper: withQueryClient() });
+    const terminal = screen.getByRole("textbox", { name: "Terminal input" });
+    terminal.focus();
+    fireEvent.keyDown(terminal, { key: "k", metaKey: true });
+    const input = await screen.findByTestId("command-palette-input");
+    await vi.waitFor(() => expect(input).toHaveFocus());
+    return { terminal, input };
+  }
+
+  it("gives the keyboard back to the field it opened from on Escape", async () => {
+    const { terminal, input } = await openFromTerminal();
+    fireEvent.keyDown(input, { key: "Escape" });
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await vi.waitFor(() => expect(terminal).toHaveFocus());
+  });
+
+  it("gives it back after running a command that leaves focus alone", async () => {
+    const { terminal } = await openFromTerminal();
+    fireEvent.click(await screen.findByRole("option", { name: /Toggle conversations sidebar/ }));
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await vi.waitFor(() => expect(terminal).toHaveFocus());
+  });
+});
+
 describe("CommandPalette — input", () => {
   it("uses the sessions-first placeholder", () => {
     renderPalette();
@@ -644,6 +782,21 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     expect(content?.className).not.toContain("top-1/4");
     // …and offers an explicit close affordance (no ⌘K/Esc hint on touch).
     expect(screen.getByLabelText("Close search")).toBeTruthy();
+  });
+
+  it("pins the mobile sheet to the top of the visible viewport in the iOS app", () => {
+    // The iOS app's dialogs center on the keyboard-aware viewport inline; the sheet must not.
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    setMobile(true);
+    renderPalette();
+
+    const style = (dialogContent() as HTMLElement | null)?.style;
+    expect(style?.top).toBe("0px");
+    expect(style?.height).toBe("var(--omnigent-viewport-height, 100dvh)");
+    expect(style?.maxHeight).toBe("var(--omnigent-viewport-height, 100dvh)");
   });
 
   it("keeps the centered dialog and shows no close button on desktop", () => {
@@ -759,7 +912,11 @@ describe("CommandPalette — title and content groups", () => {
 
   it("does not search while the palette is closed or listing sessions only", () => {
     renderPalette({ open: false });
-    expect(useSessionSearch).toHaveBeenCalledWith("", "title", { enabled: false, limit: 8 });
+    expect(useSessionSearch).toHaveBeenCalledWith("", "title", {
+      enabled: false,
+      limit: 8,
+      includeArchived: true,
+    });
     cleanup();
     useSessionSearch.mockClear();
     renderPalette({ sessionsOnly: true });
@@ -767,6 +924,7 @@ describe("CommandPalette — title and content groups", () => {
     expect(useSessionSearch).toHaveBeenLastCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
   });
 
@@ -826,6 +984,37 @@ describe("CommandPalette — title and content groups", () => {
 
     fireEvent.keyDown(input, { key: "Enter" });
     expect(navigate).toHaveBeenCalledWith("/c/second");
+  });
+
+  it("steps the rows with Ctrl-N and Ctrl-P as the arrows do, leaving Ctrl+J alone", () => {
+    setSessions([conv("c1", "Fix the parser"), conv("c2", "Deploy API"), conv("c3", "Ship it")]);
+    render(
+      <CommandPalette
+        open
+        onOpenChange={vi.fn()}
+        onToggleLeftSidebar={vi.fn()}
+        onToggleRightSidebar={vi.fn()}
+      />,
+      { wrapper: withQueryClient() },
+    );
+    const input = screen.getByTestId("command-palette-input");
+    input.focus();
+    const selected = () => screen.getByRole("option", { selected: true }).textContent;
+    expect(selected()).toContain("Fix the parser");
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    expect(selected()).toContain("Deploy API");
+    // The arrows and Ctrl-N/Ctrl-P walk the same selection.
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(selected()).toContain("Fix the parser");
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "p", code: "KeyP", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "j", code: "KeyJ", ctrlKey: true });
+    // Neither key types into the field or takes focus from it.
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c2");
   });
 
   it("selects the top row again when the palette reopens", () => {
@@ -1024,6 +1213,7 @@ describe("CommandPalette — title and content groups", () => {
     expect(useSessionSearch).toHaveBeenCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
     expect(screen.queryByText("In messages")).toBeNull();
     const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
@@ -1152,6 +1342,96 @@ describe("CommandPalette — actions", () => {
   });
 });
 
+describe("CommandPalette — QuickPick preview bootstrap", () => {
+  const label = "Enable feature preview: new QuickPick command palette";
+  const origin = window.location.origin;
+  const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(origin)}`;
+  const isQuickPick = "QUICK_PICK_PALETTE" in commandPaletteModule;
+
+  function searchPreview() {
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "preview" } });
+  }
+
+  const reload = vi.fn();
+  beforeEach(() => {
+    reload.mockReset();
+    vi.stubGlobal("location", { origin, reload });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.skipIf(isQuickPick)(
+    "offers the command only in search and saves the opt-in before reloading",
+    () => {
+      serverInfo.mockReturnValue({
+        session_search_scope: true,
+        features: { quick_pick_palette: false },
+      });
+      renderPalette();
+      expect(screen.queryByRole("option", { name: label })).toBeNull();
+      searchPreview();
+      const command = screen.getByRole("option", { name: label });
+      let savedAtReload: string | null = null;
+      reload.mockImplementation(() => {
+        savedAtReload = localStorage.getItem(key);
+      });
+      fireEvent.click(command);
+      expect(localStorage.getItem(key)).toBe('{"quick_pick_palette":true}');
+      expect(reload).toHaveBeenCalledOnce();
+      expect(savedAtReload).toBe('{"quick_pick_palette":true}');
+    },
+  );
+
+  it.skipIf(isQuickPick)("offers the command when an override turns QuickPick off", () => {
+    localStorage.setItem(key, '{"quick_pick_palette":false}');
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { quick_pick_palette: true },
+    });
+    renderPalette();
+    searchPreview();
+    expect(screen.getByRole("option", { name: label })).toBeVisible();
+  });
+
+  it.skipIf(isQuickPick)("does not reload if storage refuses the opt-in", () => {
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { quick_pick_palette: false },
+    });
+    renderPalette();
+    searchPreview();
+    const storage = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "");
+    onTestFinished(() => {
+      storage.mockRestore();
+      errorToast.mockRestore();
+    });
+    fireEvent.click(screen.getByRole("option", { name: label }));
+    expect(errorToast).toHaveBeenCalledWith("Couldn't save the feature preview on this device.");
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(isQuickPick).each(["server-on", "override-on", "unreported", "no-identity"])(
+    "does not offer the bootstrap for %s",
+    (scenario) => {
+      if (scenario === "override-on") localStorage.setItem(key, '{"quick_pick_palette":true}');
+      if (scenario === "no-identity") {
+        const identity = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue(null);
+        onTestFinished(() => identity.mockRestore());
+      }
+      const features =
+        scenario === "unreported" ? {} : { quick_pick_palette: scenario === "server-on" };
+      serverInfo.mockReturnValue({ session_search_scope: true, features });
+      renderPalette();
+      searchPreview();
+      expect(screen.queryByRole("option", { name: label })).toBeNull();
+    },
+  );
+});
+
 describe("CommandPalette — empty state", () => {
   it("shows an empty state when nothing matches", () => {
     setSessions([]);
@@ -1163,5 +1443,215 @@ describe("CommandPalette — empty state", () => {
     });
 
     expect(screen.getByText("No results found")).toBeTruthy();
+  });
+});
+
+describe("CommandPalette — commands a mounted feature offers", () => {
+  const BACK_ONLY: WorkspaceHistoryFacts = {
+    back: { target: "Files", waitingForPage: false },
+    forward: { target: null, waitingForPage: false },
+  };
+
+  const FORWARD_ONLY: WorkspaceHistoryFacts = {
+    back: { target: null, waitingForPage: false },
+    forward: { target: "Files", waitingForPage: false },
+  };
+
+  /** The tabs sidebar's Back and Forward, registered as its host registers them. */
+  function WorkspaceHistory({ go, facts }: { go: () => void; facts: WorkspaceHistoryFacts }) {
+    useWorkspaceHistoryCommands({ conversationId: "conv_a", facts, go }, true);
+    return null;
+  }
+
+  /** A palette opened from a button. */
+  function OpenedPalette({
+    go,
+    facts = BACK_ONLY,
+  }: {
+    go: () => void;
+    facts?: WorkspaceHistoryFacts;
+  }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Open palette
+        </button>
+        <button type="button">Where the command moves focus</button>
+        <WorkspaceHistory go={go} facts={facts} />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  const withSidebarFlag = (enabled: boolean) =>
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { workspace_sidebar_v2: enabled },
+    });
+
+  function openPalette(go: () => void, facts?: WorkspaceHistoryFacts) {
+    render(<OpenedPalette go={go} facts={facts} />, { wrapper: withQueryClient() });
+    const opener = screen.getByRole("button", { name: "Open palette" });
+    opener.focus();
+    fireEvent.click(opener);
+    return opener;
+  }
+
+  it("lists them with their chords, and one that can't run says why", async () => {
+    withSidebarFlag(true);
+    openPalette(vi.fn());
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "in the workspace" },
+    });
+
+    const back = await screen.findByRole("option", { name: /Go back in the workspace/ });
+    expect(back.textContent).toContain("←");
+    const forward = screen.getByRole("option", { name: /Go forward in the workspace/ });
+    expect(forward).toHaveAttribute("aria-disabled", "true");
+    expect(forward.textContent).toContain("There's nothing to go forward to in the workspace.");
+  });
+
+  it("highlights the first one that can run, so Enter runs it past one that can't", async () => {
+    withSidebarFlag(true);
+    const go = vi.fn();
+    openPalette(go, FORWARD_ONLY);
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "in the workspace" } });
+
+    const forward = await screen.findByRole("option", { name: /Go forward in the workspace/ });
+    expect(screen.getByRole("option", { name: /Go back in the workspace/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    // Once the rows have settled, before anyone moves the selection.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    expect(forward).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await vi.waitFor(() => expect(go).toHaveBeenCalledWith("forward"));
+  });
+
+  it("runs one that moves focus once the palette has closed, so the focus stays", async () => {
+    withSidebarFlag(true);
+    let dialogAtRun: Element | null = null;
+    const go = vi.fn(() => {
+      dialogAtRun = screen.queryByRole("dialog");
+      screen.getByText("Where the command moves focus").focus();
+    });
+    openPalette(go);
+
+    fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
+    expect(go).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(go).toHaveBeenCalledOnce());
+    expect(dialogAtRun).toBeNull();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    // The dialog's own focus return, to the opener, came first and didn't undo it.
+    expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
+  });
+
+  // The QuickPick palette lists them under its own flag; its own test covers that.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "lists none without the workspace_sidebar_v2 flag",
+    async () => {
+      withSidebarFlag(false);
+      openPalette(vi.fn());
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "in the workspace" },
+      });
+
+      await screen.findByText("No results found");
+      expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
+    },
+  );
+});
+
+// Either palette's dialog content.
+const PALETTE_CONTENT = "[data-command-palette], [data-quick-pick-dialog]";
+
+/**
+ * Gives the palette's content an enter animation while open and an exit one once closing, so
+ * Radix keeps it mounted until the exit ends, as in the app.
+ */
+function stubExitAnimation() {
+  let animationName = "enter";
+  const computedStyle = window.getComputedStyle.bind(window);
+  const styleSpy = vi.spyOn(window, "getComputedStyle").mockImplementation((element) => {
+    const style = computedStyle(element);
+    if (!(element instanceof HTMLElement) || !element.matches(PALETTE_CONTENT)) return style;
+    return new Proxy(style, {
+      get: (target, property) =>
+        property === "animationName" ? animationName : Reflect.get(target, property),
+    });
+  });
+  onTestFinished(() => styleSpy.mockRestore());
+  return {
+    exitNext: () => {
+      animationName = "exit";
+    },
+    stop: () => {
+      animationName = "none";
+      styleSpy.mockRestore();
+    },
+  };
+}
+
+describe("CommandPalette reopened during its exit animation", () => {
+  let setOpen: (open: boolean) => void = () => undefined;
+  function Opener() {
+    const [open, setOpenState] = useState(false);
+    setOpen = setOpenState;
+    return (
+      <>
+        <textarea aria-label="Editor" />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpenState}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  it("focuses its search field again after a row click left focus on the list", async () => {
+    const animation = stubExitAnimation();
+    render(<Opener />, { wrapper: withQueryClient() });
+    const editor = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "Editor" });
+    editor.focus();
+    act(() => setOpen(true));
+    await vi.waitFor(() => expect(screen.getByTestId("command-palette-input")).toHaveFocus());
+    animation.exitNext();
+    // Clicking a row focuses the list, and the row's command closes the palette.
+    act(() => screen.getByRole("listbox").focus());
+    act(() => setOpen(false));
+    expect(document.querySelector(PALETTE_CONTENT)).not.toBeNull();
+
+    // ⌘K again while it animates out.
+    act(() => setOpen(true));
+    const input = screen.getByTestId("command-palette-input");
+    await vi.waitFor(() => expect(input).toHaveFocus());
+    // The replaced content's late close doesn't pull focus back to the editor.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(input).toHaveFocus();
+    fireEvent.change(input, { target: { value: "settings" } });
+    expect(input).toHaveValue("settings");
+
+    // Cancelling still returns focus to where the user was before the first opening.
+    animation.stop();
+    fireEvent.keyDown(input, { key: "Escape" });
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // Radix returns focus just after the content unmounts.
+    await vi.waitFor(() => expect(editor).toHaveFocus());
   });
 });

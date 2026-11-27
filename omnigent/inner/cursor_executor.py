@@ -80,6 +80,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
 )
+from .sandbox import reject_unsupported_harness_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -704,6 +705,7 @@ class CursorExecutor(Executor):
             tools (policy DENY still blocks). Any other value keeps the
             interactive per-tool approval card.
         """
+        reject_unsupported_harness_sandbox(os_env, "Cursor")
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
         self._model_override = model
@@ -1103,28 +1105,14 @@ class CursorExecutor(Executor):
             str(bridge_path),
         ]
 
-    def _check_bridged_tool_isolation(self, tools: list[ToolSpec], cwd: str) -> None:
+    @staticmethod
+    def _check_bridged_tool_isolation(tools: list[ToolSpec]) -> None:
         if any(str(tool.get("name", "")).startswith("sys_terminal_") for tool in tools):
             raise RuntimeError("Cursor SDK terminal tools need a verified sandbox boundary")
-        if not any(str(tool.get("name", "")).startswith("sys_os_") for tool in tools):
-            return
-        if self._os_env_spec is None:
-            raise RuntimeError("Cursor SDK OS tools require an isolated OS environment")
-        from .sandbox import resolve_sandbox
-
-        os_env_cwd = Path(self._os_env_spec.cwd or cwd).resolve(strict=True)
-        sandbox = resolve_sandbox(self._os_env_spec, os_env_cwd)
-        if not sandbox.active:
-            raise RuntimeError("Cursor SDK OS tools require an active sandbox")
-        # A directory can be granted through ``write_files`` as well.
-        grants = [*sandbox.write_roots, *sandbox.write_files]
-        home_root = Path.home().resolve(strict=True)
-        if any(home_root.is_relative_to(grant) for grant in grants):
-            raise RuntimeError("Cursor SDK OS tools cannot write the policy home")
-        # The hook is only as trustworthy as the interpreter and modules it loads.
-        for path in _policy_hook_runtime_paths():
-            if any(path.is_relative_to(grant) or grant.is_relative_to(path) for grant in grants):
-                raise RuntimeError("Cursor SDK OS tools cannot write the policy hook's Python")
+        if any(str(tool.get("name", "")).startswith("sys_os_") for tool in tools):
+            raise RuntimeError(
+                "Cursor SDK cannot isolate bridged OS tools; choose a sandbox-capable harness"
+            )
 
     async def _ensure_isolated_session(
         self,
@@ -1147,7 +1135,7 @@ class CursorExecutor(Executor):
         if not self._api_key:
             raise RuntimeError("Cursor SDK requires a Cursor API key")
         cwd = os.path.abspath(self._cwd or os.getcwd())
-        self._check_bridged_tool_isolation(tools, cwd)
+        self._check_bridged_tool_isolation(tools)
         try:
             from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
         except ImportError as exc:

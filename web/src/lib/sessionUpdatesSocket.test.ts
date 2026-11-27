@@ -9,6 +9,7 @@ import {
   HEALTHY_CONNECTION_MS,
   HEARTBEAT_WATCHDOG_MS,
   nextPushedSession,
+  SessionUpdatesSocket,
   sessionUpdatesSocket,
 } from "./sessionUpdatesSocket";
 
@@ -416,5 +417,50 @@ describe("nextPushedSession", () => {
     // already committed to the authoritative id would be handed a second one.
     latestWs().emit({ type: "changed", items: [{ id: "conv_late" }] });
     await expect(mine).resolves.toBeNull();
+  });
+});
+
+describe("SessionUpdatesSocket.isWatching", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("follows the watch-set the server has reached, not the one last asked for", () => {
+    const socket = new SessionUpdatesSocket();
+    socket.setWatched(["a"]);
+    socket.start();
+    // Opening sends the set once; nothing is watched until the server answers.
+    latestWs().open();
+    expect(socket.isWatching("a")).toBe(false);
+
+    // A second request goes out before the first is answered.
+    socket.setWatched(["b"]);
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("a")).toBe(true);
+    expect(socket.isWatching("b")).toBe(false);
+    // A delta between the two answers still comes from the first set.
+    latestWs().emit({ type: "changed", items: [] });
+    expect(socket.isWatching("a")).toBe(true);
+
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("a")).toBe(false);
+    expect(socket.isWatching("b")).toBe(true);
+
+    // A new connection starts over: the server watches nothing until it answers.
+    latestWs().close();
+    vi.advanceTimersByTime(60_000);
+    latestWs().open();
+    expect(socket.isWatching("b")).toBe(false);
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("b")).toBe(true);
+    socket.stop();
   });
 });

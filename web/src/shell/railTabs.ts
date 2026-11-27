@@ -5,8 +5,9 @@
  */
 
 /** The selectable tabs in the right workspace rail, in display order.
- *  "browser" and "sidechat" are dynamic-tab modes (a browser tab / a side-chat
- *  tab is selected), not fixed nav tabs — the nav strip renders the first four.
+ *  "browser", "sidechat" and "gadget" are dynamic-tab modes (a browser tab / a
+ *  side-chat tab / a gadget tab is selected), not fixed nav tabs — the nav strip
+ *  renders the first four.
  *  "github" is a stable stored id for the Pull Requests tab; renaming it drops saved choices. */
 export type RightRailTab =
   | "files"
@@ -16,7 +17,8 @@ export type RightRailTab =
   | "subagents"
   | "browser"
   | "sidechat"
-  | "content-search";
+  | "content-search"
+  | "gadget";
 
 /**
  * Count/status badge geometry. Fixed height with min-width == height keeps a

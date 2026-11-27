@@ -70,10 +70,12 @@ from omnigent.entities.environment_filesystem import InvalidPath
 from omnigent.host.workspace_git.files import is_inside
 from omnigent.host.workspace_git.runner import (
     LISTING_OUTPUT_BYTES,
+    CheckedRepository,
     Deadline,
     GitError,
     GitProblem,
     GitRepository,
+    checked_or_discovered,
     failure,
     is_object_name,
 )
@@ -373,14 +375,18 @@ async def resolve_base(
 
 
 async def resolve_comparison(
-    root: Path, comparison: Comparison, deadline: Deadline
+    root: Path,
+    comparison: Comparison,
+    deadline: Deadline,
+    checked: CheckedRepository = None,
 ) -> tuple[GitRepository, ComparisonBase]:
     """The repository of ``root`` and the base a comparison request names.
 
+    :param checked: The repository a folder check already found at ``root``, reused as is.
     :raises ComparisonUnavailableError: NOT_A_REPOSITORY outside a repository, or any
         problem the base resolution reports.
     """
-    repository = await GitRepository.discover(root, deadline)
+    repository = await checked_or_discovered(root, deadline, checked)
     if repository is None:
         raise ComparisonUnavailableError(COMPARISON_PROBLEM_NOT_A_REPOSITORY)
     if comparison.kind == COMPARISON_KIND_REVISIONS:
@@ -815,12 +821,15 @@ async def _blob_size_at(
 
 
 async def resolve_working_copy_base(
-    root: Path, request: ResolveWorkingCopyBaseRequest
+    root: Path, request: ResolveWorkingCopyBaseRequest, checked: CheckedRepository = None
 ) -> ResolveWorkingCopyBaseResponse:
-    """The base a working-copy comparison compares with, or why there is none."""
+    """The base a working-copy comparison compares with, or why there is none.
+
+    :param checked: The repository a folder check already found at ``root``, reused as is.
+    """
     deadline = Deadline(LISTING_DEADLINE_S)
     try:
-        _repository, base = await resolve_comparison(root, request.comparison, deadline)
+        _repository, base = await resolve_comparison(root, request.comparison, deadline, checked)
     except COMPARISON_ERRORS as error:
         return ResolveWorkingCopyBaseResponse(
             base=WorkingCopyBase(unavailable=as_unavailable(error).to_message())
@@ -829,15 +838,17 @@ async def resolve_working_copy_base(
 
 
 async def list_working_copy_changes(
-    root: Path, request: ListWorkingCopyChangesRequest
+    root: Path, request: ListWorkingCopyChangesRequest, checked: CheckedRepository = None
 ) -> ListWorkingCopyChangesResponse:
     """The changes against the requested base, beneath ``root``.
 
     A comparison that can't be made answers with its reason in ``base.unavailable``.
+
+    :param checked: The repository a folder check already found at ``root``, reused as is.
     """
     deadline = Deadline(LISTING_DEADLINE_S)
     try:
-        repository, base = await resolve_comparison(root, request.comparison, deadline)
+        repository, base = await resolve_comparison(root, request.comparison, deadline, checked)
         if base.kind == COMPARISON_KIND_REVISIONS:
             # Imported here: the revision comparison builds on this module.
             from omnigent.host.workspace_git.comparison import list_revision_changes
@@ -857,13 +868,14 @@ async def list_working_copy_changes(
 
 
 async def read_base_file(
-    root: Path, request: ReadBaseFileRequest
+    root: Path, request: ReadBaseFileRequest, checked: CheckedRepository = None
 ) -> AsyncGenerator[ReadBaseFileResponse]:
     """Stream one file's content at a commit, when its entry there is the blob requested.
 
     The first message carries the metadata; a blob over ``maximum_bytes`` sends only that,
     with ``truncated`` set.
 
+    :param checked: The repository a folder check already found at ``root``, reused as is.
     :raises ConnectError: INVALID_ARGUMENT for a malformed name or path, FAILED_PRECONDITION
         when the path at the commit isn't that blob, NOT_FOUND when this clone lacks it.
     """
@@ -873,7 +885,7 @@ async def read_base_file(
     content_type = guess_content_type(relative) or ""
     deadline = Deadline(READ_DEADLINE_S)
     try:
-        repository = await GitRepository.discover(root, deadline)
+        repository = await checked_or_discovered(root, deadline, checked)
         if repository is None:
             raise ConnectError(Code.FAILED_PRECONDITION, "The workspace isn't in a Git repository")
         size = await _blob_size_at(repository, request, relative, deadline)

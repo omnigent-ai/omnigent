@@ -432,8 +432,12 @@ multi-provider configurations. It queries managed host rows directly and
 detaches a sandbox generation only after its host has stayed offline past
 `terminate_after_offline_days`. Provider termination failures remain recorded
 for a later sweep, while the session history and durable host binding stay
-available for a fresh sandbox generation. Both
-`terminate_after_offline_days` and `sweep_interval_s` must be positive integers.
+available for a fresh sandbox generation. Every server process sweeps on its
+own schedule: the first sweep runs at a random point within the first
+`sweep_interval_s` after startup, and later sweeps follow every
+`sweep_interval_s` ±10%, so replicas restarted together by a rollout don't scan
+the host table at the same moment. Both `terminate_after_offline_days` and
+`sweep_interval_s` must be positive integers.
 
 **The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
 
@@ -639,8 +643,16 @@ admins: [you@yourcompany.com]         # who can manage members
 across when you switch, so they keep their sessions and admin rights:
 
 ```bash
-omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com
+omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com \
+  --gadget-dir /data/gadgets
 ```
+
+`--gadget-dir` is the server's gadget directory (`<data dir>/gadgets` unless
+the config sets `gadget_location`), so the command can refuse users who own
+gadgets instead of cutting them off. A `--config` whose file sets
+`gadget_location` works too; pass `--no-gadgets` instead for a server that
+never kept any. Without any of these it checks only this machine's default
+gadget directory, and warns when there is none.
 
 For the provider-specific walkthroughs (GitHub OAuth, Google Workspace,
 generic OIDC), see

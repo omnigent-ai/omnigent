@@ -27,7 +27,17 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from importlib import import_module, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, NoReturn, TypeAlias, cast, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    BinaryIO,
+    Literal,
+    NoReturn,
+    TextIO,
+    TypeAlias,
+    cast,
+    get_args,
+)
 
 import click
 import psutil
@@ -1313,6 +1323,34 @@ def _default_db_uri() -> str:
     from omnigent.host.local_server import _local_data_dir
 
     return f"sqlite:///{_local_data_dir() / 'chat.db'}"
+
+
+def _default_gadget_location() -> str:
+    """Default gadget directory for ``omnigent server`` — ``<data_dir>/gadgets``.
+
+    Beside the default database and artifacts, so ``OMNIGENT_DATA_DIR`` isolates
+    gadgets too. The config file's ``gadget_location`` overrides it.
+
+    :returns: e.g. ``"/home/alice/.omnigent/gadgets"``.
+    """
+    from omnigent.host.local_server import _local_data_dir
+
+    return str(_local_data_dir() / "gadgets")
+
+
+def _gadget_location(cfg: dict[str, Any], config_path: str | None) -> str:  # type: ignore[explicit-any]
+    """Where ``omnigent server`` keeps gadgets for this config.
+
+    The config's ``gadget_location``, relative to the config file, or the default.
+
+    :param cfg: The server config, as :func:`_load_config` reads it.
+    :param config_path: The config file it came from, or ``None``.
+    :returns: e.g. ``"/srv/omnigent/gadgets"``.
+    """
+    location = cfg.get("gadget_location") or _default_gadget_location()
+    if config_path and not Path(location).is_absolute():
+        location = str(Path(config_path).parent / location)
+    return location
 
 
 def _default_artifact_location() -> str:
@@ -5015,6 +5053,16 @@ def server(
 
         preference_store = SqlAlchemyPreferenceStore(db_uri, authority_id=authority_id)
     artifact_store = _create_artifact_store(art_loc)
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    gadget_location = _gadget_location(cfg, config_path)
+    # With gadgets off the store does no cleanup and touches nothing until a deleted account
+    # notes its gadgets' cleanup, which waits until gadgets are on again.
+    from omnigent.server.feature_flags import Feature, resolve_feature_flags
+
+    gadget_store = LocalGadgetStore(
+        gadget_location, maintain=resolve_feature_flags().enabled(Feature.GADGETS)
+    )
 
     # Initialize the runtime with store references so workflow code
     # can access them via getter functions (get_agent_cache(), etc.).
@@ -5225,6 +5273,7 @@ def server(
         project_store=project_store,
         preference_store=preference_store,
         memory_store=memory_store,
+        gadget_store=gadget_store,
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,
@@ -7640,6 +7689,7 @@ def session(ctx: click.Context) -> None:
 
     \b
     Examples:
+      omnigent session create --agent claude -m "Fix the flaky test"
       omnigent session export --id conv_abc123
       omnigent session export --id conv_abc123 --output transcript.jsonl
       omnigent session export --id conv_abc123 --server https://myserver.com
@@ -8006,6 +8056,184 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 
     new_id = created.get("id") or created.get("session_id")
     click.echo(f"Imported {len(initial_items)} item(s) into {new_id}")
+
+
+@session.command("create")
+@click.option(
+    "--agent",
+    default=None,
+    metavar="NAME",
+    help="Native agent to run, as `omnigent <agent>` names it, e.g. claude or codex.",
+)
+@click.option(
+    "--agent-id",
+    default=None,
+    metavar="AGENT_ID",
+    help="Run a registered agent by id instead of a native one.",
+)
+@click.option("--title", default=None, help="Session title.")
+@click.option(
+    "--project-id",
+    default=None,
+    metavar="PROJECT_ID",
+    help="File the session in this project. Its saved agent and workspace apply "
+    "unless you pass --agent/--agent-id or --workspace.",
+)
+@click.option("--model", default=None, help="Model for the session, e.g. claude-sonnet-4-6.")
+@click.option("--reasoning-effort", default=None, help="Reasoning effort, e.g. high.")
+@click.option(
+    "--permission-mode",
+    default=None,
+    help="Permission mode in the agent's own terms, e.g. auto for Claude. Modes "
+    "that skip approval are refused.",
+)
+@click.option(
+    "--workspace",
+    default=None,
+    metavar="DIR",
+    help="Directory the session works in. Defaults to the project's saved "
+    "workspace, else the current directory.",
+)
+@click.option(
+    "--host-id",
+    default=None,
+    metavar="HOST_ID",
+    help="Run on another connected host you own instead of this machine. Needs "
+    "--workspace, an absolute path on that host.",
+)
+@click.option("-m", "--message", default=None, help="First message to queue.")
+@click.option(
+    "--message-file",
+    type=click.File("r", encoding="utf-8"),
+    default=None,
+    help="Read the first message from FILE ('-' for stdin).",
+)
+@click.option(
+    "--server",
+    default=None,
+    help="Omnigent server URL. Defaults to the configured server, or a local one.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Print the result as JSON.")
+def session_create(
+    agent: str | None,
+    agent_id: str | None,
+    title: str | None,
+    project_id: str | None,
+    model: str | None,
+    reasoning_effort: str | None,
+    permission_mode: str | None,
+    workspace: str | None,
+    host_id: str | None,
+    message: str | None,
+    message_file: TextIO | None,
+    server: str | None,
+    json_output: bool,
+) -> None:
+    """Create a session without a terminal, queue its first message, and print its id.
+
+    The session runs on this machine's host, which is started if needed, unless
+    --host-id names another connected host you own. It is created as you, the
+    same as starting a session in the web UI, so the server's host, workspace
+    and permission-mode checks apply. The command exits once the message is
+    queued; open the session in the web UI or with `omnigent claude --resume`
+    to follow it.
+
+    \b
+    Examples:
+      omnigent session create --agent claude --title "Fix flaky test" -m "Fix tests/test_x.py"
+      omnigent session create --agent codex --project-id proj_123 --message-file task.md
+      id=$(omnigent session create --agent claude --permission-mode auto --message-file -)
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+    from omnigent.session_create_cli import (
+        ScriptedSession,
+        create_session,
+        project_has_saved_workspace,
+        queue_message,
+        resolve_agent_id,
+        wait_for_local_host,
+    )
+
+    if message is not None and message_file is not None:
+        raise click.UsageError("Pass --message or --message-file, not both.")
+    text = message_file.read() if message_file is not None else message
+    if text is not None and not text.strip():
+        raise click.UsageError("The first message is empty.")
+    resolved_agent_id = resolve_agent_id(agent=agent, agent_id=agent_id, project_id=project_id)
+    if host_id is not None and workspace is None:
+        raise click.UsageError("--host-id needs --workspace, an absolute path on that host.")
+    if host_id is not None and workspace is not None and not workspace.startswith("/"):
+        raise click.UsageError("--workspace must be an absolute path on the --host-id host.")
+    if host_id is None and workspace is not None:
+        workspace = str(Path(workspace).expanduser().resolve())
+
+    cfg = _load_effective_config()
+    if host_id is None:
+        from omnigent.host.identity import load_or_create_host_identity
+
+        # Running here needs this machine's host daemon connected to the server.
+        base_url = _ensure_backend(server if server is not None else cfg.get("server"))
+        host_id = load_or_create_host_identity().host_id
+        wait_for_local_host(
+            base_url.rstrip("/"),
+            _remote_headers(server_url=base_url.rstrip("/"), host_id=host_id),
+            host_id,
+        )
+    else:
+        attach_url = _resolve_attach_server(server, cfg.get("server"))
+        if attach_url is None:
+            raise click.ClickException(
+                "No Omnigent server to create the session on: pass --server, or set "
+                "the server in your config."
+            )
+        base_url = attach_url
+    base_url = base_url.rstrip("/")
+
+    with httpx.Client(
+        base_url=base_url,
+        # Session requests must reach the replica holding the host's tunnel.
+        headers=_remote_headers(server_url=base_url, host_id=host_id),
+        trust_env=_trust_env_for(base_url),
+    ) as client:
+        if workspace is None and (
+            project_id is None or not project_has_saved_workspace(client, project_id)
+        ):
+            workspace = str(Path.cwd().resolve())
+        spec = ScriptedSession(
+            agent_id=resolved_agent_id,
+            host_id=host_id,
+            workspace=workspace,
+            title=title,
+            project_id=project_id,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            permission_mode=permission_mode,
+        )
+        session_id = create_session(client, spec)
+
+        def _report(message_queued: bool) -> None:
+            if not json_output:
+                click.echo(session_id)
+                return
+            from omnigent.conversation_browser import conversation_url
+
+            result = {
+                "session_id": session_id,
+                "url": conversation_url(base_url, session_id),
+                "message_queued": message_queued,
+            }
+            click.echo(json.dumps(result))
+
+        try:
+            if text is not None:
+                queue_message(client, session_id, text)
+        except click.ClickException:
+            # Name the half-created session on stdout so a script can clean it up.
+            _report(False)
+            raise
+    _report(text is not None)
 
 
 # Shared option help for ``run`` and the harness commands. These are the same
@@ -10408,6 +10636,7 @@ def _daemon_session_request_params(
     connected_only: bool,
     after: str | None,
     kind: Literal["default", "sub_agent"] = "default",
+    visibility: Literal["all", "mine"] = "all",
 ) -> dict[str, str | int]:
     """
     Build query parameters for one sessions page.
@@ -10417,12 +10646,14 @@ def _daemon_session_request_params(
     :param after: Optional cursor from the prior page, e.g.
         ``"conv_abc123"``.
     :param kind: Session kind to fetch; the server omits sub-agents by default.
+    :param visibility: Which sessions to list: ``"mine"`` for the caller's
+        own, ``"all"`` for every session the caller can read.
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
         "limit": 1000,
         "include_archived": "true",
-        "visibility": "all",
+        "visibility": visibility,
     }
     if kind != "default":
         params["kind"] = kind
@@ -10491,6 +10722,7 @@ def _fetch_session_pages(
     base_url: str,
     connected_only: bool,
     kind: Literal["default", "sub_agent"] = "default",
+    visibility: Literal["all", "mine"] = "all",
 ) -> _SessionPagesResult:
     """
     Fetch every available session page from a server.
@@ -10500,6 +10732,8 @@ def _fetch_session_pages(
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
     :param kind: Session kind to fetch, e.g. ``"sub_agent"``.
+    :param visibility: Which sessions to list, e.g. ``"mine"``; see
+        :func:`_daemon_session_request_params`.
     :returns: Accumulated sessions result. ``error`` is ``None`` on success.
     """
     after: str | None = None
@@ -10513,6 +10747,7 @@ def _fetch_session_pages(
                 connected_only=connected_only,
                 after=after,
                 kind=kind,
+                visibility=visibility,
             ),
         )
         page = _decode_sessions_page(page_result)
@@ -10592,6 +10827,32 @@ def _daemon_owned_sessions(
     return owned
 
 
+def _host_session_visibility(base_url: str) -> Literal["all", "mine"]:
+    """
+    Pick the session-list scope that finds a daemon's host sessions.
+
+    Launching a runner on a host takes owner access to the session, so an
+    ordinary user's host sessions are all in their own ``"mine"`` list, while
+    ``"all"`` makes the server read every session they can see, everyone's
+    shared ones included. Administrators pass that check for sessions they
+    don't own, so they keep ``"all"``, as does a caller ``GET /v1/me`` doesn't
+    confirm as a non-administrator. So does a server that doesn't advertise
+    ``session_list_scoped_archives`` in ``GET /v1/info``, because it drops
+    archived rows from ``"mine"`` lists.
+
+    :param base_url: Omnigent server base URL, e.g. ``"https://example.com"``.
+    :returns: ``"mine"`` when the server keeps archived rows in owner-scoped
+        lists and the caller is not an administrator, otherwise ``"all"``.
+    """
+    info = _host_http_json(base_url=base_url, method="GET", path="/v1/info")
+    info_body = info.body if info.status_code == 200 else None
+    if not (isinstance(info_body, dict) and info_body.get("session_list_scoped_archives") is True):
+        return "all"
+    me = _host_http_json(base_url=base_url, method="GET", path="/v1/me")
+    me_body = me.body if me.status_code == 200 else None
+    return "mine" if isinstance(me_body, dict) and me_body.get("is_admin") is False else "all"
+
+
 def _sessions_for_daemon(
     record: _HostDaemonRecord,
     *,
@@ -10627,9 +10888,11 @@ def _sessions_for_daemon(
             sessions=[],
             error="host id is not available in local config",
         )
+    visibility = _host_session_visibility(base_url)
     pages = _fetch_session_pages(
         base_url=base_url,
         connected_only=connected_only,
+        visibility=visibility,
     )
     if pages.error is not None:
         return _DaemonSessionsResult(
@@ -10644,6 +10907,7 @@ def _sessions_for_daemon(
             base_url=base_url,
             connected_only=connected_only,
             kind="sub_agent",
+            visibility=visibility,
         )
         if children.error is not None:
             # The root listing succeeded, so a child-list failure is not proof
@@ -12968,6 +13232,67 @@ def debug_db_upgrade(url: str) -> None:
     click.echo("Upgrade complete.")
 
 
+def _migration_gadget_location(
+    gadget_dir: str | None, config_path: str | None, no_gadgets: bool
+) -> str | None:
+    """The gadget directory ``migrate-accounts-to-oidc`` checks, or ``None`` for none.
+
+    The server's own location, from --gadget-dir or a --config that sets
+    gadget_location; a config without one is refused, since its default depends on the
+    server's data directory. With none of the options (the command's form from before
+    gadgets) this machine's default directory is checked when it exists, and a warning
+    says gadgets went unchecked when it doesn't.
+
+    :param gadget_dir: ``--gadget-dir``, which must exist.
+    :param config_path: ``--config``, the server's config file.
+    :param no_gadgets: ``--no-gadgets``: the server never kept gadgets.
+    :returns: The directory to check; ``None`` with ``--no-gadgets``. A configured
+        location that doesn't exist holds no gadgets, so the caller skips it.
+    :raises click.UsageError: When a given option can't establish the location.
+    """
+    if no_gadgets and (gadget_dir is not None or config_path is not None):
+        raise click.UsageError("--no-gadgets can't be combined with --config or --gadget-dir")
+    if no_gadgets:
+        return None
+    if gadget_dir is not None:
+        # A typo would otherwise skip the gadget check.
+        if not Path(gadget_dir).is_dir():
+            raise click.BadParameter(
+                f"{gadget_dir!r} is not a directory", param_hint="'--gadget-dir'"
+            )
+        return gadget_dir
+    if config_path is not None:
+        cfg = _load_config(config_path)
+        if cfg.get("gadget_location"):
+            location = _gadget_location(cfg, config_path)
+            if not Path(location).is_dir():
+                raise click.BadParameter(
+                    f"the config's gadget_location {location!r} is not a directory",
+                    param_hint="'--config'",
+                )
+            return location
+        # The default is under the data directory, which this process can't see the
+        # server's value of, so a guess could skip the check.
+        raise click.UsageError(
+            "the config doesn't set gadget_location, so where the server keeps gadgets "
+            "depends on its data directory: pass --gadget-dir with the server's gadget "
+            "directory, or --no-gadgets if it never kept any"
+        )
+    # None of them, as before gadgets existed: check this machine's default directory when
+    # it is there, and otherwise say plainly that gadgets went unchecked.
+    location = _default_gadget_location()
+    if Path(location).is_dir():
+        return location
+    click.echo(
+        f"WARNING: no gadget directory at {location}, so gadget owners were not checked. "
+        "If the server keeps gadgets elsewhere, pass --gadget-dir with its gadget directory "
+        "(or --config with a config that sets gadget_location) before running with --commit; "
+        "pass --no-gadgets to silence this for a server that never kept any.",
+        err=True,
+    )
+    return None
+
+
 @debug.command("migrate-accounts-to-oidc")
 @click.argument("url")
 @click.option(
@@ -13000,12 +13325,37 @@ def debug_db_upgrade(url: str) -> None:
     "distinct user (merges admin rights). Off by default to avoid "
     "accidental privilege merges.",
 )
+@click.option(
+    "--config",
+    "-c",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="The config file the server runs with (`omnigent server --config`). Its "
+    "gadget_location is where the server's gadgets are checked, so users with gadgets are "
+    "refused rather than cut off from them. Without one, pass --gadget-dir or --no-gadgets.",
+)
+@click.option(
+    "--gadget-dir",
+    default=None,
+    metavar="DIR",
+    help="The server's gadget directory, overriding --config. It must exist.",
+)
+@click.option(
+    "--no-gadgets",
+    is_flag=True,
+    default=False,
+    help="The server never kept gadgets, so there is no gadget directory to check.",
+)
 def debug_migrate_accounts_to_oidc(
     url: str,
     maps: tuple[str, ...],
     domain: str | None,
     commit: bool,
     force: bool,
+    config_path: str | None,
+    gadget_dir: str | None,
+    no_gadgets: bool,
 ) -> None:
     """Remap user identities when switching the accounts provider to OIDC.
 
@@ -13023,11 +13373,22 @@ def debug_migrate_accounts_to_oidc(
     \b
     Examples:
       # Dry run: append the org domain to every username
-      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com
+      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com \\
+        --gadget-dir /data/gadgets
       # Apply it
-      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com --commit
+      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com \\
+        --gadget-dir /data/gadgets --commit
       # Explicit per-user mapping (add --commit to apply)
-      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --map alice=alice@corp.com
+      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --map alice=alice@corp.com \\
+        --gadget-dir /data/gadgets
+
+    Gadgets are not moved: a user who owns gadgets or has pinned ones is
+    refused, and their rows stay as they are. Delete or hand off those
+    gadgets first, then run it again. Say where the server keeps them
+    with --config (when it sets gadget_location) or --gadget-dir, or pass
+    --no-gadgets for a server that never kept any. With none of these it
+    checks this machine's default gadget directory, or warns that gadgets
+    went unchecked when there is none.
 
     \b
     IMPORTANT: always back up your database before running with
@@ -13055,7 +13416,16 @@ def debug_migrate_accounts_to_oidc(
         if not mapping:
             raise click.UsageError("nothing to migrate: pass --domain DOMAIN and/or --map OLD=NEW")
 
-        report = remap_identities(engine, mapping, dry_run=not commit, force=force)
+        gadget_location = _migration_gadget_location(gadget_dir, config_path, no_gadgets)
+        gadget_store = None
+        if gadget_location is not None:
+            from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+            # Read only: no cleanup step, no directories made and no index repairs.
+            gadget_store = LocalGadgetStore(gadget_location, maintain=False, read_only=True)
+        report = remap_identities(
+            engine, mapping, dry_run=not commit, force=force, gadget_store=gadget_store
+        )
     finally:
         engine.dispose()
 
@@ -13094,6 +13464,11 @@ def debug_migrate_accounts_to_oidc(
         click.echo(
             "  REFUSED (NEW id already exists — re-run with --force to merge): "
             + ", ".join(report.refused)
+        )
+    if report.refused_gadgets:
+        click.echo(
+            "  REFUSED (has gadgets this remap can't move — delete or hand them off, then "
+            "re-run): " + ", ".join(report.refused_gadgets)
         )
 
     if not report.committed:

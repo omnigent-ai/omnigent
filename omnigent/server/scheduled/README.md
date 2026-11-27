@@ -1,9 +1,8 @@
 # Persistent task scheduling
 
-Recurring schedules have a minimum interval
-of **10 minutes** on connected hosts in either session mode, and in sandboxes
-when continuing the existing session. Starting a new sandbox session each run
-requires **one hour**. Use `FREQ=MINUTELY;INTERVAL=10` for a ten-minute schedule.
+Recurring schedules have a minimum interval of **10 minutes** on every execution
+target and session mode, including a sandbox that starts a new session each run.
+Use `FREQ=MINUTELY;INTERVAL=10` for a ten-minute schedule.
 
 Scheduled tasks ("automations") run a saved prompt on a recurring schedule or on
 demand. `PersistentTaskScheduler` keeps the schedule in the database, so every
@@ -445,6 +444,46 @@ deployment:
 - Each poll reads one page of pending Run now requests, so on a server with many
   pending requests for other replicas' hosts, a request can wait a few polls.
 
+## Agent timers
+
+`sys_timer_set` saves a timer of at least 120 seconds (`DURABLE_TIMER_MIN_SECONDS`) in
+a top-level session as one hidden `kind="timer"` task whose ID is the `timer_id`,
+through `POST /v1/sessions/{id}/timers`. `sys_timer_cancel` deletes it through
+`DELETE /v1/sessions/{id}/timers/{timer_id}`. Both authorize the caller as a message
+to the session would, and a cancel must come from the timer's own session and owner.
+Saving needs the database scheduler and the default-off `session_timers` release
+feature, which `/v1/info` reports; the automations gate doesn't hide these routes.
+The runner keeps every other timer in its own memory and says so in the tool's
+result: a shorter one, one on a server that doesn't save timers, and one in a
+sub-agent's session or a side chat, which the route answers with `durable: false`
+instead of saving.
+
+- **Schedule.** `FREQ=SECONDLY;INTERVAL=<n>`, plus `COUNT=1` for a one-shot, with `n`
+  the delay rounded up to whole seconds. Firings fall at `created_at + k * n`
+  (`next_timer_time`), skipping missed ones, and timers are exempt from the automation
+  minimum interval. A firing comes up to one poll (15 seconds by default) late.
+- **Delivery.** The executor skips budgets, sharing and run labels, and sends the
+  hidden (`is_meta`) wake through the continued-session dispatch, in the session's
+  current permission mode. A session that was deleted, archived or closed, or that
+  the owner can no longer send to, stops the timer (`timer_session_unavailable`).
+  The wake meets the session's REQUEST-phase input policies first: a deny, or an ASK
+  no one can answer, skips that firing (`timer_policy_denied`). A runner that can't
+  be reached or declines the wake fails the firing (`launch_failed`), which is not
+  retried.
+- **Hosts.** The replica that owns a timer's saved host claims its firings. When the
+  session has since moved to another host, or got one after the timer was saved, that
+  replica records the firing `skipped` (`timer_host_moved`) without sending it, saves
+  the session's host on the timer and makes it due a second later, so the replica
+  that owns the new host claims it at its next poll. A one-shot reopens for that.
+- **History.** A timer claims one firing at a time and keeps only its newest run. It
+  never stamps `last_run_at`, and a spent one-shot is deleted. The automations list
+  (unless `kind=all`) and the Inbox leave timers out, and PATCH, Run now, clone and
+  sharing refuse them.
+- **Limits.** A cancel can't stop a firing already claimed, and recovery marks an
+  expired startup `failed` without resending. Every server on the database must read
+  timer rows before the feature is turned on; turning it off stops new timers, while
+  existing ones keep firing and can still be cancelled.
+
 ## Custom callbacks
 
 A deployment can replace parts of the scheduler by passing
@@ -553,7 +592,7 @@ These are the defaults, set in the server YAML configuration:
 ```yaml
 scheduled_task_scheduler:
   startup_retry_seconds: 30  # Wait before retrying a failed scheduler start, in either mode
-  poll_seconds: 30       # Time between checks for due tasks and expired startups
+  poll_seconds: 15       # Time between checks for due tasks and expired startups
   renewal_seconds: 30    # Time between startup heartbeats
   lease_seconds: 120     # How long a lease lasts after each renewal
   recovery_seconds: 30   # Time limit for inspecting and recovering one run
@@ -587,8 +626,9 @@ automations.
 
 ## Sub-hour schedule rollout
 
-API validation and both schedulers always support the target/mode minimums above.
-`/v1/info` reports the fixed `scheduled_task_subhour` capability so newer clients
+API validation and both schedulers always support the ten-minute minimum above.
+`/v1/info` reports the fixed `scheduled_task_subhour` capability, and
+`scheduled_task_subhour_new_sandbox` for new sandbox sessions, so newer clients
 retain the hourly floor on older servers. The custom UI also needs `automations_v2`.
 
 Upgrade scheduler replicas before API replicas begin accepting sub-hour schedules,
@@ -596,14 +636,15 @@ and avoid routing writes across mixed API versions during the rollout. Older API
 replicas reject short schedules; older schedulers can pause them as invalid.
 Keep the existing scheduler mode unchanged during the version upgrade.
 
-Updates validate the proposed recurrence, session mode and target outside the
-database transaction, then compare their saved values under the task row lock.
+Updates validate a proposed recurrence outside the database transaction, then
+compare the saved recurrence, session mode and target under the task row lock.
 A concurrent change returns HTTP 409 without applying any fields; reload and
 revalidate before retrying. Metadata-only writes do not revalidate saved cadences.
 
 Before rolling binaries back to a version with the hourly-only parser, stop
 accepting sub-hour schedules, pause them and change their recurrence to hourly
-or slower (or delete them). An old scheduler can durably pause unsupported rules
+or slower (or delete them). Rolling back to a version that still needs an hour
+for new sandbox sessions needs the same for those automations only. An old scheduler can durably pause unsupported rules
 and clear `next_run_at`, even before its host-ownership filter. Restoring the new
 binary does not automatically resume tasks paused by an old scheduler.
 

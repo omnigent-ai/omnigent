@@ -72,6 +72,15 @@ describe("useSessionWorktrees", () => {
     expect(result.current.data).toEqual({ status: "unknown" });
   });
 
+  it("marks a refusal (403) as unknown and denied, which asking again won't change", async () => {
+    authenticatedFetchMock.mockResolvedValue(res(403, { detail: "not your host" }));
+    const { result } = renderHook(() => useSessionWorktrees("c", "h", "/w"), {
+      wrapper: wrapper(),
+    });
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data).toEqual({ status: "unknown", denied: true });
+  });
+
   it("does not carry a prior workspace's result across a host switch", async () => {
     // hostA on /w → branchA; hostB on the SAME path → branchB. Without
     // placeholderData, the switch must go through an undefined (loading) state

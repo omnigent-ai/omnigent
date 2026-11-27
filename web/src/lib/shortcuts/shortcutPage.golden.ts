@@ -1,4 +1,4 @@
-// Golden Keyboard shortcuts rows for macOS and other platforms across all 1,024 runtime contexts,
+// Golden Keyboard shortcuts rows for macOS and other platforms across all 2,048 runtime contexts,
 // pinning the page's output independently of the registry that builds it.
 
 /** A recorded row: keys as space-separated caps on macOS, then on other platforms. */
@@ -29,7 +29,7 @@ function row(
 /** The context flags each group reads, in the order they appear in GOLDEN_GROUPS' keys. */
 export const GOLDEN_GROUP_FLAGS = {
   General: ["native", "siblingSessions", "desktopCommands"],
-  "In chats": ["submitWithModEnter", "preventsKeyboardSubmit"],
+  "In chats": ["submitWithModEnter", "preventsKeyboardSubmit", "alwaysSteer"],
   Navigation: ["electron", "native"],
   View: ["native", "browser", "contentSearch", "desktopCommands", "preventsKeyboardSubmit"],
   Panes: ["grids", "splitTerminal"],
@@ -61,7 +61,7 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 20 */ row("Focus chat input", "⌃ ⇧ L", "Ctrl ⇧ L"),
   /* 21 */ row("Toggle voice dictation", "⌘ ⌥ V", "Ctrl Alt V"),
   /* 22 */ row("Stop response", "Esc", "Esc"),
-  /* 23 */ row("Jump to a sidebar session (1–10)", "⌘ ⌥ 1…0", "Ctrl Alt 1…0"),
+  /* 23 */ row("Jump to a sidebar session (1–9)", "⌘ ⌥ 1…9", "Ctrl Alt 1…9"),
   /* 24 */ row("Toggle Chat / Terminal view", "⌘ ⌥ \\", "Ctrl Alt \\"),
   /* 25 */ row("Toggle conversations sidebar", "⌘ ⌥ [", "Ctrl Alt ["),
   /* 26 */ row("Toggle workspace sidebar", "⌘ ⌥ ]", "Ctrl Alt ]"),
@@ -71,7 +71,7 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 30 */ row("Apply highlighted command", "Tab", "Tab"),
   /* 31 */ row("Dismiss menu", "Esc", "Esc"),
   /* 32 */ row("Start a new session", "⌘ N", "Ctrl N"),
-  /* 33 */ row("Jump to a sidebar session (1–10)", "⌘ 1…0", "Ctrl 1…0"),
+  /* 33 */ row("Jump to a sidebar session (1–9)", "⌘ 1…9", "Ctrl 1…9"),
   /* 34 */ row("Toggle conversations sidebar", "⌘ B", "Ctrl B"),
   /* 35 */ row("Toggle workspace sidebar", "⌘ ⇧ B", "Ctrl ⇧ B"),
   /* 36 */ row("Switch recent sessions", "⌃ Tab", "Ctrl Tab"),
@@ -102,6 +102,8 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 61 */ row("Focus the browser address bar", "⌘ L", "Ctrl L"),
   /* 62 */ row("Mark current session unread or read", "⌘ ⌥ U", "Ctrl Alt U"),
   /* 63 */ row("Exit full screen from a file", "Esc", "Esc"),
+  /* 64 */ row("Queue message until the agent finishes", "⌘ ↵", "Ctrl ↵"),
+  /* 65 */ row("Queue message until the agent finishes", "⌘ ⇧ ↵", "Ctrl ⇧ ↵"),
 ];
 
 /**
@@ -142,6 +144,22 @@ export const GOLDEN_GROUPS: Record<string, GoldenGroup | null> = {
     rows: [9, 10, 11, 12, 16, 17, 18, 19, 20, 21, 22],
   },
   "In chats: submitWithModEnter+preventsKeyboardSubmit": {
+    title: "In chats",
+    rows: [9, 10, 11, 12, 16, 17, 18, 19, 20, 21, 22],
+  },
+  "In chats: alwaysSteer": {
+    title: "In chats",
+    rows: [6, 64, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+  },
+  "In chats: submitWithModEnter+alwaysSteer": {
+    title: "In chats",
+    rows: [39, 65, 41, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+  },
+  "In chats: preventsKeyboardSubmit+alwaysSteer": {
+    title: "In chats",
+    rows: [9, 10, 11, 12, 16, 17, 18, 19, 20, 21, 22],
+  },
+  "In chats: submitWithModEnter+preventsKeyboardSubmit+alwaysSteer": {
     title: "In chats",
     rows: [9, 10, 11, 12, 16, 17, 18, 19, 20, 21, 22],
   },

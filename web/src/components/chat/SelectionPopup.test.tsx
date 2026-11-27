@@ -2,7 +2,7 @@ import { createRef } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
-import { SelectionPopup } from "./SelectionPopup";
+import { SelectionPopup, SelectionPopupActions } from "./SelectionPopup";
 
 afterEach(() => {
   cleanup();
@@ -33,4 +33,33 @@ it.each([true, false])("portals outside the transcript (embedded: %s)", (embedde
   fireEvent.click(reply);
   expect(onReply).toHaveBeenCalledExactlyOnceWith("Selected message");
   expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+});
+
+it("shows the actions above a given point for a selection tracked elsewhere", () => {
+  const onReply = vi.fn();
+  const onAskInSideChat = vi.fn();
+  const onAddComment = vi.fn();
+  render(
+    <SelectionPopupActions
+      position={{ x: 120, y: 80 }}
+      onReply={onReply}
+      onAskInSideChat={onAskInSideChat}
+      onAddComment={onAddComment}
+    />,
+  );
+
+  const reply = screen.getByRole("button", { name: "Reply ↵" });
+  expect(reply.parentElement).toHaveStyle({ position: "fixed", left: "120px", top: "80px" });
+  fireEvent.click(reply);
+  fireEvent.click(screen.getByRole("button", { name: "Ask in side chat" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
+  expect(onReply).toHaveBeenCalledTimes(1);
+  expect(onAskInSideChat).toHaveBeenCalledTimes(1);
+  expect(onAddComment).toHaveBeenCalledTimes(1);
+});
+
+it("offers only Reply without side chat or comment handlers", () => {
+  render(<SelectionPopupActions position={{ x: 0, y: 0 }} onReply={() => undefined} />);
+  expect(screen.queryByRole("button", { name: "Ask in side chat" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
 });

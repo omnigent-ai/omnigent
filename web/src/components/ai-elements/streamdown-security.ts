@@ -50,6 +50,12 @@ export const GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehyp
 // Exact shape only, so loading it can reach nothing but GitHub's asset store.
 const GITHUB_ATTACHMENT_ASSET =
   /^https:\/\/github\.com\/user-attachments\/assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** The asset id of a GitHub-hosted attachment image URL, or null for any other URL. */
+export function githubAttachmentAssetId(src: string | null | undefined): string | null {
+  return typeof src === "string" && GITHUB_ATTACHMENT_ASSET.test(src)
+    ? src.slice(src.lastIndexOf("/") + 1).toLowerCase()
+    : null;
+}
 // The only attributes a restored image keeps, so nothing like `srcset` can load elsewhere.
 const GITHUB_IMAGE_ATTRIBUTES = ["src", "alt", "title", "width", "height"];
 // Harden checks only `img` and `a` tags, so a parked attachment passes through it untouched.

@@ -3,8 +3,7 @@ import { Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
-import { PageLoading } from "@/components/PageLoading";
-import { Spinner } from "@/components/ui/spinner";
+import { PageLoading, PaneLoading } from "@/components/PageLoading";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Outlet, useLocation, useNavigate, useParams } from "@/lib/routing";
@@ -14,6 +13,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
 import { isElectronShell } from "@/lib/nativeBridge";
+import { CANVAS_SESSION_ROUTE, CHAT_SESSION_ROUTE } from "@/lib/sessionRoutes";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -28,6 +28,19 @@ function withPageView<P extends object>(id: string, Component: ComponentType<P>)
   return function WithPageView(props: P) {
     useOmnigentPageView(id);
     return <Component {...props} />;
+  };
+}
+
+// A lazy page inside the shell gets its own boundary. A router transition keeps
+// already-visible content, but a newly mounted boundary shows its fallback, so
+// an in-app click shows the pane spinner instead of leaving the old page up.
+function withPaneLoading<P extends object>(Page: ComponentType<P>): ComponentType<P> {
+  return function WithPaneLoading(props: P) {
+    return (
+      <Suspense fallback={<PaneLoading />}>
+        <Page {...props} />
+      </Suspense>
+    );
   };
 }
 
@@ -63,48 +76,80 @@ const FloatingComposerPage = withPageView(
 );
 const InboxPage = withPageView(
   "inbox",
-  lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
+  withPaneLoading(lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })))),
 );
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
 const ProjectHomePage = withPageView(
   "project_home",
-  lazy(() => import("@/pages/ProjectHomePage").then((m) => ({ default: m.ProjectHomePage }))),
+  withPaneLoading(
+    lazy(() => import("@/pages/ProjectHomePage").then((m) => ({ default: m.ProjectHomePage }))),
+  ),
 );
-const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
+const TasksPage = withPaneLoading(
+  lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
+);
 const UsagePage = withPageView(
   "usage",
-  lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+  withPaneLoading(lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage })))),
 );
 const TaskDetailPage = withPageView(
   "tasks.detail",
-  lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
+  withPaneLoading(
+    lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
+  ),
 );
 const WorkflowsPage = withPageView(
   "workflows",
-  lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+  withPaneLoading(
+    lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+  ),
 );
 const WorkflowDetailPage = withPageView(
   "workflows.detail",
-  lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage }))),
+  withPaneLoading(
+    lazy(() =>
+      import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage })),
+    ),
+  ),
 );
-const SettingsPage = lazy(() =>
-  import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+const GadgetListPage = withPageView(
+  "gadgets",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetListPage").then((m) => ({ default: m.GadgetListPage }))),
+  ),
+);
+const GadgetStartPage = withPageView(
+  "gadgets.new",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetStart").then((m) => ({ default: m.GadgetStartPage }))),
+  ),
+);
+const GadgetOpenPage = withPageView(
+  "gadgets.open",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetOpenPage").then((m) => ({ default: m.GadgetOpenPage }))),
+  ),
+);
+const SettingsPage = withPaneLoading(
+  lazy(() => import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage }))),
 );
 
 // A release-feature route stays registered so a hard load never falls through
 // to the catch-all "Page not found" while the /v1/info probe is in flight; the
 // gate is decided inside once the probe resolves.
-function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children: ReactNode }) {
+function FeatureGatedPage({
+  feature,
+  children,
+  loading,
+}: {
+  feature: FeatureKey;
+  children: ReactNode;
+  loading?: ReactNode;
+}) {
   const info = useServerInfo();
-  if (info === "loading") {
-    return (
-      <div className="flex min-h-0 flex-1 items-center justify-center">
-        <Spinner className="size-5 text-muted-foreground" aria-label="Loading" />
-      </div>
-    );
-  }
+  if (info === "loading") return loading !== undefined ? loading : <PaneLoading />;
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
 }
 
@@ -216,14 +261,24 @@ function AppRoutes({ basename }: AppProps) {
         <Route
           path={`${prefix}${FLOATING_COMPOSER_PATH}`}
           element={
-            <FeatureGatedPage feature="floating_composer">
-              {isElectronShell() ? <FloatingComposerPage /> : <NotFoundPage />}
+            <FeatureGatedPage
+              feature="floating_composer"
+              loading={isElectronShell() ? <PageLoading quiet /> : undefined}
+            >
+              {isElectronShell() ? (
+                // The panel boots out of sight, so it shows no loading screen of its own.
+                <Suspense fallback={<PageLoading quiet />}>
+                  <FloatingComposerPage />
+                </Suspense>
+              ) : (
+                <NotFoundPage />
+              )}
             </FeatureGatedPage>
           }
         />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route path={`${prefix}${CHAT_SESSION_ROUTE}`} element={<ChatPage />} />
           <Route
             path={`${prefix}/grid/:gridId`}
             element={
@@ -250,7 +305,7 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route
-            path={`${prefix}/canvas/c/:conversationId`}
+            path={`${prefix}${CANVAS_SESSION_ROUTE}`}
             element={
               <FeatureGatedPage feature="canvas">
                 <ChatPage />
@@ -260,7 +315,7 @@ function AppRoutes({ basename }: AppProps) {
           <Route
             element={
               info === "loading" ? (
-                <PageLoading />
+                <PaneLoading />
               ) : info.automations_enabled === false ? (
                 <NotFoundPage />
               ) : (
@@ -295,6 +350,30 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="workflows">
                 <WorkflowDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetListPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget/new`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetStartPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget/:gadgetId`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetOpenPage />
               </FeatureGatedPage>
             }
           />

@@ -36,7 +36,12 @@ import {
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentUserId,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isSingleUserMode } from "@/lib/capabilities";
@@ -477,11 +482,16 @@ export function PoliciesPage() {
   // / login_url:null shape) is NOT single-user and keeps its admin gate.
   const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
-  const { data: policies = [], refetch, error } = useDefaultPolicies();
+  const {
+    data: policies = [],
+    refetch,
+    error,
+    isFetching,
+  } = useDefaultPolicies(isSingleUser || meIsAdmin === true);
   // The backend may restrict listing global policies (HTTP 403). Treat that
   // like the non-admin case and hide the section rather than surfacing a raw
   // fetch error.
-  const policiesForbidden = error instanceof PoliciesForbiddenError;
+  const policiesForbidden = error instanceof PoliciesForbiddenError && !isFetching;
   const { data: registry = [] } = usePolicyRegistry();
   const updatePolicy = useUpdateDefaultPolicy();
   const deletePolicy = useDeleteDefaultPolicy();
@@ -501,11 +511,17 @@ export function PoliciesPage() {
   // because no auth endpoints exist and the backend skips admin enforcement.
   useEffect(() => {
     if (isSingleUser || capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
-      if (userId === null) return;
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active || userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
-    })();
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [isSingleUser, capabilitiesLoading]);
 
   if (!isSingleUser && meIsAdmin === null) {

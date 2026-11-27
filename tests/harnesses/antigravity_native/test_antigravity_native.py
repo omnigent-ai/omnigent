@@ -25,6 +25,8 @@ from omnigent.harnesses.antigravity_native.bridge import (
     read_tmux_info,
 )
 from omnigent.harnesses.antigravity_native.main import antigravity_terminal_resource_id
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.spec.types import AgentSpec
 
 
 def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
@@ -500,6 +502,8 @@ def _terminal_launch_handler(request: httpx.Request) -> httpx.Response:
 
 def _terminal_launch_handler_with_pane(request: httpx.Request) -> httpx.Response:
     """Terminal POST handler that exposes a local tmux pane in the response metadata."""
+    if request.method == "GET":
+        return httpx.Response(200, json={})
     return httpx.Response(
         200,
         json={
@@ -542,6 +546,111 @@ async def test_launch_and_record_advertises_tmux_target_when_pane_exposed(
 # ---------------------------------------------------------------------------
 # _launch_is_headless — attended vs unattended signal (phase 4 task 1)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sub_agent_name", "available", "expected"),
+    [
+        (None, True, "Parent instructions."),
+        ("worker", True, "Child instructions."),
+        (None, False, None),
+        ("missing-worker", True, None),
+    ],
+    ids=["root", "sub-agent", "missing-legacy-bundle", "missing-named-child"],
+)
+async def test_cli_fallback_delivers_effective_session_startup_instructions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sub_agent_name: str | None,
+    available: bool,
+    expected: str | None,
+) -> None:
+    """The CLI uses the selected session agent and retains old-server fallback."""
+    from omnigent.runner.native import orchestration
+
+    child = AgentSpec(spec_version=1, name="worker", instructions="Child instructions.")
+    root = AgentSpec(
+        spec_version=1,
+        name="parent",
+        instructions="Parent instructions.",
+        sub_agents=[child],
+    )
+
+    async def resolve(
+        _client: object, _cache: object, agent_id: str, session_id: str | None = None
+    ) -> orchestration.ResolvedSpec | None:
+        assert (agent_id, session_id) == ("agent", "sess")
+        return orchestration.ResolvedSpec(root, None) if available else None
+
+    selected: list[AgentSpec | None] = []
+
+    async def memory(
+        _client: object,
+        session_id: str,
+        entry: orchestration.ResolvedSpec | None,
+        *,
+        workspace: object = None,
+    ) -> str | None:
+        assert session_id == "sess"
+        selected.append(entry.spec if entry is not None else None)
+        return "MEMORY GUIDANCE" if entry is not None else None
+
+    monkeypatch.setattr("omnigent.runner._entry._resolve_agent_spec_from_server", resolve)
+    monkeypatch.setattr(orchestration, "memory_startup_guidance", memory)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/sess"
+        return httpx.Response(200, json={"agent_id": "agent", "sub_agent_name": sub_agent_name})
+
+    bridge_dir = tmp_path / "bridge"
+    async with _mock_client(handler) as client:
+        await _mod._write_cli_startup_instructions(client, "sess", bridge_dir)
+
+    rule = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+    text = rule.read_text(encoding="utf-8")
+    assert WORKSPACE_IMAGE_INSTRUCTION in text
+    if expected is not None:
+        assert expected in text
+        assert "MEMORY GUIDANCE" in text
+    else:
+        assert "MEMORY GUIDANCE" not in text
+    assert ("Parent instructions." in text) is (available and sub_agent_name is None)
+    assert ("Child instructions." in text) is (available and sub_agent_name == "worker")
+    assert selected == [
+        child
+        if sub_agent_name == "worker"
+        else root
+        if available and sub_agent_name is None
+        else None
+    ]
+
+
+@pytest.mark.parametrize("failure", ["invalid-archive", "invalid-root", "invalid-yaml"])
+async def test_cli_bundle_failures_preserve_framework_startup_guidance(
+    tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Optional bundle failures share the real loader and framework fallback."""
+    from tests._helpers.session import bundle_files
+
+    content = b"not an archive"
+    if failure in {"invalid-root", "invalid-yaml"}:
+        content = bundle_files(
+            {"config.yaml": b"[]\n" if failure == "invalid-root" else b"executor: [\n"}
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/agent/contents"):
+            return httpx.Response(200, content=content)
+        assert request.url.path == "/v1/sessions/sess"
+        return httpx.Response(200, json={"agent_id": "agent"})
+
+    bridge_dir = tmp_path / "bridge"
+    async with _mock_client(handler) as client:
+        await _mod._write_cli_startup_instructions(client, "sess", bridge_dir)
+
+    rule = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+    assert WORKSPACE_IMAGE_INSTRUCTION in rule.read_text(encoding="utf-8")
+    assert "Warning: Could not load your agent's startup instructions" in capsys.readouterr().err
 
 
 class _FakeStream:
@@ -599,6 +708,8 @@ async def test_launch_and_record_threads_headless_skip_flag(
     captured_args: list[str] = []
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={})
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
@@ -621,8 +732,15 @@ async def test_launch_and_record_threads_headless_skip_flag(
     assert "--dangerously-skip-permissions" in captured_args
 
 
+@pytest.mark.parametrize(
+    "startup_case",
+    ["authored", "bundle-error", "write-error", "cyclic-rules"],
+)
 async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    startup_case: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The CLI launch scopes agy to a per-session Gemini dir, like the runner path.
 
@@ -639,11 +757,62 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     user_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
     user_settings.write_text('{"model":"gemini-3-pro"}', encoding="utf-8")
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
+    from tests._helpers.session import bundle_files
+
+    authored = "Begin every reply with AGY-STARTUP."
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                "spec_version: 1\nname: startup-check\n"
+                "executor:\n  type: omnigent\n  config:\n    harness: antigravity-native\n"
+                f"instructions: {authored}\n"
+            ).encode(),
+        }
+    )
+    previous_rule = None
+    if startup_case == "write-error":
+        bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+        bridge_mod.write_agent_instructions(bridge_dir, "Keep the previous guidance.")
+        previous_rule = (
+            bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+        ).read_bytes()
+
+        def fail_write(*_args: object) -> None:
+            raise PermissionError("read-only rules")
+
+        monkeypatch.setattr(_mod, "write_agent_instructions", fail_write)
+    elif startup_case == "cyclic-rules":
+        bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+        rules_dir = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules"
+        rules_dir.parent.mkdir(parents=True)
+        rules_dir.symlink_to(rules_dir.name, target_is_directory=True)
 
     captured_args: list[str] = []
     captured_env: dict[str, str] = {}
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            if request.url.path.endswith("/agent/contents"):
+                return (
+                    httpx.Response(500)
+                    if startup_case == "bundle-error"
+                    else httpx.Response(
+                        200,
+                        content=bundle,
+                        headers={"Content-Type": "application/gzip"},
+                    )
+                )
+            return httpx.Response(200, json={"agent_id": "authored-agent"})
+        bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+        rule = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+        if startup_case == "write-error":
+            assert rule.read_bytes() == previous_rule
+        elif startup_case == "cyclic-rules":
+            assert rule.parent.is_symlink()
+        else:
+            text = rule.read_text(encoding="utf-8")
+            assert WORKSPACE_IMAGE_INSTRUCTION in text
+            assert (authored in text) is (startup_case == "authored")
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         captured_env.update(body["spec"]["env"])
@@ -670,17 +839,21 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     assert captured_args[0] == f"--gemini_dir={iso_gemini}"
     # HOME must stay real: relocating it breaks keyring-backed auth on macOS.
     assert "HOME" not in captured_env
-    # The relay config + token exist, so the wrapped agy can reach the sys_* tools.
+    # The relay config + token exist without enabledTools so agy exposes every
+    # dynamically advertised relay tool; permissions.allow auto-approves them.
     relay_config = iso_gemini / "config" / "mcp_config.json"
     payload = json.loads(relay_config.read_text(encoding="utf-8"))
-    assert "sys_session_create" in payload["mcpServers"]["omnigent"]["enabledTools"]
+    assert "enabledTools" not in payload["mcpServers"]["omnigent"]
     assert (bridge_dir / "bridge.json").is_file()
-    # The survey/trust seeds landed in the isolated dir, never the user's own file.
+    # The survey/trust/permission seeds landed in the isolated dir, never the user's own file.
     iso_settings = json.loads(
         (iso_gemini / "antigravity-cli" / "settings.json").read_text(encoding="utf-8")
     )
     assert iso_settings["showFeedbackSurvey"] is False
+    assert "mcp(omnigent/*)" in iso_settings["permissions"]["allow"]
     assert user_settings.read_text(encoding="utf-8") == '{"model":"gemini-3-pro"}'
+    warning = capsys.readouterr().err
+    assert ("Warning:" in warning) is (startup_case != "authored")
 
 
 # ---------------------------------------------------------------------------

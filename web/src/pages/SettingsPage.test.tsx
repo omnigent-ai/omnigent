@@ -16,7 +16,9 @@ import {
   within,
 } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as IdentityApi from "@/lib/identity";
+import { PANE_CORNERS_STORAGE_KEY, paneCornersPreference } from "@/lib/paneCornersPreference";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -72,6 +74,7 @@ const mocks = vi.hoisted(() => ({
   sessionTitleInstructions: false,
   projectKanban: false,
   floatingComposer: false,
+  workspaceSidebarV2: false,
   nestedAgents: false,
   advisorAvailable: false,
   authenticatedFetch: vi.fn(),
@@ -116,6 +119,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           features: {
             project_kanban: mocks.projectKanban,
             floating_composer: mocks.floatingComposer,
+            workspace_sidebar_v2: mocks.workspaceSidebarV2,
           },
         },
 }));
@@ -144,13 +148,19 @@ vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
   changePassword: vi.fn(),
 }));
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityApi>()),
   authenticatedFetch: (...args: unknown[]) => mocks.authenticatedFetch(...args),
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.effectiveAdmin ?? mocks.me?.is_admin ?? false,
   getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
-  subscribeIdentity: () => () => {},
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
 vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
@@ -338,6 +348,7 @@ function renderPage(path = "/settings") {
 }
 
 beforeEach(() => {
+  identityUpdates.clear();
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
@@ -353,6 +364,7 @@ beforeEach(() => {
   mocks.sessionTitleInstructions = false;
   mocks.projectKanban = false;
   mocks.floatingComposer = false;
+  mocks.workspaceSidebarV2 = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
   mocks.authenticatedFetch.mockReset();
@@ -383,6 +395,20 @@ afterEach(() => {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+});
+
+describe("Keyboard shortcuts", () => {
+  it("offers a search field, and lets Settings search reveal every row", () => {
+    renderPage("/settings/shortcuts");
+
+    expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeTruthy();
+    expect(screen.getAllByRole("searchbox", { name: "Search shortcuts" })).toHaveLength(1);
+    const row = (label: string) => screen.getByText(label, { selector: "span" }).closest("li");
+    expect(row("Open command palette")?.getAttribute("data-settings-item")).toBe(
+      "shortcut.palette.commands",
+    );
+    expect(row("Stop response")?.getAttribute("data-settings-item")).toBe("shortcut.response.stop");
+  });
 });
 
 describe("Import sessions", () => {
@@ -643,6 +669,32 @@ describe("SettingsPage", () => {
     renderPage("/settings/general");
     expect(await screen.findByRole("switch", newAgent)).toBeChecked();
     expect(getGlobalShortcut).toHaveBeenCalledWith("floatingComposer");
+  });
+
+  it("offers the right sidebar window setting in Desktop app only on shells that have it", async () => {
+    const name = { name: "Widen window when opening the right sidebar" };
+    const newAgent = { name: "Open New Agent from anywhere" };
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    const rightSidebarWindow = {
+      getWidensWindow: vi.fn().mockResolvedValue(false),
+      setWidensWindow: vi.fn().mockResolvedValue(true),
+      opened: vi.fn(),
+      closed: vi.fn(),
+    };
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      rightSidebarWindow,
+    };
+    // A shell without global shortcuts still gets the Desktop app group for this setting.
+    renderPage("/settings/general");
+    const group = screen.getByTestId("settings-group-desktop-app");
+    await waitFor(() => expect(within(group).getByRole("switch", name)).toBeEnabled());
+    expect(within(group).queryByRole("switch", newAgent)).toBeNull();
   });
 
   it("offers the kanban board switch under Composer only when the server has the board", () => {
@@ -1118,6 +1170,19 @@ describe("SettingsPage", () => {
     expect(select.value).toBe("github");
     expect(document.documentElement.getAttribute("data-theme")).toBe("github");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+  });
+
+  it("saves this device's Pane corners choice from its dropdown, where the design exists", () => {
+    mocks.workspaceSidebarV2 = true;
+    onTestFinished(() => void paneCornersPreference.write("automatic"));
+    renderPage("/settings/appearance");
+    const select = screen.getByTestId("pane-corners-select") as HTMLSelectElement;
+    expect(select.value).toBe("automatic");
+
+    fireEvent.change(select, { target: { value: "floating" } });
+    expect(select.value).toBe("floating");
+    expect(paneCornersPreference.read()).toBe("floating");
+    expect(localStorage.getItem(PANE_CORNERS_STORAGE_KEY)).toContain("floating");
   });
 
   it("creates and applies a custom theme when a guided color control changes", () => {
@@ -1770,6 +1835,23 @@ describe("SettingsPage", () => {
     mocks.loginUrl = null;
     renderPage("/settings/account");
     expect(screen.queryByText("alice")).toBeNull();
+  });
+
+  it("shows account identity after a transient probe recovers without remounting", async () => {
+    mocks.me = null;
+    const view = renderPage("/settings/account");
+    await act(async () => {});
+    expect(screen.queryByText("alice")).not.toBeInTheDocument();
+
+    mocks.me = { id: "alice", is_admin: true };
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(await screen.findByText("alice")).toBeInTheDocument();
+    expect(screen.getByText("(admin)")).toBeInTheDocument();
+    view.unmount();
+    expect(identityUpdates.size).toBe(0);
   });
 
   it("persists an Updates mode change through the desktop bridge", async () => {

@@ -37,7 +37,9 @@ import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
 } from "./sessionWorkspaceState";
+import { notifyTerminalThemeChanged } from "./terminalThemePreferences";
 import {
+  notifyWorkspaceTabPreferencesChanged,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
@@ -193,11 +195,13 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyCodeBlockWordWrapChanged();
   notifyPeerSessionMessageDisplayChanged();
   notifySessionRowQuickActionsChanged();
+  notifyTerminalThemeChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);
   if (previousDefault !== readDefaultWorkspaceTab()) {
     resetSessionWorkspaceTabSelections();
   }
+  notifyWorkspaceTabPreferencesChanged();
   return count;
 }

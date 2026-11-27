@@ -1,29 +1,27 @@
-import { type RefObject, useEffect, useId, useState } from "react";
+import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
 import {
-  contentSearchPattern,
-  fetchContentSearch,
-  fitsContentSearchLimit,
   type ContentMatch,
-  type ContentSearchResult,
-  wholeWordRegexProblem,
+  contentSearchProblem,
+  type ContentSearchInput,
+  EMPTY_CONTENT_SEARCH,
+  runContentSearch,
 } from "@/lib/contentSearch";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import type { OpenFileOptions } from "./FileViewerContext";
 import { cn } from "@/lib/utils";
+import { useTextSearchFocus } from "@/store/fileFinder";
 
-interface ContentSearchInput {
-  query: string;
-  caseSensitive: boolean;
-  regex: boolean;
-  /** Optional so an input cached before this option existed still reads as off. */
-  wholeWord?: boolean;
-  include: string;
-  exclude: string;
-}
+import {
+  type ContentSearchAnswer,
+  type ContentSearchHandOff,
+  contentSearchHandOffKey,
+  contentSearchInputKey,
+  contentSearchResultKey,
+} from "./contentSearchCache";
 
 export function ContentSearchPanel({
   conversationId,
@@ -34,17 +32,14 @@ export function ContentSearchPanel({
   onFileSelect: (path: string, options?: OpenFileOptions) => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }) {
+  const ownInputRef = useRef<HTMLInputElement | null>(null);
+  const fieldRef = inputRef ?? ownInputRef;
+  // Go to File's "Open in Search" shows this page ready to type into.
+  useTextSearchFocus(conversationId, fieldRef);
   const queryClient = useQueryClient();
   const cachedInput = useQuery<ContentSearchInput>({
-    queryKey: ["content-search-input", conversationId],
-    initialData: {
-      query: "",
-      caseSensitive: false,
-      regex: false,
-      wholeWord: false,
-      include: "",
-      exclude: "",
-    },
+    queryKey: contentSearchInputKey(conversationId),
+    initialData: EMPTY_CONTENT_SEARCH,
     enabled: false,
     gcTime: Infinity,
   });
@@ -53,31 +48,46 @@ export function ContentSearchPanel({
   const filtersId = useId();
   const { query, caseSensitive, regex, include, exclude } = input;
   const wholeWord = input.wholeWord === true;
-  // Whole word is sent as a regular expression, which can outgrow the server's query limit.
-  const sent = contentSearchPattern({ query, regex, wholeWord });
-  const tooLong = wholeWord && !fitsContentSearchLimit(sent.pattern);
-  // Such an expression could escape the Whole word wrapper and lose its boundaries.
-  const regexProblem = wholeWord && regex ? wholeWordRegexProblem(query) : null;
-  const canSearch = query.trim() !== "" && !tooLong && regexProblem === null;
+  // The same checks Go to File's text search makes, such as Whole word's length limit.
+  const problem = contentSearchProblem(input);
+  const canSearch = query.trim() !== "" && problem === null;
+  // A search handed over while the page shows, such as Go to File's "Open in Search",
+  // replaces what was typed here.
+  const handOff = useQuery<ContentSearchHandOff | null>({
+    queryKey: contentSearchHandOffKey(conversationId),
+    initialData: null,
+    enabled: false,
+  });
+  const handed = handOff.data;
+  // Set with the handed input, so the search runs once the page holds it.
+  const [runHanded, setRunHanded] = useState(false);
   useEffect(() => {
-    queryClient.setQueryData(["content-search-input", conversationId], input);
+    if (!handed) return;
+    setInput(handed.input);
+    if (handed.input.include.trim() || handed.input.exclude.trim()) setShowFilters(true);
+    if (handed.run) setRunHanded(true);
+    queryClient.setQueryData(contentSearchHandOffKey(conversationId), null);
+  }, [conversationId, handed, queryClient]);
+  useEffect(() => {
+    queryClient.setQueryData(contentSearchInputKey(conversationId), input);
   }, [conversationId, input, queryClient]);
   const search = useQuery({
-    queryKey: ["content-search-result", conversationId],
+    queryKey: contentSearchResultKey(conversationId),
     enabled: false,
     gcTime: Infinity,
     retry: false,
     // Keep the latest search, including in-flight work, when its panel unmounts.
-    queryFn: async (): Promise<ContentSearchResult & { query: string }> => {
-      const result = await fetchContentSearch(conversationId, sent.pattern, {
-        caseSensitive,
-        regex: sent.regex,
-        include,
-        exclude,
-      });
+    queryFn: async (): Promise<ContentSearchAnswer> => {
+      const result = await runContentSearch(conversationId, input);
       return { ...result, query };
     },
   });
+  const refetchSearch = search.refetch;
+  useEffect(() => {
+    if (!runHanded) return;
+    setRunHanded(false);
+    if (canSearch) void refetchSearch();
+  }, [runHanded, canSearch, refetchSearch]);
   const files = new Map<string, ContentMatch[]>();
   for (const match of search.data?.matches ?? []) {
     const matches = files.get(match.path) ?? [];
@@ -97,7 +107,7 @@ export function ContentSearchPanel({
         <div className="flex gap-2">
           <div className="flex flex-1">
             <Input
-              ref={inputRef}
+              ref={fieldRef}
               aria-label="Search file contents"
               placeholder="Search file contents"
               type="search"
@@ -151,21 +161,9 @@ export function ContentSearchPanel({
             Regular expression
           </label>
         </div>
-        {tooLong && (
+        {problem && (
           <p role="alert" className="text-xs text-destructive">
-            This search is too long to match whole words. Shorten it, or turn off Whole word.
-          </p>
-        )}
-        {regexProblem === "unopened-group" && (
-          <p role="alert" className="text-xs text-destructive">
-            This expression closes a group it never opened, so it can’t match whole words. Balance
-            its parentheses, or turn off Whole word.
-          </p>
-        )}
-        {regexProblem === "verbose" && (
-          <p role="alert" className="text-xs text-destructive">
-            Whole word can’t be used with verbose mode (?x). Remove that flag, or turn off Whole
-            word.
+            {problem}
           </p>
         )}
         <div id={filtersId} hidden={!showFilters} className="space-y-2 text-xs">

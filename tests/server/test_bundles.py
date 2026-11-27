@@ -668,3 +668,96 @@ def test_uploaded_agent_reports_the_rewrite_failure_when_the_store_is_down(
         )
 
     assert excinfo.value is put_error
+
+
+# ── tool groups an older runner doesn't know ───────────────
+
+
+def test_a_runner_that_predates_a_tool_group_gets_a_bundle_it_can_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An author's ``tool_groups.gadgets: false`` must not stop an older runner starting.
+
+    Such a runner's parser refuses a group it doesn't know, before the session starts; it
+    also has no gadget tools to offer, so the bundle it gets drops the key and keeps the rest.
+    """
+    from omnigent.server.bundles import bundle_without_tool_groups
+    from omnigent.spec import parser as spec_parser
+
+    config = _MIN_CONFIG.format(name="opted-out") + (
+        "tool_groups:\n  gadgets: false\n  browser: false\nguardrails:\n  policies: {}\n"
+    )
+    notes = "notes kept as written\n"
+    bundle = _make_bundle_bytes({"config.yaml": config, "notes.md": notes})
+    # An older runner: its accepted group set lacks gadgets.
+    monkeypatch.setattr(
+        spec_parser, "_TOOL_GROUP_NAMES", spec_parser._TOOL_GROUP_NAMES - {"gadgets"}
+    )
+    with pytest.raises(OmnigentError, match="unknown group"):
+        validate_agent_bundle(bundle)
+
+    delivered = bundle_without_tool_groups(bundle, frozenset({"gadgets"}))
+
+    spec = validate_agent_bundle(delivered)
+    assert spec.tool_groups.browser is False
+    with tarfile.open(fileobj=io.BytesIO(delivered), mode="r:gz") as archive:
+        assert archive.extractfile("notes.md").read().decode() == notes  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("filename", ["worker.yaml", "worker.yml"])
+def test_a_standalone_spec_file_drops_a_tool_group_an_older_runner_lacks(
+    monkeypatch: pytest.MonkeyPatch, filename: str
+) -> None:
+    """A single-file bundle's spec may have any ``.yaml``/``.yml`` name; it is rewritten like
+    ``config.yaml``, while a YAML file elsewhere in the bundle is left as written."""
+    import yaml
+
+    from omnigent.server.bundles import bundle_without_tool_groups
+    from omnigent.spec import parser as spec_parser
+
+    spec_text = (
+        "name: standalone\n"
+        "prompt: hi\n"
+        "executor:\n  harness: claude-sdk\n"
+        "tool_groups:\n  gadgets: false\n  browser: false\n"
+    )
+    asset = "tool_groups:\n  gadgets: false\n"
+    bundle = _make_bundle_bytes({filename: spec_text, "assets/config.yaml": asset})
+    monkeypatch.setattr(
+        spec_parser, "_TOOL_GROUP_NAMES", spec_parser._TOOL_GROUP_NAMES - {"gadgets"}
+    )
+
+    delivered = bundle_without_tool_groups(bundle, frozenset({"gadgets"}))
+
+    with tarfile.open(fileobj=io.BytesIO(delivered), mode="r:gz") as archive:
+        rewritten = yaml.safe_load(archive.extractfile(filename).read())  # type: ignore[union-attr]
+        kept = archive.extractfile("assets/config.yaml").read().decode()  # type: ignore[union-attr]
+    assert rewritten["tool_groups"] == {"browser": False}
+    assert kept == asset
+    assert validate_agent_bundle(delivered).tool_groups.browser is False
+
+
+def test_a_sub_agents_config_drops_a_tool_group_an_older_runner_lacks() -> None:
+    import yaml
+
+    from omnigent.server.bundles import bundle_without_tool_groups
+
+    sub = _MIN_CONFIG.format(name="child") + "tool_groups:\n  gadgets: false\n"
+    bundle = _make_bundle_bytes(
+        {"config.yaml": _MIN_CONFIG.format(name="parent"), "agents/child/config.yaml": sub}
+    )
+
+    delivered = bundle_without_tool_groups(bundle, frozenset({"gadgets"}))
+
+    with tarfile.open(fileobj=io.BytesIO(delivered), mode="r:gz") as archive:
+        child = yaml.safe_load(archive.extractfile("agents/child/config.yaml").read())  # type: ignore[union-attr]
+    assert "tool_groups" not in child
+
+
+def test_a_bundle_that_names_no_new_group_is_delivered_as_it_is() -> None:
+    from omnigent.server.bundles import bundle_without_tool_groups
+
+    bundle = _make_bundle_bytes(
+        {"config.yaml": _MIN_CONFIG.format(name="plain") + "tool_groups:\n  browser: false\n"}
+    )
+    assert bundle_without_tool_groups(bundle, frozenset({"gadgets"})) is bundle

@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
@@ -5,6 +6,7 @@ import {
   BotIcon,
   EllipsisVerticalIcon,
   FileIcon,
+  FlagIcon,
   FolderPlusIcon,
   GitCompareIcon,
   GitForkIcon,
@@ -15,6 +17,7 @@ import {
   Maximize2Icon,
   MessagesSquareIcon,
   PanelLeftIcon,
+  PanelsTopLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   SearchIcon,
@@ -24,6 +27,13 @@ import {
   XIcon,
 } from "lucide-react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
+import {
+  BACK_TO_CANVAS_LABEL,
+  CLOSE_CONVERSATION_PANE_LABEL,
+  FOCUS_CONVERSATION_LABEL,
+  SHOW_CANVAS_LABEL,
+} from "@/canvas/canvasHeaderActions";
+import { useCanvasHeaderPaletteCommands } from "@/canvas/useCanvasHeaderPaletteCommands";
 import {
   rightSidebarToggleAriaShortcut,
   rightSidebarToggleShortcutKeys,
@@ -39,7 +49,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
-import { CreatedBySession } from "./CreatedBySession";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
@@ -50,11 +59,15 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOmnigentAnalytics } from "@/lib/analytics";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { activeUiFeatureOverrides } from "@/lib/uiFeatureOverrides";
+import { openFeatureFlagsPicker } from "@/store/featureFlagsPicker";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
+import { useChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
 import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
@@ -129,6 +142,8 @@ interface MobileSessionMenuProps {
   showSideChats: boolean;
   /** Open the mobile side-chats drawer. */
   onOpenSideChats: () => void;
+  /** The gadgets shown beside the session; each opens over it. */
+  gadgets?: readonly { key: string; label: string; onSelect: () => void }[];
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -157,8 +172,9 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** The URL-owned workspace can lag a warm header switch. */
+  workspaceConversationId?: string | null;
   workingDirectory?: string | null;
-  createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -231,6 +247,8 @@ interface ChatHeaderProps {
   rightPanelOpen: boolean;
   /** Toggle the right workspace panel. */
   onToggleRightPanel: () => void;
+  /** The open Workspace sidebar has its own Collapse button, so the header's toggle only opens it. */
+  rightPanelCollapsesItself?: boolean;
   /** Show dependency-free disabled chrome while the server session is pending. */
   pending?: boolean;
   /** Gating + handlers for the mobile session-menu FAB. */
@@ -356,8 +374,8 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  workspaceConversationId = conversationId,
   workingDirectory,
-  createdBySessionId,
   permissionLevel,
   actionConversation = null,
   conversationTitle,
@@ -382,11 +400,19 @@ export function ChatHeader({
   hasRailContent,
   rightPanelOpen,
   onToggleRightPanel,
+  rightPanelCollapsesItself = false,
   pending = false,
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
+  // Floating panes give the switch to the chat pane's own strip.
+  const viewToggleHost = useChatPaneViewToggleHost(workspaceConversationId ?? undefined);
+  const info = useServerInfo();
+  const overrides = activeUiFeatureOverrides(info);
+  const overrideNames = overrides.map(({ label, value }) => `${label} ${value ? "On" : "Off"}`);
+  const overrideLabel = `UI feature flags overridden: ${overrideNames.join(", ")}`;
   const canvas = useCanvasWorkspace();
+  useCanvasHeaderPaletteCommands(canvas);
   const { trackClick } = useOmnigentAnalytics();
   const hasPageTitle = !conversationId && pageTitle !== undefined;
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
@@ -493,6 +519,16 @@ export function ChatHeader({
             Side chats
           </DropdownMenuItem>
         )}
+        {mobileMenu.gadgets?.map((gadget) => (
+          <DropdownMenuItem
+            key={gadget.key}
+            onSelect={gadget.onSelect}
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <PanelsTopLeftIcon className="size-4 shrink-0" />
+            <span className="min-w-0 truncate">{gadget.label}</span>
+          </DropdownMenuItem>
+        ))}
         {/* Shells — the mobile entry into the session's shells
             (desktop has no Shells tab; it opens shells as soft tabs):
             visible when a real shell exists, or when the agent spec
@@ -605,6 +641,12 @@ export function ChatHeader({
         !conversationId && "pointer-events-none *:pointer-events-auto",
         settingsMode && !sidebarOpen && "settings-mobile-header",
       )}
+      // Collapsed, the sidebar's toggle ends the row where its own Collapse button sits open.
+      data-corner-toggle={
+        conversationId && hasRailContent && rightPanelCollapsesItself && !rightPanelOpen && !canvas
+          ? ""
+          : undefined
+      }
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
           back-to-parent link (when this is a sub-agent session). The
@@ -634,7 +676,7 @@ export function ChatHeader({
             variant="ghost"
             size="sm"
             onClick={canvas.closeConversation}
-            aria-label="Back to canvas"
+            aria-label={BACK_TO_CANVAS_LABEL}
             className="shrink-0 gap-1 px-1.5 text-ui"
           >
             <ArrowLeftIcon className="size-4" />
@@ -665,13 +707,27 @@ export function ChatHeader({
             className="pr-1"
           />
         )}
-        {conversationId && createdBySessionId && (
-          <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
-        )}
         {hasPageTitle && pageTitle}
       </div>
 
       <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:empty:hidden">
+        {overrides.length > 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <MobileHeaderButton
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={overrideLabel}
+                onClick={openFeatureFlagsPicker}
+                className="text-warning border-none"
+              >
+                <FlagIcon aria-hidden className="size-4" />
+              </MobileHeaderButton>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{overrideLabel}</TooltipContent>
+          </Tooltip>
+        )}
         {isMobile && !settingsMode && (
           <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
         )}
@@ -702,7 +758,13 @@ export function ChatHeader({
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
-        {!pending && conversationId && <ViewModeToggle />}
+        {!pending &&
+          conversationId &&
+          (viewToggleHost ? (
+            createPortal(<ViewModeToggle variant="pane" alwaysVisible />, viewToggleHost)
+          ) : (
+            <ViewModeToggle />
+          ))}
         {!pending && !actionConversation && canFork && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -864,7 +926,7 @@ export function ChatHeader({
         ) : null}
         {/* Beside the right-panel toggle: both show or hide a panel on the right. */}
         {!pending && conversationId && sessionOverviewControl}
-        {conversationId && hasRailContent && (
+        {conversationId && hasRailContent && !(rightPanelOpen && rightPanelCollapsesItself) && (
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -898,7 +960,7 @@ export function ChatHeader({
             <Button
               variant="ghost"
               size="icon-xs"
-              aria-label={canvas.focused ? "Show canvas beside conversation" : "Focus conversation"}
+              aria-label={canvas.focused ? SHOW_CANVAS_LABEL : FOCUS_CONVERSATION_LABEL}
               title={canvas.focused ? "Show canvas" : "Focus conversation"}
               onClick={canvas.toggleFocus}
               className="shrink-0 text-muted-foreground"
@@ -912,8 +974,8 @@ export function ChatHeader({
             <Button
               variant="ghost"
               size="icon-xs"
-              aria-label="Close conversation pane"
-              title="Close conversation pane"
+              aria-label={CLOSE_CONVERSATION_PANE_LABEL}
+              title={CLOSE_CONVERSATION_PANE_LABEL}
               onClick={canvas.closeConversation}
               className="shrink-0 text-muted-foreground"
             >

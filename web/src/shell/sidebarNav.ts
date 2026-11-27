@@ -106,6 +106,12 @@ export const COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY = "omnigent:collapsed-sideba
 // when its name is present here.
 export const EXPANDED_PROJECT_SECTIONS_STORAGE_KEY = "omnigent:expanded-project-sections";
 
+// Ids of session families (a session and its nested agents) the user has
+// collapsed. Families default to expanded, so only collapsed ids are stored.
+export const COLLAPSED_SESSION_FAMILIES_STORAGE_KEY = "omnigent:collapsed-session-families";
+// A family deleted while collapsed never leaves the list, so keep only the newest ids.
+export const MAX_STORED_COLLAPSED_SESSION_FAMILIES = 500;
+
 // Snapshot of the active chat's updated_at at the moment the user
 // entered it. Used as the sort key for the active row so subsequent
 // updated_at bumps (the user sending a message) don't move it.
@@ -172,7 +178,10 @@ export function getConversationAgentType(conversation: Conversation): string {
  * ``null`` until identity resolves and is then treated as "not the owner" for
  * shared rows, so they never flash into the viewer's own lists.
  */
-export function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
+export function isOwnedByViewer(
+  conversation: Pick<Conversation, "owner">,
+  viewerId: string | null,
+): boolean {
   const owner = conversation.owner ?? null;
   if (owner === null) return true;
   return owner === viewerId;
@@ -185,7 +194,9 @@ export function isOwnedByViewer(conversation: Conversation, viewerId: string | n
  * viewer owns it.
  */
 export function sessionBelongsToProject(
-  conversation: Conversation,
+  conversation: Pick<Conversation, "owner" | "project_id"> & {
+    labels?: Record<string, string> | null;
+  },
   project: { id: string | null; name: string },
   viewerId: string | null,
 ): boolean {

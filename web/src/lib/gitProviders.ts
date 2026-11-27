@@ -6,6 +6,7 @@ import AzureMono from "@lobehub/icons/es/Azure/components/Mono";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { GitPullRequestIcon } from "lucide-react";
 import { GitLabIcon } from "@/components/icons/GitLabIcon";
+import { pullRequestIntegrations } from "@/lib/pullRequestIntegrations";
 
 export interface GitProviderDisplay {
   id: string;
@@ -72,6 +73,22 @@ const NEUTRAL: GitProviderCopy = {
   cliLabel: "Git provider CLI",
 };
 
+/** The registered named code host with provider id `id`, keyed as the registry keys it. */
+function namedHost(id: string) {
+  return pullRequestIntegrations().namedCodeHosts.find((host) => host.provider === id);
+}
+
+/**
+ * Whether GitHub hosts a provider's pull requests, so a change this Mac can't make has
+ * GitHub's own page to hand off to. No id is a host that predates the field.
+ */
+export function hostedOnGitHub(id: string | null | undefined): boolean {
+  // The same ids gitProviderCopy reads as GitHub: none, an empty one, and "github" itself.
+  if (id === null) return false;
+  if (!id || id === "github") return true;
+  return namedHost(id)?.hostedOnGitHub === true;
+}
+
 /** Copy for each known provider id. */
 export const GIT_PROVIDERS: Readonly<Record<string, GitProviderCopy>> = {
   github: GITHUB,
@@ -90,6 +107,8 @@ export function gitProviderCopy(
   if (id === null) return NEUTRAL;
   if (!id) return GITHUB;
   if (Object.hasOwn(GIT_PROVIDERS, id)) return GIT_PROVIDERS[id];
+  const named = namedHost(id)?.copy;
+  if (named) return named;
   const metadata = display?.id === id ? display : undefined;
   const label = metadata?.display_name || id;
   const requestName = metadata?.request_name || "pull request";

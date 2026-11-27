@@ -41,6 +41,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from omnigent.terminals.shell_inspection import ShellInspection, ShellState
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
@@ -967,6 +968,154 @@ async def test_get_terminal_by_id_returns_404_when_tmux_exited(
 
 
 @pytest.mark.asyncio
+async def test_terminal_shell_reads_only_the_named_terminal_of_that_session(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shell route inspects the session's own terminal and answers no pids."""
+    inspected: list[str] = []
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        inspected.append(self.name)
+        return ShellInspection(ShellState.BUSY, "vim", 1)
+
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await client.get(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell",
+        params={"socket": "/tmp/elsewhere.sock", "pid": "1"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"state": "busy", "foreground": "vim", "background_jobs": 1}
+    assert inspected == ["bash"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Another session's terminal, in the same runner and workspace.
+        "/v1/sessions/conv_abc/resources/terminals/terminal_other_s1/shell",
+        "/v1/sessions/conv_abc/resources/terminals/terminal_nope_s1/shell",
+        # A terminal whose tmux has exited.
+        "/v1/sessions/conv_abc/resources/terminals/terminal_stale_s3/shell",
+        "/v1/sessions/conv_unknown/resources/terminals/terminal_bash_s1/shell",
+    ],
+    ids=["other session", "unknown", "not running", "unknown session"],
+)
+async def test_terminal_shell_answers_every_miss_with_the_same_404(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A foreign terminal can't be told apart from a missing one, and none is inspected."""
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await client.get(path)
+
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"code": "not_found", "message": "Terminal not found"}}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_the_same_404_when_tmux_exited_under_a_stale_flag(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal still flagged running whose tmux is gone is a miss, not an "unknown" answer."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+
+    async def dead_tmux() -> bool:
+        return False
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    instance.is_alive = dead_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    assert instance.running is True
+    resp = await client.get("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell")
+
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"code": "not_found", "message": "Terminal not found"}}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_unknown_in_time_when_its_liveness_check_stalls(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux liveness probe that never answers is cut off with the read, not waited out."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    gave_up = asyncio.Event()
+
+    async def stalled_tmux() -> bool:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            gave_up.set()
+        raise AssertionError("unreachable")
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    instance.is_alive = stalled_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await asyncio.wait_for(
+        client.get("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"), 5
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"state": "unknown", "foreground": None, "background_jobs": None}
+    assert gave_up.is_set()
+
+
+@pytest.mark.asyncio
+async def test_repeated_terminal_shell_requests_share_one_liveness_check_and_read(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Several close paths asking at once start one tmux probe and one read between them.
+
+    Busy, since only a read begun after a request may answer it idle.
+    """
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    probes = 0
+    reads = 0
+    release = asyncio.Event()
+
+    async def live_tmux() -> bool:
+        nonlocal probes
+        probes += 1
+        await release.wait()
+        return True
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        nonlocal reads
+        reads += 1
+        return ShellInspection(ShellState.BUSY, "vim", 0)
+
+    instance.is_alive = live_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    path = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"
+    requests = [asyncio.create_task(client.get(path)) for _ in range(3)]
+
+    async def probe_started() -> None:
+        while probes == 0:
+            await asyncio.sleep(0)
+
+    # Bounded, so a request that never probes fails here instead of hanging.
+    await asyncio.wait_for(probe_started(), timeout=5)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    responses = await asyncio.gather(*requests)
+
+    assert [resp.json()["state"] for resp in responses] == ["busy"] * 3
+    assert (probes, reads) == (1, 1)
+
+
+@pytest.mark.asyncio
 async def test_transfer_terminal_moves_resource_without_closing(
     client: httpx.AsyncClient,
     registry: TerminalRegistry,
@@ -1199,12 +1348,12 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
     ``omnigent claude`` wrapper) could spawn an unsandboxed
     terminal in a session whose YAML declared an egress allow-list.
     """
-    from omnigent.inner.datamodel import AgentDef, OSEnvSandboxSpec, OSEnvSpec
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="hardened",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
@@ -1220,7 +1369,7 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
         assert request.url.path == "/v1/sessions/conv_test"
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_hardened"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         assert agent_id == "agent_hardened"
         assert session_id == "conv_test"
         return agent
@@ -1276,13 +1425,6 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     could spawn the YAML-declared terminal name with a completely
     different command.
     """
-    from omnigent.inner.datamodel import (
-        AgentDef,
-        OSEnvSandboxSpec,
-        OSEnvSpec,
-        TerminalEnvSpec,
-    )
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     declared_zsh = TerminalEnvSpec(
@@ -1291,8 +1433,10 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
         env={"OPERATOR": "set"},
         os_env="inherit",
     )
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="hardened",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
@@ -1304,7 +1448,7 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_hardened"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -1351,7 +1495,6 @@ async def test_create_terminal_rejects_unavailable_native_shell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A mixed-version request cannot silently substitute another shell."""
-    from omnigent.inner.datamodel import AgentDef
     from omnigent.native.native_coding_agents import (
         CLAUDE_NATIVE_AGENT_NAME,
         native_shell_terminal_specs,
@@ -1365,15 +1508,17 @@ async def test_create_terminal_rejects_unavailable_native_shell(
     monkeypatch.setattr("shutil.which", lambda _name: None)
     monkeypatch.setattr("omnigent._platform._INTERACTIVE_SHELL_DIRS", ())
 
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name=CLAUDE_NATIVE_AGENT_NAME,
+        executor=ExecutorSpec(),
         terminals=native_shell_terminal_specs(["fish"]),
     )
 
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_native"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -1426,13 +1571,6 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     workspace must be baked into the launched spec (never via
     ``cwd_override``, which the stub asserts stays ``None``).
     """
-    from omnigent.inner.datamodel import (
-        AgentDef,
-        OSEnvSandboxSpec,
-        OSEnvSpec,
-        TerminalEnvSpec,
-    )
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     # Declared shell owns its os_env with the placeholder cwd — the
@@ -1445,8 +1583,10 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="polly-like",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=".",
@@ -1458,7 +1598,7 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_polly"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -2832,7 +2972,7 @@ async def test_slow_changed_files_listing_leaves_the_default_executor_free(
             )
         return httpx.Response(200, json={})
 
-    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
     server_client = httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler), base_url="http://server"
     )
@@ -2842,9 +2982,10 @@ async def test_slow_changed_files_listing_leaves_the_default_executor_free(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://runner"
         ) as client:
-            # As many stuck listings as the default executor has workers.
+            # Concurrent listings share one scan, so one stuck git status
+            # would fill the one-worker default executor if it ran there.
             listings = [asyncio.create_task(client.get(path)) for _ in range(2)]
-            await poll_until_async(lambda: len(listing_threads) == 2, timeout_s=budget(5))
+            await poll_until_async(lambda: len(listing_threads) >= 1, timeout_s=budget(5))
 
             quick = asyncio.to_thread(lambda: "done")
             assert await asyncio.wait_for(quick, timeout=budget(2)) == "done"
@@ -2857,6 +2998,94 @@ async def test_slow_changed_files_listing_leaves_the_default_executor_free(
         await server_client.aclose()
 
     assert [response.status_code for response in responses] == [200, 200]
+
+
+@pytest.mark.asyncio
+async def test_listings_arriving_mid_scan_share_the_next_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent changes listings share git status runs instead of each queuing one.
+
+    Refetches the browser abandons would otherwise stack full scans on the slow-IO
+    pool. A listing that arrives mid-scan gets the next scan, never the running one,
+    so its answer is no older than the request.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+    from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
+
+    conv = "conv_shared_changes"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scans_started: list[int] = []
+    releases = [threading.Event() for _ in range(4)]
+
+    class _GatedGitRegistry:
+        """Each git status blocks until the test releases it, then names itself."""
+
+        def __init__(self, watch_path: Path | None) -> None:
+            self.watch_path = watch_path
+
+        def start(self) -> None:
+            return None
+
+        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
+            del session_id, limit
+            scan = len(scans_started)
+            scans_started.append(scan)
+            releases[scan].wait(budget(10))
+            return [{"path": f"scan-{scan}.txt", "status": "modified"}]
+
+    monkeypatch.setattr(
+        filesystem_registry_mod,
+        "create_filesystem_registry",
+        lambda *, watch_path=None: _GatedGitRegistry(watch_path),
+    )
+    arrivals: list[object] = []
+    coalesced_run = FreshCallCoalescer.run
+
+    async def _observed_run(self: Any, key: Any, call: Any) -> Any:
+        arrivals.append(key)
+        return await coalesced_run(self, key, call)
+
+    monkeypatch.setattr(FreshCallCoalescer, "run", _observed_run)
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(
+                200, json={"id": conv, "agent_id": None, "workspace": str(workspace)}
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    )
+    app = create_runner_app(runner_workspace=workspace, server_client=server_client)
+    path = f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            first = asyncio.create_task(client.get(path))
+            await poll_until_async(lambda: scans_started == [0], timeout_s=budget(5))
+            late = [asyncio.create_task(client.get(path)) for _ in range(3)]
+            await poll_until_async(lambda: len(arrivals) == 4, timeout_s=budget(5))
+
+            releases[0].set()
+            first_response = await first
+            await poll_until_async(lambda: len(scans_started) == 2, timeout_s=budget(5))
+            releases[1].set()
+            late_responses = await asyncio.gather(*late)
+    finally:
+        for release in releases:
+            release.set()
+        await server_client.aclose()
+
+    assert scans_started == [0, 1]
+    assert first_response.status_code == 200, first_response.text
+    assert [entry["path"] for entry in first_response.json()["data"]] == ["scan-0.txt"]
+    for response in late_responses:
+        assert response.status_code == 200, response.text
+        assert [entry["path"] for entry in response.json()["data"]] == ["scan-1.txt"]
 
 
 @pytest.mark.asyncio

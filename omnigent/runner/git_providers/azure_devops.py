@@ -1231,6 +1231,8 @@ class AzureDevOpsPullRequests:
         self,
         root: str,  # noqa: ARG002 - labels are unsupported
         reference: PullRequestRef,  # noqa: ARG002 - labels are unsupported
+        *,
+        text: str = "",  # noqa: ARG002 - labels are unsupported
     ) -> dict[str, Any]:
         """Reject the request: Azure DevOps label editing is not supported.
 

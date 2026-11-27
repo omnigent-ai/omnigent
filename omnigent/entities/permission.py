@@ -56,6 +56,22 @@ class WorkflowPermission:
 
 
 @dataclasses.dataclass(frozen=True)
+class GadgetPermission:
+    """A single permission grant on a gadget.
+
+    The gadget's owner holds no grant; ownership is ``Gadget.owner_id``.
+
+    :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
+    :param gadget_id: The gadget this grant applies to.
+    :param level: Numeric permission level: ``1`` read, ``2`` edit, ``3`` manage.
+    """
+
+    user_id: str
+    gadget_id: str
+    level: int
+
+
+@dataclasses.dataclass(frozen=True)
 class ResolvedAccess:
     """The raw permission inputs for one ``(user, conversation)`` pair.
 

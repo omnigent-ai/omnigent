@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+import random
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext, suppress
 
 from omnigent.db.db_models import workspace_scope
@@ -26,6 +27,8 @@ _logger = logging.getLogger(__name__)
 
 _SECONDS_PER_DAY = 24 * 60 * 60
 _DEFAULT_SCAN_BATCH_SIZE = 500
+# Later sweeps wait sweep_interval_s scaled by a random factor in [0.9, 1.1].
+_SWEEP_INTERVAL_JITTER = 0.1
 
 
 class ManagedSandboxReaper:
@@ -40,6 +43,12 @@ class ManagedSandboxReaper:
     Reaping detaches only the stale provider generation. The session transcript
     and durable host row remain, allowing a fresh sandbox to launch while failed
     provider cleanup stays pending for a later sweep.
+
+    Every server replica runs this loop, and replicas start together on each
+    rollout. Each sweep reads every managed host row in the deployment, so the
+    loop waits a random part of one ``sweep_interval_s`` before its first sweep
+    and jitters every later interval. Replicas then sweep at independent times
+    instead of all at once.
     """
 
     def __init__(
@@ -50,7 +59,21 @@ class ManagedSandboxReaper:
         clock: Callable[[], int] = now_epoch,
         scan_batch_size: int = _DEFAULT_SCAN_BATCH_SIZE,
         reap_offline: bool = True,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        """
+        Configure the reaper without starting its loop.
+
+        :param host_store: Store whose managed host rows are swept.
+        :param sandbox_config: Deployment whose providers terminate sandboxes and
+            whose ``reaper`` settings set the offline cutoff and sweep interval.
+        :param clock: Returns the current epoch second for each sweep.
+        :param scan_batch_size: Host rows read per keyset page, e.g. ``500``.
+        :param reap_offline: Whether hosts offline past the cutoff are reaped.
+            Deleted hosts and pending terminations are retried regardless.
+        :param sleep: Awaits a delay in seconds between sweeps. Tests substitute
+            one that records each delay instead of waiting.
+        """
         if scan_batch_size <= 0:
             raise ValueError("scan_batch_size must be positive")
         self._host_store = host_store
@@ -58,6 +81,7 @@ class ManagedSandboxReaper:
         self._reap_offline = reap_offline
         self._clock = clock
         self._scan_batch_size = scan_batch_size
+        self._sleep = sleep
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -91,6 +115,11 @@ class ManagedSandboxReaper:
         return reaped
 
     async def _run(self) -> None:
+        interval_s = self._sandbox_config.reaper.sweep_interval_s
+        # Spread the first sweeps of replicas that started together across one
+        # interval; sweeping at startup would scan every host row once per replica
+        # at the same moment.
+        await self._sleep(random.uniform(0, interval_s))
         while True:
             try:
                 reaped = await self.sweep_once()
@@ -100,7 +129,10 @@ class ManagedSandboxReaper:
                 raise
             except Exception:
                 _logger.exception("Managed sandbox reaper sweep failed; retrying later")
-            await asyncio.sleep(self._sandbox_config.reaper.sweep_interval_s)
+            # Jitter keeps replicas from drifting back into step.
+            await self._sleep(
+                interval_s * random.uniform(1 - _SWEEP_INTERVAL_JITTER, 1 + _SWEEP_INTERVAL_JITTER)
+            )
 
     async def _sweep_terminating_slot(self, *, cutoff: int, now: int) -> int:
         cursor: ManagedSandboxScanCursor | None = None
