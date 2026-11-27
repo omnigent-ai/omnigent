@@ -23,6 +23,7 @@ from omnigent.harnesses.claude_native import (
     editor_control,
     editor_delegate,
     editor_handoff,
+    editor_launch,
     editor_owner,
     editor_transaction,
     model_switch,
@@ -35,7 +36,10 @@ from tests.e2e.conftest import get_mock_message_requests
 pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
 
 
-@pytest.mark.parametrize("draft_mode", ["editor", "picker", "controller-clear"])
+@pytest.mark.parametrize(
+    "draft_mode",
+    ["editor", "picker", "controller-clear", "launch-picker", "launch-controller-clear"],
+)
 @pytest.mark.parametrize("editor_source", ["configured", "configured-code", "default"])
 def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     monkeypatch: pytest.MonkeyPatch,
@@ -287,7 +291,13 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         delegate_manifests.append((manifest, command))
         return [sys.executable, "-m", editor_delegate.__name__, "--manifest", str(manifest), "--"]
 
-    if editor_source == "configured":
+    if draft_mode.startswith("launch-"):
+        overrides = editor_launch.prepare_editor_environment(
+            bridge_dir, executable=Path(claude), environment=env
+        )
+        assert overrides is not None
+        env.update(overrides)
+    elif editor_source == "configured":
         for key, program in (("VISUAL", "visual"), ("EDITOR", "editor")):
             env[key] = shlex.join(
                 delegate_command(
@@ -470,7 +480,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert owner["bridge_session_id"] == bridge.read_active_session_id(bridge_dir)
             assert owner["native_session_id"] == payload["session_id"]
             assert owner["process"] == payload["native_process"]
-            if draft_mode == "controller-clear":
+            if draft_mode.endswith("controller-clear"):
                 session_id = bridge.read_active_session_id(bridge_dir)
                 assert session_id is not None
                 assert write_turn_routing_marker(bridge_dir, session_id=session_id)
@@ -487,10 +497,13 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     bridge.inject_model_command(
                         bridge_dir, model="draft-test-model", owned_draft=wrong, timeout_s=30
                     )
-                wait_for_editor(count, draft)
-                refused = observations()[-1]
-                assert refused["kind"] == "controller" and refused["accepted"] is False
-                assert refused["content"] == refused["after"] == draft
+                if draft_mode.startswith("launch-"):
+                    assert len(observations()) == count
+                else:
+                    wait_for_editor(count, draft)
+                    refused = observations()[-1]
+                    assert refused["kind"] == "controller" and refused["accepted"] is False
+                    assert refused["content"] == refused["after"] == draft
                 controller_observations.append(
                     {
                         "kind": "refused",
@@ -528,17 +541,21 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 )
                 assert isinstance(result, model_switch.ClaudeModelSwitchResult)
                 controller_observations.append({"kind": "selected", "receipt": asdict(result)})
-                wait_for_editor(count, "")
-                cleared = observations()[-1]
-                assert cleared["kind"] == "controller" and cleared["accepted"] is True
-                assert cleared["content"] == draft and cleared["after"] == ""
+                if draft_mode.startswith("launch-"):
+                    poll_until(lambda: model_switch._draft(pane()) == "", timeout_s=10)
+                    assert len(observations()) == count
+                else:
+                    wait_for_editor(count, "")
+                    cleared = observations()[-1]
+                    assert cleared["kind"] == "controller" and cleared["accepted"] is True
+                    assert cleared["content"] == draft and cleared["after"] == ""
                 assert result.resolved_model == result.status_model == "draft-test-model"
                 assert result.session_id == payload["session_id"]
                 assert not (bridge_dir / "editor-operation.json").exists()
                 assert saved_settings.read_bytes() == saved_contents
                 assert get_mock_message_requests(isolated_mock_llm_server_url) == []
                 return
-            if draft_mode == "picker":
+            if draft_mode in {"picker", "launch-picker"}:
 
                 def raw_status() -> dict[str, object]:
                     return bridge._read_json_file(bridge_dir / bridge.CONTEXT_RAW_FILE)
@@ -772,6 +789,9 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     "controller_observations": controller_observations,
                     "model_switch_source_sha256": hashlib.sha256(
                         Path(model_switch.__file__).read_bytes()
+                    ).hexdigest(),
+                    "editor_launch_source_sha256": hashlib.sha256(
+                        Path(editor_launch.__file__).read_bytes()
                     ).hexdigest(),
                     "saved_model_settings_unchanged": saved_settings.read_bytes() == saved_contents
                     if saved_contents is not None

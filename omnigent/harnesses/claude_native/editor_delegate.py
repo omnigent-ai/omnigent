@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
 import sys
 from collections.abc import Sequence
@@ -85,11 +86,30 @@ def _read_delegate(path: Path) -> tuple[list[str], dict[str, str]]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--bridge-dir", type=Path)
+    parser.add_argument("--native-executable", type=Path)
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    if (args.bridge_dir is None) != (args.native_executable is None):
+        parser.error("--bridge-dir and --native-executable must be supplied together")
     arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
     try:
         command, environment = _read_delegate(args.manifest)
+        if args.bridge_dir is not None and (args.bridge_dir / "editor-operation.json").exists():
+            from omnigent.harnesses.claude_native.editor_control import run_editor_operation
+
+            if not arguments:
+                return 1
+            location = arguments[-1]
+            if Path(command[0]).name in {"code", "code-insiders", "cursor", "windsurf"} and any(
+                flag in arguments for flag in ("-g", "--goto")
+            ):
+                location = re.sub(r":\d+(?::\d+)?$", "", location)
+            outcome = run_editor_operation(
+                Path(location), bridge_dir=args.bridge_dir, executable=args.native_executable
+            )
+            if outcome is not None:
+                return outcome
         os.execvpe(command[0], [*command, *arguments], environment)
     except (OSError, UnicodeError, ValueError):
         print(
