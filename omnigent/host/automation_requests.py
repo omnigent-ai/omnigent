@@ -5,12 +5,13 @@ Lead's host, so it needs no credential for the automation workspace. The host
 signs each call with its owner's Databricks login for the URL's own workspace,
 and the token is only ever sent to that workspace.
 
-Only HTTPS calls to a ``…/scheduled-tasks`` path are made; anything else is
-refused without resolving a credential.
+Only HTTPS calls to a ``…/scheduled-tasks`` path are made, with a query string
+only on a GET listing; anything else is refused without resolving a credential.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import re
@@ -28,6 +29,9 @@ _TASK_PATH = re.compile(
     r"^/[A-Za-z0-9._~/-]*/scheduled-tasks(?:/[A-Za-z0-9._@-]+){0,2}(?:/state)?$"
 )
 _TIMEOUT_S = 30.0
+# The login lookup can hang on a workspace the owner never signed in to; answer
+# well inside the server's wait with the sign-in hint instead.
+LOGIN_TIMEOUT_S = 20.0
 _BODY_MAX_CHARS = 64 * 1024
 
 
@@ -46,6 +50,8 @@ def check_automation_request(frame: HostAutomationRequestFrame) -> str | None:
         return "the URL may not carry credentials or a fragment"
     if not _TASK_PATH.match(parts.path):
         return "only scheduled-task automation calls are allowed"
+    if parts.query and frame.method != "GET":
+        return "only a listing (GET) may carry a query string"
     return None
 
 
@@ -68,14 +74,22 @@ def run_automation_request(
         from omnigent.inner.databricks_executor import _resolve_databricks_auth_for_host
 
         resolve_auth = _resolve_databricks_auth_for_host
+    lookup = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        auth, resolved = resolve_auth(f"https://{hostname}")
+        auth, resolved = lookup.submit(resolve_auth, f"https://{hostname}").result(
+            timeout=LOGIN_TIMEOUT_S
+        )
     except Exception as exc:  # noqa: BLE001 — reported to the server as a sign-in problem
+        detail = "timed out" if isinstance(exc, concurrent.futures.TimeoutError) else str(exc)
+        _logger.info("No Databricks login on this host for %s: %s", hostname, detail)
         return _refuse(
             frame,
             f"The project owner's host has no Databricks login for {hostname}. On that "
-            f"machine run: databricks auth login --host https://{hostname} ({exc})",
+            f"machine run: databricks auth login --host https://{hostname} ({detail})",
         )
+    finally:
+        # A hung lookup keeps its worker; don't wait for it.
+        lookup.shutdown(wait=False)
     resolved_host = (
         urlsplit(resolved if "://" in resolved else f"https://{resolved}").hostname or ""
     )

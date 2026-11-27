@@ -49,6 +49,7 @@ def test_refuses_anything_but_scheduled_task_calls_without_resolving_a_login() -
         _frame(url="https://automation.example.com/api/2.0/clusters/list"),
         _frame(url="https://user:pw@automation.example.com/api/2.0/agent/scheduled-tasks"),
         _frame(method="PUT"),
+        _frame(url=API + "?page_size=50"),
     ):
         result = run_automation_request(frame, resolve_auth=resolve)
         assert result.status_code == 0 and result.error, frame
@@ -86,3 +87,21 @@ def test_missing_login_says_how_to_sign_in() -> None:
     result = run_automation_request(_frame(), resolve_auth=resolve)
     assert result.status_code == 0
     assert "databricks auth login --host https://automation.example.com" in (result.error or "")
+
+
+def test_a_hung_login_lookup_is_reported_in_time(monkeypatch) -> None:
+    import threading
+
+    from omnigent.host import automation_requests
+
+    monkeypatch.setattr(automation_requests, "LOGIN_TIMEOUT_S", 0.2)
+    release = threading.Event()
+
+    def resolve(host: str):
+        release.wait(5)
+        raise RuntimeError("never signed in")
+
+    result = run_automation_request(_frame(), resolve_auth=resolve)
+    release.set()
+    assert result.status_code == 0
+    assert "timed out" in (result.error or "") and "databricks auth login" in (result.error or "")
