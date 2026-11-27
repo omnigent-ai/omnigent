@@ -318,7 +318,8 @@ describe("CommandPalette — sessions", () => {
     ]);
     const { onOpenChange } = renderPalette({ sessionsOnly: true });
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "fxprs" } });
-    expect(screen.getByText("Fix the parser")).toBeTruthy();
+    // By name: a palette that marks each fuzzy-matched letter splits the label's text.
+    expect(screen.getByRole("option", { name: /Fix the parser/ })).toBeTruthy();
     expect(screen.queryByText("Deploy API")).toBeNull();
     expect(screen.queryByText("Unrelated")).toBeNull();
     expect(screen.queryByText("Go to Inbox")).toBeNull();
