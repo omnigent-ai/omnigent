@@ -11,23 +11,32 @@ export interface HeldPoll {
   }[];
 }
 
+// Below this many, holding never prunes: a few refs to let go cost less than walking them.
+const PRUNE_AT_LEAST = 32;
+
 const observed = (poll: HeldPoll) => (poll.observers?.length ?? 0) > 0;
 
 /** Holding never keeps a query alive: one removed, or whose observers all left, is let go. */
 export function createHeldPolls() {
   let refs: WeakRef<HeldPoll>[] = [];
   const holding = new WeakSet<HeldPoll>();
+  // How many refs the last pass kept, so holding prunes only once they've doubled since.
+  let keptAtPrune = 0;
 
   /** The held polls still alive and observed; the rest are let go. */
   function live(): HeldPoll[] {
     const polls: HeldPoll[] = [];
+    const kept: WeakRef<HeldPoll>[] = [];
     for (const ref of refs) {
       const poll = ref.deref();
       if (!poll) continue;
-      if (observed(poll)) polls.push(poll);
-      else holding.delete(poll);
+      if (observed(poll)) {
+        polls.push(poll);
+        kept.push(ref);
+      } else holding.delete(poll);
     }
-    refs = polls.map((poll) => new WeakRef(poll));
+    refs = kept;
+    keptAtPrune = kept.length;
     return polls;
   }
 
@@ -41,7 +50,7 @@ export function createHeldPolls() {
   return {
     hold(poll: HeldPoll) {
       if (holding.has(poll)) return;
-      live();
+      if (refs.length >= Math.max(2 * keptAtPrune, PRUNE_AT_LEAST)) live();
       holding.add(poll);
       refs.push(new WeakRef(poll));
     },

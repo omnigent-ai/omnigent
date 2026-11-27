@@ -296,4 +296,13 @@ describe("the limit a cooldown waits out", () => {
     cooldowns.rateLimited(KEY, null);
     expect(cooldowns.phase(KEY)).not.toHaveProperty("limit");
   });
+
+  it("shows no earlier limit with a later deadline that names none", () => {
+    const { cooldowns, now } = harness();
+    cooldowns.rateLimited(KEY, now() + 60_000, { kind: "secondary", resource: "graphql" });
+    const later = now() + 5 * 60_000;
+    cooldowns.rateLimited(KEY, later);
+    expect(cooldowns.phase(KEY)).toMatchObject({ until: later });
+    expect(cooldowns.phase(KEY)).not.toHaveProperty("limit");
+  });
 });

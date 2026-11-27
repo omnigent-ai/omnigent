@@ -15,12 +15,23 @@ export interface BrowserFlagDefinition {
 
 const NO_DEFINITIONS: readonly BrowserFlagDefinition[] = Object.freeze([]);
 let registered = NO_DEFINITIONS;
+const registrationListeners = new Set<() => void>();
 
-/** Use `definitions` for every browser override from now on. */
+/** Use `definitions` for every browser override from now on, telling who reads overrides. */
 export function registerBrowserFlagDefinitions(
   definitions: readonly BrowserFlagDefinition[],
 ): void {
+  if (registered === definitions) return;
   registered = definitions;
+  for (const listener of [...registrationListeners]) listener();
+}
+
+/** Call `listener` after each new registration; returns the unsubscribe. */
+export function onBrowserFlagDefinitionsChange(listener: () => void): () => void {
+  registrationListeners.add(listener);
+  return () => {
+    registrationListeners.delete(listener);
+  };
 }
 
 /** The definitions registered last, the same array until the next registration. */

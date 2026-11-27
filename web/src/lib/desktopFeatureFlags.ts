@@ -125,11 +125,10 @@ function readBrowserFeatureFlag<T>(
     const override = browserOverrideOf(name, accepts);
     if (!active || (delivered !== undefined && delivered?.value === override?.value)) return;
     delivered = override;
-    onChange(
-      override
-        ? { value: override.value, resolved: true, source: "browser_override" }
-        : { value: fallback, resolved: true, source: "no_bridge" },
-    );
+    const reading: DesktopFeatureFlagReading<T> = override
+      ? { value: override.value, resolved: true, source: "browser_override" }
+      : { value: fallback, resolved: true, source: "no_bridge" };
+    deliver(() => onChange(reading), undefined);
   };
   deliverCurrent();
   const leave = subscribeBrowserFlagOverrides(deliverCurrent);
@@ -164,7 +163,9 @@ export function readDesktopFeatureFlag<T>(
       active = false;
     };
   }
-  if (mode === "value") onChange({ value: fallback, resolved: false, source: "pending" });
+  if (mode === "value") {
+    deliver(() => onChange({ value: fallback, resolved: false, source: "pending" }), undefined);
+  }
 
   void getDesktopFeatures().then((features) => {
     if (!active) return;

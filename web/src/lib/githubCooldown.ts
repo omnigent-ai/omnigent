@@ -194,10 +194,11 @@ export function createGitHubCooldowns({
       const names = named !== undefined && (later || episode.limit === undefined);
       if (!later && !names) return;
       if (later) {
+        // A later deadline sets its own limit, named or not, so an older one isn't shown with it.
         episode.until = deadline;
         episode.fallback = false;
-      }
-      if (names) episode.limit = named;
+        episode.limit = named;
+      } else if (names) episode.limit = named;
     } else if (episode) {
       // Only a fallback wait that proved too short doubles the next; a deadline the shell named
       // says nothing about how long a fallback should be.

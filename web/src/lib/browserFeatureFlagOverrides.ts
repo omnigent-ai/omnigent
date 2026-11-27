@@ -6,6 +6,7 @@ import {
   type BrowserFlagDefinition,
   browserFlagDefinitions,
   browserOverrideAllowed,
+  onBrowserFlagDefinitionsChange,
 } from "@/lib/browserFlagDefinitions";
 
 export const BROWSER_FLAG_OVERRIDES_KEY = "omnigent.browserFeatureFlagOverrides.v1";
@@ -29,7 +30,7 @@ let flagsByName: {
   flags: ReadonlyMap<string, BrowserFlagDefinition>;
 } | null = null;
 
-/** The flags a browser may set, by name, for the definitions registered now. */
+/** The browser-settable definition named `name`, if any, under the current registration. */
 function browserFlag(name: string): BrowserFlagDefinition | undefined {
   const definitions = browserFlagDefinitions();
   if (flagsByName?.definitions !== definitions) {
@@ -129,13 +130,24 @@ function onStorage(event: StorageEvent): void {
   if (event.key === BROWSER_FLAG_OVERRIDES_KEY || event.key === null) notify();
 }
 
-/** Hear every change to this browser's choices, from this tab or another. */
+// Ends the registration watch while anyone listens; null otherwise.
+let stopRegistrationWatch: (() => void) | null = null;
+
+/**
+ * Hear every change to this browser's choices, from this tab or another, and each new
+ * registration of definitions, which changes which stored choices apply.
+ */
 export function subscribeBrowserFlagOverrides(listener: () => void): () => void {
-  if (listeners.size === 0) window.addEventListener("storage", onStorage);
+  if (listeners.size === 0) {
+    window.addEventListener("storage", onStorage);
+    stopRegistrationWatch = onBrowserFlagDefinitionsChange(notify);
+  }
   listeners.add(listener);
   return () => {
     if (!listeners.delete(listener) || listeners.size > 0) return;
     window.removeEventListener("storage", onStorage);
+    stopRegistrationWatch?.();
+    stopRegistrationWatch = null;
   };
 }
 

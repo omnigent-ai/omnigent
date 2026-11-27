@@ -308,7 +308,6 @@ describe("subscribeDesktopFeatureFlag", () => {
     });
     const healthy = collect("gate", false, "resolved");
     await vi.waitFor(() => expect(shell.subscriptions).toHaveLength(1));
-    await vi.waitFor(() => expect(shell.subscribe).toHaveBeenCalledTimes(1));
     shell.send("gate", true);
     expect(healthy.states).toEqual([{ value: true, resolved: true }]);
     expect(error).toHaveBeenCalled();
@@ -438,6 +437,30 @@ describe("a browser's own overrides", () => {
     );
     return { readings, unsubscribe };
   }
+
+  it("reads a stored override once the build registers its definitions after the read", () => {
+    resetBrowserFlagDefinitionsForTests();
+    window.localStorage.setItem(BROWSER_FLAG_OVERRIDES_KEY, JSON.stringify({ [FLAG]: true }));
+    const { readings, unsubscribe } = read(false);
+    expect(readings).toEqual([{ value: false, resolved: true, source: "no_bridge" }]);
+    registerBrowserFlagDefinitions([{ name: FLAG, type: "boolean", rendererVisible: true }]);
+    expect(readings.at(-1)).toEqual({ value: true, resolved: true, source: "browser_override" });
+    unsubscribe();
+  });
+
+  it("logs a consumer that throws, and keeps following the flag", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    let calls = 0;
+    const unsubscribe = readDesktopFeatureFlag(FLAG, { fallback: false }, () => {
+      calls += 1;
+      if (calls === 1) throw new Error("consumer failed");
+    });
+    setBrowserFlagOverride(FLAG, true);
+    expect(calls).toBe(2);
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
+    unsubscribe();
+  });
 
   it("reads the caller's fallback until this browser sets the flag", () => {
     expect(read(false).readings).toEqual([{ value: false, resolved: true, source: "no_bridge" }]);

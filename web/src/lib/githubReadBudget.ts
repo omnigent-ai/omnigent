@@ -21,6 +21,9 @@ export const BUDGET_SPECULATIVE_ABOVE = 0.5;
 /** The shell's rollback flag, which pages watch so turning it off resumes paused polls at once. */
 export const GITHUB_READ_BUDGET_FLAG = "github-read-budget";
 
+// A held poll whose pace its caller didn't say waits for the reset, as a stopped one does.
+const STOPPED_UNTIL_RESET: GitHubBudgetPace = { pace: "stopped", until: Number.POSITIVE_INFINITY };
+
 /** How a poll paces on its reader's budget: unchanged, slower, or held until `until`. */
 export type GitHubBudgetPace =
   { pace: "normal" } | { pace: "slow"; factor: number } | { pace: "stopped"; until: number };
@@ -39,7 +42,9 @@ export function createGitHubReadBudgets({
 } = {}) {
   // Per reader, each hourly resource's budget in its current window.
   const budgets = new Map<string, Map<GitHubReadBudget["resource"], GitHubReadBudget>>();
+  // Stopped polls wait until their reset; slowed ones until their slowed interval ends.
   const held = createHeldPolls();
+  const slowed = createHeldPolls();
   let enabled = true;
   let stopWatching: (() => void) | null = null;
   // Which watch the flag's answers belong to: one handed out before a clear can't act after it.
@@ -57,11 +62,12 @@ export function createGitHubReadBudgets({
   /** Let every held poll work out its pace again, now that a budget holds less. */
   const wake = () => {
     held.reschedule();
+    slowed.reschedule();
     for (const listener of [...listeners]) listener();
   };
 
-  // Paused polls don't read, so no answer reports a reset: a timer tells work paced by hand.
-  // Held polls need no wake here, since their own interval already ends at the reset.
+  // Paused polls don't read, so no answer reports a reset: a timer tells work paced by hand, and
+  // slowed polls pace as usual again. A stopped poll's own interval already ends at the reset.
   function scheduleReset() {
     if (resetTimer !== null) clearTimeout(resetTimer);
     resetTimer = null;
@@ -76,6 +82,7 @@ export function createGitHubReadBudgets({
     resetTimer = setTimeout(
       () => {
         resetTimer = null;
+        slowed.reschedule();
         for (const listener of [...listeners]) listener();
         changed();
         scheduleReset();
@@ -175,15 +182,17 @@ export function createGitHubReadBudgets({
     );
   }
 
-  /** Remember a poll its budget slowed or paused, to wake it when that budget lets go. */
-  function hold(query: HeldPoll) {
-    held.hold(query);
+  /** Remember a poll its budget slowed or paused, at `heldAt`, to wake it when that budget lets go. */
+  function hold(query: HeldPoll, heldAt: GitHubBudgetPace = STOPPED_UNTIL_RESET) {
+    if (heldAt.pace === "stopped") held.hold(query);
+    else if (heldAt.pace === "slow") slowed.hold(query);
   }
 
   /** Forget every budget, listener and flag watch, for tests. */
   function clear() {
     budgets.clear();
     held.clear();
+    slowed.clear();
     scheduleReset();
     listeners.clear();
     changeListeners.clear();

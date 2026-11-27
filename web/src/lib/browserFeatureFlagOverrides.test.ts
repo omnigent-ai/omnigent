@@ -154,7 +154,7 @@ describe("subscribeBrowserFlagOverrides", () => {
 
   it("hears another tab's writes and a storage clear, and ignores other keys", () => {
     const listener = vi.fn();
-    subscribeBrowserFlagOverrides(listener);
+    const leave = subscribeBrowserFlagOverrides(listener);
     window.dispatchEvent(new StorageEvent("storage", { key: "some-other-key" }));
     expect(listener).not.toHaveBeenCalled();
 
@@ -167,5 +167,20 @@ describe("subscribeBrowserFlagOverrides", () => {
     window.dispatchEvent(new StorageEvent("storage", { key: null }));
     expect(listener).toHaveBeenCalledTimes(2);
     expect(browserFlagOverrides()).toEqual({});
+    leave();
+  });
+
+  it("tells its listeners when new definitions change which stored choices apply", () => {
+    resetBrowserFlagDefinitionsForTests();
+    store({ [FLAG]: true });
+    const listener = vi.fn();
+    const leave = subscribeBrowserFlagOverrides(listener);
+    expect(browserFlagOverrides()).toEqual({});
+    registerBrowserFlagDefinitions(DEFINITIONS);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(browserFlagOverrides()).toEqual({ [FLAG]: true });
+    registerBrowserFlagDefinitions(DEFINITIONS);
+    expect(listener).toHaveBeenCalledTimes(1);
+    leave();
   });
 });
