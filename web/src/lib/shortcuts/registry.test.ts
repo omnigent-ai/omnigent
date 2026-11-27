@@ -407,14 +407,17 @@ describe("General and Navigation bindings", () => {
     }
   });
 
-  it("numbers sidebar sessions ⌘1–⌘9 then ⌘0, adding Alt in a browser", () => {
+  it("numbers sidebar sessions ⌘1–⌘9, leaving ⌘0 to Actual Size, adding Alt in a browser", () => {
     const native = { ...mac, native: true };
     expect(
       matchedShortcutChordIndex(press({ key: "1", metaKey: true }), "session.number", native),
     ).toBe(0);
     expect(
+      matchedShortcutChordIndex(press({ key: "9", metaKey: true }), "session.number", native),
+    ).toBe(8);
+    expect(
       matchedShortcutChordIndex(press({ key: "0", metaKey: true }), "session.number", native),
-    ).toBe(9);
+    ).toBe(-1);
     expect(
       matchedShortcutChordIndex(press({ key: "1", metaKey: true }), "session.number", mac),
     ).toBe(-1);
@@ -688,7 +691,7 @@ describe("Keyboard shortcuts page metadata", () => {
 
   it("shows a numbered binding's row as a range of digits", () => {
     const native = resolved({ mac: true, native: true, desktopMenu: false });
-    expect(shortcutRowKeys("session.number", native, page)).toEqual(["⌘", "1…0"]);
+    expect(shortcutRowKeys("session.number", native, page)).toEqual(["⌘", "1…9"]);
     expect(shortcutRowKeys("workspace.tab", resolved(mac), page)).toEqual(["⌃", "1…4"]);
     expect(
       shortcutRowKeys("workspace.tab", resolved(mac), { ...page, contentSearch: true }),

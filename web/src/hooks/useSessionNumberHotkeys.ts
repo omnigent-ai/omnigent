@@ -1,15 +1,6 @@
-// Cmd+1..9/0 (Ctrl on Win/Linux) jumps to the Nth session the sidebar lists,
-// top to bottom (the caller passes its visible rows): 1–9 → the first nine,
-// 0 → the tenth (browser-tab-style mapping). Once-bound, ref-backed, and
-// platform-aware (only ⌘ fires on macOS, only Ctrl on Win/Linux). Fires even in
-// a focused text field so you can jump mid-compose. Bind ONCE.
-//
-// Platform-aware chord: a browser tab reserves plain Cmd/Ctrl+digit for native
-// tab-switching, so in the browser the binding adds Alt (Cmd/Ctrl+Alt+digit) to
-// own a free chord; the Electron shell keeps the plain Cmd/Ctrl+digit it can
-// safely claim. With Alt held macOS rewrites e.key to a composed glyph
-// (⌥1 → "¡"), so the browser path matches on e.code (physical key) while the
-// native path matches on e.key. The shortcuts-dialog row mirrors the same split.
+// Cmd/Ctrl+1..9 jumps to the Nth listed session, even from a text field; Cmd+0 stays Actual Size.
+// A browser adds Alt (plain Cmd/Ctrl+digit switches tabs) and matches e.code, since Alt composes
+// e.key on macOS. Bind once; registry.ts owns the chords.
 
 import { useEffect, useRef } from "react";
 import { isMacPlatform } from "@/lib/hotkeys";

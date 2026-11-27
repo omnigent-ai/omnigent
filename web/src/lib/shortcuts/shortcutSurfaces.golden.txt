@@ -38,7 +38,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+shift+key:T
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -150,7 +150,7 @@ session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -214,7 +214,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+shift+key:T
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -326,7 +326,7 @@ session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -390,7 +390,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+shift+key:T
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -502,7 +502,7 @@ session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -566,7 +566,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+shift+key:T
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -678,7 +678,7 @@ session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -742,7 +742,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+k
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -854,7 +854,7 @@ session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -918,7 +918,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+k
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -1030,7 +1030,7 @@ session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -1094,7 +1094,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+k
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -1206,7 +1206,7 @@ session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -1270,7 +1270,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+k
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -1382,7 +1382,7 @@ session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -1446,7 +1446,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+shift+key:T
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -1558,7 +1558,7 @@ session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -1622,7 +1622,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+shift+key:T
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -1734,7 +1734,7 @@ session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -1798,7 +1798,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+shift+key:T
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -1910,7 +1910,7 @@ session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -1974,7 +1974,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+shift+key:T
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -2086,7 +2086,7 @@ session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -2150,7 +2150,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+k
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -2262,7 +2262,7 @@ session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -2326,7 +2326,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+k
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -2438,7 +2438,7 @@ session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -2502,7 +2502,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+k
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -2614,7 +2614,7 @@ session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode
@@ -2678,7 +2678,7 @@ session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+k
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
-session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.number | Jump to a sidebar session (1–9) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 | matches=true true true true true true true true true
 session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
@@ -2790,7 +2790,7 @@ session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
-session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number
 session.recent | search=-
 session.recentReverse | search=-
 view.mode | search=view.mode

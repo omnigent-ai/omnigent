@@ -60,8 +60,8 @@ afterEach(() => {
 describe("useSessionNumberHotkeys", () => {
   const ids = ["a", "b", "c"];
 
-  it("exposes ten digits mapping 1–9 then 0", () => {
-    expect(SESSION_HOTKEY_DIGITS).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]);
+  it("exposes the nine digits 1–9", () => {
+    expect(SESSION_HOTKEY_DIGITS).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
   });
 
   it("Cmd+1 opens the first pinned session", () => {
@@ -76,11 +76,12 @@ describe("useSessionNumberHotkeys", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c");
   });
 
-  it("Cmd+0 opens the tenth pinned session", () => {
+  it("leaves Cmd+0 to the menu's Actual Size, even with a tenth session", () => {
     const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
     render(ten);
-    press("0");
-    expect(navigate).toHaveBeenCalledWith("/c/j");
+    const event = press("0");
+    expect(navigate).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
   });
 
   it("Cmd+9 opens the ninth pinned session", () => {
@@ -164,12 +165,12 @@ describe("useSessionNumberHotkeys", () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
-  it("only maps the first ten: an 11th pinned session has no shortcut", () => {
-    const eleven = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"];
-    render(eleven);
-    // No digit maps to index 10, so "k" is unreachable; 0 still lands on the 10th.
-    press("0");
-    expect(navigate).toHaveBeenCalledWith("/c/j");
+  it("only maps the first nine: a tenth pinned session has no shortcut", () => {
+    const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+    render(ten);
+    for (const digit of ["0", ...SESSION_HOTKEY_DIGITS]) press(digit);
+    expect(navigate).toHaveBeenCalledTimes(SESSION_HOTKEY_DIGITS.length);
+    expect(navigate).not.toHaveBeenCalledWith("/c/j");
   });
 
   it("does nothing when the list is empty", () => {
@@ -217,11 +218,12 @@ describe("useSessionNumberHotkeys", () => {
     altGraph.mockRestore();
   });
 
-  it("browser: Cmd+Alt+Digit0 opens the tenth pinned session", () => {
+  it("browser: leaves Cmd+Alt+Digit0 alone, even with a tenth session", () => {
     isNativeShell.mockReturnValue(false);
     const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
     render(ten);
-    press("º", { metaKey: true, altKey: true }, document.body, "Digit0");
-    expect(navigate).toHaveBeenCalledWith("/c/j");
+    const event = press("º", { metaKey: true, altKey: true }, document.body, "Digit0");
+    expect(navigate).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
   });
 });
