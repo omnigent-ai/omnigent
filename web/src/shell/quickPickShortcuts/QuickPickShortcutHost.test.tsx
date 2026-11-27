@@ -127,11 +127,12 @@ afterEach(() => {
 });
 
 describe("QuickPickShortcutHost", () => {
-  it("steps through the sidebar's sessions as ⌘K's Next and Previous session do", () => {
+  it("steps through the sidebar's sessions with Ctrl+Tab and Ctrl+Shift+Tab, with no switcher", () => {
     renderHost();
-    press(NEXT);
-    press(PREVIOUS);
+    expect(press(NEXT)).toBe(false);
+    expect(press(PREVIOUS)).toBe(false);
     expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/b"]]);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
   });
 
   it("steps sessions with Ctrl+Alt+Shift+arrows too, the chord a browser tab reaches", () => {
@@ -180,14 +181,6 @@ describe("QuickPickShortcutHost", () => {
     unmount();
     press(NEXT);
     expect(navigate).not.toHaveBeenCalled();
-  });
-
-  it("steps with Ctrl+Tab and Ctrl+Shift+Tab, with no switcher", () => {
-    renderHost();
-    expect(press(CTRL_TAB)).toBe(false);
-    expect(press(CTRL_SHIFT_TAB)).toBe(false);
-    expect(navigate.mock.calls).toEqual([["/c/c"], ["/c/b"]]);
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
   });
 
   it("takes Ctrl+Tab from a terminal, but leaves it to a dialog", () => {
