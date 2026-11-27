@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import copy
 import json
 import os
@@ -15,7 +14,6 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from omnigent.harnesses.claude_native import settings_validation as validation
-from omnigent.inner import sandbox as sb
 from tests.harnesses.claude_native._settings_validation_helpers import (
     DOCTOR_COMPLETION as _COMPLETION,
 )
@@ -116,14 +114,13 @@ def _context(tmp_path: Path, *, sandboxed: bool, form: str):
         payload_paths=[],
         launcher_paths=[],
         bootstrap=[],
-        finals=[],
         documents=[],
         original_policy=copy.deepcopy(instance.sandbox_policy),
     )
 
 
-def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False):
-    observations = SimpleNamespace(launches=[], doctors=[], handoffs=[])
+def _install_doubles(context, monkeypatch: pytest.MonkeyPatch):
+    observations = SimpleNamespace(launches=[], doctors=[])
 
     def launcher(command, policy, *, cwd, target_environment_path=None):
         payload = Path(target_environment_path) if target_environment_path is not None else None
@@ -157,50 +154,6 @@ def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False)
             SimpleNamespace(command=command, args=list(args), cwd=cwd, env=dict(env))
         )
         context.bootstrap.append(dict(env))
-        if handoff:
-            policy = context.launches[-1][1]
-            scratch = context.payload_paths[-1].parent / "launcher-scratch"
-            scratch.mkdir(mode=0o700)
-            final = Mock(return_value=SimpleNamespace(returncode=0))
-            bootstrap = dict(env)
-            launcher_os = SimpleNamespace(**{**vars(os), "environ": bootstrap})
-            activation_environments = []
-            activate = Mock(
-                side_effect=lambda _policy: activation_environments.append(dict(bootstrap))
-            )
-            backend = Mock()
-            execute = Mock(side_effect=SystemExit("inert re-exec boundary"))
-            with monkeypatch.context() as inner:
-                inner.setattr(sb, "os", launcher_os)
-                inner.setattr(sb, "activate_sandbox", activate)
-                inner.setattr(sb, "get_backend", backend)
-                inner.setattr(sb, "create_private_tmpdir", Mock(return_value=scratch))
-                inner.setattr(sb, "cleanup_private_tmpdir", Mock())
-                inner.setattr(sb.subprocess, "run", final)
-                inner.setattr(launcher_os, "execvp", execute)
-                encoded = base64.urlsafe_b64encode(
-                    json.dumps(policy.to_jsonable()).encode()
-                ).decode()
-                result = sb.run_launcher(
-                    encoded,
-                    context.launches[-1][0],
-                    list(args),
-                    cwd=str(context.cwd),
-                    target_environment_path=str(context.payload_paths[-1]),
-                    _spawn_wrapped=policy.active,
-                )
-            observations.handoffs.append(
-                SimpleNamespace(
-                    result=result,
-                    activate=activate,
-                    activation_environments=activation_environments,
-                    bootstrap_after=dict(bootstrap),
-                    target=final,
-                    backend=backend,
-                    execute=execute,
-                )
-            )
-            context.finals.append(final.call_args.kwargs["env"] if final.call_args else None)
         if "--help" in args:
             return _HELP, ""
         candidate = Path(args[args.index("--settings") + 1])
@@ -230,14 +183,12 @@ async def test_validator_keeps_wrapper_values_out_of_bootstrap(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     context = _context(tmp_path, sandboxed=sandboxed, form=form)
-    observations = _install_doubles(context, monkeypatch, handoff=True)
+    observations = _install_doubles(context, monkeypatch)
     await validation.validate_caller_settings(
         context.instance, {"attribution": False}, wrapper_prefix=context.prefix
     )
     assert len(context.launches) == len(context.payloads) == len(context.bootstrap) == 4
-    assert (
-        len(observations.launches) == len(observations.doctors) == len(observations.handoffs) == 4
-    )
+    assert len(observations.launches) == len(observations.doctors) == 4
     shared = bool(context.original_policy and context.original_policy.copy_on_write_namespace)
     expected_command = (
         str(Path(os.defpath.split(os.pathsep)[0]) / "env") if shared else str(context.executable)
@@ -245,14 +196,13 @@ async def test_validator_keeps_wrapper_values_out_of_bootstrap(
     expected_prefix = (
         ["--", context.command, *context.cli_prefix] if shared else context.cli_prefix
     )
-    for index, ((command, policy), payload, bootstrap, launch, doctor, handoff) in enumerate(
+    for index, ((command, policy), payload, bootstrap, launch, doctor) in enumerate(
         zip(
             context.launches,
             context.payloads,
             context.bootstrap,
             observations.launches,
             observations.doctors,
-            observations.handoffs,
             strict=True,
         )
     ):
@@ -299,35 +249,12 @@ async def test_validator_keeps_wrapper_values_out_of_bootstrap(
             )
         else:
             assert not policy.active and policy.backend_type == "none"
-        assert handoff.result == 0
-        handoff.activate.assert_called_once()
-        handoff.backend.assert_not_called()
-        handoff.execute.assert_not_called()
-        assert len(handoff.activation_environments) == 1
-        assert "EXAMPLE_TARGET_ONLY" not in handoff.activation_environments[0]
-        assert "EXAMPLE_TARGET_ONLY" not in handoff.bootstrap_after
-        assert handoff.target.call_args.kwargs["cwd"] == str(context.cwd)
     assert context.instance.sandbox_policy == context.original_policy
     assert context.prefix == context.original_prefix
     assert context.instance.args == ["original-argument"]
     assert context.documents == [{}, {"hooks": {"PreToolUse": [None]}}, {"attribution": False}]
     assert all(not path.exists() for path in [*context.payload_paths, *context.launcher_paths])
     assert _SENTINEL not in caplog.text
-    assert len(context.finals) == 4
-    for final, bootstrap in zip(context.finals, context.bootstrap, strict=True):
-        assert final["EXAMPLE_TARGET_ONLY"] == _SENTINEL
-        assert final["PATH"] == str(context.executable.parent)
-        assert final["PRIVATE_KEY"] == "wrapper-value"
-        assert final["CLAUDE_CONFIG_DIR"] == bootstrap["CLAUDE_CONFIG_DIR"]
-        if context.sandboxed or not context.inherit:
-            assert "EXCLUDED" not in final
-        else:
-            assert final["EXCLUDED"] == "bootstrap-only"
-        assert final["HOME"] == bootstrap["HOME"]
-        assert final["TMPDIR"] == bootstrap["TMPDIR"]
-        assert final["DISABLE_AUTOUPDATER"] == "1"
-        assert "REMOVE" not in final and "DISCARDED" not in final
-        assert (final.get("KEEP") == "bootstrap") is context.inherit
 
 
 @pytest.mark.parametrize(

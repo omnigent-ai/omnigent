@@ -121,11 +121,25 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
     tmp_path: Path, inert_launcher, active: bool, inherit: bool, launch_overrides: bool
 ) -> None:
     payload = _payload(tmp_path, inherit=inherit)
+    data = json.loads(payload.read_text())
+    data["unset"].append("DISCARDED")
+    data["variables"].update(PATH="/fixture/selected/bin", PRIVATE_KEY="wrapper-value")
+    data["overrides"].update(
+        TMPDIR=str(tmp_path / "owned-tmp"),
+        CLAUDE_CONFIG_DIR=str(tmp_path / "owned-config"),
+        DISABLE_AUTOUPDATER="1",
+    )
+    payload.write_text(json.dumps(data))
     bootstrap = _bootstrap()
+    bootstrap["DISCARDED"] = "discard"
+    policy = _policy(active)
+    if not active:
+        bootstrap["EXCLUDED"] = "bootstrap-only"
+        policy.spawn_env_allowlist = None
     with patch.dict(inert_launcher.environment, bootstrap, clear=True):
         assert (
             sb.run_launcher(
-                _encoded(_policy(active)),
+                _encoded(policy),
                 _TARGET,
                 ["doctor"],
                 cwd="/fixture/workspace",
@@ -144,8 +158,14 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
     assert call.kwargs["cwd"] == "/fixture/workspace"
     environment = call.kwargs["env"]
     assert environment["EXAMPLE_TARGET_ONLY"] == _SENTINEL
+    assert environment["PATH"] == "/fixture/selected/bin"
+    assert environment["PRIVATE_KEY"] == "wrapper-value"
     assert environment["HOME"] == str(tmp_path / "owned-home")
-    assert "REMOVE" not in environment
+    assert environment["TMPDIR"] == str(tmp_path / "owned-tmp")
+    assert environment["CLAUDE_CONFIG_DIR"] == str(tmp_path / "owned-config")
+    assert environment["DISABLE_AUTOUPDATER"] == "1"
+    assert "REMOVE" not in environment and "DISCARDED" not in environment
+    assert (environment.get("EXCLUDED") == "bootstrap-only") is (not active and inherit)
     assert (
         environment.get("KEEP") == ("snapshot" if launch_overrides else "bootstrap")
     ) is inherit

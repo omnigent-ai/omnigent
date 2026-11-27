@@ -244,11 +244,16 @@ def test_old_owners_cannot_remove_or_refresh_reactivated_credentials(bridge_dir:
 
 @pytest.mark.parametrize("kind", ["control", "relay"])
 @pytest.mark.parametrize("reactivate", [False, True])
+@pytest.mark.parametrize("binding_fault", [None, "missing", "damaged"])
 def test_cached_local_handlers_refuse_a_deleted_bridge_activation(
-    bridge_dir: Path, kind: str, reactivate: bool
+    bridge_dir: Path, kind: str, reactivate: bool, binding_fault: str | None
 ) -> None:
     request = ClaudeSettingsRequest.create(bridge_dir)
     _populate(request)
+    if binding_fault == "missing":
+        (bridge_dir / "bridge.json").unlink()
+    elif binding_fault == "damaged":
+        (bridge_dir / "bridge.json").write_text("{")
     notifications: queue.Queue = queue.Queue()
     handler_class = (
         bridge._handler_factory("synthetic-local-token", notifications, bridge_dir=bridge_dir)
@@ -265,25 +270,42 @@ def test_cached_local_handlers_refuse_a_deleted_bridge_activation(
     handler._send_json = Mock()
     try:
         handler.do_POST()
-        handler.send_error.assert_not_called()
-        handler._send_json.assert_called_once()
+        if binding_fault is None:
+            handler.send_error.assert_not_called()
+        else:
+            handler.send_error.assert_called_once_with(401)
+        assert handler._send_json.call_count == int(binding_fault is None)
         request_claude_bridge_deletion(bridge_dir, "conv_fenced")
-        if reactivate:
-            bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+        handler.send_error.reset_mock()
         handler.do_POST()
         handler.send_error.assert_called_once_with(401)
-        handler._send_json.assert_called_once()
+        if reactivate:
+            bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+            assert bridge.read_bridge_credential_binding(bridge_dir) is not None
+            handler.send_error.reset_mock()
+            handler.do_POST()
+            handler.send_error.assert_called_once_with(401)
+        assert handler._send_json.call_count == int(binding_fault is None)
     finally:
         request.close()
 
 
 @pytest.mark.parametrize("kind", ["control", "relay"])
 @pytest.mark.parametrize("reactivate", [False, True])
+@pytest.mark.parametrize("binding_fault", [None, "missing", "damaged"])
 def test_deleted_bridge_cannot_be_republished_by_an_inflight_endpoint_start(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, kind: str, reactivate: bool
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    reactivate: bool,
+    binding_fault: str | None,
 ) -> None:
     request = ClaudeSettingsRequest.create(bridge_dir)
     _populate(request)
+    if binding_fault == "missing":
+        (bridge_dir / "bridge.json").unlink()
+    elif binding_fault == "damaged":
+        (bridge_dir / "bridge.json").write_text("{")
     server = Mock()
 
     def retire_during_bind(_handler: object) -> tuple[Mock, object]:

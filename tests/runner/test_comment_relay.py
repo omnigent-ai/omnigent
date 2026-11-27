@@ -2102,6 +2102,7 @@ async def test_failed_launch_rolls_back_only_new_relay(
     "mode",
     [
         "wrapped",
+        "sandbox-split",
         "legacy",
         "declared-identical",
         "declared-identical-invalid",
@@ -2115,6 +2116,39 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
+    profile_reads = []
+    if mode == "sandbox-split":
+        from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
+
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        write_mcp_inheritance({"inherit": False})
+        for path in (
+            tmp_path / "home/.claude/settings.json",
+            tmp_path / ".claude/settings.json",
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}")
+        unrelated = tmp_path / "unrelated-profile/settings.json"
+        unrelated.parent.mkdir()
+        unrelated.write_text("{")
+        monkeypatch.setenv("EXAMPLE_PROFILE", str(unrelated.parent))
+        original_open = Path.open
+
+        def record_open(path, *args, **kwargs):
+            if path == unrelated:
+                profile_reads.append(path)
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", record_open)
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+            lambda command, args: (
+                "env",
+                ["-S", "CLAUDE_CONFIG_DIR=${EXAMPLE_PROFILE} claude", *args],
+            ),
+        )
 
     agent_id = "settings-agent"
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
@@ -2171,7 +2205,9 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
     original = bridge.finalize_claude_caller_settings
 
     async def record(instance, **kwargs):
-        assert instance.sandbox_policy is None
+        assert bool(instance.sandbox_policy and instance.sandbox_policy.active) is (
+            mode == "sandbox-split"
+        )
         assert instance.os_env.cwd == tmp_path
         await original(instance, **kwargs)
         finalized.append(instance.args)
@@ -2187,6 +2223,18 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             kwargs["spec"],
             parent_os_env_spec=kwargs["parent_os_env"],
         )
+        if mode == "sandbox-split":
+            from omnigent.inner.sandbox import SandboxPolicy
+
+            created.instance.sandbox_policy = SandboxPolicy(
+                backend_type="linux_bwrap",
+                active=True,
+                read_roots=[tmp_path],
+                write_roots=[created.instance.private_dir],
+                write_files=[],
+                allow_network=False,
+                spawn_env_allowlist=["PATH", "HOME"],
+            )
         try:
             await kwargs["prepare_terminal"](created.instance)
             kwargs["spec"].args = created.instance.args
@@ -2214,6 +2262,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
                 assert not (bridge_dir / _TOOL_RELAY_FILE).exists()
             else:
                 assert response.status_code == 200, response.text
+                assert profile_reads == []
                 assert len(finalized) == 1
                 final_args = finalized[0]
                 settings_index = max(i for i, arg in enumerate(final_args) if arg == "--settings")

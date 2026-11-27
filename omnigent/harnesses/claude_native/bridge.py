@@ -1517,7 +1517,7 @@ class ClaudeNativeToolRelay:
             "updated_at": time.time(),
         }
         with _bridge_metadata_write_lock(self._bridge_dir):
-            if self._closed.is_set() or not _bridge_credentials_current(
+            if self._closed.is_set() or not _bridge_endpoint_is_current(
                 self._bridge_dir, self._credential_binding
             ):
                 raise RuntimeError("Native tool relay activation has ended")
@@ -2284,6 +2284,13 @@ def _bridge_credentials_current(
     return config.get("deleted") is not True and (
         binding is None or read_bridge_credential_binding(bridge_dir) == binding
     )
+
+
+def _bridge_endpoint_is_current(
+    bridge_dir: Path, binding: ClaudeBridgeCredentialBinding | None
+) -> bool:
+    """An endpoint must retain a concrete activation before exposing its cached token."""
+    return binding is not None and _bridge_credentials_current(bridge_dir, binding)
 
 
 def retire_bridge_credentials(bridge_dir: Path, session_id: str) -> None:
@@ -3907,7 +3914,10 @@ async def finalize_claude_caller_settings(
     if environment is None:
         raise ValueError("caller settings require the terminal filesystem environment")
     launch_env = terminal_pane_environment(
-        inherit_env=instance.inherit_env, env=instance.env, env_unset=instance.env_unset
+        inherit_env=instance.inherit_env,
+        env=instance.env,
+        env_unset=instance.env_unset,
+        sandbox_policy=instance.sandbox_policy,
     )
     wrapper = env_wrapper_launch(instance.command, instance.args, launch_env)
     if wrapper is not None:
@@ -9303,7 +9313,7 @@ def start_tool_relay(
         relay_info["session_id"] = session_id
     try:
         with _bridge_metadata_write_lock(bridge_dir):
-            if not _bridge_credentials_current(bridge_dir, credential_binding):
+            if not _bridge_endpoint_is_current(bridge_dir, credential_binding):
                 raise ClaudeSettingsRequestExpired()
             _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
             # Hooks source this file whenever they run, so replace it whole.
@@ -9433,7 +9443,7 @@ def _start_http_ingress(
         server_info["socket"] = str(socket_path)
     try:
         with _bridge_metadata_write_lock(bridge_dir):
-            if not _bridge_credentials_current(bridge_dir, credential_binding):
+            if not _bridge_endpoint_is_current(bridge_dir, credential_binding):
                 raise ClaudeSettingsRequestExpired()
             _write_json_file(bridge_dir / _SERVER_FILE, server_info)
     except BaseException:
@@ -9552,7 +9562,7 @@ def _handler_factory(
                 return
             if self.headers.get("Authorization") != f"Bearer {token}" or (
                 bridge_dir is not None
-                and not _bridge_credentials_current(bridge_dir, credential_binding)
+                and not _bridge_endpoint_is_current(bridge_dir, credential_binding)
             ):
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
@@ -9664,7 +9674,7 @@ def _tool_relay_handler_factory(
                 return
             if self.headers.get("Authorization") != f"Bearer {token}" or (
                 bridge_dir is not None
-                and not _bridge_credentials_current(bridge_dir, credential_binding)
+                and not _bridge_endpoint_is_current(bridge_dir, credential_binding)
             ):
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return

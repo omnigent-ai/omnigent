@@ -172,9 +172,13 @@ async def test_cancelled_shared_environment_resolution_keeps_loop_responsive(
         release.set()
 
 
-@requires_tmux
 @pytest.mark.parametrize(
-    "settings_protocol", [None, 1, 2], ids=["no-settings", "legacy", "fenced"]
+    "settings_protocol",
+    [
+        pytest.param(None, marks=requires_tmux, id="no-settings"),
+        pytest.param(1, id="legacy"),
+        pytest.param(2, id="fenced"),
+    ],
 )
 async def test_missing_tmux_during_spawn_releases_private_resources(
     tmp_path: Path,
@@ -202,6 +206,7 @@ async def test_missing_tmux_during_spawn_releases_private_resources(
         request = ClaudeSettingsRequest.create(bridge_dir, protocol=settings_protocol)
         augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
         baseline = settings_generation_path(bridge_dir, request.generation)
+        monkeypatch.setattr("omnigent.inner.terminal._require_supported_tmux", lambda: None)
         monkeypatch.setattr(
             asyncio,
             "create_subprocess_exec",
