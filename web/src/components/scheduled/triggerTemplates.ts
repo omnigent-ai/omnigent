@@ -275,6 +275,14 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         scopePrefix: "#",
       },
       {
+        id: "thread_reply",
+        label: "Reply posted in a thread",
+        authorAction: "reply in a thread in this channel",
+        scopePrefix: "#",
+        description:
+          "Runs your automation on new replies in any thread in these channels, including threads it never handled, and starts one session per thread with new matching replies. New top-level posts don't count; use Message posted in a channel for those.",
+      },
+      {
         id: "dm",
         label: "Direct message received",
         authorAction: "send you a direct message from one of these accounts",
@@ -675,11 +683,19 @@ function triggerPromptHeadings(prompt: string): TriggerPromptHeadings {
 const POSTING_INSTRUCTIONS = `Anything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "${OMNIGENT_ATTRIBUTION}", since it posts with the owner's account.`;
 
 /** How a Slack worker replies: one start reply with its session link, then only new results. */
-function slackWorkerPostingInstructions(linkBack: boolean, sessionLink: string): string {
+function slackWorkerPostingInstructions(
+  linkBack: boolean,
+  sessionLink: string,
+  threadReplies: boolean,
+): string {
+  // A thread-reply worker gets the whole thread, so Slack tools must target its first message.
+  const replyTarget = threadReplies
+    ? " Wherever a Slack tool asks which message to reply to, name the message that started the thread, not a reply. The thread can hold earlier replies your message doesn't carry: read it with your Slack tools when you need that context."
+    : "";
   const start = linkBack
     ? `As soon as you start working on a Slack message, call sys_session_get_info to obtain your session_id and substitute it for ${SESSION_LINK_ID_PLACEHOLDER} in the link below; if your Slack tool takes Markdown rather than Slack mrkdwn, write the link as [Omni Session](<url>) instead. Then reply once in the message's thread with exactly the lines between <slack-reply> and </slack-reply>, without those marker lines:\n<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <${sessionLink}|Omni Session>\n${OMNIGENT_ATTRIBUTION}\n</slack-reply>\n`
     : "Do not send an acknowledgement or a session link. ";
-  return `${POSTING_INSTRUCTIONS}\n${start}Reply in the same thread when you have a useful result or a blocker. Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`;
+  return `${POSTING_INSTRUCTIONS}\n${start}Reply in the same thread when you have a useful result or a blocker. Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.${replyTarget}`;
 }
 
 /** Whether `prompt` begins like a prompt rendered from a trigger template. */
@@ -1597,8 +1613,37 @@ export const FOLLOWED_SLACK_THREAD_HOURS = 24;
  * The analysis_prompt a privacy-filtering Slack tool answers for each history read: just the
  * fields the manager needs, one JSON line per message.
  */
-const SLACK_HISTORY_ANALYSIS_PROMPT =
-  '"Output one JSON object per line for every message, oldest first, with exactly these keys: ts, thread_ts, user, bot_id, subtype, text (verbatim). Use null for a missing key. End with one line giving has_more (true or false) and next_cursor. Output nothing else."';
+const SLACK_HISTORY_ANALYSIS_PROMPT = slackAnalysisPrompt(
+  "ts, thread_ts, user, bot_id, subtype, text (verbatim)",
+);
+
+/** The analysis_prompt for a search that looks for new thread replies. */
+const SLACK_REPLY_SEARCH_ANALYSIS_PROMPT = slackAnalysisPrompt(
+  "ts, thread_ts, permalink, channel (its id), user, bot_id, text (verbatim)",
+  "page and pages from paging",
+);
+
+/** The analysis_prompt for a history read that looks for threads with new replies. */
+const SLACK_THREAD_PARENTS_ANALYSIS_PROMPT = slackAnalysisPrompt(
+  "ts, user, text (verbatim), reply_count, latest_reply",
+);
+
+/**
+ * How far back the thread-reply fallback scans top-level messages for threads with new
+ * replies. Slack rate-limits history reads hard, and the scan costs a page per 200
+ * messages (15 for apps outside the Marketplace) on every run, so it stays short.
+ */
+export const SLACK_THREAD_PARENT_LOOKBACK_DAYS = 1;
+
+/** History pages the thread-reply fallback reads per channel before giving up on older threads. */
+export const SLACK_THREAD_PARENT_MAX_PAGES = 5;
+
+function slackAnalysisPrompt(
+  keys: string,
+  paging = "has_more (true or false) and next_cursor",
+): string {
+  return `"Output one JSON object per line for every message, oldest first, with exactly these keys: ${keys}. Use null for a missing key. End with one line giving ${paging}. Output nothing else."`;
+}
 
 const GITHUB_ACCOUNT_INSTRUCTIONS =
   "Before using GitHub.com, verify which authenticated account can access the target repository. " +
@@ -1754,18 +1799,29 @@ function sourceText(source: TriggerSource, fields: TriggerFields, shared: boolea
     const authorColumns = fields.conditions.some((condition) => condition.field === "author")
       ? ", adding one yes/no column per author ID the conditions name, such as author_U0123ABCD, and apply author conditions with those columns, since the filter may hide the user field"
       : "";
+    const lookups = `Your most recent reply's "${SLACK_IDS}" line, when there is one, gives each channel's ID, the workspace URL and the Slack user ID of each author the conditions name: use them and skip those lookups. Otherwise look up only what's missing, once: find each channel's ID with your Slack tool's users.conversations (types public_channel,private_channel, exclude_archived true, limit 1000), which lists only your channels, rather than a full conversations.list.${channelLookupFilter} Call auth.test for the workspace URL and your own user ID; and find any other author with users.lookupByEmail for an email, users.info for a user ID, or users.list for a handle or display name. An author who matches no one or more than one person counts as no match: say so in your reply and save no ID for them. If a saved ID stops working, for example with channel_not_found, look it up again.`;
+    const stateLine = `Above it, write a "${SLACK_IDS}" line followed by one-line JSON with channel_ids (each channel name mapped to its ID), workspace_url, and author_ids (each author the conditions name mapped to their Slack user ID): carry over your previous reply's values and add what you looked up this run.`;
+    if (fields.event === "thread_reply") {
+      return slackThreadReplyText(shared, {
+        channels,
+        filter,
+        lookups,
+        authorColumns,
+        stateLine,
+      });
+    }
     return {
       ...slack,
       watch: () =>
         `Watch: new Slack messages in ${channels}${filter !== "" ? ` ${filter}` : ""}, then new replies in their threads`,
       search: () =>
-        `Your most recent reply's "${SLACK_IDS}" line, when there is one, gives each channel's ID, the workspace URL and the Slack user ID of each author the conditions name: use them and skip those lookups. Otherwise look up only what's missing, once: find each channel's ID with your Slack tool's users.conversations (types public_channel,private_channel, exclude_archived true, limit 1000), which lists only your channels, rather than a full conversations.list.${channelLookupFilter} Call auth.test for the workspace URL and your own user ID; and find any other author with users.lookupByEmail for an email, users.info for a user ID, or users.list for a handle or display name. An author who matches no one or more than one person counts as no match: say so in your reply and save no ID for them. If a saved ID stops working, for example with channel_not_found, look it up again. Then use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. If you read a channel with conversations.history, call it once with the channel ID, oldest set to that time as a Unix timestamp, inclusive false, limit 200 and caching off, and if your Slack tool takes an analysis_prompt (it filters message data for privacy), pass ${SLACK_HISTORY_ANALYSIS_PROMPT}${authorColumns}. History pages come newest first, so read every page, following the cursor only while has_more is true, before handling any message, then handle them oldest first. Don't pass a bash_query to a message read, and don't repeat a read. Replies inside a thread (thread_ts set and different from ts) don't start a new session.` +
+        `${lookups} Then use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. If you read a channel with conversations.history, call it once with the channel ID, oldest set to that time as a Unix timestamp, inclusive false, limit 200 and caching off, and if your Slack tool takes an analysis_prompt (it filters message data for privacy), pass ${SLACK_HISTORY_ANALYSIS_PROMPT}${authorColumns}. History pages come newest first, so read every page, following the cursor only while has_more is true, before handling any message, then handle them oldest first. Don't pass a bash_query to a message read, and don't repeat a read. Replies inside a thread (thread_ts set and different from ts) don't start a new session.` +
         (only || " Every top-level message counts.") +
         " When a message has no permalink, build it as the workspace URL followed by archives/<channel ID>/p<ts without its dot>.",
       details: "the channel, author, message text and permalink",
       // An unread history page can hold older messages, so a partial run keeps its window.
       partialCheckpoint: "the previous check time",
-      stateLine: `Above it, write a "${SLACK_IDS}" line followed by one-line JSON with channel_ids (each channel name mapped to its ID), workspace_url, and author_ids (each author the conditions name mapped to their Slack user ID): carry over your previous reply's values and add what you looked up this run.`,
+      stateLine,
       followsThreads: true,
     };
   }
@@ -1857,6 +1913,55 @@ function sourceText(source: TriggerSource, fields: TriggerFields, shared: boolea
   };
 }
 
+/** The channel-trigger text a thread-reply trigger shares with the posted event. */
+interface SlackChannelText {
+  channels: string;
+  filter: string;
+  lookups: string;
+  authorColumns: string;
+  stateLine: string;
+}
+
+/**
+ * The "Reply posted in a thread" event: one session per thread with new replies, in any
+ * thread of the watched channels. New replies come from search.messages, or from a short
+ * history scan when search is unavailable. Nothing is followed between runs; the check time
+ * alone keeps a reply from being handled twice, and a thread with more replies later is
+ * found again.
+ */
+function slackThreadReplyText(shared: boolean, channel: SlackChannelText): SourceText {
+  const { channels, filter, lookups, authorColumns, stateLine } = channel;
+  const handled = shared ? "sent to the task session" : "started a session for";
+  const only =
+    filter !== ""
+      ? ` Only new replies ${filter} count; a thread whose new replies all fail the conditions starts nothing.`
+      : " Every new reply by a person counts.";
+  const titlePrefix = '"Slack <channel> <thread ts> replies "';
+  const alreadyHandled = `The ts at the end of the latest such title, or of a pending entry for the thread, is the newest reply already handled: skip the thread when it is at or after the thread's newest new reply, and otherwise count only the replies after it.`;
+  return {
+    watch: () => `Watch: new replies in threads in ${channels}${filter !== "" ? ` ${filter}` : ""}`,
+    search: () =>
+      `${lookups} Then find the new replies in threads in ${channels}. Slack rate-limits message reads hard, so spend as few calls as you can. If your Slack tools offer search.messages, use it: for each channel, search for in:<channel> after:<the day before the check time's date>, writing the channel as #<name> or <#<channel ID>> for an ID, with sort timestamp, sort_dir asc and count 100, and if your Slack tool takes an analysis_prompt (it filters message data for privacy), pass ${SLACK_REPLY_SEARCH_ANALYSIS_PROMPT}. after: takes a date and excludes that day, so the results start before the check time: a result is a reply when its thread_ts is set and differs from its ts, or, since search often leaves thread_ts out, when its permalink has a thread_ts query parameter that differs from its ts; keep only the replies whose ts is after the check time and not after the time you noted, and read the next page only while the last result's ts is still at or before the time you noted. Group the replies by their thread ts. Otherwise fall back to a history scan: for each channel, read its top-level messages from the last ${SLACK_THREAD_PARENT_LOOKBACK_DAYS === 1 ? "day" : `${SLACK_THREAD_PARENT_LOOKBACK_DAYS} days`} with conversations.history, called with the channel ID, oldest set to ${SLACK_THREAD_PARENT_LOOKBACK_DAYS === 1 ? "one day" : `${SLACK_THREAD_PARENT_LOOKBACK_DAYS} days`} before the time you noted as a Unix timestamp, latest set to the time you noted, inclusive false, limit 200 and caching off, passing ${SLACK_THREAD_PARENTS_ANALYSIS_PROMPT} if your tool takes an analysis_prompt. The message that starts a thread is usually older than the check time, so the check time doesn't bound this read. Slack sets reply_count and latest_reply on a message that started a thread; a thread has new replies when its latest_reply is after the check time. History pages come newest first: follow the cursor only while has_more is true and the oldest message on the page is still inside the window, and read at most ${SLACK_THREAD_PARENT_MAX_PAGES} pages per channel; if that isn't every page, say in your reply that older threads in that channel weren't checked. Threads whose starting message is older than the window are only found through search. In both paths, use the check time itself, not 5 minutes before it: Slack shows replies at once, and the check time is what keeps a reply from being handled twice. For each thread with new replies, make one read with conversations.replies, called with the channel ID, ts set to the thread ts, oldest set to the check time as a Unix timestamp, latest set to the time you noted, inclusive false, limit 200 and caching off, following the cursor only while has_more is true; if your Slack tool takes an analysis_prompt, pass ${SLACK_HISTORY_ANALYSIS_PROMPT}${authorColumns}. Slack returns the message that started the thread first; if it doesn't, read that one message with conversations.replies with ts, oldest and latest all set to the thread ts, inclusive true and limit 1. Don't read a thread's earlier replies, don't pass a bash_query to a message read, and don't repeat a read. Leave out the message that started the thread, replies that end with a "${OMNIGENT_ATTRIBUTION}" line, which Omnigent sessions add to what they post, and replies whose user is your own user ID from auth.test. New top-level messages never count for this event: a message with no reply after the check time starts nothing, however new it is.${only} When a reply has no permalink, build it as the workspace URL followed by archives/<channel ID>/p<ts without its dot>?thread_ts=<thread ts>&cid=<channel ID>; the message that started the thread takes that form without the query.`,
+    leaveOut:
+      "Replies posted after the time you noted don't count yet: the next run picks them up, and a thread that gets more replies later is found again then.",
+    readOrder: `Finish every search, history and thread read before starting on any thread, then handle the threads oldest first, by the ts of the message that started each. If a search, a channel's history or a thread can't be read in full, handle only the threads you read in full and leave the rest for the next run, which searches from the previous check time again.`,
+    createdAt: "posted",
+    item: "thread",
+    fence: "slack-thread",
+    title: '"Slack <channel> <thread ts> replies <newest reply ts>"',
+    details:
+      "the channel, the message that started the thread with its author, text and permalink, and then the new replies, oldest first, each with its author, text and permalink",
+    linkBack: (link) => `Reply "${link}" in each thread you ${handled}.`,
+    opening: "thread with new replies",
+    skip: shared
+      ? `Skip any thread whose new replies you already sent to the task session, or that is on a "${DELIVERY_PENDING}" line. Your replies and your own earlier calls in this session that sent task messages, with their results, are the record of what you sent: check them first. For threads they don't show, also read your task session's latest items with sys_session_get_history (tail_items ${TASK_SESSION_HISTORY_ITEMS}) for task messages from your session whose title starts with ${titlePrefix} for that thread. ${alreadyHandled} Only the latest items are there, so older sends rely on your own record.`
+      : `Skip any thread whose new replies you already started a session for, or that is on a "${DELIVERY_PENDING}" line. Check the sessions your earlier replies in this session say you started first. For threads they don't show, call sys_session_list once with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID and whose title starts with ${titlePrefix} for that thread. ${alreadyHandled} If the listed rows have no archived field, the runner predates include_archived and listed only active sessions, so rely on your earlier replies for archived ones. sys_session_get_info with no arguments returns your session ID and agent ID.`,
+    // A thread read can fail part way, so a partial run searches from the same check time again.
+    partialCheckpoint: "the previous check time",
+    stateLine,
+  };
+}
+
 /**
  * The Slack channel step that sends new replies in each followed thread to the session its
  * first message went to, so a conversation stays in one session instead of starting new ones.
@@ -1933,7 +2038,11 @@ export function renderTriggerPrompt(
   const followsThreads = text.followsThreads === true;
   const workerPostingInstructions =
     source === "slack"
-      ? slackWorkerPostingInstructions(fields.linkBack, ctx.sessionLink)
+      ? slackWorkerPostingInstructions(
+          fields.linkBack,
+          ctx.sessionLink,
+          fields.event === "thread_reply",
+        )
       : POSTING_INSTRUCTIONS;
   const pendingLines = [
     `"${DELIVERY_PENDING}"`,
