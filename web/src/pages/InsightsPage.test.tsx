@@ -86,9 +86,21 @@ describe("InsightsPanels", () => {
     expect(within(roles).getAllByText("—").length).toBe(4);
     expect(within(roles).getByText("2")).toBeTruthy(); // side chats are measured
     expect(screen.getByText(/aren't measured yet/)).toBeTruthy();
-    const team = screen.getByRole("region", { name: "Building the team" });
-    expect(within(team).getByText("Created by the Lead 67%")).toBeTruthy();
+    const team = screen.getByRole("region", { name: "Team" });
+    expect(within(team).getByText("By the Lead 67%")).toBeTruthy();
     expect(within(team).getByText("6.5 h")).toBeTruthy();
+  });
+
+  it("leads with numbers and keeps each panel's question behind its info button", () => {
+    render(<InsightsPanels numbers={insightsNumbers(project("Alpha"))} />);
+    expect(screen.getAllByTestId("insights-panel")).toHaveLength(4);
+    expect(screen.queryByText(/Decision:/)).toBeNull();
+    expect(screen.queryByText(/real front door/)).toBeNull();
+    expect(screen.getByRole("button", { name: "About Starting work" })).toBeTruthy();
+    const shipping = screen.getByRole("region", { name: "Shipping" });
+    // Stalled work is the one number tinted as a problem.
+    const stalled = within(shipping).getByText("Stalled 3+ days").parentElement!;
+    expect(within(stalled).getByText("2").className).toContain("text-warning");
   });
 });
 

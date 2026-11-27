@@ -1,8 +1,11 @@
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { InfoIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Link } from "@/lib/routing";
+import { cn } from "@/lib/utils";
 import {
   formatTelemetryNumber,
   getProjectTelemetry,
@@ -31,51 +34,88 @@ export function insightsNumbers(telemetry: ProjectTelemetry): InsightsNumbers {
   };
 }
 
+function About({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={label}
+          className="-m-1 inline-flex size-6 items-center justify-center rounded-full text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+        >
+          <InfoIcon className="size-4" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-64">{children}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/** One panel: a title, its question behind an info button, then numbers. */
 function Panel({
   title,
-  question,
-  decision,
+  about,
+  bar,
   children,
 }: {
   title: string;
-  question: string;
-  decision: string;
+  /** The question the panel answers and the decision it informs. */
+  about: string;
+  bar?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <section
       aria-label={title}
-      className="flex flex-col gap-2.5 rounded-lg border border-border/60 p-3"
+      className="flex flex-col gap-3 rounded-lg border border-border/60 p-3"
       data-testid="insights-panel"
     >
-      <div>
+      <div className="flex items-center gap-1.5">
         <h3 className="font-medium">{title}</h3>
-        <p className="text-xs text-muted-foreground">{question}</p>
+        <About label={`About ${title}`}>{about}</About>
       </div>
-      <dl className="flex flex-col gap-1.5 text-sm">{children}</dl>
-      <p className="mt-auto rounded-md bg-muted/60 px-2 py-1.5 text-xs text-muted-foreground">
-        Decision: {decision}
-      </p>
+      {bar}
+      <dl className="grid grid-cols-2 gap-x-3 gap-y-2.5">{children}</dl>
     </section>
   );
 }
 
-function Row({ label, value, note }: { label: string; value: string; note?: string }) {
+/** A number first, with a short caption under it. */
+function Stat({
+  value,
+  label,
+  warn = false,
+  note,
+}: {
+  value: string;
+  label: string;
+  /** Tint the number when it signals a problem, e.g. stalled work. */
+  warn?: boolean;
+  /** A caveat about this number, shown behind an info button. */
+  note?: string;
+}) {
   return (
-    <div className="grid grid-cols-[1fr_auto] items-baseline gap-x-3">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="font-medium tabular-nums">{value}</dd>
-      {note && <dd className="col-span-2 text-xs text-muted-foreground">{note}</dd>}
+    <div className="flex min-w-0 flex-col">
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd
+        className={cn(
+          "order-first flex items-center gap-1 text-xl leading-tight font-semibold tabular-nums",
+          warn && "text-warning",
+        )}
+      >
+        {value}
+        {note && <About label={note}>{note}</About>}
+      </dd>
     </div>
   );
 }
 
-/** A two- or three-part share bar with its legend, e.g. roles by the Lead vs by hand. */
+/** A share bar with a dot legend, e.g. roles created by the Lead vs by hand. */
 function ShareBar({ parts }: { parts: { label: string; value: number; className: string }[] }) {
   const total = parts.reduce((sum, part) => sum + part.value, 0);
   if (total === 0) return null;
   return (
-    <div className="space-y-1">
+    <div className="space-y-1.5">
       <div className="flex h-2 overflow-hidden rounded-full bg-muted" aria-hidden>
         {parts.map((part) => (
           <span
@@ -85,10 +125,11 @@ function ShareBar({ parts }: { parts: { label: string; value: number; className:
           />
         ))}
       </div>
-      <p className="flex flex-wrap gap-x-3 text-xs text-muted-foreground">
+      <p className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
         {parts.map((part) => (
-          <span key={part.label}>
-            {part.label} {Math.round((part.value / total) * 100)}%
+          <span key={part.label} className="inline-flex items-center gap-1.5">
+            <span aria-hidden className={cn("size-2 rounded-full", part.className)} />
+            {`${part.label} ${Math.round((part.value / total) * 100)}%`}
           </span>
         ))}
       </p>
@@ -97,128 +138,142 @@ function ShareBar({ parts }: { parts: { label: string; value: number; className:
 }
 
 const NOT_MEASURED =
-  "Messages to the Lead and roles aren't measured yet: stored messages can't tell a person's words from the server's own notices. They'll appear once the usage log records each message as it's sent.";
+  "Stored messages can't tell a person's words from the server's own notices. These numbers appear once the usage log records each message as it's sent.";
 
 /** The question-led panels shared by a project's Summary and the Insights page. */
 export function InsightsPanels({ numbers }: { numbers: InsightsNumbers }) {
   const { workStart, roles, team, shipping } = numbers;
   const unmeasured = roles.messages_to_lead === null;
   return (
-    <div className="space-y-2">
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
-        <Panel
-          title="How people start work"
-          question="Is chat or the board the real front door?"
-          decision="what the project page leads with, the board or a chat."
-        >
-          <ShareBar
-            parts={[
-              {
-                label: "Chat first",
-                value: workStart.people.session_first,
-                className: "bg-primary",
-              },
-              {
-                label: "Tickets first",
-                value: workStart.people.ticket_first,
-                className: "bg-primary/40",
-              },
-              { label: "Both", value: workStart.people.both, className: "bg-muted-foreground/40" },
-            ]}
-          />
-          <Row
-            label="Sessions started by people"
-            value={formatTelemetryNumber(workStart.sessions_started_by_people)}
-          />
-          <Row
-            label="Tickets filed on the board"
-            value={formatTelemetryNumber(workStart.tickets_filed_directly)}
-          />
-          <Row
-            label="Tickets filed from a chat"
-            value={formatTelemetryNumber(workStart.tickets_filed_from_a_chat)}
-          />
-          <Row
-            label="Tickets filed by agents"
-            value={formatTelemetryNumber(workStart.tickets_filed_by_agents)}
-          />
-        </Panel>
-        <Panel
-          title="Lead and roles"
-          question="Do people talk to roles, or route everything through tickets?"
-          decision="whether roles get their own chat entry points, or stay behind tickets."
-        >
-          <Row label="Messages to the Lead" value={formatTelemetryNumber(roles.messages_to_lead)} />
-          <Row label="Messages to roles" value={formatTelemetryNumber(roles.messages_to_roles)} />
-          <Row
-            label="People who message roles"
-            value={formatTelemetryNumber(roles.people_messaging_roles)}
-          />
-          <Row
-            label="People who only use ticket comments"
-            value={formatTelemetryNumber(roles.people_ticket_only)}
-          />
-          <Row label="Side chats opened" value={formatTelemetryNumber(roles.side_chats_opened)} />
-        </Panel>
-        <Panel
-          title="Building the team"
-          question="Do people trust the Lead to staff the project?"
-          decision="invest in better role defaults if roles keep being reworked."
-        >
-          <ShareBar
-            parts={[
-              {
-                label: "Created by the Lead",
-                value: team.roles_created_by_lead,
-                className: "bg-primary",
-              },
-              {
-                label: "By hand",
-                value: team.roles_created_by_hand,
-                className: "bg-muted-foreground/40",
-              },
-            ]}
-          />
-          <Row label="Roles" value={formatTelemetryNumber(team.roles)} />
-          <Row
-            label="Roles edited after creation"
-            value={formatTelemetryNumber(team.roles_edited_after_creation)}
-          />
-          <Row
-            label="Median time to last edit"
-            value={formatTelemetryNumber(team.median_hours_to_last_role_edit, " h")}
-          />
-        </Panel>
-        <Panel
-          title="Shipping"
-          question="Is the factory productive, and where does work get stuck?"
-          decision="where to point performance and workflow fixes."
-        >
-          <Row label="Tickets shipped" value={formatTelemetryNumber(shipping.tickets_shipped)} />
-          <Row
-            label="PRs merged"
-            value={formatTelemetryNumber(shipping.merged_prs)}
-            note={prsMergedZeroNote(shipping.merged_prs, shipping.tickets_shipped)}
-          />
-          {shipping.changes_landed != null && (
-            <Row label="Changes landed" value={formatTelemetryNumber(shipping.changes_landed)} />
-          )}
-          <Row
-            label="Median time to merged"
-            value={formatTelemetryNumber(shipping.time_to_merged_median_hours, " h")}
-          />
-          <Row
-            label="Review rounds per ticket"
-            value={formatTelemetryNumber(shipping.review_rounds_per_shipped_ticket)}
-          />
-          <Row
-            label="Tickets stalled 3+ days"
-            value={formatTelemetryNumber(shipping.stalled_tickets)}
-          />
-        </Panel>
+    <TooltipProvider delayDuration={200}>
+      <div className="space-y-2">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <Panel
+            title="Starting work"
+            about="Is chat or the board the real front door? This decides what the project page leads with."
+            bar={
+              <ShareBar
+                parts={[
+                  { label: "Chat", value: workStart.people.session_first, className: "bg-primary" },
+                  {
+                    label: "Tickets",
+                    value: workStart.people.ticket_first,
+                    className: "bg-primary/40",
+                  },
+                  {
+                    label: "Both",
+                    value: workStart.people.both,
+                    className: "bg-muted-foreground/50",
+                  },
+                ]}
+              />
+            }
+          >
+            <Stat
+              value={formatTelemetryNumber(workStart.sessions_started_by_people)}
+              label="Sessions by people"
+            />
+            <Stat
+              value={formatTelemetryNumber(workStart.tickets_filed_directly)}
+              label="Board tickets"
+            />
+            <Stat
+              value={formatTelemetryNumber(workStart.tickets_filed_from_a_chat)}
+              label="Chat tickets"
+            />
+            <Stat
+              value={formatTelemetryNumber(workStart.tickets_filed_by_agents)}
+              label="Agent tickets"
+            />
+          </Panel>
+          <Panel
+            title="Lead and roles"
+            about="Do people talk to roles, or route everything through tickets? This decides whether roles get their own chat entry points."
+          >
+            <Stat
+              value={formatTelemetryNumber(roles.messages_to_lead)}
+              label="Messages to Lead"
+            />
+            <Stat
+              value={formatTelemetryNumber(roles.messages_to_roles)}
+              label="Messages to roles"
+            />
+            <Stat
+              value={formatTelemetryNumber(roles.people_messaging_roles)}
+              label="People messaging roles"
+            />
+            <Stat
+              value={formatTelemetryNumber(roles.people_ticket_only)}
+              label="Comment-only people"
+            />
+            <Stat value={formatTelemetryNumber(roles.side_chats_opened)} label="Side chats" />
+          </Panel>
+          <Panel
+            title="Team"
+            about="Do people trust the Lead to staff the project? If roles keep being reworked, invest in better role defaults."
+            bar={
+              <ShareBar
+                parts={[
+                  {
+                    label: "By the Lead",
+                    value: team.roles_created_by_lead,
+                    className: "bg-primary",
+                  },
+                  {
+                    label: "By hand",
+                    value: team.roles_created_by_hand,
+                    className: "bg-muted-foreground/50",
+                  },
+                ]}
+              />
+            }
+          >
+            <Stat value={formatTelemetryNumber(team.roles)} label="Roles" />
+            <Stat
+              value={formatTelemetryNumber(team.roles_edited_after_creation)}
+              label="Edited after creation"
+            />
+            <Stat
+              value={formatTelemetryNumber(team.median_hours_to_last_role_edit, " h")}
+              label="Median to last edit"
+            />
+          </Panel>
+          <Panel
+            title="Shipping"
+            about="Is the factory productive, and where does work get stuck? This points performance and workflow fixes."
+          >
+            <Stat value={formatTelemetryNumber(shipping.tickets_shipped)} label="Tickets shipped" />
+            <Stat
+              value={formatTelemetryNumber(shipping.merged_prs)}
+              label="PRs merged"
+              note={prsMergedZeroNote(shipping.merged_prs, shipping.tickets_shipped)}
+            />
+            {shipping.changes_landed != null && (
+              <Stat value={formatTelemetryNumber(shipping.changes_landed)} label="Changes landed" />
+            )}
+            <Stat
+              value={formatTelemetryNumber(shipping.time_to_merged_median_hours, " h")}
+              label="Median to merge"
+            />
+            <Stat
+              value={formatTelemetryNumber(shipping.review_rounds_per_shipped_ticket)}
+              label="Review rounds per ticket"
+            />
+            <Stat
+              value={formatTelemetryNumber(shipping.stalled_tickets)}
+              label="Stalled 3+ days"
+              warn={(shipping.stalled_tickets ?? 0) > 0}
+            />
+          </Panel>
+        </div>
+        {unmeasured && (
+          <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            Messages aren't measured yet.
+            <About label="Why messages aren't measured">{NOT_MEASURED}</About>
+          </p>
+        )}
       </div>
-      {unmeasured && <p className="text-xs text-muted-foreground">{NOT_MEASURED}</p>}
-    </div>
+    </TooltipProvider>
   );
 }
 
@@ -231,6 +286,9 @@ const PEOPLE_COLUMNS: { key: keyof TelemetryPerson; label: string }[] = [
   { key: "ticket_comments", label: "Comments" },
 ];
 
+// On narrow screens the table scrolls sideways; names stay on one line and pinned.
+const PERSON_CELL = "sticky left-0 z-10 bg-background px-3 py-2 text-left whitespace-nowrap";
+
 export function InsightsPeopleTable({ people }: { people: TelemetryPerson[] }) {
   if (!people.length)
     return <p className="text-sm text-muted-foreground">No activity from people yet.</p>;
@@ -239,11 +297,15 @@ export function InsightsPeopleTable({ people }: { people: TelemetryPerson[] }) {
       <table className="w-full text-sm">
         <thead className="border-b border-border/60 text-muted-foreground">
           <tr>
-            <th scope="col" className="px-3 py-2 text-left font-medium">
+            <th scope="col" className={cn(PERSON_CELL, "font-medium")}>
               Person
             </th>
             {PEOPLE_COLUMNS.map((column) => (
-              <th key={column.key} scope="col" className="px-3 py-2 text-right font-medium">
+              <th
+                key={column.key}
+                scope="col"
+                className="px-3 py-2 text-right font-medium whitespace-nowrap"
+              >
                 {column.label}
               </th>
             ))}
@@ -252,7 +314,7 @@ export function InsightsPeopleTable({ people }: { people: TelemetryPerson[] }) {
         <tbody className="divide-y divide-border/60">
           {people.map((person) => (
             <tr key={person.user_id}>
-              <th scope="row" className="px-3 py-2 text-left font-normal">
+              <th scope="row" className={cn(PERSON_CELL, "font-normal")}>
                 <MemberName
                   member={{ kind: "human", name: person.user_id, user_id: person.user_id }}
                 />
