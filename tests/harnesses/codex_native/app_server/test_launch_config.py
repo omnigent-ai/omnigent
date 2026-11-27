@@ -685,6 +685,7 @@ def test_launch_argv_and_config_pin_name_the_same_model(
 async def test_unpinned_start_drops_claude_config_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     source_model: str,
     expected_model: str | None,
 ) -> None:
@@ -703,13 +704,16 @@ async def test_unpinned_start_drops_claude_config_model(
     _disable_codex_startup_rpc(monkeypatch)
 
     server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
-    await server.start()
-    await server.close()
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"):
+        await server.start()
+        await server.close()
 
     config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
     assert config.get("model") == expected_model
     assert config["model_provider"] == "gateway"
     assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+    warned = "Ignoring configured Codex model" in caplog.text
+    assert warned is (expected_model is None)
 
 
 async def test_start_pins_reasoning_effort_in_config(
