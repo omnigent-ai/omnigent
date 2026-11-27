@@ -21,7 +21,7 @@ const STATE_TEXT: Record<ProjectSlackState, string> = {
   active: "On: @omni in this channel reaches the Lead",
   disabled: "Paused: the channel is kept for this project but not watched",
   error: "Setup failed",
-  needs_reconnect: "Needs reconnecting: the owner's automation connection expired",
+  needs_reconnect: "Needs the owner to sign in; see below",
 };
 
 function channelLabel(link: ProjectSlackLink): string {
