@@ -946,6 +946,10 @@ async def test_a_draft_reply_goes_in_its_conversation_without_lines(
             pb.SearchReviewersRequest(pr_url=_PR, text="x" * 257),
             "The search is longer than 256 characters",
         ),
+        (
+            pb.SearchReviewersRequest(pr_url="https://github.com/" + "x" * 2048, text="al"),
+            "The pull request URL is longer than 2048 characters",
+        ),
         (pb.SearchReviewersRequest(pr_url=_PR, page_size=21), "Ask for at most 20 reviewers"),
         (pb.SearchReviewersRequest(pr_url=_PR, page_size=-1), "Ask for at most 20 reviewers"),
         (
@@ -965,6 +969,7 @@ async def test_a_draft_reply_goes_in_its_conversation_without_lines(
     ],
     ids=[
         "long-reviewer-text",
+        "long-pr-url",
         "too-many-reviewers",
         "negative-page",
         "long-completion-text",

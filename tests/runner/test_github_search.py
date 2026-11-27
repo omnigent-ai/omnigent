@@ -33,7 +33,10 @@ class FakeGraphQL:
         self.calls: list[list[str]] = []
         self.requests: list[dict[str, Any]] = []
         self.envs: list[dict[str, str] | None] = []
-        self.answer: Any = {"data": {}}
+        # A repository with no people and a search with no results, unless a test says.
+        self.answer: Any = {
+            "data": {"repository": {"assignableUsers": {"nodes": []}}, "search": {"nodes": []}}
+        }
         self.raw_output: str | None = None
         self.exit_code = 0
         # The teams with access to the repository, or ``None`` when GitHub refuses the list.
@@ -60,9 +63,6 @@ class FakeGraphQL:
             return self.exit_code, json.dumps(self.answer), "gh: example-org/secret-repo failed"
 
         monkeypatch.setattr(github, "_run", run)
-
-    def graphql_calls(self) -> list[list[str]]:
-        return [call for call in self.calls if call[0] == "api" and "graphql" in call]
 
     def api_calls(self) -> list[list[str]]:
         return [call for call in self.calls if call[0] == "api"]
@@ -92,6 +92,10 @@ def _people(*logins: str) -> dict[str, Any]:
     return {"nodes": [{"login": login, "name": login.title()} for login in logins]}
 
 
+def _people_named(prefix: str, count: int) -> dict[str, Any]:
+    return {"nodes": [{"login": f"{prefix}-{index}", "name": None} for index in range(count)]}
+
+
 def test_reviewers_are_the_repositorys_people_then_its_teams_with_access(
     tmp_path: Path, fake: FakeGraphQL
 ) -> None:
@@ -113,6 +117,7 @@ def test_reviewers_are_the_repositorys_people_then_its_teams_with_access(
             {"login": "alpha-reviewers", "kind": "team", "name": "Reviewers"},
             {"login": "platform", "kind": "team", "name": "Allied platform"},
         ],
+        "has_more": False,
     }
     (request,) = fake.requests
     # The text is a variable, never part of the query.
@@ -120,7 +125,8 @@ def test_reviewers_are_the_repositorys_people_then_its_teams_with_access(
         "owner": "example-org",
         "name": "example-repo",
         "q": "Al",
-        "first": 5,
+        # One past the page, to tell a full page of people from a cut one.
+        "first": 6,
     }
     assert "Al" not in request["query"]
     # Only teams with access to the repository are offered, never the whole organization's.
@@ -130,18 +136,55 @@ def test_reviewers_are_the_repositorys_people_then_its_teams_with_access(
         assert call[call.index("--hostname") + 1] == "github.com"
 
 
-def test_teams_are_capped_at_the_page_size(tmp_path: Path, fake: FakeGraphQL) -> None:
+@pytest.mark.parametrize(
+    ("page_size", "people", "teams", "shown"),
+    [
+        (3, 0, 10, ["team-0", "team-1", "team-2"]),
+        (4, 3, 3, ["user-0", "user-1", "user-2", "team-0"]),
+        (2, 3, 0, ["user-0", "user-1"]),
+    ],
+    ids=["teams-only", "people-then-teams", "people-only"],
+)
+def test_the_page_holds_people_then_teams_up_to_its_size(
+    tmp_path: Path, fake: FakeGraphQL, page_size: int, people: int, teams: int, shown: list[str]
+) -> None:
+    fake.answer = {"data": {"repository": {"assignableUsers": _people_named("user", people)}}}
+    fake.teams = [{"slug": f"team-{index}", "name": None} for index in range(teams)]
+
+    found = github_search.search_reviewers(
+        str(tmp_path), _reference(), text="", page_size=page_size
+    )
+
+    assert [entry["login"] for entry in found["data"]] == shown
+    assert found["has_more"] is True
+
+
+def test_with_no_page_size_the_page_holds_the_most_in_all(
+    tmp_path: Path, fake: FakeGraphQL
+) -> None:
+    fake.answer = {"data": {"repository": {"assignableUsers": _people_named("user", 21)}}}
     fake.teams = [{"slug": f"team-{index}", "name": None} for index in range(10)]
 
-    found = github_search.search_reviewers(str(tmp_path), _reference(), text="", page_size=3)
+    found = github_search.search_reviewers(str(tmp_path), _reference(), text="", page_size=0)
 
-    assert [entry["login"] for entry in found["data"]] == ["team-0", "team-1", "team-2"]
+    assert len(found["data"]) == github_search.MAX_REVIEWERS
+    assert {entry["kind"] for entry in found["data"]} == {"user"}
+    assert found["has_more"] is True
+    assert fake.requests[0]["variables"]["first"] == github_search.MAX_REVIEWERS + 1
 
 
-def test_reviewers_with_no_page_size_ask_for_the_most(tmp_path: Path, fake: FakeGraphQL) -> None:
-    github_search.search_reviewers(str(tmp_path), _reference(), text="", page_size=0)
+def test_a_team_list_cut_at_its_cap_says_there_may_be_more(
+    tmp_path: Path, fake: FakeGraphQL
+) -> None:
+    """GitHub lists 100 teams at most here, so a matching team past them can't be offered."""
+    fake.teams = [{"slug": f"team-{index}", "name": None} for index in range(100)]
 
-    assert fake.requests[0]["variables"]["first"] == github_search.MAX_REVIEWERS
+    found = github_search.search_reviewers(
+        str(tmp_path), _reference(), text="team-9", page_size=20
+    )
+
+    assert [entry["login"] for entry in found["data"]][:2] == ["team-9", "team-90"]
+    assert found["has_more"] is True
 
 
 def test_a_repository_whose_teams_cant_be_listed_answers_its_people(
@@ -173,7 +216,10 @@ def test_a_search_runs_as_the_account_saved_for_the_repository(
 
     github_search.search_reviewers(str(tmp_path), _reference(), text="a", page_size=0)
 
-    assert fake.calls[0] == ["auth", "token", "--user", "octocat", "-h", "github.com"]
+    # The token is read once for both reads.
+    assert [call for call in fake.calls if call[:2] == ["auth", "token"]] == [
+        ["auth", "token", "--user", "octocat", "-h", "github.com"]
+    ]
     api_envs = [env for call, env in zip(fake.calls, fake.envs, strict=True) if call[0] == "api"]
     assert len(api_envs) == 2
     assert all(env is not None and env["GH_TOKEN"] == TOKEN for env in api_envs)
@@ -217,6 +263,60 @@ def test_an_answer_that_isnt_data_names_nothing_gh_said(
 
     with pytest.raises(PullRequestError) as failed:
         github_search.search_reviewers(str(tmp_path), _reference(), text="a", page_size=0)
+
+    assert str(failed.value) == "GitHub couldn't answer this search. Try again."
+
+
+_SECRET_ERROR = {
+    "message": "Could not resolve to a Repository with the name 'example-org/secret-repo'."
+}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # The repository lookup failed: gh exits nonzero and GitHub names the repository.
+        {"data": {"repository": None}, "errors": [_SECRET_ERROR]},
+        {"data": None, "errors": [_SECRET_ERROR]},
+        # The repository answered, but without its people.
+        {"data": {"repository": {"assignableUsers": None}}},
+        {"data": {"repository": {}}},
+    ],
+    ids=["null-repository", "errors-only", "null-people", "no-people"],
+)
+@pytest.mark.parametrize("search", ["reviewers", "mention"])
+def test_a_repository_that_cant_be_read_is_a_failure_not_no_matches(
+    tmp_path: Path, fake: FakeGraphQL, answer: dict[str, Any], search: str
+) -> None:
+    """Lost access or a missing repository must not read as a search with no matches."""
+    fake.exit_code = 1
+    fake.answer = answer
+
+    with pytest.raises(PullRequestError) as failed:
+        if search == "reviewers":
+            github_search.search_reviewers(str(tmp_path), _reference(), text="a", page_size=0)
+        else:
+            github_search.search_completions(str(tmp_path), _reference(), kind="MENTION", text="a")
+
+    assert str(failed.value) == "GitHub couldn't answer this search. Try again."
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"data": {"search": None}, "errors": [_SECRET_ERROR]},
+        {"data": None, "errors": [_SECRET_ERROR]},
+    ],
+    ids=["null-search", "errors-only"],
+)
+def test_a_reference_search_github_failed_is_a_failure_not_no_matches(
+    tmp_path: Path, fake: FakeGraphQL, answer: dict[str, Any]
+) -> None:
+    fake.exit_code = 1
+    fake.answer = answer
+
+    with pytest.raises(PullRequestError) as failed:
+        github_search.search_completions(str(tmp_path), _reference(), kind="REFERENCE", text="")
 
     assert str(failed.value) == "GitHub couldn't answer this search. Try again."
 
