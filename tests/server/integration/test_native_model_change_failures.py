@@ -48,7 +48,7 @@ from tests.runner.conftest import (
 )
 from tests.runner.helpers import make_test_terminal_instance
 from tests.runner.native_helpers import _harness_spec
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, create_test_session
 from tests.server.integration.test_codex_model_change_after_idle_reap import _LoopbackCodex
 
 _QUESTION = """\
@@ -555,7 +555,7 @@ async def test_unconfirmed_claude_model_change_keeps_intent_without_claiming_an_
     session.assert_unconfirmed(response)
     assert ("saved default" in response.text) is (phase == "legacy")
     assert session.runner_replies[0].json().get("uncertainty_scope") == (
-        "session_and_saved_default" if phase == "legacy" else None
+        "session_and_saved_default" if phase == "legacy" else "session_only"
     )
     session.assert_model_request()
     assert len(session.runner_replies) == 1
@@ -796,37 +796,69 @@ async def test_refused_model_change_preserves_newer_silent_selection(
 
 
 @pytest.mark.parametrize(
-    ("confirmed", "newer_same_selection"),
-    [(True, False), (False, False), (False, True)],
-    ids=["confirmed", "refused", "refused-newer-selection"],
+    ("outcome", "newer_same_selection"),
+    [
+        ("confirmed", False),
+        ("refused", False),
+        ("refused", True),
+        ("unconfirmed", False),
+        ("unconfirmed", True),
+    ],
+    ids=[
+        "confirmed",
+        "refused",
+        "refused-newer-selection",
+        "unconfirmed",
+        "unconfirmed-newer-selection",
+    ],
 )
 async def test_new_server_accepts_legacy_runner_replies_without_losing_newer_metadata(
     client: httpx.AsyncClient,
-    native_session: _NativeSession,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    confirmed: bool,
+    outcome: str,
     newer_same_selection: bool,
 ) -> None:
     """Freeze the older peer's wire contract; its CLI actuator is outside this test."""
-    session = native_session
+    created = await create_test_session(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    session_id = created["id"]
+    previous_model, requested_model = "claude-opus-4-6", "claude-opus-4-7"
+    store = SqlAlchemyConversationStore(db_uri)
+    store.update_conversation(session_id, model_override=previous_model, reasoning_effort="high")
+    store.replace_runner_id(session_id, "legacy-runner")
+    events = []
+    publish = session_stream.publish
+
+    def capture_event(sid: str, event: dict[str, Any]) -> None:
+        if sid == session_id:
+            events.append(event)
+        publish(sid, event)
+
+    monkeypatch.setattr(session_stream, "publish", capture_event)
     requests: list[dict[str, Any]] = []
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def legacy_runner(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
-        assert request.url.path == f"/v1/sessions/{session.session_id}/events"
+        assert request.url.path == f"/v1/sessions/{session_id}/events"
         event = json.loads(request.content)
-        assert event == {"type": "model_change", "model": session.requested_model}
+        assert event == {"type": "model_change", "model": requested_model}
         requests.append(event)
         entered.set()
         await release.wait()
-        if confirmed:
+        if outcome == "confirmed":
             return httpx.Response(204)
         return httpx.Response(
             503,
             json={
-                "error": "claude_native_model_failed",
-                "detail": "The terminal refused the selection.",
+                "error": "claude_native_model_unconfirmed"
+                if outcome == "unconfirmed"
+                else "claude_native_model_failed",
+                "detail": "The older runner could not confirm the selection.",
             },
         )
 
@@ -839,9 +871,11 @@ async def test_new_server_accepts_legacy_runner_replies_without_losing_newer_met
         monkeypatch.setattr(
             routes_core,
             "ensure_runner_connected",
-            AsyncMock(return_value=(peer, session.store.get_conversation(session.session_id))),
+            AsyncMock(return_value=(peer, store.get_conversation(session_id))),
         )
-        pending = asyncio.create_task(_pick_model(client, session))
+        pending = asyncio.create_task(
+            client.patch(f"/v1/sessions/{session_id}", json={"model_override": requested_model})
+        )
         try:
             await asyncio.wait_for(entered.wait(), timeout=5)
             metadata: dict[str, Any] = {
@@ -850,8 +884,8 @@ async def test_new_server_accepts_legacy_runner_replies_without_losing_newer_met
                 "silent": True,
             }
             if newer_same_selection:
-                metadata["model_override"] = session.requested_model
-            newer = await client.patch(f"/v1/sessions/{session.session_id}", json=metadata)
+                metadata["model_override"] = requested_model
+            newer = await client.patch(f"/v1/sessions/{session_id}", json=metadata)
             assert newer.status_code == 200, newer.text
             release.set()
             response = await asyncio.wait_for(pending, timeout=5)
@@ -861,18 +895,21 @@ async def test_new_server_accepts_legacy_runner_replies_without_losing_newer_met
                 pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
 
-    assert requests == [{"type": "model_change", "model": session.requested_model}]
-    assert response.status_code == (200 if confirmed else 503), response.text
-    saved = session.store.get_conversation(session.session_id)
+    assert requests == [{"type": "model_change", "model": requested_model}]
+    assert response.status_code == (200 if outcome == "confirmed" else 503), response.text
+    if outcome == "unconfirmed":
+        assert "saved default" in response.text
+        assert "future terminals" in response.text
+        assert "Check the terminal's current model before retrying" in response.text
+    saved = store.get_conversation(session_id)
     assert saved.title == "Changed while older runner replied"
     assert saved.reasoning_effort == "low"
     assert saved.model_override == (
-        session.requested_model if confirmed or newer_same_selection else session.previous_model
+        requested_model if outcome != "refused" or newer_same_selection else previous_model
     )
-    assert [error["code"] for error in session.errors] == (
-        [] if confirmed else ["model_change_not_applied"]
+    assert [event["error"]["code"] for event in events if event["type"] == "response.error"] == (
+        ["model_change_not_applied"] if outcome == "refused" else []
     )
-    assert session.runner_replies == []
 
 
 @pytest.mark.parametrize("unconfirmed", [False, True], ids=["refused", "unconfirmed"])

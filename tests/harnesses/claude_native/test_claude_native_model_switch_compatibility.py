@@ -26,18 +26,24 @@ def _trust_test_bridge_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.parametrize(
-    ("version", "session_only", "legacy_dialog_delay_s"),
+    ("version", "session_only", "legacy_dialog_delay_s", "publication"),
     [
-        pytest.param("2.1.302", False, None, id="2.1.302-False"),
-        pytest.param("2.1.311", False, None, id="2.1.311-False"),
-        pytest.param("2.1.322", False, None, id="2.1.322-False"),
-        pytest.param("2.1.323", True, None, id="2.1.323-True"),
-        pytest.param("2.1.324", True, None, id="2.1.324-True"),
-        pytest.param("2.2.0", True, None, id="2.2.0-True"),
-        pytest.param("3.0.0", True, None, id="3.0.0-True"),
-        pytest.param("2.1.323-preview", False, None, id="2.1.323-preview-False"),
-        pytest.param(None, False, None, id="None-False"),
-        pytest.param("2.1.311", False, 0, id="legacy-immediate-confirmation"),
+        pytest.param("2.1.302", False, None, None, id="2.1.302-False"),
+        pytest.param("2.1.311", False, None, None, id="2.1.311-False"),
+        pytest.param("2.1.322", False, None, None, id="2.1.322-False"),
+        pytest.param("2.1.323", True, None, None, id="2.1.323-True"),
+        pytest.param("2.1.324", True, None, None, id="2.1.324-True"),
+        pytest.param("2.2.0", True, None, None, id="2.2.0-True"),
+        pytest.param("3.0.0", True, None, None, id="3.0.0-True"),
+        pytest.param("2.1.323-preview", False, None, None, id="2.1.323-preview-False"),
+        pytest.param(None, False, None, None, id="None-False"),
+        pytest.param("2.1.311", False, 0, None, id="legacy-immediate-confirmation"),
+        pytest.param("2.1.323", True, None, "delayed", id="delayed-supported-version"),
+        pytest.param("2.1.322", False, None, "delayed", id="delayed-older-version"),
+        pytest.param("2.1.323-preview", False, None, "delayed", id="delayed-preview-version"),
+        pytest.param("2.1.323", True, None, "foreign", id="delayed-foreign-version"),
+        pytest.param("2.1.323", True, None, "deadline", id="version-wait-deadline"),
+        pytest.param("2.1.323", True, None, "cancelled", id="version-wait-cancelled"),
     ],
 )
 def test_model_changes_preserve_the_version_appropriate_behavior(
@@ -46,20 +52,59 @@ def test_model_changes_preserve_the_version_appropriate_behavior(
     version: str | None,
     session_only: bool,
     legacy_dialog_delay_s: float | None,
+    publication: str | None,
 ) -> None:
     composer = _SessionModelComposer(legacy_dialog_delay_s=legacy_dialog_delay_s)
     composer.version = version or "unknown"
     bridge_dir = _session_model_bridge(tmp_path, composer)
-    if version is None:
-        path = bridge_dir / bridge.CONTEXT_RAW_FILE
-        raw = json.loads(path.read_text())
+    path = bridge_dir / bridge.CONTEXT_RAW_FILE
+    raw = json.loads(path.read_text())
+    if version is None or publication is not None:
         raw.pop("version")
         path.write_text(json.dumps(raw))
     initial_default = composer.saved_default
     composer.install(monkeypatch)
+    cancelled = threading.Event()
+    published = []
+    if publication is not None:
+        sleep = bridge.time.sleep
 
-    result = bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        def publish_version(seconds: float) -> None:
+            sleep(seconds)
+            if bridge.time.monotonic() < 0.1 or published:
+                return
+            assert composer.sends == []
+            if publication == "cancelled":
+                cancelled.set()
+                return
+            current = {**raw, "version": version}
+            if publication == "foreign":
+                current["session_id"] = "another-native-session"
+            path.write_text(json.dumps(current))
+            published.append(bridge.time.monotonic())
 
+        monkeypatch.setattr(bridge.time, "sleep", publish_version)
+
+    with bridge.cancellable_injection(cancelled):
+        if publication in {"foreign", "deadline", "cancelled"}:
+            with pytest.raises(bridge.ClaudeModelSwitchRefused) as caught:
+                bridge.inject_model_command(
+                    bridge_dir,
+                    model="private-glm[1m]",
+                    timeout_s=0.05 if publication == "deadline" else 2,
+                )
+            assert not caught.value.command_submitted
+            assert not caught.value.model_may_have_changed
+            assert composer.sends == []
+            assert composer.saved_default == initial_default
+            return
+
+        result = bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    if publication is not None:
+        assert len(published) == 1
+    if version is None:
+        assert bridge.time.monotonic() >= 0.5
     assert result.requested_model == composer.model == "private-glm[1m]"
     if session_only:
         assert isinstance(result, bridge.ClaudeModelSwitchResult)

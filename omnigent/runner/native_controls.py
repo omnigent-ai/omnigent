@@ -1487,6 +1487,8 @@ def build_native_controls(
                 error_code = "claude_native_model_unconfirmed"
                 if exc.phase == "legacy":
                     uncertainty_scope = "session_and_saved_default"
+                else:
+                    uncertainty_scope = "session_only"
                 detail = (
                     str(exc)
                     if exc.phase == "legacy"

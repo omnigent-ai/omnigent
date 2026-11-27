@@ -5790,6 +5790,7 @@ def inject_model_command(
     this function never sends the dependent prompt.
     Older or unverified CLIs keep matching, identity-bound status unchanged;
     actual legacy selections retain their default-changing command behavior.
+    Missing version evidence gets a bounded startup wait within the same deadline.
     """
     deadline = ModelSwitchDeadline(timeout_s, _INJECTION_CANCEL_EVENT.get(), time.monotonic)
     transaction = SessionOnlyModelSwitch(
@@ -5802,6 +5803,26 @@ def inject_model_command(
     try:
         with cancellable_injection(deadline):
             raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+            if raw.get("version") is None:
+                version_until = min(deadline.at, deadline.clock() + 0.5)
+                while True:
+                    _check_injection_cancelled()
+                    raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+                    session = read_claude_session_id(bridge_dir)
+                    if (
+                        raw.get("version") is not None
+                        and session
+                        and raw.get("session_id") == session
+                    ):
+                        break
+                    if deadline.clock() >= version_until:
+                        if raw.get("version") is not None:
+                            raise transaction.refuse(
+                                "Claude's version evidence does not match its current session. "
+                                "Retry model selection explicitly."
+                            )
+                        break
+                    time.sleep(min(0.05, version_until - deadline.clock(), deadline.remaining_s()))
             if not supports_session_only_model_switch(raw.get("version")):
                 return _inject_legacy_model_command_locked(
                     bridge_dir, transaction, literal_model=legacy_literal_model

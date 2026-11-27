@@ -4774,7 +4774,7 @@ def register_core_routes(
                         )
                     elif (
                         _runner_reply_field(_model_forward.body, "uncertainty_scope")
-                        == "session_and_saved_default"
+                        != "session_only"
                     ):
                         uncertainty_detail = (
                             "Claude may have changed the session model and the saved default for "
