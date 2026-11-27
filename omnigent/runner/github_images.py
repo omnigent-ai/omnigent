@@ -367,14 +367,21 @@ def read_pull_request_image(
         _read_slots.release()
 
 
-def _image_token(root: str, reference: PullRequestRef) -> str | None:
+def _image_token(root: str, reference: PullRequestRef) -> str:
     """The bound account's token; in a managed sandbox, the owner's brokered one.
 
     A sandbox binds no token, because ``gh`` reads the owner's from its ``hosts.yml``. The
     fetch doesn't go through ``gh``, so it asks ``gh`` for that token, which ignores the
-    ambient token variables there.
+    ambient token variables there. Without a token the fetch would run signed out, so it
+    is refused instead.
+
+    :raises ValueError: When the token can't be read, or reading it timed out.
     """
     token = github._pr_token(root, reference)
-    if token is None and github._in_sandbox():
+    if not token and github._in_sandbox():
         token = github._gh_active_token(root, reference.host)
+        if github._gh_timed_out.get():
+            raise ValueError(_AUTHENTICATION_TIMED_OUT)
+    if not token:
+        raise ValueError(github._ACTIVE_ACCOUNT_UNREADABLE)
     return token

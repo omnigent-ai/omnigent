@@ -56,8 +56,10 @@ class FakeGitHub:
         self.active_tokens = [TOKEN]
         # Each active-account token lookup, as binding the PR's account makes one.
         self.token_lookups: list[str] = []
-        # What a sandbox's gh answers from its hosts.yml.
+        # What a sandbox's gh answers from its hosts.yml, and how that lookup ends.
         self.broker_token = ""
+        self.broker_exit_code = 0
+        self.broker_times_out = False
         monkeypatch.setattr(github, "_gh_active_token", self._active_token)
 
     def _active_token(self, _root: str, host: str = "github.com") -> str | None:
@@ -69,7 +71,10 @@ class FakeGitHub:
     ) -> tuple[int | None, str, str]:
         self.calls.append((argv, token))
         if argv[:2] == ["auth", "token"]:
-            return 0, f"{self.broker_token}\n", ""
+            if self.broker_times_out:
+                github._gh_timed_out.set(True)
+                return None, "", ""
+            return self.broker_exit_code, f"{self.broker_token}\n", ""
         return 1, "", "An image read runs no other gh command"
 
 
@@ -778,6 +783,50 @@ def test_a_pr_on_the_gh_host_set_up_is_read(
 
     assert _read(GHES_ASSET, transport, pr_url=GHES_PR_URL).data == PNG
     assert transport.seen[0].headers["authorization"] == f"token {TOKEN}"
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "output", "times_out", "message"),
+    [
+        (1, "gho_brokered_example", False, "Couldn't read the host's GitHub sign-in"),
+        (0, "", False, "Couldn't read the host's GitHub sign-in"),
+        (0, "", True, "GitHub authentication timed out"),
+    ],
+    ids=["failed", "empty", "timed-out"],
+)
+def test_a_sandbox_whose_token_cant_be_read_fetches_nothing(
+    fake: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    output: str,
+    times_out: bool,
+    message: str,
+) -> None:
+    """Without the owner's token the fetch would run signed out, so it never starts."""
+    monkeypatch.setattr(github, "_in_sandbox", lambda: True)
+    monkeypatch.setattr(github, "_gh_active_token", _REAL_ACTIVE_TOKEN)
+    fake.broker_token = output
+    fake.broker_exit_code = exit_code
+    fake.broker_times_out = times_out
+    transport = Transport(_image())
+
+    with pytest.raises(ValueError, match=message):
+        _read(ASSET, transport)
+
+    assert transport.seen == []
+
+
+def test_an_empty_bound_token_fetches_nothing(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty token would send a bare Authorization header, so the read is refused."""
+    monkeypatch.setattr(github, "_pr_token", lambda _root, _reference: "")
+    transport = Transport(_image())
+
+    with pytest.raises(ValueError, match="Couldn't read the host's GitHub sign-in"):
+        _read(ASSET, transport)
+
+    assert transport.seen == []
 
 
 def test_a_sandbox_fetches_with_its_brokered_token_on_the_first_request_only(
