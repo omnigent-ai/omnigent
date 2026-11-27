@@ -42,7 +42,9 @@ _LAUNCHER_FD = 42
 _Result = TypeVar("_Result")
 
 
-def _start_worker(action: Callable[[], _Result]) -> tuple[threading.Thread, Future[_Result]]:
+def _start_worker(
+    action: Callable[[], _Result], *, daemon: bool | None = None
+) -> tuple[threading.Thread, Future[_Result]]:
     result: Future[_Result] = Future()
 
     def run() -> None:
@@ -51,7 +53,7 @@ def _start_worker(action: Callable[[], _Result]) -> tuple[threading.Thread, Futu
         except BaseException as error:
             result.set_exception(error)
 
-    worker = threading.Thread(target=run)
+    worker = threading.Thread(target=run, daemon=daemon)
     worker.start()
     return worker, result
 
@@ -769,6 +771,9 @@ signal.pause()
                     hardening.fileno(),
                 ),
             )
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    resources.callback(stream.close)
             child.close()
             launcher_lifetime = os.pidfd_open(process.pid)
             resources.callback(os.close, launcher_lifetime)
@@ -792,7 +797,9 @@ signal.pause()
             init_lifetime = os.dup(owner._init_pidfd)
             resources.callback(os.close, init_lifetime)
             observed_lifetimes.append(init_lifetime)
-            worker, result = _start_worker(lambda: owner.run(deadline=time.monotonic() + 10))
+            worker, result = _start_worker(
+                lambda: owner.run(deadline=time.monotonic() + 10), daemon=True
+            )
             yield _LiveBwrapRequest(
                 owner, process, result, init_lifetime, launcher_lifetime, descendant_ready
             )
@@ -805,25 +812,26 @@ signal.pause()
                 )
             raise
         finally:
-            if owner is not None:
-                with suppress(OSError):
-                    owner.cancel()
-            for descriptor in observed_lifetimes:
-                with suppress(ProcessLookupError):
-                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-            if worker is not None:
-                worker.join(timeout=10)
-                assert not worker.is_alive(), "Request control did not finish after pinned cleanup"
-            elif owner is not None:
-                with suppress(request_control.RequestCancelled):
-                    owner.run(deadline=time.monotonic())
-            if process is not None:
-                if not observed_lifetimes and process.poll() is None:
-                    process.kill()
-                process.wait(timeout=10)
-                for stream in (process.stdout, process.stderr):
-                    if stream is not None:
-                        stream.close()
+            stalled_worker = False
+            try:
+                if owner is not None:
+                    with suppress(OSError):
+                        owner.cancel()
+                for descriptor in observed_lifetimes:
+                    with suppress(ProcessLookupError):
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                if worker is not None:
+                    worker.join(timeout=10)
+                    stalled_worker = worker.is_alive()
+                elif owner is not None:
+                    with suppress(request_control.RequestCancelled):
+                        owner.run(deadline=time.monotonic())
+            finally:
+                if process is not None:
+                    if not observed_lifetimes and process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=10)
+            assert not stalled_worker, "Request worker stalled after pinned and launcher cleanup"
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="requires Bubblewrap")
