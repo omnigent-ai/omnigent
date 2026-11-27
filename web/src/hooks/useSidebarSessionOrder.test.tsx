@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   currentSidebarSessionId,
+  PENDING_SESSION_MS,
   stepSidebarSession,
   steppedSessionId,
   usePublishSidebarSessionOrder,
@@ -46,12 +47,14 @@ describe("usePublishSidebarSessionOrder", () => {
       orderedSessionIds: ["a", "b"],
       activeSessionId: "b",
       pendingSessionId: null,
+      pendingSince: 0,
     });
     view.unmount();
     expect(useSidebarSessionOrderStore.getState()).toEqual({
       orderedSessionIds: [],
       activeSessionId: null,
       pendingSessionId: null,
+      pendingSince: 0,
     });
   });
 });
@@ -89,6 +92,26 @@ describe("stepSidebarSession", () => {
     expect(currentSidebarSessionId()).toBe("b");
     act(() => view.getByRole("button").click());
     expect(currentSidebarSessionId()).toBe("a");
+  });
+
+  it("forgets a step whose navigation never commits, so steps and a retry start over", () => {
+    vi.useFakeTimers();
+    try {
+      useSidebarSessionOrderStore.setState({
+        orderedSessionIds: ["a", "b", "c"],
+        activeSessionId: "a",
+      });
+      // A guard, such as unsaved edits, cancels the navigation to b.
+      const navigate = vi.fn();
+      stepSidebarSession(1, navigate);
+      expect(currentSidebarSessionId()).toBe("b");
+      vi.advanceTimersByTime(PENDING_SESSION_MS);
+      expect(currentSidebarSessionId()).toBe("a");
+      stepSidebarSession(1, navigate);
+      expect(navigate.mock.calls).toEqual([["/c/b"], ["/c/b"]]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("has nowhere to go with nothing listed", () => {

@@ -10,14 +10,22 @@ import { useLocation } from "@/lib/routing";
 interface SidebarSessionOrderState {
   /** Visible rows in render order, without duplicates; empty while no sidebar lists any. */
   orderedSessionIds: readonly string[];
-  /** The open session's row, or null off-list (a new session, the inbox). */
+  /**
+   * The session the route shows (a sub-agent's root), whether or not the list still holds its
+   * row; null on a page that shows none, such as a new session or the inbox.
+   */
   activeSessionId: string | null;
   /**
    * A session a step opened that the route hasn't rendered yet. Navigations render in a
    * transition that waits for the session to load, so a quick next step starts from here.
    */
   pendingSessionId: string | null;
+  /** When `pendingSessionId` was set, so a navigation that never commits stops counting. */
+  pendingSince: number;
 }
+
+/** How long a step's session counts as current before the route has rendered it. */
+export const PENDING_SESSION_MS = 5_000;
 
 const NO_SESSIONS: readonly string[] = [];
 
@@ -25,6 +33,7 @@ export const useSidebarSessionOrderStore = create<SidebarSessionOrderState>(() =
   orderedSessionIds: NO_SESSIONS,
   activeSessionId: null,
   pendingSessionId: null,
+  pendingSince: 0,
 }));
 
 /** Publishes the sidebar's rows while it's mounted, and clears them once it unmounts. */
@@ -70,10 +79,27 @@ export function steppedSessionId(
   return orderedSessionIds[(current + direction + count) % count];
 }
 
-/** The session a step starts from: the one a step last opened, else the rendered one. */
-export function currentSidebarSessionId(): string | null {
-  const { pendingSessionId, activeSessionId } = useSidebarSessionOrderStore.getState();
-  return pendingSessionId ?? activeSessionId;
+/**
+ * The session a step starts from: the one a step last opened, else the rendered one. A step's
+ * session stops counting once its navigation has gone uncommitted for `PENDING_SESSION_MS`,
+ * as when a guard cancels it.
+ */
+export function currentSidebarSessionId(now = Date.now()): string | null {
+  const { pendingSessionId, pendingSince, activeSessionId } =
+    useSidebarSessionOrderStore.getState();
+  const pendingCurrent = pendingSessionId !== null && now - pendingSince < PENDING_SESSION_MS;
+  return pendingCurrent ? pendingSessionId : activeSessionId;
+}
+
+/** Opens `sessionId` at `path`, counting it as current until the route renders it. */
+export function navigateToPendingSession(
+  sessionId: string,
+  path: string,
+  navigate: (path: string) => void,
+): void {
+  // Recorded first, so the commit that renders it clears it rather than running before it.
+  useSidebarSessionOrderStore.setState({ pendingSessionId: sessionId, pendingSince: Date.now() });
+  navigate(path);
 }
 
 /**
@@ -94,6 +120,5 @@ export function stepSidebarSession(
 /** Opens `sessionId` from a shortcut, unless it's already the current one; see `pendingSessionId`. */
 export function openSidebarSession(sessionId: string, navigate: (path: string) => void): void {
   if (sessionId === currentSidebarSessionId()) return;
-  navigate(`/c/${sessionId}`);
-  useSidebarSessionOrderStore.setState({ pendingSessionId: sessionId });
+  navigateToPendingSession(sessionId, `/c/${sessionId}`, navigate);
 }

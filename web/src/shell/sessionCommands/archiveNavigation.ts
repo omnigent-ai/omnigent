@@ -8,6 +8,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
 import {
   currentSidebarSessionId,
+  navigateToPendingSession,
   useSidebarSessionOrderStore,
 } from "@/hooks/useSidebarSessionOrder";
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
@@ -127,8 +128,9 @@ function follow(request: ArchiveNavigationRequest, landing: ArchiveLanding): boo
     });
     return true;
   }
-  request.navigate(`/c/${landing.entryId}`, { replace: true });
-  useSidebarSessionOrderStore.setState({ pendingSessionId: landing.entryId });
+  navigateToPendingSession(landing.entryId, `/c/${landing.entryId}`, (path) =>
+    request.navigate(path, { replace: true }),
+  );
   recordArchiveNavigation({
     event: "session_archive_navigation",
     source: request.source,
