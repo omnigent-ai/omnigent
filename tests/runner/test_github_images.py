@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import ssl
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -771,13 +772,24 @@ def test_other_requests_keep_their_transport_records(
     assert "receive_response_headers" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        "gopher://proxy-user@proxy.example:70",
+        "http://proxy-user@proxy.example:not-a-port",
+        "socks5://proxy-user@proxy.example:1080",
+    ],
+    ids=["unknown-scheme", "invalid-url", "socks-without-socksio"],
+)
 def test_a_proxy_httpx_cant_use_fails_the_fetch_without_its_diagnostic(
-    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, proxy: str
 ) -> None:
-    """A malformed HTTPS_PROXY breaks the transport before any request is made."""
+    """An unusable HTTPS_PROXY breaks the transport before any request is made."""
     for variable in ("https_proxy", "NO_PROXY", "no_proxy"):
         monkeypatch.delenv(variable, raising=False)
-    monkeypatch.setenv("HTTPS_PROXY", "gopher://proxy-user@proxy.example:70")
+    monkeypatch.setenv("HTTPS_PROXY", proxy)
+    # SOCKS needs the optional socksio package; without it httpx can't build the proxy.
+    monkeypatch.setitem(sys.modules, "socksio", None)
 
     with pytest.raises(ImageRefused) as refused:
         _read(ASSET)

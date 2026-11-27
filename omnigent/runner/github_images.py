@@ -405,8 +405,9 @@ async def _fetch(
         request = httpx.Request("GET", current, headers=headers, extensions={"timeout": timeout})
         try:
             hop_transport = transport or _transport_for(current)
-        # An HTTPS_PROXY httpx can't use; its message names the proxy, so none is passed on.
-        except ValueError:
+        # An HTTPS_PROXY httpx can't use: an unknown scheme, a malformed URL, or SOCKS without
+        # socksio. Its message names the proxy, so none is passed on.
+        except (ValueError, httpx.InvalidURL, ImportError):
             raise ImageRefused("fetch_failed") from None
         try:
             async with hop_transport:
