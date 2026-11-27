@@ -67,6 +67,8 @@ function collect<T>(name: string, fallback: T, mode?: "value" | "resolved") {
   const unsubscribe = subscribeDesktopFeatureFlag(name, { fallback, mode }, (state) =>
     states.push(state),
   );
+  // Ended after the test too, so no override listener or shell subscription outlives it.
+  readers.push(unsubscribe);
   return { states, unsubscribe };
 }
 

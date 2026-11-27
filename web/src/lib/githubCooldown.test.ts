@@ -93,13 +93,20 @@ describe("githubCooldowns", () => {
     expect(cooldowns.heldUntil(KEY)).toBe(now() + MAX_FALLBACK_COOLDOWN_MS);
   });
 
-  it("uses the shell's deadline for a limited recovery, if later than the doubled fallback", () => {
-    const { cooldowns, advance, now } = harness();
-    cooldowns.rateLimited(KEY, null);
-    advance(FALLBACK_COOLDOWN_MS);
-    cooldowns.rateLimited(KEY, now() + 10 * 60_000);
-    expect(cooldowns.heldUntil(KEY)).toBe(now() + 10 * 60_000);
-  });
+  it.each([
+    ["later", 10 * 60_000],
+    ["earlier", 1_000],
+  ])(
+    "uses the shell's deadline for a limited recovery, %s than the doubled fallback",
+    (_case, wait) => {
+      const { cooldowns, advance, now } = harness();
+      cooldowns.rateLimited(KEY, null);
+      advance(FALLBACK_COOLDOWN_MS);
+      // The doubled fallback would be 2 minutes; a deadline GitHub named wins either way.
+      cooldowns.rateLimited(KEY, now() + wait);
+      expect(cooldowns.heldUntil(KEY)).toBe(now() + wait);
+    },
+  );
 
   it("doubles only after a fallback wait, never after a deadline the shell named", () => {
     const { cooldowns, advance, now } = harness();
