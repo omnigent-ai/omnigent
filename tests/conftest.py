@@ -391,6 +391,19 @@ def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _forget_gadget_grants() -> Generator[None, None, None]:
+    """Forget the in-memory gadget grants after each test that used them.
+
+    They are kept per database URI, and a shared test database keeps its URI while its
+    tables are emptied between tests.
+    """
+    yield
+    grant_store = sys.modules.get("tests.gadgets.grant_store")
+    if grant_store is not None:
+        grant_store.reset_gadget_grants()
+
+
 @pytest.fixture
 def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep a slow runner from tripping the RRULE search's CPU-time limit.

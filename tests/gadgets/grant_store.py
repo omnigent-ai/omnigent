@@ -16,7 +16,14 @@ from omnigent.stores.permission_store import MAX_SHARED_GADGETS_PAGE_SIZE
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 # Grants per database, so every store a test opens on one database sees the same grants.
+# Cleared after every test (see ``tests/conftest.py``): a shared test database keeps its URI
+# from test to test while its tables are emptied.
 _GRANTS_BY_DATABASE: dict[str, dict[str, dict[str, int]]] = {}
+
+
+def reset_gadget_grants() -> None:
+    """Forget every grant, as the test database's tables are emptied between tests."""
+    _GRANTS_BY_DATABASE.clear()
 
 
 class GadgetGrantStore(SqlAlchemyPermissionStore):

@@ -166,24 +166,39 @@ def _holds_gadget_data(user: SqlUser, gadget_store: GadgetStore | None) -> bool:
     """Whether *user* has gadget data a remap would strand.
 
     Their own gadgets and shelf are in *gadget_store*, owned under their username's
-    registration. Each check reads at most a page.
+    registration. The shelf counts only while it holds something: unpinning and hiding
+    leave its documents behind, empty, and those strand nothing. Each check reads at most
+    a page; a page of sessions that continues counts as holding data.
     """
     if gadget_store is None:
         return False
     from omnigent.db.account_authority import account_registration
     from omnigent.gadgets.access import workspace_registration
-    from omnigent.gadgets.service import SHELF_ROOT
+    from omnigent.gadgets.documents import ImmutableDocumentStore
+    from omnigent.gadgets.service import _STATE_STORE_LIMITS, SHELF_ROOT
 
     registration = workspace_registration(account_registration(user.created_at))
     if gadget_store.owns_any(user.id, owner_registration=registration):
         return True
+    shelf = ImmutableDocumentStore(
+        gadget_store.user_files(user.id, owner_registration=registration),
+        SHELF_ROOT,
+        limits=_STATE_STORE_LIMITS,
+    )
     try:
-        pinned, _ = gadget_store.user_files(user.id, owner_registration=registration).list_page(
-            SHELF_ROOT, after=None, limit=1
-        )
+        pins = shelf.get("pins", "all")
+        if pins is not None and pins.value.get("items"):
+            return True
+        page = shelf.list("sessions", limit=_SHELF_SESSIONS_CHECKED)
     except NotFound:
         return False
-    return bool(pinned)
+    if page.next_cursor is not None:
+        return True
+    return any(document.value.get("gadgets") for document in page.items)
+
+
+# Session documents of a shelf one check reads; a shelf with more is treated as in use.
+_SHELF_SESSIONS_CHECKED = 50
 
 
 def remap_identities(

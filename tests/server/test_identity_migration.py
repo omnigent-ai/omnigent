@@ -154,6 +154,37 @@ def test_remap_refuses_a_user_with_gadgets_and_leaves_them_reachable(
     ]
 
 
+def test_remap_goes_ahead_once_a_user_deleted_their_gadgets_and_cleared_the_shelf(
+    db_uri: str, tmp_path
+) -> None:
+    """Following the refusal's advice works: unpinned, hidden and deleted, nothing of the
+    user's is left to strand, even though the shelf keeps its emptied documents."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", hash_password("password123"))
+    alice = _gadget_service(db_uri, store, "alice")
+    board = alice.create("Synthetic board")
+    alice.pin(board["id"], {"pinned": True})
+
+    def remap() -> list[str]:
+        report = remap_identities(
+            get_or_create_engine(db_uri),
+            {"alice": "alice@example.com"},
+            dry_run=False,
+            gadget_store=store,
+        )
+        return report.refused_gadgets
+
+    assert remap() == ["alice -> alice@example.com"]
+    alice.pin(board["id"], {"pinned": False})
+    alice.delete(board["id"])
+
+    assert remap() == []
+    assert accounts.get_user("alice@example.com") is not None
+
+
 def account_store_ids(db_uri: str) -> set[str]:
     """Every user ID in the default workspace."""
     with Session(get_or_create_engine(db_uri)) as session:

@@ -988,8 +988,17 @@ class ConstraintGuard:
         for attempt in range(GUARD_ATTEMPTS):
             epoch, state = self._current()
             current = state.value
-            if current.get("rules") == _STALE or (
-                unguarded_write and current.get("rules") == self.digest
+            if current.get("sealed") is True:
+                # A sealed epoch is never changed: its successor is made from it as it was
+                # sealed, so a mark here could be lost. Make the successor, then mark that.
+                self._advance(epoch, current)
+                continue
+            # A rebuild under way may already have read the record this write changed, so
+            # it starts over even when the state is stale or the rules match.
+            rebuilding = isinstance(current.get("rebuild"), dict)
+            if not rebuilding and (
+                current.get("rules") == _STALE
+                or (unguarded_write and current.get("rules") == self.digest)
             ):
                 return
             try:

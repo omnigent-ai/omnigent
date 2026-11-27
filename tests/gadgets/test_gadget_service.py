@@ -1364,6 +1364,109 @@ def _republish(service: GadgetService, app: dict, revision_id: str) -> dict:
     return service.publish(app["id"], {"revision_id": revision_id, "if_version": app["version"]})
 
 
+def _old_revision_replace(
+    service: GadgetService, gadgets: Fixture, app: dict, rules: list, record: dict, title: str
+) -> None:
+    """Replace *record* as a request validated under an older revision with *rules* (none on
+    its collection) does: straight to the records, marking the rule state stale around it."""
+    gadget = gadgets.store.get(app["id"])
+    files = service._files(gadget)
+    store = documents_module.ImmutableDocumentStore(
+        files, "data", limits=service_module._DATA_STORE_LIMITS
+    )
+    actor = service.viewer.user_id
+    marker = ConstraintGuard(files, "data/_guard", store, rules, actor)
+    marker.mark_stale(unguarded_write=True)
+    store.replace(
+        "cards",
+        record["id"],
+        {"title": title, "column": "todo"},
+        record["version"],
+        f"old-{title}",
+        actor,
+    )
+    marker.mark_stale(unguarded_write=True)
+
+
+_FEW_RUNS = {"name": "few_runs", "kind": "max_records", "collection": "runs", "max": 100}
+
+
+def test_marking_stale_never_changes_a_sealed_epoch(gadgets: Fixture) -> None:
+    # A guarded writer that read the sealed epoch makes its successor from it as sealed, so
+    # a mark written into the sealed epoch would be lost: the mark goes to the successor.
+    service = gadgets.service()
+    unique = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    app = publish_ruled_board(service, [unique])
+    card(service, app, "a", "todo")
+    gadget = gadgets.store.get(app["id"])
+    files = service._files(gadget)
+    store = documents_module.ImmutableDocumentStore(
+        files, "data", limits=service_module._DATA_STORE_LIMITS
+    )
+    guard = ConstraintGuard(files, "data/_guard", store, [unique], service.viewer.user_id)
+    epoch, state = guard._current()
+    guard._seal(epoch, state)
+    sealed = guard.guard.get("epochs", epoch)
+
+    ConstraintGuard(files, "data/_guard", store, [], service.viewer.user_id).mark_stale(
+        unguarded_write=True
+    )
+
+    assert guard.guard.get("epochs", epoch).version == sealed.version
+    newest, current = guard._current()
+    assert newest != epoch and current.value["rules"] == "stale"
+    # The guarded writer resuming its rotation from the sealed state changes nothing.
+    guard._advance(epoch, sealed.value)
+    assert guard._current()[1].value["rules"] == "stale"
+
+
+@pytest.mark.parametrize("older", ["no_rules", "other_rules"])
+def test_a_write_from_an_older_revision_restarts_a_rebuild_under_way(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch, older: str
+) -> None:
+    # The older revision's marker found the state stale (no rules) or matching its own
+    # rules (rules for another collection), and used to leave the rebuild to go on.
+    service = gadgets.service()
+    unique = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    old_rules = [] if older == "no_rules" else [_FEW_RUNS]
+    app = publish_ruled_board(service, [unique])
+    card(service, app, "a", "todo")
+    app = _republish(service, app, ruled_revision(service, app["id"], old_rules))
+    # Written without the unique rule: the next publish of it must rebuild.
+    card(service, app, "b", "todo")
+    if old_rules:
+        # A guarded write commits the state for the older rules.
+        rpc(
+            service,
+            app,
+            "create",
+            collection="runs",
+            id="r",
+            value={"state": "x"},
+            operation_id="c-r",
+        )
+    first = rpc(service, app, "get", id="a")
+    app = _republish(service, app, ruled_revision(service, app["id"], [unique]))
+    # The new rules' rebuild reads one record ("a"), saves where it got to, and stops.
+    monkeypatch.setattr(constraints_module, "REBUILD_PAGE", 1)
+    monkeypatch.setattr(constraints_module, "REBUILD_STEPS_PER_WRITE", 3)
+    with pytest.raises(Conflict):
+        card(service, app, "z", "todo")
+    # A request validated before the new rules changes "a", which the rebuild already read.
+    _old_revision_replace(service, gadgets, app, old_rules, first, "taken")
+    monkeypatch.undo()
+
+    with pytest.raises(ConstraintViolation):
+        rpc(
+            service,
+            app,
+            "create",
+            id="c",
+            value={"title": "taken", "column": "doing"},
+            operation_id="c-dup",
+        )
+
+
 @pytest.mark.parametrize(
     ("case", "between"),
     [
