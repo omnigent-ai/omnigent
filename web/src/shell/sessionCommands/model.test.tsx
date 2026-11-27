@@ -12,7 +12,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation, useMoveToProject } from "@/hooks/useConversations";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, SHARING_OFF_REASON } from "@/lib/capabilities";
-import { clearSessionMuteState, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import { clearSessionMuteState, MUTED_LABEL_KEY, setMutedProjects } from "@/lib/sessionMute";
 import { PinCapacityContext } from "@/lib/sidebarConfig";
 import { isCommandListed } from "@/store/paletteCommands";
 
@@ -50,6 +50,7 @@ const FACTS: SessionCommandFacts = {
   pinSaving: false,
   unread: false,
   muted: false,
+  mutedByProject: false,
   canCreateAutomation: true,
   currentProject: null,
   nestable: false,
@@ -221,6 +222,10 @@ function rowMenu(facts: SessionCommandFacts) {
   onTestFinished(() => queryClient.clear());
   const labels: Record<string, string> = facts.muted ? { [MUTED_LABEL_KEY]: "1" } : {};
   const row: Conversation = { ...conversation, labels };
+  if (facts.mutedByProject) {
+    setMutedProjects([{ id: "proj_muted", name: "Muted project", muted: true }], null);
+    row.project_id = "proj_muted";
+  }
   queryClient.setQueryData(["conversation-backfill", row.id], row);
   forkRestriction.reason = facts.forkDisabledReason;
   sessionWindows.open = facts.canOpenWindow ? vi.fn() : null;
@@ -330,6 +335,11 @@ describe("sessionCommands against the sidebar row's menu", () => {
     ["a session a new window can show", { ...FACTS, canOpenWindow: true }],
     ["a muted session", { ...FACTS, muted: true }],
     ["a muted, unread session", { ...FACTS, muted: true, unread: true }],
+    ["a session in a muted project", { ...FACTS, mutedByProject: true }],
+    [
+      "a muted, unread session in a muted project",
+      { ...FACTS, muted: true, mutedByProject: true, unread: true },
+    ],
     [
       "a filed session that isn't running",
       { ...FACTS, currentProject: "Payments", stoppable: false },

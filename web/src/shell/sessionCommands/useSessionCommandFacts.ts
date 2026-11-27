@@ -17,7 +17,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
-import { isConversationMuted } from "@/lib/sessionMute";
+import { isInMutedProject, isSessionMuted, useMutedProjects } from "@/lib/sessionMute";
 import { isOwnSessionWindow } from "@/lib/sessionWindow";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { PinCapacityContext } from "@/lib/sidebarConfig";
@@ -41,6 +41,8 @@ export function useSessionCommandFacts(
   const routedSessionId = useCommandContext().session?.id ?? null;
   const routedRoot = useActiveRootSessionId(routedSessionId);
   const windowsOpen = useOpenSessionWindow() !== null;
+  // A project muted or unmuted changes the session's mute without changing its row.
+  const mutedProjects = useMutedProjects();
   const readState = useConversationReadState(
     sessionId ?? "",
     conversation?.updated_at ?? 0,
@@ -70,7 +72,8 @@ export function useSessionCommandFacts(
       atPinCapacity,
       pinSaving,
       unread: readState.unseen && (!active || readState.explicitlyUnread),
-      muted: isConversationMuted(conversation),
+      muted: isSessionMuted(conversation),
+      mutedByProject: mutedProjects.length > 0 && isInMutedProject(conversation),
       canCreateAutomation: canCreateAutomationFromSession({
         info: serverInfo,
         automationsEnabled: serverInfo !== "loading" && serverInfo.automations_enabled !== false,
@@ -115,5 +118,6 @@ export function useSessionCommandFacts(
     forkDisabledReason,
     windowsOpen,
     routedSessionId,
+    mutedProjects,
   ]);
 }
