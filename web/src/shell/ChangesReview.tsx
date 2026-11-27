@@ -537,8 +537,9 @@ export function ChangesReview(props: ChangesReviewProps) {
     rememberBrowseLocation(conversationId, restoreTo);
     landing.folders = browseLocationChanges(conversationId);
   }, [restoreTo, landing, conversationId]);
-  // While the folder is on its way, the review neither applies, records nor waits on the visit.
-  const holding = folderStep.kind !== "none";
+  // While the folder is on its way or unknown, the review neither applies, records nor waits on
+  // the visit, so it never records a comparison under the wrong folder.
+  const holding = folderStep.kind !== "none" || !folder.resolved;
   const visit = useMemo((): Pick<
     ChangesReviewAtProps,
     "comparison" | "onComparisonShown" | "landing"

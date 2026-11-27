@@ -3,10 +3,11 @@
 // header opens the same folder browser Files does; choosing a folder moves both.
 
 import { FolderOpenIcon, FolderSearchIcon } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { useSession } from "@/hooks/useSession";
+import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -86,9 +87,21 @@ export function useReviewFolder(
   // once Files or Diffs moved off the workspace, or for a folder the review may move to.
   const needsWorktrees = active || directory !== null || lookUp !== null;
   const worktrees = useSessionWorktrees(conversationId, hostId, needsWorktrees ? workspace : null);
-  const listed = worktrees.data?.status === "ok" ? worktrees.data.worktrees : null;
-  // Only a list, or "not a Git repository", says which folders exist; a failed lookup doesn't.
-  const worktreesKnown = listed !== null || worktrees.data?.status === "not_git";
+  const answer = worktrees.data;
+  // Only the host's owner may list worktrees; anyone else reviews the workspace itself.
+  const denied = answer?.status === "unknown" && answer.denied === true;
+  // A failed lookup keeps the list this workspace last had, so a review doesn't jump to the
+  // workspace and record that over its visit.
+  const lookupKey = `${hostId ?? ""}\u0000${workspace ?? ""}`;
+  const lastListed = useRef<{ key: string; worktrees: HostWorktree[] } | null>(null);
+  if (answer?.status === "ok") lastListed.current = { key: lookupKey, worktrees: answer.worktrees };
+  const kept =
+    answer?.status === "unknown" && !denied && lastListed.current?.key === lookupKey
+      ? lastListed.current.worktrees
+      : null;
+  const listed = answer?.status === "ok" ? answer.worktrees : kept;
+  // Only a list, "not a Git repository" or a refusal says which folders Diffs can review.
+  const worktreesKnown = listed !== null || answer?.status === "not_git" || denied;
   const insideLargerRepository =
     workspace !== null && listed !== null && workspaceInsideLargerRepository(workspace, listed);
   const root = workspace ? diffRootFor(directory, workspace, listed ?? []) : null;

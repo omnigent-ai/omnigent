@@ -67,7 +67,7 @@ const mocks = vi.hoisted(() => ({
    * When set, the review uses the real folder hook, over the workspace `/repo` with this worktree
    * answer; otherwise `folder` above.
    */
-  realFolder: null as { worktrees: SessionWorktreesResult } | null,
+  realFolder: null as { worktrees: SessionWorktreesResult; permissionLevel?: number } | null,
 }));
 // The real folder hook's inputs, given only while a test asks for that hook.
 vi.mock("./FileViewerContext", async (importOriginal) => {
@@ -86,7 +86,11 @@ vi.mock("@/hooks/useSession", async (importOriginal) => {
     ...actual,
     useSession: (...args: Parameters<typeof actual.useSession>) =>
       mocks.realFolder
-        ? { session: { permissionLevel: 4 }, isLoading: false, error: null }
+        ? {
+            session: { permissionLevel: mocks.realFolder.permissionLevel ?? 4 },
+            isLoading: false,
+            error: null,
+          }
         : actual.useSession(...args),
   };
 });
@@ -1523,6 +1527,79 @@ describe("a review of a worktree inside the workspace", () => {
       expect(rememberedBrowseLocation("s1")).toBe(ROOT);
       expect(data.choice.choose).toHaveBeenCalledWith(visit);
       // Unmounted while the real hook still applies, since the next test's folder mock differs.
+      unmount();
+    });
+
+    it("keeps a shown worktree's review and visit through a failed refetch of the worktrees", () => {
+      const listed: SessionWorktreesResult = {
+        status: "ok",
+        worktrees: [
+          { path: "/repo", branch: "main", is_main: true, detached: false },
+          { path: ROOT, branch: "feature", is_main: false, detached: false },
+        ],
+      };
+      rememberBrowseLocation("s1", ROOT);
+      mocks.realFolder = { worktrees: listed };
+      const shown = { kind: "saved", intent: "head" } as const;
+      mocks.source.mockReturnValue(
+        source(changes({ workspace: { hostId: "host_1", root: "/repo" } })),
+      );
+      const onComparisonShown = vi.fn();
+      // A settled visit of the worktree, showing the comparison it recorded.
+      const { props, rerender, unmount } = renderReview({
+        comparison: shown,
+        comparisonRoot: ROOT,
+        landing: { ...landed(), settled: true },
+        onComparisonShown,
+      });
+      expect(screen.getByTestId("changes-review-folder")).toHaveTextContent("feature");
+
+      mocks.realFolder = { worktrees: { status: "unknown" } };
+      rerender(<ChangesReview {...props} />);
+      expect(screen.getByTestId("changes-review-folder")).toHaveTextContent("feature");
+      mocks.realFolder = { worktrees: listed };
+      rerender(<ChangesReview {...props} />);
+
+      expect(onComparisonShown).not.toHaveBeenCalledWith(expect.anything(), {
+        step: false,
+        root: null,
+      });
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      unmount();
+    });
+
+    it("records nothing for a settled worktree visit while its first worktree lookup fails", () => {
+      rememberBrowseLocation("s1", ROOT);
+      mocks.realFolder = { worktrees: { status: "unknown" } };
+      mocks.source.mockReturnValue(
+        source(changes({ workspace: { hostId: "host_1", root: "/repo" } })),
+      );
+      const onComparisonShown = vi.fn();
+      const { unmount } = renderReview({
+        comparison: { kind: "saved", intent: "head" },
+        comparisonRoot: ROOT,
+        landing: { ...landed(), settled: true },
+        onComparisonShown,
+      });
+      // Without a list the worktree reads as the workspace, so nothing is recorded under it.
+      expect(onComparisonShown).not.toHaveBeenCalled();
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      unmount();
+    });
+
+    it("applies a workspace visit for a collaborator who may not list the host's worktrees", () => {
+      // Only the host's owner may list worktrees; an editor's lookup is refused.
+      mocks.realFolder = { worktrees: { status: "unknown", denied: true }, permissionLevel: 2 };
+      const data = source(changes({ workspace: { hostId: "host_1", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const { unmount } = renderReview({
+        comparison: visit,
+        comparisonRoot: null,
+        landing: landed(),
+        onComparisonShown: vi.fn(),
+      });
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+      expect(rememberedBrowseLocation("s1")).toBeNull();
       unmount();
     });
 
