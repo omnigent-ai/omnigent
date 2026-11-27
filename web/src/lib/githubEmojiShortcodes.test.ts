@@ -64,6 +64,16 @@ describe("remarkGitHubEmoji", () => {
     );
   });
 
+  // Excerpts see raw HTML as unparsed text, so only a plain tag pair within one paragraph is
+  // recognized; the rendered page (the rehype plugin) parses HTML and keeps all of these as typed.
+  it("turns shortcodes in raw-HTML code it can't recognize, a known limit of excerpts", () => {
+    expect(text('<code title="a > b">:tada:</code>')).toBe('<code title="a > b">🎉</code>');
+    // Inline code that spans two paragraphs is closed in another parent than the one it opens in.
+    expect(text("Run <code>:tada:\n\n:tada:</code>")).toBe("Run <code>:tada:🎉</code>");
+    // A block of raw HTML, even across blank lines, is one node and stays as typed.
+    expect(text("<pre>\n:tada:\n\n:tada:\n</pre>")).toBe("<pre>\n:tada:\n\n:tada:\n</pre>");
+  });
+
   it("renders link text, but never a bare URL or address GitHub linked by itself", () => {
     expect(text("[ship :rocket:](https://example.com/:rocket:)")).toBe("ship 🚀");
     expect(leaves("See https://example.com/a/:tada:/b now")).toContainEqual([
