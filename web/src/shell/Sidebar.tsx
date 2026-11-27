@@ -255,6 +255,10 @@ import {
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { useSessionActions } from "./useSessionActions";
+import {
+  useBulkSessionPaletteCommands,
+  useSessionSelectionPaletteCommands,
+} from "./sessionCommands/useBulkSessionPaletteCommands";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { useProjectActionStore } from "./projectCommands/projectActionStore";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -298,7 +302,12 @@ import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { usePublishSidebarSessionOrder } from "@/hooks/useSidebarSessionOrder";
-import { leaveSessionView } from "./sessionCommands/archiveNavigation";
+import {
+  isLeavingOpenSession,
+  leaveSessionView,
+  navigateAfterArchiving,
+  newSessionPathFor,
+} from "./sessionCommands/archiveNavigation";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import {
@@ -918,6 +927,13 @@ function SidebarImpl({
     setSelectedIds(new Set());
     lastSelectedIdRef.current = null;
   }, []);
+
+  useSessionSelectionPaletteCommands({
+    selecting: selectionMode,
+    selected: selectedIds.size,
+    selectAll: () => setSelectedIds(new Set(getVisibleIdsRef.current())),
+    deselectAll,
+  });
 
   // Enter selection mode targeting a given scope; clear any prior selection so
   // rows from the previous scope don't linger.
@@ -8241,6 +8257,7 @@ function BulkActionBar({
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const quickPick = useQuickPickPaletteEnabled();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const archivePrompt = useArchivePrompt();
@@ -8396,7 +8413,23 @@ function BulkActionBar({
     // mutate-level callback — a callback on the unmounted observer never fires,
     // and it would carry a stale `activeId` that could jump the user off a
     // session they switched to meanwhile. Mirrors handleDelete.
-    if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
+    const leavingIds = toArchive.map((c) => c.id);
+    // With quick_pick_palette, a sub-agent's view also leaves with its archived parent.
+    const leavesOpenView = quickPick
+      ? isLeavingOpenSession(queryClient, activeId, leavingIds)
+      : toArchive.some((c) => c.id === activeId);
+    if (leavesOpenView) {
+      navigateAfterArchiving({
+        leavingIds,
+        source: "bulk",
+        navigate,
+        newSessionPath: newSessionPathFor(
+          queryClient,
+          toArchive.find((c) => c.id === activeId) ?? toArchive[0],
+        ),
+        queryClient,
+      });
+    }
     onDeselectAll();
     bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, deleteWorktreeIds });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
@@ -8429,6 +8462,28 @@ function BulkActionBar({
     onDeselectAll();
     bulkDelete.mutate({ ids, deleteBranchIds: branchesToDelete });
   }
+
+  useBulkSessionPaletteCommands({
+    facts: {
+      selected: count,
+      unread: unreadSelected.length,
+      flaggable: flaggableSelected.length,
+      owned: ownedSelected.length,
+      ownedArchived: archivedSelected.length,
+      canMove: canMoveSelection,
+      busy: isBusy,
+    },
+    selection: selectedIds,
+    projects: projects.map((project) => project.name),
+    run: {
+      "mark-read": handleMarkRead,
+      "mark-unread": handleMarkUnread,
+      archive: handleArchive,
+      unarchive: handleUnarchive,
+      delete: () => setConfirmDeleteOpen(true),
+    },
+    moveToProject: handleMoveToProject,
+  });
 
   return (
     <>
