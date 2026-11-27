@@ -73,6 +73,15 @@ def comments_without_account_rights(page: dict[str, Any]) -> dict[str, Any]:
     return {**page, "data": _mapped(page.get("data"), _comment_without_account_rights)}
 
 
+def info_without_account_rights(info: dict[str, Any]) -> dict[str, Any]:
+    """A ``session.github.info`` payload whose conversation comments lack the account fields."""
+    pr = info.get("pr")
+    if not isinstance(pr, dict) or not isinstance(pr.get("comments"), list):
+        return info
+    comments = _mapped(pr["comments"], _comment_without_account_rights)
+    return {**info, "pr": {**pr, "comments": comments}}
+
+
 def _mapped(items: Any, shape: Callable[[Any], Any]) -> Any:
     return [shape(item) for item in items] if isinstance(items, list) else items
 

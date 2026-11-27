@@ -805,6 +805,7 @@ def cached_pr_info(
     session_id: str | None = None,
     pr_url: str | None = None,
     allow_cached: bool = False,
+    account_rights: bool = False,
 ) -> dict[str, Any]:
     """Serve :func:`pr_info`, letting panel polls share forge reads.
 
@@ -820,10 +821,13 @@ def cached_pr_info(
     :param session_id: Session whose tracked PRs to list; ``None`` reads uncached.
     :param pr_url: The selected PR, which must be tracked by the session.
     :param allow_cached: The caller polls again soon, so an answer one read old will be corrected.
+    :param account_rights: Whether to include what the host's account may do with each comment,
+        which a server asks for only for the session's owner. Every read fetches them, so one
+        cached answer serves both kinds of reader; each answer handed back drops them unless asked.
     :returns: A ``session.github.info`` payload.
     """
     if session_id is None:
-        return pr_info(root, pr_url=pr_url)
+        return _with_account_rights(pr_info(root, pr_url=pr_url), account_rights)
     key = (root, session_id, pr_url, _SERVER_TRACKING.get())
     version = SessionPrRegistry(session_id).version()
     requested_at = time.monotonic()
@@ -838,7 +842,7 @@ def cached_pr_info(
             del _PANEL_READS[key]
             done = None
         if done is not None and requested_at - done.started_at < _PANEL_READ_FRESH_SECONDS:
-            return _served(done, requested_at)
+            return _with_account_rights(_served(done, requested_at), account_rights)
         running = _RUNNING_PANEL_READS.get(key)
         start = (
             not allow_cached
@@ -856,7 +860,12 @@ def cached_pr_info(
             read()
         else:
             _PANEL_READ_POOL.submit(contextvars.copy_context().run, read)
-    return _served(done or running, requested_at)
+    return _with_account_rights(_served(done or running, requested_at), account_rights)
+
+
+def _with_account_rights(info: dict[str, Any], account_rights: bool) -> dict[str, Any]:
+    """``info`` with the host account's comment rights only for a caller that asked for them."""
+    return info if account_rights else review_fields.info_without_account_rights(info)
 
 
 @_invalidates_panel_reads
@@ -877,10 +886,12 @@ def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict
                 raise ValueError(f"{name} pull requests are not supported")
             facet.verify_accessible(root, reference)
             registry.record([reference], relationship="attached", source="user")
-            return pr_info(root, session_id=session_id, pr_url=reference.url)
+            return _with_account_rights(
+                pr_info(root, session_id=session_id, pr_url=reference.url), False
+            )
         if action == "remove":
             registry.remove(reference.url)
-            return pr_info(root, session_id=session_id)
+            return _with_account_rights(pr_info(root, session_id=session_id), False)
     except FileLockTimeout as exc:
         raise ValueError("PR tracking is busy; try again.") from exc
     raise ValueError("Expected attach or remove")
@@ -894,6 +905,7 @@ def set_pr_preference(
     remote: str | None = None,
     session_id: str | None = None,
     pr_url: str | None = None,
+    account_rights: bool = False,
 ) -> dict[str, Any]:
     """Apply an account and/or base remote choice, then return refreshed info.
 
@@ -903,6 +915,7 @@ def set_pr_preference(
 
     :param account: Account to prefer, ``None`` to leave it, or empty to clear it.
     :param remote: Base remote to set, or ``None`` to leave the base unchanged.
+    :param account_rights: Whether to include what the host's account may do with each comment.
     :returns: The refreshed :func:`pr_info` payload.
     """
     reference = _selected_pr(session_id, pr_url) if pr_url and session_id else None
@@ -915,8 +928,10 @@ def set_pr_preference(
         if account is not None or remote:
             facet.set_preference(root, reference, account=account, remote=remote)
     if reference is not None:
-        return pr_info(root, session_id=session_id, pr_url=pr_url)
-    return pr_info(root, session_id=session_id)
+        return _with_account_rights(
+            pr_info(root, session_id=session_id, pr_url=pr_url), account_rights
+        )
+    return _with_account_rights(pr_info(root, session_id=session_id), account_rights)
 
 
 def _capable_target(

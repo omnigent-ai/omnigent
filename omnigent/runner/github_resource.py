@@ -74,6 +74,7 @@ from omnigent import config as _config
 from omnigent.git_providers import EnvInstances, host_of
 from omnigent.git_providers.github import GitHubProvider
 from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.runner import github_review_fields as review_fields
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
     COMMIT_OBJECT,
@@ -597,14 +598,26 @@ def _shape_comments(
         if not isinstance(comment, dict) or comment.get("isMinimized"):
             continue
         author = comment.get("author")
-        shaped.append(
-            {
-                "author": author.get("login") if isinstance(author, dict) else None,
-                "body": str(comment.get("body") or ""),
-                "created_at": comment.get("createdAt") or None,
-                "url": comment.get("url") or None,
-            }
-        )
+        entry: dict[str, Any] = {
+            "author": author.get("login") if isinstance(author, dict) else None,
+            "body": str(comment.get("body") or ""),
+            "created_at": comment.get("createdAt") or None,
+            "url": comment.get("url") or None,
+        }
+        node_id = comment.get("id")
+        if isinstance(node_id, str) and review_fields.NODE_ID.fullmatch(node_id):
+            entry["id"] = node_id
+        number = _issue_comment_number(comment.get("url"))
+        if number is not None:
+            entry["database_id"] = number
+        # Only GitHub's GraphQL read says who reacted, and what the host's account may do.
+        if "viewerCanReact" in comment:
+            entry["reactions"] = review_fields.reactions(comment.get("reactionGroups"))
+            entry["can_react"] = comment.get("viewerCanReact") is True
+            entry["can_update"] = comment.get("viewerCanUpdate") is True
+            entry["can_delete"] = comment.get("viewerCanDelete") is True
+            entry["viewer_did_author"] = comment.get("viewerDidAuthor") is True
+        shaped.append(entry)
     for review in reviews if isinstance(reviews, list) else []:
         if (
             not isinstance(review, dict)
@@ -625,6 +638,45 @@ def _shape_comments(
         )
     shaped.sort(key=lambda comment: comment["created_at"] or "")
     return shaped[-_MAX_COMMENTS:] if cap else shaped
+
+
+# Bounded, so an anchor too long for an exact ID can't fail the read.
+_ISSUE_COMMENT_ANCHOR = re.compile(r"#issuecomment-(\d{1,19})$")
+
+
+def _issue_comment_number(url: Any) -> int | None:
+    """A conversation comment's number, from the anchor GitHub's URL for it ends with."""
+    match = _ISSUE_COMMENT_ANCHOR.search(url) if isinstance(url, str) else None
+    return review_fields.database_id(match.group(1)) if match else None
+
+
+# What GitHub's read adds to a comment gh listed: its reactions and the account's rights.
+_COMMENT_ACCOUNT_KEYS = (
+    "viewerCanReact",
+    "viewerCanUpdate",
+    "viewerCanDelete",
+    "viewerDidAuthor",
+    "reactionGroups",
+)
+
+
+def _with_comment_rights(listed: Any, latest: list[Any]) -> Any:
+    """gh's comments, each with what GitHub's read said of it; its text stays gh's."""
+    if not isinstance(listed, list):
+        return listed
+    read = {
+        node["id"]: node
+        for node in latest
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    }
+    merged = []
+    for comment in listed:
+        node_id = comment.get("id") if isinstance(comment, dict) else None
+        node = read.get(node_id) if isinstance(node_id, str) else None
+        if node is not None:
+            comment = {**comment, **{key: node.get(key) for key in _COMMENT_ACCOUNT_KEYS}}
+        merged.append(comment)
+    return merged
 
 
 def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -956,14 +1008,18 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
         host = _host_args(cwd, reference)
     except ValueError:
         return
-    comments = data.get("comments")
-    refresh_comments = isinstance(comments, list) and len(comments) >= _MAX_COMMENTS
+    comments_listed = data.get("comments")
+    refresh_comments = isinstance(comments_listed, list) and len(comments_listed) >= _MAX_COMMENTS
     owner, name = reference.repository.split("/", 1)
-    query = """query($owner: String!, $name: String!, $number: Int!, $includeComments: Boolean!) {
+    query = """query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
-          comments(last: 100) @include(if: $includeComments) {
-            nodes { author { login } body createdAt url isMinimized }
+          comments(last: 100) {
+            nodes {
+              id author { login } body createdAt url isMinimized
+              viewerCanReact viewerCanUpdate viewerCanDelete viewerDidAuthor
+              reactionGroups { content viewerHasReacted reactors { totalCount } }
+            }
           }
           timelineItems(last: 100, itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT]) {
             pageInfo { hasPreviousPage }
@@ -998,8 +1054,6 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
             f"name={name}",
             "-F",
             f"number={reference.number}",
-            "-F",
-            f"includeComments={str(refresh_comments).lower()}",
         ],
         cwd=cwd,
         token=token,
@@ -1015,8 +1069,12 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
     data["timelineItems"] = conversation.get("timelineItems")
     comments = conversation.get("comments")
     latest = comments.get("nodes") if isinstance(comments, dict) else None
-    if isinstance(latest, list):
-        data["comments"] = latest
+    if not isinstance(latest, list):
+        return
+    # A busy PR's latest comments come from this uncached read; gh's are fresher otherwise.
+    data["comments"] = (
+        latest if refresh_comments else _with_comment_rights(comments_listed, latest)
+    )
 
 
 def _checks_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -1466,10 +1524,18 @@ def _set_preference(
 
 
 def github_info(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    account_rights: bool = False,
 ) -> dict[str, Any]:
-    """Return the panel payload; see :func:`pr_resource.pr_info`."""
-    return pr_resource.pr_info(root, session_id=session_id, pr_url=pr_url)
+    """Return the panel payload; see :func:`pr_resource.pr_info`.
+
+    :param account_rights: Whether to include what the host's account may do with each comment.
+    """
+    info = pr_resource.pr_info(root, session_id=session_id, pr_url=pr_url)
+    return info if account_rights else review_fields.info_without_account_rights(info)
 
 
 def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
