@@ -268,6 +268,8 @@ def test_launch_delivers_private_config_and_preserves_the_relay_until_owner_comp
         "unsupported",
         "readiness-timeout",
         "invalid-metadata",
+        "empty-metadata",
+        "malformed-metadata",
         "receive",
         "spawn",
         "unadmitted",
@@ -286,7 +288,7 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
         monkeypatch.setattr(shell_request, "request_launcher", lambda *_args: None)
     elif failure == "readiness-timeout":
         case.poll.return_value = []
-    elif failure == "invalid-metadata":
+    elif failure in {"invalid-metadata", "empty-metadata", "malformed-metadata"}:
         original = case.spawn.side_effect
 
         def invalid_metadata(
@@ -294,7 +296,12 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
         ) -> MagicMock:
             result = original(argv, env, fds)
             os.ftruncate(fds[2], 0)
-            os.pwrite(fds[2], b'{"child-pid": 0}', 0)
+            payload = {
+                "invalid-metadata": b'{"child-pid": 0}',
+                "empty-metadata": b"",
+                "malformed-metadata": b"{",
+            }[failure]
+            os.pwrite(fds[2], payload, 0)
             return result
 
         case.spawn.side_effect = invalid_metadata
@@ -323,8 +330,14 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
         case.owner.run.side_effect = failed_run
     else:
         case.spawn.side_effect = OSError("spawn failed")
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as caught:
         _launch(case, tmp_path)
+    if failure in {"empty-metadata", "malformed-metadata"}:
+        assert str(caught.value) == (
+            "Shell request launcher did not publish valid startup metadata; "
+            "check Bubblewrap startup and sandbox support"
+        )
+        case.receive.assert_not_called()
     assert case.request.admitted == (failure == "admission-lost")
     if failure == "unsupported":
         case.spawn.assert_not_called()
@@ -334,7 +347,13 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
         case.owner.run.assert_called_once()
     else:
         case.owner.run.assert_not_called()
-    if failure in {"readiness-timeout", "invalid-metadata", "receive"}:
+    if failure in {
+        "readiness-timeout",
+        "invalid-metadata",
+        "empty-metadata",
+        "malformed-metadata",
+        "receive",
+    }:
         case.process.communicate.assert_called_once_with(timeout=1)
     if failure in {"cleanup-timeout", "launcher-pidfd"}:
         assert case.process.communicate.call_args_list == [call(timeout=1), call()]
@@ -486,6 +505,38 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
             if ending == "timeout":
                 assert actual["exit_code"] is None
                 assert actual["error"] == "Command timed out after 7 seconds"
+        if ending == "success":
+            warm_request = shell_request.BwrapShellRequest()
+            monkeypatch.setattr(warm_request, "run", run)
+            assert helper.shell_request("printf result", 7, limit, warm_request) == actual
+            assert metadata.call_count == 1 and run.call_count == 2
+            assert run.call_args.kwargs["output_encoding"] == encoding
+            assert run.call_args.kwargs["command_env"]["LC_CTYPE"] == "C.UTF-8"
+
+            helper._stop_locked()
+            assert helper._prepared is None
+            helper._prepared = replace(prepared, env={**prepared.env, "PYTHONUTF8": "1"})
+            metadata.side_effect = None
+            metadata.return_value = {
+                "encoding": "utf-8",
+                "locale": {"LC_CTYPE": "C"},
+            }
+            output = _TextPrefix("utf-8", limit)
+            output.feed("λok".encode(), final=True)
+            run.return_value = BwrapRequestResult(
+                output.result(), CapturedOutput(""), 0, False, "utf-8"
+            )
+            restarted_request = shell_request.BwrapShellRequest()
+            monkeypatch.setattr(restarted_request, "run", run)
+            refreshed = helper.shell_request("printf result", 7, limit, restarted_request)
+            assert refreshed["stdout"] == "λok" and refreshed["exit_code"] == 0
+            assert metadata.call_count == 2 and run.call_count == 3
+            assert metadata.call_args == call({"op": "shell_encoding"}, allow_retry=True)
+            assert run.call_args.kwargs["output_encoding"] == "utf-8"
+            assert os_env_module._shell_locale_env(run.call_args.kwargs["command_env"]) == {
+                "LC_CTYPE": "C",
+            }
+            assert run.call_args.kwargs["command_env"]["PYTHONUTF8"] == "1"
     finally:
         helper._egress_auth_token = None
         helper.close()

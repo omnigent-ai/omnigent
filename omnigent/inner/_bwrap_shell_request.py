@@ -192,7 +192,13 @@ class BwrapShellRequest:
                 if not poller.poll(round(_STARTUP_TIMEOUT_S * 1000)):
                     raise TimeoutError("Shell request init did not publish readiness")
                 info.seek(0)
-                metadata = json.load(info)
+                try:
+                    metadata = json.load(info)
+                except json.JSONDecodeError as exc:
+                    raise OSError(
+                        "Shell request launcher did not publish valid startup metadata; "
+                        "check Bubblewrap startup and sandbox support"
+                    ) from exc
                 init_pid = metadata.get("child-pid") if isinstance(metadata, dict) else None
                 if type(init_pid) is not int or init_pid <= 0:
                     raise OSError("Shell request launcher did not identify its init")
