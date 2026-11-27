@@ -17523,6 +17523,78 @@
         "title": "SkippedRun",
         "type": "object"
       },
+      "SlackLinkBody": {
+        "additionalProperties": false,
+        "description": "What a product approver enters in Project settings \u2192 Slack.",
+        "properties": {
+          "channel_id": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Id"
+          },
+          "channel_link": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A Slack channel link: https://app.slack.com/client/<team>/<channel> gives both IDs; a https://<workspace>.slack.com/archives/<channel> link needs slack_team_id too.",
+            "title": "Channel Link"
+          },
+          "channel_name": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Name"
+          },
+          "destination": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the watcher automation runs: org, repo and model. Omit to use the server's defaults.",
+            "title": "Destination"
+          },
+          "slack_team_id": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slack Team Id"
+          }
+        },
+        "title": "SlackLinkBody",
+        "type": "object"
+      },
       "SlashCommandData": {
         "description": "Data payload for a slash-command invocation observed in a\nharness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it \u2014 a downstream LLM never sees this as a\nphantom tool call. Field names mirror `function_call` so the\nweb renderer can reuse the tool-card layout.\n\n**Parameters**\n\n- `agent` \u2014 Harness/agent name, e.g. `\"claude-native-ui\"`. Serialized as `\"model\"` for parity with other items.",
         "properties": {
@@ -26341,6 +26413,282 @@
           }
         },
         "summary": "Update Project Share",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/slack": {
+      "delete": {
+        "description": "Unlink: delete the watcher, then free the channel for any project.",
+        "operationId": "unlink_project_slack_v1_projects__project_id__slack_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Unlink Project Slack V1 Projects  Project Id  Slack Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Project Slack",
+        "tags": [
+          "projects"
+        ]
+      },
+      "get": {
+        "description": "The project's Slack channel link, its state, and whether the caller may change it.",
+        "operationId": "get_project_slack_v1_projects__project_id__slack_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Project Slack V1 Projects  Project Id  Slack Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Slack",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Link the project to a Slack channel, or change the link.\n\nThe channel is claimed before anything is provisioned; a channel another\nproject holds is refused with 409. The project owner owns the watcher.",
+        "operationId": "link_project_slack_v1_projects__project_id__slack_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SlackLinkBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Link Project Slack V1 Projects  Project Id  Slack Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Project Slack",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/slack/audit": {
+      "get": {
+        "description": "Recent link changes and relay events, newest first; product approvers only.",
+        "operationId": "project_slack_audit_v1_projects__project_id__slack_audit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Project Slack Audit V1 Projects  Project Id  Slack Audit Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Project Slack Audit",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/slack/disable": {
+      "post": {
+        "description": "Stop watching the channel but keep the claim; the watcher is paused.",
+        "operationId": "disable_project_slack_v1_projects__project_id__slack_disable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Disable Project Slack V1 Projects  Project Id  Slack Disable Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disable Project Slack",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/slack/enable": {
+      "post": {
+        "description": "Resume watching a disabled link (or retry one that failed).",
+        "operationId": "enable_project_slack_v1_projects__project_id__slack_enable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Enable Project Slack V1 Projects  Project Id  Slack Enable Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enable Project Slack",
         "tags": [
           "projects"
         ]

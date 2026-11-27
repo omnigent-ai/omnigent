@@ -4840,6 +4840,19 @@ def create_app(
                     prefix="/v1",
                     tags=["projects"],
                 )
+                from omnigent.server.routes.project_slack import create_project_slack_router
+                from omnigent.stores.project_slack_store import ProjectSlackStore
+
+                app.state.project_slack_store = ProjectSlackStore(kpi_location)
+                app.include_router(
+                    create_project_slack_router(
+                        project_store,
+                        app.state.project_slack_store,
+                        auth_provider=auth_provider,
+                    ),
+                    prefix="/v1",
+                    tags=["projects"],
+                )
             if conversation_store is not None and getattr(
                 conversation_store, "storage_location", None
             ):

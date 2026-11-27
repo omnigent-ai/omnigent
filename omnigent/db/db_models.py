@@ -1242,6 +1242,68 @@ class SqlProjectRoleKpiRevision(OmnigentBase):
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class SqlProjectSlackBinding(OmnigentBase):
+    """A project's link to one Slack channel, watched by an automation the owner runs.
+
+    Unique on both ends: a channel belongs to at most one project and a project
+    to at most one channel, so claiming is a single insert the database arbitrates.
+    Disabling keeps the row (and the claim); unlinking deletes it.
+    """
+
+    __tablename__ = "project_slack_bindings"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    slack_team_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # claimed | active | disabled | error | needs_reconnect
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    # Where the watcher automation runs: {"host", "org", "repo", "model"}.
+    destination: Mapped[dict[str, Any] | None] = mapped_column(
+        EnvelopedJSON(4096), nullable=True
+    )
+    automation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # SHA-256 of the per-binding relay key; the key itself is never stored.
+    relay_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_by_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_by_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "slack_team_id",
+            "channel_id",
+            name="uq_project_slack_bindings_channel",
+        ),
+        UniqueConstraint("workspace_id", "project_id", name="uq_project_slack_bindings_project"),
+    )
+
+
+class SqlProjectSlackAudit(OmnigentBase):
+    """One audited Slack-link event: who changed a binding, or what the relay did."""
+
+    __tablename__ = "project_slack_audit"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    binding_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    actor_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    action: Mapped[str] = mapped_column(String(48), nullable=False)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(EnvelopedJSON(4096), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_project_slack_audit_project", "workspace_id", "project_id", "created_at"),
+    )
+
+
 class SqlUsageEvent(OmnigentBase):
     """One product-usage event for project telemetry: names and IDs only, never content.
 

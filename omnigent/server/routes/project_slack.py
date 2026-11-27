@@ -1,0 +1,264 @@
+"""Project settings → Slack: link a project to one Slack channel.
+
+Any member can see the link; only a product approver (the owner or a configured
+approver) can link, change, disable, enable or unlink it. Linking claims the
+channel first: the database refuses a channel another project holds. The
+watcher automation is then provisioned for the link (see
+:mod:`omnigent.server.slack_provisioning`); disabling pauses it and keeps the
+claim, and unlinking deletes it and frees the channel.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from typing import TYPE_CHECKING, Any
+
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, ConfigDict, Field
+
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.product_approval import product_approvers
+from omnigent.server.routes._auth_helpers import require_user
+from omnigent.stores.project_slack_store import ChannelTakenError, SlackBinding
+
+if TYPE_CHECKING:
+    from omnigent.entities import Project
+    from omnigent.server.auth import AuthProvider
+    from omnigent.stores import ProjectStore
+    from omnigent.stores.project_slack_store import ProjectSlackStore
+
+TEAM_ID = re.compile(r"^[TE][A-Z0-9]{2,30}$")
+CHANNEL_ID = re.compile(r"^[CG][A-Z0-9]{2,30}$")
+# https://app.slack.com/client/T0123/C0456 carries both ids.
+_CLIENT_LINK = re.compile(r"^https://app\.slack\.com/client/([A-Z0-9]+)/([A-Z0-9]+)/?(?:[?#].*)?$")
+# https://<workspace>.slack.com/archives/C0456 carries only the channel.
+_ARCHIVE_LINK = re.compile(
+    r"^https://[a-z0-9-]+\.(?:enterprise\.)?slack\.com/archives/([A-Z0-9]+)/?(?:[?#].*)?$"
+)
+_DESTINATION_KEYS = ("org", "repo", "model")
+
+
+class SlackLinkBody(BaseModel):
+    """What a product approver enters in Project settings → Slack."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    channel_link: str | None = Field(
+        default=None,
+        max_length=512,
+        description="A Slack channel link: https://app.slack.com/client/<team>/<channel> "
+        "gives both IDs; a https://<workspace>.slack.com/archives/<channel> link needs "
+        "slack_team_id too.",
+    )
+    slack_team_id: str | None = Field(default=None, max_length=32)
+    channel_id: str | None = Field(default=None, max_length=32)
+    channel_name: str | None = Field(default=None, max_length=128)
+    destination: dict[str, str] | None = Field(
+        default=None,
+        description="Where the watcher automation runs: org, repo and model. "
+        "Omit to use the server's defaults.",
+    )
+
+
+def parse_channel(body: SlackLinkBody) -> tuple[str, str]:
+    """The ``(slack_team_id, channel_id)`` a link body names.
+
+    :raises OmnigentError: ``INVALID_INPUT`` when the IDs are missing or malformed.
+    """
+    team_id = (body.slack_team_id or "").strip().upper() or None
+    channel_id = (body.channel_id or "").strip().upper() or None
+    link = (body.channel_link or "").strip()
+    if link:
+        if match := _CLIENT_LINK.match(link):
+            team_id, channel_id = match.group(1), match.group(2)
+        elif match := _ARCHIVE_LINK.match(link):
+            channel_id = match.group(1)
+        else:
+            raise OmnigentError(
+                "Paste a Slack channel link, e.g. https://app.slack.com/client/T0123/C0456",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    if channel_id is None or not CHANNEL_ID.match(channel_id):
+        raise OmnigentError(
+            "Give a Slack channel ID like C0123ABCD", code=ErrorCode.INVALID_INPUT
+        )
+    if team_id is None or not TEAM_ID.match(team_id):
+        raise OmnigentError(
+            "Give the Slack workspace (team) ID like T0123ABCD, or paste an "
+            "app.slack.com/client link, which carries it",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return team_id, channel_id
+
+
+def clean_destination(destination: dict[str, str] | None) -> dict[str, str]:
+    cleaned: dict[str, str] = {}
+    for key, value in (destination or {}).items():
+        if key not in _DESTINATION_KEYS:
+            raise OmnigentError(
+                f"Unknown destination setting {key!r}; use org, repo or model",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        value = str(value).strip()
+        if value:
+            cleaned[key] = value[:128]
+    return cleaned
+
+
+def binding_json(binding: SlackBinding | None, *, can_manage: bool) -> dict[str, Any]:
+    """The link as Project settings shows it; never any credential."""
+    if binding is None:
+        return {"object": "project.slack", "linked": False, "can_manage": can_manage}
+    return {
+        "object": "project.slack",
+        "linked": True,
+        "can_manage": can_manage,
+        "id": binding.id,
+        "slack_team_id": binding.slack_team_id,
+        "channel_id": binding.channel_id,
+        "channel_name": binding.channel_name,
+        "state": binding.state,
+        "destination": binding.destination,
+        "automation_id": binding.automation_id,
+        "last_error": binding.last_error,
+        "owner_user_id": binding.owner_user_id,
+        "updated_by_user_id": binding.updated_by_user_id,
+        "updated_at": binding.updated_at,
+    }
+
+
+def create_project_slack_router(
+    project_store: ProjectStore,
+    slack_store: ProjectSlackStore,
+    *,
+    auth_provider: AuthProvider | None = None,
+) -> APIRouter:
+    router = APIRouter(prefix="/projects/{project_id}/slack")
+
+    async def load(request: Request, project_id: str) -> tuple[str | None, Project, bool]:
+        user_id = require_user(request, auth_provider)
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        can_manage = user_id is None or user_id in product_approvers(project)
+        return user_id, project, can_manage
+
+    async def load_manager(request: Request, project_id: str) -> tuple[str, Project]:
+        user_id, project, can_manage = await load(request, project_id)
+        if not can_manage:
+            raise OmnigentError(
+                "Only the project owner or a product approver can change its Slack link",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return user_id or project.user_id or "local", project
+
+    def provisioner(request: Request) -> Any:
+        return getattr(request.app.state, "slack_provisioner", None)
+
+    @router.get("")
+    async def get_project_slack(request: Request, project_id: str) -> dict[str, Any]:
+        """The project's Slack channel link, its state, and whether the caller may change it."""
+        _, project, can_manage = await load(request, project_id)
+        binding = await asyncio.to_thread(slack_store.get, project.id)
+        return binding_json(binding, can_manage=can_manage)
+
+    @router.put("")
+    async def link_project_slack(
+        request: Request, project_id: str, body: SlackLinkBody
+    ) -> dict[str, Any]:
+        """Link the project to a Slack channel, or change the link.
+
+        The channel is claimed before anything is provisioned; a channel another
+        project holds is refused with 409. The project owner owns the watcher.
+        """
+        actor, project = await load_manager(request, project_id)
+        team_id, channel_id = parse_channel(body)
+        destination = clean_destination(body.destination)
+        try:
+            binding = await asyncio.to_thread(
+                slack_store.claim,
+                project.id,
+                slack_team_id=team_id,
+                channel_id=channel_id,
+                channel_name=(body.channel_name or "").strip().lstrip("#") or None,
+                destination=destination,
+                owner_user_id=project.user_id or actor,
+                actor_user_id=actor,
+            )
+        except ChannelTakenError:
+            raise OmnigentError(
+                "That Slack channel is already linked to another project. Unlink it there "
+                "first; a channel can belong to one project.",
+                code=ErrorCode.CONFLICT,
+            ) from None
+        active = provisioner(request)
+        if active is not None:
+            binding = await active.provision(project, binding, actor_user_id=actor)
+        return binding_json(binding, can_manage=True)
+
+    @router.post("/disable")
+    async def disable_project_slack(request: Request, project_id: str) -> dict[str, Any]:
+        """Stop watching the channel but keep the claim; the watcher is paused."""
+        actor, project = await load_manager(request, project_id)
+        binding = await asyncio.to_thread(slack_store.get, project.id)
+        if binding is None:
+            raise OmnigentError("This project has no Slack link", code=ErrorCode.NOT_FOUND)
+        active = provisioner(request)
+        if active is not None:
+            binding = await active.pause(project, binding, actor_user_id=actor)
+        else:
+            binding = await asyncio.to_thread(
+                slack_store.set_state, project.id, "disabled", actor_user_id=actor
+            )
+        return binding_json(binding, can_manage=True)
+
+    @router.post("/enable")
+    async def enable_project_slack(request: Request, project_id: str) -> dict[str, Any]:
+        """Resume watching a disabled link (or retry one that failed)."""
+        actor, project = await load_manager(request, project_id)
+        binding = await asyncio.to_thread(slack_store.get, project.id)
+        if binding is None:
+            raise OmnigentError("This project has no Slack link", code=ErrorCode.NOT_FOUND)
+        active = provisioner(request)
+        if active is not None:
+            binding = await active.provision(project, binding, actor_user_id=actor)
+        else:
+            binding = await asyncio.to_thread(
+                slack_store.set_state, project.id, "claimed", actor_user_id=actor, action="enabled"
+            )
+        return binding_json(binding, can_manage=True)
+
+    @router.delete("")
+    async def unlink_project_slack(request: Request, project_id: str) -> dict[str, Any]:
+        """Unlink: delete the watcher, then free the channel for any project."""
+        actor, project = await load_manager(request, project_id)
+        binding = await asyncio.to_thread(slack_store.get, project.id)
+        if binding is None:
+            return binding_json(None, can_manage=True)
+        active = provisioner(request)
+        if active is not None:
+            await active.remove(project, binding, actor_user_id=actor)
+        await asyncio.to_thread(slack_store.release, project.id, actor_user_id=actor)
+        return binding_json(None, can_manage=True)
+
+    @router.get("/audit")
+    async def project_slack_audit(request: Request, project_id: str) -> dict[str, Any]:
+        """Recent link changes and relay events, newest first; product approvers only."""
+        _, project = await load_manager(request, project_id)
+        entries = await asyncio.to_thread(slack_store.audit, project.id)
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": entry.id,
+                    "action": entry.action,
+                    "actor_user_id": entry.actor_user_id,
+                    "detail": entry.detail,
+                    "created_at": entry.created_at,
+                }
+                for entry in entries
+            ],
+        }
+
+    return router
