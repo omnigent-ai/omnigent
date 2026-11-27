@@ -240,6 +240,35 @@ def test_remap_goes_ahead_after_gadgets_were_shown_and_hidden_beside_many_sessio
     assert accounts.get_user("alice@example.com") is not None
 
 
+def test_remap_checks_gadget_grants_under_the_old_accounts_lock(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grant writers lock their grantee's account row; the remap takes that lock before it
+    checks for grants and keeps it to the commit, so no grant lands in between."""
+    import omnigent.db.account_authority as authority
+    import omnigent.server.identity_migration as migration
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("bob", hash_password("password123"))
+    events: list[str] = []
+    real_lock, real_check = authority.lock_account, migration._holds_gadget_data
+
+    def lock(session, user_id):
+        events.append(f"lock {user_id}")
+        return real_lock(session, user_id)
+
+    def check(session, user, store):
+        events.append(f"check {user.id}")
+        return real_check(session, user, store)
+
+    monkeypatch.setattr(authority, "lock_account", lock)
+    monkeypatch.setattr(migration, "_holds_gadget_data", check)
+
+    remap_identities(get_or_create_engine(db_uri), {"bob": "bob@example.com"}, dry_run=True)
+
+    assert events[:2] == ["lock bob", "check bob"]
+
+
 def test_remap_refuses_a_user_granted_a_gadget_even_without_the_gadget_store(
     db_uri: str,
 ) -> None:

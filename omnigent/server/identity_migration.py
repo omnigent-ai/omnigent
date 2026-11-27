@@ -278,7 +278,12 @@ def remap_identities(
             if old_id == new_id:
                 continue
 
-            old_user = session.get(SqlUser, (current_workspace_id(), old_id))
+            # Locked like a grant writer locks its grantee, and held to the commit, so a
+            # gadget grant to the old identity can't commit between the check below and
+            # the remap.
+            from omnigent.db.account_authority import lock_account
+
+            old_user = lock_account(session, old_id)
             if old_user is None:
                 report.skipped_missing.append(old_id)
                 continue

@@ -2011,9 +2011,6 @@ def test_a_name_registered_again_before_the_gadget_cleanup_inherits_nothing(
     original = store.delete
     # The gadget store can't delete while the account is deleted and registered again.
     monkeypatch.setattr(store, "delete", lambda gadget_id: False)
-    monkeypatch.setattr(
-        accounts_module, "delete_deleted_account_gadget_grants", lambda *args, **kwargs: 0
-    )
     assert accounts.delete_user("alice") is True
     assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
 

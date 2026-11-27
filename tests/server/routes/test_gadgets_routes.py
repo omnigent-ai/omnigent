@@ -198,6 +198,7 @@ async def test_requests_need_an_identity_and_a_json_body(
     info = (await client.get("/v1/info", headers=_as(ALICE))).json()
     assert info["features"]["gadgets"] is True
     assert info["gadgets"] is True and info["gadget_sharing"] is True
+    assert info["gadget_copy"] is True
 
 
 def _own_session(stores: SimpleNamespace, owner: str = ALICE) -> str:

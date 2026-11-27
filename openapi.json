@@ -8197,6 +8197,11 @@
               }
             ]
           },
+          "gadget_copy": {
+            "default": false,
+            "title": "Gadget Copy",
+            "type": "boolean"
+          },
           "gadget_sharing": {
             "default": false,
             "title": "Gadget Sharing",

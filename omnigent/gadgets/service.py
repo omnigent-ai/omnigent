@@ -670,9 +670,9 @@ class GadgetService:
         copied = self.store.create(
             self.viewer.user_id, name, owner_registration=self.viewer.registration
         )
-        self._after_owned_write()
-        permissions = self.access.permissions(self.viewer.user_id, copied)
         try:
+            self._after_owned_write()
+            permissions = self.access.permissions(self.viewer.user_id, copied)
             files = self._files(copied)
             value = {**revision, "id": uuid.uuid4().hex}
             files.mkdirs("code/revisions")
@@ -690,10 +690,16 @@ class GadgetService:
             with self._lifecycle(copied):
                 return self._publish(copied, permissions, {"revision_id": value["id"]})
         except BaseException:
-            # Best effort: a copy that failed half-way is not left for the viewer to find.
-            with contextlib.suppress(Exception):
+            # Best effort, each step on its own: a copy that failed half-way is not left
+            # for the viewer to find, even when its grant cleanup fails too.
+            try:
                 self.access.forget(copied.id)
+            except Exception:  # noqa: BLE001 - logged; the original error is re-raised
+                _log.warning("could not forget the grants of a failed gadget copy", exc_info=True)
+            try:
                 self.store.delete(copied.id)
+            except Exception:  # noqa: BLE001 - logged; the original error is re-raised
+                _log.warning("could not delete a failed gadget copy", exc_info=True)
             raise
 
     def gadget_session_status(self, app_id: str) -> dict:

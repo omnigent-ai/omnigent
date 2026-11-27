@@ -164,3 +164,94 @@ def test_a_copy_that_fails_half_way_is_removed(gadgets: Fixture) -> None:
     gadgets.store.before_create = None
 
     assert [item["id"] for item in owner.list_owned()["items"]] == [source["id"]]
+
+
+@pytest.mark.parametrize("failing", ["permissions", "forget"])
+def test_a_copy_is_removed_whichever_later_step_fails(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    owner = gadgets.service(1)
+    source = publish_board(owner)
+    real_permissions = gadgets.access.permissions
+
+    def permissions(viewer_id, gadget):
+        if gadget.id != source["id"]:
+            raise RuntimeError("synthetic permission lookup failure")
+        return real_permissions(viewer_id, gadget)
+
+    if failing == "permissions":
+        monkeypatch.setattr(gadgets.access, "permissions", permissions)
+    else:
+        # The copy fails publishing, then its grant cleanup fails too.
+        monkeypatch.setattr(owner, "_publish", lambda *args: (_ for _ in ()).throw(OSError("x")))
+        monkeypatch.setattr(
+            gadgets.access, "forget", lambda gadget_id: (_ for _ in ()).throw(RuntimeError())
+        )
+
+    with pytest.raises((RuntimeError, OSError)):
+        owner.copy(source["id"], {})
+    monkeypatch.undo()
+
+    assert [item["id"] for item in owner.list_owned()["items"]] == [source["id"]]
+
+
+def test_the_published_version_is_copied_not_a_newer_draft(gadgets: Fixture) -> None:
+    owner = gadgets.service(1)
+    source = publish_board(owner)
+    owner.create_revision(
+        source["id"],
+        {
+            "html": "<main>Unpublished draft</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read"],
+            "collections": {},
+        },
+    )
+
+    copied = owner.copy(source["id"], {})
+
+    assert owner.get_revision(copied["id"])["html"] == "<main>Synthetic app fixture</main>"
+
+
+def test_data_is_copied_across_pages_and_collections_and_capped_over_all_of_them(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = gadgets.service(1)
+    app = owner.create("Two collections")
+    revision = owner.create_revision(
+        app["id"],
+        {
+            "html": "<main>Two</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read", "data.write"],
+            "collections": {"cards": {"type": "object"}, "notes": {"type": "object"}},
+        },
+    )
+    source = owner.publish(app["id"], {"revision_id": revision["id"], "if_version": None})
+    page = service_module._DATA_STORE_LIMITS.max_list_limit
+    for number in range(page + 3):
+        rpc(
+            owner,
+            source,
+            "create",
+            id=f"c{number}",
+            value={"n": number},
+            operation_id=f"c{number}",
+        )
+    for number in range(2):
+        owner.rpc(
+            source["id"],
+            source["published_revision"],
+            "data.v1.create",
+            {"collection": "notes", "id": f"n{number}", "value": {}, "operation_id": f"n{number}"},
+        )
+
+    copied = owner.copy(source["id"], {"include_data": True})
+    listed = rpc(owner, copied, "list", limit=page)
+    rest = rpc(owner, copied, "list", limit=page, cursor=listed["next_cursor"])
+    assert len(listed["items"]) + len(rest["items"]) == page + 3
+
+    # The cap counts every collection: the cards alone fit, the notes push it over.
+    monkeypatch.setattr(service_module, "MAX_COPIED_RECORDS", page + 4)
+    with pytest.raises(CapacityExceeded):
+        owner.copy(source["id"], {"include_data": True})

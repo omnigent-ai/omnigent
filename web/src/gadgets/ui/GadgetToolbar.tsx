@@ -32,7 +32,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { copyText } from "@/lib/clipboard";
-import { gadgetSharingAvailable } from "@/lib/permissionsApi";
+import { gadgetCopyAvailable, gadgetSharingAvailable } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import type { Gadget, GadgetContent } from "@/gadgets/api/gadgetApi";
@@ -391,7 +391,7 @@ export function GadgetActions({
             </DropdownMenuItem>
           )}
           <DropdownMenuItem onSelect={() => setDetailsOpen(true)}>Gadget details</DropdownMenuItem>
-          {gadget.published_revision !== null && (
+          {gadget.published_revision !== null && gadgetCopyAvailable(info) && (
             <DropdownMenuItem onSelect={() => setCopying(true)}>Make a copy</DropdownMenuItem>
           )}
           {gadget.permissions.manage && (

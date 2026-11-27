@@ -206,6 +206,18 @@ describe("Make a copy", () => {
       }),
     );
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.getByRole("status", { name: "location" })).toHaveTextContent("/gadget/copy");
+  });
+
+  it("isn't offered by a server that can't make copies", async () => {
+    renderWithGadgets(
+      <GadgetActions gadget={VIEW_ONLY} onDeleted={vi.fn()} shareInMenu={false} />,
+      { info: { ...GADGETS_INFO, gadget_copy: undefined } },
+    );
+
+    openMenu();
+    expect(await screen.findByRole("menuitem", { name: "Gadget details" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Make a copy" })).toBeNull();
   });
 
   it("isn't offered before the gadget is published", async () => {

@@ -393,6 +393,8 @@ export interface ServerInfo {
    * can be shared; absent on older servers and on stores without grants (off).
    */
   gadget_sharing?: boolean;
+  /** The server makes copies of gadgets (``/v1/gadgets/{id}/copy``); absent on older servers (off). */
+  gadget_copy?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -821,6 +823,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           workflows: data.workflows === true,
           workflow_sharing: data.workflow_sharing === true,
           gadget_sharing: data.gadget_sharing === true,
+          gadget_copy: data.gadget_copy === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,
