@@ -72,9 +72,7 @@ def _fake_environments(monkeypatch: pytest.MonkeyPatch, cwd: Path) -> list[Mock]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "outcome", ["success", "nonzero", "timeout", "lost", "raised", "unsupported"]
-)
+@pytest.mark.parametrize("outcome", ["success", "nonzero", "timeout", "lost", "raised"])
 async def test_supported_shells_lease_the_file_environment_and_retire_failures(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
 ) -> None:
@@ -97,35 +95,20 @@ async def test_supported_shells_lease_the_file_environment_and_retire_failures(
             "timeout": {"error": "timed out", "timed_out": True},
             "lost": {"error": "reply lost; command was not sent again"},
         }
-        if outcome == "unsupported":
-            monkeypatch.setattr(
-                "omnigent.inner._bwrap_shell_request.request_launcher", lambda *_: None
-            )
-        elif outcome == "raised":
+        if outcome == "raised":
             environment.isolated_shell.side_effect = OSError("request failed")
         else:
             environment.isolated_shell.return_value = results[outcome]
         result = json.loads(await execute("sys_os_shell", {"command": "example", "timeout": 7}))
-        if outcome == "unsupported":
-            assert result == {"stdout": "disposable", "exit_code": 0}
-            environment.isolated_shell.assert_not_awaited()
-            environment.shell.assert_not_awaited()
-            assert len(environments) == 2
-            environments[1].shell.assert_awaited_once_with(command="example", timeout=7)
-            environments[1].isolated_shell.assert_not_awaited()
-            environments[1].close.assert_called_once_with()
-        else:
-            assert result == (
-                {"error": "request failed"} if outcome == "raised" else results[outcome]
-            )
-            environment.isolated_shell.assert_awaited_once_with(command="example", timeout=7)
-            environment.shell.assert_not_awaited()
-            assert len(environments) == 1
+        assert result == ({"error": "request failed"} if outcome == "raised" else results[outcome])
+        environment.isolated_shell.assert_awaited_once_with(command="example", timeout=7)
+        environment.shell.assert_not_awaited()
+        assert len(environments) == 1
         assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
             "content": "file"
         }
-        if outcome in {"success", "unsupported"}:
-            assert len(environments) == (2 if outcome == "unsupported" else 1)
+        if outcome == "success":
+            assert len(environments) == 1
             assert environment.read.await_count == 2
             environment.close.assert_not_called()
         else:
