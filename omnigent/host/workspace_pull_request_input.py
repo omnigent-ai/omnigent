@@ -11,6 +11,7 @@ from typing import Any
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 
+from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.runner import pr_resource
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
@@ -21,6 +22,7 @@ from omnigent.runner.github_review_fields import (
     SHA256,
     VERDICT_STATES,
 )
+from omnigent.runner.github_search import MAX_REVIEWERS
 from omnigent.runner.pr_actions import AUTO_MERGE_BATCH_LIMIT
 
 # The largest pull request attachment, a video; the runner checks each type's own limit.
@@ -31,6 +33,9 @@ MAX_ATTACHMENT_NAME_CHARACTERS = 255
 MAX_PULL_REQUEST_URL_CHARACTERS = 2048
 # GitHub label names are at most 50 characters; a search needs no more than a few.
 MAX_LABEL_SEARCH_CHARACTERS = 256
+# A login or team name is far shorter; the same cap bounds the other searches.
+MAX_SEARCH_CHARACTERS = MAX_LABEL_SEARCH_CHARACTERS
+_COMPLETION_KINDS = frozenset({pb.COMPLETION_KIND_MENTION, pb.COMPLETION_KIND_REFERENCE})
 MAX_IMAGE_URL_CHARACTERS = 2048
 _LONG_PULL_REQUEST_URL = (
     f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
@@ -101,6 +106,8 @@ def refuse_unserved_request(method: str, request: Any) -> None:
             reason = "Expected an account to merge as"
     elif method == "ListLabels" and len(request.text) > MAX_LABEL_SEARCH_CHARACTERS:
         reason = f"The label search is longer than {MAX_LABEL_SEARCH_CHARACTERS} characters"
+    elif method in {"SearchReviewers", "SearchCompletions"}:
+        reason = _search_refusal(method, request)
     elif method == "EnableAutoMerge":
         reason = _auto_merge_refusal(request)
     elif method == "ReadPullRequestImage":
@@ -125,6 +132,19 @@ def refuse_unserved_request(method: str, request: Any) -> None:
         reason = _review_refusal(method, request)
     if reason is not None:
         raise PullRequestRefused(Code.INVALID_ARGUMENT, reason, INVALID_INPUT_REASON)
+
+
+def _search_refusal(method: str, request: Any) -> str | None:
+    """Why a reviewer or completion search's fields are malformed, or ``None``."""
+    if len(request.text) > MAX_SEARCH_CHARACTERS:
+        return f"The search is longer than {MAX_SEARCH_CHARACTERS} characters"
+    if len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+        return _LONG_PULL_REQUEST_URL
+    if method == "SearchReviewers" and not 0 <= request.page_size <= MAX_REVIEWERS:
+        return f"Ask for at most {MAX_REVIEWERS} reviewers"
+    if method == "SearchCompletions" and request.kind not in _COMPLETION_KINDS:
+        return "Choose what to complete: people or pull requests"
+    return None
 
 
 def _review_refusal(method: str, request: Any) -> str | None:

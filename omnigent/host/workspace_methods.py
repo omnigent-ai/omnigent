@@ -59,8 +59,6 @@ DECLARED_NOT_SERVED: frozenset[str] = frozenset(
         "ListBranchPullRequests",
         "LookupPullRequest",
         "PreviewReviewerPing",
-        "SearchCompletions",
-        "SearchReviewers",
         "SendReviewerPing",
     }
 )
