@@ -688,11 +688,16 @@ export function InboxPage() {
   };
 
   const rowsById = new Map(allRows.map((row) => [row.id, row]));
-  /** Whether an unread card shows its reply field, as its body decides below. */
+  /** A sent reply whose answer hasn't arrived yet, which the card shows instead of its field. */
+  const replyAwaitsAnswer = (sessionId: string) =>
+    replyStatuses[sessionId]?.state === "sent" && !settledReplyIds.includes(sessionId);
+  /** Whether an unread card shows its reply field: the card body and ⌘K's Reply both ask. */
+  const showsReplyField = (sessionId: string, permissionLevel: number | null) =>
+    // The server refuses user messages below edit access.
+    isEditorLevel(permissionLevel) && !replyAwaitsAnswer(sessionId);
   const canReplyTo = (sessionId: string) => {
     const row = rowsById.get(sessionId);
-    if (!row || !isEditorLevel(row.permission_level)) return false;
-    return !(replyStatuses[sessionId]?.state === "sent" && !settledReplyIds.includes(sessionId));
+    return row !== undefined && showsReplyField(sessionId, row.permission_level);
   };
   const renderEntry = (entry: InboxEntry) => {
     const expanded = expandedOverrides[entry.key] ?? entry.key === defaultExpandedKey;
@@ -993,17 +998,14 @@ export function InboxPage() {
     const output = previewQuery?.data ?? undefined;
     const preview = output?.preview;
     const markRead = () => markUnreadRead(entry);
-    // The server refuses user messages below edit access.
-    const canReply = isEditorLevel(item.row.permission_level);
     const replyDraft = replyDrafts[sessionId] ?? "";
     const replyStatus = replyStatuses[sessionId];
     const replySending = replyStatus?.state === "sending";
-    const replyAwaitingAnswer =
-      replyStatus?.state === "sent" && !settledReplyIds.includes(sessionId);
+    const replyAwaitingAnswer = replyAwaitsAnswer(sessionId);
     // A send records the current output to tell the agent's answer from it, so
     // only a loaded preview will do; a failed fetch leaves no baseline.
     const previewReady = previewQuery?.isSuccess === true;
-    const showReplyField = canReply && !replyAwaitingAnswer;
+    const showReplyField = showsReplyField(sessionId, item.row.permission_level);
     const sendIsPrimary = showReplyField && replyDraft.trim() !== "";
     const sendReply = () => {
       if (!replyDraft.trim() || replySending || !previewReady) return;

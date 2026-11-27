@@ -2446,10 +2446,19 @@ describe("the Inbox in ⌘K", () => {
     expect(within(item).queryByRole("textbox", { name: /Reply to/ })).toBeNull();
 
     act(() => command("Reply to “Unread Session”…")!.run());
-    const box = await within(item).findByRole("textbox", { name: /Reply to/ });
+    const box = await within(item).findByRole<HTMLTextAreaElement>("textbox", {
+      name: /Reply to/,
+    });
     await waitFor(() => expect(box).toHaveFocus());
     // Replying from ⌘K leaves the card unread until the reply sends.
     expect(screen.getByTestId("inbox-unread")).toBeInTheDocument();
+
+    // Asked again on the open card, it comes back to the draft with the caret after it.
+    fireEvent.change(box, { target: { value: "Check the parser" } });
+    act(() => box.blur());
+    act(() => command("Reply to “Unread Session”…")!.run());
+    await waitFor(() => expect(box).toHaveFocus());
+    expect([box.selectionStart, box.selectionEnd]).toEqual([16, 16]);
   });
 
   it("offers no Reply on a card the viewer can't edit", async () => {
