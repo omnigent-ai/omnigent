@@ -91,7 +91,12 @@ import {
 import { sessionChoiceCount, workingCopyComparisonsAt } from "@/lib/workingCopyComparisons";
 import { unrepresentableNote, WorkingCopyDiffReviewBody } from "./WorkingCopyDiffReview";
 import { useLastInteractedSurface } from "./useLastInteractedSurface";
-import { landingStands, type VisitLanding, visitFolderStep } from "./visitFolderRestore";
+import {
+  landingStands,
+  sameReviewFolder,
+  type VisitLanding,
+  visitFolderStep,
+} from "./visitFolderRestore";
 
 const REVIEW_METADATA_KEYS = [BRANCH_COMMITS_KEY, REPOSITORY_REFS_KEY] as const;
 /** A commit's review toolbar: how its diff shows, with nothing about the session's comparison. */
@@ -508,7 +513,7 @@ export function ChangesReview(props: ChangesReviewProps) {
   // A visit's comparison is its folder's. Another folder's review never applies it, and records
   // its own comparison on the visit in place, with its folder.
   const shownRoot = repository ? folder.root : null;
-  const sameFolder = visitRoot === shownRoot;
+  const sameFolder = sameReviewFolder(visitRoot, shownRoot);
   const folderStep = visitFolderStep({
     stands,
     active,
@@ -517,7 +522,7 @@ export function ChangesReview(props: ChangesReviewProps) {
     shownRoot,
     directory: folder.directory,
     resolved: folder.resolved,
-    visitRootShows: folder.rootFor(visitRoot) === visitRoot,
+    visitRootShows: sameReviewFolder(folder.rootFor(visitRoot), visitRoot),
     canChoose: folder.canChoose,
   });
   // Before paint, move Diffs and Files to the visit's folder; the landing then stands there.

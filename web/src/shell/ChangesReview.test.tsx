@@ -1477,6 +1477,21 @@ describe("a review of a worktree inside the workspace", () => {
       expect(data.choice.choose).toHaveBeenCalledWith(visit);
     });
 
+    it("applies the visit in its worktree however the visit spells that folder", () => {
+      rememberBrowseLocation("s1", ROOT);
+      mocks.folder = following;
+      const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      renderReview({
+        comparison: visit,
+        comparisonRoot: `${ROOT}/`,
+        landing: landed(),
+        onComparisonShown: vi.fn(),
+      });
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+    });
+
     it("keeps the visit while the worktree lookup fails, and brings it back once they list", () => {
       mocks.realFolder = { worktrees: { status: "unknown" } };
       const data = source(changes({ workspace: { hostId: "host_1", root: "/repo" } }));
