@@ -505,12 +505,6 @@ def test_a_compressed_answer_is_refused_before_it_is_decoded(
     assert read == []
 
 
-def test_an_answer_marked_identity_is_served(fake: FakeGitHub) -> None:
-    transport = Transport(_image(**{"content-encoding": "identity"}))
-
-    assert _read(ASSET, transport).data == PNG
-
-
 def _after(now: list[float], seconds: float, answer: Any) -> Any:
     """An answer that takes ``seconds`` of the fake clock to arrive."""
 
@@ -598,20 +592,21 @@ def test_the_whole_fetch_ends_at_its_deadline_though_no_wait_passes_its_cap(
 
 
 @pytest.mark.parametrize(
-    "content_type, data",
+    "content_type, data, headers",
     [
-        ("image/png", PNG),
-        ("image/jpeg", JPEG),
-        ("image/gif", GIF),
-        ("image/webp", WEBP),
-        ("image/avif", AVIF),
-        ("image/PNG; charset=binary", PNG),
+        ("image/png", PNG, {}),
+        ("image/jpeg", JPEG, {}),
+        ("image/gif", GIF, {}),
+        ("image/webp", WEBP, {}),
+        ("image/avif", AVIF, {}),
+        ("image/PNG; charset=binary", PNG, {}),
+        ("image/png", PNG, {"content-encoding": "identity"}),
     ],
 )
 def test_each_raster_type_with_matching_bytes_is_served(
-    fake: FakeGitHub, content_type: str, data: bytes
+    fake: FakeGitHub, content_type: str, data: bytes, headers: dict[str, str]
 ) -> None:
-    image = _read(ASSET, Transport(_image(content_type, data)))
+    image = _read(ASSET, Transport(_image(content_type, data, **headers)))
 
     assert (image.content_type, image.data) == (content_type.split(";")[0].lower(), data)
 
@@ -774,6 +769,22 @@ def test_other_requests_keep_their_transport_records(
     asyncio.run(fetch())
 
     assert "receive_response_headers" in caplog.text
+
+
+def test_a_proxy_httpx_cant_use_fails_the_fetch_without_its_diagnostic(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed HTTPS_PROXY breaks the transport before any request is made."""
+    for variable in ("https_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "gopher://proxy-user@proxy.example:70")
+
+    with pytest.raises(ImageRefused) as refused:
+        _read(ASSET)
+
+    assert refused.value.reason == "fetch_failed"
+    assert str(refused.value) == "GitHub couldn't load that image. Try again."
+    assert refused.value.__cause__ is None
 
 
 # Slots.

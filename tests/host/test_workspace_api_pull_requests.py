@@ -1871,12 +1871,12 @@ async def test_an_image_read_waits_its_own_time_for_each_reply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The first reply follows the PR read and the whole fetch, past a read's 30 s."""
-    monkeypatch.setattr(workspace_api, "_REPLY_TIMEOUT_S", 60.0)
     monkeypatch.setattr(workspace_api, "_IMAGE_REPLY_TIMEOUT_S", 0.05)
     tunnel = _tunnel(tmp_path)
 
+    # Bounded here, so a read waiting only a read's 30 s fails the test at once.
     with pytest.raises(ConnectError) as lost:
-        await anext(_image_stream(tunnel))
+        await asyncio.wait_for(anext(_image_stream(tunnel)), timeout=5.0)
 
     assert (lost.value.code, lost.value.message) == (
         Code.DEADLINE_EXCEEDED,
@@ -1887,7 +1887,6 @@ async def test_an_image_read_waits_its_own_time_for_each_reply(
 async def test_an_image_part_after_the_metadata_waits_the_images_time_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(workspace_api, "_REPLY_TIMEOUT_S", 60.0)
     # Long enough to deliver the metadata under load; the part after it never comes.
     monkeypatch.setattr(workspace_api, "_IMAGE_REPLY_TIMEOUT_S", 0.5)
     tunnel = _tunnel(tmp_path)
@@ -1906,7 +1905,7 @@ async def test_an_image_part_after_the_metadata_waits_the_images_time_too(
     await first
 
     with pytest.raises(ConnectError) as lost:
-        await anext(stream)
+        await asyncio.wait_for(anext(stream), timeout=5.0)
 
     assert lost.value.code == Code.DEADLINE_EXCEEDED
 

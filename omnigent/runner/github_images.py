@@ -404,7 +404,12 @@ async def _fetch(
             headers["Authorization"] = f"token {token}"
         request = httpx.Request("GET", current, headers=headers, extensions={"timeout": timeout})
         try:
-            async with transport or _transport_for(current) as hop_transport:
+            hop_transport = transport or _transport_for(current)
+        # An HTTPS_PROXY httpx can't use; its message names the proxy, so none is passed on.
+        except ValueError:
+            raise ImageRefused("fetch_failed") from None
+        try:
+            async with hop_transport:
                 response = await hop_transport.handle_async_request(request)
                 try:
                     if response.status_code in _REDIRECT_STATUSES:
