@@ -8,7 +8,6 @@ A provider read past the scope check is a test failure unless the case allows it
 from __future__ import annotations
 
 import copy
-import json
 import socket
 from pathlib import Path
 from typing import Any
@@ -42,6 +41,7 @@ from omnigent.runner.pull_request_errors import (
 )
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.connect_stream import connect_frame, end_of_stream_code
 from tests.host.test_workspace_methods import (
     _PULL_REQUEST_OWNER_METHODS,
     _PULL_REQUEST_OWNER_STREAMS,
@@ -307,19 +307,12 @@ async def _stream_error(
     http: httpx.AsyncClient, path: str, message: bytes, headers: dict[str, str]
 ) -> str | None:
     """A Connect streaming call's error code, from its end-of-stream message."""
-    envelope = b"\x00" + len(message).to_bytes(4, "big") + message
     response = await http.post(
         path,
-        content=envelope,
+        content=connect_frame(message),
         headers={**headers, "Content-Type": "application/connect+proto"},
     )
-    body, error = response.content, None
-    while body:
-        flags, size = body[0], int.from_bytes(body[1:5], "big")
-        if flags & 0x02:
-            error = json.loads(body[5 : 5 + size]).get("error", {}).get("code")
-        body = body[5 + size :]
-    return error
+    return end_of_stream_code(response.content)
 
 
 def _pr_target(**fields: Any) -> dict[str, Any]:
