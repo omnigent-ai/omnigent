@@ -1,8 +1,9 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { createAutomaticFeaturePreference } from "./automaticFeaturePreference";
 
+// Storage, events and other windows are the stored choice preference's; these pin the intents.
 describe("createAutomaticFeaturePreference", () => {
   const preference = createAutomaticFeaturePreference("omnigent:test-automatic-feature");
 
@@ -39,13 +40,5 @@ describe("createAutomaticFeaturePreference", () => {
       preference.notifyChanged();
     });
     expect(result.current).toBe("automatic");
-  });
-
-  it("ignores other keys' storage events", () => {
-    const listener = vi.fn();
-    const unsubscribe = preference.subscribe(listener);
-    window.dispatchEvent(new StorageEvent("storage", { key: "omnigent:something-else" }));
-    expect(listener).not.toHaveBeenCalled();
-    unsubscribe();
   });
 });

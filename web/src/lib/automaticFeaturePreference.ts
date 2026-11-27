@@ -1,7 +1,7 @@
 // A feature's stored choice: Automatic, On or Off. The automatic policy and the effective value
 // stay with the feature; this keeps only the user's intent, with Automatic stored as nothing.
 
-import { useSyncExternalStore } from "react";
+import { createStoredChoicePreference } from "@/lib/storedChoicePreference";
 
 /** What the user chose. Nothing stored means Automatic. */
 export type AutomaticFeatureIntent = "automatic" | "on" | "off";
@@ -30,53 +30,18 @@ export function isAutomaticFeatureIntent(value: unknown): value is AutomaticFeat
   return AUTOMATIC_FEATURE_INTENTS.includes(value as AutomaticFeatureIntent);
 }
 
-/** One feature's stored intent, under its own key. */
+/** One feature's stored intent, under its own key; Automatic is the default, stored as nothing. */
 export function createAutomaticFeaturePreference(storageKey: string): AutomaticFeaturePreference {
-  const changeEvent = `${storageKey}-change`;
-
-  const read = (): AutomaticFeatureIntent => {
-    if (typeof window === "undefined") return "automatic";
-    try {
-      const stored = window.localStorage.getItem(storageKey);
-      return isAutomaticFeatureIntent(stored) ? stored : "automatic";
-    } catch {
-      return "automatic";
-    }
+  // Automatic stored as nothing means a later policy reaches everyone still on it.
+  const stored = createStoredChoicePreference(storageKey, AUTOMATIC_FEATURE_INTENTS, "automatic");
+  return {
+    storageKey,
+    read: stored.read,
+    write: (intent) => {
+      stored.write(intent);
+    },
+    subscribe: stored.subscribe,
+    notifyChanged: stored.notifyChanged,
+    useIntent: stored.use,
   };
-
-  const notifyChanged = (): void => {
-    if (typeof window === "undefined") return;
-    window.dispatchEvent(new Event(changeEvent));
-  };
-
-  const write = (intent: AutomaticFeatureIntent): void => {
-    if (typeof window === "undefined") return;
-    try {
-      // Automatic is stored as nothing, so a later policy reaches everyone still on it.
-      if (intent === "automatic") window.localStorage.removeItem(storageKey);
-      else window.localStorage.setItem(storageKey, intent);
-    } catch {
-      // A storage failure must not break Settings.
-    }
-    notifyChanged();
-  };
-
-  const subscribe = (listener: () => void): (() => void) => {
-    if (typeof window === "undefined") return () => {};
-    const onStorage = (event: StorageEvent) => {
-      if (event.key !== null && event.key !== storageKey) return;
-      listener();
-    };
-    window.addEventListener(changeEvent, listener);
-    window.addEventListener("storage", onStorage);
-    return () => {
-      window.removeEventListener(changeEvent, listener);
-      window.removeEventListener("storage", onStorage);
-    };
-  };
-
-  const useIntent = (): AutomaticFeatureIntent =>
-    useSyncExternalStore(subscribe, read, () => "automatic");
-
-  return { storageKey, read, write, subscribe, notifyChanged, useIntent };
 }

@@ -8,7 +8,8 @@ export interface Mention {
   end: number;
 }
 
-const LOGIN = "[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}";
+// A managed user's login ends in `_` and its enterprise's short code, as in `octo-user_acme`.
+const LOGIN = "[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}(?:_[A-Za-z0-9]+)?";
 const TEAM = "[A-Za-z0-9][A-Za-z0-9_-]*";
 // Not inside a word, an email address, a path or a URL; not followed by more of a word.
 const MENTION = new RegExp(`(?<![\\w@./\`-])@(${LOGIN}(?:\\/${TEAM})?)(?![\\w-]|\\.\\w|\\/)`, "g");

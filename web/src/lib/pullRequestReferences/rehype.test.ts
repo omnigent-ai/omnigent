@@ -73,11 +73,11 @@ describe("rehypeMentions", () => {
   const mentions = (tree: Root) => marked(tree, rehypeMentions, MENTION_TAG);
 
   it("marks mentions in prose, beside the PR references", () => {
-    const paragraph = element("p", [text("@octo, see #12 with @acme/web.")]);
+    const paragraph = element("p", [text("@octo, see #12 with @acme/web and @octo-user_acme.")]);
     const tree: Root = { type: "root", children: [paragraph] };
     rehypePullRequestReferences()(tree);
 
-    expect(mentions(tree)).toEqual(["@octo", "@acme/web"]);
+    expect(mentions(tree)).toEqual(["@octo", "@acme/web", "@octo-user_acme"]);
     expect(marked(tree)).toEqual(["#12"]);
   });
 
@@ -88,7 +88,7 @@ describe("rehypeMentions", () => {
         element("p", [
           element("code", [text("@octo")]),
           element("a", [text("@octo")], { href: "https://example.com" }),
-          text(" octo@example.com"),
+          text(" octo@example.com octo_acme@example.com @octo_ @octo__acme"),
         ]),
         element("pre", [element("code", [text("@decorator")])]),
       ],

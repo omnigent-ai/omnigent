@@ -1,7 +1,6 @@
 // Polls a pacer slowed or paused, kept so they can pace again the moment what held them lets go.
 // TanStack works out a poll's interval only after a read or an options change, so a poll held
-// for an hour would otherwise wait out its old timer. Holding never keeps a query alive: one
-// TanStack removed, or whose observers all left, is dropped and can be collected.
+// for an hour would otherwise wait out its old timer.
 
 /** A TanStack query, by the observers that schedule its poll. */
 export interface HeldPoll {
@@ -14,6 +13,7 @@ export interface HeldPoll {
 
 const observed = (poll: HeldPoll) => (poll.observers?.length ?? 0) > 0;
 
+/** Holding never keeps a query alive: one removed, or whose observers all left, is let go. */
 export function createHeldPolls() {
   let refs: WeakRef<HeldPoll>[] = [];
   const holding = new WeakSet<HeldPoll>();

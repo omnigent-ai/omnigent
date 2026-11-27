@@ -299,4 +299,25 @@ describe("hearing the pause", () => {
     harness.setEnabled(true);
     expect(heard).toHaveBeenCalledTimes(3);
   });
+
+  it("hears a pause that starts before any poll asks", () => {
+    const harness = focusHarness();
+    const heard = vi.fn();
+    harness.focus.subscribe(heard);
+    harness.blur();
+    harness.advance(UNFOCUSED_POLL_PAUSE_MS);
+    expect(heard).toHaveBeenCalledTimes(1);
+  });
+
+  it("forgets its listeners at a reset", () => {
+    const harness = focusHarness();
+    const heard = vi.fn();
+    harness.focus.subscribe(heard);
+    harness.focus.resetForTests();
+    harness.focus.paused();
+    harness.blur();
+    harness.advance(UNFOCUSED_POLL_PAUSE_MS);
+    expect(harness.focus.paused()).toBe(true);
+    expect(heard).not.toHaveBeenCalled();
+  });
 });

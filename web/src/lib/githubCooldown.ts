@@ -171,8 +171,8 @@ export function createGitHubCooldowns({
     );
   }
 
-  function fallbackDeadline(backoffMs: number): number {
-    return now() + Math.round(backoffMs * (1 + random() * FALLBACK_JITTER));
+  function fallbackDeadline(time: number, backoffMs: number): number {
+    return time + Math.round(backoffMs * (1 + random() * FALLBACK_JITTER));
   }
 
   /**
@@ -181,11 +181,11 @@ export function createGitHubCooldowns({
    */
   function rateLimited(key: string, retryAt: number | null, limit: GitHubRateLimit | null = null) {
     const named = namedLimit(limit);
+    const time = now();
     // A deadline already passed says only that GitHub limited the read: the fallback applies.
     const deadline =
-      retryAt !== null && Number.isFinite(retryAt) && retryAt > now() ? retryAt : null;
+      retryAt !== null && Number.isFinite(retryAt) && retryAt > time ? retryAt : null;
     const episode = episodes.get(key);
-    const time = now();
     if (episode && episode.until > time) {
       // Within a wait, a named limit replaces one that said nothing, and goes with a later deadline.
       const later = deadline !== null && deadline > episode.until;
@@ -194,13 +194,16 @@ export function createGitHubCooldowns({
       if (later) episode.until = deadline;
       if (names) episode.limit = named;
     } else if (episode) {
-      episode.backoffMs = Math.min(episode.backoffMs * 2, MAX_FALLBACK_COOLDOWN_MS);
-      episode.until = Math.max(episode.until, deadline ?? fallbackDeadline(episode.backoffMs));
+      // Only a fallback wait doubles: a deadline the shell named says nothing about the next one.
+      if (deadline === null) {
+        episode.backoffMs = Math.min(episode.backoffMs * 2, MAX_FALLBACK_COOLDOWN_MS);
+      }
+      episode.until = deadline ?? fallbackDeadline(time, episode.backoffMs);
       episode.limit = named;
     } else {
       episodes.set(key, {
         backoffMs: FALLBACK_COOLDOWN_MS,
-        until: deadline ?? fallbackDeadline(FALLBACK_COOLDOWN_MS),
+        until: deadline ?? fallbackDeadline(time, FALLBACK_COOLDOWN_MS),
         ...(named ? { limit: named } : {}),
       });
     }

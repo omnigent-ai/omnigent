@@ -93,7 +93,7 @@ export const EXAMPLE_STACK_FORMAT = markdownListStackFormat({
 const EXAMPLE_READINESS_KEY = "example-merge-readiness";
 
 /** The stand-in source's wording: the generic reasons, and its own name for its failures. */
-export const EXAMPLE_READINESS_WORDING: MergeReadinessWording = {
+const EXAMPLE_READINESS_WORDING: MergeReadinessWording = {
   details: MERGE_READINESS_DETAILS,
   failures: {
     credential: {

@@ -26,20 +26,25 @@ export type GitHubBudgetPace =
   { pace: "normal" } | { pace: "slow"; factor: number } | { pace: "stopped"; until: number };
 
 const NORMAL: GitHubBudgetPace = { pace: "normal" };
+// Browsers fire a longer timer at once; a reset further out is checked again then.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 export function createGitHubReadBudgets({
   now = () => Date.now(),
   watchEnabled = () => {},
 }: {
   now?: () => number;
-  /** Starts watching whether pacing is on, once a budget first arrives. */
-  watchEnabled?: (setEnabled: (enabled: boolean) => void) => void;
+  /** Starts watching whether pacing is on, once a budget first arrives; returns how to stop. */
+  watchEnabled?: (setEnabled: (enabled: boolean) => void) => (() => void) | void;
 } = {}) {
   // Per reader, each hourly resource's budget in its current window.
   const budgets = new Map<string, Map<GitHubReadBudget["resource"], GitHubReadBudget>>();
   const held = createHeldPolls();
   let enabled = true;
-  let watching = false;
+  let stopWatching: (() => void) | null = null;
+  // Which watch the flag's answers belong to: one handed out before a clear can't act after it.
+  let lifecycle = 0;
+  let resetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Work paced by hand, such as reading ahead, hears each wake too.
   const listeners = new Set<() => void>();
@@ -55,6 +60,29 @@ export function createGitHubReadBudgets({
     for (const listener of [...listeners]) listener();
   };
 
+  // Polls a budget paused don't read, so no answer reports its reset: a timer wakes them then.
+  function scheduleReset() {
+    if (resetTimer !== null) clearTimeout(resetTimer);
+    resetTimer = null;
+    const at = now();
+    let next = Number.POSITIVE_INFINITY;
+    for (const byResource of budgets.values()) {
+      for (const budget of byResource.values()) {
+        if (budget.resetAt > at) next = Math.min(next, budget.resetAt);
+      }
+    }
+    if (next === Number.POSITIVE_INFINITY) return;
+    resetTimer = setTimeout(
+      () => {
+        resetTimer = null;
+        wake();
+        changed();
+        scheduleReset();
+      },
+      Math.min(next - at, MAX_TIMER_MS),
+    );
+  }
+
   /** Hear when paces may have eased: a budget's window reset, or pacing turned off. */
   function subscribe(listener: () => void): () => void {
     listeners.add(listener);
@@ -66,6 +94,7 @@ export function createGitHubReadBudgets({
     enabled = next;
     if (!next) {
       budgets.clear();
+      scheduleReset();
       wake();
     }
     changed();
@@ -77,9 +106,12 @@ export function createGitHubReadBudgets({
    */
   function observe(key: string, budget: GitHubReadBudget | null | undefined) {
     if (!budget || !(budget.limit > 0) || !Number.isFinite(budget.resetAt)) return;
-    if (!watching) {
-      watching = true;
-      watchEnabled(setEnabled);
+    if (!stopWatching) {
+      const current = lifecycle;
+      stopWatching =
+        watchEnabled((next) => {
+          if (current === lifecycle) setEnabled(next);
+        }) || (() => {});
     }
     if (!enabled) return;
     let byResource = budgets.get(key);
@@ -92,6 +124,7 @@ export function createGitHubReadBudgets({
     const sameWindow = known !== undefined && budget.resetAt === known.resetAt;
     if (sameWindow && budget.remaining >= known.remaining) return;
     byResource.set(budget.resource, { ...budget });
+    if (!sameWindow) scheduleReset();
     if (known && !sameWindow) wake();
     changed();
   }
@@ -146,10 +179,17 @@ export function createGitHubReadBudgets({
     held.hold(query);
   }
 
-  /** Forget every budget, for tests. */
+  /** Forget every budget, listener and flag watch, for tests. */
   function clear() {
     budgets.clear();
     held.clear();
+    scheduleReset();
+    listeners.clear();
+    changeListeners.clear();
+    lifecycle += 1;
+    stopWatching?.();
+    stopWatching = null;
+    enabled = true;
   }
 
   return { observe, pace, speculativeAllowed, hold, clear, subscribe, subscribeChanges };
@@ -159,11 +199,10 @@ export type GitHubReadBudgets = ReturnType<typeof createGitHubReadBudgets>;
 
 /** The page's one view of its readers' budgets, paced only while the shell's flag is on. */
 export const githubReadBudgets = createGitHubReadBudgets({
-  watchEnabled: (setEnabled) => {
+  watchEnabled: (setEnabled) =>
     subscribeDesktopFeatureFlag(
       GITHUB_READ_BUDGET_FLAG,
       { fallback: true, mode: "resolved" },
       ({ value }) => setEnabled(value),
-    );
-  },
+    ),
 });

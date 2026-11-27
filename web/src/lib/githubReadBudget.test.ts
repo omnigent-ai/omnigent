@@ -207,6 +207,61 @@ describe("githubReadBudgets and the shell's rollback flag", () => {
     expect(setOptions).toHaveBeenCalledTimes(2);
   });
 
+  it("wakes held polls and work paced by hand at the reset, with no answer in between", () => {
+    vi.useFakeTimers();
+    try {
+      const { store, advance } = budgets();
+      const setOptions = vi.fn();
+      const eased = vi.fn();
+      store.subscribe(eased);
+      store.observe(KEY, graphql(10));
+      store.hold({ observers: [{ options: { queryKey: ["q"] }, setOptions }] });
+      const wait = RESET - START;
+      advance(wait - 1);
+      vi.advanceTimersByTime(wait - 1);
+      expect(eased).not.toHaveBeenCalled();
+      advance(1);
+      vi.advanceTimersByTime(1);
+      expect(setOptions).toHaveBeenCalledTimes(1);
+      expect(eased).toHaveBeenCalledTimes(1);
+      expect(store.pace(KEY)).toEqual({ pace: "normal" });
+      vi.advanceTimersByTime(2 * 60 * 60_000);
+      expect(eased).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("forgets its listeners and flag watch on clear, and pacing turned off with them", () => {
+    let setEnabled: (enabled: boolean) => void = () => {};
+    const stopWatching = vi.fn();
+    const store = createGitHubReadBudgets({
+      now: () => START,
+      watchEnabled: (set) => {
+        setEnabled = set;
+        return stopWatching;
+      },
+    });
+    const eased = vi.fn();
+    const changed = vi.fn();
+    store.subscribe(eased);
+    store.subscribeChanges(changed);
+    store.observe(KEY, graphql(10));
+    setEnabled(false);
+    expect(store.pace(KEY)).toEqual({ pace: "normal" });
+    store.clear();
+    expect(stopWatching).toHaveBeenCalledTimes(1);
+    eased.mockClear();
+    changed.mockClear();
+    const before = setEnabled;
+    store.observe(KEY, graphql(10));
+    expect(store.pace(KEY)).toMatchObject({ pace: "stopped" });
+    expect(changed).not.toHaveBeenCalled();
+    // An answer for the watch from before the clear turns nothing off.
+    before(false);
+    expect(store.pace(KEY)).toMatchObject({ pace: "stopped" });
+  });
+
   it("tells work paced by hand when a window resets or the flag turns off, until it stops", () => {
     const { store, setEnabled } = budgets();
     const eased = vi.fn();

@@ -20,13 +20,17 @@ const REPOSITORY = "[A-Za-z0-9_.-]{1,100}";
 // `file.md#3` stays a file's anchor; `owner/name.js#3` still names a dotted repository.
 const BARE_REPOSITORY = "[A-Za-z0-9_][A-Za-z0-9_-]{0,98}[A-Za-z0-9_]";
 const NUMBER = "[1-9][0-9]{0,9}";
+// A letter, digit or mark of any script continues a word, as in `café#12`; Han, kana and
+// Hangul set no spaces between words, so they may border a reference (as `pullRequestRefs`).
+const UNSPACED_SCRIPT = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Hangul}";
+const WORD = `(?![${UNSPACED_SCRIPT}])[\\p{L}\\p{N}\\p{M}_]`;
 // Not inside a word, a path, a URL fragment, an entity or a mention.
-const BEFORE = "(?<![\\w./#&@-])";
+const BEFORE = `(?<!${WORD}|[./#&@-])`;
 // Not followed by more of a word, `.md`, or `:12`.
-const AFTER = "(?![\\w-]|[.:]\\w)";
+const AFTER = `(?!${WORD}|-|[.:][\\p{L}\\p{N}])`;
 const SHORTHAND = new RegExp(
   `${BEFORE}(?:(${OWNER})\\/(${REPOSITORY})|(${BARE_REPOSITORY}))?#(${NUMBER})${AFTER}`,
-  "g",
+  "gu",
 );
 /** GitHub's largest PR number fits a signed 32-bit integer. */
 const MAX_NUMBER = 2 ** 31 - 1;

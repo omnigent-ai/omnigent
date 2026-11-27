@@ -196,7 +196,7 @@ describe("subscribeDesktopFeatureFlag", () => {
       { value: false, resolved: false },
       { value: true, resolved: true },
     ]);
-    // A null fallback takes any value, as before.
+    // A null fallback accepts a value of any type.
     expect(asNumber.states).toEqual([{ value: true, resolved: true }]);
     const typed = collect("gate", 3, "resolved");
     shell.send("gate", 7);
@@ -386,6 +386,16 @@ describe("readDesktopFeatureFlag", () => {
     const { readings } = read();
     await vi.waitFor(() => expect(shell.live()).toHaveLength(1));
     expect(readings).toEqual([{ value: false, resolved: false, source: "pending" }]);
+  });
+
+  it("logs a consumer that throws on a fallback the shell's features settle", async () => {
+    installShell({ names: ["another-flag"] });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    readDesktopFeatureFlag(FLAG, { fallback: false, mode: "resolved" }, () => {
+      throw new Error("consumer failed");
+    });
+    await vi.waitFor(() => expect(error).toHaveBeenCalled());
+    error.mockRestore();
   });
 
   it("names a subscribe that throws", async () => {

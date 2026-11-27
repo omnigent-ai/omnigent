@@ -1,5 +1,6 @@
 // The desktop flags a build lets a browser with no native shell turn on or off for itself. A
-// build registers its definitions once at startup; without them a browser overrides nothing.
+// build registers its definitions once at startup, before the first flag read; without them a
+// browser overrides nothing.
 
 export interface BrowserFlagDefinition {
   name: string;

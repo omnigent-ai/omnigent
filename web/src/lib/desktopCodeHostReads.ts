@@ -28,6 +28,14 @@ async function desktopCodeHost(provider: CodeHostProviderId) {
   return hosts.find((candidate) => candidate?.id === provider);
 }
 
+type DesktopCodeHost = Awaited<ReturnType<typeof desktopCodeHost>>;
+
+const operationsOf = (entry: DesktopCodeHost): readonly string[] =>
+  Array.isArray(entry?.operations) ? entry.operations : [];
+
+const readsByPriority = (entry: DesktopCodeHost) =>
+  hasCodeHostReadCancel() && entry?.readPriority === 1;
+
 /**
  * Whether this shell reads GitHub list stats a row can follow: with each PR's snapshot, as the
  * row's own reader. Older shells answer without either, so their rows keep polling.
@@ -44,8 +52,7 @@ export async function desktopRowSnapshotsSupport(): Promise<
 export async function desktopCodeHostOperations(
   provider: CodeHostProviderId,
 ): Promise<readonly string[]> {
-  const entry = await desktopCodeHost(provider);
-  return Array.isArray(entry?.operations) ? entry.operations : [];
+  return operationsOf(await desktopCodeHost(provider));
 }
 
 /**
@@ -75,23 +82,24 @@ export interface CodeHostReadScheduling {
 }
 
 /**
- * `request` with its priority and a fresh `readId`, for a shell that advertises `readPriority`
- * and can cancel; an older or partial shell gets the request as it always did.
- */
-/**
  * Whether this shell places `provider`'s reads by priority and can let go of a waiting one: its
  * query and cancel methods, and the priorities it advertises. Anything less gets today's reads.
  */
 export async function desktopReadsByPriority(provider: CodeHostProviderId): Promise<boolean> {
   if (!hasCodeHostReadCancel()) return false;
-  return (await desktopCodeHost(provider))?.readPriority === 1;
+  return readsByPriority(await desktopCodeHost(provider));
 }
 
-async function withReadPriority(
+/**
+ * `request` with its priority and a fresh `readId`, for a shell that advertises `readPriority`
+ * and can cancel; an older or partial shell gets the request as it always did.
+ */
+function withReadPriority(
   request: CodeHostQueryRequest,
+  entry: DesktopCodeHost,
   priority: CodeHostReadPriority = "interactive",
-): Promise<CodeHostQueryRequest> {
-  if (!(await desktopReadsByPriority(request.provider))) return request;
+): CodeHostQueryRequest {
+  if (!readsByPriority(entry)) return request;
   return { ...request, priority, readId: randomUUID() };
 }
 
@@ -125,7 +133,9 @@ export async function queryCodeHost<Data>(
   request: CodeHostQueryRequest,
   scheduling: CodeHostReadScheduling = {},
 ): Promise<GitHubFastTrackResult<Data>> {
-  if (!(await isDesktopCodeHostAvailable(request.provider, [request.operation]))) {
+  // One look at what the shell offers serves both the operation check and the read's priority.
+  const entry = await desktopCodeHost(request.provider);
+  if (!operationsOf(entry).includes(request.operation)) {
     return {
       ok: false,
       error: { code: "unsupported", message: "This app can't read from that code host." },
@@ -143,7 +153,7 @@ export async function queryCodeHost<Data>(
   const refusal = cooldownKey ? githubCooldowns.refusal(cooldownKey) : null;
   if (refusal) return { ok: false, error: refusal };
   const result = await desktopCodeHostQuery<Data>(
-    await withReadPriority(request, scheduling.priority),
+    withReadPriority(request, entry, scheduling.priority),
     signal,
   );
   // Let go of before its turn: it never read, so it says nothing about the reader.

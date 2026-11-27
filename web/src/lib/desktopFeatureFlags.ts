@@ -151,8 +151,9 @@ export function readDesktopFeatureFlag<T>(
 ): () => void {
   let active = true;
   let unsubscribe: (() => void) | null = null;
+  // Settles from a promise too, so a consumer that throws is logged, never an unhandled rejection.
   const settleOnFallback = (source: Exclude<DesktopFeatureFlagSource, "pending" | "shell">) => {
-    if (active) onChange({ value: fallback, resolved: true, source });
+    if (active) deliver(() => onChange({ value: fallback, resolved: true, source }), undefined);
   };
 
   const bridge = featureFlagBridge();

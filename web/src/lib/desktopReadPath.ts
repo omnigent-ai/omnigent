@@ -1,11 +1,6 @@
-// Which path reads a pull request: this Mac, through the desktop shell as the
-// Mac's own identity, or the session's host. The Mac reads a named host registered to
-// read as the Mac whenever the shell can, and github.com or GitHub Enterprise when the shell picks Mac accounts
-// and the user's setting allows it. Everything else, including browsers and
-// mobile, uses the host. The store here also keeps the identity behind Mac reads
-// so a cached answer never outlives a change of account or workspace user.
-// The Mac path reads and writes linked GitHub data through the Mac's own gh, with no
-// running session host, so a closed session still shows whether its pull request merged.
+// Which path reads a pull request: this Mac's own gh through the desktop shell, which needs no
+// running session host, or the session's host. It also keeps the identity behind Mac reads, so a
+// cached answer never outlives a change of account or workspace user.
 
 import { useSyncExternalStore } from "react";
 
@@ -205,11 +200,9 @@ function supportFrom(codeHosts: unknown): DesktopReadSupport {
 }
 
 // ---------------------------------------------------------------------------
-// The live store: shell support, the setting, known Enterprise hosts, and the
-// identity per read scope. `version` moves on every change, so hooks re-render.
-// Mac reads are cached and ordered under the shared scope in `macReadScope.ts`;
-// this store adds what main reports about GitHub accounts, and advances a scope
-// (dropping its queries) when the account behind it changes.
+// The live store: shell support, the setting, known Enterprise hosts and each scope's identity.
+// `macReadScope.ts` caches and orders the reads; this store advances a scope, dropping its
+// queries, when the account behind it changes. `version` moves on every change.
 
 const HOST_NAME =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
@@ -289,7 +282,8 @@ function advance(entry: ScopeState): void {
  * generation as the account last read means only the choice did: what's shown
  * re-reads, and answers already read as that account stay.
  */
-function accountsChanged(host: string, generation: number | null): void {
+function accountsChanged(spelledHost: string, generation: number | null): void {
+  const host = spelledHost.toLowerCase();
   const entry = githubScope(host);
   const known = entry.identity;
   if (generation !== null && known?.generation === generation) {
@@ -326,13 +320,14 @@ export function ensureMacIdentity(host: string): void {
 }
 
 /** Re-read the account `host` is read as, after the shell says it changed. */
-function accountChanged(host: string): void {
+function accountChanged(spelledHost: string): void {
+  const host = spelledHost.toLowerCase();
   // A sign-in to an Enterprise host this Mac couldn't read makes it readable.
   unsignedHosts.delete(host);
   const entry = githubScope(host);
   entry.identity = null;
   bumpAccountEpoch(host);
-  resolveMacIdentity(host.toLowerCase(), entry);
+  resolveMacIdentity(host, entry);
   advance(entry);
 }
 
@@ -389,6 +384,7 @@ function resolveMacIdentity(name: string, entry: ScopeState, staleAnswers = 0): 
 }
 
 function start(): void {
+  ensureRepoReaderPolicy();
   if (started) return;
   started = true;
   const stopReadsFlag = subscribeDesktopFeatureFlag(
@@ -433,8 +429,23 @@ function start(): void {
     stopAccounts();
     stopIdentity();
   };
-  // The repository choices' policy, loaded apart since it reads named reads, which read this.
-  if (!repoPolicy) void import("@/lib/pullRequestRepoReader");
+}
+
+// The repository choices' policy, loaded apart since it reads named reads, which read this.
+// A load that fails, as when an update removed the chunk, is tried again at the next read.
+let loadRepoReader: () => Promise<unknown> = () => import("@/lib/pullRequestRepoReader");
+let repoReaderLoad: Promise<unknown> | null = null;
+
+function ensureRepoReaderPolicy(): void {
+  if (repoPolicy || repoReaderLoad) return;
+  repoReaderLoad = loadRepoReader().catch(() => {
+    repoReaderLoad = null;
+  });
+}
+
+/** Load the repository choices' policy with `load` from now on; for tests. */
+export function loadRepoReaderPolicyWithForTests(load: () => Promise<unknown>): void {
+  loadRepoReader = load;
 }
 
 /** Who reads each repository's pull requests, installed by pullRequestRepoReader. */

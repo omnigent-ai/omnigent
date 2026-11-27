@@ -6,6 +6,7 @@ import {
   type ChildSessionInfo,
   type ChildSessionsResponse,
   type ChildSessionWire,
+  isStaleCursorResponse,
   MAX_TREE_DEPTH,
   parseChildSessionError,
 } from "@/hooks/useChildSessions";
@@ -78,10 +79,18 @@ async function fetchChildPage(
     signal ? { signal } : undefined,
   );
   if (!res.ok) {
-    throw Object.assign(new Error(`${res.status} ${res.statusText}`), { status: res.status });
+    const stale = await isStaleCursorResponse(res);
+    throw Object.assign(new Error(`${res.status} ${res.statusText}`), {
+      status: res.status,
+      staleCursor: stale,
+    });
   }
   return (await res.json()) as ChildSessionsResponse;
 }
+
+/** The server's 400 `stale_cursor`: the list changed under a page's cursor. */
+const isStaleCursor = (error: unknown) =>
+  (error as { staleCursor?: unknown } | null)?.staleCursor === true;
 /** How many parents of one level are read at once: the one being placed and the next three. */
 const LEVEL_READ_AHEAD = 4;
 /** A direct child read on one level of the walk, with the parent whose listing returned it. */
@@ -183,6 +192,19 @@ async function walkSubAgentTree(rootId: string, signal: AbortSignal): Promise<Se
 export async function fetchSessionDescendants(
   rootId: string,
   signal: AbortSignal = new AbortController().signal,
+): Promise<SessionDescendants> {
+  try {
+    return await listSessionDescendants(rootId, signal);
+  } catch (error) {
+    // The tree changed between pages: drop what was read and read it all again, once.
+    if (!isStaleCursor(error) || signal.aborted) throw error;
+    return listSessionDescendants(rootId, signal);
+  }
+}
+
+async function listSessionDescendants(
+  rootId: string,
+  signal: AbortSignal,
 ): Promise<SessionDescendants> {
   const rows: ChildSessionWire[] = [];
   let after: string | null = null;

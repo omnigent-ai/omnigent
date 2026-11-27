@@ -1,7 +1,6 @@
-// Reads the Pull Requests page runs as one of this Mac's GitHub logins it names itself,
-// beside the host's own account, which they never change. Each host and login has its own
-// scope: answers are ordered and cached under it, kept only when main and GitHub both say
-// they were read as that login, and dropped when it signs out or the page reads as another.
+// Reads the Pull Requests page runs as a GitHub login of this Mac's that it names itself, beside
+// the host's own account. Each host and login has its own cached scope, kept only when main and
+// GitHub both prove that login, and dropped when it signs out or the page reads as another.
 
 import { useSyncExternalStore } from "react";
 
@@ -12,7 +11,7 @@ import {
   refreshDesktopReadSupport,
   useDesktopReadPathVersion,
 } from "@/lib/desktopReadPath";
-import { getCurrentUserId } from "@/lib/identity";
+import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import {
   acceptMacRead,
   acceptedMacReader,
@@ -123,6 +122,9 @@ const epochs = new Map<string, number>();
 // names, until its status changes; and the logins main refused to read as since.
 const writers = new Map<string, { login: string; generation: number }>();
 const refusedReaders = new Set<string>();
+// Per named login, the newest generation an answer read for it on another host was kept at, so
+// a late one from before a change can't replace it. Never makes the login a writer.
+const answeredFor = new Map<string, number>();
 const listeners = new Set<() => void>();
 let flagOn = false;
 // Each flag answer is numbered; a saved choice waits until the latest one has settled, i.e.
@@ -207,9 +209,21 @@ function start(): void {
       changed();
     },
   );
+  // Who each login proved to be, or was refused as, was for the previous workspace user.
+  let user = getCurrentUserId();
+  const stopIdentity = subscribeIdentity(() => {
+    const previous = user;
+    user = getCurrentUserId();
+    if (previous === user) return;
+    writers.clear();
+    refusedReaders.clear();
+    answeredFor.clear();
+    changed();
+  });
   stopWatching = () => {
     stopFlag();
     stopAccounts();
+    stopIdentity();
   };
 }
 
@@ -344,12 +358,6 @@ export function acceptNamedAnswer(
  * read it for) that login at a generation from no earlier than its last change. The other
  * host proves its own reader.
  */
-/**
- * Per named login, the newest generation an answer read for it on another host was kept at, so
- * a late one from before a change can't replace it. Never makes the login a writer.
- */
-const answeredFor = new Map<string, number>();
-
 export function acceptNamedReaderFor(
   ticket: NamedAnswerTicket,
   reader: { login: string; generation: number; named?: true },

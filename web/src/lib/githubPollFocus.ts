@@ -58,8 +58,9 @@ export function createGitHubPollFocus({
     for (const listener of [...listeners]) listener();
   };
 
-  /** Hear when the pause may have started or ended. */
+  /** Hear when the pause may have started or ended; starts watching focus, as a poll would. */
   function subscribe(listener: () => void): () => void {
+    start();
     listeners.add(listener);
     return () => listeners.delete(listener);
   }
@@ -154,7 +155,7 @@ export function createGitHubPollFocus({
 
   /**
    * Back to how a fresh page starts, for tests, which share this module across a whole file: no
-   * timer, listeners or flag watch, no held polls (none is read or woken), the pause on until the
+   * timer, listeners, subscribers or flag watch, no held polls (none is read or woken), the pause on until the
    * flag says otherwise, and the unfocused count starting again at the next use.
    */
   function resetForTests() {
@@ -167,6 +168,7 @@ export function createGitHubPollFocus({
     stopped.drain();
     polling.drain();
     readable = new WeakMap();
+    listeners.clear();
     started = false;
     enabled = true;
     blurredAt = null;

@@ -265,8 +265,9 @@ describe("the live read path", () => {
     resetDesktopReadPathForTests();
     featureFlags.subscribe = () => () => {};
     shell();
+    // A task runs only once every promise chain the shell's answers started has settled.
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 20);
+      setTimeout(resolve, 0);
     });
     expect(await desktopReadTarget(GITHUB_PR)).toBeNull();
   });
@@ -287,6 +288,10 @@ describe("the live read path", () => {
     macAccountChanged("github", "code.example.org");
     expect(await desktopReadTarget(UNKNOWN_PR)).toBeNull();
     expect(asked()).toBe(2);
+    // The shell may spell the host otherwise; it's the same host.
+    macAccountChanged("github", "Code.Example.org");
+    expect(await desktopReadTarget(UNKNOWN_PR)).toBeNull();
+    expect(asked()).toBe(3);
     rememberGitHubHosts(["code.example.org"]);
     expect(await desktopReadTarget(UNKNOWN_PR)).toMatchObject({ provider: "github" });
   });

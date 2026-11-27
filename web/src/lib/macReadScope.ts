@@ -1,9 +1,6 @@
-// The scope Mac-read answers are cached under, and which reader's answers it
-// keeps. A scope is one workspace user's reads of one host. Each read takes a
-// sequence number before it's sent; the answer names the login that read it
-// (from the same request), and is kept only when it can't predate a change of
-// reader. So an answer read as one account never shows after a switch to another,
-// even when the switch goes back to the first.
+// The scope Mac-read answers are cached under: one workspace user's reads of one host. Each read
+// is numbered before it's sent and kept only when it can't predate a change of reader, so an
+// answer read as one account never shows after a switch, even a switch back.
 
 import { useSyncExternalStore } from "react";
 

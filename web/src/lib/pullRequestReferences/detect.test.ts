@@ -36,15 +36,27 @@ describe("detectPullRequestShorthand", () => {
     ["a language name", "Written in C#7 and F#1."],
     ["a heading anchor", "Read file.md#3 first."],
     ["a URL fragment", "https://example.com/page#12"],
+    ["a URL fragment after an accented letter", "https://example.com/café#12"],
+    ["a URL path after an accented letter", "https://example.com/naïve/app#12"],
     ["a line reference", "#12:3"],
     ["an HTML entity", "&#39;"],
     ["a word", "issue#12abc"],
+    ["a word in another script", "задача#12"],
+    ["a word continuing in another script", "#12é"],
+    ["a decomposed accent", "cafe\u0301#12"],
     ["a mention", "@team#4"],
     ["a leading zero", "#012"],
     ["a number too large", "#99999999999"],
     ["no hash", "PR 12"],
   ])("ignores %s", (_case, text) => {
     expect(found(text)).toEqual([]);
+  });
+
+  it("finds a reference that Han, kana or Hangul borders, which set no spaces", () => {
+    expect(found("修正#12を確認").map((reference) => reference.text)).toEqual(["#12"]);
+    expect(found("참고 owner/repo#3입니다").map((reference) => reference.text)).toEqual([
+      "owner/repo#3",
+    ]);
   });
 
   it("stops at a number beyond GitHub's range but keeps the ones within it", () => {

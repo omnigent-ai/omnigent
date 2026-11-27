@@ -87,6 +87,13 @@ describe("browserFlagOverrides", () => {
     expect(browserFlagOverrides()).toEqual({ [FLAG]: true });
   });
 
+  it("drops a registered flag's value that isn't a boolean", () => {
+    for (const value of ["on", 1, null, { on: true }]) {
+      store({ [FLAG]: value });
+      expect(browserFlagOverrides(), JSON.stringify(value)).toEqual({});
+    }
+  });
+
   it("gives the same object until the choices change", () => {
     store({ [FLAG]: true });
     const first = browserFlagOverrides();
