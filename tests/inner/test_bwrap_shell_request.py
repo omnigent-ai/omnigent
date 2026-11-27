@@ -722,17 +722,9 @@ async def test_isolated_shell_forwards_validated_limits_to_its_owned_worker(
 
 @pytest.mark.asyncio
 async def test_repeated_cancellation_waits_for_actual_worker_retirement(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, caller_environment: CallerProcessOSEnvironment
 ) -> None:
-    environment = CallerProcessOSEnvironment(
-        spec=OSEnvSpec(
-            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="linux_bwrap")
-        ),
-        cwd=tmp_path,
-        sandbox=_policy(tmp_path),
-        shell_path="/bin/sh",
-        _relaunch_when_stale=True,
-    )
+    environment = caller_environment
     started, cancelled, retirement = (threading.Event() for _ in range(3))
     request = shell_request.BwrapShellRequest()
     cancel = MagicMock(side_effect=cancelled.set)
@@ -764,7 +756,6 @@ async def test_repeated_cancellation_waits_for_actual_worker_retirement(
     finally:
         retirement.set()
         await asyncio.gather(task, return_exceptions=True)
-        environment.close()
 
 
 @pytest.mark.asyncio
