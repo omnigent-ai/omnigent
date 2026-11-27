@@ -1,0 +1,869 @@
+/* Activity's conversation, ported from the reference app's review styles. Its palette names map
+   onto the theme's tokens here, and every rule stays inside the page. */
+.comments-tab {
+  --comments-muted: var(--muted-foreground);
+  --comments-surface: var(--muted);
+  --comments-accent: var(--primary);
+  --comments-success: var(--status-green);
+  --comments-danger: var(--status-red);
+  --comments-warning: var(--status-yellow);
+  --review-hairline: color-mix(in srgb, var(--foreground) 9%, transparent);
+  --review-card: color-mix(in srgb, var(--comments-surface) 30%, var(--background));
+  --review-card-header: color-mix(in srgb, var(--comments-surface) 62%, var(--background));
+  --review-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  /* A column filling the Comments region: the toolbar, the comment box when it leads
+   * the list, then the list, which scrolls on its own. */
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 12px;
+}
+/* The page's own controls only: the reply editor and comment bodies keep their own styles. */
+:is(
+    .comments-toolbar,
+    .comments-thread-header,
+    .comments-more,
+    .comments-notice,
+    .comments-empty-actions,
+    .comments-message,
+    .review-comment-header
+  )
+  button,
+.comments-tab
+  :is(.review-thread-fold, .review-hidden-comment, .review-more-replies, .review-hunk-expand) {
+  font: inherit;
+  color: inherit;
+  cursor: default;
+}
+:is(
+    .comments-toolbar,
+    .comments-thread-header,
+    .comments-more,
+    .comments-notice,
+    .comments-empty-actions,
+    .comments-message,
+    .review-comment-header
+  )
+  :focus-visible,
+.comments-tab
+  :is(
+    .review-thread-fold,
+    .review-hidden-comment,
+    .review-more-replies,
+    .review-hunk-expand
+  ):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--comments-accent) 75%, transparent);
+  outline-offset: -2px;
+}
+
+/* Toolbar */
+.comments-toolbar {
+  display: flex;
+  flex: none;
+  min-height: 40px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--review-hairline);
+  background: color-mix(in srgb, var(--comments-surface) 30%, var(--background));
+}
+.comments-toolbar-spacer {
+  flex: 1 1 0;
+}
+.comments-views {
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid var(--review-hairline);
+  border-radius: 7px;
+}
+.comments-view {
+  display: inline-flex;
+  height: 22px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--comments-muted) !important;
+  font-size: 11.5px;
+  font-weight: 520;
+  white-space: nowrap;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+.comments-view:hover {
+  color: var(--foreground) !important;
+}
+.comments-view.selected {
+  background: var(--comments-surface);
+  color: var(--foreground) !important;
+}
+.comments-view-count {
+  color: color-mix(in srgb, var(--comments-muted) 72%, transparent);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.comments-view.selected .comments-view-count {
+  color: var(--comments-muted);
+}
+.comments-toolbar-button {
+  display: inline-flex;
+  height: 24px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px dashed color-mix(in srgb, var(--foreground) 16%, transparent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--comments-muted) !important;
+  font-size: 11.5px;
+  font-weight: 520;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s ease;
+}
+.comments-toolbar-button.icon {
+  width: 24px;
+  justify-content: center;
+  padding: 0;
+}
+.comments-toolbar-button:is(:hover, [data-state="open"]):where(:not(:disabled)) {
+  border-style: solid;
+  border-color: var(--border);
+  background: var(--comments-surface);
+  color: var(--foreground) !important;
+}
+.comments-toolbar-button.active {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--comments-accent) 45%, transparent);
+  background: color-mix(in srgb, var(--comments-accent) 14%, transparent);
+  color: var(--comments-accent) !important;
+}
+.comments-toolbar-button svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 2;
+}
+.comments-toolbar-button:disabled {
+  opacity: 0.55;
+}
+.comments-toolbar-button.refreshing svg {
+  animation: comments-spin 0.9s linear infinite;
+}
+.comments-chip {
+  display: inline-flex;
+  height: 24px;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--review-hairline);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--comments-surface) 45%, var(--background));
+  font-size: 11.5px;
+}
+.comments-chip > span,
+.comments-chip > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+}
+.comments-chip > * + * {
+  border-left: 1px solid var(--review-hairline);
+}
+.comments-chip-field {
+  font-weight: 560;
+}
+.comments-chip-operator {
+  color: var(--comments-muted);
+}
+.comments-chip button {
+  width: 24px;
+  justify-content: center;
+  padding: 0 !important;
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+  background: transparent;
+  color: var(--comments-muted) !important;
+}
+.comments-chip button:hover {
+  background: var(--comments-surface);
+  color: var(--foreground) !important;
+}
+.comments-chip button svg {
+  width: 11px;
+  height: 11px;
+  stroke-width: 2.2;
+}
+.comments-search {
+  display: flex;
+  width: min(240px, 40vw);
+  height: 24px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 4px 0 7px;
+  border: 1px solid var(--review-hairline);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--comments-muted);
+  transition:
+    border-color 0.1s ease,
+    box-shadow 0.1s ease;
+}
+.comments-search:focus-within {
+  border-color: color-mix(in srgb, var(--comments-accent) 70%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--comments-accent) 14%, transparent);
+}
+.comments-search > svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  stroke-width: 2;
+}
+.comments-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 11px;
+  -webkit-appearance: none;
+}
+.comments-search input::-webkit-search-cancel-button {
+  display: none;
+}
+.comments-search kbd {
+  padding: 0 4px;
+  border: 1px solid var(--review-hairline);
+  border-radius: 4px;
+  color: var(--comments-muted);
+  font-family: inherit;
+  font-size: 9.5px;
+  line-height: 14px;
+}
+.comments-search button {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--comments-muted);
+}
+.comments-search button svg {
+  width: 10px;
+  height: 10px;
+}
+
+/* List */
+.comments-list {
+  display: grid;
+  gap: 12px;
+  width: min(100% - 32px, 900px);
+  margin: 0 auto;
+  padding: 14px 0 24px;
+  list-style: none;
+}
+.comments-row {
+  min-width: 0;
+}
+.comments-notice {
+  width: min(100% - 32px, 900px);
+  margin: 12px auto 0;
+  padding: 7px 10px;
+  border: 1px solid var(--review-hairline);
+  border-radius: 8px;
+  color: var(--comments-muted);
+  font-size: 11px;
+}
+.comments-notice.warning {
+  border-color: color-mix(in srgb, var(--comments-warning) 40%, transparent);
+  color: var(--foreground);
+}
+.comments-notice button,
+.comments-more button,
+.comments-empty-actions button,
+.comments-message button {
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.comments-notice button:is(:hover, :focus-visible),
+.comments-more button:is(:hover, :focus-visible):where(:not(:disabled)),
+.comments-empty-actions button:is(:hover, :focus-visible),
+.comments-message button:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+}
+.comments-more {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px 20px;
+  color: var(--comments-muted);
+  font-size: 11px;
+}
+.comments-more button:disabled {
+  opacity: 0.55;
+}
+.comments-truncated {
+  margin: 0;
+  padding: 6px 16px 14px;
+  color: var(--comments-muted);
+  font-size: 10.5px;
+  text-align: center;
+}
+.comments-truncated a {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.comments-message,
+.comments-empty {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 6px;
+  padding: 32px 24px;
+  color: var(--comments-muted);
+  font-size: 11px;
+  text-align: center;
+}
+.comments-message strong,
+.comments-empty strong {
+  color: var(--foreground);
+  font-size: 13px;
+}
+.comments-empty-actions {
+  margin-top: 6px;
+}
+.comments-spinner {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid color-mix(in srgb, var(--comments-muted) 35%, transparent);
+  border-top-color: var(--comments-muted);
+  border-radius: 50%;
+  animation: comments-spin 0.9s linear infinite;
+}
+@keyframes comments-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Comments */
+.comments-entry.conversation {
+  border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
+  border-radius: 10px;
+  background: var(--review-card);
+}
+.comments-tab .review-comment {
+  position: relative;
+  padding: 10px 12px 11px;
+}
+.comments-tab .review-comment + .review-comment,
+.comments-tab .review-comment + .review-truncated,
+.comments-tab .review-comment + .review-more-replies {
+  border-top: 1px solid var(--review-hairline);
+}
+.comments-tab .review-comment-header {
+  display: flex;
+  min-width: 0;
+  min-height: 22px;
+  align-items: center;
+  gap: 6px;
+  color: var(--comments-muted);
+  font-size: 10.5px;
+}
+.comments-tab .review-comment-author {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comments-tab .review-avatar {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  overflow: hidden;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--comments-accent) 22%, var(--comments-surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--foreground) 10%, transparent) inset;
+}
+.comments-tab .review-avatar::after {
+  display: none;
+}
+.comments-tab .review-avatar-initials {
+  background: transparent;
+  color: var(--foreground);
+  font-size: 7.5px;
+  font-weight: 700;
+}
+.comments-tab .review-time {
+  white-space: nowrap;
+}
+.comments-tab .review-badge {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--review-hairline);
+  border-radius: 999px;
+  color: var(--comments-muted);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 16px;
+}
+.comments-tab .review-badge-warning {
+  border-color: color-mix(in srgb, var(--comments-warning) 40%, transparent);
+  color: var(--comments-warning);
+}
+.comments-tab .review-badge-success {
+  border-color: color-mix(in srgb, var(--comments-success) 40%, transparent);
+  color: var(--comments-success);
+}
+.comments-tab .review-comment-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 1px;
+  margin-left: auto;
+  opacity: 0.55;
+  transition: opacity 0.1s ease;
+}
+.comments-tab .review-comment:is(:hover, :focus-within) .review-comment-actions {
+  opacity: 1;
+}
+.comments-tab .review-icon-button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--comments-muted);
+}
+.comments-tab .review-icon-button:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  color: var(--foreground);
+}
+.comments-tab .review-icon-button svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.7;
+}
+.comments-tab .review-comment-body {
+  min-width: 0;
+  margin-top: 5px;
+  padding-left: 26px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.comments-tab .review-empty-body {
+  margin: 0;
+  color: var(--comments-muted);
+  font-style: italic;
+}
+.comments-tab .review-hidden-comment {
+  margin: 6px 0 0 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--comments-muted) !important;
+  font-size: 11px;
+  font-style: italic;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.comments-tab .review-truncated {
+  margin: 0;
+  padding: 8px 12px;
+  color: var(--comments-muted);
+  font-size: 10.5px;
+}
+.comments-tab .review-more-replies {
+  display: block;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--comments-accent) !important;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-align: left;
+}
+.comments-tab .review-more-replies:disabled {
+  opacity: 0.6;
+}
+
+/* Threads */
+/* Visible overflow, as in the reference: the reply editor grows and shows its own menus. */
+.comments-tab .review-thread {
+  overflow: visible;
+  border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
+  border-radius: 10px;
+  background: var(--review-card);
+  box-shadow: 0 1px 2px color-mix(in srgb, black 6%, transparent);
+}
+.comments-tab .review-thread.resolved {
+  background: color-mix(in srgb, var(--comments-surface) 14%, var(--background));
+}
+.comments-tab .review-thread-fold {
+  display: flex;
+  width: 100%;
+  min-height: 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border: 0;
+  border-top: 1px solid var(--review-hairline);
+  background: transparent;
+  color: var(--comments-muted) !important;
+  font-size: 10.5px;
+  text-align: left;
+}
+.comments-tab .review-thread-fold[aria-expanded="true"] {
+  border-bottom: 1px solid var(--review-hairline);
+}
+.comments-tab .review-thread-fold:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--foreground) 4%, transparent);
+  color: var(--foreground) !important;
+}
+.comments-tab .review-thread-fold svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: var(--comments-success);
+  stroke-width: 2;
+}
+.comments-tab .review-thread-fold-count {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.comments-tab .review-thread-fold-action {
+  color: var(--comments-accent);
+  font-weight: 600;
+}
+.comments-tab .review-thread-comments {
+  position: relative;
+}
+.comments-tab .review-thread:not(.resolved) > .comments-thread-header + .review-thread-comments {
+  border-top: 1px solid var(--review-hairline);
+}
+.comments-tab .review-thread-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--review-hairline);
+  background: color-mix(in srgb, var(--comments-surface) 22%, var(--background));
+}
+/* Resolve sits at the footer's end, under the reply box, as on GitHub. */
+.comments-tab .review-thread-resolve {
+  margin-left: auto;
+}
+.comments-thread-header .review-thread-menu {
+  margin-left: auto;
+}
+/* The reply editor sizes and styles itself; its container only gives it the width. */
+.comments-tab .review-reply {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.comments-thread-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px 0;
+  border-radius: 10px 10px 0 0;
+  background: var(--review-card-header);
+}
+/* The card's last row rounds its own corners, since the card doesn't clip them. */
+.comments-tab .review-thread > :last-child {
+  border-radius: 0 0 10px 10px;
+}
+.comments-thread-header .review-hunk {
+  flex: 1 1 100%;
+  margin: 2px -10px 0;
+}
+.comments-location {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  height: 24px;
+  align-items: center;
+  gap: 6px;
+  margin-left: -4px;
+  padding: 0 6px 0 4px;
+  border-radius: 5px;
+  font-size: 11px;
+}
+/* In Activity the location opens the conversation in Changes. */
+.comments-location-button {
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+.comments-location-button:hover {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+}
+.comments-location > svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: var(--comments-muted);
+  stroke-width: 1.7;
+}
+.comments-location-path {
+  overflow: hidden;
+  font-family: var(--review-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+.comments-location-directory {
+  color: var(--comments-muted);
+}
+.comments-location-file {
+  font-weight: 600;
+}
+.comments-location-line {
+  flex: none;
+  color: var(--comments-muted);
+  font-size: 10.5px;
+}
+
+/* The lines a thread is about */
+.comments-tab .review-hunk {
+  overflow: hidden;
+  border-top: 1px solid var(--review-hairline);
+  background: var(--background);
+  font-family: var(--review-mono);
+  font-size: 10.5px;
+  line-height: 17px;
+}
+.comments-tab .review-hunk table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.comments-tab .review-hunk td {
+  padding: 0;
+  vertical-align: top;
+}
+.comments-tab .review-hunk-number {
+  width: 36px;
+  padding: 0 6px !important;
+  color: color-mix(in srgb, var(--comments-muted) 75%, transparent);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  user-select: none;
+}
+.comments-tab .review-hunk-marker {
+  width: 14px;
+  color: var(--comments-muted);
+  text-align: center;
+  user-select: none;
+}
+.comments-tab .review-hunk-text {
+  overflow: hidden;
+  padding-right: 10px !important;
+  white-space: pre;
+  text-overflow: ellipsis;
+}
+.comments-tab .review-hunk tr.addition {
+  background: color-mix(in srgb, var(--comments-success) 12%, transparent);
+}
+.comments-tab .review-hunk tr.addition .review-hunk-marker {
+  color: var(--comments-success);
+}
+.comments-tab .review-hunk tr.deletion {
+  background: color-mix(in srgb, var(--comments-danger) 12%, transparent);
+}
+.comments-tab .review-hunk tr.deletion .review-hunk-marker {
+  color: var(--comments-danger);
+}
+.comments-tab .review-hunk tr.commented td:first-child {
+  box-shadow: inset 2px 0 0 var(--comments-accent);
+}
+.comments-tab .review-hunk-expand {
+  display: block;
+  width: 100%;
+  height: 22px;
+  padding: 0 12px;
+  border: 0;
+  border-bottom: 1px solid var(--review-hairline);
+  background: color-mix(in srgb, var(--comments-accent) 6%, transparent);
+  color: var(--comments-accent) !important;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  text-align: left;
+}
+.comments-tab .review-hunk-expand:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--comments-accent) 12%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comments-tab
+    :is(
+      .comments-view,
+      .comments-toolbar-button,
+      .comments-toolbar-button svg,
+      .comments-search,
+      .comments-spinner,
+      .review-comment-actions
+    ) {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* The Overview's Activity: the same entries in the page's own flow, under its heading, with
+   no scroller or column of its own. */
+.comments-tab.activity-section {
+  display: block;
+  flex: none;
+  background: transparent;
+}
+.activity-section > :is(.comments-toolbar, .activity-chips) {
+  margin-top: 8px;
+  border: 1px solid var(--review-hairline);
+  border-radius: 8px;
+}
+.activity-section > .activity-chips {
+  border-style: dashed;
+  background: transparent;
+}
+.activity-section :is(.comments-list, .comments-notice) {
+  width: 100%;
+}
+.activity-section .comments-list {
+  padding-bottom: 12px;
+}
+.activity-section .comments-row:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--comments-accent) 75%, transparent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+.comments-notice-inline {
+  color: var(--comments-muted);
+  font-size: 11px;
+}
+.comments-view-split {
+  display: inline-flex;
+  border-radius: 5px;
+}
+.comments-view-split.selected {
+  background: var(--comments-surface);
+}
+.comments-view-split.selected > .comments-view {
+  background: transparent;
+}
+.comments-view.comments-view-menu {
+  padding: 0 4px;
+}
+.comments-view-menu svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* A push or a review's verdict: one line; a push opens its commit on Commits where it can. */
+.activity-event {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  text-align: left;
+}
+button.activity-event:hover {
+  background: color-mix(in srgb, var(--comments-surface) 60%, transparent);
+}
+button.activity-event:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--comments-accent) 75%, transparent);
+  outline-offset: -2px;
+}
+.activity-event-icon {
+  flex: none;
+  align-self: center;
+  width: 14px;
+  height: 14px;
+  color: var(--comments-muted);
+}
+/* In a narrow pane a long login truncates, so the time stays inside the row. */
+.activity-event-author {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-event-action,
+.activity-event-time {
+  flex: none;
+  color: var(--comments-muted);
+}
+.activity-event-sha {
+  flex: none;
+  color: var(--comments-muted);
+  font-family: var(--review-mono);
+  font-size: 11px;
+}
+.activity-event-message {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A review's verdict colors its icon as GitHub's timeline does; a dismissed one stays muted. */
+.activity-review[data-verdict="APPROVED"] .activity-event-icon {
+  color: var(--comments-success);
+}
+.activity-review[data-verdict="CHANGES_REQUESTED"] .activity-event-icon {
+  color: var(--comments-danger);
+}
+/* A review with a body shows it under its verdict, indented past the icon, as the
+   conversation comment it is. */
+.activity-review-body {
+  margin-top: 2px;
+  margin-inline-start: 20px;
+}
+/* In a narrow pane the pills wrap rather than run past its edge, and search takes the next row. */
+.activity-section .comments-views {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.activity-section .comments-search {
+  min-width: 0;
+  flex: 1 1 160px;
+  max-width: 240px;
+}

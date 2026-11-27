@@ -1,0 +1,341 @@
+{
+  "_comment": "Whether a run-grant write's answer keeps its entry armed (rearm) or spends it (retire). main's runGrantSettlement passes every case; the page's retry policy, which sees only the answer, passes those with pageSees.",
+  "cases": [
+    {
+      "name": "success retires",
+      "decision": "retire",
+      "code": "done",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": false,
+      "steps": {
+        "completed": 1,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, rate limited",
+      "decision": "rearm",
+      "code": "rate_limited",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, busy",
+      "decision": "rearm",
+      "code": "busy",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, preflight network failure",
+      "decision": "rearm",
+      "code": "query_failed",
+      "cause": "network",
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, preflight timeout",
+      "decision": "rearm",
+      "code": "query_failed",
+      "cause": "timeout",
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, preflight unavailable",
+      "decision": "rearm",
+      "code": "query_failed",
+      "cause": "unavailable",
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, preflight SSO refusal",
+      "decision": "retire",
+      "code": "query_failed",
+      "cause": "sso_required",
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, preflight failure with no cause",
+      "decision": "retire",
+      "code": "query_failed",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, account changed",
+      "decision": "retire",
+      "code": "account_changed",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, writes turned off",
+      "decision": "retire",
+      "code": "writes_disabled",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, cancelled",
+      "decision": "retire",
+      "code": "cancelled",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "nothing sent, already ready",
+      "decision": "retire",
+      "code": "already_ready",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "one step refused by a rate limit",
+      "decision": "rearm",
+      "code": "rate_limited",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": "failed"
+      },
+      "pageSees": true
+    },
+    {
+      "name": "one step refused by a rate limit, rechecking operation",
+      "decision": "rearm",
+      "code": "rate_limited",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": "failed"
+      },
+      "pageSees": true
+    },
+    {
+      "name": "one step refused otherwise",
+      "decision": "retire",
+      "code": "forbidden",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": "failed"
+      },
+      "pageSees": true
+    },
+    {
+      "name": "one uncertain step, rechecking operation",
+      "decision": "rearm",
+      "code": "outcome_unknown",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": "uncertain"
+      },
+      "pageSees": true
+    },
+    {
+      "name": "one uncertain step, other operation",
+      "decision": "retire",
+      "code": "outcome_unknown",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": "uncertain"
+      },
+      "pageSees": true
+    },
+    {
+      "name": "one step answered but not understood, rechecking operation",
+      "decision": "rearm",
+      "code": "outcome_unknown",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": "failed"
+      },
+      "pageSees": true
+    },
+    {
+      "name": "a completed step then an uncertain one",
+      "decision": "retire",
+      "code": "outcome_unknown",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": false,
+      "steps": {
+        "completed": 1,
+        "sending": false,
+        "stopped": "uncertain"
+      },
+      "pageSees": false
+    },
+    {
+      "name": "a completed step then a rate limit",
+      "decision": "retire",
+      "code": "rate_limited",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 1,
+        "sending": false,
+        "stopped": "failed"
+      },
+      "pageSees": false
+    },
+    {
+      "name": "partial",
+      "decision": "retire",
+      "code": "partial",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": false,
+      "steps": {
+        "completed": 1,
+        "sending": false,
+        "stopped": "failed"
+      },
+      "pageSees": true
+    },
+    {
+      "name": "a step still sending",
+      "decision": "retire",
+      "code": "outcome_unknown",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": false,
+      "steps": {
+        "completed": 0,
+        "sending": true,
+        "stopped": null
+      },
+      "pageSees": false
+    },
+    {
+      "name": "batch, nothing sent, rate limited",
+      "decision": "retire",
+      "code": "rate_limited",
+      "cause": null,
+      "rechecksBeforeWrite": false,
+      "batch": true,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": null
+      },
+      "pageSees": true
+    },
+    {
+      "name": "batch, uncertain",
+      "decision": "retire",
+      "code": "outcome_unknown",
+      "cause": null,
+      "rechecksBeforeWrite": true,
+      "batch": true,
+      "steps": {
+        "completed": 0,
+        "sending": false,
+        "stopped": "uncertain"
+      },
+      "pageSees": true
+    }
+  ]
+}
