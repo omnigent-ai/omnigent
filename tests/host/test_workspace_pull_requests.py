@@ -29,6 +29,7 @@ from omnigent.runner import (
     github_merge_queue,
     github_resource,
     github_reviews,
+    github_search,
     github_stack,
     pr_resource,
 )
@@ -561,8 +562,21 @@ _QUEUE_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
 _STACK_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "GetPullRequestStack": (pb.GetPullRequestStackRequest(pr_url=_PR), "pull_request_stack", {}),
 }
+# The searches for the owner's reviewer picker and editor: a request, its function, arguments.
+_SEARCH_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "SearchReviewers": (
+        pb.SearchReviewersRequest(pr_url=_PR, text="al", page_size=5),
+        "search_reviewers",
+        {"text": "al", "page_size": 5},
+    ),
+    "SearchCompletions": (
+        pb.SearchCompletionsRequest(pr_url=_PR, kind=pb.COMPLETION_KIND_MENTION, text="al"),
+        "search_completions",
+        {"kind": "MENTION", "text": "al"},
+    ),
+}
 # The methods that act on GitHub for the session's selected pull request.
-_SELECTED_PR_CALLS = {**_GITHUB_CHANGE_CALLS, **_QUEUE_CALLS, **_STACK_CALLS}
+_SELECTED_PR_CALLS = {**_GITHUB_CHANGE_CALLS, **_QUEUE_CALLS, **_STACK_CALLS, **_SEARCH_CALLS}
 
 
 def record_github_changes(
@@ -570,12 +584,14 @@ def record_github_changes(
 ) -> list[tuple[str, str, str, dict[str, Any]]]:
     """Each GitHub call a method made: the function, its root, PR and arguments."""
     calls: list[tuple[str, str, str, dict[str, Any]]] = []
-    for table in (_GITHUB_CHANGE_CALLS, _QUEUE_CALLS, _STACK_CALLS):
+    for table in (_GITHUB_CHANGE_CALLS, _QUEUE_CALLS, _STACK_CALLS, _SEARCH_CALLS):
         for function in {name for _request, name, _kwargs in table.values()}:
             if table is _QUEUE_CALLS:
                 module = github_merge_queue
             elif table is _STACK_CALLS:
                 module = github_stack
+            elif table is _SEARCH_CALLS:
+                module = github_search
             else:
                 module = github_reviews if hasattr(github_reviews, function) else github_lifecycle
 
@@ -629,6 +645,9 @@ def test_every_owner_method_has_a_call_case() -> None:
     assert not set(_GITHUB_CHANGE_CALLS) & set(_QUEUE_CALLS)
     assert not set(_GITHUB_CHANGE_CALLS) & set(_STACK_CALLS)
     assert not set(_QUEUE_CALLS) & set(_STACK_CALLS)
+    assert not set(_SEARCH_CALLS) & (
+        set(_GITHUB_CHANGE_CALLS) | set(_QUEUE_CALLS) | set(_STACK_CALLS)
+    )
     owner_unary = _PULL_REQUEST_OWNER_METHODS - _PULL_REQUEST_OWNER_STREAMS
     assert set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) | {"EnableAutoMerge"} == owner_unary
 
@@ -918,6 +937,73 @@ async def test_a_draft_reply_goes_in_its_conversation_without_lines(
             },
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("request_message", "refusal"),
+    [
+        (
+            pb.SearchReviewersRequest(pr_url=_PR, text="x" * 257),
+            "The search is longer than 256 characters",
+        ),
+        (
+            pb.SearchReviewersRequest(pr_url="https://github.com/" + "x" * 2048, text="al"),
+            "The pull request URL is longer than 2048 characters",
+        ),
+        (pb.SearchReviewersRequest(pr_url=_PR, page_size=21), "Ask for at most 20 reviewers"),
+        (pb.SearchReviewersRequest(pr_url=_PR, page_size=-1), "Ask for at most 20 reviewers"),
+        (
+            pb.SearchCompletionsRequest(
+                pr_url=_PR, kind=pb.COMPLETION_KIND_MENTION, text="x" * 257
+            ),
+            "The search is longer than 256 characters",
+        ),
+        (
+            pb.SearchCompletionsRequest(pr_url=_PR, text="al"),
+            "Choose what to complete: people or pull requests",
+        ),
+        (
+            pb.SearchCompletionsRequest(pr_url=_PR, kind=99, text="al"),
+            "Choose what to complete: people or pull requests",
+        ),
+    ],
+    ids=[
+        "long-reviewer-text",
+        "long-pr-url",
+        "too-many-reviewers",
+        "negative-page",
+        "long-completion-text",
+        "no-kind",
+        "unknown-kind",
+    ],
+)
+async def test_a_malformed_search_is_refused_with_nothing_read(
+    tmp_path: Path,
+    github_changes: list[tuple[str, str, str, dict[str, Any]]],
+    request_message: Any,
+    refusal: str,
+) -> None:
+    method = type(request_message).__name__.removesuffix("Request")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, request_message.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
+    assert github_changes == []
+
+
+async def test_a_reference_completion_passes_its_kind_to_the_search(
+    tmp_path: Path, github_changes: list[tuple[str, str, str, dict[str, Any]]]
+) -> None:
+    request = pb.SearchCompletionsRequest(
+        pr_url=_PR, kind=pb.COMPLETION_KIND_REFERENCE, text="fix"
+    )
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "SearchCompletions", request.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert code is None, message
+    assert [call[3] for call in github_changes] == [{"kind": "REFERENCE", "text": "fix"}]
 
 
 @pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))

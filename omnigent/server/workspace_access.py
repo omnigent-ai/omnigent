@@ -50,6 +50,9 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "ListReviewThreadComments": WorkspaceGate.READ,
     "ListLabels": WorkspaceGate.SESSION_OWNER,
     "ListReviewerCandidates": WorkspaceGate.SESSION_OWNER,
+    # Searches as the host's account, for the owner's reviewer picker and comment editor.
+    "SearchReviewers": WorkspaceGate.SESSION_OWNER,
+    "SearchCompletions": WorkspaceGate.SESSION_OWNER,
     "GetMergeOptions": WorkspaceGate.SESSION_OWNER,
     "CreateComment": WorkspaceGate.SESSION_OWNER,
     "CreateReviewThread": WorkspaceGate.SESSION_OWNER,
