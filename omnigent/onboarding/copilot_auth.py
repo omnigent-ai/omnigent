@@ -31,11 +31,13 @@ accepted by Copilot.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.extra_install import extra_install_command
 from omnigent.onboarding.provider_config import load_config, resolve_secret
+from omnigent.util.gh_env import gh_subprocess_env
 
 # The secret-store name (and thus ``keychain:<name>``) under which a Copilot
 # GitHub token is stored — stable so the setup flow and the resolver agree.
@@ -78,7 +80,14 @@ def gh_cli_github_token(host: str | None = None) -> str | None:
     if host:
         argv += ["--hostname", host]
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env=gh_subprocess_env(os.environ),
+        )
     except (OSError, subprocess.TimeoutExpired):
         return None
     token = completed.stdout.strip()

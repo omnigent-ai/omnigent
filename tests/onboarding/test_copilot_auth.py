@@ -31,6 +31,7 @@ from omnigent.onboarding.copilot_auth import (
     looks_like_github_copilot_token,
     resolve_copilot_github_token,
 )
+from omnigent.util import gh_env
 
 
 @pytest.fixture(autouse=True)
@@ -212,6 +213,36 @@ def test_gh_cli_github_token_returns_stdout(monkeypatch: pytest.MonkeyPatch) -> 
     calls.clear()
     assert copilot_auth.gh_cli_github_token("acme.ghe.com") == "gho_abc"
     assert calls == [["gh", "auth", "token", "--hostname", "acme.ghe.com"]]
+
+
+def test_gh_cli_github_token_never_lets_gh_start_a_session_bus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a session bus in the environment, ``gh`` gets one it cannot launch.
+
+    A host polling for a Copilot login would otherwise leave an idle
+    ``dbus-daemon`` behind every call on a machine with no desktop session.
+    """
+    seen: list[dict[str, str]] = []
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        env = kwargs.get("env")
+        assert isinstance(env, dict), "gh must run with an explicit environment"
+        seen.append(env)
+        return subprocess.CompletedProcess(argv, 0, stdout="gho_abc\n", stderr="")
+
+    monkeypatch.setattr(copilot_auth.subprocess, "run", _fake_run)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent/runtime")
+    monkeypatch.setattr(gh_env, "_RUN_USER_DIR", Path("/nonexistent/run-user"))
+    monkeypatch.setenv("GH_HOST", "acme.ghe.com")
+    assert copilot_auth.gh_cli_github_token() == "gho_abc"
+    assert seen[-1]["DBUS_SESSION_BUS_ADDRESS"] == "disabled:"
+    assert seen[-1]["GH_HOST"] == "acme.ghe.com"  # the rest of the environment is passed through
+
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    assert copilot_auth.gh_cli_github_token() == "gho_abc"
+    assert seen[-1]["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
 
 
 @pytest.mark.parametrize(
