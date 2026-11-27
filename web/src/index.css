@@ -2166,6 +2166,27 @@ body {
   }
 }
 
+/* iOS Safari auto-zooms when focusing any editable field under 16px, pushing
+ * the header (hamburger menu) off-screen. Pin editable fields to 16px on touch
+ * devices; include the composer's highlight overlay so it stays aligned with
+ * the textarea. Also set touch-action: manipulation so repeated taps don't
+ * trigger double-tap zoom while keeping pinch-zoom available. */
+@media (pointer: coarse) {
+  html {
+    touch-action: manipulation;
+  }
+
+  :is(
+    input,
+    textarea,
+    select,
+    [contenteditable="true"],
+    [data-testid="composer-highlight-overlay"]
+  ) {
+    font-size: 16px;
+  }
+}
+
 /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
 .conversations-sidebar {
   @variant max-md {
