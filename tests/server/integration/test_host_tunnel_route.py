@@ -117,16 +117,18 @@ def _make_hello(
     name: str = "test-laptop",
     runners: list[str] | None = None,
     connection_id: str | None = None,
+    version: str = "0.1.0-test",
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
     :param name: Human-readable host name.
     :param runners: Live runner IDs, defaults to empty.
+    :param version: Host software version, e.g. ``"0.24.0"``.
     :returns: JSON-encoded hello frame string.
     """
     return encode_host_frame(
         HostHelloFrame(
-            version="0.1.0-test",
+            version=version,
             frame_protocol_version=1,
             name=name,
             runners=runners or [],
@@ -160,6 +162,7 @@ async def _send_hello_and_wait(
     name: str = "test-laptop",
     runners: list[str] | None = None,
     connection_id: str | None = None,
+    version: str = "0.1.0-test",
 ) -> None:
     """Send hello and wait for registration.
 
@@ -168,9 +171,13 @@ async def _send_hello_and_wait(
     :param host_id: Expected host_id in the registry.
     :param name: Host name for the hello frame.
     :param runners: Live runner IDs for the hello frame.
+    :param version: Host software version for the hello frame.
     """
     await communicator.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, runners, connection_id)},
+        {
+            "type": "websocket.receive",
+            "text": _make_hello(name, runners, connection_id, version),
+        },
     )
     await wait_for_tunnel_registration(communicator, registry, host_id)
 
@@ -640,6 +647,57 @@ async def test_host_replacement_names_retirement_without_inventing_close_code(
         await new.wait(timeout=budget(2.0))
         old.stop(exceptions=False)
         await asyncio.gather(old.future, return_exceptions=True)
+
+
+async def test_older_duplicate_host_cannot_replace_live_newer_host(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A forgotten older daemon sharing the host id must not take over launches."""
+    app, registry, store = host_app
+    current = await _connect_route(app, _TUNNEL_PATH)
+    stale = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello_and_wait(
+            current,
+            registry,
+            name="current-host",
+            connection_id="current-host-socket",
+            version="0.24.0",
+        )
+        await stale.send_input(
+            {
+                "type": "websocket.receive",
+                "text": _make_hello(
+                    name="stale-host", connection_id="stale-host-socket", version="0.3.0"
+                ),
+            }
+        )
+
+        sent = await stale.receive_output(timeout=budget(1.0))
+        assert sent["type"] == "websocket.send"
+        error = decode_host_frame(sent["text"])
+        assert isinstance(error, HostConnectionErrorFrame)
+        assert error.stage == "duplicate_host"
+        assert error.retryable is False
+        assert "0.24.0" in error.error
+        assert "0.3.0" in error.error
+        close = await stale.receive_output(timeout=budget(1.0))
+        assert close["type"] == "websocket.close"
+        assert close.get("code") == 4009
+
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        assert conn.hello.connection_id == "current-host-socket"
+        assert conn.retirement_reason is None
+        host = store.get_host(_HOST_ID)
+        assert host is not None
+        assert host.name == "current-host"
+        assert store.is_online(_HOST_ID)
+    finally:
+        await current.send_input({"type": "websocket.disconnect", "code": 1000})
+        await current.wait(timeout=budget(2.0))
+        stale.stop(exceptions=False)
+        await asyncio.gather(stale.future, return_exceptions=True)
 
 
 @pytest.mark.parametrize(

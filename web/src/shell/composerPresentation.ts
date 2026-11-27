@@ -26,6 +26,11 @@ export type ComposerPresentation =
       /** The native file picker opened or closed, so the panel stays up while it's open. */
       onFilePicker: (state: "open" | "closed") => void;
       openAppPage: (page: ComposerAppPage) => void;
+      /**
+       * Hear each time the panel comes on screen or takes the keyboard again, so the prompt can
+       * take it too. Returns an unsubscribe.
+       */
+      subscribeShown: (listener: () => void) => () => void;
     };
 
 export const ComposerPresentationContext = createContext<ComposerPresentation>({ kind: "page" });

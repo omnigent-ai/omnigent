@@ -41,6 +41,11 @@ describe("HighlightedText", () => {
     expect(underline.className).toContain("text-foreground");
     expect(underline.className).toContain("underline");
     expect(underline.className).toContain("decoration-muted-foreground");
+
+    const [strong] = marks("needle", range, "strong").marks;
+    expect(strong.dataset.matchHighlight).toBe("strong");
+    expect(strong.className).toContain("text-search-match");
+    expect(strong.className).toContain("decoration-search-match");
   });
 
   it("marks whole words with the underline but keeps the default on exact characters", () => {
@@ -55,6 +60,7 @@ describe("HighlightedText", () => {
       marks("Go to Settings", ranges, highlight).marks.map((mark) => mark.textContent);
     expect(text("underline")).toEqual(["Go", "Settings"]);
     expect(text("emphasis")).toEqual(["Go", "S", "t", "ng"]);
+    expect(text("strong")).toEqual(["Go", "S", "t", "ng"]);
   });
 
   it("clips overlapping and out-of-bounds ranges without repeating text", () => {

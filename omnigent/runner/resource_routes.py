@@ -53,6 +53,7 @@ from omnigent.runner.native import (
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
     NativeLaunchContext,
+    _antigravity_startup_agent_spec,
     _auto_create_qwen_terminal,
     _auto_create_repl_terminal,
     _claude_native_bridge_id_for_session,
@@ -76,7 +77,13 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.slow_io import run_provider_cli, run_slow_io
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.shell_inspection import (
+    TERMINAL_SHELL_NOT_FOUND,
+    ShellInspection,
+    ShellInspector,
+)
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
+from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -497,13 +504,6 @@ def register_resource_routes(
                     "and could not be closed."
                 )
 
-            elif terminal_name == "antigravity":
-                _ensure_is_owned = _is_runner_owned_antigravity_terminal
-                _ensure_conflict = (
-                    "Existing antigravity terminal is not a runner-owned agy TUI "
-                    "and could not be closed."
-                )
-
             elif terminal_name in ("pi", "opencode"):
                 # pi/opencode resolve the spec unwrapped — a resolution error
                 # surfaces as a terminal-start error (the resolver does not
@@ -518,6 +518,7 @@ def register_resource_routes(
                 _ensure_build = _spec_ensure_build
 
             elif terminal_name in (
+                "antigravity",
                 "cursor",
                 "kimi",
                 "devin",
@@ -530,11 +531,22 @@ def register_resource_routes(
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
-                    return dataclasses.replace(
-                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
+                    spec = (
+                        await _antigravity_startup_agent_spec(
+                            session_id, _resolve_session_agent_spec_or_none
+                        )
+                        if terminal_name == "antigravity"
+                        else await _resolve_session_agent_spec_or_none(session_id)
                     )
+                    return dataclasses.replace(ctx, agent_spec=spec)
 
                 _ensure_build = _spec_or_none_ensure_build
+                if terminal_name == "antigravity":
+                    _ensure_is_owned = _is_runner_owned_antigravity_terminal
+                    _ensure_conflict = (
+                        "Existing antigravity terminal is not a runner-owned agy TUI "
+                        "and could not be closed."
+                    )
 
             _ensure_result = await _ensure_native_terminal(
                 terminal_name,
@@ -845,6 +857,36 @@ def register_resource_routes(
             status_code=200,
             content=session_resource_view_to_dict(resource),
         )
+
+    shell_inspector = ShellInspector()
+
+    @app.get("/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell")
+    async def get_session_terminal_shell(session_id: str, terminal_id: str) -> JSONResponse:
+        """Whether one of this session's terminals runs anything besides its login shell.
+
+        Looked up under this session only. A missing terminal, another session's and a stopped
+        one all answer the same 404, so none can be told apart from the others.
+
+        :param session_id: Owning session id.
+        :param terminal_id: Terminal resource id, e.g. ``"terminal_bash_s1"``.
+        :returns: ``{"state", "foreground", "background_jobs"}``; see :class:`ShellInspection`.
+        """
+        entry = resolve_terminal_entry_by_resource_id(session_id, terminal_id, terminal_registry)
+        if entry is None or not entry.instance.running:
+            return JSONResponse(status_code=404, content=TERMINAL_SHELL_NOT_FOUND)
+        instance = entry.instance
+
+        async def read_live_shell() -> ShellInspection | None:
+            # Live tmux state, not the optimistic flag: a stopped terminal is a miss too.
+            if not await instance.is_alive():
+                return None
+            return await instance.inspect_shell()
+
+        # Concurrent requests share one liveness check and one read, both inside the budget.
+        inspection = await shell_inspector.inspect(str(instance.socket_path), read_live_shell)
+        if inspection is None:
+            return JSONResponse(status_code=404, content=TERMINAL_SHELL_NOT_FOUND)
+        return JSONResponse(status_code=200, content=inspection.to_dict())
 
     @app.get("/v1/sessions/{session_id}/sign-in-link")
     async def get_session_sign_in_link(session_id: str) -> JSONResponse:
@@ -1293,6 +1335,10 @@ def register_resource_routes(
             )
         return registry
 
+    # A browser abandons a slow listing but its git status keeps running, so
+    # refetches would pile up on the slow-IO pool; concurrent ones share a scan.
+    changes_scans: FreshCallCoalescer[tuple[str, str], list[dict[str, Any]]] = FreshCallCoalescer()
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
     async def list_filesystem_changes(
         session_id: str,
@@ -1302,19 +1348,19 @@ def register_resource_routes(
 
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
-        try:
+
+        async def scan() -> list[dict[str, Any]]:
+            # Resolved when the scan starts, so a multi-repository Git budget
+            # does not run down while the request waits its turn.
+            session_registry = await _changes_registry(session_id, environment_id, agent_spec)
+            if session_registry is None:
+                return []
             # git status can take seconds; keep it off the loop (relay probes)
             # and off the default pool (native message delivery).
-            raw_changes = (
-                await run_slow_io(
-                    session_registry.list_changed_files,
-                    session_id,
-                    limit=10_000,
-                )
-                if session_registry is not None
-                else []
-            )
+            return await run_slow_io(session_registry.list_changed_files, session_id, limit=10_000)
+
+        try:
+            raw_changes = await changes_scans.run((session_id, environment_id), scan)
         except GitStatusUnavailable as exc:
             return JSONResponse(
                 status_code=500,
@@ -1505,11 +1551,13 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        allow_cached: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
-            "pr_info",
+            "cached_pr_info",
             pr_url=pr_url,
+            allow_cached=allow_cached,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )
@@ -1761,6 +1809,7 @@ def register_resource_routes(
         base_sha: str = "",
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        account_rights: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
@@ -1769,6 +1818,7 @@ def register_resource_routes(
             after=after,
             head_sha=head_sha,
             base_sha=base_sha,
+            account_rights=account_rights,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )
@@ -1781,6 +1831,7 @@ def register_resource_routes(
         after: str,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        account_rights: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
@@ -1788,6 +1839,7 @@ def register_resource_routes(
             pr_url=pr_url,
             thread_id=thread_id,
             after=after,
+            account_rights=account_rights,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )

@@ -161,8 +161,10 @@ describe("WorkflowStepsGraph", () => {
     expect(within(overlay).getAllByTestId("workflow-step-node")).toHaveLength(2);
     // The workflow itself has no run, so its full-screen view has no legend.
     expect(within(overlay).queryByText("Not started")).toBeNull();
+    expect(document.documentElement).toHaveAttribute("data-fullscreen-overlay-open");
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+    expect(document.documentElement).not.toHaveAttribute("data-fullscreen-overlay-open");
   });
 
   it("shows a step's full name and goal on hover, wrapped inside its card, with no menu", async () => {
@@ -264,6 +266,28 @@ describe("WorkflowGraphOverlay", () => {
     expect(within(card).getByText("Goal")).toBeInTheDocument();
     expectMarkdownGoal(card);
     expectTextWrapsInside(card);
+  });
+
+  it("says a stopped step started when its attempt did, not at its newest start", async () => {
+    const now = Date.now() / 1000;
+    const run = progress("stopped", "waiting");
+    const newest = {
+      ...statusEntry("explore", "started", "Pushed fix 7"),
+      created_at: now - 1_926,
+    };
+    run[0] = { ...run[0]!, status: newest, startedAt: now - 14_840 };
+    render(
+      <WorkflowGraphOverlay
+        title="Triage flaky tests"
+        steps={STEPS}
+        progress={run}
+        onClose={vi.fn()}
+      />,
+    );
+    await userEvent.hover(screen.getAllByTestId("workflow-step-node")[0]!);
+    expect(await screen.findByTestId("workflow-step-card")).toHaveTextContent(
+      "Stopped · started 4h ago",
+    );
   });
 
   it("offers each step's action in its ⋯ menu, and an open menu takes the first Escape", async () => {

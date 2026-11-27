@@ -1,4 +1,8 @@
-"""Host-owned MCP disable state, applied only to explicitly active launches.
+"""Launch-time MCP filtering for Claude and Codex sessions.
+
+Two inputs apply here: host-owned disable state, only for explicitly active
+launches, and the user's MCP inheritance setting (:mod:`omnigent.mcp_inheritance`),
+which allowlists servers when ``inherit`` is false.
 
 Codex names are read in-process from prepared private, trusted project and CLI
 config layers; launch never waits for a discovery subprocess. If that best-effort
@@ -22,9 +26,11 @@ from pathlib import Path
 from typing import Any, Final, Literal, overload
 
 import tomlkit
+from tomlkit.exceptions import TOMLKitError
 
 from omnigent.config import global_config_path
-from omnigent.harnesses.codex_native.launch_args import _merge_tables
+from omnigent.harnesses.codex_native.launch_args import _merge_tables, codex_config_overrides
+from omnigent.mcp_inheritance import McpInheritance, resolve_mcp_inheritance
 
 HarnessKey = Literal["claude", "codex"]
 ExecutorId = Literal["claude-native", "claude-sdk", "codex-native", "codex"]
@@ -37,6 +43,9 @@ RELAUNCH_WITHOUT_OVERRIDES_EVENT: Final = "mcp_disabled_relaunch_without_overrid
 _MAX_BYTES = 64 * 1024
 _MAX_NAME_LENGTH = 1024
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+# Codex reads these on POSIX hosts below and above its user and project layers.
+CODEX_SYSTEM_CONFIG_PATH = Path("/etc/codex/config.toml")
+CODEX_MANAGED_CONFIG_PATH = Path("/etc/codex/managed_config.toml")
 _write_lock = threading.Lock()
 _read_failure_lock = threading.Lock()
 _read_failures: set[tuple[Path, str, str]] = set()
@@ -48,6 +57,25 @@ class ServerKey:
     harness: HarnessKey
     server: str
     plugin: str | None = None
+
+
+class McpStrictModeError(RuntimeError):
+    """The CLI's launch configuration cannot honor the strict MCP policy."""
+
+    def __init__(
+        self, executor: str, path: Path, reason: str, *, problem: str | None = None
+    ) -> None:
+        self.path = path
+        problem = problem or (
+            f"{path} could not be read ({reason}), so MCP servers it configures could still load"
+        )
+        super().__init__(
+            f"Strict MCP mode stopped this {executor} launch: {problem}. Fix that file, or "
+            f"set harness.{executor}.mcp.inherit: true in {global_config_path()}."
+        )
+        _logger.warning(
+            "mcp_strict_launch_refused executor=%s path=%s reason=%s", executor, path, reason
+        )
 
 
 class DisabledServerWriteError(ValueError):
@@ -206,12 +234,246 @@ def _claude_name(key: ServerKey) -> str:
     return f"plugin:{key.plugin}:{key.server}" if key.plugin else key.server
 
 
+def _claude_inherited_settings_paths(
+    cwd: Path,
+    executor: str,
+    env: Mapping[str, str] | None,
+    setting_sources: Collection[str] | None,
+) -> list[Path]:
+    """List the user, project, local and managed settings files Claude merges from *cwd*."""
+    from omnigent.onboarding import ambient
+
+    sources = {"user", "project", "local"} if setting_sources is None else set(setting_sources)
+    paths = [ambient.claude_user_settings_path(cwd, env)] if "user" in sources else []
+    if sources & {"project", "local"}:
+        for directory in _claude_project_directories(cwd):
+            if "project" in sources:
+                paths.append(directory / ".claude" / "settings.json")
+            if "local" in sources:
+                paths.append(directory / ".claude" / "settings.local.json")
+    for managed in ambient.claude_code_platform_managed_settings_paths():
+        paths.append(managed)
+        drop_ins = managed.with_name("managed-settings.d")
+        try:
+            names = sorted(name for name in os.listdir(drop_ins) if name.endswith(".json"))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as error:
+            raise McpStrictModeError(executor, drop_ins, type(error).__name__) from error
+        paths.extend(drop_ins / name for name in names)
+    return list(dict.fromkeys(paths))
+
+
+def _claude_project_directories(cwd: Path) -> list[Path]:
+    """The launch directory, its Git root and, for a linked worktree, the main checkout.
+
+    Claude versions differ in which of these they read project and local settings
+    from, so strict mode reads all of them.
+    """
+    git_root = next(
+        (directory for directory in (cwd, *cwd.parents) if (directory / ".git").exists()), cwd
+    )
+    return list(dict.fromkeys(path for path in (cwd, git_root, _canonical_git_root(cwd)) if path))
+
+
+def _claude_allowlisted_servers(
+    cwd: Path,
+    inheritance: McpInheritance,
+    env: Mapping[str, str] | None,
+    managed_settings: Sequence[Mapping[str, object]],
+    claude_args: Sequence[str],
+) -> list[tuple[str, Mapping[str, object]]]:
+    """Return the readable configs of strict-allowlisted servers Claude may load from *cwd*."""
+    from omnigent.harnesses.claude_native.bridge import claude_global_config_path
+    from omnigent.host.mcp_inventory import managed_claude_mcp_config
+
+    def servers_in(data: object) -> Mapping[str, object]:
+        servers = data.get("mcpServers") if isinstance(data, Mapping) else None
+        return servers if isinstance(servers, Mapping) else {}
+
+    def read(path: Path, *, diagnostic_path: Path | None = None) -> Mapping[str, object]:
+        # Unreadable configs hide allowlisted transports, so a matching entry is denied.
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeError, ValueError, RecursionError) as error:
+            _log_read_failure(
+                diagnostic_path or path,
+                type(error).__name__,
+                event="mcp_strict_claude_config_read_failed",
+            )
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    present, managed = managed_claude_mcp_config()
+    tables = [managed, *managed_settings]
+    if not present:
+        user = read(claude_global_config_path(cwd, env))
+        projects = user.get("projects")
+        tables.append(servers_in(user))
+        for directory in _claude_project_directories(cwd):
+            # Claude keys projects by its physical working directory.
+            for key in dict.fromkeys((str(directory), os.path.realpath(directory))):
+                project = projects.get(key) if isinstance(projects, dict) else None
+                tables.append(servers_in(project))
+            tables.append(servers_in(read(directory / ".mcp.json")))
+    configs: list[str] = []
+    collecting = False
+    for arg in claude_args:
+        if arg == "--":
+            break
+        if arg == "--mcp-config":
+            collecting = True
+        elif arg.startswith("--mcp-config="):
+            configs.append(arg.partition("=")[2])
+            collecting = True
+        elif arg.startswith("-"):
+            collecting = False
+        elif collecting:
+            configs.append(arg)
+    for config in configs:
+        try:
+            payload = json.loads(config)
+        except (ValueError, RecursionError):
+            payload = read(cwd / config, diagnostic_path=Path("--mcp-config"))
+        tables.append(servers_in(payload))
+    return [
+        (name, config)
+        for table in tables
+        for name, config in table.items()
+        if isinstance(config, Mapping) and inheritance.allows(name)
+    ]
+
+
+def _claude_inherited_denials(
+    cwd: Path,
+    inheritance: McpInheritance,
+    executor: str,
+    env: Mapping[str, str] | None,
+    setting_sources: Collection[str] | None,
+    claude_args: Sequence[str],
+) -> list[dict[str, object]]:
+    """Deny inherited MCP admissions outside the strict allowlist.
+
+    Claude unions allowlists across its settings sources, but a deny from any source
+    wins, so mirroring them is the only way an injected allowlist can narrow them.
+    Policy-delivered servers skip the allowlist, so their names are denied too.
+
+    :raises McpStrictModeError: When an inherited transport entry cannot be denied
+        without also blocking an allowlisted server or the ``omnigent`` relay.
+    """
+    from omnigent.host.mcp_inventory import managed_claude_mcp_config
+    from omnigent.onboarding import ambient
+
+    settings: list[tuple[Path, dict[str, object]]] = []
+    managed_settings: list[Mapping[str, object]] = []
+    managed_paths = ambient.claude_code_platform_managed_settings_paths()
+    for path in _claude_inherited_settings_paths(cwd, executor, env, setting_sources):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, UnicodeError) as error:
+            raise McpStrictModeError(executor, path, type(error).__name__) from error
+        try:
+            payload = json.loads(text)
+        except (ValueError, RecursionError) as error:
+            raise McpStrictModeError(executor, path, "invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise McpStrictModeError(executor, path, "not a JSON object")
+        if payload.get("allowManagedMcpServersOnly") is True and any(
+            path == managed or path.parent == managed.with_name("managed-settings.d")
+            for managed in managed_paths
+        ):
+            raise McpStrictModeError(
+                executor,
+                path,
+                "managed-only MCP allowlist",
+                problem=(
+                    f"{path} enables a managed-only MCP allowlist, so Omnigent cannot "
+                    "enforce its invocation MCP allowlist"
+                ),
+            )
+        settings.append((path, payload))
+        servers = payload.get("managedMcpServers")
+        if isinstance(servers, dict):
+            managed_settings.append(servers)
+
+    allowlisted: list[tuple[str, Mapping[str, object]]] | None = None
+    denials: list[dict[str, object]] = []
+    for path, payload in settings:
+        inherited = payload.get("allowedMcpServers")
+        for entry in inherited if isinstance(inherited, list) else ():
+            for field, value in entry.items() if isinstance(entry, dict) else ():
+                if field == "serverName":
+                    mirrored = isinstance(value, str) and not inheritance.allows(value)
+                elif (
+                    field == "serverCommand"
+                    and isinstance(value, list)
+                    and all(isinstance(part, str) for part in value)
+                ):
+                    # With any command entry, Claude admits stdio servers by command only.
+                    raise McpStrictModeError(
+                        executor,
+                        path,
+                        "inherited serverCommand allow entry",
+                        problem=(
+                            f"{path} allows MCP servers by command, so Claude admits stdio "
+                            "servers only by command and ignores the name allowlist, "
+                            "including for the omnigent relay. Replace it with serverName "
+                            "entries"
+                        ),
+                    )
+                elif field == "serverUrl" and isinstance(value, str):
+                    if allowlisted is None:
+                        allowlisted = _claude_allowlisted_servers(
+                            cwd, inheritance, env, managed_settings, claude_args
+                        )
+                    remote = next(
+                        (
+                            name
+                            for name, config in allowlisted
+                            if isinstance(config.get("url"), str)
+                        ),
+                        None,
+                    )
+                    if remote is not None:
+                        raise McpStrictModeError(
+                            executor,
+                            path,
+                            "serverUrl overrides name-based remote admission",
+                            problem=(
+                                f"{path} contains a serverUrl allow entry, so Claude uses "
+                                "URL-only admission and cannot enforce the name allowlist "
+                                f"for allowlisted remote server {remote}. Replace serverUrl "
+                                "entries with serverName entries"
+                            ),
+                        )
+                    mirrored = True
+                else:
+                    mirrored = False
+                if mirrored and {field: value} not in denials:
+                    denials.append({field: value})
+    _, managed = managed_claude_mcp_config()
+    for table in (*managed_settings, managed):
+        for name in table:
+            if not inheritance.allows(name) and {"serverName": name} not in denials:
+                denials.append({"serverName": name})
+    return denials
+
+
 @overload
 def apply_claude_settings(
     settings: dict[str, object],
     *,
     executor: Literal["claude-native"],
     active_harnesses: Collection[str] | None,
+    cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+    discover_inherited: bool = True,
+    setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
 ) -> dict[str, object]: ...
 
 
@@ -221,6 +483,11 @@ def apply_claude_settings(
     *,
     executor: Literal["claude-sdk"],
     active_harnesses: Collection[str] | None,
+    cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+    discover_inherited: bool = True,
+    setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
 ) -> str | None: ...
 
 
@@ -229,72 +496,121 @@ def apply_claude_settings(
     *,
     executor: Literal["claude-native", "claude-sdk"],
     active_harnesses: Collection[str] | None,
+    cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+    discover_inherited: bool = True,
+    setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
 ) -> dict[str, object] | str | None:
-    """Append Claude deny entries without modifying the caller's settings.
+    """Add Claude deny and strict-mode allow entries without modifying the caller's settings.
 
     The executor selects native dict settings versus the SDK's JSON-string form.
+    With ``inherit: false``, ``allowedMcpServers`` replaces any caller allowlist and
+    inherited allow entries outside it, read from Claude's settings files for the
+    launch *cwd* and *env* (default: this process's), are added to ``deniedMcpServers``.
+    ``discover_inherited=False`` skips that reading, for a caller that applies these
+    settings again once the launch context is known.
+    ``setting_sources`` narrows ordinary files to the CLI's effective scopes;
+    managed policy always applies. ``claude_args`` supplies additional native
+    ``--mcp-config`` definitions for remote admission checks.
+
+    :raises McpStrictModeError: In strict mode, when the caller's settings or an
+        inherited settings file cannot be read as a JSON object.
     """
     entries = _active_entries("claude", active_harnesses)
-    if not entries:
+    inheritance = resolve_mcp_inheritance(executor)
+    if not entries and inheritance.inherit:
         return settings
     try:
         parsed = json.loads(settings) if isinstance(settings, str) else settings
     except (ValueError, RecursionError):
-        return settings
+        parsed = None
     if parsed is None and settings is None:
         parsed = {}
     if not isinstance(parsed, dict):
+        if not inheritance.inherit:
+            raise McpStrictModeError(executor, Path("--settings"), "not a JSON object")
         return settings
+    merged = dict(parsed)
     denied = parsed.get("deniedMcpServers", [])
     if not isinstance(denied, list):
+        if not inheritance.inherit:
+            raise McpStrictModeError(executor, Path("--settings"), "deniedMcpServers not a list")
+        denied = None
+    if denied is not None:
+        wanted: list[dict[str, object]] = [{"serverName": _claude_name(key)} for key in entries]
+        if not inheritance.inherit and discover_inherited:
+            launch_cwd = Path(cwd) if cwd is not None else Path.cwd()
+            wanted.extend(
+                _claude_inherited_denials(
+                    launch_cwd.absolute(), inheritance, executor, env, setting_sources, claude_args
+                )
+            )
+        additions: list[dict[str, object]] = []
+        for entry in wanted:
+            if entry not in denied and entry not in additions:
+                additions.append(entry)
+        if additions:
+            merged["deniedMcpServers"] = [*denied, *additions]
+    if not inheritance.inherit:
+        merged["allowedMcpServers"] = [
+            {"serverName": name} for name in inheritance.allowed_names()
+        ]
+    if merged == parsed:
         return settings
-    additions = []
-    for key in entries:
-        entry = {"serverName": _claude_name(key)}
-        if entry not in denied and entry not in additions:
-            additions.append(entry)
-    if not additions:
-        return settings
-    merged = {**parsed, "deniedMcpServers": [*denied, *additions]}
     return merged if executor == "claude-native" else json.dumps(merged)
 
 
 def claude_loaded_anyway(
     loaded_names: Iterable[str], *, active_harnesses: Collection[str] | None
 ) -> tuple[str, ...]:
-    """Identify disabled names in an SDK init event, in saved order."""
+    """Identify disabled names in an SDK init event, then any outside a strict allowlist."""
     entries = _active_entries("claude", active_harnesses)
-    loaded = set(loaded_names)
-    return tuple(_claude_name(key) for key in entries if _claude_name(key) in loaded)
+    loaded = list(dict.fromkeys(loaded_names))
+    found = [_claude_name(key) for key in entries if _claude_name(key) in loaded]
+    inheritance = resolve_mcp_inheritance("claude-sdk")
+    found.extend(name for name in loaded if not inheritance.allows(name) and name not in found)
+    return tuple(found)
 
 
-def _read_codex_config(path: Path) -> dict[str, Any]:
+def _read_codex_config(path: Path, unreadable: list[Path]) -> dict[str, Any]:
     try:
-        return tomllib.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        try:
+            return tomllib.loads(text)
+        except ValueError:
+            # Codex accepts TOML 1.1 forms, such as trailing commas, that tomllib rejects.
+            return tomlkit.parse(text).unwrap()
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+    except (OSError, ValueError, UnicodeError, RecursionError, TOMLKitError) as error:
         _log_read_failure(
             path, type(error).__name__, event="mcp_disabled_codex_config_read_failed"
         )
+        unreadable.append(path)
         return {}
 
 
-def _codex_cli_overrides(overrides: Sequence[str], config_path: Path) -> dict[str, Any]:
-    """Build Codex's single CLI layer, assigning each dotted path in order."""
+def _codex_cli_overrides(
+    overrides: Sequence[str], config_path: Path, unreadable: list[Path] | None = None
+) -> dict[str, Any]:
+    """Build Codex's single CLI layer, assigning each dotted path in order.
+
+    An ``mcp_servers`` or ``mcp_servers.<name>`` override that is not a TOML table
+    goes to *unreadable*, since the servers it was meant to configure are unknown.
+    """
     result: dict[str, Any] = {}
     for override in overrides:
         key, separator, value = override.partition("=")
+        # Codex splits the key literally; TOML quoting applies only to the value.
+        *parents, name = key.strip().split(".")
+        server_table = [*parents, name][:1] == ["mcp_servers"] and len(parents) <= 1
         try:
             if not separator:
                 raise ValueError("Missing assignment")
-            try:
-                parsed = tomllib.loads(f"value={value}")["value"]
-            except ValueError:
-                # Codex accepts unquoted strings when a value is not valid TOML.
-                parsed = value.strip()
-            # Codex splits the key literally; TOML quoting applies only to the value.
-            *parents, name = key.strip().split(".")
+            parsed = _parse_codex_override_value(value)
+            if server_table and not isinstance(parsed, dict) and unreadable is not None:
+                unreadable.append(Path(f"-c {key.strip()}"))
             target = result
             for parent in parents:
                 if not isinstance(target.get(parent), dict):
@@ -306,10 +622,25 @@ def _codex_cli_overrides(overrides: Sequence[str], config_path: Path) -> dict[st
             _log_read_failure(
                 config_path, "InvalidOverride", event="mcp_disabled_codex_config_read_failed"
             )
+            if server_table and unreadable is not None:
+                unreadable.append(Path(f"-c {key.strip()}"))
     return result
 
 
-def _codex_git_root(cwd: Path) -> Path | None:
+def _parse_codex_override_value(value: str) -> object:
+    try:
+        return tomllib.loads(f"value={value}")["value"]
+    except ValueError:
+        pass
+    try:
+        # Codex accepts TOML 1.1 forms, such as multiline inline tables.
+        return tomlkit.parse(f"value={value}").unwrap()["value"]
+    except (TOMLKitError, ValueError, KeyError):
+        # Codex accepts unquoted strings when a value is not valid TOML.
+        return value.strip()
+
+
+def _canonical_git_root(cwd: Path) -> Path | None:
     """Resolve the trust root, including linked worktrees, without invoking git."""
     for directory in (cwd, *cwd.parents):
         dot_git = directory / ".git"
@@ -352,11 +683,22 @@ def _codex_layer_trusted(projects: Any, *candidates: Path | None) -> bool:
     return False
 
 
-def _codex_server_names(codex_home: Path, cwd: Path, config_overrides: Sequence[str]) -> set[str]:
-    """Read already-materialized profile MCPs, then trusted project and CLI layers."""
+def _codex_server_names(
+    codex_home: Path,
+    cwd: Path,
+    config_overrides: Sequence[str],
+    unreadable: list[Path],
+    managed_enabled: list[str] | None = None,
+) -> set[str]:
+    """Read system and already-materialized profile MCPs, then trusted project, CLI and
+    managed layers. Paths of layers that exist but cannot be read go to *unreadable*,
+    and servers the managed layer sets ``enabled = true`` go to *managed_enabled*."""
     config_path = codex_home / "config.toml"
-    config = _read_codex_config(config_path)
-    cli = _codex_cli_overrides(config_overrides, config_path)
+    config: dict[str, Any] = {}
+    if os.name == "posix":
+        _merge_tables(config, _read_codex_config(CODEX_SYSTEM_CONFIG_PATH, unreadable))
+    _merge_tables(config, _read_codex_config(config_path, unreadable))
+    cli = _codex_cli_overrides(config_overrides, config_path, unreadable)
     discovery: dict[str, Any] = {}
     _merge_tables(discovery, config)
     _merge_tables(discovery, cli)
@@ -380,7 +722,7 @@ def _codex_server_names(codex_home: Path, cwd: Path, config_overrides: Sequence[
         ):
             root = directory
             break
-    git_root = _codex_git_root(cwd)
+    git_root = _canonical_git_root(cwd)
     projects = discovery.get("projects", {})
     layers = list(directories[: directories.index(root) + 1])
     for directory in reversed(layers):
@@ -388,8 +730,18 @@ def _codex_server_names(codex_home: Path, cwd: Path, config_overrides: Sequence[
         trusted = _codex_layer_trusted(projects, directory, root, git_root)
         project_home = directory / ".codex"
         if trusted and project_home.resolve() != codex_home.resolve():
-            _merge_tables(config, _read_codex_config(project_home / "config.toml"))
+            _merge_tables(config, _read_codex_config(project_home / "config.toml", unreadable))
     _merge_tables(config, cli)
+    if os.name == "posix":
+        managed = _read_codex_config(CODEX_MANAGED_CONFIG_PATH, unreadable)
+        managed_servers = managed.get("mcp_servers")
+        if managed_enabled is not None and isinstance(managed_servers, dict):
+            managed_enabled.extend(
+                name
+                for name, server in managed_servers.items()
+                if isinstance(server, dict) and server.get("enabled") is True
+            )
+        _merge_tables(config, managed)
     servers = config.get("mcp_servers", {})
     return (
         {name for name, server in servers.items() if isinstance(server, dict)}
@@ -413,6 +765,24 @@ class CodexLaunchPlan:
         return self.fallback_config_overrides if self.outcome == "applied" else None
 
 
+def _codex_disable_overrides(
+    names: Sequence[str], original: Sequence[str], config_path: Path
+) -> list[str]:
+    """Build ``-c`` overrides that set ``enabled=false`` for each named server."""
+    if not names:
+        return []
+    if all(_TOML_BARE_KEY.fullmatch(name) for name in names):
+        return [f"mcp_servers.{name}.enabled=false" for name in names]
+    # Codex splits dotted paths literally. Rebuild its CLI MCP table so
+    # adding quoted names preserves existing CLI transports.
+    cli_servers = _codex_cli_overrides(original, config_path).get("mcp_servers", {})
+    for name in names:
+        cli_servers.setdefault(name, {})["enabled"] = False
+    table = tomlkit.inline_table()
+    table.update(cli_servers)
+    return [f"mcp_servers={table.as_string()}"]
+
+
 def plan_codex_launch(
     config_overrides: Sequence[str],
     *,
@@ -420,47 +790,82 @@ def plan_codex_launch(
     active_harnesses: Collection[str] | None,
     codex_home: Path,
     cwd: Path,
+    launch_args: Sequence[str] = (),
 ) -> CodexLaunchPlan:
     """Plan synchronously from prepared config files; never spawn or await a probe.
 
     Call after profile/MCP preparation in the session's private CODEX_HOME and
     before building argv. Unreadable layers are skipped with one warning each.
+    With ``inherit: false`` every discovered server outside the allowlist is
+    disabled, and the early-exit retry keeps those overrides.
+
+    :raises McpStrictModeError: With ``inherit: false``, when a config layer
+        exists but cannot be read or parsed, or the managed layer enables a server
+        outside the allowlist, since it outranks the ``-c`` disables.
     """
     original = tuple(config_overrides)
     entries = _active_entries("codex", active_harnesses)
-    if not entries:
+    inheritance = resolve_mcp_inheritance(executor)
+    if not entries and inheritance.inherit:
         return CodexLaunchPlan(original, original, "none", ())
+    config_path = codex_home / "config.toml"
+    effective_overrides = (*codex_config_overrides(launch_args), *original)
+    unreadable: list[Path] = []
+    managed_enabled: list[str] = []
     try:
-        servers = _codex_server_names(codex_home.resolve(), cwd.absolute(), original)
+        servers = _codex_server_names(
+            codex_home.resolve(), cwd.absolute(), effective_overrides, unreadable, managed_enabled
+        )
     except (OSError, ValueError, RuntimeError, RecursionError) as error:
         _log_read_failure(
-            codex_home / "config.toml",
+            config_path,
             type(error).__name__,
             event="mcp_disabled_codex_config_read_failed",
         )
+        unreadable.append(config_path)
         servers = set()
-    applied = [key.server for key in entries if key.server in servers]
-    dropped = [key.server for key in entries if key.server not in servers]
-    overrides = []
-    if any(not _TOML_BARE_KEY.fullmatch(name) for name in applied):
-        # Codex splits dotted paths literally. Rebuild its CLI MCP table so
-        # adding quoted names preserves existing CLI transports.
-        cli_servers = _codex_cli_overrides(original, codex_home / "config.toml").get(
-            "mcp_servers", {}
+    if unreadable and not inheritance.inherit:
+        # Servers in an unreadable layer cannot be named, so they could still load.
+        raise McpStrictModeError(executor, unreadable[0], "unreadable or invalid TOML")
+    forced = next((name for name in managed_enabled if not inheritance.allows(name)), None)
+    if forced is not None and not inheritance.inherit:
+        raise McpStrictModeError(
+            executor,
+            CODEX_MANAGED_CONFIG_PATH,
+            "managed layer enables a server outside the allowlist",
+            problem=(
+                f"{CODEX_MANAGED_CONFIG_PATH} sets enabled = true for MCP server {forced}, "
+                "which outranks the launch's disable, so it would still load. Remove that "
+                f"setting or add {forced} to the allowlist"
+            ),
         )
-        for name in applied:
-            cli_servers.setdefault(name, {})["enabled"] = False
-        table = tomlkit.inline_table()
-        table.update(cli_servers)
-        overrides.append(f"mcp_servers={table.as_string()}")
-    else:
-        overrides.extend(f"mcp_servers.{name}.enabled=false" for name in applied)
+    strict = _codex_strict_names(servers, inheritance, executor)
+    applied = [key.server for key in entries if key.server in servers and key.server not in strict]
+    dropped = [key.server for key in entries if key.server not in servers]
     if dropped:
         _logger.warning(
             "mcp_disabled_servers_not_reported names=%s",
             tuple(dropped),
             extra={"executor": executor},
         )
-    return CodexLaunchPlan(
-        (*original, *overrides), original, "applied" if overrides else "none", tuple(dropped)
+    baseline = (*original, *_codex_disable_overrides(strict, effective_overrides, config_path))
+    if not applied:
+        return CodexLaunchPlan(baseline, baseline, "none", tuple(dropped))
+    overrides = _codex_disable_overrides([*strict, *applied], effective_overrides, config_path)
+    return CodexLaunchPlan((*original, *overrides), baseline, "applied", tuple(dropped))
+
+
+def _codex_strict_names(
+    servers: Collection[str], inheritance: McpInheritance, executor: str
+) -> list[str]:
+    """Return discovered servers outside a strict allowlist, in a stable order."""
+    if inheritance.inherit:
+        return []
+    names = sorted(name for name in servers if not inheritance.allows(name))
+    _logger.info(
+        "mcp_strict_mode_applied executor=%s disabled=%s allowed=%s",
+        executor,
+        tuple(names),
+        inheritance.allowed_names(),
     )
+    return names

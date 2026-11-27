@@ -6,6 +6,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
 import ssl
 import subprocess
@@ -2033,6 +2034,97 @@ async def test_is_alive_true_when_pane_live(
     assert instance.running is True
 
 
+class _StalledProcess:
+    """A tmux probe that never answers until it's killed."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+        self.reaped = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self) -> int:
+        self.reaped = True
+        self.returncode = -9
+        return -9
+
+
+@pytest.mark.asyncio
+async def test_is_alive_kills_and_reaps_its_probe_when_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that gives up on a stalled liveness probe leaves no tmux child behind."""
+    probe = _StalledProcess()
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _StalledProcess:
+        del cmd, stdout, stderr
+        return probe
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(instance.is_alive(), 0.05)
+    assert probe.killed and probe.reaped
+    # Giving up says nothing about the terminal, so it stays running.
+    assert instance.running is True
+
+
+@pytest.mark.asyncio
+async def test_is_alive_kills_and_reaps_a_dead_panes_capture_when_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that gives up while a dead pane's last screen is captured leaves no tmux child."""
+    capture = _StalledProcess()
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _ProcessWithStdout | _StalledProcess:
+        del stdout, stderr
+        if "list-panes" in cmd:
+            return _ProcessWithStdout(stdout=b"1 2\n", returncode=0)
+        return capture
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(instance.is_alive(), 0.05)
+    assert capture.killed and capture.reaped
+    # The capture didn't finish, so the exit watcher still owns marking it stopped.
+    assert instance.running is True
+
+
 @pytest.mark.asyncio
 async def test_is_alive_preserves_running_state_when_probe_cannot_start(
     tmp_path: Path,
@@ -2573,6 +2665,79 @@ async def _capture_launch_argv(
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
     return captured[0]
+
+
+async def _failed_launch_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process: _ProcessWithStdout,
+) -> str:
+    """Launch with a failing mocked tmux and return the raised error message."""
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+        env: dict[str, str],
+    ) -> _ProcessWithStdout:
+        """Check both streams are captured, then hand back the failing process."""
+        del cmd, env
+        assert stdout is asyncio.subprocess.PIPE
+        assert stderr is asyncio.subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            **(vars(asyncio) | {"create_subprocess_exec": fake_create_subprocess_exec})
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await instance.launch(cwd=tmp_path)
+    assert instance.running is False
+    return str(excinfo.value)
+
+
+async def test_launch_failure_preserves_stdout_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux launch failure must retain a stdout-only diagnostic."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _ProcessWithStdout(
+            returncode=1, stdout=b"new-session refused: server socket unavailable\n"
+        ),
+    )
+    assert message == ("tmux launch failed (rc=1): new-session refused: server socket unavailable")
+
+
+async def test_launch_failure_reports_stderr_before_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When both streams carry text, stderr leads and stdout is preserved."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _ProcessWithStdout(returncode=1, stdout=b"stdout-detail\n", stderr=b"stderr-detail\n"),
+    )
+    assert message == "tmux launch failed (rc=1): stderr-detail; stdout-detail"
+
+
+async def test_launch_failure_names_silent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A silent tmux failure includes its return code and an explicit reason."""
+    message = await _failed_launch_error(tmp_path, monkeypatch, _ProcessWithStdout(returncode=2))
+    assert message == "tmux launch failed (rc=2): <tmux produced no output>"
 
 
 @pytest.mark.parametrize("launch_fails", [False, True])
@@ -3407,7 +3572,8 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
         "asyncio",
         SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
-    monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
+    launcher = Mock(return_value="/test/launcher")
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", launcher)
     instance = TerminalInstance(
         name="bash",
         session_key="test-keyring",
@@ -3430,6 +3596,7 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     spawn.assert_awaited_once()
     env = spawn.call_args.kwargs["env"]
     if sandbox_active:
+        assert launcher.call_args.kwargs["cwd"] == str(tmp_path)
         assert session_env.keys().isdisjoint(env)
     else:
         assert {name: env[name] for name in session_env} == session_env
@@ -3648,7 +3815,6 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import os
 
     def _raise_if_called(*args: object, **kwargs: object) -> None:
         """Fail the test if kill-server runs with no socket present."""

@@ -37,7 +37,7 @@ from omnigent.llms.types import (
 )
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import init as init_runtime
-from omnigent.runtime import pending_elicitations
+from omnigent.runtime import pending_elicitations, pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import _elicitation_registry, presence
 from omnigent.server.app import create_app
@@ -456,6 +456,7 @@ def _reset_elicitation_state() -> Iterator[None]:
     """
     yield
     pending_elicitations.reset_for_tests()
+    pending_inputs.set_session_busy_check(None)
     _elicitation_registry.reset_for_tests()
     # Presence is likewise module-global (keyed by conversation/user)
     # with pending leave-grace timers that would fire into later tests.

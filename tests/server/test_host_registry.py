@@ -41,14 +41,15 @@ class FakeWebSocket:
         return ""  # pragma: no cover
 
 
-def _make_hello(name: str = "test-host") -> HostHelloFrame:
+def _make_hello(name: str = "test-host", version: str = "0.1.0") -> HostHelloFrame:
     """Build a minimal HostHelloFrame for tests.
 
     :param name: Human-readable host name.
+    :param version: Host software version, e.g. ``"0.24.0"``.
     :returns: A :class:`HostHelloFrame` with default values.
     """
     return HostHelloFrame(
-        version="0.1.0",
+        version=version,
         frame_protocol_version=1,
         name=name,
     )
@@ -413,6 +414,51 @@ def test_register_replaces_stale_connection() -> None:
     # The None sentinel tells the sender loop to exit.
     poison = old_conn.outbound_queue.get_nowait()
     assert poison is None
+
+
+@pytest.mark.parametrize(
+    ("registered_version", "connecting_version", "connecting_owner", "silent_s", "refused"),
+    [
+        ("0.24.0", "0.3.0", "dave", 0.0, True),
+        ("0.24.0", "0.24.0.dev20261123", "dave", 0.0, True),
+        ("0.24.0", "0.24.0", "dave", 0.0, False),
+        ("0.3.0", "0.24.0", "dave", 0.0, False),
+        ("0.24.0", "0.3.0", "dave", 91.0, False),
+        ("0.24.0", "0.3.0", "erin", 0.0, False),
+        ("0.24.0", "not-a-version", "dave", 0.0, False),
+    ],
+    ids=[
+        "older-refused",
+        "dev-build-of-same-release-refused",
+        "same-version-replaces",
+        "newer-replaces",
+        "silent-incumbent-replaced",
+        "other-owner-not-matched",
+        "unparsable-version-replaces",
+    ],
+)
+def test_live_newer_duplicate_only_matches_live_newer_same_owner_host(
+    registered_version: str,
+    connecting_version: str,
+    connecting_owner: str,
+    silent_s: float,
+    refused: bool,
+) -> None:
+    """Only a live, strictly newer connection of the same owner blocks a reconnect."""
+    registry = HostRegistry()
+    registered = registry.register(
+        "host_ddd", FakeWebSocket(), _make_hello(version=registered_version), owner="dave"
+    )
+    registered.last_frame_monotonic -= silent_s
+
+    newer = registry.live_newer_duplicate(
+        "host_ddd",
+        _make_hello(version=connecting_version),
+        connecting_owner,
+        max_silence_s=90.0,
+    )
+
+    assert newer is (registered if refused else None)
 
 
 def test_send_text_enqueues_frame() -> None:

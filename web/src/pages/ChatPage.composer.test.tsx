@@ -1,3 +1,4 @@
+import type { Comment } from "@/hooks/useComments";
 import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
@@ -17,6 +18,7 @@ import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as ComposerSectionSettingsModule from "@/components/composer/composerSectionSettings";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
@@ -61,6 +63,8 @@ import {
 import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
@@ -83,6 +87,18 @@ import {
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
 // to avoid needing a QueryClientProvider around every bare render.
+// Counts renders of the composer's ⌘K settings, which render nothing themselves.
+const composerPaletteSettings = vi.hoisted(() => ({ renders: 0 }));
+vi.mock("@/components/composer/composerSectionSettings", async (importOriginal) => {
+  const original = await importOriginal<typeof ComposerSectionSettingsModule>();
+  return {
+    ...original,
+    ComposerPaletteSettings: (props: Parameters<typeof original.ComposerPaletteSettings>[0]) => {
+      composerPaletteSettings.renders += 1;
+      return original.ComposerPaletteSettings(props);
+    },
+  };
+});
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
@@ -136,6 +152,8 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
   },
 }));
 const { openGithubTabMock } = vi.hoisted(() => ({ openGithubTabMock: vi.fn() }));
+const tabsSidebar = vi.hoisted(() => ({ shows: false }));
+vi.mock("@/shell/useTabsSidebar", () => ({ useTabsSidebar: () => tabsSidebar.shows }));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: (args: unknown) => {
     composerGitStatusArgsSpy(args);
@@ -161,13 +179,17 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       prCount: 0,
       prNumber: null,
       prNumberPrefix: "#",
+      prs: [],
       refreshing: false,
     },
     overrides,
   );
 }
 
-afterEach(() => setComposerGitStatus());
+afterEach(() => {
+  setComposerGitStatus();
+  tabsSidebar.shows = false;
+});
 // SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
 // so the indicator self-hides (no active children) in isolated composer renders.
 const { childSessionsArgsSpy, composerChildSessions } = vi.hoisted(() => ({
@@ -283,6 +305,34 @@ import {
 // through to the browser's default focus move and Enter sent the message.
 
 /** Minimal ComposerProps for an interactive (writable, idle) composer. */
+const LOCAL_REVIEW_ANCHOR = {
+  pr_url: "https://github.com/acme/repo/pull/1",
+  side: "RIGHT" as const,
+  line: 12,
+  start_line: null,
+  head_sha: "a".repeat(40),
+  base_sha: "b".repeat(40),
+};
+
+/** A draft local review comment on `src/example.ts`, as the review panel queues it. */
+function localReviewComment(overrides: Partial<Comment> = {}): Comment {
+  return {
+    id: "123",
+    conversation_id: "conv_test",
+    path: "src/example.ts",
+    start_index: 0,
+    end_index: 0,
+    body: "Preserve the public API.",
+    status: "draft",
+    created_at: 1,
+    updated_at: 1,
+    anchor_content: null,
+    created_by: null,
+    anchor_metadata: LOCAL_REVIEW_ANCHOR,
+    ...overrides,
+  };
+}
+
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
     status: "idle" as const,
@@ -333,6 +383,11 @@ const CLAUDE_MODEL_OPTIONS = [
 /** The composer textarea, located by its aria-label. */
 function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
+}
+
+/** An onSend that queues every message, as ChatPage does while the agent works. */
+function enqueueFromComposer(text: string, files?: File[], replyDraft?: StoredReplyDraft) {
+  useChatStore.getState().enqueueMessage(text, files, replyDraft);
 }
 
 function forceMobileViewport(): () => void {
@@ -807,9 +862,10 @@ describe("Composer send shortcut", () => {
     [true, "metaKey"],
     [true, "ctrlKey"],
   ] as const)(
-    "steers the draft and backlog (alternate send: %s, modifier: %s)",
+    "steers the draft and backlog with Always steer off (alternate send: %s, modifier: %s)",
     (alternate, modifier) => {
       localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(false);
       const onSend = vi.fn((text: string, files?: File[]) => {
         useChatStore.getState().enqueueMessage(text, files);
       });
@@ -854,6 +910,64 @@ describe("Composer send shortcut", () => {
           sendQueued.mock.invocationCallOrder[0]!,
         );
         expect(useChatStore.getState().queuedMessages).toEqual([]);
+      } finally {
+        act(() =>
+          useChatStore.setState({
+            boundAgentId: originalState.boundAgentId,
+            queuedMessages: [],
+            send: originalState.send,
+            sessionStatus: originalState.sessionStatus,
+            status: originalState.status,
+          }),
+        );
+      }
+    },
+  );
+
+  it.each([
+    [false, "metaKey"],
+    [false, "ctrlKey"],
+    [true, "metaKey"],
+    [true, "ctrlKey"],
+  ] as const)(
+    "queues the draft behind the turn with Always steer on (alternate send: %s, modifier: %s)",
+    (alternate, modifier) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(true);
+      const sendNow = vi.fn().mockResolvedValue(undefined);
+      const originalState = useChatStore.getState();
+      setComposerState({
+        boundAgentId: "agent_shortcut",
+        queuedMessages: [{ queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" }],
+        sessionStatus: "running",
+        send: sendNow,
+        status: "streaming",
+      });
+      const onSend = vi.fn();
+
+      try {
+        renderWithTooltips(
+          <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
+        );
+        fireEvent.change(textarea(), { target: { value: "after this turn" } });
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+
+        expect(onSend).toHaveBeenCalledExactlyOnceWith("after this turn", undefined, undefined, {
+          queue: true,
+        });
+        expect(textarea()).toHaveValue("");
+        // The existing backlog stays queued; nothing is steered into the turn.
+        expect(sendNow).not.toHaveBeenCalled();
+        expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+          "queued first",
+        ]);
+
+        // With nothing to queue, the chord still steers the backlog.
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+        expect(onSend).toHaveBeenCalledOnce();
+        expect(sendNow.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+          ["queued first", "agent_shortcut"],
+        ]);
       } finally {
         act(() =>
           useChatStore.setState({
@@ -3420,6 +3534,37 @@ describe("Composer shared visible controls", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it.each([
+    ["the classic sidebar, which keeps the section it shows", false, []],
+    [
+      "the tabs sidebar, which shows the PR in its own tab",
+      true,
+      ["https://github.com/omnigent-ai/omnigent/pull/42"],
+    ],
+  ])("opens a lone PR's link in %s", (_, shows, args) => {
+    tabsSidebar.shows = shows;
+    setComposerGitStatus({
+      githubState: "ready",
+      prCount: 1,
+      prNumber: 42,
+      prs: [
+        {
+          url: "https://github.com/omnigent-ai/omnigent/pull/42",
+          host: "github.com",
+          repository: "omnigent-ai/omnigent",
+          number: 42,
+          relationship: "created",
+          title: "Add the tabs sidebar",
+          state: "OPEN",
+        },
+      ],
+    });
+    openGithubTabMock.mockClear();
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.click(screen.getByTestId("composer-pr-link"));
+    expect(openGithubTabMock.mock.calls).toEqual([args]);
   });
 
   it("transitions PR and worktree visibility across ready, empty, loading, and unknown GitHub states", () => {
@@ -6047,27 +6192,7 @@ describe("Composer native shell mode", () => {
         shellBeforeReview,
       );
 
-      const comment = {
-        id: "shell-review",
-        conversation_id: "conv_shell",
-        path: "src/example.ts",
-        start_index: 0,
-        end_index: 0,
-        body: "Preserve the public API.",
-        status: "draft" as const,
-        created_at: 1,
-        updated_at: 1,
-        anchor_content: null,
-        created_by: null,
-        anchor_metadata: {
-          pr_url: "https://github.com/acme/repo/pull/1",
-          side: "RIGHT" as const,
-          line: 12,
-          start_line: null,
-          head_sha: "a".repeat(40),
-          base_sha: "b".repeat(40),
-        },
-      };
+      const comment = localReviewComment({ id: "shell-review", conversation_id: "conv_shell" });
       // A refused send keeps the context; drop it so later tests don't render its chips.
       onTestFinished(() => clearLocalReviewContexts("conv_shell"));
       act(() => requestLocalReviewContext(comment));
@@ -6126,6 +6251,34 @@ describe("Composer placeholder", () => {
     render(<Composer {...composerProps({ status: "streaming" })} />);
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
+
+  it.each([
+    {
+      viewport: "desktop",
+      hostId: "host-a",
+      copy: "Session offline — reconnect below to continue",
+    },
+    {
+      viewport: "mobile",
+      hostId: "host-a",
+      copy: "Session offline — reconnect from the host menu",
+    },
+    { viewport: "mobile", hostId: null, copy: "Session offline — reconnect below to continue" },
+  ])(
+    "points an offline $viewport session with host $hostId at its reconnect control",
+    ({ viewport, hostId, copy }) => {
+      // Mobile moves a bound host's button into the header; a session with no
+      // host reconnects from the banner below the composer instead.
+      if (viewport === "mobile") onTestFinished(forceMobileViewport());
+      composerSessionSnapshot.hostId = hostId;
+      onTestFinished(() => {
+        composerSessionSnapshot.hostId = null;
+      });
+      render(<Composer {...composerProps({ unreachable: true })} />);
+      expect(textarea()).toBeDisabled();
+      expect(textarea().placeholder).toBe(copy);
+    },
+  );
 
   it("resets the native text input when the Send button moves focus first", () => {
     const props = composerProps({ status: "streaming", isWorking: true });
@@ -7052,9 +7205,7 @@ describe("Composer reply quotes", () => {
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.
-    renderWithTooltips(
-      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
-    );
+    renderWithTooltips(<Composer {...composerProps({ onSend: enqueueFromComposer })} />);
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
@@ -7130,27 +7281,7 @@ describe("Composer reply quotes", () => {
     );
     act(() => ref.current?.appendReplyQuote("Existing quote"));
     fireEvent.change(textarea(), { target: { value: "My instructions" } });
-    const comment = {
-      id: "123",
-      conversation_id: "conv_test",
-      path: "src/example.ts",
-      start_index: 0,
-      end_index: 0,
-      body: "Preserve the public API.",
-      status: "draft" as const,
-      created_at: 1,
-      updated_at: 1,
-      anchor_content: null,
-      created_by: null,
-      anchor_metadata: {
-        pr_url: "https://github.com/acme/repo/pull/1",
-        side: "RIGHT" as const,
-        line: 12,
-        start_line: null,
-        head_sha: "a".repeat(40),
-        base_sha: "b".repeat(40),
-      },
-    };
+    const comment = localReviewComment();
     act(() => requestLocalReviewContext({ ...comment, conversation_id: "other-session" }));
     expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
     act(() => requestLocalReviewContext(comment));
@@ -7232,7 +7363,7 @@ describe("Composer reply quotes", () => {
         ...comment,
         id: "1011",
         body: "Keep the old behavior for this range.",
-        anchor_metadata: { ...comment.anchor_metadata, side: "LEFT" as const, start_line: 7 },
+        anchor_metadata: { ...LOCAL_REVIEW_ANCHOR, side: "LEFT" as const, start_line: 7 },
       },
     ];
     expect(textarea()).toHaveValue("");
@@ -7331,6 +7462,54 @@ describe("Composer built-in tint by case", () => {
     expect(screen.queryByText(token, { selector: `.${COMMAND_TOKEN_CLASS}` }) !== null).toBe(
       tinted,
     );
+  });
+});
+
+describe("Composer built-in tint with message context", () => {
+  beforeEach(() => {
+    setComposerState({
+      conversationId: "conv_case_ctx",
+      sessionHarness: "codex-native",
+      skills: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    clearLocalReviewContexts("conv_case_ctx");
+  });
+  const goalTint = () => screen.queryByText("/Goal", { selector: `.${COMMAND_TOKEN_CLASS}` });
+
+  // A tag or review comment sends `/Goal` as typed, where nothing runs it.
+  it.each([
+    {
+      label: "an inline tag",
+      draft: "@src/example.ts",
+      add: () =>
+        useChatStore.setState({
+          pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+        }),
+    },
+    {
+      label: "a review comment",
+      draft: "/Goal review",
+      add: () =>
+        requestLocalReviewContext(
+          localReviewComment({ id: "goal-review", conversation_id: "conv_case_ctx" }),
+        ),
+    },
+  ])("drops a mixed-case built-in's tint once $label rides along", ({ draft, add }) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Composer {...composerProps({ showGoalControl: true })} />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/Goal review" } });
+    expect(goalTint()).not.toBeNull();
+
+    act(add);
+    expect(textarea().value).toContain(draft);
+    expect(goalTint()).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-slash-command");
   });
 });
 
@@ -7620,6 +7799,40 @@ describe("Composer workflow entry point", () => {
     expect(onSendSlashCommand).not.toHaveBeenCalled();
   });
 
+  it("opens the Tasks tab's choice in the dialog: a new workflow's text, or a saved workflow", async () => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: "openai-agents",
+      skills: workflowSkills,
+    });
+    const onSendSlashCommand = vi.fn();
+    renderWithWorkflows(<Composer {...composerProps({ onSendSlashCommand })} />);
+    const startWorkflow = useSessionTasksActions.getState().startWorkflow.conv_test;
+
+    act(() => startWorkflow?.("Bump deps"));
+    expect(await screen.findByTestId("workflow-dialog-description")).toHaveValue("Bump deps");
+    fireEvent.keyDown(screen.getByTestId("workflow-dialog-description"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("workflow-dialog")).toBeNull());
+
+    const workflow = {
+      id: "a".repeat(32),
+      name: "Triage flaky tests",
+      description: "Finds and fixes flaky tests.",
+    };
+    act(() => startWorkflow?.("", workflow));
+    expect(
+      await screen.findByRole("heading", { name: "Run Triage flaky tests" }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("workflow-dialog-description"), {
+      target: { value: "The upload tests" },
+    });
+    fireEvent.click(screen.getByTestId("workflow-dialog-run"));
+    expect(onSendSlashCommand).toHaveBeenCalledWith(
+      "workflow",
+      `Run the saved workflow "Triage flaky tests" (ID ${workflow.id}).\n\nThe upload tests`,
+    );
+  });
+
   it("runs or continues a task for the Tasks tab, or says why it can't", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onSend = vi.fn();
@@ -7706,7 +7919,7 @@ describe("Composer workflow entry point", () => {
         usePlanStops.setState({ requests: {}, settledStops: {} });
       });
       const onStop = vi.fn();
-      const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+      const onSend = vi.fn(enqueueFromComposer);
       const error = vi.spyOn(toast, "error");
       const { rerender } = renderWithWorkflows(
         <Composer {...composerProps({ onStop, onSend, isWorking })} />,
@@ -8053,7 +8266,7 @@ describe("Composer file-attachment focus", () => {
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [bad] } });
 
     expect(document.activeElement).not.toBe(ta);
@@ -8108,7 +8321,7 @@ describe("Composer file-attachment focus", () => {
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
     render(<Composer {...composerProps()} />);
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [bad] } });
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
 
@@ -8123,7 +8336,7 @@ describe("Composer file-attachment focus", () => {
     // composer's mixed-drop behavior).
     render(<Composer {...composerProps()} />);
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [ok, bad] } });
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
@@ -8236,7 +8449,7 @@ describe("Composer failed-send attachment restore", () => {
   it("restores the retriable files and flags the ones current limits reject", () => {
     render(<Composer {...composerProps()} />);
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
@@ -8244,7 +8457,7 @@ describe("Composer failed-send attachment restore", () => {
     );
 
     expect(screen.getByText("notes.txt")).toBeTruthy();
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText("clip.webm")).toBeNull();
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
     // The store entry drained on restore, so the draft can't come back twice.
     expect(useChatStore.getState().failedSendDraft).toBeNull();
@@ -8282,7 +8495,7 @@ describe("Composer failed-send attachment restore", () => {
         failedSendDraft: {
           conversationId: "conv_test",
           text: "",
-          files: [new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" })],
+          files: [new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" })],
         },
       }),
     );
@@ -8490,7 +8703,7 @@ describe("Composer — editing queued messages", () => {
 
   it("dequeues the recalled message so re-sending can't duplicate it", async () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     renderWithTooltips(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
@@ -8563,7 +8776,7 @@ describe("Composer — editing queued messages", () => {
     useChatStore.setState({
       queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
     });
-    const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+    const onSend = vi.fn(enqueueFromComposer);
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
     const strip = screen.getByTestId("composer-queued-strip");
@@ -8617,7 +8830,7 @@ describe("Composer — editing queued messages", () => {
 
   it.each([false, true])("recalls queued path mentions with quotes: %s", (quoted) => {
     useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...props} ref={ref} />);
     act(() =>
@@ -10243,5 +10456,50 @@ describe("Composer with the CodeMirror release flag on", () => {
 
     fireEvent.keyDown(editor, { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git status", undefined);
+  });
+});
+
+describe("Composer model and effort in ⌘K", () => {
+  const settingLabels = () =>
+    registeredPaletteCommands()
+      .filter((command) => command.setting)
+      .map((command) => command.label);
+
+  function renderOpenSessionComposer(quickPickPalette: boolean) {
+    const previous = useChatStore.getState();
+    onTestFinished(() => {
+      useChatStore.setState(previous, true);
+      usePaletteCommandsStore.setState({ groups: {} });
+    });
+    composerPaletteSettings.renders = 0;
+    useChatStore.setState({ conversationId: "conv_models", llmModel: "opus" });
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: quickPickPalette } }}
+      >
+        <TooltipProvider>
+          <Composer
+            {...composerProps({
+              showModels: true,
+              showEffort: true,
+              modelPickerKind: "claude",
+              codexModelOptions: CLAUDE_MODEL_OPTIONS,
+            })}
+          />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("offers the open session's Model and Reasoning Effort with quick_pick_palette on", () => {
+    renderOpenSessionComposer(true);
+    expect(settingLabels()).toEqual(expect.arrayContaining(["Model", "Reasoning Effort"]));
+  });
+
+  it("mounts neither with quick_pick_palette off", () => {
+    renderOpenSessionComposer(false);
+    expect(composerPaletteSettings.renders).toBe(0);
+    expect(settingLabels()).not.toContain("Model");
+    expect(settingLabels()).not.toContain("Reasoning Effort");
   });
 });

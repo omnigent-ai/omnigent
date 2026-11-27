@@ -1,0 +1,13 @@
+/* The name's tint marks added and deleted files; the counts replace the status letters. */
+.diff-review-tree-counts[data-file-tree] [data-item-section="git"] {
+  display: none;
+}
+
+.diff-review-tree-counts[data-file-tree] [data-item-section="decoration"] {
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-review-tree-counts[data-file-tree] [data-item-section="decoration"] > span {
+  gap: 0.4em;
+}

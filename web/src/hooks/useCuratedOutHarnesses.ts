@@ -26,6 +26,11 @@ export function curatedOutHarnesses(
   );
 }
 
+/** Whether any native harness is left once `curatedOut` is removed, so Settings lists Harnesses. */
+export function offersAnyHarness(curatedOut: ReadonlySet<string>): boolean {
+  return NATIVE_CODING_AGENTS.some((spec) => !curatedOut.has(spec.harness));
+}
+
 /**
  * Native harness slugs Settings leaves out, per {@link curatedOutHarnesses}.
  * Empty unless every pickable agent is known: while either catalog request

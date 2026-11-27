@@ -149,6 +149,17 @@ export const HARNESS_CARD_ENTRIES = settingsEntryFamily({
   },
 });
 
+/**
+ * The harness a Harnesses row is for: the page it lives on, or for a card, which lives on the
+ * grid and so names no page, the card's own harness.
+ */
+export function harnessOfSettingsEntry(entry: SettingsEntry): string | undefined {
+  if (entry.harness !== undefined) return entry.harness;
+  return HARNESS_CARD_ENTRIES.members.find(
+    (harness) => HARNESS_CARD_ENTRIES.entry(harness).id === entry.id,
+  );
+}
+
 /** The fix a harness page's setup warning offers, by its name's key: "Set up" unless one of these. */
 export type HarnessFixActionName = "install" | "update" | "reconfigure" | "tmux";
 
@@ -323,10 +334,8 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
         ),
       },
       presence: { ...page.presence, tab: { states: ["lists its inventory"] } },
-      regions: {
-        plugins: OPENS_BY_NAME,
-        ...(hasSkillPage(inventoryFamilyOf(harness)!) ? { skills: OPENS_BY_NAME } : {}),
-      },
+      // Each plugin and skill row opens its own page, where its harness has one.
+      regions: { plugins: OPENS_BY_NAME, skills: OPENS_BY_NAME },
     }) as InventoryHarnessDetailEntry;
   },
 });
@@ -391,7 +400,7 @@ export const HARNESS_PLUGIN_ENTRIES = settingsEntryFamily({
           PLUGIN_KINDS.map((kind) => [kind, { before: `${kind} · `, count: true }]),
         ),
       },
-      ...(hasSkillPage(inventoryFamilyOf(harness)!) ? { regions: { skills: OPENS_BY_NAME } } : {}),
+      regions: { skills: OPENS_BY_NAME },
       revealedBy: { entry: `harness-${harness}-detail`, part: "tab", choice: "Plugins" },
     }),
 });
@@ -416,6 +425,13 @@ export const HARNESS_SKILL_ENTRIES = settingsEntryFamily({
     }),
 });
 
+// A server's row opens to its tools, and a tool's row to its description. Each is named by the
+// server or the tool, so none of it is searchable.
+const MCP_SERVER_REGIONS = {
+  servers: OPENS_BY_NAME,
+  tools: { rowActions: { expand: { dataName: true } } },
+} as const;
+
 /**
  * Each inventory harness's MCP list on its page. Claude Code's and Codex's turn each server on
  * or off for Omnigent sessions; the other harnesses' only list them.
@@ -431,7 +447,13 @@ export const MCP_SERVER_LIST_ENTRIES = settingsEntryFamily({
       section: "harnesses" as const,
       harness,
       label: `MCP servers for ${name}`,
-      regions: { servers: OPENS_BY_NAME, listed: {} },
+      regions: { ...MCP_SERVER_REGIONS, listed: {} },
+      // The list isn't a row of its own, so its page's MCP servers tab stands in for it.
+      revealedBy: {
+        entry: `harness-${harness}-detail`,
+        part: "tab",
+        choice: INVENTORY_KIND_LABELS.mcps,
+      },
     };
     if (harness === "claude-native" || harness === "codex-native") {
       return {

@@ -33,6 +33,7 @@ from omnigent.spec.skill_sources import (
     _FRONTMATTER_RE,
     _enabled_plugin_keys,
     _quote_description_with_colon,
+    _trusted_plugin_roots,
     skill_source_context_from_env,
 )
 
@@ -189,8 +190,10 @@ def _user_config_is_readable(claude: Path) -> bool:
     return True
 
 
-def _user_install_path(key: str, entries: list, plugins_root: Path) -> Path | None:
-    """The user-scoped install path of *key*, inside the plugins root, or ``None``.
+def _user_install_path(
+    key: str, entries: list, plugins_root: Path, trusted_roots: tuple[Path, ...]
+) -> Path | None:
+    """The user-scoped install path of *key*, inside trusted plugin roots, or ``None``.
 
     Records for another scope or project are skipped, so a user-enabled key cannot load
     an install that belongs to a different project.
@@ -206,8 +209,16 @@ def _user_install_path(key: str, entries: list, plugins_root: Path) -> Path | No
             continue
         candidate = Path(raw)
         resolved = _resolve(candidate if candidate.is_absolute() else plugins_root / candidate)
-        if resolved is not None and resolved.is_relative_to(plugins_root):
-            return resolved
+        if resolved is not None and any(resolved.is_relative_to(root) for root in trusted_roots):
+            try:
+                if resolved.is_dir():
+                    return resolved
+            except OSError:
+                pass
+            _logger.warning(
+                "Not bridging Claude plugin %s: installation directory is unavailable", key
+            )
+            continue
         _logger.warning("Not bridging Claude plugin %s: install path is outside the plugins", key)
     return None
 
@@ -227,13 +238,14 @@ def _enabled_plugins() -> list[tuple[str, Path, bool]]:
     records = installed.get("plugins") if installed else None
     if not isinstance(records, dict):
         return []
+    trusted_roots = _trusted_plugin_roots(plugins_root)
     ctx = replace(skill_source_context_from_env(roots=(), harness="claude-native"), is_native=True)
     enabled = _enabled_plugin_keys(ctx)
     plugins: list[tuple[str, Path, bool]] = []
     for key, entries in records.items():
         if key not in enabled or not isinstance(entries, list):
             continue
-        root = _user_install_path(key, entries, plugins_root)
+        root = _user_install_path(key, entries, plugins_root, trusted_roots)
         if root is None:
             continue
         manifest = _read_json_object(root / "package.json", MAX_MANIFEST_BYTES)

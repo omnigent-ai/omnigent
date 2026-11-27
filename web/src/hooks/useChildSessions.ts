@@ -65,11 +65,11 @@ export interface ChildSessionInfo {
 }
 
 /**
- * Wire shape of a single entry in the ``child_sessions`` response.
+ * A row of a ``child_sessions`` or ``descendants`` listing as the server sends it.
  * Field set matches the server's ``ChildSessionSummary`` Pydantic
  * model. Extra wire fields are silently ignored.
  */
-interface ChildSessionWire {
+export interface ChildSessionWire {
   id: string;
   title: string | null;
   task_summary?: string | null;
@@ -82,9 +82,13 @@ interface ChildSessionWire {
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
+  /** Set on rows of a ``descendants`` listing: the row's own parent. */
+  parent_session_id?: string | null;
+  /** Set on rows of a ``descendants`` listing: levels below the requested session. */
+  depth?: number;
 }
 
-interface ChildSessionsResponse {
+export interface ChildSessionsResponse {
   object: "list";
   data: ChildSessionWire[];
   last_id?: string | null;
@@ -221,7 +225,7 @@ export function executionLogTabKey(idOrMain: string): string {
   return `executionLog:${idOrMain}`;
 }
 
-function parseChildSessionError(value: unknown): ChildSessionError | null {
+export function parseChildSessionError(value: unknown): ChildSessionError | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
   if (typeof record.code !== "string" || typeof record.message !== "string") return null;

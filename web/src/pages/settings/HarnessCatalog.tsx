@@ -3,9 +3,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useSetMcpServerEnabled } from "@/hooks/useSetMcpServerEnabled";
 import * as AccordionPrimitive from "radix-ui/accordion";
 import { useMcpServerTools, type McpServerTools } from "@/hooks/useMcpServerTools";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
-import { Link, useSearchParams } from "@/lib/routing";
+import { Link, useLocation, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
@@ -25,7 +25,9 @@ import {
   SKILL_PAGE_FAMILIES,
   type SkillPageHarnessId,
 } from "./search/catalog/harnesses";
-import { settingsControlProps } from "./search/settingsControl";
+import { settingsEntryById } from "./search/catalog";
+import { settingsRevealer } from "./search/catalog/types";
+import { parseSettingsHash, settingsControlProps } from "./search/settingsControl";
 import { SettingsItem } from "./search/SettingsItem";
 import {
   SettingsContent,
@@ -60,6 +62,15 @@ const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
   { id: "skills", label: INVENTORY_KIND_LABELS.skills, noun: "skills" },
   { id: "plugins", label: INVENTORY_KIND_LABELS.plugins, noun: "plugins" },
 ];
+
+/** The tab the URL's row is revealed through on this page, as a search result's MCP list is. */
+function revealedTab(hash: string, detailEntryId: string): CatalogKind | undefined {
+  const target = parseSettingsHash(hash);
+  const entry = target === null ? undefined : settingsEntryById(target.id);
+  const revealer = entry === undefined ? undefined : settingsRevealer(entry);
+  if (revealer?.id !== detailEntryId || revealer.part !== "tab") return undefined;
+  return KINDS.find((kind) => kind.label === revealer.choice)?.id;
+}
 
 /** "← label" row above a page title: a link when `to` is set, else a button. */
 export function BackButton({
@@ -122,15 +133,34 @@ export function HarnessCatalog({
   defaultTab?: CatalogKind | "settings";
 }) {
   const family = entries.family;
-  // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
+  // `?tab=settings` (the grid card's gear) opens on Settings, and a revealed row on its own tab;
+  // otherwise the page's default.
   const [searchParams] = useSearchParams();
-  const [tab, setTab] = useState<CatalogKind | "settings">(
-    searchParams.get("tab") === "settings" ? "settings" : defaultTab,
+  const location = useLocation();
+  const detailEntryId = HARNESS_DETAIL_ENTRIES.entry(entries.harness).id;
+  const [tab, setTab] = useState<CatalogKind | "settings">(() =>
+    searchParams.get("tab") === "settings"
+      ? "settings"
+      : (revealedTab(location.hash, detailEntryId) ?? defaultTab),
   );
   const [open, setOpen] = useState<InventoryPlugin | null>(null);
   const [selectedSkill, setSelectedSkill] = useState<{ name: string; sourceId?: string } | null>(
     null,
   );
+  // A later navigation to a row on one of the tabs, such as a search result picked while this
+  // page is open, shows that tab; clicking a tab doesn't navigate, so it's left alone.
+  const handledNavigation = useRef(location.key);
+  const pageOpen = selectedSkill !== null ? entries.skill?.id : open ? entries.plugin.id : null;
+  useEffect(() => {
+    if (location.key === handledNavigation.current) return;
+    handledNavigation.current = location.key;
+    const kind = revealedTab(location.hash, detailEntryId);
+    // The open plugin or skill page is the row itself, which reveals itself.
+    if (kind === undefined || parseSettingsHash(location.hash)?.id === pageOpen) return;
+    setSelectedSkill(null);
+    setOpen(null);
+    setTab(kind);
+  }, [location.key, location.hash, detailEntryId, pageOpen]);
   const [contentSupported, setContentSupported] = useState(DETAILED_HARNESSES.has(family));
   const families = useMemo(() => [family], [family]);
   const inventory = useHarnessInventory(host, {
@@ -628,6 +658,7 @@ function McpList({
           <div key={server.id} data-settings-region-row className="not-last:border-b">
             <McpRow
               host={host}
+              harness={harness}
               entry={entry}
               server={server}
               expanded={expanded.includes(server.id)}
@@ -732,6 +763,7 @@ const CONNECTION_STATUS: Record<McpServerTools["connection"], { label: string; c
 
 function McpRow({
   host,
+  harness,
   entry,
   server,
   expanded,
@@ -739,6 +771,8 @@ function McpRow({
   onDisabled,
 }: {
   host: Host;
+  /** The harness whose list this row is in, whose tools region it holds. */
+  harness: InventoryPageHarnessId;
   entry: McpServerListEntry;
   server: InventoryMcpServer;
   expanded: boolean;
@@ -817,25 +851,31 @@ function McpRow({
               <>
                 {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
                 {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
-                <ul className="flex flex-col gap-1 text-xs text-muted-foreground my-2">
-                  {data.tools.map((tool, index) => (
-                    // Capped names can collide; these display-only rows have no state.
-                    // eslint-disable-next-line react/no-array-index-key
-                    <li key={`${tool.name}-${index}`}>
-                      {tool.description ? (
-                        <details className="group">
-                          <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
-                            <span className="font-mono">{tool.name}</span>
-                            <ChevronRightIcon className="size-3 shrink-0 group-open:rotate-90" />
-                          </summary>
-                          <div className="my-1">{tool.description}</div>
-                        </details>
-                      ) : (
-                        <span className="pl-4 font-mono">{tool.name}</span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
+                {/* Each tool is a row named by the tool; one with a description opens to it. */}
+                <SettingsDataRegion entry={MCP_SERVER_LIST_ENTRIES.entry(harness)} region="tools">
+                  <ul className="flex flex-col gap-1 text-xs text-muted-foreground my-2">
+                    {data.tools.map((tool, index) => (
+                      // Capped names can collide; these display-only rows have no state.
+                      // eslint-disable-next-line react/no-array-index-key
+                      <li key={`${tool.name}-${index}`} data-settings-region-row>
+                        {tool.description ? (
+                          <details className="group">
+                            <summary
+                              data-settings-row-action="expand"
+                              className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden"
+                            >
+                              <span className="font-mono">{tool.name}</span>
+                              <ChevronRightIcon className="size-3 shrink-0 group-open:rotate-90" />
+                            </summary>
+                            <div className="my-1">{tool.description}</div>
+                          </details>
+                        ) : (
+                          <span className="pl-4 font-mono">{tool.name}</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </SettingsDataRegion>
               </>
             )
           ) : null}

@@ -583,9 +583,16 @@ def test_subagent_delivery_not_confirmed_503_exhausts_after_budget() -> None:
     assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is True
 
 
-def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "internal_error"},
+        {"error": {"code": "runner_unavailable", "message": "Could not reach runner"}},
+    ],
+)
+def test_generic_503_without_not_confirmed_body_never_exhausts(body: object) -> None:
     tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
-    exc = _http_status_error(503, {"error": "internal_error"})
+    exc = _http_status_error(503, body)
     for _ in range(10):
         assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is False
 
@@ -625,9 +632,18 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     yes = _http_status_error(503, {"error": "subagent_delivery_not_confirmed"})
     no_status = _http_status_error(500, {"error": "subagent_delivery_not_confirmed"})
     no_body = _http_status_error(503, {"error": "something_else"})
+    relayed_error = {
+        "code": "runner_unavailable",
+        "message": "Runner rejected external_session_status 'idle' with status 503: "
+        '{"error":"subagent_delivery_not_confirmed","reason":"missing_parent_inbox"}',
+    }
+    relayed = _http_status_error(503, {"error": relayed_error})
+    other_code = _http_status_error(503, {"error": {**relayed_error, "code": "internal_error"}})
     assert forwarder._is_subagent_delivery_not_confirmed(yes) is True
+    assert forwarder._is_subagent_delivery_not_confirmed(relayed) is True
     assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
     assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(other_code) is False
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
 
 
