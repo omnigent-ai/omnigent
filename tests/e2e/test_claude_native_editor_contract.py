@@ -36,6 +36,40 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     config.mkdir()
     instruction = tmp_path / "editor-instruction.json"
     observed = tmp_path / "editor-observed.jsonl"
+    hook_record = tmp_path / "blocked-prompt.json"
+    hook = tmp_path / "block-prompt.py"
+    hook.write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        f"destination = Path({str(hook_record)!r})\n"
+        "payload = json.load(sys.stdin)\n"
+        "temporary = destination.with_suffix('.tmp')\n"
+        "temporary.write_text(json.dumps({key: payload.get(key) for key in "
+        "('prompt', 'session_id', 'hook_event_name')}))\n"
+        "temporary.replace(destination)\n"
+        "print('blocked-draft-ownership-probe', file=sys.stderr)\n"
+        "sys.exit(2)\n"
+    )
+    settings = tmp_path / "hook-settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": shlex.join([sys.executable, str(hook)]),
+                                    "timeout": 15,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+    )
     editor = tmp_path / "editor.py"
     editor.write_text(
         "import json, sys\n"
@@ -67,7 +101,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     }
     bridge.ensure_claude_workspace_trusted(workspace, env)
     version = subprocess.check_output([claude, "--version"], env=env, text=True, timeout=10)
-    draft = (
+    typed_draft = (
         "  editor-wrapped-draft "
         + "0123456789 " * 24
         + "draft-end\n\nsecond line with spaces  \nthird line 😀\n"
@@ -114,6 +148,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     "-c",
                     str(workspace),
                     claude,
+                    "--settings",
+                    str(settings),
                     "--model",
                     _PINNED_CLAUDE_MODELS["sonnet"],
                     "--strict-mcp-config",
@@ -128,11 +164,24 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 poll_until(lambda: bridge._composer_box(pane()) is not None, timeout_s=30)
             except AssertionError as exc:
                 raise AssertionError({"phase": "initial-composer", "pane": pane()}) from exc
-            command("load-buffer", "-b", "editor-draft", "-", text=draft)
+            command("load-buffer", "-b", "editor-draft", "-", text=typed_draft)
             command("paste-buffer", "-d", "-p", "-b", "editor-draft", "-t", target)
             poll_until(lambda: bridge._draft_in_input_box(pane(), "draft-end"), timeout_s=10)
+            command("send-keys", "-t", target, "Enter")
+            poll_until(hook_record.exists, timeout_s=15)
+            poll_until(
+                lambda: (
+                    "blocked-draft-ownership-probe" in pane()
+                    and bridge._draft_in_input_box(last_pane, "draft-end")
+                ),
+                timeout_s=10,
+            )
+            payload = json.loads(hook_record.read_text())
+            draft = payload["prompt"]
+            assert payload["hook_event_name"] == "UserPromptSubmit"
+            assert isinstance(draft, str) and "\n" in draft and payload["session_id"]
             steps = [
-                (draft.rstrip("\n"), draft, False),
+                (draft[:-1] if draft.endswith("\n") else draft + "\n", draft, False),
                 (draft.replace("\n", " "), draft, False),
                 (draft, draft, True),
                 ("unrelated claim", "/status", False),
@@ -157,6 +206,10 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             try:
                 diagnostics = {
                     "version": version.strip(),
+                    "typed_draft": typed_draft,
+                    "blocked_hook": json.loads(hook_record.read_text())
+                    if hook_record.exists()
+                    else None,
                     "editor_observations": observations(),
                     "last_pane": last_pane,
                     "provider_messages": len(
