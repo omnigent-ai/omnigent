@@ -16,16 +16,18 @@ import pytest
 
 from omnigent.harnesses.claude_native import settings_validation as validation
 from omnigent.inner import sandbox as sb
+from tests.harnesses.claude_native._settings_validation_helpers import (
+    DOCTOR_COMPLETION as _COMPLETION,
+)
+from tests.harnesses.claude_native._settings_validation_helpers import (
+    DOCTOR_HEADER as _HEADER,
+)
+from tests.harnesses.claude_native._settings_validation_helpers import (
+    DOCTOR_HELP as _HELP,
+)
+from tests.harnesses.claude_native._settings_validation_helpers import validator_policy
 
 _SENTINEL = "inert-target-value with whitespace"
-_HELP = (
-    "Usage: claude doctor [options]\nReads settings files\n"
-    "For a full setup checkup that can also fix issues, run /doctor in a session.\n"
-)
-_HEADER = "Claude Code doctor\nRunning: fixture\nCommit: fixture-build\nPath: /fixture/claude\n"
-_COMPLETION = (
-    "For a full setup checkup that can also fix issues, run /doctor in a Claude Code session.\n"
-)
 
 
 def _context(tmp_path: Path, *, sandboxed: bool, form: str):
@@ -51,18 +53,11 @@ def _context(tmp_path: Path, *, sandboxed: bool, form: str):
         sandbox_policy=None,
     )
     if sandboxed:
-        instance.sandbox_policy = sb.SandboxPolicy(
-            backend_type="linux_bwrap",
-            active=True,
+        instance.sandbox_policy = validator_policy(
+            workspace,
+            private,
+            instance.socket_path,
             read_roots=[],
-            write_roots=[workspace, private],
-            write_files=[workspace / "write-file"],
-            allow_network=True,
-            mask_paths=[workspace / "secret", private / "covered"],
-            deny_unix_socket_paths=[instance.socket_path, workspace / "other.sock"],
-            credential_source_paths=[workspace / "credential-file"],
-            copy_on_write_roots=[workspace],
-            copy_on_write_namespace=(123, 456, 789),
             spawn_env_allowlist=["PATH", "KEEP", "REMOVE"],
         )
     variables = {

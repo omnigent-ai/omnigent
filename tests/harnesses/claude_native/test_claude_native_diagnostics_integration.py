@@ -254,7 +254,6 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         ClaudeSettingsLease,
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
-        prune_unused_claude_settings,
         request_claude_bridge_deletion,
     )
 
@@ -273,7 +272,6 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
     posted: list[dict[str, object]] = []
     original_error: BaseException | None = None
     receiver: ClaudeSettingsLease | None = None
-    admitted_settings: bytes | None = None
     uncertain_errors = {
         "read": httpx.ReadError,
         "write": httpx.WriteError,
@@ -291,7 +289,7 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         )
 
     def launch_failure(request: httpx.Request) -> httpx.Response:
-        nonlocal original_error, receiver, admitted_settings
+        nonlocal original_error, receiver
         if request.method == "GET":
             return httpx.Response(
                 200,
@@ -333,9 +331,6 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
                 receiver = acquire_claude_settings_request(
                     bridge_dir, posted[-1]["claude_settings_request"], protocol=2
                 )
-                admitted_settings = (
-                    bridge_dir / f"claude-settings-{receiver.generation}.json"
-                ).read_bytes()
                 original_error = uncertain_errors[failure_mode](
                     "simulated failure after admission", request=request
                 )
@@ -381,26 +376,12 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
             assert raised.value is original_error
         assert len(posted) == 1
         assert ("claude_settings_request" in posted[0]) is owned_request
-        if owned_request:
-            generation = posted[0]["claude_settings_request"]
-            if failure_mode not in uncertain_errors:
-                assert not list(bridge_dir.glob("claude-settings-*"))
-            else:
-                settings = bridge_dir / f"claude-settings-{generation}.json"
-                assert settings.exists()
-                if admitted_settings is not None:
-                    assert settings.read_bytes() == admitted_settings
-                assert not (bridge_dir / f"claude-settings-{generation}.dispatch.owner").exists()
         assert "--debug-file" in posted[0]["spec"]["args"]
         make_follower.assert_called_once_with(bridge_dir)
         follower.close.assert_called_once_with("failed-child")
     finally:
         if receiver is not None:
             receiver.close()
-    if failure_mode == "reactivated-ack":
-        prune_unused_claude_settings(bridge_dir)
-    if failure_mode in uncertain_errors or failure_mode == "reactivated-ack":
-        assert not list(bridge_dir.glob("claude-settings-*"))
 
 
 @pytest.mark.parametrize("reactivated", [False, True], ids=["current-epoch", "reactivated"])

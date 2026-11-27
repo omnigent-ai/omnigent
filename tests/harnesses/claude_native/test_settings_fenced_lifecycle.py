@@ -16,7 +16,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -81,8 +81,21 @@ def test_sender_close_fences_new_admission_and_preserves_admitted_readers(
             receiver.close()
 
 
-@pytest.mark.parametrize("admitted", [False, True])
-@pytest.mark.parametrize("failure", ["read", "write", "timeout", "cancel", "400", "503", "no-ack"])
+@pytest.mark.parametrize(
+    ("admitted", "failure"),
+    [
+        (admitted, failure)
+        for failure in ["read", "write", "timeout", "cancel", "400", "503", "no-ack", "mismatched"]
+        for admitted in [False, True]
+    ]
+    + [
+        (False, "connect"),
+        (False, "connect-timeout"),
+        (False, "pool-timeout"),
+        (False, "cleanup-failure"),
+        (True, "reactivated-ack"),
+    ],
+)
 async def test_uncertain_http_completion_releases_only_sender_ownership(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, admitted: bool, failure: str
 ) -> None:
@@ -90,6 +103,22 @@ async def test_uncertain_http_completion_releases_only_sender_ownership(
     received = []
     receiver = None
     generation = None
+    errors = {
+        "read": httpx.ReadError,
+        "write": httpx.WriteError,
+        "timeout": httpx.ReadTimeout,
+        "cancel": asyncio.CancelledError,
+        "connect": httpx.ConnectError,
+        "connect-timeout": httpx.ConnectTimeout,
+        "pool-timeout": httpx.PoolTimeout,
+        "cleanup-failure": httpx.ConnectError,
+    }
+    if failure == "cleanup-failure":
+        monkeypatch.setattr(
+            ClaudeSettingsRequest,
+            "cancel_undelivered_dispatch",
+            Mock(side_effect=OSError("inert cleanup failure")),
+        )
 
     def respond(request: httpx.Request) -> httpx.Response:
         nonlocal receiver, generation
@@ -108,28 +137,31 @@ async def test_uncertain_http_completion_releases_only_sender_ownership(
         if admitted:
             receiver = acquire_claude_settings_request(bridge_dir, generation, protocol=2)
             received.append(settings_generation_path(bridge_dir, generation).read_bytes())
-        errors = {
-            "read": httpx.ReadError,
-            "write": httpx.WriteError,
-            "timeout": httpx.ReadTimeout,
-            "cancel": asyncio.CancelledError,
-        }
         if failure in errors:
             raise errors[failure]("inert uncertain delivery")
+        if failure == "reactivated-ack":
+            request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+            bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+            return httpx.Response(
+                409,
+                json={
+                    "detail": "inert rejection after reactivation",
+                    "claude_settings_request_ack": generation,
+                },
+            )
         return httpx.Response(
-            200 if failure == "no-ack" else int(failure), json={"id": "terminal"}
+            200 if failure in {"no-ack", "mismatched"} else int(failure),
+            json={
+                "id": "terminal",
+                **({"claude_settings_request_ack": "0" * 32} if failure == "mismatched" else {}),
+            },
         )
 
     try:
         async with httpx.AsyncClient(
             base_url="http://unused.invalid", transport=httpx.MockTransport(respond)
         ) as client:
-            expected = {
-                "read": httpx.ReadError,
-                "write": httpx.WriteError,
-                "timeout": httpx.ReadTimeout,
-                "cancel": asyncio.CancelledError,
-            }.get(failure, ClickException)
+            expected = errors.get(failure, ClickException)
             with pytest.raises(expected):
                 await main._launch_claude_terminal(
                     client, "conv_fenced", (), command="claude", bridge_dir=bridge_dir
@@ -143,6 +175,8 @@ async def test_uncertain_http_completion_releases_only_sender_ownership(
             assert baseline.read_bytes() == received[0]
             assert prune_unused_claude_settings(bridge_dir) == 0
             receiver.close()
+        if failure == "reactivated-ack":
+            prune_unused_claude_settings(bridge_dir)
         assert not list(bridge_dir.glob(f"claude-settings-{generation}*"))
     finally:
         if receiver is not None:
@@ -150,20 +184,74 @@ async def test_uncertain_http_completion_releases_only_sender_ownership(
 
 
 @pytest.mark.parametrize(
-    ("capabilities", "expected"),
+    ("probe", "expected"),
     [
-        ({"claude_settings_request_protocol": 1}, 1),
-        ({"claude_settings_request_protocol": 2}, None),
-        ({"claude_settings_fenced_request_protocol": 2}, 2),
-        ({"claude_settings_fenced_request_protocol": True}, None),
-        ({"claude_settings_fenced_request_protocol": 2.0}, None),
-        ({"claude_settings_request_protocol": 1, "claude_settings_fenced_request_protocol": 3}, 1),
+        pytest.param(
+            httpx.Response(200, json={"claude_settings_request_protocol": 1}), 1, id="legacy-peer"
+        ),
+        pytest.param(
+            httpx.Response(200, json={"claude_settings_fenced_request_protocol": 2}),
+            2,
+            id="fenced-peer",
+        ),
+        pytest.param(
+            httpx.Response(
+                200,
+                json={
+                    "claude_settings_request_protocol": 1,
+                    "claude_settings_fenced_request_protocol": 3,
+                },
+            ),
+            1,
+            id="legacy-with-unknown-fenced-version",
+        ),
+        pytest.param(
+            httpx.Response(404, json={"claude_settings_request_protocol": 1}), None, id="http-404"
+        ),
+        pytest.param(
+            httpx.Response(503, json={"claude_settings_request_protocol": 1}), None, id="http-503"
+        ),
+        pytest.param(httpx.ConnectError("inert probe failure"), None, id="connect-error"),
+        pytest.param(httpx.ReadTimeout("inert probe timeout"), None, id="timeout"),
+        pytest.param(httpx.Response(200, content=b"{"), None, id="malformed-json"),
+        pytest.param(httpx.Response(200, json=[]), None, id="non-object"),
+        pytest.param(httpx.Response(200, json={}), None, id="missing-version"),
+        *[
+            pytest.param(
+                httpx.Response(200, json={"claude_settings_request_protocol": version}),
+                None,
+                id=name,
+            )
+            for name, version in [
+                ("version-zero", 0),
+                ("version-future", 2),
+                ("version-string", "1"),
+                ("version-float", 1.0),
+                ("version-bool", True),
+            ]
+        ],
+        pytest.param(
+            httpx.Response(200, json={"claude_settings_fenced_request_protocol": True}),
+            None,
+            id="fenced-bool",
+        ),
+        pytest.param(
+            httpx.Response(200, json={"claude_settings_fenced_request_protocol": 2.0}),
+            None,
+            id="fenced-float",
+        ),
     ],
 )
-async def test_additive_capability_negotiation_keeps_legacy_fallback(capabilities, expected):
+async def test_additive_capability_negotiation_keeps_legacy_fallback(
+    probe: httpx.Response | httpx.HTTPError, expected: int | None
+) -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        if isinstance(probe, httpx.HTTPError):
+            raise probe
+        return probe
+
     async with httpx.AsyncClient(
-        base_url="http://unused.invalid",
-        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=capabilities)),
+        base_url="http://unused.invalid", transport=httpx.MockTransport(respond)
     ) as client:
         assert await main._supports_claude_settings_requests(client, "conv_fenced") == expected
 

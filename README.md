@@ -391,6 +391,23 @@ historical single settings file and argument precedence without allocating
 new untracked generations. Caller-settings composition requires the fenced
 path. Existing bundles and registration continue to work without migration.
 
+Protocol-1 requests and schema-1 lifecycle/request records belong to earlier
+candidate versions, rather than the historical single-file release. Readers retain that
+already-exposed state conservatively; the current client still uses the single
+file for protocol-1-only peers. This does not establish that a production
+deployment needs the intermediate protocol. Removing its readers requires an
+inventory of affected state and a compatible transition.
+
+Caller composition needs terminal-context reads, an immutable baseline, private
+finalized output and cancellation-safe ownership transfer. The process guard,
+deferred bridge deletion and uncertain-consumer records serve the broader
+reclamation contract: completed launches must stop accumulating unused files,
+while live, overlapping, resumed and transferred consumers keep their inputs.
+The positive completion/recovery transition is still missing. Uncertainty
+retention protects live inputs but can also retain credential-bearing bridge
+files after deletion; immediate credential revocation/removal must be separated
+from retention of inputs an unknown consumer may still need.
+
 Terminal claims in new v2 generations, older v1 records and historical untracked
 generations retain conservative ownership rules. Terminal preparation, shutdown
 or a crash can leave files indefinitely, including after the direct child exits.

@@ -5539,10 +5539,36 @@ def test_merge_caller_settings_preserves_hook_contents(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["inline", "file"])
-async def test_caller_hook_shapes_fail_before_finalized_output(
+@pytest.mark.parametrize(
+    ("caller", "error", "reason"),
+    [
+        pytest.param(
+            {"hooks": {"PrivateEvent": {"command": "private-hook-content"}}},
+            "Caller hooks must be an object",
+            "INVALID_HOOKS",
+            id="hook-shape",
+        ),
+        pytest.param(
+            {"cleanupPeriodDays": 0},
+            "cleanupPeriodDays must be a positive integer",
+            "INVALID_RETENTION",
+            id="retention",
+        ),
+        pytest.param(
+            {"language": 0},
+            "Claude rejected the merged caller settings",
+            "INVALID_SETTINGS",
+            id="vendor-rejection",
+        ),
+    ],
+)
+async def test_caller_settings_validation_preserves_baseline_and_arguments(
     tmp_path: Path,
     claude_settings_validator,
     caplog: pytest.LogCaptureFixture,
+    caller: dict,
+    error: str,
+    reason: str,
     source: str,
 ) -> None:
     from omnigent.harnesses.claude_native.settings_validation import (
@@ -5552,7 +5578,7 @@ async def test_caller_hook_shapes_fail_before_finalized_output(
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import create_terminal_instance
 
-    payload = json.dumps({"hooks": {"PrivateEvent": {"command": "private-hook-content"}}})
+    payload = json.dumps(caller)
     if source == "file":
         caller_file = tmp_path / "caller.json"
         caller_file.write_text(payload)
@@ -5564,6 +5590,8 @@ async def test_caller_hook_shapes_fail_before_finalized_output(
         tmp_path, args, claude_args_start=0
     )
     baseline = {path.name: path.read_bytes() for path in tmp_path.glob("claude-settings-*")}
+    baseline_path = Path(args[max(i for i, arg in enumerate(args) if arg == "--settings") + 1])
+    assert json.loads(baseline_path.read_bytes())["hooks"]["UserPromptSubmit"]
     instance = create_terminal_instance(
         "claude",
         "settings",
@@ -5575,80 +5603,32 @@ async def test_caller_hook_shapes_fail_before_finalized_output(
         ),
     ).instance
     original_args = list(instance.args)
+    claude_settings_validator.side_effect = CallerSettingsError(
+        CallerSettingsErrorReason.INVALID_SETTINGS
+    )
     try:
-        with pytest.raises(ValueError, match="Caller hooks must be an object") as error:
+        with pytest.raises(CallerSettingsError, match=error) as raised:
             await claude_native_bridge.finalize_claude_caller_settings(
                 instance, bridge_dir=tmp_path, generation=generation, private_output=True
             )
-
-        assert isinstance(error.value, CallerSettingsError)
-        assert error.value.reason is CallerSettingsErrorReason.INVALID_HOOKS
-        assert str(error.value) == error.value.client_message
-        assert "private-hook-content" not in str(error.value)
-        assert "PrivateEvent" not in str(error.value)
+        assert raised.value.reason is getattr(CallerSettingsErrorReason, reason)
+        assert str(raised.value) == raised.value.client_message
+        assert "private-hook-content" not in str(raised.value)
+        assert "PrivateEvent" not in str(raised.value)
         assert "private-hook-content" not in caplog.text
         assert "PrivateEvent" not in caplog.text
-        claude_settings_validator.assert_not_awaited()
         assert instance.args == original_args
+        assert args == original_args
         assert {
             path.name: path.read_bytes() for path in tmp_path.glob("claude-settings-*")
         } == baseline
         assert not list(instance.private_dir.glob("claude-finalized-settings-*.json"))
+        if reason == "INVALID_SETTINGS":
+            claude_settings_validator.assert_awaited_once()
+        else:
+            claude_settings_validator.assert_not_awaited()
     finally:
         await instance.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "caller, error",
-    [
-        ({"cleanupPeriodDays": 0}, "cleanupPeriodDays must be a positive integer"),
-        ({"language": 0}, "Claude rejected the merged caller settings"),
-    ],
-    ids=["retention", "vendor-rejection"],
-)
-async def test_caller_settings_validation_preserves_baseline_and_arguments(
-    tmp_path: Path,
-    claude_settings_validator,
-    caller: dict,
-    error: str,
-    _finalize_test_claude_args,
-) -> None:
-    from omnigent.harnesses.claude_native.settings_validation import (
-        CallerSettingsError,
-        CallerSettingsErrorReason,
-    )
-    from omnigent.inner.datamodel import OSEnvSpec
-
-    args = augment_claude_args(
-        ("--settings=" + json.dumps(caller),),
-        bridge_dir=tmp_path,
-    )
-    baseline_path = Path(args[max(i for i, arg in enumerate(args) if arg == "--settings") + 1])
-    baseline_bytes = baseline_path.read_bytes()
-    original_args = list(args)
-    claude_settings_validator.side_effect = CallerSettingsError(
-        CallerSettingsErrorReason.INVALID_SETTINGS
-    )
-    with pytest.raises(CallerSettingsError, match=error) as raised:
-        await _finalize_test_claude_args(
-            args,
-            bridge_dir=tmp_path,
-            os_env_spec=OSEnvSpec(
-                type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
-            ),
-        )
-    assert args == original_args
-    assert baseline_path.read_bytes() == baseline_bytes
-    assert json.loads(baseline_bytes)["hooks"]["UserPromptSubmit"]
-    assert not list(tmp_path.glob("claude-settings-*-*.json"))
-    if "cleanupPeriodDays" in caller:
-        assert isinstance(raised.value, CallerSettingsError)
-        assert raised.value.reason is CallerSettingsErrorReason.INVALID_RETENTION
-        claude_settings_validator.assert_not_awaited()
-    else:
-        assert raised.value.reason is CallerSettingsErrorReason.INVALID_SETTINGS
-        claude_settings_validator.assert_awaited_once()
 
 
 @pytest.mark.asyncio

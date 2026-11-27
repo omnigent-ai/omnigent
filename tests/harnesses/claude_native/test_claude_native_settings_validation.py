@@ -18,25 +18,21 @@ import pytest
 
 from omnigent.harnesses.claude_native import settings_validation as validation
 from omnigent.inner import terminal as terminal_module
-from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import TerminalInstance
 from tests._helpers.polling import poll_until_async
-
-_CAPTURED_DOCTOR = json.loads(
-    (Path(__file__).with_name("fixtures") / "claude-doctor-2.1.323.json").read_text(
-        encoding="utf-8"
-    )
+from tests.harnesses.claude_native._settings_validation_helpers import (
+    CAPTURED_DOCTOR as _CAPTURED_DOCTOR,
 )
-_HELP = _CAPTURED_DOCTOR["runs"]["help"]["stdout"]
-# Synthetic responses isolate launch-context and process-cleanup behavior.
-_HEADER = (
-    "Claude Code doctor\n\nRunning: native (2.1.0)\n"
-    "Commit: example-build\nPath: /opt/example/claude\n"
+from tests.harnesses.claude_native._settings_validation_helpers import (
+    DOCTOR_COMPLETION as _COMPLETION,
 )
-_COMPLETION = (
-    "\nNo installation issues found.\n\n"
-    "For a full setup checkup that can also fix issues, run /doctor in a Claude Code session.\n"
+from tests.harnesses.claude_native._settings_validation_helpers import (
+    DOCTOR_HEADER as _HEADER,
 )
+from tests.harnesses.claude_native._settings_validation_helpers import (
+    DOCTOR_HELP as _HELP,
+)
+from tests.harnesses.claude_native._settings_validation_helpers import validator_policy
 
 
 def _instance(tmp_path: Path) -> TerminalInstance:
@@ -252,9 +248,10 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         selected_path = str(terminal_tools)
         instance.env["PATH"] = selected_path
     selected_cwd = instance.os_env.cwd / "subdir" if env_wrapped else instance.os_env.cwd
-    policy = SandboxPolicy(
-        backend_type="linux_bwrap",
-        active=True,
+    policy = validator_policy(
+        instance.os_env.cwd,
+        instance.private_dir,
+        instance.socket_path,
         read_roots=(
             [Path("/")]
             if fork_executable == "policy-root"
@@ -262,14 +259,6 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
             if fork_executable == "private-read"
             else []
         ),
-        write_roots=[instance.os_env.cwd, instance.private_dir],
-        write_files=[instance.os_env.cwd / "write-file"],
-        allow_network=True,
-        mask_paths=[instance.os_env.cwd / "secret", instance.private_dir / "covered"],
-        deny_unix_socket_paths=[instance.socket_path, instance.os_env.cwd / "other.sock"],
-        credential_source_paths=[instance.os_env.cwd / "credential-file"],
-        copy_on_write_roots=[instance.os_env.cwd],
-        copy_on_write_namespace=(123, 456, 789),
         spawn_env_allowlist=["PATH"],
     )
     if sandboxed:
