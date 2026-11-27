@@ -80,12 +80,6 @@ def _candidates(nodes: Any, key: str, kind: str) -> list[dict[str, Any]]:
     return found
 
 
-_REVIEWERS_QUERY = """query($owner: String!, $name: String!, $q: String!, $first: Int!) {
-  repository(owner: $owner, name: $name) {
-    assignableUsers(query: $q, first: $first) { nodes { login name } }
-  }
-  organization(login: $owner) { teams(query: $q, first: $first) { nodes { slug name } } }
-}"""
 _PEOPLE_QUERY = """query($owner: String!, $name: String!, $q: String!, $first: Int!) {
   repository(owner: $owner, name: $name) {
     assignableUsers(query: $q, first: $first) { nodes { login name } }
@@ -99,30 +93,43 @@ def _connection_nodes(data: dict[str, Any], owner: str, field: str) -> Any:
     return connection.get("nodes") if isinstance(connection, dict) else None
 
 
+def _matching_teams(
+    root: str, reference: PullRequestRef, text: str, first: int
+) -> list[dict[str, Any]]:
+    """The teams with access to the repository whose slug or name contains ``text``.
+
+    The reviewer picker's own list, so a team GitHub would refuse as a reviewer is never
+    offered. A personal repository has none, and a list gh can't read leaves them out.
+    """
+    with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+        teams, _more = github._repo_teams(
+            root, ["--hostname", reference.host], github._pr_token(root, reference), reference
+        )
+    needle = text.strip().casefold()
+    return [
+        team
+        for team in teams
+        if needle in team["login"].casefold() or needle in (team["name"] or "").casefold()
+    ][:first]
+
+
 def search_reviewers(
     root: str, reference: PullRequestRef, *, text: str, page_size: int
 ) -> dict[str, Any]:
     """The people and teams who can review ``reference``, matching ``text``.
 
-    People come first, then the organization's teams, each in GitHub's best-match order.
+    People come first, in GitHub's best-match order, then the teams with access to the
+    repository, in the order GitHub lists them.
 
     :param page_size: At most :data:`MAX_REVIEWERS` of each; 0 asks for that many.
     """
     if not 0 <= page_size <= MAX_REVIEWERS:
         raise InvalidPullRequestInput(f"Ask for at most {MAX_REVIEWERS} reviewers")
     owner, name = reference.repository.split("/", 1)
-    data = _query(
-        root,
-        reference,
-        _REVIEWERS_QUERY,
-        owner=owner,
-        name=name,
-        q=text,
-        first=page_size or MAX_REVIEWERS,
-    )
+    first = page_size or MAX_REVIEWERS
+    data = _query(root, reference, _PEOPLE_QUERY, owner=owner, name=name, q=text, first=first)
     users = _candidates(_connection_nodes(data, "repository", "assignableUsers"), "login", "user")
-    # A personal repository has no organization, and so no teams.
-    teams = _candidates(_connection_nodes(data, "organization", "teams"), "slug", "team")
+    teams = _matching_teams(root, reference, text, first)
     return {"object": "list", "data": users + teams}
 
 

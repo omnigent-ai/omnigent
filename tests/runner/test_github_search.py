@@ -25,7 +25,9 @@ TOKEN = "ghp_example_token_value"
 
 
 class FakeGraphQL:
-    """Answers ``gh api graphql`` with ``answer``, recording each query and its variables."""
+    """Answers ``gh api graphql`` with ``answer``, and the repository's team list with
+    ``teams``, recording each query and its variables.
+    """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.calls: list[list[str]] = []
@@ -34,6 +36,8 @@ class FakeGraphQL:
         self.answer: Any = {"data": {}}
         self.raw_output: str | None = None
         self.exit_code = 0
+        # The teams with access to the repository, or ``None`` when GitHub refuses the list.
+        self.teams: list[dict[str, Any]] | None = []
 
         def run(
             argv: list[str], *, cwd: str, timeout: float, env: dict[str, str] | None = None
@@ -43,7 +47,12 @@ class FakeGraphQL:
             self.envs.append(env)
             if argv[1:3] == ["auth", "token"]:
                 return 0, TOKEN + "\n", ""
-            assert argv[1] == "api" and "graphql" in argv, argv
+            assert argv[1] == "api", argv
+            if argv[-1].startswith(f"repos/{REPOSITORY}/teams"):
+                if self.teams is None:
+                    return 1, '{"message": "Not Found"}', "gh: Not Found (HTTP 404)"
+                return 0, json.dumps(self.teams), ""
+            assert "graphql" in argv, argv
             path = argv[argv.index("--input") + 1]
             self.requests.append(json.loads(Path(path).read_text(encoding="utf-8")))
             if self.raw_output is not None:
@@ -53,6 +62,9 @@ class FakeGraphQL:
         monkeypatch.setattr(github, "_run", run)
 
     def graphql_calls(self) -> list[list[str]]:
+        return [call for call in self.calls if call[0] == "api" and "graphql" in call]
+
+    def api_calls(self) -> list[list[str]]:
         return [call for call in self.calls if call[0] == "api"]
 
 
@@ -80,24 +92,26 @@ def _people(*logins: str) -> dict[str, Any]:
     return {"nodes": [{"login": login, "name": login.title()} for login in logins]}
 
 
-def test_reviewers_are_the_repositorys_people_then_its_organizations_teams(
+def test_reviewers_are_the_repositorys_people_then_its_teams_with_access(
     tmp_path: Path, fake: FakeGraphQL
 ) -> None:
-    fake.answer = {
-        "data": {
-            "repository": {"assignableUsers": _people("alice", "alvaro")},
-            "organization": {"teams": {"nodes": [{"slug": "app-reviewers", "name": None}]}},
-        }
-    }
+    fake.answer = {"data": {"repository": {"assignableUsers": _people("alice", "alvaro")}}}
+    fake.teams = [
+        {"slug": "alpha-reviewers", "name": "Reviewers"},
+        {"slug": "platform", "name": "Allied platform"},
+        {"slug": "docs", "name": "Docs"},
+    ]
 
-    found = github_search.search_reviewers(str(tmp_path), _reference(), text="al", page_size=5)
+    found = github_search.search_reviewers(str(tmp_path), _reference(), text="Al", page_size=5)
 
     assert found == {
         "object": "list",
         "data": [
             {"login": "alice", "kind": "user", "name": "Alice"},
             {"login": "alvaro", "kind": "user", "name": "Alvaro"},
-            {"login": "app-reviewers", "kind": "team", "name": None},
+            # Matched by slug, then by name; a team that matches neither is left out.
+            {"login": "alpha-reviewers", "kind": "team", "name": "Reviewers"},
+            {"login": "platform", "kind": "team", "name": "Allied platform"},
         ],
     }
     (request,) = fake.requests
@@ -105,12 +119,23 @@ def test_reviewers_are_the_repositorys_people_then_its_organizations_teams(
     assert request["variables"] == {
         "owner": "example-org",
         "name": "example-repo",
-        "q": "al",
+        "q": "Al",
         "first": 5,
     }
-    assert "al" not in request["query"]
-    (call,) = fake.graphql_calls()
-    assert call[call.index("--hostname") + 1] == "github.com"
+    assert "Al" not in request["query"]
+    # Only teams with access to the repository are offered, never the whole organization's.
+    assert "organization" not in request["query"]
+    assert fake.api_calls()[1][-1] == f"repos/{REPOSITORY}/teams?per_page=100"
+    for call in fake.api_calls():
+        assert call[call.index("--hostname") + 1] == "github.com"
+
+
+def test_teams_are_capped_at_the_page_size(tmp_path: Path, fake: FakeGraphQL) -> None:
+    fake.teams = [{"slug": f"team-{index}", "name": None} for index in range(10)]
+
+    found = github_search.search_reviewers(str(tmp_path), _reference(), text="", page_size=3)
+
+    assert [entry["login"] for entry in found["data"]] == ["team-0", "team-1", "team-2"]
 
 
 def test_reviewers_with_no_page_size_ask_for_the_most(tmp_path: Path, fake: FakeGraphQL) -> None:
@@ -119,15 +144,12 @@ def test_reviewers_with_no_page_size_ask_for_the_most(tmp_path: Path, fake: Fake
     assert fake.requests[0]["variables"]["first"] == github_search.MAX_REVIEWERS
 
 
-def test_a_personal_repository_answers_its_people_without_teams(
+def test_a_repository_whose_teams_cant_be_listed_answers_its_people(
     tmp_path: Path, fake: FakeGraphQL
 ) -> None:
-    """GitHub fails the organization lookup and gh exits nonzero, but the people answer."""
-    fake.exit_code = 1
-    fake.answer = {
-        "data": {"repository": {"assignableUsers": _people("alice")}, "organization": None},
-        "errors": [{"message": "Could not resolve to an Organization with the login of 'x'."}],
-    }
+    """A personal repository has no teams, and listing them may need more access."""
+    fake.answer = {"data": {"repository": {"assignableUsers": _people("alice")}}}
+    fake.teams = None
 
     found = github_search.search_reviewers(str(tmp_path), _reference(), text="a", page_size=0)
 
@@ -152,7 +174,9 @@ def test_a_search_runs_as_the_account_saved_for_the_repository(
     github_search.search_reviewers(str(tmp_path), _reference(), text="a", page_size=0)
 
     assert fake.calls[0] == ["auth", "token", "--user", "octocat", "-h", "github.com"]
-    assert fake.envs[1] is not None and fake.envs[1]["GH_TOKEN"] == TOKEN
+    api_envs = [env for call, env in zip(fake.calls, fake.envs, strict=True) if call[0] == "api"]
+    assert len(api_envs) == 2
+    assert all(env is not None and env["GH_TOKEN"] == TOKEN for env in api_envs)
 
 
 def test_a_pr_on_a_host_never_set_up_runs_no_gh_with_an_enterprise_token(
@@ -179,8 +203,10 @@ def test_a_pr_on_the_gh_host_set_up_is_searched_with_no_sign_in_probe(
         str(tmp_path), _reference(f"https://{GHES}/{REPOSITORY}/pull/7"), text="a", page_size=0
     )
 
-    (call,) = fake.calls
-    assert call[call.index("--hostname") + 1] == GHES
+    # The two reads, and no sign-in probe before them.
+    assert [call[0] for call in fake.calls] == ["api", "api"]
+    for call in fake.calls:
+        assert call[call.index("--hostname") + 1] == GHES
 
 
 @pytest.mark.parametrize("output", ["<html>example-org/secret-repo</html>", "[]", '{"x": 1}'])

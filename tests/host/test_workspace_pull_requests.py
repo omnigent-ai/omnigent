@@ -645,7 +645,9 @@ def test_every_owner_method_has_a_call_case() -> None:
     assert not set(_GITHUB_CHANGE_CALLS) & set(_QUEUE_CALLS)
     assert not set(_GITHUB_CHANGE_CALLS) & set(_STACK_CALLS)
     assert not set(_QUEUE_CALLS) & set(_STACK_CALLS)
-    assert not set(_SEARCH_CALLS) & (set(_GITHUB_CHANGE_CALLS) | set(_QUEUE_CALLS))
+    assert not set(_SEARCH_CALLS) & (
+        set(_GITHUB_CHANGE_CALLS) | set(_QUEUE_CALLS) | set(_STACK_CALLS)
+    )
     owner_unary = _PULL_REQUEST_OWNER_METHODS - _PULL_REQUEST_OWNER_STREAMS
     assert set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) | {"EnableAutoMerge"} == owner_unary
 
