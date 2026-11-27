@@ -193,15 +193,18 @@ def test_a_pull_request_in_no_stack_says_so(fake: FakeGraphQL) -> None:
     assert found["native_stack"] == {"stackEntry": None, "stack": None}
 
 
-def test_a_stack_longer_than_one_read_says_there_are_more(fake: FakeGraphQL) -> None:
+@pytest.mark.parametrize("listed", [50, 51], ids=["a-full-read", "more-than-asked-for"])
+def test_a_stack_longer_than_one_read_says_there_are_more(fake: FakeGraphQL, listed: int) -> None:
+    """An answer with more entries than the read asked for is cut to the read's cap."""
     count = github_native_stack.MAX_NATIVE_STACK_ENTRIES
-    nodes = [{"position": n, "pullRequest": _member(n)} for n in range(1, count + 1)]
+    nodes = [{"position": n, "pullRequest": _member(n)} for n in range(1, listed + 1)]
     fake.answer = _answer(nodes, has_next_page=True, size=count + 5)
 
     stack = _read()["native_stack"]["stack"]
 
     assert stack["entries"]["hasNextPage"] is True
-    assert len(stack["entries"]["nodes"]) == count
+    assert stack["size"] == count + 5
+    assert [entry["position"] for entry in stack["entries"]["nodes"]] == list(range(1, count + 1))
 
 
 @pytest.mark.parametrize(
@@ -366,11 +369,22 @@ def test_entries_with_no_position_are_dropped_and_odd_positions_kept(fake: FakeG
             {"position": "1", "pullRequest": _member(1)},
             {"position": 9, "pullRequest": _member(2)},
             {"position": 9, "pullRequest": _member(3)},
+            # Past GraphQL's largest Int, so GitHub never sent it.
+            {"position": 2**31, "pullRequest": _member(4)},
+            {"position": 2**31 - 1, "pullRequest": _member(5)},
             "not an entry",
         ]
     )
 
-    assert [entry["position"] for entry in _entries(_read())] == [9, 9]
+    assert [entry["position"] for entry in _entries(_read())] == [9, 9, 2**31 - 1]
+
+
+@pytest.mark.parametrize("login", ["octocat", "github-actions[bot]", "example-app[bot]"])
+def test_the_account_it_was_read_as_may_be_a_user_or_an_app(fake: FakeGraphQL, login: str) -> None:
+    """A GitHub App's token reads as a login ending in ``[bot]``."""
+    fake.answer["data"]["viewer"]["login"] = login
+
+    assert _read()["viewer"] == login
 
 
 def test_a_member_github_hides_is_a_gap(fake: FakeGraphQL) -> None:
@@ -528,6 +542,9 @@ def _with(path: list[str], value: Any) -> dict[str, Any]:
     [
         _with(["viewer", "login"], "octo cat"),
         _with(["viewer", "login"], "x" * 65),
+        _with(["viewer", "login"], "[bot]"),
+        _with(["viewer", "login"], "example-app[bot]x"),
+        _with(["repository", "pullRequest", "stackEntry"], {"position": 2**31}),
         _with(["viewer"], None),
         _with(["repository", "pullRequest"], None),
         _with(["repository", "pullRequest", "number"], 3),
@@ -546,6 +563,9 @@ def _with(path: list[str], value: Any) -> dict[str, Any]:
     ids=[
         "viewer-with-space",
         "viewer-too-long",
+        "viewer-only-suffix",
+        "viewer-text-after-suffix",
+        "position-past-int",
         "no-viewer",
         "no-pull-request",
         "other-pull-request",

@@ -28,7 +28,10 @@ MAX_STACK_SIZE = 10_000
 _UNKNOWN_HOST = "Sign in to this GitHub host with gh before reading its stacks"
 _UNREADABLE = "GitHub couldn't read this pull request's stack. Try again."
 
-_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+# A user's login, or a GitHub App's, which ends in ``[bot]``.
+_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?:\[bot\])?")
+# GraphQL's Int is 32-bit and signed.
+_INT_MIN, _INT_MAX = -(2**31), 2**31 - 1
 _NODE_ID = re.compile(r"[A-Za-z0-9_=-]{1,256}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
@@ -236,7 +239,7 @@ def _stack(stack: Any, reference: PullRequestRef, errors: list[Any]) -> dict[str
         }
         for index, node in enumerate(nodes[:MAX_NATIVE_STACK_ENTRIES])
         if isinstance(node, dict)
-        and _count(node.get("position"), least=-(2**31), most=2**31) is not None
+        and _count(node.get("position"), least=_INT_MIN, most=_INT_MAX) is not None
     ]
     return {**shaped, "entries": {"hasNextPage": has_next_page, "nodes": shaped_nodes}}
 
@@ -290,7 +293,7 @@ def pull_request_native_stack(root: str, reference: PullRequestRef) -> dict[str,
         raise _unreadable()
     entry = pull_request.get("stackEntry")
     position = entry.get("position") if isinstance(entry, dict) else None
-    if entry is not None and _count(position, least=-(2**31), most=2**31) is None:
+    if entry is not None and _count(position, least=_INT_MIN, most=_INT_MAX) is None:
         raise _unreadable()
     return {
         "object": "pull_request_native_stack",
