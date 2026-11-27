@@ -263,3 +263,46 @@ def test_data_is_copied_across_pages_and_collections_and_capped_over_all_of_them
     monkeypatch.setattr(service_module, "MAX_COPIED_RECORDS", page + 4)
     with pytest.raises(CapacityExceeded):
         owner.copy(source["id"], {"include_data": True})
+
+
+def test_a_copy_reads_a_bounded_number_of_pages_however_much_was_deleted(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleted records keep their place in a collection's order, so pages can come back
+    empty and still continue; the copy stops after a fixed number of them."""
+    monkeypatch.setattr(service_module, "MAX_COPY_PAGES", 3)
+    monkeypatch.setattr(
+        service_module, "_DATA_STORE_LIMITS", service_module.StoreLimits(max_scan_per_list=2)
+    )
+    owner = gadgets.service(1)
+    source = publish_board(owner)
+    for number in range(8):
+        created = rpc(
+            owner,
+            source,
+            "create",
+            id=f"d{number}",
+            value={"title": "x"},
+            operation_id=f"d{number}",
+        )
+        rpc(
+            owner,
+            source,
+            "delete",
+            id=f"d{number}",
+            if_version=created["version"],
+            operation_id=f"x{number}",
+        )
+    pages: list[str | None] = []
+    real = service_module.ImmutableDocumentStore.list
+
+    def counted(self, collection, limit=100, cursor=None):  # type: ignore[no-untyped-def]
+        pages.append(cursor)
+        return real(self, collection, limit, cursor)
+
+    monkeypatch.setattr(service_module.ImmutableDocumentStore, "list", counted)
+
+    with pytest.raises(CapacityExceeded, match="too much history"):
+        owner.copy(source["id"], {"include_data": True})
+    assert len(pages) == 3
+    assert [item["id"] for item in owner.list_owned()["items"]] == [source["id"]]

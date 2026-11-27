@@ -575,7 +575,9 @@ async def test_viewer_scopes_round_trip_and_an_older_server_that_drops_them_is_r
     def older(request: httpx.Request) -> httpx.Response:
         return httpx.Response(201, json={"id": "0" * 32})
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(older), base_url="http://s") as old:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(older), base_url="http://server.example.test"
+    ) as old:
         refused = await _call(old, "sys_gadget_revision_create", gadget_id=gadget_id, **args)
         shared = await _call(
             old,

@@ -96,8 +96,11 @@ _REVISION = re.compile(r"^[0-9a-f]{32}$")
 # The viewer's pins and session links, in their own files.
 SHELF_ROOT = "shelf"
 MAX_PINNED_GADGETS = 50
-# The most records "Make a copy" copies in one request, over all collections.
+# The most records "Make a copy" copies in one request, over all collections, and the most
+# listing pages it reads to find them: a collection's order keeps deleted records' entries,
+# so a page can hold none, and the pages bound the work however many were deleted.
 MAX_COPIED_RECORDS = 2000
+MAX_COPY_PAGES = 64
 MAX_SESSION_GADGETS = 20
 COMMENT_STATUSES = frozenset({"draft", "addressed"})
 MAX_COMMENT_CHARS = 4000
@@ -362,6 +365,22 @@ def _collection_scopes(value: Any, collections: dict, constraints: list[dict]) -
                 details={"constraint": rule["name"]},
             )
     return scopes
+
+
+# Written, once, before a viewer's first viewer record: lets identity migration tell they have
+# some in one read instead of listing a directory of every gadget they wrote in.
+VIEWER_DATA_MARKER = "viewer-data.json"
+
+
+def _mark_viewer_data(files: GadgetFiles) -> None:
+    """Note that the viewer keeps viewer records; never removed, so it can only over-report."""
+    try:
+        files.read_json(VIEWER_DATA_MARKER)
+    except NotFound:
+        # Also makes the viewer's file scope, which a viewer without a shelf has not got yet.
+        files.mkdirs(VIEWER_DATA_ROOT)
+        with contextlib.suppress(Conflict):  # Another write made it first.
+            files.create_json(VIEWER_DATA_MARKER, {"viewer_data": True})
 
 
 def _scope_digest(schema: Any, scope: str) -> str:
@@ -699,9 +718,17 @@ class GadgetService:
             source = ImmutableDocumentStore(self._files(gadget), "data", limits=_DATA_STORE_LIMITS)
             # Viewer collections' records are each viewer's own and are never copied.
             shared = set(revision["collections"]) - set(revision.get("collection_scopes", {}))
+            pages = 0
             for collection in sorted(shared):
                 cursor = None
                 while True:
+                    pages += 1
+                    if pages > MAX_COPY_PAGES:
+                        raise CapacityExceeded(
+                            "This gadget's data has too much history to copy in one go; "
+                            "copy the gadget without its data",
+                            details={"max_pages": MAX_COPY_PAGES},
+                        )
                     page = source.list(collection, _DATA_STORE_LIMITS.max_list_limit, cursor)
                     records.extend((collection, item.id, item.value) for item in page.items)
                     if len(records) > MAX_COPIED_RECORDS:
@@ -1737,15 +1764,22 @@ class GadgetService:
         gadget, permissions, revision, publication = self._active(
             app_id, _revision_id(revision_id)
         )
-        result = self._rpc(gadget, permissions, revision, publication, method, params)
-        if (
+        viewer_write = (
             method in {"data.v1.create", "data.v1.replace", "data.v1.delete"}
             and isinstance(params, dict)
             and params.get("collection") in revision.get("collection_scopes", {})
-        ):
-            # Viewer records are the viewer's own files, which their account's deletion
-            # removes: a write that lands after it queues that cleanup again.
-            self._after_owned_write()
+        )
+        try:
+            result = self._rpc(gadget, permissions, revision, publication, method, params)
+        finally:
+            if viewer_write:
+                # Viewer records are the viewer's own files, which their account's deletion
+                # removes: a write that lands after it, even one that then fails part-way,
+                # queues that cleanup again. A failure here must not hide the write's own.
+                try:
+                    self._after_owned_write()
+                except Exception:  # noqa: BLE001 - logged; the write's outcome stands
+                    _log.warning("could not queue a deleted account's cleanup", exc_info=True)
         return self._for_gadget_code(gadget, result)
 
     def _rpc(
@@ -1795,6 +1829,8 @@ class GadgetService:
                 self.viewer.user_id, owner_registration=self.viewer.registration
             )
             root = f"{VIEWER_DATA_ROOT}/{gadget.id}"
+            if method in writes:
+                _mark_viewer_data(files)
         else:
             files, root = self._files(gadget), "data"
         store = ImmutableDocumentStore(files, root, limits=_DATA_STORE_LIMITS)

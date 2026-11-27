@@ -2674,3 +2674,58 @@ def test_deletion_removes_the_accounts_own_records_in_other_peoples_gadgets(
 
     assert progress(service("alice")) == []
     assert progress(bob) == ["b1"]
+
+
+def test_a_viewer_write_that_lands_after_deletion_and_then_fails_is_still_cleaned_up(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    """A viewer write on its way when the account was deleted recreates the account's files,
+    commits its record, then fails; the cleanup is queued again regardless."""
+    from omnigent.gadgets import service as service_module
+    from omnigent.stores.gadget_store import NotFound as GadgetNotFound
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    bob = service("bob")
+    app = bob.create("Bob's course")
+    created = bob.create_revision(
+        app["id"],
+        {
+            "html": "<main>Course</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read", "data.write"],
+            "collections": {"progress": {"type": "object"}},
+            "collection_scopes": {"progress": "viewer"},
+        },
+    )
+    app = bob.publish(app["id"], {"revision_id": created["id"], "if_version": None})
+    permissions.grant_for_gadget("alice", app["id"], 1)
+    # Alice's request resolved her registration before the deletion.
+    old_alice = service("alice")
+    assert accounts.delete_user("alice") is True
+
+    real_create = service_module.ImmutableDocumentStore.create
+
+    def commit_then_fail(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        real_create(self, *args, **kwargs)
+        raise OSError("synthetic failure after the record committed")
+
+    monkeypatch.setattr(service_module.ImmutableDocumentStore, "create", commit_then_fail)
+    with pytest.raises(OSError):
+        old_alice.service.rpc(
+            app["id"],
+            app["published_revision"],
+            "data.v1.create",
+            {"collection": "progress", "id": "a1", "value": {}, "operation_id": "a1"},
+        )
+    monkeypatch.undo()
+
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+
+    DeletedAccountGadgets(store, access).resume()
+    files = store.user_files("alice", owner_registration=old_alice.registration)
+    with pytest.raises(GadgetNotFound):
+        files.list_page("viewer-data", after=None, limit=1)
