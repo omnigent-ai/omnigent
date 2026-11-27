@@ -9,7 +9,9 @@ import type * as SessionModule from "@/hooks/useSession";
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import type * as PermissionsApiModule from "@/lib/permissionsApi";
 import { LEVEL_READ } from "@/lib/permissionsApi";
+import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { SCHEDULED_TASK_SOURCE_LABEL_KEY } from "@/lib/automationFromSession";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
@@ -27,6 +29,7 @@ const writes = vi.hoisted(() => ({
   nest: vi.fn(),
   rename: vi.fn(),
   archive: vi.fn(),
+  delete: vi.fn(),
 }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
   const actual = await importOriginal<typeof ConversationsModule>();
@@ -46,10 +49,19 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     useSessionSearch: () => ({ data: { pages: [{ data: [OTHER_NEST] }] } }),
     useRenameConversation: mutation(writes.rename),
     useArchiveConversation: mutation(writes.archive),
+    useStopAndDeleteConversation: mutation(writes.delete),
   };
 });
-// The server's answers to Stop and Leave, which each test settles when it chooses.
-const server = vi.hoisted(() => ({ stopSession: vi.fn(), revokePermission: vi.fn() }));
+// The server's answers to Stop, Leave and an automation's delete, which each test settles.
+const server = vi.hoisted(() => ({
+  stopSession: vi.fn(),
+  revokePermission: vi.fn(),
+  deleteScheduledTask: vi.fn(),
+}));
+vi.mock("@/lib/scheduledTasksApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ScheduledTasksApiModule>()),
+  deleteScheduledTask: server.deleteScheduledTask,
+}));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
   stopSession: server.stopSession,
@@ -387,6 +399,35 @@ describe("SessionActionHost", () => {
       remountHost();
       await act(async () => leave.reject(new Error("offline")));
       expect(ui.toast).toHaveBeenCalledWith("Couldn't leave the session: offline");
+      expect(location()).toBe("/c/c1");
+    });
+
+    async function startDeleteBoth() {
+      const automationDelete = deferred();
+      server.deleteScheduledTask.mockReturnValue(automationDelete.promise);
+      ui.viewing = "c1";
+      const host = renderHost();
+      const source = { ...SESSION, labels: { [SCHEDULED_TASK_SOURCE_LABEL_KEY]: "task-1" } };
+      act(() => requestSessionAction(source, "delete"));
+      fireEvent.click(await screen.findByRole("button", { name: "Delete both" }));
+      await waitFor(() => expect(server.deleteScheduledTask).toHaveBeenCalledWith("task-1"));
+      return { automationDelete, ...host };
+    }
+
+    it("leaves a session deleted with its automation, though another action replaced it", async () => {
+      const { automationDelete } = await startDeleteBoth();
+      act(() => requestSessionAction(SESSION, "mark-unread"));
+      await act(async () => automationDelete.resolve());
+      expect(writes.delete.mock.calls[0]?.[0]).toMatchObject({ id: "c1" });
+      expect(location()).toBe("/");
+    });
+
+    it("stays on another session opened before a Delete both finishes", async () => {
+      const { automationDelete, remountHost } = await startDeleteBoth();
+      ui.viewing = "c2";
+      remountHost();
+      await act(async () => automationDelete.resolve());
+      expect(writes.delete).toHaveBeenCalledTimes(1);
       expect(location()).toBe("/c/c1");
     });
 

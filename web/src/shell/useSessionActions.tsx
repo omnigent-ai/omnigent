@@ -128,6 +128,9 @@ export function useSessionActions({
       showToast("Couldn't delete the automation, so the session was kept");
       return;
     }
+    // A caller replaced while the automation deleted can't see the route, so the open session
+    // is read live: leave it only if it's still the one shown.
+    if (reportsAfterUnmount && isOpenSession(conversation.id)) onLeave?.("delete");
     del.mutate({ id: conversation.id, deleteBranch: deleteLocalBranch });
   }
 
