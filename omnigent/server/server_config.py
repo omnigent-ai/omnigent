@@ -895,17 +895,20 @@ def read_only_code_hosts(config: Mapping[str, Any]) -> tuple[str, ...]:
     :param config: Loaded server config with the optional ``read_only_code_hosts`` key, a
         list of host names where ``*`` matches any run of characters, such as
         ``["*.code.example.com"]``. Their pull requests can be read, but they offer no write
-        capabilities and the server refuses their writes.
+        capabilities and the server refuses their writes. A URL or a path isn't a host name
+        and is ignored.
     """
-    from omnigent.server.read_only_code_hosts import parse_patterns
+    from omnigent.server.read_only_code_hosts import is_host_pattern, parse_patterns
 
     raw = config.get("read_only_code_hosts")
     if "read_only_code_hosts" in config and not isinstance(raw, list):
         logger.warning("server config read_only_code_hosts=%r is not a list, ignoring", raw)
         return ()
     for entry in raw or ():
-        if not isinstance(entry, str) or not entry.strip():
+        if not is_host_pattern(entry):
             logger.warning(
-                "server config read_only_code_hosts entry %r is not a host name, ignoring", entry
+                "server config read_only_code_hosts entry %r is not a host name, such as "
+                "code.example.com, ignoring",
+                entry,
             )
     return parse_patterns(raw)

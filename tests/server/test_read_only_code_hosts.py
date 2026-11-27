@@ -107,6 +107,10 @@ def test_no_patterns_leave_every_pull_request_writable() -> None:
     ("value", "expected"),
     [
         ([" *.Code.Example.com ", "", 7, "git.example.org", "git.example.org"], PATTERNS),
+        (
+            ["https://git.example.org", "git.example.org/team", "*.code.example.com"],
+            ("*.code.example.com",),
+        ),
         ("*.code.example.com", ()),
         (None, ()),
         ({"host": "git.example.org"}, ()),
@@ -160,7 +164,11 @@ def test_the_config_lists_its_read_only_hosts(caplog: pytest.LogCaptureFixture) 
     assert caplog.text == ""
 
 
-@pytest.mark.parametrize("entry", [123, None, "  "], ids=["number", "null", "blank"])
+@pytest.mark.parametrize(
+    "entry",
+    [123, None, "  ", "https://code.example.com", "code.example.com/team"],
+    ids=["number", "null", "blank", "url", "path"],
+)
 def test_a_config_entry_that_isnt_a_host_name_is_ignored_with_a_warning(
     caplog: pytest.LogCaptureFixture, entry: object
 ) -> None:

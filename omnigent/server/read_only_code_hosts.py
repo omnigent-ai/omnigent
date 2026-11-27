@@ -4,7 +4,9 @@ A server can list host patterns, such as ``"*.code.example.com"``, whose pull re
 it serves for reading only: their overviews offer no write capabilities, and the server
 refuses their writes before they reach the session's host. A pattern is a host name,
 matched case-insensitively, where ``*`` stands for any run of characters and every other
-character, ``?`` and ``[`` included, stands for itself. The server reads its config's
+character, ``?`` and ``[`` included, stands for itself. A URL or a path, such as
+``"https://code.example.com"`` or ``"code.example.com/team"``, is no host name and is
+ignored. The server reads its config's
 list when it starts, so a change takes a restart. Only the server's routes are limited:
 an agent in the session that runs ``gh`` itself isn't.
 """
@@ -30,12 +32,17 @@ _KEPT_CAPABILITIES = READ_CAPABILITIES | _HOST_ONLY_CAPABILITIES
 CODE_HOST_WRITE_CAPABILITIES = OWNER_CAPABILITIES - _HOST_ONLY_CAPABILITIES
 
 
+def is_host_pattern(entry: object) -> bool:
+    """Whether ``entry`` is a host name pattern: text that isn't blank, a URL or a path."""
+    return isinstance(entry, str) and bool(entry.strip()) and "/" not in entry
+
+
 def parse_patterns(value: object) -> tuple[str, ...]:
     """The host patterns in ``value``, a list of strings; anything else reads as none."""
     if not isinstance(value, (list, tuple)):
         return ()
-    patterns = (item.strip().casefold() for item in value if isinstance(item, str))
-    return tuple(dict.fromkeys(pattern for pattern in patterns if pattern))
+    patterns = (item.strip().casefold() for item in value if is_host_pattern(item))
+    return tuple(dict.fromkeys(patterns))
 
 
 def is_read_only_pull_request(pr_url: object, patterns: Iterable[str]) -> bool:
