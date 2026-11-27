@@ -136,19 +136,28 @@ def _protect_init() -> None:
 
 
 def _wait_for_command(control: socket.socket, command_pid: int) -> int:
-    poller = select.poll()
-    poller.register(control.fileno(), select.POLLIN)
-    while True:
+    descriptor = os.pidfd_open(command_pid)
+    try:
+        poller = select.poll()
+        poller.register(control.fileno(), select.POLLIN)
+        poller.register(descriptor, select.POLLIN)
         while True:
-            pid, status = os.waitpid(-1, os.WNOHANG)
-            if pid == command_pid:
-                return os.waitstatus_to_exitcode(status)
-            if pid == 0:
-                break
-        if poller.poll(round(_OWNER_POLL_S * 1000)):
-            # EOF or any additional frame means the sole admission channel ended.
-            control.recv(1)
-            raise ConnectionError("Request owner channel ended")
+            while True:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+                if pid == command_pid:
+                    return os.waitstatus_to_exitcode(status)
+                if pid == 0:
+                    break
+            # Command exit wakes immediately; the timeout still reaps other orphans.
+            for ready, flags in poller.poll(round(_OWNER_POLL_S * 1000)):
+                if ready == control.fileno():
+                    # EOF or any additional frame means the sole admission channel ended.
+                    control.recv(1)
+                    raise ConnectionError("Request owner channel ended")
+                if flags & (select.POLLERR | select.POLLNVAL):
+                    raise OSError("Command lifetime descriptor is invalid")
+    finally:
+        os.close(descriptor)
 
 
 def _run_request(control: socket.socket, config: _RequestConfig) -> None:

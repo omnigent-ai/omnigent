@@ -30,13 +30,13 @@ _LIVE_LINUX = (
 )
 
 
-def _spec(cwd: Path) -> AgentSpec:
+def _spec(cwd: Path, *, write_paths: list[str] | None = None) -> AgentSpec:
     return AgentSpec(
         spec_version=1,
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(cwd),
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=write_paths),
         ),
     )
 
@@ -222,7 +222,7 @@ async def test_real_runner_shell_requests_retire_descendants_and_keep_only_clean
 ) -> None:
     from omnigent.inner import _bwrap_request_control as request_control
 
-    spec = _spec(tmp_path)
+    spec = _spec(tmp_path, write_paths=["."])
     _require_request_launcher(spec, tmp_path)
     (tmp_path / "note.txt").write_text("ready\n")
     registry = SessionResourceRegistry()
@@ -283,7 +283,11 @@ signal.pause()
                 },
             )
         )
-        await poll_until_async(ready.exists, timeout_s=10, interval_s=0.01)
+        await poll_until_async(
+            lambda: ready.exists() or task.done(), timeout_s=10, interval_s=0.01
+        )
+        if not ready.exists():
+            pytest.fail(f"Descendant did not publish readiness: {await task}")
         if ending == "cancel":
             task.cancel()
             with pytest.raises(asyncio.CancelledError):

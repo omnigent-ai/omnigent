@@ -11,7 +11,7 @@ import socket
 import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -35,7 +35,12 @@ def _control_socket() -> MagicMock:
 def init_calls(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
     protection = MagicMock()
     monkeypatch.setattr(request_init, "_protect_init", protection)
-    monkeypatch.setattr(request_init.os, "pidfd_open", MagicMock(return_value=41), raising=False)
+    monkeypatch.setattr(
+        request_init.os,
+        "pidfd_open",
+        MagicMock(side_effect=lambda pid: 41 if pid == 1 else 42),
+        raising=False,
+    )
     monkeypatch.setattr(request_init.os, "close", MagicMock())
     process = MagicMock(spec=subprocess.Popen)
     process.pid = 73
@@ -84,7 +89,7 @@ def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_re
     control = _control_socket()
     control.fileno.return_value = control_fd
     poller = MagicMock()
-    poller.poll.return_value = []
+    poller.poll.return_value = [(42, request_init.select.POLLIN)]
     monkeypatch.setattr(request_init.select, "poll", lambda: poller, raising=False)
 
     def limited_select(channels: list[MagicMock], *_args: object) -> tuple[list, list, list]:
@@ -131,8 +136,12 @@ def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_re
     control.set_inheritable.assert_called_once_with(False)
     control.send.assert_called_once_with(result)
     assert launch.return_value.returncode == expected_exit
-    poller.register.assert_called_once_with(control_fd, request_init.select.POLLIN)
+    assert poller.register.call_args_list == [
+        call(control_fd, request_init.select.POLLIN),
+        call(42, request_init.select.POLLIN),
+    ]
     poller.poll.assert_called_once_with(50)
+    assert request_init.os.close.call_args_list == [call(41), call(42)]
 
 
 def test_child_interrupt_cannot_replace_the_commands_exact_result(
@@ -227,7 +236,7 @@ def test_control_transport_must_frame_messages_and_report_owner_loss(
 
 @pytest.mark.parametrize("frame", [b"", b"admit:" + _TOKEN])
 def test_owner_channel_loss_or_repeated_admission_exits_the_init(
-    monkeypatch: pytest.MonkeyPatch, frame: bytes
+    monkeypatch: pytest.MonkeyPatch, init_calls: tuple[MagicMock, MagicMock], frame: bytes
 ) -> None:
     control = _control_socket()
     control.recv.return_value = frame
@@ -237,6 +246,21 @@ def test_owner_channel_loss_or_repeated_admission_exits_the_init(
     monkeypatch.setattr(request_init.select, "poll", lambda: poller, raising=False)
     with pytest.raises(ConnectionError, match="owner channel ended"):
         request_init._wait_for_command(control, 73)
+    control.send.assert_not_called()
+    request_init.os.close.assert_called_once_with(42)
+
+
+def test_invalid_command_handle_is_closed_without_inventing_a_command_result(
+    monkeypatch: pytest.MonkeyPatch, init_calls: tuple[MagicMock, MagicMock]
+) -> None:
+    control = _control_socket()
+    monkeypatch.setattr(request_init.os, "waitpid", lambda *_: (0, 0))
+    poller = MagicMock()
+    poller.poll.return_value = [(42, request_init.select.POLLNVAL)]
+    monkeypatch.setattr(request_init.select, "poll", lambda: poller, raising=False)
+    with pytest.raises(OSError, match="Command lifetime descriptor is invalid"):
+        request_init._wait_for_command(control, 73)
+    request_init.os.close.assert_called_once_with(42)
     control.send.assert_not_called()
 
 
@@ -331,16 +355,19 @@ def test_request_starts_its_own_relay_after_protection_and_reports_the_child_enc
     init_calls[1].assert_called_once()
 
 
+@pytest.mark.parametrize("failure", ["bind", "readiness"])
 def test_relay_start_failure_never_publishes_readiness_or_runs_a_command(
-    monkeypatch: pytest.MonkeyPatch, init_calls: tuple[MagicMock, MagicMock]
+    monkeypatch: pytest.MonkeyPatch, init_calls: tuple[MagicMock, MagicMock], failure: str
 ) -> None:
     control = _control_socket()
-    start = MagicMock(side_effect=OSError("relay bind failed"))
+    start = MagicMock(return_value=SimpleNamespace(wait=lambda _timeout: False))
+    if failure == "bind":
+        start.side_effect = OSError("relay bind failed")
     monkeypatch.setattr(request_init.runpy, "run_path", lambda _path: {"start_relay": start})
     config = replace(
         _CONFIG, relay=request_init._RelayConfig("/runtime/relay.py", 1234, "/broker.sock")
     )
-    with pytest.raises(OSError, match="relay bind failed"):
+    with pytest.raises(OSError, match=r"relay bind failed|relay did not become ready"):
         request_init._run_request(control, config)
     control.sendmsg.assert_not_called()
     init_calls[1].assert_not_called()
