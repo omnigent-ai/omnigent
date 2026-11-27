@@ -69,9 +69,9 @@ describe("remarkGitHubEmoji", () => {
       "www.example.com/:tada:/x",
     ]);
     // The URL itself is never touched, even where its link text is.
-    const tree = processor.runSync(processor.parse("[x :tada:](https://e.com/:tada:)"));
+    const tree = processor.runSync(processor.parse("[x :tada:](https://example.com/:tada:)"));
     const link = (tree as MarkdownNode).children![0]!.children![0]!;
-    expect(link.url).toBe("https://e.com/:tada:");
+    expect(link.url).toBe("https://example.com/:tada:");
   });
 });
 

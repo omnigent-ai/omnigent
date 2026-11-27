@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { fetchSessionDescendants } from "./useSessionDescendants";
+import { getSessionParent } from "@/lib/sessionHost";
+import { fetchSessionDescendants, SUB_AGENT_LIST_CAP } from "./useSessionDescendants";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -75,5 +76,43 @@ describe("fetchSessionDescendants", () => {
     vi.mocked(authenticatedFetch).mockResolvedValue(new Response("{}", { status: 500 }));
     await expect(fetchSessionDescendants("conv_root")).rejects.toMatchObject({ status: 500 });
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("walks each parent's own children, and registers each row under its real parent", async () => {
+    const tree: Record<string, string[]> = {
+      conv_root: ["conv_a", "conv_b"],
+      conv_a: ["conv_a1"],
+      conv_b: ["conv_b1", "conv_b2"],
+    };
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const parent = Object.keys(tree).find((id) => String(input).includes(`/${id}/`));
+      return page((tree[parent ?? ""] ?? []).map((id) => row(id)));
+    });
+
+    const result = await fetchSessionDescendants("conv_root");
+
+    expect(result.rows.map((entry) => [entry.info.id, entry.parentId, entry.depth])).toEqual([
+      ["conv_a", "conv_root", 1],
+      ["conv_b", "conv_root", 1],
+      ["conv_a1", "conv_a", 2],
+      ["conv_b1", "conv_b", 2],
+      ["conv_b2", "conv_b", 2],
+    ]);
+    expect(getSessionParent("conv_b2")).toBe("conv_b");
+    expect(result.truncated).toBe(false);
+  });
+
+  it("stops the walk at the row cap and says the list is cut short", async () => {
+    let next = 0;
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      if (!String(input).includes("/conv_root/")) return page([]);
+      const rows = Array.from({ length: 100 }, () => row(`conv_${(next += 1)}`));
+      return page(rows, rows.at(-1)!.id);
+    });
+
+    const result = await fetchSessionDescendants("conv_root");
+
+    expect(result.rows).toHaveLength(SUB_AGENT_LIST_CAP);
+    expect(result.truncated).toBe(true);
   });
 });

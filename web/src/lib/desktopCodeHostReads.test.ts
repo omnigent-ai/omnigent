@@ -1,18 +1,24 @@
-// One code-host read asks the shell what it offers once, for both its operation and its priority.
+// One code-host read asks the shell what it offers once, for both its operation and its priority,
+// and waits out its reader's cooldown without reaching the shell.
 
 import { afterEach, expect, it, vi } from "vitest";
 
 import { queryCodeHost } from "./desktopCodeHostReads";
+import { githubCooldownKey, githubCooldowns } from "./githubCooldown";
 
 afterEach(() => {
+  githubCooldowns.reset();
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
 });
 
-function installShell({ readPriority }: { readPriority?: number } = {}) {
+function installShell({
+  readPriority,
+  answer = { ok: true, data: {} },
+}: { readPriority?: number; answer?: unknown } = {}) {
   const getDesktopFeatures = vi.fn(async () => ({
     codeHosts: [{ id: "github", operations: ["pull_request_view"], readPriority }],
   }));
-  const codeHostQuery = vi.fn(async (_request: unknown) => ({ ok: true, data: {} }));
+  const codeHostQuery = vi.fn(async (_request: unknown) => answer);
   (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
     kind: "electron",
     getDesktopFeatures,
@@ -49,4 +55,22 @@ it("answers unsupported for an operation the shell doesn't offer, without asking
   const result = await queryCodeHost(request("pull_request_merge"));
   expect(result).toMatchObject({ ok: false, error: { code: "unsupported" } });
   expect(shell.codeHostQuery).not.toHaveBeenCalled();
+});
+
+it("refuses a read while its reader cools down, without asking the shell", async () => {
+  const shell = installShell();
+  githubCooldowns.rateLimited(githubCooldownKey("github.com", "octo"), Date.now() + 60_000);
+  const result = await queryCodeHost(request("pull_request_view"));
+  expect(result).toMatchObject({ ok: false, error: { code: "rate_limited", local: true } });
+  expect(shell.codeHostQuery).not.toHaveBeenCalled();
+});
+
+it("starts the reader's cooldown from a partial answer that met a limit", async () => {
+  const retryAt = Date.now() + 120_000;
+  installShell({
+    answer: { ok: true, data: { partial: { cause: "rate_limited", retryAt } } },
+  });
+  const result = await queryCodeHost(request("pull_request_view"));
+  expect(result.ok).toBe(true);
+  expect(githubCooldowns.heldUntil(githubCooldownKey("github.com", "octo"))).toBe(retryAt);
 });

@@ -94,6 +94,20 @@ describe("markdownListStackFormat on hand-edited descriptions", () => {
     ],
     ["odd indentation", LINEAR.replace("  - [stack/middle]", "   - [stack/middle]"), "indentation"],
     ["the bold marker without the pointer", LINEAR.replace(" ← _this PR_", ""), "current-marker"],
+    ...[
+      "stack/middle.lock",
+      "stack/middle/",
+      "stack//middle",
+      "stack/.middle",
+      "stack/middle.",
+    ].map(
+      (label) =>
+        [
+          `a label git can't create, ${label}`,
+          LINEAR.replace("[stack/middle]", `[${label}]`),
+          "unexpected-line",
+        ] as [string, string, string],
+    ),
   ])("tolerates %s for navigation only", (_case, body, tolerance) => {
     const parsed = parse(body);
     expect(parsed?.trust).toBe("tolerated");

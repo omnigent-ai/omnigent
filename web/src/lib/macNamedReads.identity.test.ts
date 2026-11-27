@@ -115,3 +115,40 @@ it("stops hearing identity changes at a reset", () => {
   resetMacNamedReadsForTests();
   expect(identityListeners.size).toBe(0);
 });
+
+it.each([
+  ["no identity", { ...answerAs("octo"), identity: undefined }],
+  [
+    "an identity main didn't read by name",
+    { ...answerAs("octo"), identity: { ...answerAs("octo").identity, named: undefined } },
+  ],
+  [
+    "an identity on another host",
+    { ...answerAs("octo"), identity: { ...answerAs("octo").identity, host: "ghe.example.com" } },
+  ],
+  ["another login's identity", answerAs("someone-else")],
+  [
+    "a negative generation",
+    { ...answerAs("octo"), identity: { ...answerAs("octo").identity, generation: -1 } },
+  ],
+  ["no provenance", { ...answerAs("octo"), provenance: undefined }],
+  [
+    "provenance of another version",
+    { ...answerAs("octo"), provenance: { ...answerAs("octo").provenance, version: 2 } },
+  ],
+  [
+    "provenance on another host",
+    {
+      ...answerAs("octo"),
+      provenance: { ...answerAs("octo").provenance, host: "ghe.example.com" },
+    },
+  ],
+  [
+    "another viewer",
+    { ...answerAs("octo"), provenance: { ...answerAs("octo").provenance, viewer: "someone-else" } },
+  ],
+])("keeps no named answer with %s, and proves no writer", async (_case, answer) => {
+  await namedReadsOn();
+  expect(acceptNamedAnswer(namedReadTicket(READER), answer)).toBe("unproven");
+  expect(namedWriterIdentity(READER)).toBe("checking");
+});

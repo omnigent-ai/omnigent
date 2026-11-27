@@ -46,7 +46,11 @@ const FORBIDDEN_IN_BRANCH = [" ", "~", "^", ":", "?", "*", "[", "\\"];
 
 /** Whether `name` could be a branch git created; anything else isn't producer output. */
 function isBranchName(name: string): boolean {
-  if (name === "" || name.includes("..") || name.includes("@{")) return false;
+  if (name === "" || name === "@" || name.includes("..") || name.includes("@{")) return false;
+  // Git's rules for each `/`-separated part, and for the name's ends.
+  if (name.endsWith(".") || name.split("/").some((part) => /^$|^\.|\.lock$/.test(part))) {
+    return false;
+  }
   return ![...name].some(
     (character) =>
       FORBIDDEN_IN_BRANCH.includes(character) ||

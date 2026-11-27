@@ -37,8 +37,8 @@ export interface DeviceRecentList<Item> {
   /** Who lists are kept for now, or null without a stable server or a user. */
   owner: () => string | null;
   /**
-   * Put `added` first, in the order given, for `owner` (from `owner()` when the change was
-   * made). Nothing is kept once another user or server is signed in instead.
+   * Put `added` first, its last item first as the most recent, for `owner` (from `owner()` when
+   * the change was made). Nothing is kept once another user or server is signed in instead.
    */
   record: (scope: readonly string[], added: readonly Item[], owner: string | null) => void;
   /**
