@@ -184,8 +184,14 @@ export function createGitHubReadBudgets({
 
   /** Remember a poll its budget slowed or paused, at `heldAt`, to wake it when that budget lets go. */
   function hold(query: HeldPoll, heldAt: GitHubBudgetPace = STOPPED_UNTIL_RESET) {
-    if (heldAt.pace === "stopped") held.hold(query);
-    else if (heldAt.pace === "slow") slowed.hold(query);
+    // Only its latest pace holds a poll: one slowed, then stopped, keeps its stopped timer.
+    if (heldAt.pace === "stopped") {
+      slowed.release(query);
+      held.hold(query);
+    } else if (heldAt.pace === "slow") {
+      held.release(query);
+      slowed.hold(query);
+    }
   }
 
   /** Forget every budget, listener and flag watch, for tests. */

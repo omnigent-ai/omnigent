@@ -27,9 +27,12 @@ export function createHeldPolls() {
   function live(): HeldPoll[] {
     const polls: HeldPoll[] = [];
     const kept: WeakRef<HeldPoll>[] = [];
+    const seen = new Set<HeldPoll>();
     for (const ref of refs) {
       const poll = ref.deref();
-      if (!poll) continue;
+      // Let go, or held again after a release: each poll counts once.
+      if (!poll || !holding.has(poll) || seen.has(poll)) continue;
+      seen.add(poll);
       if (observed(poll)) {
         polls.push(poll);
         kept.push(ref);
@@ -53,6 +56,10 @@ export function createHeldPolls() {
       if (refs.length >= Math.max(2 * keptAtPrune, PRUNE_AT_LEAST)) live();
       holding.add(poll);
       refs.push(new WeakRef(poll));
+    },
+    /** Stop holding `poll`, as when another pacer's rule now holds it instead. */
+    release(poll: HeldPoll) {
+      holding.delete(poll);
     },
     /** Work out each held poll's interval again; its next read follows the new one. */
     reschedule() {

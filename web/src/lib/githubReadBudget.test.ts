@@ -274,6 +274,25 @@ describe("githubReadBudgets and the shell's rollback flag", () => {
     }
   });
 
+  it("holds a poll slowed and then stopped only as stopped, so the reset leaves its read due", () => {
+    vi.useFakeTimers();
+    try {
+      const { store, advance } = budgets();
+      const setOptions = vi.fn();
+      const query = { observers: [{ options: { queryKey: ["q"] }, setOptions }] };
+      store.observe(KEY, graphql(1000));
+      store.hold(query, store.pace(KEY));
+      store.observe(KEY, graphql(10));
+      store.hold(query, store.pace(KEY));
+      const wait = RESET - START;
+      advance(wait);
+      vi.advanceTimersByTime(wait);
+      expect(setOptions).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("forgets its listeners and flag watch on clear, and pacing turned off with them", () => {
     let setEnabled: (enabled: boolean) => void = () => {};
     const stopWatching = vi.fn();
