@@ -55,6 +55,7 @@ Design notes:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -72,6 +73,7 @@ from urllib.parse import quote
 
 from omnigent import config as _config
 from omnigent.git_providers import host_of
+from omnigent.git_providers.github import gh_config_dir
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
@@ -357,6 +359,11 @@ def _owner_repo_from_pr_url(url: str | None) -> str | None:
     return f"{match.group(1)}/{match.group(2)}" if match else None
 
 
+# Entries _list_accounts dropped because gh couldn't resolve their login; _gh_accounts
+# doesn't reuse a list fetched while this changed, since that list is incomplete.
+_unresolved_account_entries = 0
+
+
 def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     """Return ``(authenticated, accounts)`` from ``gh auth status --json hosts``.
 
@@ -364,6 +371,7 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     when at least one account validates (``state == "success"``). Falls back to a
     plain ``gh auth status`` for the boolean on an older ``gh`` without ``--json``.
     """
+    global _unresolved_account_entries
     _, out, _ = _gh(["auth", "status", "--json", "hosts"], cwd=root)
     try:
         data = json.loads(out)
@@ -376,7 +384,10 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
             if not isinstance(entries, list):
                 continue
             for entry in entries:
-                if not isinstance(entry, dict) or not entry.get("login"):
+                if not isinstance(entry, dict):
+                    continue
+                if not entry.get("login"):
+                    _unresolved_account_entries += 1
                     continue
                 accounts.append(
                     {
@@ -392,13 +403,66 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     return rc == 0, []
 
 
+_GH_TOKEN_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+_accounts_cache: tuple[tuple[Any, ...], list[dict[str, Any]]] | None = None
+
+
+def _gh_auth_state_key(root: str) -> tuple[Any, ...]:
+    """Identify the local state ``gh auth status`` in *root* reads its accounts from.
+
+    ``gh auth login``/``logout``/``switch`` rewrite ``hosts.yml``, and env tokens add
+    accounts, so a change to any account's login, host, or active flag changes this key.
+    """
+    hosts_path = ""
+    hosts_file: tuple[Any, ...] = ()
+    try:
+        # gh runs with cwd=root, so a relative config dir names a file under root.
+        hosts_path = os.path.join(root, gh_config_dir(), "hosts.yml")
+        stat = os.stat(hosts_path)
+        hosts_file = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    except (RuntimeError, OSError):
+        # No home directory (RuntimeError) or no readable hosts.yml: gh has no file accounts.
+        pass
+    # _gh scrubs the env tokens inside a sandbox, so gh doesn't see them there.
+    tokens = "" if _in_sandbox() else "\0".join(os.environ.get(k, "") for k in _GH_TOKEN_ENV_VARS)
+    return (
+        hosts_path,
+        hosts_file,
+        hashlib.sha256(tokens.encode()).hexdigest(),
+        os.environ.get("GH_HOST", ""),
+    )
+
+
+def _gh_accounts(root: str) -> list[dict[str, Any]]:
+    """``_list_accounts``'s accounts, reused while gh's local auth state is unchanged.
+
+    ``gh auth status`` checks every token over the network, and the PR panel polls a
+    tracked PR every few seconds. Callers here read only login, host, and the active
+    flag, which come from local state, so the list is reused until that state changes.
+    ``state`` can lag a server-side token revocation; callers that need it use
+    ``_list_accounts``. An empty list (signed out, a timeout, or an older gh) is never
+    reused, nor is one missing an account whose login gh couldn't resolve this time.
+    """
+    global _accounts_cache
+    key = _gh_auth_state_key(root)
+    # One read of the shared entry, so a concurrent caller can't swap in another key's list.
+    cached = _accounts_cache
+    if cached is None or cached[0] != key:
+        unresolved_before = _unresolved_account_entries
+        _, accounts = _list_accounts(root)
+        if accounts and _unresolved_account_entries == unresolved_before:
+            _accounts_cache = (key, accounts)
+        return [dict(account) for account in accounts]
+    return [dict(account) for account in cached[1]]
+
+
 def _gh_signed_in_to_host(root: str, host: str) -> bool:
     """Whether ``gh`` reports a login on ``host``.
 
     Some setups sign ``gh`` in to an enterprise host only when a command names that host,
     so a host missing from the global listing is asked about directly.
     """
-    _, accounts = _list_accounts(root)
+    accounts = _gh_accounts(root)
     if host in {account.get("host") for account in accounts}:
         return True
     rc, _, _ = _gh(["auth", "status", "-h", host], cwd=root)
@@ -1307,7 +1371,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     }
     if not info["gh_available"]:
         return info
-    _, accounts = _list_accounts(root)
+    accounts = _gh_accounts(root)
     info["accounts"] = [a for a in accounts if a.get("host") == reference.host]
     preferred = _config.github_account_preference(_repo_argument(reference))
     info["selected_account"] = preferred or next(
@@ -2236,7 +2300,7 @@ def _merge_error(stderr: str, *, action: str) -> str:
 
 def _active_login(root: str, host: str) -> str | None:
     """``gh``'s active account on ``host``, or ``None`` when there is none."""
-    _, accounts = _list_accounts(root)
+    accounts = _gh_accounts(root)
     return next(
         (a.get("login") for a in accounts if a.get("host") == host and a.get("active")), None
     )
