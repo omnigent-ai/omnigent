@@ -1,4 +1,4 @@
-"""Check exact native draft export and replacement through the external editor."""
+"""Check native draft export, refusal preservation and conditional replacement."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from tests.e2e.conftest import get_mock_message_requests
 pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
 
 
-def test_claude_external_editor_preserves_exact_logical_drafts(
+def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     tmp_path: Path,
     isolated_mock_llm_server_url: str,
     claude_managed_settings: None,
@@ -44,10 +44,13 @@ def test_claude_external_editor_preserves_exact_logical_drafts(
         f"observed = Path({str(observed)!r})\n"
         "source = Path(sys.argv[-1])\n"
         "content = source.read_bytes().decode('utf-8')\n"
+        "request = json.loads(instruction.read_text())\n"
+        "accepted = content == request['expected']\n"
         "with observed.open('a', encoding='utf-8') as stream:\n"
-        "    stream.write(json.dumps({'content': content}) + '\\n')\n"
-        "replacement = json.loads(instruction.read_text())['replacement']\n"
-        "source.write_bytes(replacement.encode('utf-8'))\n"
+        "    stream.write(json.dumps({'content': content, 'accepted': accepted}) + '\\n')\n"
+        "if not accepted:\n"
+        "    sys.exit(1)\n"
+        "source.write_bytes(request['replacement'].encode('utf-8'))\n"
     )
     editor_command = shlex.join([sys.executable, str(editor)])
     env = {
@@ -64,13 +67,13 @@ def test_claude_external_editor_preserves_exact_logical_drafts(
     }
     bridge.ensure_claude_workspace_trusted(workspace, env)
     version = subprocess.check_output([claude, "--version"], env=env, text=True, timeout=10)
-    drafts = [
-        "editor-wrapped-draft " + "0123456789 " * 24 + "draft-end",
-        "  editor-multiline-draft\n\nsecond line with spaces  \nthird line 😀\n",
-        "editor-replacement-confirmed",
-    ]
+    draft = (
+        "  editor-wrapped-draft "
+        + "0123456789 " * 24
+        + "draft-end\n\nsecond line with spaces  \nthird line 😀\n"
+    )
 
-    def observations() -> list[dict[str, str]]:
+    def observations() -> list[dict[str, object]]:
         if not observed.exists():
             return []
         try:
@@ -125,20 +128,27 @@ def test_claude_external_editor_preserves_exact_logical_drafts(
                 poll_until(lambda: bridge._composer_box(pane()) is not None, timeout_s=30)
             except AssertionError as exc:
                 raise AssertionError({"phase": "initial-composer", "pane": pane()}) from exc
-            command("load-buffer", "-b", "editor-draft", "-", text=drafts[0])
+            command("load-buffer", "-b", "editor-draft", "-", text=draft)
             command("paste-buffer", "-d", "-p", "-b", "editor-draft", "-t", target)
             poll_until(lambda: "draft-end" in pane(), timeout_s=10)
-            for index, expected in enumerate(drafts):
-                replacement = drafts[min(index + 1, len(drafts) - 1)]
-                instruction.write_text(json.dumps({"replacement": replacement}))
+            steps = [
+                (draft.rstrip("\n"), draft, False),
+                (draft.replace("\n", " "), draft, False),
+                (draft, draft, True),
+                ("unrelated claim", "/status", False),
+            ]
+            for index, (claimed, expected, accepted) in enumerate(steps):
+                instruction.write_text(json.dumps({"expected": claimed, "replacement": "/status"}))
                 command("send-keys", "-t", target, "C-g")
                 poll_until(lambda index=index: len(observations()) == index + 1, timeout_s=15)
-                actual = observations()[-1]["content"]
+                observation = observations()[-1]
+                actual = observation["content"]
                 assert actual == expected, {"step": index, "expected": expected, "actual": actual}
+                assert observation["accepted"] is accepted
                 poll_until(
-                    lambda replacement=replacement: (
+                    lambda expected=("/status" if accepted else expected): (
                         bridge._composer_box(pane()) is not None
-                        and replacement.splitlines()[0].strip() in pane()
+                        and expected.splitlines()[0].strip() in pane()
                     ),
                     timeout_s=10,
                 )
