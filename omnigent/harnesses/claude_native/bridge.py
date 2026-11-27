@@ -1479,6 +1479,7 @@ class ClaudeNativeToolRelay:
         tool_executor: ToolExecutor,
         closed: threading.Event,
         credential_binding: ClaudeBridgeCredentialBinding | None = None,
+        require_activation_binding: bool = True,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1490,6 +1491,7 @@ class ClaudeNativeToolRelay:
         :param relay_info: Current relay advertisement, including its stable token.
         :param tool_executor: Callback for the current tool surface.
         :param credential_binding: Bridge activation owned by this relay.
+        :param require_activation_binding: Whether this relay uses Claude's activation metadata.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
@@ -1503,6 +1505,7 @@ class ClaudeNativeToolRelay:
         self._tool_executor = tool_executor
         self._closed = closed
         self._credential_binding = credential_binding or read_bridge_credential_binding(bridge_dir)
+        self._require_activation_binding = require_activation_binding
 
     def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
@@ -1518,7 +1521,9 @@ class ClaudeNativeToolRelay:
         }
         with _bridge_metadata_write_lock(self._bridge_dir):
             if self._closed.is_set() or not _bridge_endpoint_is_current(
-                self._bridge_dir, self._credential_binding
+                self._bridge_dir,
+                self._credential_binding,
+                require_binding=self._require_activation_binding,
             ):
                 raise RuntimeError("Native tool relay activation has ended")
             _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
@@ -2287,10 +2292,15 @@ def _bridge_credentials_current(
 
 
 def _bridge_endpoint_is_current(
-    bridge_dir: Path, binding: ClaudeBridgeCredentialBinding | None
+    bridge_dir: Path,
+    binding: ClaudeBridgeCredentialBinding | None,
+    *,
+    require_binding: bool = True,
 ) -> bool:
-    """An endpoint must retain a concrete activation before exposing its cached token."""
-    return binding is not None and _bridge_credentials_current(bridge_dir, binding)
+    """Require a concrete activation for endpoints tied to Claude's settings lifecycle."""
+    return (binding is not None or not require_binding) and _bridge_credentials_current(
+        bridge_dir, binding
+    )
 
 
 def retire_bridge_credentials(bridge_dir: Path, session_id: str) -> None:
@@ -9272,6 +9282,9 @@ def start_tool_relay(
         registry.
     :returns: Started relay handle. Call :meth:`close` when done.
     """
+    require_activation_binding = _absolute_syntactic_path(bridge_dir).is_relative_to(
+        _absolute_syntactic_path(_BRIDGE_ROOT)
+    )
     credential_binding = read_bridge_credential_binding(bridge_dir)
     token = secrets.token_urlsafe(32)
     closed = threading.Event()
@@ -9300,6 +9313,7 @@ def start_tool_relay(
         session_id=session_id,
         bridge_dir=bridge_dir,
         file_change_observer=file_change_observer,
+        require_activation_binding=require_activation_binding,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
@@ -9313,7 +9327,9 @@ def start_tool_relay(
         relay_info["session_id"] = session_id
     try:
         with _bridge_metadata_write_lock(bridge_dir):
-            if not _bridge_endpoint_is_current(bridge_dir, credential_binding):
+            if not _bridge_endpoint_is_current(
+                bridge_dir, credential_binding, require_binding=require_activation_binding
+            ):
                 raise ClaudeSettingsRequestExpired()
             _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
             # Hooks source this file whenever they run, so replace it whole.
@@ -9332,6 +9348,7 @@ def start_tool_relay(
         tool_executor=tool_executor,
         closed=closed,
         credential_binding=credential_binding,
+        require_activation_binding=require_activation_binding,
     )
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -9622,6 +9639,7 @@ def _tool_relay_handler_factory(
     session_id: str | None = None,
     bridge_dir: Path | None = None,
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
+    require_activation_binding: bool = True,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -9637,6 +9655,7 @@ def _tool_relay_handler_factory(
         for each ``/hook/observe-tool`` payload, so the runner can record
         native file-mutating tool calls in the session's filesystem
         registry.
+    :param require_activation_binding: Whether the relay uses Claude activation metadata.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
@@ -9674,7 +9693,9 @@ def _tool_relay_handler_factory(
                 return
             if self.headers.get("Authorization") != f"Bearer {token}" or (
                 bridge_dir is not None
-                and not _bridge_endpoint_is_current(bridge_dir, credential_binding)
+                and not _bridge_endpoint_is_current(
+                    bridge_dir, credential_binding, require_binding=require_activation_binding
+                )
             ):
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return

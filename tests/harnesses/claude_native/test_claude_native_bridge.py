@@ -7544,6 +7544,7 @@ async def test_unreadable_caller_settings_warn_without_contents_or_argument_chan
     from unittest.mock import AsyncMock, Mock
 
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.inner.terminal import TerminalInstance
 
     secret = "private-settings-content"
@@ -7567,7 +7568,14 @@ async def test_unreadable_caller_settings_warn_without_contents_or_argument_chan
         socket_path=tmp_path / "socket",
         private_dir=tmp_path,
         os_env=environment,
-        sandbox_policy=Mock(active=failure not in {"missing", "invalid-utf8"}),
+        sandbox_policy=SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=failure not in {"missing", "invalid-utf8"},
+            read_roots=[tmp_path],
+            write_roots=[],
+            write_files=[],
+            allow_network=False,
+        ),
         args=list(args),
     )
     await claude_native_bridge.finalize_claude_caller_settings(
@@ -7615,6 +7623,7 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
     from unittest.mock import AsyncMock, Mock
 
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.inner.terminal import TerminalInstance
 
     path = tmp_path / "settings.json"
@@ -7636,7 +7645,14 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
         socket_path=tmp_path / "socket",
         private_dir=tmp_path,
         os_env=environment,
-        sandbox_policy=Mock(active=True),
+        sandbox_policy=SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[tmp_path],
+            write_roots=[],
+            write_files=[],
+            allow_network=False,
+        ),
         command=command,
         args=prefix + augment_claude_args(("--settings", "settings.json"), bridge_dir=tmp_path),
     )
@@ -11448,6 +11464,7 @@ async def test_start_tool_relay_accepts_pi_native_bridge_root(
     from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
     pi_root = tmp_path / ".omnigent" / "pi-native"
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", pi_root)
     bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_pi")
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
@@ -11502,6 +11519,7 @@ async def test_start_tool_relay_accepts_codex_native_bridge_root(
     from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 
     codex_root = tmp_path / ".omnigent" / "codex-native"
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", codex_root)
     bridge_dir = codex_native_bridge.prepare_bridge_dir("conv_codex")
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
@@ -11608,6 +11626,7 @@ async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
     from omnigent.harnesses.antigravity_native import bridge as antigravity_native_bridge
 
     antigravity_root = tmp_path / ".omnigent" / "antigravity-native"
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr(
         "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT", antigravity_root
     )
@@ -11673,6 +11692,7 @@ async def test_start_tool_relay_accepts_opencode_native_bridge_root(
     from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
 
     opencode_root = tmp_path / ".omnigent" / "opencode-native"
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge._BRIDGE_ROOT", opencode_root)
     bridge_dir = opencode_native_bridge.prepare_bridge_dir("conv_oc")
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
@@ -18605,6 +18625,7 @@ def _hook_relay(tmp_path, monkeypatch, client):
     """Boot a relay wired with *client* for the hook-evaluate tests."""
     from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
     bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_hook_eval")
 
@@ -18700,6 +18721,7 @@ async def test_tool_relay_runs_only_advertised_tools(
     """
     from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
     bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_relay_surface")
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
