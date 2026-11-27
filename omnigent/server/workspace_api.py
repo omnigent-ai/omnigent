@@ -217,10 +217,11 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         vouch = await _vouch(route, request)
         sent_at = time.time()
         changes = not method.no_side_effects
-        # The PR the call names, else the server's first, which the host would change.
-        target = getattr(request, "pr_url", "") or (vouch.default_pr_url if vouch else None)
         writes = changes and method.name not in _HOST_ONLY_CHANGES
-        if writes and refuses_change(target, route.read_only_code_hosts):
+        targets = _change_targets(request, vouch)
+        if writes and any(
+            refuses_change(target, route.read_only_code_hosts) for target in targets
+        ):
             raise ConnectError(
                 Code.FAILED_PRECONDITION,
                 READ_ONLY_CODE_HOST_MESSAGE,
@@ -398,6 +399,18 @@ async def _vouch(route: PullRequestRoute, request: Message) -> PullRequestVouch 
     if not vouches or any(vouch is None or not vouch.server_tracked for vouch in vouches):
         return None
     return PullRequestVouch(server_tracked=True)
+
+
+def _change_targets(request: Message, vouch: PullRequestVouch | None) -> list[str | None]:
+    """The pull requests a change acts on.
+
+    Each one a batch names; otherwise the one the call names, or else the server's first,
+    which the host would change.
+    """
+    items = getattr(request, "pull_requests", None)
+    if items is not None:
+        return [item.pr_url or None for item in items] or [None]
+    return [getattr(request, "pr_url", "") or (vouch.default_pr_url if vouch else None)]
 
 
 def _reply_timeout(method: str, *, changes: bool) -> float:

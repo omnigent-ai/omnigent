@@ -1551,6 +1551,7 @@ _CHANGE_REQUESTS = {
     **host_tests._OWNER_CALLS,
     **host_tests._GITHUB_CHANGE_CALLS,
     **host_tests._QUEUE_CALLS,
+    "EnableAutoMerge": (host_tests._AUTO_MERGE, "enable_auto_merge", {}),
 }
 _READ_ONLY_GITHUB = ("github.com",)
 
@@ -1628,6 +1629,34 @@ async def test_a_change_to_a_pr_on_a_read_only_host_is_refused_before_the_host(
     tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=_READ_ONLY_GITHUB)
 
     await _refused_before_the_host(tunnel, method, _CHANGE_REQUESTS[method][0])
+
+
+async def test_an_auto_merge_batch_naming_a_read_only_hosts_pr_is_refused_before_the_host(
+    tmp_path: Path,
+) -> None:
+    """The session's first pull request is writable; a later one in the batch isn't."""
+    batch = pb.EnableAutoMergeRequest(
+        pull_requests=[
+            pb.PullRequestAutoMerge(pr_url=_PR, merge_method="squash", expected_head_oid="a" * 40),
+            pb.PullRequestAutoMerge(
+                pr_url="https://git.example.com/example-org/example-repo/pull/9",
+                merge_method="squash",
+                expected_head_oid="b" * 40,
+            ),
+        ]
+    )
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=("git.example.com",))
+
+    await _refused_before_the_host(tunnel, "EnableAutoMerge", batch)
+
+
+async def test_an_auto_merge_batch_on_writable_hosts_reaches_the_host(tmp_path: Path) -> None:
+    """A batch names no single pull request, so each one it names is checked instead."""
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=("git.example.com",))
+
+    await _end_after_frame(tunnel, "EnableAutoMerge", host_tests._AUTO_MERGE, "internal")
+
+    assert [frame.method for frame in tunnel.sent] == ["EnableAutoMerge"]
 
 
 @pytest.mark.parametrize(
