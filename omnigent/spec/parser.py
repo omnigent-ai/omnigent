@@ -109,6 +109,7 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 # ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
     {
+        "acp_agent",
         "broker_gateway",
         "context_files",
         "disable_native_tools",
