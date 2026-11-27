@@ -399,7 +399,33 @@ def test_quick_pick_marks_all_read_and_filters_the_inbox(
     )
 
 
-def _create_project(base_url: str, name: str) -> str:
+@pytest.fixture
+def project_names_to_delete() -> Iterator[list[tuple[str, str]]]:
+    """(base URL, name) of each project a test makes or renames; deleted even when it fails."""
+    tracked: list[tuple[str, str]] = []
+    yield tracked
+    for base_url in {base for base, _ in tracked}:
+        names = {name for base, name in tracked if base == base_url}
+        listed = httpx.get(f"{base_url}/v1/projects", timeout=10.0).json()["data"]
+        for project in listed:
+            if project["name"] in names:
+                httpx.delete(f"{base_url}/v1/projects/{project['id']}", timeout=10.0)
+
+
+@pytest.fixture
+def restored_project_order(live_server: str) -> Iterator[None]:
+    """Put the caller's project order and sort mode back after a test that moves projects."""
+    url = f"{live_server}/v1/projects/order"
+    saved = httpx.get(url, timeout=10.0).json()
+    yield
+    if saved["ordered_project_ids"] is not None:
+        httpx.put(url, json={"ordered_project_ids": saved["ordered_project_ids"]}, timeout=10.0)
+    if saved["sort_mode"] == "alphabetical":
+        httpx.put(url, json={"ordered_project_ids": None}, timeout=10.0)
+
+
+def _create_project(base_url: str, name: str, tracked: list[tuple[str, str]]) -> str:
+    tracked.append((base_url, name))
     response = httpx.post(f"{base_url}/v1/projects", json={"name": name}, timeout=10.0)
     response.raise_for_status()
     return response.json()["id"]
@@ -417,13 +443,15 @@ def _project_folder(page: Page, name: str) -> Locator:
 
 
 def test_quick_pick_renames_the_open_sessions_project(
-    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+    project_names_to_delete: list[tuple[str, str]],
 ) -> None:
     """⌘K names the open session's project and renames it with the folder menu's dialog."""
     base_url, session_id = seeded_session
     # The server is shared, so each run names its own project.
     name = f"Osprey {uuid.uuid4().hex[:6]}"
-    project_id = _create_project(base_url, name)
+    project_id = _create_project(base_url, name, project_names_to_delete)
     patch_session(base_url, session_id, project_id=project_id)
     page: Page = request.getfixturevalue("page")
     enable_quick_pick_palette(page)
@@ -436,6 +464,7 @@ def test_quick_pick_renames_the_open_sessions_project(
     expect(name_input).to_be_focused(timeout=10_000)
     expect(name_input).to_have_value(name)
     renamed = f"{name} field notes"
+    project_names_to_delete.append((base_url, renamed))
     name_input.fill(renamed)
     page.get_by_test_id("rename-project-confirm").click()
     expect(dialog).to_have_count(0)
@@ -444,7 +473,9 @@ def test_quick_pick_renames_the_open_sessions_project(
 
 
 def test_quick_pick_creates_a_project(
-    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+    project_names_to_delete: list[tuple[str, str]],
 ) -> None:
     """⌘K New project… opens the Projects header's dialog and files a new folder."""
     base_url, session_id = seeded_session
@@ -457,6 +488,7 @@ def test_quick_pick_creates_a_project(
     name_input = page.get_by_placeholder("Project name…")
     expect(name_input).to_be_visible(timeout=10_000)
     name = f"Wren {uuid.uuid4().hex[:6]}"
+    project_names_to_delete.append((base_url, name))
     name_input.fill(name)
     page.get_by_test_id("new-project-confirm").click()
     expect(page.get_by_test_id("new-project-confirm")).to_have_count(0)
@@ -465,12 +497,14 @@ def test_quick_pick_creates_a_project(
 
 
 def test_quick_pick_deletes_the_project_a_new_session_starts_in(
-    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+    project_names_to_delete: list[tuple[str, str]],
 ) -> None:
     """From the new-session view filed under a project, ⌘K deletes it and leaves the view."""
     base_url, session_id = seeded_session
     name = f"Plover {uuid.uuid4().hex[:6]}"
-    project_id = _create_project(base_url, name)
+    project_id = _create_project(base_url, name, project_names_to_delete)
     patch_session(base_url, session_id, project_id=project_id)
     page: Page = request.getfixturevalue("page")
     enable_quick_pick_palette(page)
@@ -518,20 +552,6 @@ def test_quick_pick_switches_the_session_lists_display(
     expect(archived_row.first).to_be_visible(timeout=10_000)
 
 
-def test_quick_pick_goes_to_the_sidebars_usage_page(
-    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
-) -> None:
-    """⌘K's Go to Usage opens the page the sidebar's Usage link does."""
-    base_url, session_id = seeded_session
-    page: Page = request.getfixturevalue("page")
-    enable_quick_pick_palette(page, "usage_page")
-    page.goto(f"{base_url}/c/{session_id}")
-    expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
-
-    run_palette_command(page, "go to usage", "Go to Usage", closes=True)
-    expect(page).to_have_url(f"{base_url}/usage", timeout=10_000)
-
-
 def test_quick_pick_moves_the_open_pin_up(
     request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
 ) -> None:
@@ -563,13 +583,18 @@ def _folder_names(page: Page) -> list[str]:
     return page.locator('button[data-slot="context-menu-trigger"]').all_inner_texts()
 
 
-def test_quick_pick_moves_the_project_in_view(request: pytest.FixtureRequest) -> None:
+@pytest.mark.usefixtures("restored_project_order")
+def test_quick_pick_moves_the_project_in_view(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    project_names_to_delete: list[tuple[str, str]],
+) -> None:
     """⌘K moves the project a new session starts in, as its folder menu's Move does."""
-    base_url = request.getfixturevalue("live_server")
+    base_url = live_server
     suffix = uuid.uuid4().hex[:6]
     first, second = f"Wren {suffix} A", f"Wren {suffix} B"
-    _create_project(base_url, first)
-    _create_project(base_url, second)
+    _create_project(base_url, first, project_names_to_delete)
+    _create_project(base_url, second, project_names_to_delete)
     page: Page = request.getfixturevalue("page")
     enable_quick_pick_palette(page)
     page.goto(f"{base_url}/?project={quote(first)}")

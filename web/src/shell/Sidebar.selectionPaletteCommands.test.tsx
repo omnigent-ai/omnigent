@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -7,8 +8,10 @@ import {
   type PaletteCommand,
   usePaletteCommandsStore,
 } from "@/store/paletteCommands";
+import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { resetArchiveNavigationForTests } from "./sessionCommands/archiveNavigation";
 
 // With quick_pick_palette on, ⌘K offers the sidebar's selection: Select all, Deselect all,
 // and the selection bar's actions, listed and greyed exactly as the bar's buttons are.
@@ -16,12 +19,14 @@ import { renderSidebar } from "@/test/sidebarTestHelpers";
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 const writes = vi.hoisted(() => ({
   move: { mutate: vi.fn(), isPending: false, isError: false },
+  archive: { mutate: vi.fn(), isPending: false, isError: false },
 }));
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
     useBulkMoveToProject: () => writes.move,
+    useBulkArchiveConversations: () => writes.archive,
     useProjects: () => ({ data: [{ id: "p1", name: "Payments", icon: null }] }),
   };
 });
@@ -54,6 +59,13 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   writes.move.isPending = false;
+  resetArchiveNavigationForTests();
+  useRecentSessionSwitchStore.setState({
+    history: [],
+    readLiveSessionIds: null,
+    sessionsKnown: false,
+    sessionsFailed: false,
+  });
   usePaletteCommandsStore.setState({ groups: {} });
 });
 
@@ -158,6 +170,35 @@ describe("Sidebar selection in ⌘K", () => {
     );
     act(() => command("Delete selected").run());
     expect(await screen.findByRole("dialog", { name: /Delete 1 session/ })).toBeTruthy();
+  });
+
+  it("archives the selection from Archive selected, and leaves the open session as the bar does", async () => {
+    function LocationProbe() {
+      return <output data-testid="location">{useLocation().pathname}</output>;
+    }
+    useRecentSessionSwitchStore.setState({
+      history: ["conv_a", "conv_b", "conv_c"],
+      readLiveSessionIds: () => new Set(ROWS.map((session) => session.id)),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+    renderSidebar({
+      features: QUICK_PICK,
+      route: "/c/conv_a",
+      routePattern: "/c/:conversationId",
+      children: <LocationProbe />,
+    });
+    await screen.findByRole("link", { name: /Alpha/ });
+    startSelecting();
+    fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Beta/ }));
+    act(() => command("Archive selected").run());
+
+    expect(writes.archive.mutate).toHaveBeenCalledTimes(1);
+    const { ids, archived } = writes.archive.mutate.mock.calls[0][0];
+    expect([...ids].sort()).toEqual(["conv_a", "conv_b"]);
+    expect(archived).toBe(true);
+    expect(screen.getByTestId("location").textContent).toBe("/c/conv_c");
   });
 
   it("names the selection in each action's ID, so an action picked before it changed does nothing", async () => {
