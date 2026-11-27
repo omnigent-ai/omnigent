@@ -271,6 +271,9 @@ import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
+import { usePublishSidebarSessionOrder } from "@/hooks/useSidebarSessionOrder";
+import { leaveSessionView } from "./sessionCommands/archiveNavigation";
+import { useQuickPickPaletteEnabled } from "@/shell/screenCommands/useQuickPickPaletteCommands";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import {
@@ -2333,6 +2336,9 @@ function useStartingConversationId(enabled: boolean): string | null {
   });
 }
 
+/** What the sidebar publishes for Next and Previous session while QuickPick is off. */
+const NO_LISTED_SESSIONS: readonly string[] = [];
+
 function ConversationList({
   conversationsQuery,
   scrollContainerRef,
@@ -3463,6 +3469,13 @@ function ConversationList({
     [orderedConversationIds],
   );
   useSessionNumberHotkeys(numberedSessionIds, activeId);
+  // With quick_pick_palette, ⌘K's Next and Previous session step through the same rows.
+  const publishesSessionOrder = useQuickPickPaletteEnabled();
+  const listedSessionIds = useMemo(
+    () => (publishesSessionOrder ? [...new Set(orderedConversationIds)] : NO_LISTED_SESSIONS),
+    [publishesSessionOrder, orderedConversationIds],
+  );
+  usePublishSidebarSessionOrder(listedSessionIds, publishesSessionOrder ? resolvedActiveId : null);
   // Holding the command modifier shows each numbered row's jump number. The slots
   // come from the hotkey's own list, so a badge exists only where the key works.
   useCommandHoldTracking();
@@ -6335,7 +6348,11 @@ function ConversationRowImpl({
     label,
     viewerId,
     serverInfo,
-    onLeave: isActive ? () => navigate("/", { replace: true }) : undefined,
+    // Leaving the open session leaves its view, as ⌘K's actions do.
+    onLeave: isActive
+      ? (cause) =>
+          leaveSessionView(cause, { conversation, source: "sidebar_menu", navigate, queryClient })
+      : undefined,
     componentIdPrefix: "sidebar.conversation",
   });
   // Subscribed so the just-recorded optimistic label flips the row
