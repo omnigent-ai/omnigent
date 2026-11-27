@@ -9172,7 +9172,11 @@ async def _execute_os_env_tool(
         until shell retirement. Without a registry each call owns its helper.
     :returns: Serialized tool result string.
     """
-    from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
+    from omnigent.inner.os_env import (
+        _DEFAULT_READ_LIMIT,
+        create_os_environment,
+        validate_shell_arguments,
+    )
 
     os_env = None
     owns_environment = True
@@ -9188,6 +9192,12 @@ async def _execute_os_env_tool(
         effective_spec = _effective_runner_os_env_spec(
             agent_spec, conversation_id, runner_workspace
         )
+        if tool_name == SysOsShellTool.name() and effective_spec.type == "caller_process":
+            invalid = validate_shell_arguments(
+                args.get("command", ""), cast("int | None", args.get("timeout"))
+            )
+            if invalid is not None:
+                return json_dumps_transport_safe(invalid)
         model_access = None
         if (
             agent_spec is not None

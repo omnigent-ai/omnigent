@@ -73,7 +73,10 @@ def _fake_environments(monkeypatch: pytest.MonkeyPatch, cwd: Path) -> list[Mock]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["success", "nonzero", "timeout", "lost", "raised"])
+@pytest.mark.parametrize(
+    "outcome",
+    ["success", "nonzero", "timeout", "lost", "raised", "invalid-command", "invalid-timeout"],
+)
 async def test_supported_shells_lease_the_file_environment_and_retire_failures(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
 ) -> None:
@@ -95,22 +98,35 @@ async def test_supported_shells_lease_the_file_environment_and_retire_failures(
             "nonzero": {"error": "command failed", "exit_code": 7},
             "timeout": {"error": "timed out", "timed_out": True},
             "lost": {"error": "reply lost; command was not sent again"},
+            "invalid-command": {"error": "command must be a non-empty string"},
+            "invalid-timeout": {"error": "timeout must be >= 1"},
         }
         if outcome == "raised":
             environment.isolated_shell.side_effect = OSError("request failed")
         else:
             environment.isolated_shell.return_value = results[outcome]
-        result = json.loads(await execute("sys_os_shell", {"command": "example", "timeout": 7}))
-        assert result == ({"error": "request failed"} if outcome == "raised" else results[outcome])
-        environment.isolated_shell.assert_awaited_once_with(
-            command="example", timeout=7, launcher="/supported/bwrap"
+        result = json.loads(
+            await execute(
+                "sys_os_shell",
+                {
+                    "command": " " if outcome == "invalid-command" else "example",
+                    "timeout": 0 if outcome == "invalid-timeout" else 7,
+                },
+            )
         )
+        assert result == ({"error": "request failed"} if outcome == "raised" else results[outcome])
+        if outcome.startswith("invalid-"):
+            environment.isolated_shell.assert_not_awaited()
+        else:
+            environment.isolated_shell.assert_awaited_once_with(
+                command="example", timeout=7, launcher="/supported/bwrap"
+            )
         environment.shell.assert_not_awaited()
         assert len(environments) == 1
         assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
             "content": "file"
         }
-        if outcome in {"success", "nonzero"}:
+        if outcome in {"success", "nonzero", "invalid-command", "invalid-timeout"}:
             assert len(environments) == 1
             assert environment.read.await_count == 2
             environment.close.assert_not_called()

@@ -191,8 +191,15 @@ class BwrapShellRequest:
                 resources.callback(os.close, launcher_pidfd)
                 poller = select.poll()
                 poller.register(parent.fileno(), select.POLLIN)
-                if not poller.poll(round(_STARTUP_TIMEOUT_S * 1000)):
-                    raise TimeoutError("Shell request init did not publish readiness")
+                startup_deadline = time.monotonic() + _STARTUP_TIMEOUT_S
+                while not self.cancelled.is_set():
+                    remaining = startup_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Shell request init did not publish readiness")
+                    if poller.poll(max(1, round(min(remaining, 0.05) * 1000))):
+                        break
+                if self.cancelled.is_set():
+                    raise RequestCancelled("Shell request was cancelled during startup")
                 info.seek(0)
                 try:
                     metadata = json.load(info)

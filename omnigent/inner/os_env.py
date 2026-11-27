@@ -97,6 +97,15 @@ logger = logging.getLogger(__name__)
 EditEntry: TypeAlias = dict[str, str]
 
 
+def validate_shell_arguments(command: object, timeout: int | None) -> OpResult | None:
+    """Return the caller-process shell error before acquiring helper ownership."""
+    if not isinstance(command, str) or not command.strip():
+        return {"error": "command must be a non-empty string"}
+    if (120 if timeout is None else timeout) < 1:
+        return {"error": "timeout must be >= 1"}
+    return None
+
+
 class _PopenKwargs(TypedDict, total=False):
     pass_fds: tuple[int, ...]
 
@@ -1308,11 +1317,10 @@ class CallerProcessOSEnvironment(OSEnvironment):
         timeout: int | None = None,
         max_output: int | None = None,
     ) -> OpResult:
-        if not isinstance(command, str) or not command.strip():
-            return {"error": "command must be a non-empty string"}
+        invalid = validate_shell_arguments(command, timeout)
+        if invalid is not None:
+            return invalid
         resolved_timeout = 120 if timeout is None else timeout
-        if resolved_timeout < 1:
-            return {"error": "timeout must be >= 1"}
         request: dict[str, object] = {
             "op": "shell",
             "command": command,
@@ -1333,11 +1341,10 @@ class CallerProcessOSEnvironment(OSEnvironment):
     ) -> OpResult:
         from ._bwrap_shell_request import BwrapShellRequest
 
-        if not isinstance(command, str) or not command.strip():
-            return {"error": "command must be a non-empty string"}
+        invalid = validate_shell_arguments(command, timeout)
+        if invalid is not None:
+            return invalid
         resolved_timeout = 120 if timeout is None else timeout
-        if resolved_timeout < 1:
-            return {"error": "timeout must be >= 1"}
         if max_output is not None and (not isinstance(max_output, int) or max_output < 1):
             return {"error": "max_output must be >= 1"}
         if (

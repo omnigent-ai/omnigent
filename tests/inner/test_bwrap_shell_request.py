@@ -369,6 +369,9 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
         case.owner.run.side_effect = failed_run
     else:
         case.spawn.side_effect = OSError("spawn failed")
+    if failure in {"readiness-timeout", "cleanup-timeout"}:
+        ticks = iter((0.0, 0.0, shell_request._STARTUP_TIMEOUT_S))
+        monkeypatch.setattr(shell_request, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
     with pytest.raises(OSError) as caught:
         _launch(case, tmp_path)
     if failure in {"empty-metadata", "malformed-metadata"}:
@@ -443,17 +446,63 @@ def test_cancelled_request_never_reaches_spawn(
     with pytest.raises(RequestCancelled):
         _launch(case, tmp_path)
     assert not case.request.admitted
-    if phase == "before-launch":
-        case.spawn.assert_not_called()
+    if phase in {"before-launch", "after-spawn"}:
+        if phase == "before-launch":
+            case.spawn.assert_not_called()
+        else:
+            case.spawn.assert_called_once()
+            case.process.communicate.assert_called_once_with(timeout=1)
         case.receive.assert_not_called()
+        case.owner.run.assert_not_called()
     else:
         case.spawn.assert_called_once()
         case.receive.assert_called_once()
         case.owner.run.assert_called_once()
+    if phase != "before-launch":
         assert case.process.stdout.closed and case.process.stderr.closed
         for descriptor in case.descriptors:
             with pytest.raises(OSError):
                 os.fstat(descriptor)
+
+
+def test_startup_cancellation_retires_the_unadmitted_launcher_promptly(
+    launch_case: _LaunchCase, tmp_path: Path
+) -> None:
+    case = launch_case
+    waiting, release = threading.Event(), threading.Event()
+    failures: list[BaseException] = []
+
+    def silent_readiness(timeout_ms: int) -> list[tuple[int, int]]:
+        waiting.set()
+        release.wait(timeout_ms / 1000)
+        return []
+
+    def launch() -> None:
+        try:
+            _launch(case, tmp_path)
+        except BaseException as exc:
+            failures.append(exc)
+
+    case.poll.side_effect = silent_readiness
+    worker = threading.Thread(target=launch, daemon=True)
+    worker.start()
+    try:
+        assert waiting.wait(2), "The request did not enter startup readiness"
+        case.request.cancel()
+        worker.join(2)
+        assert not worker.is_alive(), "Cancellation remained blocked on startup readiness"
+    finally:
+        release.set()
+        worker.join(2)
+    assert len(failures) == 1 and isinstance(failures[0], RequestCancelled)
+    assert not case.request.admitted
+    case.receive.assert_not_called()
+    case.owner.run.assert_not_called()
+    case.process.communicate.assert_called_once_with(timeout=1)
+    assert case.process.stdout.closed and case.process.stderr.closed
+    for descriptor in case.descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 @pytest.mark.parametrize(
