@@ -92,6 +92,10 @@ class StackGraph:
                 return 1, "", "HTTP 502"
             return 0, json.dumps({"defaultBranchRef": {"name": self.default_branch}}), ""
         assert argv[:2] == ["pr", "list"], argv
+        # Every list is of this repository, closed and merged PRs included, bounded.
+        assert argv[argv.index("-R") + 1].endswith("example-org/example-repo"), argv
+        assert argv[argv.index("--state") + 1] == "all", argv
+        assert argv[argv.index("--limit") + 1] == str(github_stack._LIST_LIMIT), argv
         flag = "--head" if "--head" in argv else "--base"
         branch = argv[argv.index(flag) + 1]
         self.lists.append((flag, branch))
