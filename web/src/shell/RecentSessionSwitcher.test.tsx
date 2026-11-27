@@ -7,10 +7,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
-  cancelRecentSessionSwitcher,
-  commitRecentSessionSwitcher,
   openRecentSessionSwitcher,
-  releaseRecentSessionSwitcher,
   stepRecentSessionSwitcher,
   useRecentSessionHotkey,
   useRecentSessionSwitchStore,
@@ -216,23 +213,23 @@ it("moves on when the selected session is deleted, without reordering the rest",
   expect(navigate.mock.calls).toEqual([["/c/c"]]);
 });
 
-it("never opens a session that went away, whether released, entered, or clicked", () => {
-  for (const accept of ["release", "enter", "click"] as const) {
-    navigate.mockClear();
-    useRecentSessionSwitchStore.setState({ readLiveSessionIds: () => new Set(["a", "b", "c"]) });
+it.each(["release", "enter", "click"] as const)(
+  "never opens a session that went away, on %s",
+  async (accept) => {
+    renderSwitcher();
+    // Enter and a click accept a switcher opened from ⌘K; while held, any key releases it.
     act(() => {
-      openRecentSessionSwitcher(1, { holding: true, navigate });
+      openRecentSessionSwitcher(1, { holding: accept === "release", navigate });
     });
-    // Gone before the switcher's list caught up.
+    await waitFor(() => expect(activeOption()).toHaveTextContent("Session b"));
+    // Gone before the switcher's list caught up, so its row still shows.
     useRecentSessionSwitchStore.setState({ readLiveSessionIds: () => new Set(["a", "c"]) });
-    act(() => {
-      if (accept === "release") releaseRecentSessionSwitcher();
-      else commitRecentSessionSwitcher("b");
-    });
+    if (accept === "release") key("keyup", { key: "Control" });
+    else if (accept === "enter") fireEvent.keyDown(listInput(), { key: "Enter" });
+    else fireEvent.click(activeOption()!);
     expect(navigate.mock.calls).toEqual(accept === "release" ? [["/c/c"]] : []);
-    act(() => cancelRecentSessionSwitcher());
-  }
-});
+  },
+);
 
 it("closes without switching once no other session is left", async () => {
   const client = renderSwitcher();
