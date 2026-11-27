@@ -3872,11 +3872,14 @@ def register_resources_routes(
         pr_url: str | None = None,
         *,
         allow_cached: bool = False,
+        viewer: PullRequestViewer | None = None,
     ) -> dict[str, Any]:
         """Read PR context through the runner or host and store what it reports.
 
         :param allow_cached: The client polls again soon, so the runner may answer
             from its previous read.
+        :param viewer: Who reads it; only the owner's read asks for the host account's rights,
+            and a background refresh, with no reader, never does.
         """
         params = await _github_params(
             session_id,
@@ -3885,6 +3888,8 @@ def register_resources_routes(
                 **({"allow_cached": True} if allow_cached else {}),
             },
         )
+        if viewer is not None:
+            params = review_read_params(params, viewer)
         requested_at = time.time()
         info = await _fs_get_with_host_fallback(
             session_id,
@@ -4156,9 +4161,12 @@ def register_resources_routes(
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        info = await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
+        viewer = await _pull_request_viewer(conv, request)
+        info = await _github_info(
+            session_id, conv, pr_url, allow_cached=allow_cached, viewer=viewer
+        )
         # Applied here, not in _github_info: background refreshes have no caller.
-        return info_for_viewer(info, await _pull_request_viewer(conv, request))
+        return info_for_viewer(info, viewer)
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",

@@ -958,6 +958,34 @@ def test_the_hosts_overview_reads_and_changes_hand_out_the_accounts_rights_only_
     )
 
 
+@pytest.mark.parametrize("transport", ["runner", "host"])
+@pytest.mark.parametrize("account_rights", [False, True], ids=["older-server", "owner-asks"])
+async def test_the_overview_reaches_its_caller_with_the_accounts_rights_only_when_asked(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, transport: str, account_rights: bool
+) -> None:
+    monkeypatch.setattr(github, "_gh", _comment_rights_gh([]))
+    params: dict[str, Any] = {"pr_url": B}
+    if transport == "runner":
+        if account_rights:
+            params["account_rights"] = "true"
+        app = create_runner_app(runner_workspace=Path(tracked), server_client=NullServerClient())  # type: ignore[arg-type]
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            response = await client.get("/v1/sessions/session/resources/github", params=params)
+        assert response.status_code == 200, response.text
+        info = response.json()
+    else:
+        from omnigent.host.connect import HostProcess
+
+        if account_rights:
+            params["account_rights"] = True
+        info = HostProcess._dispatch_fs_op(
+            WorkspaceReader(Path(tracked)), "github_info", "session", params
+        )
+    assert _shows_account_rights(info) is account_rights
+
+
 def test_panel_polls_share_a_recent_read_and_refresh_an_older_one_in_the_background(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

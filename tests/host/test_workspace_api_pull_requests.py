@@ -508,7 +508,7 @@ _OVERVIEW = {"pr": None, "prs": [{"url": _PR}], "count": 2}
 
 def _get_answers_the_overview(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        WorkspaceReader, "github_info", lambda _self, _session, _url: dict(_OVERVIEW)
+        WorkspaceReader, "github_info", lambda _self, _session, _url, **_kwargs: dict(_OVERVIEW)
     )
 
 
@@ -662,6 +662,7 @@ def _tunnel(
     viewer: PullRequestViewer = PullRequestViewer.VIEWER,
     vouch: Callable[[str], Any] = _no_vouch,
     read_only_code_hosts: tuple[str, ...] = (),
+    overview: Callable[[dict[str, Any], float], Any] = _as_reported,
 ) -> _Tunnel:
     registry = HostRegistry()
     hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
@@ -682,7 +683,7 @@ def _tunnel(
         pull_requests=workspace_api.PullRequestRoute(
             _SESSION,
             vouch=vouch,
-            overview=_as_reported,
+            overview=overview,
             viewer=viewer,
             read_only_code_hosts=read_only_code_hosts,
         ),
@@ -969,7 +970,9 @@ async def test_only_owner_gated_calls_look_up_the_owner_and_never_on_the_event_l
 ) -> None:
     """With permissions on, the lookup reads the database."""
     monkeypatch.setattr(
-        WorkspaceReader, "github_info", lambda _self, _session, _url: {"pr": None, "prs": []}
+        WorkspaceReader,
+        "github_info",
+        lambda _self, _session, _url, **_kwargs: {"pr": None, "prs": []},
     )
     client = _client(tmp_path, monkeypatch, None)
 
@@ -1611,7 +1614,10 @@ async def test_anyone_else_reads_threads_through_the_api_without_the_rights(
     assert (comment["database_id"], comment["can_update"]) == (2**53 - 1, False)
 
 
-@pytest.mark.parametrize("method", ["ListReviewThreads", "ListReviewThreadComments"])
+@pytest.mark.parametrize(
+    "method",
+    ["GetPullRequest", "SetPullRequestAccount", "ListReviewThreads", "ListReviewThreadComments"],
+)
 @pytest.mark.parametrize(
     ("viewer", "asks"),
     [
@@ -1625,11 +1631,14 @@ async def test_the_frame_asks_for_the_accounts_rights_for_the_owner_alone(
 ) -> None:
     """The ask is the server's, in the frame; a request message can't carry it."""
     tunnel = _tunnel(tmp_path, viewer=viewer)
-    request = (
-        pb.ListReviewThreadsRequest(pr_url=_PR)
-        if method == "ListReviewThreads"
-        else pb.ListReviewThreadCommentsRequest(pr_url=_PR, thread_id="PRRT_1", page_token="c")
-    )
+    request = {
+        "GetPullRequest": pb.GetPullRequestRequest(pr_url=_PR),
+        "SetPullRequestAccount": pb.SetPullRequestAccountRequest(pr_url=_PR, account="octocat"),
+        "ListReviewThreads": pb.ListReviewThreadsRequest(pr_url=_PR),
+        "ListReviewThreadComments": pb.ListReviewThreadCommentsRequest(
+            pr_url=_PR, thread_id="PRRT_1", page_token="c"
+        ),
+    }[method]
     call = asyncio.create_task(tunnel.call(method, request))
     await tunnel.frame_sent()
     call.cancel()
@@ -1640,7 +1649,8 @@ async def test_the_frame_asks_for_the_accounts_rights_for_the_owner_alone(
 
 async def test_no_other_pull_request_call_asks_for_the_accounts_rights(tmp_path: Path) -> None:
     tunnel = _tunnel(tmp_path, viewer=PullRequestViewer.OWNER)
-    call = asyncio.create_task(tunnel.call("GetPullRequest", pb.GetPullRequestRequest(pr_url=_PR)))
+    request = pb.ListPullRequestFilesRequest(pr_url=_PR)
+    call = asyncio.create_task(tunnel.call("ListPullRequestFiles", request))
     await tunnel.frame_sent()
     call.cancel()
 
@@ -1651,7 +1661,12 @@ async def test_no_other_pull_request_call_asks_for_the_accounts_rights(tmp_path:
 def test_the_route_takes_the_reader_to_be_the_least_trusted_unless_told() -> None:
     route = workspace_api.PullRequestRoute(_SESSION, vouch=_no_vouch, overview=_as_reported)
     assert route.viewer is PullRequestViewer.VIEWER
-    assert {"ListReviewThreads", "ListReviewThreadComments"} == workspace_api.VIEWER_SHAPED_METHODS
+    assert {
+        "GetPullRequest",
+        "SetPullRequestAccount",
+        "ListReviewThreads",
+        "ListReviewThreadComments",
+    } == workspace_api.VIEWER_SHAPED_METHODS
 
 
 @pytest.mark.parametrize("method", ["ListReviewThreads", "ListReviewThreadComments"])
@@ -1758,7 +1773,7 @@ async def test_the_overview_of_a_pr_on_a_read_only_host_offers_no_changes(
     monkeypatch.setattr(server_prs, "ingest_info", ingest)
     monkeypatch.setattr(server_prs, "answer", lambda info, _stored: dict(info))
     monkeypatch.setattr(
-        WorkspaceReader, "github_info", lambda _self, _session, _url: dict(overview)
+        WorkspaceReader, "github_info", lambda _self, _session, _url, **_kwargs: dict(overview)
     )
     store = None if fault == "no-store" else _Store(stored)
     client = _client(tmp_path, monkeypatch, store, read_only_code_hosts=read_only_code_hosts)
@@ -2102,3 +2117,46 @@ async def test_a_caller_that_leaves_an_image_read_ends_its_call(tmp_path: Path) 
     await stream.aclose()
 
     assert tunnel.host.pending_workspace_calls == {}
+
+
+_HOST_OVERVIEW: dict[str, Any] = {
+    "object": "session.github.info",
+    "pr": {"number": 42, "comments": [{"id": "IC_1", "database_id": 501, "can_update": True}]},
+}
+
+
+async def _overview_through(tmp_path: Path, viewer: PullRequestViewer) -> dict[str, Any]:
+    """GetPullRequest's answer from a host that sends its account's rights unasked."""
+
+    async def with_server_list(payload: dict[str, Any], _sent_at: float) -> dict[str, Any]:
+        return {**payload, "prs": ["the server's list"]}
+
+    tunnel = _tunnel(tmp_path, viewer=viewer, overview=with_server_list)
+    call = asyncio.create_task(tunnel.call("GetPullRequest", pb.GetPullRequestRequest(pr_url=_PR)))
+    await tunnel.frame_sent()
+    answer = pb.GetPullRequestResponse(payload=payload_struct(_HOST_OVERVIEW))
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id, message=answer.SerializeToString(), done=True
+        ),
+    )
+    return payload_dict((await call).payload)
+
+
+async def test_the_owner_reads_the_overview_with_the_host_accounts_rights(tmp_path: Path) -> None:
+    overview = await _overview_through(tmp_path, PullRequestViewer.OWNER)
+    assert overview["prs"] == ["the server's list"]
+    assert overview["pr"]["comments"] == _HOST_OVERVIEW["pr"]["comments"]
+
+
+@pytest.mark.parametrize("viewer", [PullRequestViewer.EDITOR, PullRequestViewer.VIEWER])
+async def test_anyone_elses_overview_has_the_servers_list_and_no_rights(
+    tmp_path: Path, viewer: PullRequestViewer
+) -> None:
+    """GetPullRequest is the owner's alone today; were it not, this is what anyone else sees."""
+    overview = await _overview_through(tmp_path, viewer)
+    assert overview["prs"] == ["the server's list"]
+    [comment] = overview["pr"]["comments"]
+    assert (comment["id"], comment["database_id"], comment["can_update"]) == ("IC_1", 501, False)
+    assert overview["owner_only_changes"] is True
