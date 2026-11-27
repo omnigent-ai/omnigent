@@ -122,6 +122,32 @@ describe("opening", () => {
     expect(store.landing(store.selectedTabId()!)).toMatchObject({ settled: false, folders: 6 });
   });
 
+  it("lands a page load on the saved Diffs tab, so its folder and comparison come back", () => {
+    const diffs: WorkspaceTab = {
+      id: "D",
+      place: {
+        kind: "changes",
+        comparison: { kind: "saved", intent: "branch-point" },
+        comparisonRoot: "/repo/.worktrees/feature",
+      },
+      openedBy: "restore",
+    };
+    const { store } = makeStore({
+      initial: initial([files, diffs], "D"),
+      choiceCount: () => 4,
+      folderCount: () => 1,
+    });
+    expect(store.landing("D")).toEqual({ settled: false, choices: 4, folders: 1 });
+    // Selecting it later is a click, not a landing.
+    expect(store.landing("F")).toBeUndefined();
+  });
+
+  it("lands a page load only on a Diffs tab, so other saved pages keep their place", () => {
+    const { store } = makeStore({ initial: initial([files, pulls], "P") });
+    expect(store.landing("P")).toBeUndefined();
+    expect(store.landing("F")).toBeUndefined();
+  });
+
   it("brings a Diffs tab forward without the comparison it showed before, for the session's own", async () => {
     const { store } = makeStore();
     const diffFile: WorkspacePlace = { kind: "changes", path: "a.go", fileTab: true };

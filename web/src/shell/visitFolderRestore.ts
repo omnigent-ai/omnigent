@@ -38,8 +38,8 @@ export interface VisitFolderInput {
   /** The session's directory, which Files shares. */
   directory: string | null;
   /**
-   * `shownRoot`, `visitRootShows` and `canChoose` rest on loaded answers: true once those loads
-   * finish, including when they fail, so a hold ends.
+   * `shownRoot`, `visitRootShows` and `canChoose` rest on answers: false while a lookup is in
+   * flight or failed, so the visit holds rather than being replaced by the workspace's.
    */
   resolved: boolean;
   /** Moving to `visitRoot` would review it: false once its worktree is gone. */
@@ -58,7 +58,7 @@ export type VisitFolderStep =
 const NONE: VisitFolderStep = { kind: "none" };
 
 /** Whether two folders, null for the workspace, are the same, however the host spells them. */
-function sameFolder(left: string | null, right: string | null): boolean {
+export function sameReviewFolder(left: string | null, right: string | null): boolean {
   return left === null || right === null ? left === right : isWorktreeRoot(left, right);
 }
 
@@ -66,10 +66,14 @@ export function visitFolderStep(input: VisitFolderInput): VisitFolderStep {
   if (!input.stands || !input.active || !input.hasComparison) return NONE;
   // Until the worktrees load, a worktree's folder reads as the workspace, so roots can't compare.
   if (!input.resolved) return { kind: "hold" };
-  if (sameFolder(input.visitRoot, input.shownRoot)) return NONE;
+  if (sameReviewFolder(input.visitRoot, input.shownRoot)) return NONE;
   // A viewer who can't choose folders keeps what it shows, and so does Files when the visit's
   // worktree is gone or already chosen.
-  if (!input.canChoose || !input.visitRootShows || sameFolder(input.directory, input.visitRoot)) {
+  if (
+    !input.canChoose ||
+    !input.visitRootShows ||
+    sameReviewFolder(input.directory, input.visitRoot)
+  ) {
     return NONE;
   }
   return { kind: "restore", directory: input.visitRoot };

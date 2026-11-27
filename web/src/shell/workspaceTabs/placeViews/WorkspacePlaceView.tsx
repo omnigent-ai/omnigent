@@ -329,7 +329,8 @@ function ChangesPlaceView({
             place.comparison ??
             (range ? { kind: "typed", base: range.base, head: range.head ?? "" } : undefined)
           }
-          onComparisonShown={(shown, { step }) => run(changesComparisonShown(place, shown, step))}
+          comparisonRoot={place.comparisonRoot ?? null}
+          onComparisonShown={(shown, options) => run(changesComparisonShown(place, shown, options))}
           landing={landing}
           active={active}
           sort={files.sort}

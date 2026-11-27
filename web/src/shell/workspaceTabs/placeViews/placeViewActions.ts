@@ -78,8 +78,7 @@ export function changedFileViewed(path: string): PlaceViewAction {
 export function changesComparisonShown(
   current: ChangesPlace,
   comparison: ComparisonChoice,
-  step: boolean,
-  root: string | null = null,
+  { step, root }: { step: boolean; root: string | null },
 ): PlaceViewAction {
   // The recorded comparison replaces a link's range, which would otherwise outlive it.
   const { range: _range, comparisonRoot: _root, ...rest } = current;

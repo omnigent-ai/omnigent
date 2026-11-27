@@ -273,6 +273,15 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   );
   // A session saved or migrated with no tabs shows a New tab, as closing the last one does.
   if (tabs.length === 0 && resting === "new-tab") addEmptyNewTab();
+  // A page load lands on the saved Diffs tab's visit, so its folder and comparison come back.
+  const restoredSelected = options.initial.tabs.find((tab) => tab.id === selectedTabId);
+  if (
+    restoredSelected &&
+    !isUnknownTab(restoredSelected) &&
+    restoredSelected.place.kind === "changes"
+  ) {
+    land(restoredSelected.id);
+  }
 
   const knownTabs = (): WorkspaceTab[] =>
     tabs.filter((tab): tab is WorkspaceTab => !isUnknownTab(tab));
