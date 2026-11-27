@@ -148,6 +148,33 @@ jobs:
           sudo apt-get install -y ripgrep bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+      - name: Install pinned bubblewrap for COW validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y build-essential libcap-dev meson ninja-build pkg-config tmux
+          bwrap_root="$RUNNER_TEMP/omnigent-cow-bubblewrap-0.11.0"
+          bwrap_prefix="$bwrap_root/install"
+          mkdir -p "$bwrap_root"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            https://github.com/containers/bubblewrap/releases/download/v0.11.0/bubblewrap-0.11.0.tar.xz \
+            --output "$bwrap_root/source.tar.xz"
+          printf '%s  %s\n' \
+            988fd6b232dafa04b8b8198723efeaccdb3c6aa9c1c7936219d5791a8b7a8646 \
+            "$bwrap_root/source.tar.xz" | sha256sum --check
+          tar -xJf "$bwrap_root/source.tar.xz" -C "$bwrap_root"
+          meson setup "$bwrap_root/build" "$bwrap_root/bubblewrap-0.11.0" \
+            --prefix="$bwrap_prefix" --buildtype=release \
+            -Dman=disabled -Dtests=false -Dbash_completion=disabled -Dzsh_completion=disabled
+          meson compile -C "$bwrap_root/build"
+          meson install -C "$bwrap_root/build"
+          "$bwrap_prefix/bin/bwrap" --version
+          "$bwrap_prefix/bin/bwrap" --help > "$bwrap_root/help.txt"
+          rg --fixed-strings -- '--tmp-overlay' "$bwrap_root/help.txt"
+          sha256sum "$bwrap_prefix/bin/bwrap"
+          echo "$bwrap_prefix/bin" >> "$GITHUB_PATH"
+          echo 'OMNIGENT_TEST_REQUIRE_COW=1' >> "$GITHUB_ENV"
+
       - name: Cache virtualenv
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
