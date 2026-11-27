@@ -14,15 +14,18 @@ describe("markdownLines", () => {
     ]);
   });
 
-  it("marks fenced lines through the closing fence, and quoted lines", () => {
-    const lines = markdownLines("a\n```md\n## inside\n```\n> quoted\nb\n");
+  it("marks fenced lines through the closing fence, and quoted lines as Markdown reads them", () => {
+    const lines = markdownLines("a\n```md\n## inside\n```\n> quoted\nb\n\nc\n");
     expect(lines.map((line) => [line.text, line.fenced, line.quoted])).toEqual([
       ["a", false, false],
       ["```md", true, false],
       ["## inside", true, false],
       ["```", true, false],
       ["> quoted", false, true],
-      ["b", false, false],
+      // A line right after a quote's paragraph continues it.
+      ["b", false, true],
+      ["", false, false],
+      ["c", false, false],
     ]);
   });
 
@@ -64,6 +67,16 @@ describe("markdownLines", () => {
   it("keeps a list item's fence open through lines indented as far as the item's content", () => {
     const lines = markdownLines("- Example\n   ```\n  sample\n   ```\nafter\n");
     expect(lines.map((line) => line.fenced)).toEqual([false, true, true, true, false]);
+  });
+
+  it("counts a tab after a list marker to its tab stop, so a fence past it stays in the item", () => {
+    const lines = markdownLines("-\tExample\n   ```\n## Stack\n```\n");
+    expect(lines.map((line) => line.fenced)).toEqual([false, true, true, true]);
+  });
+
+  it("marks a block of raw HTML, such as a comment, like code", () => {
+    const lines = markdownLines("<!--\n## Stack\n-->\nafter\n");
+    expect(lines.map((line) => line.fenced)).toEqual([true, true, true, false]);
   });
 
   it("leaves an unclosed fence open to the end", () => {

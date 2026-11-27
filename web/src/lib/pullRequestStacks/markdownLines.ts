@@ -1,6 +1,10 @@
 // A PR description's lines with their exact offsets, so stack metadata can be located
 // and spliced without rewriting any other byte, and with the context that keeps a
-// format example inside a code fence or a quote from reading as real metadata.
+// format example inside code, raw HTML or a quote from reading as real metadata.
+
+import remarkGfm from "remark-gfm";
+import remarkParse from "remark-parse";
+import { unified } from "unified";
 
 export interface MarkdownLine {
   /** The line without its terminator. */
@@ -9,76 +13,63 @@ export interface MarkdownLine {
   start: number;
   /** Offset just past the line's terminator (`\n` or `\r\n`), or the body's end. */
   end: number;
-  /** Inside a fenced code block, or a fence line itself. */
+  /** Inside a code block or a block of raw HTML, fence lines included. */
   fenced: boolean;
-  /** A blockquote line. */
+  /** Inside a blockquote, and not in code. */
   quoted: boolean;
 }
 
-const FENCE = /^ {0,3}(`{3,}|~{3,})/;
-// Markdown lets only spaces and tabs follow a closing fence; `trim()` would also take U+00A0.
-const CLOSING_FENCE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
-const QUOTE = /^ {0,3}>/;
-// A list item's marker and the spaces after it, which set where its content starts.
-const LIST_ITEM = /^( {0,3})([-*+]|\d{1,9}[.)])([ \t]+|$)/;
-
-const indentOf = (text: string): number => text.length - text.trimStart().length;
-
-/** Where a list item's content starts, or null for a line that opens no item. */
-function listContentIndent(text: string): number | null {
-  const item = LIST_ITEM.exec(text);
-  if (!item) return null;
-  const spaces = item[3]?.length ?? 0;
-  // Five or more spaces after the marker start indented code: the content starts one past it.
-  return item[1]!.length + item[2]!.length + (spaces >= 1 && spaces <= 4 ? spaces : 1);
+/** The parts of a parsed tree this reads. */
+interface MarkdownNode {
+  type: string;
+  position?: { start: { offset?: number }; end: { offset?: number } };
+  children?: MarkdownNode[];
 }
 
-/** An open code fence: its marker, and its list item's content indent when it opened in one. */
-interface OpenFence {
-  marker: string;
-  itemIndent: number | null;
+interface Range {
+  start: number;
+  end: number;
 }
+
+const parser = unified().use(remarkParse).use(remarkGfm);
+// Containers whose children are blocks, so raw HTML directly inside them is an HTML block.
+const BLOCK_CONTAINERS = new Set(["root", "blockquote", "listItem", "footnoteDefinition"]);
+
+/** Where Markdown itself puts code and raw HTML blocks, and quotes, by offset in `body`. */
+function literalRanges(body: string): { code: Range[]; quotes: Range[] } {
+  const code: Range[] = [];
+  const quotes: Range[] = [];
+  const visit = (node: MarkdownNode, parent: string | null) => {
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    const placed = start !== undefined && end !== undefined;
+    const htmlBlock = node.type === "html" && parent !== null && BLOCK_CONTAINERS.has(parent);
+    if (placed && (node.type === "code" || htmlBlock)) {
+      code.push({ start, end });
+      return;
+    }
+    if (placed && node.type === "blockquote") quotes.push({ start, end });
+    for (const child of node.children ?? []) visit(child, node.type);
+  };
+  visit(parser.parse(body) as MarkdownNode, null);
+  return { code, quotes };
+}
+
+// A blank line counts by its start, so one just past a block's last character stays outside it.
+const within = (ranges: readonly Range[], start: number, length: number) =>
+  ranges.some((range) => start < range.end && range.start < start + Math.max(length, 1));
 
 export function markdownLines(body: string): MarkdownLine[] {
+  const { code, quotes } = literalRanges(body);
   const lines: MarkdownLine[] = [];
-  let open: OpenFence | null = null;
-  // Where the current list item's content starts, so a fence indented that far belongs to it.
-  let itemIndent: number | null = null;
   let start = 0;
   while (start < body.length) {
     const newline = body.indexOf("\n", start);
     const end = newline === -1 ? body.length : newline + 1;
     const raw = body.slice(start, newline === -1 ? end : newline);
     const text = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-    const blank = text.trim() === "";
-    const indent = indentOf(text);
-    // A line indented less than its list item's content ends the item, and a fence inside it.
-    if (itemIndent !== null && !blank && indent < itemIndent) {
-      if (open?.itemIndent != null) open = null;
-      itemIndent = null;
-    }
-    if (open !== null) {
-      const content = open.itemIndent === null ? text : text.slice(open.itemIndent);
-      const closing = CLOSING_FENCE.exec(content)?.[1];
-      if (closing && closing[0] === open.marker[0] && closing.length >= open.marker.length) {
-        open = null;
-      }
-      lines.push({ text, start, end, fenced: true, quoted: false });
-      start = end;
-      continue;
-    }
-    const content = itemIndent === null ? text : text.slice(itemIndent);
-    const fence = FENCE.exec(content)?.[1] ?? null;
-    // A backtick fence's info string holds no backtick, so "```a```" is inline code, not a fence.
-    const opens =
-      fence !== null &&
-      !(fence[0] === "`" && text.slice(text.indexOf(fence) + fence.length).includes("`"));
-    if (opens && fence !== null) {
-      open = { marker: fence, itemIndent };
-    } else if (!blank) {
-      itemIndent = listContentIndent(text) ?? itemIndent;
-    }
-    lines.push({ text, start, end, fenced: opens, quoted: !opens && QUOTE.test(text) });
+    const fenced = within(code, start, text.length);
+    lines.push({ text, start, end, fenced, quoted: !fenced && within(quotes, start, text.length) });
     start = end;
   }
   return lines;

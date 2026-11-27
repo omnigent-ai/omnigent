@@ -146,9 +146,14 @@ describe("markdownListStackFormat on hand-edited descriptions", () => {
       "```\n```\u00a0\n",
       "- Example\n  ```\n  sample\n```\n",
       "- Example\n   ```\n   sample\n ```\n",
+      "-\tExample\n   ```\n",
     ]) {
       expect(parse(`${before}${LINEAR}\`\`\`\n`)).toBeNull();
     }
+  });
+
+  it("never verifies a section inside an HTML comment", () => {
+    expect(parse(`<!--\n${LINEAR}-->\n`)).toBeNull();
   });
 
   it("reads a section after a list item's code example", () => {
