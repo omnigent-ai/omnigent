@@ -2273,6 +2273,30 @@ def _conversation_read(
     return {"query": queries[0], "comments": github_resource._comments_payload(data)["comments"]}
 
 
+def test_a_changed_conversation_is_read_past_ghs_cache_until_its_copy_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a comment or reaction change, gh's cached read would undo it for up to 30s."""
+    url = "https://github.com/o/r/pull/8"
+    now = [1000.0]
+    monkeypatch.setattr(github_resource, "_CHANGED_CONVERSATIONS", {})
+    monkeypatch.setattr(github_resource.time, "monotonic", lambda: now[0])
+
+    def read() -> list[str]:
+        return _conversation_read(monkeypatch, listed=[], latest=[])["query"]
+
+    assert "--cache" in read()
+    github_resource.conversation_changed(url)
+    github_resource.conversation_changed("https://github.com/o/r/pull/9")
+    assert "--cache" not in read()
+    now[0] += 29.9
+    assert "--cache" not in read()
+    now[0] += 0.2
+    assert "--cache" in read()
+    # An expired mark is dropped once read, so marks don't pile up.
+    assert list(github_resource._CHANGED_CONVERSATIONS) == ["https://github.com/o/r/pull/9"]
+
+
 _RIGHTS = {
     "viewerCanReact": True,
     "viewerCanUpdate": True,

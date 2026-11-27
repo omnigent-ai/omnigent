@@ -933,6 +933,65 @@ def test_a_reaction_change_github_answers_without_the_comment_says_none(
     assert "reactions" not in result and "can_react" not in result
 
 
+def _change_issue_comment(action: str, kind: str) -> None:
+    """Make ``action`` on comment 5, the way the page asks for it."""
+    target = {"session_id": SESSION, "pr_url": PR_URL, "kind": kind, "comment_id": 5}
+    if action in ("edit", "delete"):
+        _change_comment(action, kind)
+    elif action == "add":
+        pr_actions.add_reaction("/workspace", content="THUMBS_UP", **target)
+    else:
+        pr_actions.remove_reaction("/workspace", content="THUMBS_UP", **target)
+
+
+@pytest.mark.parametrize("action", ["edit", "delete", "add", "remove"])
+def test_a_conversation_comment_change_reads_its_conversation_past_ghs_cache(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    monkeypatch.setattr(github, "_CHANGED_CONVERSATIONS", {})
+    if action == "remove":
+        fake.graphql_failure = _answer(
+            "removeReaction", {"subject": {"reactionGroups": [_group("THUMBS_UP", False)]}}
+        )
+    _change_issue_comment(action, "issue")
+    assert list(github._CHANGED_CONVERSATIONS) == [PR_URL]
+
+
+def test_a_review_comment_change_leaves_the_conversation_cached(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github, "_CHANGED_CONVERSATIONS", {})
+    _change_issue_comment("edit", "review")
+    assert github._CHANGED_CONVERSATIONS == {}
+
+
+def test_a_reaction_change_with_an_unknown_outcome_still_reads_past_ghs_cache(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GitHub may have made the change, so the next read mustn't show the old one."""
+    monkeypatch.setattr(github, "_CHANGED_CONVERSATIONS", {})
+    fake.graphql_failure = _answer("addReaction", {})
+    with pytest.raises(UnknownOutcomeError):
+        _change_issue_comment("add", "issue")
+    assert list(github._CHANGED_CONVERSATIONS) == [PR_URL]
+
+
+def test_a_refused_comment_change_leaves_the_conversation_cached(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github, "_CHANGED_CONVERSATIONS", {})
+    with pytest.raises(InvalidPullRequestInput):
+        pr_actions.add_reaction(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            kind="issue",
+            comment_id=0,
+            content="THUMBS_UP",
+        )
+    assert github._CHANGED_CONVERSATIONS == {}
+
+
 def test_a_reaction_must_be_a_github_reaction(fake: FakeGitHub) -> None:
     with pytest.raises(InvalidPullRequestInput):
         pr_actions.add_reaction(

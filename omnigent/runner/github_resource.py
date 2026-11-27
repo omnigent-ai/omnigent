@@ -62,6 +62,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -998,6 +999,29 @@ def _gh_pr_view(
     return data
 
 
+# How long gh keeps a conversation read, and the PRs whose conversation changed since.
+_CONVERSATION_CACHE_SECONDS = 30
+_CHANGED_CONVERSATIONS: dict[str, float] = {}
+_CHANGED_CONVERSATIONS_LOCK = threading.Lock()
+
+
+def conversation_changed(pr_url: str) -> None:
+    """Read ``pr_url``'s conversation past gh's cache until the copy it holds expires."""
+    with _CHANGED_CONVERSATIONS_LOCK:
+        _CHANGED_CONVERSATIONS[pr_url] = time.monotonic()
+
+
+def _conversation_changed_recently(pr_url: str) -> bool:
+    with _CHANGED_CONVERSATIONS_LOCK:
+        changed_at = _CHANGED_CONVERSATIONS.get(pr_url)
+        if changed_at is None:
+            return False
+        if time.monotonic() - changed_at < _CONVERSATION_CACHE_SECONDS:
+            return True
+        del _CHANGED_CONVERSATIONS[pr_url]
+        return False
+
+
 def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
     """Read recent comments and activity, preserving gh's comments if this read fails."""
     url = data.get("url")
@@ -1010,6 +1034,7 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
         return
     comments_listed = data.get("comments")
     refresh_comments = isinstance(comments_listed, list) and len(comments_listed) >= _MAX_COMMENTS
+    cached = not refresh_comments and not _conversation_changed_recently(reference.url)
     owner, name = reference.repository.split("/", 1)
     query = """query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
@@ -1044,8 +1069,8 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
             "api",
             *host,
             "graphql",
-            # ponytail: gh handles token-scoped caching; busy comment tails stay fresh.
-            *([] if refresh_comments else ["--cache", "30s"]),
+            # gh caches per token; busy tails and just-changed comments read fresh.
+            *(["--cache", f"{_CONVERSATION_CACHE_SECONDS}s"] if cached else []),
             "-f",
             f"query={query}",
             "-f",
