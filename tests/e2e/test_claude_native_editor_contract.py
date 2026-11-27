@@ -130,7 +130,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 raise AssertionError({"phase": "initial-composer", "pane": pane()}) from exc
             command("load-buffer", "-b", "editor-draft", "-", text=draft)
             command("paste-buffer", "-d", "-p", "-b", "editor-draft", "-t", target)
-            poll_until(lambda: "draft-end" in pane(), timeout_s=10)
+            poll_until(lambda: bridge._draft_in_input_box(pane(), "draft-end"), timeout_s=10)
             steps = [
                 (draft.rstrip("\n"), draft, False),
                 (draft.replace("\n", " "), draft, False),
@@ -148,7 +148,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 poll_until(
                     lambda expected=("/status" if accepted else expected): (
                         bridge._composer_box(pane()) is not None
-                        and expected.splitlines()[0].strip() in pane()
+                        and bridge._draft_in_input_box(last_pane, expected.splitlines()[0].strip())
                     ),
                     timeout_s=10,
                 )
