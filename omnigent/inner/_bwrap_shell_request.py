@@ -43,7 +43,8 @@ def _has_request_options(executable: str, identity: tuple[int, ...]) -> bool:
         timeout=2,
         check=False,
     )
-    return result.returncode == 0 and all(option in result.stdout for option in _REQUEST_OPTIONS)
+    result.check_returncode()
+    return all(option in result.stdout for option in _REQUEST_OPTIONS)
 
 
 def request_launcher(policy: SandboxPolicy, *, executable: str | None = None) -> str | None:
@@ -75,7 +76,7 @@ def request_launcher(policy: SandboxPolicy, *, executable: str | None = None) ->
         os.close(descriptor)
         identity = (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
         return executable if _has_request_options(executable, identity) else None
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.SubprocessError):
         return None
 
 

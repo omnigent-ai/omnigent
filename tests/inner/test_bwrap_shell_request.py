@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -142,10 +143,19 @@ def test_launcher_probe_uses_the_selected_executable_and_rechecks_replacements(
             assert request_launcher(_policy(tmp_path), executable=str(executable)) is None
         assert run.call_count == 2
         run.side_effect = None
+        supported = run.return_value
+        for status in (1, -signal.SIGTERM):
+            shell_request._has_request_options.cache_clear()
+            run.return_value = subprocess.CompletedProcess([], status, stdout="temporary failure")
+            assert request_launcher(_policy(tmp_path), executable=str(executable)) is None
+            run.return_value = supported
+            assert request_launcher(_policy(tmp_path), executable=str(executable)) == str(
+                executable
+            )
         for _ in range(2):
             assert request_launcher(_policy(tmp_path)) == str(executable)
         which.assert_called_with("bwrap", path="/selected/host-tools")
-        assert run.call_count == 3
+        assert run.call_count == 6
         assert run.call_args.args[0] == [str(executable), "--help"]
         assert run.call_args.kwargs["env"] == {"PATH": os.defpath, "LANG": "C"}
         case.launcher = str(executable)
@@ -155,12 +165,12 @@ def test_launcher_probe_uses_the_selected_executable_and_rechecks_replacements(
         assert which.call_count == 2
         assert case.spawn.call_args.args[0][0] == str(executable)
         assert case.spawn.call_args.args[1] == {"PATH": os.defpath, "LANG": "C"}
-        assert run.call_count == 3
+        assert run.call_count == 6
         executable.write_text("replacement with no request flags")
         run.return_value = subprocess.CompletedProcess([], 0, stdout="--unshare-pid")
         for _ in range(2):
             assert request_launcher(_policy(tmp_path), executable=str(executable)) is None
-        assert run.call_count == 4
+        assert run.call_count == 7
     finally:
         shell_request._has_request_options.cache_clear()
 
