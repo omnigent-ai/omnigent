@@ -10,11 +10,14 @@ On an open session, the QuickPick palette also previews themes as the user moves
 through Select theme…, hands focus to the session switcher and back, and runs
 the session's own actions. ⌘↵ on another session's row lists that session's
 actions, which archive it without leaving the open one, and a verb-first row
-such as Archive a Session… asks which session first.
+such as Archive a Session… asks which session first. On the Inbox, Mark all as
+read clears an unread session and tells the server, and the Inbox filter setting
+picks a tab.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -47,7 +50,12 @@ from tests.e2e_ui.conftest import (
     _ensure_runner_online,
     _server_state,
 )
-from tests.e2e_ui.sessions._sidebar_helpers import patch_session, session_archived
+from tests.e2e_ui.sessions._sidebar_helpers import (
+    patch_session,
+    session_archived,
+    sidebar_row,
+    unread_dot,
+)
 
 _PALETTE_INPUT = "command-palette-input"
 # "Go to Settings" navigates to /settings, which redirects to the general section.
@@ -310,3 +318,79 @@ def test_quick_pick_archiving_the_open_session_opens_the_previous_visit(
     poll_until(lambda: session_archived(base_url, second), timeout_s=15.0)
     expect(page).to_have_url(re.compile(rf"/c/{first}$"), timeout=10_000)
     expect(page).to_have_title(re.compile("Heron"), timeout=10_000)
+
+
+def _viewer_unread(base_url: str, session_id: str) -> bool:
+    """Read the server's ``viewer_unread`` for one session from ``GET /v1/sessions``."""
+    response = httpx.get(f"{base_url}/v1/sessions", params={"visibility": "all"}, timeout=10.0)
+    response.raise_for_status()
+    for item in response.json()["data"]:
+        if item["id"] == session_id:
+            return bool(item.get("viewer_unread"))
+    raise AssertionError(f"session {session_id} not present in /v1/sessions")
+
+
+def test_quick_pick_marks_all_read_and_filters_the_inbox(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    """Mark all as read clears an unread dot and tells the server; the Inbox filter picks a tab."""
+    base_url, session_id = seeded_session
+    page: Page = request.getfixturevalue("page")
+    enable_quick_pick_palette(page)
+    page.goto(f"{base_url}/c/{session_id}")
+    row = sidebar_row(page, session_id)
+    expect(row).to_be_visible(timeout=30_000)
+
+    def read_state_put(unread: bool):
+        def matches(candidate) -> bool:
+            return (
+                candidate.request.method == "PUT"
+                and candidate.url.endswith(f"/v1/sessions/{session_id}/read-state")
+                and json.loads(candidate.request.post_data or "{}").get("unread") is unread
+            )
+
+        return matches
+
+    row.hover()
+    row.get_by_test_id("conversation-actions").click()
+    # The dot lights at once; wait for the server's copy, so leaving the page can't cancel it.
+    with page.expect_response(read_state_put(True), timeout=10_000):
+        page.get_by_test_id("mark-unread-conversation").click()
+    expect(unread_dot(row)).to_be_visible()
+
+    # From the Inbox no session is open, and the sidebar row keeps its dot.
+    page.goto(f"{base_url}/inbox")
+    row = sidebar_row(page, session_id)
+    expect(unread_dot(row)).to_be_visible(timeout=30_000)
+
+    # The server holds the unread mark, so reading it back later shows Mark all's write.
+    poll_until(lambda: _viewer_unread(base_url, session_id), timeout_s=10.0)
+
+    palette_input = open_quick_pick_palette(page)
+    palette_input.fill("mark all as read")
+    # Wait for the list to settle: rows from before the query can linger for a moment.
+    options = page.get_by_role("dialog").get_by_role("option")
+    expect(options).to_have_count(1)
+    expect(options.first).to_contain_text("Mark 1 unread session as read")
+    expect(options.first).to_have_attribute("aria-selected", "true")
+    with page.expect_response(read_state_put(False), timeout=10_000) as put:
+        page.keyboard.press("Enter")
+    assert put.value.status == 204
+    expect(palette_input).to_have_count(0)
+    expect(unread_dot(row)).to_have_count(0)
+    poll_until(lambda: not _viewer_unread(base_url, session_id), timeout_s=10.0)
+
+    expect(page.get_by_role("tab", name="All")).to_have_attribute("aria-selected", "true")
+    run_palette_command(page, "inbox filter", "Inbox filter")
+    heading = page.locator('[data-slot="quick-pick-heading"]')
+    expect(heading).to_have_text("Inbox filter")
+    page.get_by_role("dialog").get_by_role("combobox").fill("unread")
+    expect(page.get_by_role("dialog").get_by_role("option").first).to_contain_text("Unread")
+    page.keyboard.press("Enter")
+    # Choosing a value returns to the command list; close it to see the page.
+    expect(heading).to_have_count(0)
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("combobox", name="Command palette")).to_have_count(0)
+    expect(page.get_by_role("tab", name="Unread")).to_have_attribute(
+        "aria-selected", "true", timeout=10_000
+    )

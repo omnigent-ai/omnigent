@@ -5,9 +5,34 @@ import type { ReactNode } from "react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+// Counts renders of ⌘K's Mark all as read and Resume sandbox, which render nothing themselves.
+const paletteCommandMounts = vi.hoisted(() => ({ markAllRead: 0, resumeSandbox: 0 }));
+vi.mock("@/shell/markAllReadPaletteCommand", async (importOriginal) => {
+  const original = await importOriginal<typeof MarkAllReadPaletteCommandModule>();
+  return {
+    ...original,
+    MarkAllReadPaletteCommand: () => {
+      paletteCommandMounts.markAllRead += 1;
+      return original.MarkAllReadPaletteCommand();
+    },
+  };
+});
+vi.mock("@/shell/resumeSandboxCommand", async (importOriginal) => {
+  const original = await importOriginal<typeof ResumeSandboxCommandModule>();
+  return {
+    ...original,
+    ResumeSandboxPaletteCommand: () => {
+      paletteCommandMounts.resumeSandbox += 1;
+      return original.ResumeSandboxPaletteCommand();
+    },
+  };
+});
+
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import type * as MarkAllReadPaletteCommandModule from "@/shell/markAllReadPaletteCommand";
+import type * as ResumeSandboxCommandModule from "@/shell/resumeSandboxCommand";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
@@ -7785,5 +7810,17 @@ describe("AppShell desktop Close", () => {
     expect(screen.queryByText("home")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(screen.getByText("home")).toBeInTheDocument();
+  });
+});
+
+describe("Mark all as read and Resume sandbox in ⌘K", () => {
+  it.each([false, true])("mount only with quick_pick_palette on (%s)", async (quickPick) => {
+    paletteCommandMounts.markAllRead = 0;
+    paletteCommandMounts.resumeSandbox = 0;
+    mockConversations([{ id: "conv_mark_all", permission_level: null }]);
+    renderShell("/c/conv_mark_all", serverInfo({ features: { quick_pick_palette: quickPick } }));
+    await waitFor(() => expect(document.querySelector("header.chat-header")).not.toBeNull());
+    expect(paletteCommandMounts.markAllRead > 0).toBe(quickPick);
+    expect(paletteCommandMounts.resumeSandbox > 0).toBe(quickPick);
   });
 });
