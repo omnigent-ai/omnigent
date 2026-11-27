@@ -34,6 +34,11 @@ const SessionActionHost = lazy(() =>
     default: module.SessionActionHost,
   })),
 );
+const ProjectActionHost = lazy(() =>
+  import("./projectCommands/ProjectActionHost").then((module) => ({
+    default: module.ProjectActionHost,
+  })),
+);
 const RecentSessionSwitchHost = lazy(() =>
   import("./quickPickShortcuts/RecentSessionSwitchHost").then((module) => ({
     default: module.RecentSessionSwitchHost,
@@ -119,14 +124,15 @@ export function AppShellOverlays({
           <FeatureFlagsPicker />
         </Suspense>
       )}
-      {/* Carry out a session's action picked from ⌘↵ on its ⌘K row. The key hosts get their
-          own boundaries, so their chords work without waiting for it. */}
+      {/* Carry out a session's action picked from ⌘↵ on its ⌘K row, and the project in view's.
+          The key hosts get their own boundaries, so their chords work without waiting for these. */}
       {quickPick && (
         <>
           {/* Read by an action that settles after its host has gone, such as a Leave. */}
           <OpenSessionPublisher sessionId={serverConversationId ?? null} />
           <Suspense fallback={null}>
             <SessionActionHost />
+            <ProjectActionHost />
           </Suspense>
           <Suspense fallback={null}>
             <QuickPickShortcutHost />

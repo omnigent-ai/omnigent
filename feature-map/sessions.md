@@ -145,6 +145,18 @@ the header menu), and each place is a separate entry point.
   The classic layout, a phone and a grid route don't offer them
   (`web/src/shell/AppShell.workspaceSidebarV2.test.tsx`,
   `tests/e2e_ui/sessions/test_workspace_sidebar_v2.py`).
+- `palette-project-commands`: with `quick_pick_palette` on, ⌘K lists the project
+  in view's folder actions under **Project**, each naming it: New session in it,
+  Project settings, Rename project and Delete project. The project in view is the
+  open session's, or the one the new-session view is filed under, which skips
+  New session. Each opens the folder menu's own dialog. A rename keeps the
+  folder expanded, and the new-session view follows a rename or leaves once the
+  project is deleted. A session filed in a project the viewer doesn't have,
+  such as a shared one, offers none, and a session's project label counts only
+  on the viewer's own session. The project home lists its own. **New project…**
+  opens the Projects header's dialog while the sidebar lists projects
+  (`web/src/shell/projectCommands/ProjectActionHost.test.tsx`,
+  `web/src/shell/NewProjectButton.test.tsx`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -333,6 +345,12 @@ the header menu), and each place is a separate entry point.
   folder glyph) under the title wherever the row isn't inside that project's folder: pins,
   Shared with me, and every grouping but Default. On phone layouts a submenu replaces the menu's list under a
   back row with its name, and reopening the menu starts at the main list.
+  With `quick_pick_palette` on, ⌘K offers each submenu as a setting showing its
+  choice ("Session List: Group by", "Session List: Display", "Session List: Sort
+  by", and "Session List: Show …" for each field), running the menu's handlers;
+  without the grouping flag only Display is offered
+  (`web/src/shell/Sidebar.paletteCommands.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_switches_the_session_lists_display`).
   Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
@@ -536,6 +554,12 @@ Escape cancels, and the dialog remains the place to change its emoji. Delete pro
 archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
+With `quick_pick_palette` on, open a session filed in a project, press
+Cmd/Ctrl+K and type "rename project" to open the same dialog for its project.
+Type "move project" there for the folder menu's Move choices (greyed at the
+list's edges and while the order loads or saves), or "sort projects", "expand
+all projects", "collapse all projects" and "select sessions" for the Projects
+header's actions, which ⌘K offers whenever the header does.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
@@ -551,7 +575,10 @@ project still opens that folder.
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot: the line marks whether it lands above or below the row. Release it
 just below the last pin to pin it at the bottom. Only standalone sessions and
-family representatives can be dragged to pin or reorder a pin.
+family representatives can be dragged to pin or reorder a pin. With
+`quick_pick_palette` on, open a pinned session and press Cmd/Ctrl+K for Move to
+top of Pinned, Move up in Pinned and Move down in Pinned, each offered only
+where it would move the pin and making the same write as a drop.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
@@ -562,6 +589,11 @@ drawer, then drag it. Ordering → Custom in the filter menu keeps the order sho
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (mark as read or unread, archive, unarchive, delete). Deleting sessions
 automations run from names those automations and deletes them first.
+With `quick_pick_palette` on, ⌘K offers Select all sessions and Deselect all sessions while
+selecting, and the selection bar's actions greyed as its buttons are; archiving
+the open session from the bar lands where ⌘K's Archive does
+(`web/src/shell/Sidebar.selectionPaletteCommands.test.tsx`,
+`web/src/shell/Sidebar.archive.test.tsx`).
 
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, export, rename, mark as unread, create automation, add to project,
@@ -665,6 +697,8 @@ host-dependent unlink behavior.
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
 cards. Choosing Canvas in the sidebar returns to the selected board.
+With `quick_pick_palette` on, ⌘K's Go to Canvas and Go to Usage open the same
+pages as the sidebar's links, and are offered exactly when those links show.
 Drag the divider to resize, or focus it and use Left/Right arrows to
 adjust the split and Home/End to reach its limits. Double-click the divider to
 restore the default split. Focus the session to use the full area; Escape
