@@ -1269,6 +1269,23 @@ async def test_a_finder_naming_no_url_is_refused_before_the_host(
     assert finder_calls == []
 
 
+async def test_a_branch_list_naming_no_branch_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.list_branch_pull_requests(pb.ListBranchPullRequestsRequest(branch="a..b"))
+
+    assert refused.value.code == Code.INVALID_ARGUMENT
+    assert _failure_reasons(refused.value) == ["invalid_input"]
+    assert host_calls == []
+    assert finder_calls == []
+
+
 @pytest.fixture
 def auto_merges(monkeypatch: pytest.MonkeyPatch) -> list[list[tuple[str, str, str]]]:
     """Each auto-merge batch the host sent: its pull requests, methods and heads."""

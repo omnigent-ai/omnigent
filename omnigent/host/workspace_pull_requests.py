@@ -341,6 +341,10 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "GetPullRequestListStats": lambda reader, _call, request: (
         github_lookup.pull_request_list_stats(_root(reader), pr_urls=list(request.pr_urls))
     ),
+    # Finds pull requests from the request alone, never from the session's or the vouch.
+    "ListBranchPullRequests": lambda reader, _call, request: github_search.branch_pull_requests(
+        _root(reader), branch=request.branch
+    ),
     # The runner takes the media type from the bytes, as on the REST route.
     "UploadAttachment": lambda reader, call, request: pr_resource.upload_pr_attachment(
         _root(reader),

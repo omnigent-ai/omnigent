@@ -1,9 +1,10 @@
-"""Searching GitHub for the session's pull request: its reviewers, mentions and references.
+"""Searching GitHub: a session pull request's reviewers and completions, and a branch's PRs.
 
-The caller's text never reaches GitHub as search syntax: it goes in as a GraphQL
-variable, or as quoted words. Each search names the pull request's host, which must be
-one the user set up for GitHub, before ``gh`` runs. What GitHub answers is untrusted: a
-pull request URL outside the repository is dropped, and a client shows titles as text.
+Each search names a host the user set up for GitHub before ``gh`` runs, so a token in
+the environment never goes to a host taken from a remote or a request. The caller's
+text never reaches GitHub as search syntax: it goes in as a GraphQL variable, or as
+quoted words. What GitHub answers is untrusted: a pull request URL outside the
+repository is dropped, and a client shows titles as plain text.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from omnigent.git_providers import host_of
 from omnigent.runner import github_resource as github
 from omnigent.runner.pull_request_errors import InvalidPullRequestInput, PullRequestError
 from omnigent.runner.session_prs import PullRequestRef
@@ -23,6 +25,10 @@ MAX_COMPLETIONS = 10
 _SEARCH_OPERATORS = frozenset({"AND", "OR", "NOT"})
 _UNKNOWN_HOST = "Sign in to this GitHub host with gh before searching it"
 _UNREADABLE = "GitHub couldn't answer this search. Try again."
+MAX_BRANCH_PULL_REQUESTS = 20
+_BRANCH_FIELDS = "url,number,title,state,isDraft,updatedAt,headRefName"
+_UNKNOWN_WORKSPACE_HOST = "The workspace's repository isn't on a GitHub host set up here."
+_UNLISTED = "GitHub couldn't list this branch's pull requests. Try again."
 
 
 @contextmanager
@@ -220,3 +226,110 @@ def search_completions(
         "kind": "reference",
         "pull_requests": _references(root, reference, text),
     }
+
+
+def _base_remote(root: str) -> str:
+    """The remote ``gh repo set-default`` chose as the base, else the branch's or ``origin``."""
+    rc, output, _ = github._git(["config", "--get-regexp", r"^remote\..*\.gh-resolved$"], cwd=root)
+    for line in output.splitlines() if rc == 0 else []:
+        key, _, value = line.partition(" ")
+        if value.strip() == "base":
+            return key.removeprefix("remote.").removesuffix(".gh-resolved")
+    return github._commit_lookup_remote(root)
+
+
+def workspace_repository(root: str) -> tuple[str, str] | None:
+    """The host and ``owner/repo`` of the workspace's base remote, read from git alone.
+
+    :returns: e.g. ``("github.com", "example-org/example-repo")``, or ``None`` when the
+        remote is missing or doesn't name a repository.
+    """
+    rc, url, _ = github._git(["remote", "get-url", _base_remote(root)], cwd=root)
+    if rc != 0:
+        return None
+    host = host_of(url.strip())
+    repository = github._owner_repo_from_url(url.strip())
+    if not host or not repository:
+        return None
+    return host, repository
+
+
+def _repository_token(root: str, host: str, repository: str) -> str | None:
+    """The token of the account chosen for ``repository``, or ``None`` for gh's active one."""
+    if github._in_sandbox():
+        return None
+    login = github._config.github_account_preference(f"{host}/{repository}")
+    return github._gh_auth_token(root, login, host) if login else None
+
+
+def _same_repository(url: str, host: str, repository: str) -> bool:
+    try:
+        reference = PullRequestRef.from_url(url)
+    except ValueError:
+        return False
+    return (
+        reference.provider == "github"
+        and reference.host == host
+        and reference.repository.lower() == repository.lower()
+    )
+
+
+def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
+    """The pull requests whose head is ``branch``, in the workspace's own repository.
+
+    Lists every state, newest first as GitHub orders them, up to
+    :data:`MAX_BRANCH_PULL_REQUESTS`. A workspace without a repository remote has none.
+
+    :param branch: A branch name, checked by the caller against git's ref rules.
+    :raises PullRequestError: When the remote's host isn't set up for GitHub, which is
+        refused before any ``gh`` call, or when GitHub's answer can't be read.
+    """
+    found = workspace_repository(root)
+    if found is None:
+        return {"object": "list", "data": []}
+    host, repository = found
+    if not github._known_github_host(host):
+        raise PullRequestError(_UNKNOWN_WORKSPACE_HOST)
+    with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+        rc, output, _ = github._gh(
+            [
+                "pr",
+                "list",
+                "-R",
+                f"{host}/{repository}",
+                f"--head={branch}",
+                "--state",
+                "all",
+                "--limit",
+                str(MAX_BRANCH_PULL_REQUESTS),
+                "--json",
+                _BRANCH_FIELDS,
+            ],
+            cwd=root,
+            token=_repository_token(root, host, repository),
+        )
+    if rc != 0:
+        raise PullRequestError(_UNLISTED)
+    try:
+        entries = json.loads(output)
+    except ValueError as exc:
+        raise PullRequestError(_UNLISTED) from exc
+    if not isinstance(entries, list):
+        entries = []
+    rows = [
+        {
+            "url": entry["url"],
+            "number": entry.get("number"),
+            "title": entry.get("title") if isinstance(entry.get("title"), str) else "",
+            "state": entry.get("state"),
+            "is_draft": entry.get("isDraft") is True,
+            "updated_at": entry.get("updatedAt"),
+            "head_ref": branch,
+        }
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("url"), str)
+        and entry.get("headRefName") == branch
+        and _same_repository(entry["url"], host, repository)
+    ]
+    return {"object": "list", "data": rows[:MAX_BRANCH_PULL_REQUESTS]}
