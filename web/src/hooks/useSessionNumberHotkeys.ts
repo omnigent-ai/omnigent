@@ -1,6 +1,6 @@
-// Cmd+1..9/0 (Ctrl on Win/Linux) jumps to the Nth session the sidebar lists,
-// top to bottom (the caller passes its visible rows): 1–9 → the first nine,
-// 0 → the tenth (browser-tab-style mapping). Once-bound, ref-backed, and
+// Cmd+1..9 (Ctrl on Win/Linux) jumps to the Nth session the sidebar lists,
+// top to bottom (the caller passes its visible rows); Cmd+0 stays the menu's
+// Actual Size. Once-bound, ref-backed, and
 // platform-aware (only ⌘ fires on macOS, only Ctrl on Win/Linux). Fires even in
 // a focused text field so you can jump mid-compose. Bind ONCE.
 //

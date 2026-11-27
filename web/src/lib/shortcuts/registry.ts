@@ -184,8 +184,8 @@ const browserOpenSessionChord =
   (chord: Chord, alsoOffMac: boolean) => (environment: ShortcutEnvironment) =>
     environment.desktopMenu || (!environment.mac && !alsoOffMac) ? [] : [chord];
 
-/** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
-export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
+/** Sidebar slots in order: ⌘1–⌘9 pick the first nine. ⌘0 stays the menu's Actual Size. */
+export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
 /** Workspace rail tabs ⌃1–⌃9, by position. */
 const WORKSPACE_TAB_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
@@ -469,8 +469,8 @@ const APP_BINDINGS = {
   },
   "session.number": {
     group: "navigation",
-    rowKeys: (keys) => withRangeLabel(keys, "1…0"),
-    label: "Jump to a sidebar session (1–10)",
+    rowKeys: (keys) => withRangeLabel(keys, "1…9"),
+    label: "Jump to a sidebar session (1–9)",
     // A browser keeps ⌘-digit for its tabs, so there Alt joins it, matched by the
     // physical key because Alt rewrites the digit on macOS.
     chords: (environment) =>
@@ -982,7 +982,7 @@ export function shortcutKeys(id: ShortcutId, environment?: Partial<ShortcutEnvir
   return chord ? chordKeys(chord, resolved.mac) : [];
 }
 
-/** Keys with the last one replaced by a range label such as "1…0". */
+/** Keys with the last one replaced by a range label such as "1…9". */
 function withRangeLabel(keys: string[], range: string): string[] {
   return [...keys.slice(0, -1), range];
 }

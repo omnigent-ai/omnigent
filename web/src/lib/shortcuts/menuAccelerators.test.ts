@@ -135,8 +135,6 @@ const SAME_COMMAND: Record<string, readonly ShortcutId[]> = {
 
 /** Keys the menu takes from an app shortcut today; listed so that any new overlap fails. */
 const KNOWN_OVERLAPS: Record<string, readonly ShortcutId[]> = {
-  // View › Actual Size and the tenth sidebar session.
-  "CmdOrCtrl+0": ["session.number"],
   // The code editor's own keys.
   "CmdOrCtrl+[": ["file.outdentLines"],
   "CmdOrCtrl+]": ["file.indentLines"],

@@ -81,7 +81,7 @@ describe("filterShortcutPage", () => {
   it("finds a row that lists a range of digits by any chord in the range", () => {
     expect(labels("ctrl+1")).toEqual(["Select a workspace tab"]);
     expect(labels("⌃4")).toEqual(["Select a workspace tab"]);
-    expect(labels("cmd+option+3")).toEqual(["Jump to a sidebar session (1–10)"]);
+    expect(labels("cmd+option+3")).toEqual(["Jump to a sidebar session (1–9)"]);
     expect(otherLabels("alt+1")).toEqual(["Select a workspace tab"]);
   });
 
