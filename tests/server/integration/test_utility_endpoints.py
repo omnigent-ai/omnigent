@@ -116,7 +116,6 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "floating_composer": False,
         "sidebar_saved_views": False,
         "shared_session_updates_socket": False,
-        "warm_switch_keep_mounted_ui": False,
         "pull_requests_v2": False,
     }
     assert data["sibling_sessions"] is True

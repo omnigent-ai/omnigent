@@ -1,5 +1,5 @@
-// Warm session switches with `warm_switch_keep_mounted_ui`: a sidebar-style
-// click switches the store with the navigation, so the commit landing
+// Warm session switches: a sidebar-style click switches the store with the
+// navigation, so the commit landing
 // `/c/:id` skips the hydrating placeholder and the chat surface stays mounted.
 import { forwardRef, Profiler, useLayoutEffect } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -264,7 +264,7 @@ function renderWarmComposer(
     });
   }
   useChatStore.setState({ boundAgentId: "agent_example" });
-  renderPage({ warm_switch_keep_mounted_ui: true }, qc, {
+  renderPage({}, qc, {
     info: options.info,
     routing: options.routing,
     sidebar: options.sidebar,
@@ -291,7 +291,6 @@ function headerSnapshot() {
 }
 
 function renderHeaderPage(
-  enabled: boolean,
   child: boolean,
   frames: ReturnType<typeof headerSnapshot>[],
   deferNavigation = true,
@@ -352,7 +351,7 @@ function renderHeaderPage(
       return new Promise<Response>(() => {});
     }),
   );
-  renderPage({ warm_switch_keep_mounted_ui: enabled }, qc, {
+  renderPage({}, qc, {
     shell: true,
     deferNavigation,
     onCommit: () => frames.push(headerSnapshot()),
@@ -389,13 +388,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
-  it("flag on, live target: the surface stays mounted and no placeholder renders", async () => {
+describe("ChatPage warm switch", () => {
+  it("live target: the surface stays mounted and no placeholder renders", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc);
+    renderPage({}, qc);
     await waitFor(() => expect(document.body.textContent).toContain("alpha transcript"));
     const surfaceBefore = transcriptNode();
     expect(surfaceBefore).not.toBeNull();
@@ -469,7 +468,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     "updates the header with the transcript in one pending commit (child: %s)",
     async (child) => {
       const frames: ReturnType<typeof headerSnapshot>[] = [];
-      renderHeaderPage(true, child, frames);
+      renderHeaderPage(child, frames);
       await screen.findByRole("button", { name: "Project: Alpha project" });
       await screen.findByText("alpha transcript");
       frames.length = 0;
@@ -515,7 +514,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
       vi.spyOn(serverOrigin, "isCurrentServerLocal").mockReturnValue(false);
       const copy = vi.spyOn(clipboard, "copyText").mockResolvedValue(undefined);
       const frames: ReturnType<typeof headerSnapshot>[] = [];
-      renderHeaderPage(true, false, frames);
+      renderHeaderPage(false, frames);
       await screen.findByRole("button", { name: "Project: Alpha project" });
       fireEvent.click(screen.getByRole("link", { name: "open beta" }));
 
@@ -541,32 +540,9 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     },
   );
 
-  it("leaves the header URL-owned with the flag off", async () => {
-    const frames: ReturnType<typeof headerSnapshot>[] = [];
-    renderHeaderPage(false, false, frames);
-    await screen.findByRole("button", { name: "Project: Alpha project" });
-
-    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
-
-    expect(headerSnapshot()).toMatchObject({
-      title: "Alpha session",
-      project: "Project: Alpha project",
-      menuTarget: "conv_a",
-      activeConversationId: "conv_a",
-      urlConvId: "conv_a",
-    });
-    fireEvent.click(screen.getByRole("link", { name: "finish beta navigation" }));
-    expect(headerSnapshot()).toMatchObject({
-      title: "Beta session",
-      menuTarget: "conv_b",
-      activeConversationId: "conv_b",
-      urlConvId: "conv_b",
-    });
-  });
-
   it("keeps header navigation URL-owned on Back and Forward", async () => {
     const frames: ReturnType<typeof headerSnapshot>[] = [];
-    renderHeaderPage(true, false, frames, false);
+    renderHeaderPage(false, frames, false);
     await screen.findByRole("button", { name: "Project: Alpha project" });
     fireEvent.click(screen.getByRole("link", { name: "open beta" }));
     expect(headerSnapshot().title).toBe("Beta session");
@@ -587,34 +563,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     });
   });
 
-  it("flag off: the placeholder commits and the surface remounts as before", async () => {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    initChatStore(qc);
-    seedLiveEntry("conv_a", "alpha transcript");
-    seedLiveEntry("conv_b", "beta transcript");
-    renderPage({}, qc);
-    await waitFor(() => expect(document.body.textContent).toContain("alpha transcript"));
-    const surfaceBefore = transcriptNode();
-    commitLog.length = 0;
-
-    act(() => fireEvent.click(screen.getByRole("link", { name: "open beta" })));
-
-    expect(useChatStore.getState().conversationId).toBe("conv_b");
-    // The mismatch commit rendered the placeholder and tore the surface down.
-    expect(commitLog).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          urlConvId: "conv_b",
-          activeConversationId: "conv_a",
-          loadingConversation: false,
-        }),
-      ]),
-    );
-    expect(transcriptNode()).not.toBe(surfaceBefore);
-    await waitFor(() => expect(document.body.textContent).toContain("beta transcript"));
-  });
-
-  it("cold target still shows the placeholder with the flag on", async () => {
+  it("cold target still shows the placeholder", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
@@ -625,7 +574,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
       "fetch",
       vi.fn(() => new Promise<Response>(() => {})),
     );
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc);
+    renderPage({}, qc);
     await waitFor(() => expect(document.body.textContent).toContain("alpha transcript"));
     const surfaceBefore = transcriptNode();
 
@@ -642,7 +591,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc, { cancelBetaNavigation: true });
+    renderPage({}, qc, { cancelBetaNavigation: true });
     await screen.findByText("alpha transcript");
     vi.useFakeTimers();
 
@@ -662,7 +611,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc, { deferNavigation: true });
+    renderPage({}, qc, { deferNavigation: true });
     await screen.findByText("alpha transcript");
     const surface = transcriptNode();
     vi.useFakeTimers();
@@ -689,7 +638,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
     seedLiveEntry("conv_c", "gamma transcript");
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc, { deferNavigation: true });
+    renderPage({}, qc, { deferNavigation: true });
     await screen.findByText("alpha transcript");
     const surface = transcriptNode();
     const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
@@ -718,7 +667,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc);
+    renderPage({}, qc);
     await screen.findByText("alpha transcript");
     fireEvent.click(screen.getByRole("link", { name: "open beta" }));
     const betaSurface = transcriptNode();
@@ -753,7 +702,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
       const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
       useChatStore.setState({ send, sendSlashCommand, loadingConversation: true });
       setPendingInitialPrompt("conv_a", { text: "alpha private prompt", skill });
-      renderPage({ warm_switch_keep_mounted_ui: true }, qc);
+      renderPage({}, qc);
       expect(screen.getByText("Loading conversation…")).toBeInTheDocument();
 
       fireEvent.click(screen.getByRole("link", { name: "open beta" }));
@@ -936,7 +885,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     const temporaryId = "temp:example";
     seedLiveEntry(temporaryId, "initial transcript");
     useChatStore.setState({ conversationId: temporaryId, boundAgentId: "agent_example" });
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc, {
+    renderPage({}, qc, {
       initialConversationId: temporaryId,
       deferNavigation: true,
     });
@@ -967,7 +916,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     seedLiveEntry("conv_b", "beta transcript");
     setSessionDraft("conv_b", { text: "beta draft", files: [] });
     useChatStore.setState({ conversationId: temporaryId, boundAgentId: "agent_example" });
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc, { initialConversationId: temporaryId });
+    renderPage({}, qc, { initialConversationId: temporaryId });
     const input = screen.getByRole("textbox");
     const surface = transcriptNode();
     fireEvent.change(input, { target: { value: "temporary draft" } });
@@ -1019,7 +968,7 @@ async function nextTask() {
   });
 }
 
-async function runSwitchRace(seed: number, enabled: boolean) {
+async function runSwitchRace(seed: number) {
   resetStreamSlotManager();
   vi.spyOn(alwaysSteer, "readAlwaysSteer").mockReturnValue(false);
   const random = raceRandom(seed);
@@ -1093,7 +1042,7 @@ async function runSwitchRace(seed: number, enabled: boolean) {
       }),
   );
   const routing = seed % 2 ? reactRouterRouting : basenamedRouting("/embed");
-  renderPage({ warm_switch_keep_mounted_ui: enabled }, qc, {
+  renderPage({}, qc, {
     routing,
     sidebar: true,
     cancelBetaNavigation: true,
@@ -1144,15 +1093,11 @@ async function runSwitchRace(seed: number, enabled: boolean) {
       finishCold = undefined;
       await waitFor(() => expect(transcriptNode()?.textContent).toContain(`${target} transcript`));
     } else if (source !== target) {
-      if (enabled) {
-        expect(document.body.textContent).not.toContain("Loading conversation…");
-        expect(transcriptNode()).toBe(surface);
-      } else {
-        expect(transcriptNode()).not.toBe(surface);
-      }
+      expect(document.body.textContent).not.toContain("Loading conversation…");
+      expect(transcriptNode()).toBe(surface);
     }
     await nextTask();
-    if (enabled && source !== target)
+    if (source !== target)
       expect(switchTo.mock.calls.slice(firstCall)).not.toContainEqual([source]);
   }
 
@@ -1219,7 +1164,7 @@ async function runSwitchRace(seed: number, enabled: boolean) {
       "cancel",
       "double",
     ];
-    const steps = enabled ? 30 : 11;
+    const steps = 30;
     const shuffled = [...actions];
     for (let shuffleIndex = shuffled.length - 1; shuffleIndex > 0; shuffleIndex--) {
       const other = random(shuffleIndex + 1);
@@ -1275,10 +1220,8 @@ async function runSwitchRace(seed: number, enabled: boolean) {
         recordNavigation(first);
         recordNavigation(second);
         await nextTask();
-        if (enabled) {
-          expect(transcriptNode()).toBe(surface);
-          expect(switchTo.mock.calls.slice(firstCall)).not.toContainEqual([source]);
-        }
+        expect(transcriptNode()).toBe(surface);
+        expect(switchTo.mock.calls.slice(firstCall)).not.toContainEqual([source]);
       }
       check();
     };
@@ -1286,7 +1229,7 @@ async function runSwitchRace(seed: number, enabled: boolean) {
     for (let step = 0; step < steps; step++) sequence = sequence.then(() => runAction(step));
     await sequence;
   } catch (error) {
-    throw new Error(`warm switch race seed ${seed}, flag ${enabled}, ${trace.join(" ")}`, {
+    throw new Error(`warm switch race seed ${seed}, ${trace.join(" ")}`, {
       cause: error,
     });
   } finally {
@@ -1322,7 +1265,7 @@ async function runPendingRace(seed: number) {
     vi.fn(() => new Promise<Response>(() => {})),
   );
   const routing = seed % 2 ? reactRouterRouting : basenamedRouting("/embed");
-  renderPage({ warm_switch_keep_mounted_ui: true }, qc, { routing, deferNavigation: true });
+  renderPage({}, qc, { routing, deferNavigation: true });
   await screen.findByText("conv_a transcript");
   const open = {
     conv_a: screen.getByRole("link", { name: "open alpha" }),
@@ -1431,7 +1374,7 @@ const browserRaceSeedCount = Math.ceil(raceSeedCount / 5);
 describe("seeded warm switch race", () => {
   it.each(Array.from({ length: browserRaceSeedCount }, (_, index) => raceSeed + index))(
     "keeps session state isolated for seed %i",
-    async (seed) => runSwitchRace(seed, true),
+    async (seed) => runSwitchRace(seed),
     30000,
   );
   it.each(
@@ -1440,7 +1383,4 @@ describe("seeded warm switch race", () => {
       (_, index) => raceSeed + browserRaceSeedCount + index,
     ),
   )("keeps pending commits isolated for seed %i", async (seed) => runPendingRace(seed), 30000);
-  it.each([1, 2])("retains the flag-off behavior for seed %i", async (seed) =>
-    runSwitchRace(seed, false),
-  );
 });
