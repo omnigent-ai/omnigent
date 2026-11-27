@@ -83,7 +83,12 @@ vi.mock("./WorkspacePickerDialog", () => ({
     ) : null,
 }));
 
-import { LARGER_REPOSITORY_REASON, ReviewFolderName, useReviewFolder } from "./ChangesReviewFolder";
+import {
+  LARGER_REPOSITORY_REASON,
+  ReviewFolderName,
+  resetReviewFolderListsForTests,
+  useReviewFolder,
+} from "./ChangesReviewFolder";
 
 const SESSION = "conv_folder";
 
@@ -119,7 +124,10 @@ beforeEach(() => {
   mocks.hostId = "host_1";
   mocks.parentSessionId = null;
 });
-afterEach(() => rememberBrowseLocation(SESSION, null));
+afterEach(() => {
+  rememberBrowseLocation(SESSION, null);
+  resetReviewFolderListsForTests();
+});
 
 describe("useReviewFolder", () => {
   it("chooses a worktree in the folder browser, which Files then shows too, and returns", async () => {
@@ -257,6 +265,26 @@ describe("useReviewFolder", () => {
       expect(result.current.resolved).toBe(false);
     },
   );
+
+  it("keeps the last list for a review that opens after the lookup failed", () => {
+    rememberBrowseLocation(SESSION, "/repo/.worktrees/feature");
+    const first = renderHook(() => useReviewFolder(SESSION, true));
+    expect(first.result.current.root).toBe("/repo/.worktrees/feature");
+    mocks.worktreeAnswer = "unknown";
+    first.rerender();
+    // Another Diffs tab of the session mounts while the shared lookup reads as failed.
+    const second = renderHook(() => useReviewFolder(SESSION, true));
+    expect(second.result.current.root).toBe("/repo/.worktrees/feature");
+    expect(second.result.current.resolved).toBe(true);
+    expect(second.result.current.canChoose).toBe(true);
+  });
+
+  it("keeps no list for another session's review", () => {
+    renderHook(() => useReviewFolder(SESSION, true));
+    mocks.worktreeAnswer = "unknown";
+    const other = renderHook(() => useReviewFolder("conv_other", true));
+    expect(other.result.current.resolved).toBe(false);
+  });
 
   it("isn't resolved while the worktree lookup fails, then resolves on the list", () => {
     mocks.worktreeAnswer = "unknown";

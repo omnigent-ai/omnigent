@@ -25,7 +25,7 @@ import type * as FileViewerContextModule from "./FileViewerContext";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as SessionWorktreesModule from "@/hooks/useSessionWorktrees";
 import type { SessionWorktreesResult } from "@/hooks/useSessionWorktrees";
-import type { ReviewFolder } from "./ChangesReviewFolder";
+import { resetReviewFolderListsForTests, type ReviewFolder } from "./ChangesReviewFolder";
 import { comparisonChoiceOf } from "@/lib/comparisonChoice";
 import type { ComparisonAvailability } from "@/shell/useVisitComparison";
 import { localComparisonView, type LocalComparisonInput } from "@/lib/localComparison";
@@ -320,6 +320,7 @@ function renderReview(overrides: Partial<ChangesReviewProps> = {}) {
 
 afterEach(() => {
   resetShownReviewsForTests();
+  resetReviewFolderListsForTests();
   vi.clearAllMocks();
   mocks.commitComparisons = null;
   mocks.folder = null;
@@ -1560,6 +1561,40 @@ describe("a review of a worktree inside the workspace", () => {
       mocks.realFolder = { worktrees: listed };
       rerender(<ChangesReview {...props} />);
 
+      expect(onComparisonShown).not.toHaveBeenCalledWith(expect.anything(), {
+        step: false,
+        root: null,
+      });
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      unmount();
+    });
+
+    it("keeps the worktree for a Diffs tab that opens after a failed refetch of the worktrees", () => {
+      const listed: SessionWorktreesResult = {
+        status: "ok",
+        worktrees: [
+          { path: "/repo", branch: "main", is_main: true, detached: false },
+          { path: ROOT, branch: "feature", is_main: false, detached: false },
+        ],
+      };
+      rememberBrowseLocation("s1", ROOT);
+      mocks.realFolder = { worktrees: listed };
+      mocks.source.mockReturnValue(
+        source(changes({ workspace: { hostId: "host_1", root: "/repo" } })),
+      );
+      const first = renderReview({ landing: { ...landed(), settled: true } });
+      first.unmount();
+
+      // The refetch fails, then another Diffs tab of the session opens.
+      mocks.realFolder = { worktrees: { status: "unknown" } };
+      const onComparisonShown = vi.fn();
+      const { unmount } = renderReview({
+        comparison: { kind: "saved", intent: "head" },
+        comparisonRoot: ROOT,
+        landing: landed(),
+        onComparisonShown,
+      });
+      expect(screen.getByTestId("changes-review-folder")).toHaveTextContent("feature");
       expect(onComparisonShown).not.toHaveBeenCalledWith(expect.anything(), {
         step: false,
         root: null,

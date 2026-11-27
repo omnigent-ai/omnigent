@@ -3,7 +3,7 @@
 // header opens the same folder browser Files does; choosing a folder moves both.
 
 import { FolderOpenIcon, FolderSearchIcon } from "lucide-react";
-import { useCallback, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useId, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { useSession } from "@/hooks/useSession";
@@ -75,6 +75,14 @@ export interface ReviewFolder {
   dialog: React.ReactNode;
 }
 
+// The last worktree list each session's workspace had, by session, host and workspace.
+const lastWorktreeLists = new Map<string, HostWorktree[]>();
+
+/** Forgets every kept worktree list, between tests. */
+export function resetReviewFolderListsForTests(): void {
+  lastWorktreeLists.clear();
+}
+
 export function useReviewFolder(
   conversationId: string,
   active: boolean,
@@ -91,17 +99,14 @@ export function useReviewFolder(
   const answer = worktrees.data;
   // Only the host's owner may list worktrees; anyone else reviews the workspace itself.
   const denied = answer?.status === "unknown" && answer.denied === true;
-  // A failed lookup keeps the list this workspace last had, so a review doesn't jump to the
-  // workspace and record that over its visit.
-  const lookupKey = `${hostId ?? ""}\u0000${workspace ?? ""}`;
-  const lastListed = useRef<{ key: string; worktrees: HostWorktree[] } | null>(null);
-  if (answer?.status === "ok") lastListed.current = { key: lookupKey, worktrees: answer.worktrees };
+  // A failed lookup keeps the list this workspace last had, in every review of the session, so
+  // a review doesn't jump to the workspace and record that over its visit.
+  const lookupKey = `${conversationId}\u0000${hostId ?? ""}\u0000${workspace ?? ""}`;
+  if (answer?.status === "ok") lastWorktreeLists.set(lookupKey, answer.worktrees);
   // "Not a Git repository" and a refusal rule the old list out, so a later failure can't revive it.
-  else if (answer?.status === "not_git" || denied) lastListed.current = null;
+  else if (answer?.status === "not_git" || denied) lastWorktreeLists.delete(lookupKey);
   const kept =
-    answer?.status === "unknown" && !denied && lastListed.current?.key === lookupKey
-      ? lastListed.current.worktrees
-      : null;
+    answer?.status === "unknown" && !denied ? (lastWorktreeLists.get(lookupKey) ?? null) : null;
   const listed = answer?.status === "ok" ? answer.worktrees : kept;
   const { session, isLoading: sessionLoading } = useSession(conversationId);
   // A top-level session with no host has no worktrees to list; a child waits for its parent's host.
