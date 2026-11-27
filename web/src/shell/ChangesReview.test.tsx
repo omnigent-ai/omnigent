@@ -471,18 +471,7 @@ describe("ChangesReview", () => {
     renderReview();
     expect(screen.getByText("Comparing with the branch point…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Change compared revisions" })).toBeInTheDocument();
-  });
-
-  it("draws the tree's icon at the right of its loading toolbar, where the toggle will be", () => {
-    mocks.source.mockReturnValue(
-      source(
-        changes({
-          data: undefined,
-          comparison: { base: "pending", message: "Comparing with the branch point…" },
-        }),
-      ),
-    );
-    renderReview();
+    // The loading toolbar draws the tree's icon at the right, where its toggle will be.
     const toolbar = screen.getByRole("toolbar", { name: "Diff review" });
     expect(toolbar.lastElementChild).toBe(screen.getByTestId("diff-review-tree-placeholder"));
     expect(screen.getByTestId("diff-review-tree-placeholder")).toHaveClass("ml-auto");

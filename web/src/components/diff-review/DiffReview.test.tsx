@@ -642,26 +642,14 @@ describe("DiffReview changed-files tree", () => {
     expect(searchBox()).toHaveFocus();
   });
 
-  it("docks and undocks the column from a pressed toolbar toggle, with no popover", () => {
+  it("docks the tree after the diff, and undocks it from a pressed toggle that ends the toolbar", () => {
     render(<DiffReview {...props(ready)} />);
+    const toolbar = screen.getByRole("toolbar", { name: "Diff review" });
     const toggle = screen.getByRole("button", { name: "Hide changed files" });
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(toggle).not.toHaveAttribute("aria-haspopup");
     expect(toggle).not.toHaveAttribute("aria-expanded");
     expect(toggle).not.toHaveAttribute("aria-controls");
-
-    fireEvent.click(toggle);
-    expect(screen.queryByRole("complementary", { name: "Changed files" })).toBeNull();
-    expect(screen.queryByRole("dialog", { name: "Changed files" })).toBeNull();
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
-    fireEvent.click(toggle);
-    expect(screen.getByRole("complementary", { name: "Changed files" })).toBeVisible();
-  });
-
-  it("docks the tree after the diff, under a toggle that ends the toolbar", () => {
-    render(<DiffReview {...props(ready)} />);
-    const toolbar = screen.getByRole("toolbar", { name: "Diff review" });
-    const toggle = screen.getByRole("button", { name: "Hide changed files" });
     // The toggle sits over the tree, and what changed reads first.
     expect(toolbar.lastElementChild).toContainElement(toggle);
     expect(toolbar.firstElementChild).toBe(screen.getByTestId("diff-review-file-count"));
@@ -673,6 +661,13 @@ describe("DiffReview changed-files tree", () => {
     expect(within(column as HTMLElement).getByTestId("diff-review-tree-resize-handle")).toHaveClass(
       "-left-0.5",
     );
+
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("complementary", { name: "Changed files" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Changed files" })).toBeNull();
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(toggle);
+    expect(screen.getByRole("complementary", { name: "Changed files" })).toBeVisible();
   });
 
   it("offers no close button as a column, where its × only clears the search", () => {
