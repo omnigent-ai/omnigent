@@ -418,8 +418,9 @@ def restored_project_order(live_server: str) -> Iterator[None]:
     url = f"{live_server}/v1/projects/order"
     saved = httpx.get(url, timeout=10.0).json()
     yield
-    if saved["ordered_project_ids"] is not None:
-        httpx.put(url, json={"ordered_project_ids": saved["ordered_project_ids"]}, timeout=10.0)
+    # Put back the remembered list too, or clear it, so the move's IDs don't outlive the test.
+    remembered = saved["ordered_project_ids"] or []
+    httpx.put(url, json={"ordered_project_ids": remembered}, timeout=10.0)
     if saved["sort_mode"] == "alphabetical":
         httpx.put(url, json={"ordered_project_ids": None}, timeout=10.0)
 
