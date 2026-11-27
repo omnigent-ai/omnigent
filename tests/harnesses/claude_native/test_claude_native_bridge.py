@@ -19187,8 +19187,8 @@ async def test_curl_evaluate_policy_command_round_trips(
     # or runner gone): stdin replays into the Python hook, which takes
     # its direct-server path (unreachable here) and fails closed with
     # its own shaping — the pre-curl behavior.
-    bare_dir = tmp_path / "no-relay"
-    bare_dir.mkdir()
+    bare_dir = claude_native_bridge._BRIDGE_ROOT / "no-relay"
+    bare_dir.mkdir(parents=True)
     args = augment_claude_args((), bridge_dir=bare_dir, ap_server_url="http://127.0.0.1:9")
     (bare_dir / "bridge.json").write_text(
         json.dumps({"active_session_id": "conv_no_relay"}), encoding="utf-8"
