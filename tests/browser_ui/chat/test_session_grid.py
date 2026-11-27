@@ -198,11 +198,10 @@ def test_session_grid_drag_persist_live_updates_and_close(
         )
         _drag_session(page, "grid-1", "grid-0", "right")
         expect(page).to_have_url(re.compile(r"/grid/[^/]+$"))
-        expect(page.get_by_test_id("new-chat-button")).not_to_have_class(
-            re.compile(r"bg-\[var\(--sidebar-active\)\]")
-        )
+        # Whole class token only: rows also carry the pressed `active:` variant.
+        active_style = re.compile(r"(?:^|\s)bg-\[var\(--sidebar-active\)\](?:\s|$)")
+        expect(page.get_by_test_id("new-chat-button")).not_to_have_class(active_style)
         grid_url = page.url
-        active_style = re.compile(r"bg-\[var\(--sidebar-active\)\]")
         for index in range(5):
             link = page.locator(f'aside [data-sidebar-session-id="grid-{index}"] a')
             if index < 2:
