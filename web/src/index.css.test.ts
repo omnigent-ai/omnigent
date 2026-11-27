@@ -1914,3 +1914,23 @@ describe("index.css pane strip window-corner inset", () => {
     ).toContain("height: var(--pane-window-top-row)");
   });
 });
+
+describe("index.css touch input font size and double-tap zoom guard", () => {
+  it("pins editable text to 16px and sets touch-action: manipulation on touch devices", () => {
+    // Mobile --text-ui defaults to 15px; iOS Safari auto-zooms any focused field below 16px.
+    const mediaBlock = cssSource.match(/@media \(pointer: coarse\) \{[\s\S]*?\n\}/)?.[0];
+    expect(mediaBlock).toBeDefined();
+    expect(mediaBlock).toMatch(/html\s*\{\s*touch-action:\s*manipulation;/);
+    const inputRule = mediaBlock?.match(/:is\(([^)]*)\)\s*\{\s*font-size:\s*16px;/);
+    expect(inputRule).not.toBeNull();
+    for (const sel of [
+      "input",
+      "textarea",
+      "select",
+      '[contenteditable="true"]',
+      '[data-testid="composer-highlight-overlay"]',
+    ]) {
+      expect(inputRule?.[1]).toContain(sel);
+    }
+  });
+});
