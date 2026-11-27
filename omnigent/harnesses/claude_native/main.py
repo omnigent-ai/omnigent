@@ -290,6 +290,8 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
+# Default-model family precedence; Fable is opt-in, so it comes last.
+_CLAUDE_DEFAULT_TIER_ORDER: tuple[str, ...] = ("opus", "sonnet", "haiku", "fable")
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
 # one more independently-selectable /model picker slot beyond those
 # families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
@@ -3275,11 +3277,7 @@ def _ucode_config_for_profile(
                     break
     if default_model is None:
         default_model = next(
-            (
-                claude_models[tier]
-                for tier in ("opus", "sonnet", "haiku", "fable")
-                if tier in claude_models
-            ),
+            (claude_models[tier] for tier in _CLAUDE_DEFAULT_TIER_ORDER if tier in claude_models),
             None,
         )
     # When ucode caches no model and live discovery was unavailable, default it
@@ -3564,6 +3562,8 @@ def _native_claude_config_from_entry(
       (:func:`_provider_config_for_native_claude`).
     - ``bedrock`` → Bedrock-style gateway config
       (:func:`_bedrock_config_for_native_claude`).
+    - ``databricks`` with ``connection: databricks`` → the owner's connection
+      through the credential broker (:func:`_connect_broker_claude_config`).
     - ``databricks`` → the existing ucode path keyed on the provider profile.
     - ``subscription`` → use the ``claude`` CLI's login without inherited API
       credentials, or defer to Claude's configured gateway/cloud transport.
@@ -3585,6 +3585,15 @@ def _native_claude_config_from_entry(
         return _provider_config_for_native_claude(entry)
     if entry.kind == BEDROCK_KIND:
         return _bedrock_config_for_native_claude(entry)
+    if entry.kind == DATABRICKS_KIND and entry.connection == "databricks":
+        broker_config = _connect_broker_claude_config()
+        log_info_once(
+            _logger,
+            "native-claude routing: provider %r uses the owner's Databricks connection (%s)",
+            entry.name,
+            "credential broker" if broker_config is not None else "no broker sidecar on this host",
+        )
+        return broker_config
     if entry.kind == DATABRICKS_KIND:
         log_info_once(_logger, "native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
@@ -3639,11 +3648,28 @@ _CONNECT_BROKER_UCODE_ENV_ALLOWLIST = frozenset(
 
 def _connect_broker_default_model() -> str:
     """The model a managed connect session pins: the deployment override if set,
-    else the bundled Databricks Claude catalog default."""
+    else the model catalog's preferred Claude tier in its Unity Catalog spelling.
+
+    The broker route is the Unity AI Gateway, which rejects legacy
+    ``databricks-`` endpoint names.
+    """
+    from omnigent.models.databricks_model_discovery import claude_models_by_family
+    from omnigent.models.model_override import normalize_model_for_provider
+
     pinned = os.environ.get(_DATABRICKS_GATEWAY_MODEL_ENV, "").strip()
     if pinned:
         return pinned
-    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    families = claude_models_by_family(
+        entry.id for entry in model_catalog.catalog_model_entries("databricks")
+    )
+    preferred = next(
+        (families[tier] for tier in _CLAUDE_DEFAULT_TIER_ORDER if tier in families), None
+    )
+    if preferred is not None:
+        return preferred
+    return normalize_model_for_provider(
+        model_catalog.resolve_catalog_model("databricks", family="claude").model_id, "databricks"
+    )
 
 
 def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
