@@ -260,8 +260,10 @@ function appPath(appId: string, suffix = ""): string {
   return `${GADGETS_PATH}/${encodeURIComponent(appId)}${suffix}`;
 }
 
-// Lists page with a cursor and a page can be short; this many pages is far past any real list.
-const MAX_LIST_PAGES = 100;
+// Lists page with a cursor and a page can be short or empty, so a long list of large records
+// takes many pages: they are followed until the last, and only a cursor seen before (a loop)
+// is malformed. This bound only stops a server that never ends a list.
+const MAX_LIST_PAGES = 100_000;
 const LIST_PAGE_SIZE = 100;
 
 /** Every page of a cursor-paged list, with each page's raw body for its other fields. */
@@ -275,6 +277,7 @@ async function everyPage(
   const items: unknown[] = [];
   let first: Record<string, unknown> | null = null;
   let cursor: string | null = null;
+  const seen = new Set<string>();
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
     const params = new URLSearchParams({ ...query, limit: String(limit) });
     if (cursor !== null) params.set("cursor", cursor);
@@ -289,6 +292,8 @@ async function everyPage(
     items.push(...pageItems);
     cursor = typeof body.next_cursor === "string" ? body.next_cursor : null;
     if (cursor === null) return { items, first };
+    if (seen.has(cursor)) throw malformed(what);
+    seen.add(cursor);
   }
   throw malformed(what);
 }

@@ -634,7 +634,9 @@ export function useGadgetRailTabState(
       if (gadgetId !== null)
         showInSession.mutate({ gadgetId, sessionId: conversationId, shown: false });
     },
-    canClose: !readOnly,
+    // A viewer's own shelf: anyone who can read the session hides gadgets beside it for
+    // themselves, even where they can't build one there.
+    canClose: true,
     mobileOpen,
     closeMobile,
     render: (key, view) => {

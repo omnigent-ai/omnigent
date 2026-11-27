@@ -303,11 +303,17 @@ describe("gadget tabs in a session's side panel", () => {
     expect(drawer).toHaveAttribute("data-state", "closed");
   });
 
-  it("offers no New gadget or close buttons to viewers who can't edit the session", async () => {
+  it("offers viewers who can't edit the session no New gadget, but lets them close their own tabs", async () => {
+    vi.mocked(linkGadgetToSession).mockResolvedValue([REPORT]);
     renderWithGadgets(<Rail conversationId="conv_1" readOnly />);
     await screen.findByRole("tab", { name: "Board" });
     expect(screen.getByRole("list", { name: "new items" })).toBeEmptyDOMElement();
-    expect(screen.queryByRole("button", { name: "Close Board" })).toBeNull();
+    // The tab is on the viewer's own shelf, so closing it only hides it for them.
+    fireEvent.click(screen.getByRole("button", { name: "Close Board" }));
+    await waitFor(() =>
+      expect(linkGadgetToSession).toHaveBeenCalledWith(BOARD.id, "conv_1", false),
+    );
+    await waitFor(() => expect(screen.queryByRole("tab", { name: "Board" })).toBeNull());
   });
 
   it("shows nothing while the server has no gadgets", () => {

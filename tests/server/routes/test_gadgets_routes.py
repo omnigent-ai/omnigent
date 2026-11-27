@@ -731,6 +731,28 @@ async def test_viewers_read_only_the_published_revision(client: httpx.AsyncClien
     assert own.json()["html"] == "<p>Synthetic draft</p>"
 
 
+async def test_an_account_deleted_after_its_request_authenticated_writes_nothing(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    # The account is gone by the time the gadget routes look up its registration: with none,
+    # the write would land where the account's cleanup never looks.
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(stores.db_uri)
+    accounts.create_user_with_password("carol@example.com", "carol-hash")
+    assert accounts.delete_user("carol@example.com") is True
+
+    refused = await client.post(
+        "/v1/gadgets", json={"name": "Late board"}, headers=_as("carol@example.com")
+    )
+
+    assert refused.status_code == 401, refused.text
+    assert list(stores.gadgets.iter_owned("carol@example.com")) == []
+    assert not (stores.root / "owners").exists() or not any(
+        stores.root.joinpath("owners").iterdir()
+    )
+
+
 async def test_a_create_waiting_too_long_for_the_owner_index_is_busy_and_retryable(
     client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

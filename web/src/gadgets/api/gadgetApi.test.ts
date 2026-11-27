@@ -177,4 +177,35 @@ describe("gadget API", () => {
     expect(listed.items.map((item) => item.id)).toEqual(["z", "a"]);
     expect(listed.canComment).toBe(true);
   });
+
+  it("follows more than a hundred short pages, and refuses a cursor that loops", async () => {
+    const comment = (id: string, createdAt: number) => ({
+      id,
+      body: id,
+      status: "draft",
+      anchor: { text: "x" },
+      created_by: "a@example.com",
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+    // Large comments: a few fit a page, so 601 of them take 101 pages.
+    for (let page = 0; page < 101; page++) {
+      fetchMock.mockResolvedValueOnce(
+        json({
+          items: [comment(`c${page}`, page)],
+          next_cursor: page < 100 ? `k${page}` : null,
+          can_comment: true,
+        }),
+      );
+    }
+    const listed = await listGadgetComments("app-1");
+    expect(listed.items).toHaveLength(101);
+    expect(listed.items.at(-1)?.id).toBe("c100");
+    expect(listed.canComment).toBe(true);
+
+    fetchMock
+      .mockResolvedValueOnce(json({ items: [], next_cursor: "loop", can_comment: true }))
+      .mockResolvedValueOnce(json({ items: [], next_cursor: "loop", can_comment: true }));
+    await expect(listGadgetComments("app-1")).rejects.toThrow();
+  });
 });

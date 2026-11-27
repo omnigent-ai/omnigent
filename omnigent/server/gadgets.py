@@ -275,7 +275,19 @@ def create_gadgets_router(
         # database read, so it runs in the request's worker thread.
         # Scoped to the request's workspace, so the same user ID in another workspace is
         # someone else.
-        return GadgetViewer(user_id, workspace_registrations(permission_store, [user_id])[user_id])
+        registration = workspace_registrations(permission_store, [user_id])[user_id]
+        if (
+            registration is None
+            and permission_store is not None
+            and user_id in permission_store.deleted_accounts([user_id])
+        ):
+            # Deleted after the request authenticated: with no registration its writes would
+            # land under a key the account's cleanup never reaches. A registration read
+            # before the deletion is covered by the deletion's own fence instead.
+            raise OmnigentError(
+                "This account was deleted; sign in again", code=ErrorCode.UNAUTHORIZED
+            )
+        return GadgetViewer(user_id, registration)
 
     def _sessions(user_id: str) -> SessionStateReader:
         def can_read(session_id: str) -> bool:
