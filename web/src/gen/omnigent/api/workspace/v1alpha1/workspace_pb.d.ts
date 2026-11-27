@@ -3677,6 +3677,38 @@ export declare type GetPullRequestStackResponse = Message<"omnigent.api.workspac
 export declare const GetPullRequestStackResponseSchema: GenMessage<GetPullRequestStackResponse>;
 
 /**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestNativeStackRequest
+ */
+export declare type GetPullRequestNativeStackRequest = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestNativeStackRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestNativeStackRequest.
+ * Use `create(GetPullRequestNativeStackRequestSchema)` to create a new message.
+ */
+export declare const GetPullRequestNativeStackRequestSchema: GenMessage<GetPullRequestNativeStackRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestNativeStackResponse
+ */
+export declare type GetPullRequestNativeStackResponse = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestNativeStackResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestNativeStackResponse.
+ * Use `create(GetPullRequestNativeStackResponseSchema)` to create a new message.
+ */
+export declare const GetPullRequestNativeStackResponseSchema: GenMessage<GetPullRequestNativeStackResponse>;
+
+/**
  * @generated from message omnigent.api.workspace.v1alpha1.ReadPullRequestImageRequest
  */
 export declare type ReadPullRequestImageRequest = Message<"omnigent.api.workspace.v1alpha1.ReadPullRequestImageRequest"> & {
@@ -4890,6 +4922,16 @@ export declare const WorkspaceService: GenService<{
     methodKind: "unary";
     input: typeof GetPullRequestStackRequestSchema;
     output: typeof GetPullRequestStackResponseSchema;
+  },
+  /**
+   * GitHub's own record of the stack this pull request is in, where its host has stacks.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetPullRequestNativeStack
+   */
+  getPullRequestNativeStack: {
+    methodKind: "unary";
+    input: typeof GetPullRequestNativeStackRequestSchema;
+    output: typeof GetPullRequestNativeStackResponseSchema;
   },
   /**
    * The pull requests for a branch of the workspace's own repository.

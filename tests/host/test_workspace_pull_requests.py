@@ -28,6 +28,7 @@ from omnigent.runner import (
     github_lifecycle,
     github_lookup,
     github_merge_queue,
+    github_native_stack,
     github_resource,
     github_reviews,
     github_search,
@@ -564,9 +565,14 @@ _QUEUE_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     ),
     "DequeuePullRequest": (pb.DequeuePullRequestRequest(pr_url=_PR), "dequeue", {}),
 }
-# The stack read: a valid request, the github_stack function it runs, and its arguments.
+# The stack reads: a valid request, the function it runs, and its arguments.
 _STACK_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "GetPullRequestStack": (pb.GetPullRequestStackRequest(pr_url=_PR), "pull_request_stack", {}),
+    "GetPullRequestNativeStack": (
+        pb.GetPullRequestNativeStackRequest(pr_url=_PR),
+        "pull_request_native_stack",
+        {},
+    ),
 }
 # The searches for the owner's reviewer picker and editor: a request, its function, arguments.
 _SEARCH_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
@@ -613,7 +619,7 @@ def record_github_changes(
             if table is _QUEUE_CALLS:
                 module = github_merge_queue
             elif table is _STACK_CALLS:
-                module = github_stack
+                module = github_stack if hasattr(github_stack, function) else github_native_stack
             elif table is _SEARCH_CALLS:
                 module = github_search
             else:
