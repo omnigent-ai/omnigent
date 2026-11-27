@@ -1438,26 +1438,36 @@ _READ_ONLY_GITHUB = ("github.com",)
         pytest.param(("git.example.com",), {"merging": True}, {}, id="writable"),
     ],
 )
+# The overview is shaped as well when the server has no PR store or can't store the PRs.
+@pytest.mark.parametrize(
+    "fault", [None, "no-store", "ingest-fails"], ids=["stored", "no-store", "ingest-fails"]
+)
 async def test_the_overview_of_a_pr_on_a_read_only_host_offers_no_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     read_only_code_hosts: tuple[str, ...],
     capabilities: dict[str, bool] | None,
     marked: dict[str, Any],
+    fault: str | None,
 ) -> None:
     """The workspace API shapes the host's overview as the REST route does."""
     overview: dict[str, Any] = {"selected_pr_url": _PR, "pr": {"url": _PR}}
     if capabilities is not None:
         overview["capabilities"] = capabilities
     stored = _linked(_PR)
-    monkeypatch.setattr(server_prs, "ingest_info", lambda *_args, **_kwargs: stored)
+
+    def ingest(*_args: Any, **_kwargs: Any) -> Any:
+        if fault == "ingest-fails":
+            raise OSError("disk full")
+        return stored
+
+    monkeypatch.setattr(server_prs, "ingest_info", ingest)
     monkeypatch.setattr(server_prs, "answer", lambda info, _stored: dict(info))
     monkeypatch.setattr(
         WorkspaceReader, "github_info", lambda _self, _session, _url: dict(overview)
     )
-    client = _client(
-        tmp_path, monkeypatch, _Store(stored), read_only_code_hosts=read_only_code_hosts
-    )
+    store = None if fault == "no-store" else _Store(stored)
+    client = _client(tmp_path, monkeypatch, store, read_only_code_hosts=read_only_code_hosts)
 
     response = await client.get_pull_request(pb.GetPullRequestRequest(pr_url=_PR))
 
