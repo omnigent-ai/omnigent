@@ -4045,8 +4045,13 @@ def register_events_routes(
             _runner_needs_session_init
             or (
                 conv.runner_id is not None
-                and _is_native_terminal_session(conv)
+                # An SDK session whose init the runner connect
+                # deferred needs it too; the runner creates the inbox only there.
                 and initializer is not None
+                and (
+                    _is_native_terminal_session(conv)
+                    or initializer.is_deferred(conv, runner_client)
+                )
                 and not initializer.is_initialized(conv, runner_client)
             )
         ):

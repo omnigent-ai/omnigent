@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from dataclasses import replace
 from types import SimpleNamespace
@@ -72,6 +73,27 @@ def _conversation() -> Conversation:
         workspace="/tmp/workspace",
         labels={"example": "value"},
     )
+
+
+def test_deferred_init_is_scoped_to_its_tunnel_generation() -> None:
+    """A deferral marks one tunnel generation and ends with that tunnel."""
+    registry = _Registry()
+    client = _Client()
+    initializer = RunnerSessionInitializer(registry, server_version="0.6.0.dev0")  # type: ignore[arg-type]
+    conversation = _conversation()
+
+    assert not initializer.is_deferred(conversation, client)  # type: ignore[arg-type]
+    initializer.defer(conversation, generation=1)
+    assert initializer.is_deferred(conversation, client)  # type: ignore[arg-type]
+    registry.connection = SimpleNamespace(generation=2)
+    assert not initializer.is_deferred(conversation, client)  # type: ignore[arg-type]
+    registry.connection = SimpleNamespace(generation=1)
+    initializer.invalidate_runner("runner_init", generation=2)
+    assert initializer.is_deferred(conversation, client)  # type: ignore[arg-type]
+    initializer.invalidate_runner("runner_init")
+    assert not initializer.is_deferred(conversation, client)  # type: ignore[arg-type]
+    initializer.defer(dataclasses.replace(conversation, agent_id=None), generation=1)
+    assert not initializer.is_deferred(conversation, client)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
