@@ -436,11 +436,13 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             receipt = controlled_edit(draft, "")
             wait_for_editor(count, "")
             assert receipt.original_text == draft and receipt.replacement_text == ""
-            assert observations()[-1]["content"] == draft and observations()[-1]["after"] == ""
+            assert observations()[-1]["content"] == draft and observations()[-1]["after"] == "\n"
             count = len(observations())
             controlled_edit(receipt.replacement_text, receipt.original_text)
             wait_for_editor(count, draft)
-            assert observations()[-1]["content"] == "" and observations()[-1]["after"] == draft
+            assert (
+                observations()[-1]["content"] == "" and observations()[-1]["after"] == draft + "\n"
+            )
             wrong_session = {**owner, "native_session_id": "other-native-session"}
             wrong_process = {
                 **owner,
@@ -498,7 +500,11 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     timeout_s=10,
                 )
             count = len(observations())
-            receipt = controlled_edit("/status", "")
+            trailing = "  exact suffix \t\n\n"
+            controlled_edit("/status", trailing)
+            wait_for_editor(count, trailing)
+            count = len(observations())
+            receipt = controlled_edit(trailing, "")
             wait_for_editor(count, "")
             changed = "new-user-edit-preserved"
             command("send-keys", "-l", "-t", target, changed)

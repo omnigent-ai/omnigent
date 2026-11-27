@@ -106,8 +106,8 @@ class NativeEditorControl:
         cancelled: Callable[[], bool],
         deadline: float,
     ) -> None:
-        NativeDraftEdit._encode(expected_text)
-        NativeDraftEdit._encode(replacement_text)
+        NativeDraftEdit._encode(expected_text + "\n")
+        NativeDraftEdit._encode(replacement_text + "\n")
         self.bridge_dir = bridge_dir
         self.binding = binding
         self.expected_text = expected_text
@@ -179,8 +179,11 @@ class NativeEditorControl:
                 hello = channel.receive("hello")
                 if hello.get("binding") != asdict(self.binding):
                     raise NativeDraftEditRefused("The editor belongs to a different native owner.")
+                # Native import consumes the file's final LF, separately from draft text.
                 channel.send(
-                    "prepare", expected=self.expected_text, replacement=self.replacement_text
+                    "prepare",
+                    expected=self.expected_text,
+                    replacement=self.replacement_text + "\n",
                 )
                 channel.receive("prepared")
                 channel.send("commit")
