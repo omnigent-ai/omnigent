@@ -41,6 +41,40 @@ describe("markdownListStackFormat on its producer's output", () => {
     expect(LINEAR.slice(parsed.span.end)).toBe("## Summary\nThe change.\n");
   });
 
+  it("starts its span at the header, leaving the text above it out", () => {
+    const parsed = parse(`Context first.\n\n${LINEAR}`);
+    if (parsed?.trust !== "verified") throw new Error("expected a verified parse");
+    expect(`Context first.\n\n${LINEAR}`.slice(parsed.span.start, parsed.span.end)).toBe(
+      LINEAR.slice(0, LINEAR.indexOf("## Summary")),
+    );
+  });
+
+  it.each([
+    ["a line separator", "\u2028"],
+    ["a paragraph separator", "\u2029"],
+  ])("verifies labels with %s, which git allows in a branch name", (_name, separator) => {
+    const base = `stack/base${separator}split`;
+    const current = `stack/current${separator}split`;
+    const parsed = parse(
+      LINEAR.replace("[stack/base]", `[${base}]`).replace(
+        "[**stack/current**]",
+        `[**${current}**]`,
+      ),
+    );
+    expect(parsed?.trust).toBe("verified");
+    expect(shape(parsed)).toEqual([
+      [base, 100, 0, null],
+      ["stack/middle", 101, 1, 0],
+      [current, 102, 2, 1],
+    ]);
+  });
+
+  it("verifies a branch named `@`, which git allows", () => {
+    const parsed = parse(LINEAR.replace("[stack/middle]", "[@]"));
+    expect(parsed?.trust).toBe("verified");
+    expect(shape(parsed)?.[1]).toEqual(["@", 101, 1, 0]);
+  });
+
   it("verifies without the header suffix or the intro line, which the syntax makes optional", () => {
     expect(parse(described(ENTRIES, "## Stacked changes"))?.trust).toBe("verified");
   });

@@ -25,7 +25,8 @@ export interface MarkdownListStackSyntax {
 
 const FOOTER = /^-{9}[ \t]*$/;
 const RULE = /^ {0,3}-{3,}[ \t]*$/;
-const BULLET = /^([ \t]*)- (.*)$/;
+// Dot-all, since git allows U+2028 and U+2029 in a branch name and `.` would stop at them.
+const BULLET = /^([ \t]*)- (.*)$/s;
 const WORD_START = /^[\p{L}\p{N}_]/u;
 // Git forbids ASCII spaces and `[` in branch names, so a label never runs into the text
 // after it; other Unicode spaces are legal and stay part of the name.
@@ -37,7 +38,7 @@ const FORBIDDEN_IN_BRANCH = [" ", "~", "^", ":", "?", "*", "[", "\\"];
 /** Whether `name` could be a branch git created; anything else isn't producer output. */
 function isBranchName(name: string): boolean {
   // `git check-ref-format --branch` also refuses `HEAD` and a name starting with `-`.
-  if (name === "" || name === "@" || name === "HEAD" || name.startsWith("-")) return false;
+  if (name === "" || name === "HEAD" || name.startsWith("-")) return false;
   if (name.includes("..") || name.includes("@{")) return false;
   // Git's rules for each `/`-separated part, and for the name's ends.
   if (name.endsWith(".") || name.split("/").some((part) => /^$|^\.|\.lock$/.test(part))) {
@@ -50,7 +51,7 @@ function isBranchName(name: string): boolean {
       character === "\u007f",
   );
 }
-const BOLD = /^\*\*(.+)\*\*$/;
+const BOLD = /^\*\*(.+)\*\*$/s;
 // What the producer appends after an entry's label, in its order.
 const PRODUCER_SUFFIX =
   /^(?: \[\[Files changed\]\([^)\s]+\)\])?( ⬆️? \(dependency: merge first\))?( \[MERGED\])?( ← _this PR_)?$/u;
