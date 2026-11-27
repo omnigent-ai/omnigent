@@ -23,6 +23,7 @@ from tests._helpers.native_claude import (
     _require_session_only_claude,
     isolated_claude_mock_routing_stack,
 )
+from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.session import message_item_text, ordered_message_items, send_user_text
 from tests.e2e.conftest import configure_mock_llm, get_mock_message_requests, set_fallback_mock_llm
@@ -216,23 +217,17 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
         models=_PINNED_CLAUDE_MODELS,
         judge_model="mock-claude-active-turn-judge",
     ) as (base_url, client, host_id, workspace, settings_path):
-        agents = client.get("/v1/agents")
-        agents.raise_for_status()
-        agent_id = next(
-            row["id"] for row in agents.json()["data"] if row["name"] == "claude-native-ui"
-        )
-        created = client.post(
-            "/v1/sessions",
-            json={
-                "agent_id": agent_id,
+        created = create_native_session(
+            client,
+            base_url,
+            harness="claude",
+            metadata={
                 "host_id": host_id,
                 "workspace": str(workspace),
                 "cost_control_mode_override": "off",
             },
-            timeout=120,
         )
-        created.raise_for_status()
-        session_id = str(created.json()["id"])
+        session_id = str(created["session_id"])
         try:
             _require_session_only_claude(base_url, session_id)
             saved_settings = claude_settings_snapshot(settings_path)
@@ -286,7 +281,12 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
                         lambda: bool(model_client.get("/gate/pending").json()["pending"]),
                         timeout_s=30,
                     )
-                    assert client.get(f"/v1/sessions/{session_id}").json()["status"] == "running"
+                    poll_until(
+                        lambda: (
+                            _live_claude_snapshot(base_url, session_id).get("status") == "running"
+                        ),
+                        timeout_s=5,
+                    )
                     (evidence / "busy-before-controls.txt").write_text(
                         bridge._capture_pane(advert["socket_path"], target)
                     )
@@ -322,7 +322,12 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
                         ),
                         timeout_s=10,
                     )
-                    assert client.get(f"/v1/sessions/{session_id}").json()["status"] == "running"
+                    poll_until(
+                        lambda: (
+                            _live_claude_snapshot(base_url, session_id).get("status") == "running"
+                        ),
+                        timeout_s=5,
+                    )
                 finally:
                     while model_client.post("/gate/release").json()["released"]:
                         pass
