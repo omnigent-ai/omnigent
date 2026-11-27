@@ -340,13 +340,13 @@ Scans user messages and LLM prompts for PII patterns (SSN, credit card, email, p
 
 #### `cost_budget`
 
-Gates a session on cumulative LLM spend, at the **request** phase (before the LLM turn, so text-only turns are budgeted too) and the **tool-call** phase. ASKs the first time spend crosses each soft warning threshold. At the hard limit it acts as a **downgrade gate**, not a hard stop: it DENYs (the whole turn on `request`, or each tool call on `tool_call`) only while the session is on an expensive model -- telling the user to switch to a cheaper one with `/model` -- and allows them again once the session has switched.
+Gates a session on cumulative LLM spend, at the **request** phase (before the LLM turn, so text-only turns are budgeted too) and the **tool-call** phase. ASKs the first time spend crosses each soft warning threshold. At the hard limit, the default is a **hard stop** on all models (the whole turn on `request`, or each tool call on `tool_call`). An explicit non-empty `expensive_models` list instead makes it a **downgrade gate**: it blocks matching or unknown models, while allowing known non-matching models to continue.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_cost_usd` | number | (required) | Hard spend limit in USD. Once reached, the turn / tool calls are blocked while the session is on an expensive model. |
-| `ask_thresholds_usd` | number[] | `null` | Soft warning checkpoints that ASK the first time spend crosses each (each must be < `max_cost_usd`) |
-| `expensive_models` | string[] | Fable + Opus + GPT-5 (excl. `-mini`/`-nano`) | Case-insensitive substring tokens for the model tiers blocked once over budget (e.g. `"opus"` matches any Opus deployment). The default's broad `gpt-5` token matches the whole GPT-5 family except the cheap `-mini`/`-nano` variants; an explicit list is matched literally with no exclusions. `[]` disables the hard limit, leaving only the soft thresholds. |
+| `max_cost_usd` | number | `null` | Hard spend limit in USD. Either this or `ask_thresholds_usd` must be set. |
+| `ask_thresholds_usd` | number[] | `null` | Soft warning checkpoints that ASK the first time spend crosses each (each must be < `max_cost_usd` when set) |
+| `expensive_models` | string[] | `null` | Omitted, `null`, or `[]` blocks all models at the hard limit. A non-empty list supplies case-insensitive substring tokens for models to block (e.g. `"opus"` matches any Opus deployment); matching is literal with no exclusions. |
 
 ```yaml
 budget:
@@ -360,13 +360,13 @@ budget:
 
 #### `user_daily_cost_budget`
 
-Same ASK / downgrade-gate behavior as `cost_budget`, but the budget is the **session owner's cumulative spend across all their sessions for the current UTC day**. The soft-threshold approval is remembered per user+day, so an approved checkpoint won't re-prompt that user again today -- even from a different session. Useful as a server-wide per-user daily cap.
+Same ASK / hard-stop or downgrade-gate behavior as `cost_budget`, but the budget is the **session owner's cumulative spend across all their sessions for the current UTC day**. The soft-threshold approval is remembered per user+day, so an approved checkpoint won't re-prompt that user again today -- even from a different session. Useful as a server-wide per-user daily cap.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_cost_usd` | number | (required) | Hard daily limit in USD. Once the owner's spend for the day reaches it, the turn / tool calls are blocked while on an expensive model. |
-| `ask_thresholds_usd` | number[] | `null` | Soft daily warning checkpoints that ASK the first time the owner's daily spend crosses each (each must be < `max_cost_usd`) |
-| `expensive_models` | string[] | Fable + Opus + GPT-5 (excl. `-mini`/`-nano`) | Case-insensitive substring tokens for the model tiers blocked once over the daily budget. An explicit list is matched literally with no exclusions. `[]` disables the hard limit, leaving only the soft thresholds. |
+| `max_cost_usd` | number | `null` | Hard daily limit in USD. Either this or `ask_thresholds_usd` must be set. |
+| `ask_thresholds_usd` | number[] | `null` | Soft daily warning checkpoints that ASK the first time the owner's daily spend crosses each (each must be < `max_cost_usd` when set) |
+| `expensive_models` | string[] | `null` | Omitted, `null`, or `[]` blocks all models at the hard limit. A non-empty list supplies case-insensitive substring tokens for models to block; matching is literal with no exclusions. Unknown models are also blocked. |
 
 ```yaml
 # server_config.yaml -- a per-user daily cap applied to every session

@@ -760,8 +760,9 @@ policies:
     type: function
     handler: omnigent.policies.builtins.cost.cost_budget
     factory_params:
-      max_cost_usd: 5.00           # hard spend cap...
-      ask_thresholds_usd: [3.00]   # ...with a soft warning on the way
+      max_cost_usd: 5.00           # hard stop on all models at this spend
+      ask_thresholds_usd: [3.00]   # soft warning on the way
+      # expensive_models: ["opus"] # optional: block only matching models over budget
 ```
 
 Policies stack across three levels, **server-wide** (admin), **per-agent**
