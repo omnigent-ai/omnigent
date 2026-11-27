@@ -147,14 +147,13 @@ export function createGitHubReadBudgets({
   function pace(key: string | null): GitHubBudgetPace {
     if (!enabled || !key) return NORMAL;
     let share = Number.POSITIVE_INFINITY;
+    // A stop lasts until every resource low enough to stop has reset, not just the tightest.
     let until = 0;
     for (const budget of budgets.get(key)?.values() ?? []) {
       if (budget.resetAt <= now()) continue;
       const left = budget.remaining / budget.limit;
-      if (left < share) {
-        share = left;
-        until = budget.resetAt;
-      }
+      share = Math.min(share, left);
+      if (left < BUDGET_STOP_BELOW) until = Math.max(until, budget.resetAt);
     }
     if (share < BUDGET_STOP_BELOW) return { pace: "stopped", until };
     if (share < BUDGET_SLOW_BELOW) return { pace: "slow", factor: BUDGET_SLOW_FACTOR };

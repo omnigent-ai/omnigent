@@ -73,6 +73,11 @@ describe("githubReadBudgets", () => {
     expect(store.pace(KEY)).toEqual({ pace: "stopped", until: RESET });
     store.observe(KEY, graphql(1000));
     expect(store.pace(KEY)).toEqual({ pace: "stopped", until: RESET });
+    // Two resources low enough to stop: the stop lasts until the later of their resets.
+    const both = budgets().store;
+    both.observe(KEY, graphql(50, 5000, START + 60_000));
+    both.observe(KEY, { ...graphql(100, 5000, START + 120_000), resource: "core" });
+    expect(both.pace(KEY)).toEqual({ pace: "stopped", until: START + 120_000 });
   });
 
   it("lifts the stop at the reset with no read in between", () => {
@@ -419,6 +424,42 @@ describe("with real query observers", () => {
     } finally {
       slowed.stop();
       stopped.stop();
+      client.clear();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a stopped list stopped until every stopped resource has reset", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const store = createGitHubReadBudgets();
+    stores.push(store);
+    const client = new QueryClient();
+    // GraphQL is the tighter share and resets first; core is still below a tenth until later.
+    store.observe(KEY, graphql(50, 5000, START + 60_000));
+    store.observe(KEY, { ...graphql(100, 5000, START + 120_000), resource: "core" });
+    const queryFn = vi.fn(async () => "list");
+    const observer = new QueryObserver(client, {
+      queryKey: ["stopped"],
+      queryFn,
+      refetchInterval: (query) => {
+        const pace = store.pace(KEY);
+        if (pace.pace === "normal") return 30_000;
+        store.hold(query, pace);
+        return pace.pace === "slow" ? 30_000 * pace.factor : Math.max(pace.until - Date.now(), 1);
+      },
+      refetchIntervalInBackground: true,
+    });
+    const stop = observer.subscribe(() => undefined);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(queryFn).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(120_000 - 1);
+      expect(queryFn).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(queryFn).toHaveBeenCalledTimes(2);
+    } finally {
+      stop();
       client.clear();
       vi.useRealTimers();
     }
