@@ -111,7 +111,7 @@ def _pinned_slot_ids(page: Page) -> list[str]:
     """Return the pinned conversation ids in sidebar render order.
 
     The Nth entry (0-based) is the row the hotkey jumps to with digit
-    ``SESSION_HOTKEY_DIGITS[N]`` (1..9 then 0). Reading the live DOM order
+    ``SESSION_HOTKEY_DIGITS[N]`` (1..9). Reading the live DOM order
     rather than assuming an insertion order keeps the digit->slot assertions
     honest to what the user actually sees.
 

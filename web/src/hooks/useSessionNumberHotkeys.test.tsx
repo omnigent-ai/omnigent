@@ -168,8 +168,9 @@ describe("useSessionNumberHotkeys", () => {
   it("only maps the first nine: a tenth pinned session has no shortcut", () => {
     const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
     render(ten);
-    press("9");
-    expect(navigate).toHaveBeenCalledWith("/c/i");
+    for (const digit of ["0", ...SESSION_HOTKEY_DIGITS]) press(digit);
+    expect(navigate).toHaveBeenCalledTimes(SESSION_HOTKEY_DIGITS.length);
+    expect(navigate).not.toHaveBeenCalledWith("/c/j");
   });
 
   it("does nothing when the list is empty", () => {
