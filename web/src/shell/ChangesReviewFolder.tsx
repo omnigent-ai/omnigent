@@ -11,6 +11,7 @@ import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { parentIdFromLabels, sessionRoutingHostId } from "@/lib/sessionHost";
 import {
   diffRootFor,
   repositoryFolderOf,
@@ -102,8 +103,16 @@ export function useReviewFolder(
       ? lastListed.current.worktrees
       : null;
   const listed = answer?.status === "ok" ? answer.worktrees : kept;
-  // Only a list, "not a Git repository" or a refusal says which folders Diffs can review.
-  const worktreesKnown = listed !== null || answer?.status === "not_git" || denied;
+  const { session, isLoading: sessionLoading } = useSession(conversationId);
+  // A top-level session with no host has no worktrees to list; a child waits for its parent's host.
+  const hostless =
+    hostId === null &&
+    session != null &&
+    sessionRoutingHostId(session.hostId, session.labels) === null &&
+    (session.parentSessionId ?? parentIdFromLabels(session.labels)) === null;
+  // Only a list, "not a Git repository", a refusal or having no host says which folders Diffs
+  // can review.
+  const worktreesKnown = listed !== null || answer?.status === "not_git" || denied || hostless;
   const insideLargerRepository =
     workspace !== null && listed !== null && workspaceInsideLargerRepository(workspace, listed);
   const root = workspace ? diffRootFor(directory, workspace, listed ?? []) : null;
@@ -113,7 +122,6 @@ export function useReviewFolder(
     const reviewed = diffRootFor(candidate, workspace, listed ?? []);
     return repositoryFolderOf(reviewed, workspace) ? reviewed : null;
   };
-  const { session, isLoading: sessionLoading } = useSession(conversationId);
   const environment = useWorkspaceEnvironment(conversationId);
   const resolved =
     workspace !== null &&

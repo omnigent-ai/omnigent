@@ -24,11 +24,19 @@ const mocks = vi.hoisted(() => ({
   worktreeLookups: [] as (string | null)[],
   /** How the worktree lookup answers: a list, a failure, or not yet. */
   worktreeAnswer: "ok" as "ok" | "unknown" | "pending" | "not_git" | "denied",
+  hostId: "host_1" as string | null,
+  parentSessionId: null as string | null,
 }));
 vi.mock("./FileViewerContext", () => ({ useWorkspacePaths: () => ({ root: mocks.workspace }) }));
-vi.mock("./fileCommands/target", () => ({ useSessionHostId: () => "host_1" }));
+vi.mock("./fileCommands/target", () => ({ useSessionHostId: () => mocks.hostId }));
 vi.mock("@/hooks/useSession", () => ({
-  useSession: () => ({ session: { permissionLevel: mocks.permissionLevel } }),
+  useSession: () => ({
+    session: {
+      permissionLevel: mocks.permissionLevel,
+      hostId: mocks.hostId,
+      parentSessionId: mocks.parentSessionId,
+    },
+  }),
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceEnvironment: () => ({
@@ -108,6 +116,8 @@ beforeEach(() => {
   mocks.worktrees = WORKTREES;
   mocks.worktreeLookups = [];
   mocks.worktreeAnswer = "ok";
+  mocks.hostId = "host_1";
+  mocks.parentSessionId = null;
 });
 afterEach(() => rememberBrowseLocation(SESSION, null));
 
@@ -260,6 +270,27 @@ describe("useReviewFolder", () => {
     expect(result.current.resolved).toBe(true);
     expect(result.current.canChoose).toBe(true);
     expect(result.current.rootFor("/repo/.worktrees/feature")).toBe("/repo/.worktrees/feature");
+  });
+
+  it("is resolved on the workspace for a session that has no host", () => {
+    mocks.hostId = null;
+    mocks.worktreeAnswer = "pending";
+    const { result } = renderHook(() => useReviewFolder(SESSION, true));
+    expect(result.current.resolved).toBe(true);
+    expect(result.current.root).toBe("/repo");
+    expect(result.current.canChoose).toBe(false);
+  });
+
+  it("waits for a child session's host, which comes from its parent", () => {
+    mocks.hostId = null;
+    mocks.parentSessionId = "conv_parent";
+    mocks.worktreeAnswer = "pending";
+    const { result, rerender } = renderHook(() => useReviewFolder(SESSION, true));
+    expect(result.current.resolved).toBe(false);
+    mocks.hostId = "host_1";
+    mocks.worktreeAnswer = "ok";
+    rerender();
+    expect(result.current.resolved).toBe(true);
   });
 
   it("offers no command while Diffs is off screen", () => {
