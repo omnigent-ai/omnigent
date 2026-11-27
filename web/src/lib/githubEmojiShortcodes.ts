@@ -88,17 +88,21 @@ function isAutolink(href: unknown, children: TreeNode[] | undefined): boolean {
   const [child, ...rest] = children ?? [];
   if (!child || rest.length > 0 || child.type !== "text" || typeof href !== "string") return false;
   const text = child.value ?? "";
-  // Rendering percent-encodes a URL's `href` but not its text, as for `https://example.com/é`.
-  const decoded = decodedUrl(href);
+  // Rendering percent-encodes a URL's `href` but not its text, as for `https://example.com/é`,
+  // so both sides are encoded the same way, keeping escapes already written.
+  const encodedHref = encodedUrl(href);
   return [text, `mailto:${text}`, `http://${text}`].some(
-    (address) => href === address || decoded === address,
+    (address) => href === address || (encodedHref !== null && encodedHref === encodedUrl(address)),
   );
 }
 
-/** `href` with its percent escapes decoded, or null when they don't decode. */
-function decodedUrl(href: string): string | null {
+/** `url` percent-encoded, with its existing `%XX` escapes kept; null if it can't be encoded. */
+function encodedUrl(url: string): string | null {
   try {
-    return decodeURI(href);
+    return url
+      .split(/(%[0-9A-Fa-f]{2})/)
+      .map((part, index) => (index % 2 === 1 ? part : encodeURI(part)))
+      .join("");
   } catch {
     return null;
   }

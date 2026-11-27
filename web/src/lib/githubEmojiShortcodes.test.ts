@@ -124,6 +124,9 @@ describe("rehypeGitHubEmoji", () => {
     expect(html("See https://example.com/é/:shipit:/b")).toContain(
       ">https://example.com/é/:shipit:/b</a>",
     );
+    expect(html("See https://example.com/é/%20/:tada:/b")).toContain(
+      ">https://example.com/é/%20/:tada:/b</a>",
+    );
     expect(html("[ship :rocket:](https://example.com/:rocket:)")).toContain(">ship 🚀</a>");
   });
 
