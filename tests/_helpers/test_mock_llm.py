@@ -98,7 +98,7 @@ def test_tool_result_text_formats_payload_and_error_flag(
 
 
 class _StatsHandler(BaseHTTPRequestHandler):
-    """Answers ``/stats`` 200, or drops the connection without a reply while *booting*."""
+    """Answers ``/stats`` 200 and other paths 404, or drops the connection while *booting*."""
 
     booting = False
 
@@ -106,6 +106,9 @@ class _StatsHandler(BaseHTTPRequestHandler):
         if type(self).booting:
             self.close_connection = True
             self.connection.shutdown(socket.SHUT_RDWR)
+            return
+        if self.path != "/stats":
+            self.send_error(404)
             return
         self.send_response(200)
         self.end_headers()
@@ -141,7 +144,8 @@ def test_mock_llm_answers_not_yet_when_the_server_drops_the_request(stats_server
 
 
 def test_mock_llm_answers_not_yet_when_nothing_listens() -> None:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    assert mock_llm_answers(f"http://127.0.0.1:{port}") is False
+    # Held bound but not listening, so no other process can take the port meanwhile.
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = reserved.getsockname()[1]
+        assert mock_llm_answers(f"http://127.0.0.1:{port}") is False
