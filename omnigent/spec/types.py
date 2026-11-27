@@ -1061,6 +1061,13 @@ class MCPServerConfig:
     # tools.timeout / tools.retry.
     timeout: int | None = None
     retry: RetryPolicy | None = None
+    # Read-only declaration for TOOL_CALL policy events.
+    # ``trust_annotations`` honours the server's ``readOnlyHint`` (MCP
+    # annotations are untrusted hints by default); ``read_only_tools``
+    # lists bare tool names the author declares read-only, winning over
+    # any hint. See omnigent/policies/tool_read_only.py.
+    trust_annotations: bool = False
+    read_only_tools: list[str] | None = None
 
     def __repr__(self) -> str:
         """
@@ -1185,6 +1192,9 @@ class LocalToolInfo:  # type: ignore[explicit-any]  # parameters: dict[str, Any]
     catalog_path: str | None = None
     warehouse_id: str | None = None
     description: str | None = None
+    # Author-declared "has no side effects". ``None`` = undeclared, which
+    # policies treat as not read-only (fail closed).
+    read_only: bool | None = None
 
 
 # ── Guardrails / Policies (POLICIES.md §3, §4) ──────────────

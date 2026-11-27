@@ -762,6 +762,12 @@ _session_mcp_startup_cache: WorkspaceScopedCache[str, dict[str, McpServerStartup
 )
 
 
+# MCP ``readOnlyHint`` values the runner reported in the last proxy
+# ``tools/list`` for each session, keyed ``"<server>__<tool>"``. Read by the
+# TOOL_CALL policy context; a miss resolves to no hint.
+_session_mcp_read_only_hints: WorkspaceScopedCache[str, dict[str, bool]] = WorkspaceScopedCache()
+
+
 _model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
 
 
@@ -1318,6 +1324,7 @@ __all__ = [
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",
+    "_session_mcp_read_only_hints",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

@@ -3103,6 +3103,20 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
+        trust_annotations = val.get("trust_annotations", False)
+        if not isinstance(trust_annotations, bool):
+            raise OmnigentError(
+                f"Inline MCP server {name!r} 'trust_annotations' must be a boolean",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        read_only_tools = val.get("read_only_tools")
+        if read_only_tools is not None and not (
+            isinstance(read_only_tools, list) and all(isinstance(t, str) for t in read_only_tools)
+        ):
+            raise OmnigentError(
+                f"Inline MCP server {name!r} 'read_only_tools' must be a list of tool names",
+                code=ErrorCode.INVALID_INPUT,
+            )
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -3118,6 +3132,8 @@ def _parse_inline_mcp_servers(
                 env=env,
                 databricks_profile=databricks_profile,
                 tools=_parse_mcp_tool_allowlist(name, val, "inline MCP server"),
+                trust_annotations=trust_annotations,
+                read_only_tools=read_only_tools,
             )
         )
     return servers
@@ -3198,6 +3214,17 @@ def _discover_mcp_servers(
         if transport is None:
             raise OmnigentError(
                 f"MCP config missing required field 'transport': {yaml_file}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Read-only declarations are parsed on inline ``type: mcp`` blocks
+        # only. Reject them here instead of silently dropping them, so a
+        # config never looks effective while policies still see no declaration.
+        unsupported = [k for k in ("trust_annotations", "read_only_tools") if k in raw]
+        if unsupported:
+            raise OmnigentError(
+                f"MCP server {name!r} sets {', '.join(unsupported)} in a standalone "
+                f"MCP file; declare them on the inline 'type: mcp' tool block in "
+                f"config.yaml instead: {yaml_file}",
                 code=ErrorCode.INVALID_INPUT,
             )
         transport_str = str(transport)

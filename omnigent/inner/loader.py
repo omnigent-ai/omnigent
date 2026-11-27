@@ -431,6 +431,9 @@ def _parse_tool(
             raise ValueError(
                 f"Tool '{name}': invalid runtime {runtime_raw!r}; must be 'server' or 'client'.",
             )
+        read_only = data.get("read_only")
+        if read_only is not None and not isinstance(read_only, bool):
+            raise ValueError(f"Tool '{name}': 'read_only' must be a boolean.")
         tool = FunctionTool(
             name=name,
             description=data.get("description"),
@@ -439,6 +442,7 @@ def _parse_tool(
             cancellable=bool(data.get("cancellable", False)),
             runtime=runtime_raw,
             warehouse_id=data.get("warehouse_id"),
+            read_only=read_only,
         )
         callable_path = data.get("callable")
         if callable_path and isinstance(callable_path, str):
@@ -481,6 +485,14 @@ def _parse_tool(
         if mcp_profile is None and isinstance(raw_auth, dict):
             if str(raw_auth.get("type", "")) == "databricks":
                 mcp_profile = raw_auth.get("profile")
+        trust_annotations = data.get("trust_annotations", False)
+        if not isinstance(trust_annotations, bool):
+            raise ValueError(f"Tool '{name}': 'trust_annotations' must be a boolean.")
+        read_only_tools = data.get("read_only_tools")
+        if read_only_tools is not None and not (
+            isinstance(read_only_tools, list) and all(isinstance(t, str) for t in read_only_tools)
+        ):
+            raise ValueError(f"Tool '{name}': 'read_only_tools' must be a list of tool names.")
         return MCPTool(
             name=name,
             description=data.get("description"),
@@ -493,6 +505,8 @@ def _parse_tool(
             profile=mcp_profile,
             databricks_server=data.get("databricks_server"),
             headers=data.get("headers"),
+            read_only_tools=read_only_tools,
+            trust_annotations=trust_annotations,
         )
 
     if tool_type == "agent":

@@ -95,6 +95,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_wrapper_label,
 )
 from omnigent.onboarding.provider_config import harness_owns_its_credential
+from omnigent.policies.tool_read_only import tool_call_context
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -257,6 +258,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_mcp_read_only_hints,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -11687,10 +11689,12 @@ async def _evaluate_tool_call_policy(
     except (ValueError, TypeError):
         args_payload = arguments_str
 
-    ctx = EvaluationContext(
-        phase=Phase.TOOL_CALL,
-        content={"name": tool_name, "arguments": args_payload},
-        tool_name=tool_name,
+    ctx = tool_call_context(
+        spec,
+        tool_name,
+        args_payload,
+        sub_agent_name=conv.sub_agent_name,
+        mcp_hints=_session_mcp_read_only_hints.get(session_id),
         actor=actor,
     )
     engine, result = await _evaluate_policy_with_fresh_engine(
@@ -14416,10 +14420,12 @@ async def _handle_mcp_tools_call(
             return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
 
         # Re-evaluate policy on every retry; approval cannot override a denial.
-        retry_ctx = EvaluationContext(
-            phase=Phase.TOOL_CALL,
-            content={"name": namespaced_name, "arguments": arguments},
-            tool_name=namespaced_name,
+        retry_ctx = tool_call_context(
+            spec,
+            namespaced_name,
+            arguments,
+            sub_agent_name=conv.sub_agent_name,
+            mcp_hints=_session_mcp_read_only_hints.get(session_id),
             actor=actor,
         )
         engine, retry_result = await _evaluate_policy_with_fresh_engine(
@@ -14461,10 +14467,12 @@ async def _handle_mcp_tools_call(
         # Fall through to execution.
     else:
         # ── First call: evaluate TOOL_CALL policy ────────────────────
-        call_ctx = EvaluationContext(
-            phase=Phase.TOOL_CALL,
-            content={"name": namespaced_name, "arguments": arguments},
-            tool_name=namespaced_name,
+        call_ctx = tool_call_context(
+            spec,
+            namespaced_name,
+            arguments,
+            sub_agent_name=conv.sub_agent_name,
+            mcp_hints=_session_mcp_read_only_hints.get(session_id),
             actor=actor,
         )
         engine, call_result = await _evaluate_policy_with_fresh_engine(

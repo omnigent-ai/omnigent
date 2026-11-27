@@ -16,6 +16,7 @@ from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.policies.tool_read_only import mcp_read_only_hint
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
@@ -121,6 +122,9 @@ class McpSchemasResult:
     schemas: list[_JsonObject]
     tool_names: set[str]
     failures: dict[str, str]  # server_name → error message
+    # ``readOnlyHint`` per ``"<server>__<tool>"``, only for tools whose server
+    # set a boolean. Trust is decided later, from the agent spec.
+    read_only_hints: dict[str, bool] = field(default_factory=dict)
 
 
 def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
@@ -444,6 +448,7 @@ class RunnerMcpManager:
 
             schemas: list[_JsonObject] = []
             tool_names: set[str] = set()
+            read_only_hints: dict[str, bool] = {}
             failures: dict[str, str] = {}
             for ref in refs:
                 server = ref.entry
@@ -459,7 +464,15 @@ class RunnerMcpManager:
                     schema_name = schema["name"]
                     if isinstance(schema_name, str):
                         tool_names.add(schema_name)
-            return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures=failures)
+                        hint = mcp_read_only_hint(td)
+                        if hint is not None:
+                            read_only_hints[schema_name] = hint
+            return McpSchemasResult(
+                schemas=schemas,
+                tool_names=tool_names,
+                failures=failures,
+                read_only_hints=read_only_hints,
+            )
         finally:
             async with self._lock:
                 for ref in refs:

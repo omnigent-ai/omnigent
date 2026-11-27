@@ -241,6 +241,7 @@ async def test_tools_list_returns_schemas_from_a_cached_resolved_spec() -> None:
         "schemas": [{"name": "jira__search"}],
         "tool_names": ["jira__search"],
         "failures": {},
+        "read_only_hints": {},
     }
 
 

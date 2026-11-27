@@ -218,6 +218,7 @@ def register_mcp_routes(
                         "schemas": result.schemas,
                         "tool_names": list(result.tool_names),
                         "failures": result.failures,
+                        "read_only_hints": result.read_only_hints,
                     }
                 }
             )
