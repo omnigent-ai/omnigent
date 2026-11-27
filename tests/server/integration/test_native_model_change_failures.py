@@ -815,6 +815,7 @@ async def test_refused_model_change_preserves_newer_silent_selection(
 async def test_new_server_accepts_legacy_runner_replies_without_losing_newer_metadata(
     client: httpx.AsyncClient,
     db_uri: str,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     outcome: str,
     newer_same_selection: bool,
@@ -829,6 +830,8 @@ async def test_new_server_accepts_legacy_runner_replies_without_losing_newer_met
     previous_model, requested_model = "claude-opus-4-6", "claude-opus-4-7"
     store = SqlAlchemyConversationStore(db_uri)
     store.update_conversation(session_id, model_override=previous_model, reasoning_effort="high")
+    host = HostStore(db_uri).upsert_on_connect("1" * 32, "laptop", "owner@example.test")
+    store.set_host_id(session_id, host_id=host.host_id, workspace=str(tmp_path))
     store.replace_runner_id(session_id, "legacy-runner")
     events = []
     publish = session_stream.publish
