@@ -10,8 +10,8 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
-import type { ReactNode, RefObject } from "react";
-import { MemoryRouter } from "react-router-dom";
+import { Profiler, type ProfilerOnRenderCallback, type ReactNode, type RefObject } from "react";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -24,6 +24,8 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UsePermissionsModule from "@/hooks/usePermissions";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseIsMobileViewportModule from "@/hooks/useIsMobileViewport";
+import type * as FileViewerModule from "./FileViewer";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
@@ -49,21 +51,30 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
 const paneRenders = vi.hoisted(() => vi.fn());
-vi.mock("./FileViewer", () => ({
-  FileViewer: ({
+const useRealFileViewer = vi.hoisted(() => ({ current: false }));
+vi.mock("./FileViewer", async (importOriginal) => {
+  const { FileViewer: RealFileViewer } = await importOriginal<typeof FileViewerModule>();
+  function StubFileViewer({
     path,
+    conversationId,
     open,
     mediaActive,
     onExitFullScreen,
   }: {
     path: string;
+    conversationId: string;
     open: boolean;
-    mediaActive: boolean;
+    mediaActive?: boolean;
     onExitFullScreen?: () => void;
-  }) => {
-    paneRenders("file");
+  }) {
+    paneRenders("file", conversationId);
     return (
-      <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
+      <div
+        data-testid="file-viewer-stub"
+        data-session={conversationId}
+        data-open={open}
+        data-media-active={mediaActive}
+      >
         {path}
         {onExitFullScreen && (
           <button type="button" onClick={onExitFullScreen}>
@@ -72,7 +83,40 @@ vi.mock("./FileViewer", () => ({
         )}
       </div>
     );
-  },
+  }
+  return {
+    FileViewer: (props: React.ComponentProps<typeof RealFileViewer>) =>
+      useRealFileViewer.current ? <RealFileViewer {...props} /> : <StubFileViewer {...props} />,
+  };
+});
+vi.mock("./CodeViewer", () => ({
+  CodeViewer: ({
+    onDirtyChange,
+    onSetActiveSelection,
+  }: {
+    onDirtyChange?: (dirty: boolean) => void;
+    onSetActiveSelection: (selection: {
+      start_index: number;
+      end_index: number;
+      anchor_content: string;
+    }) => void;
+  }) => (
+    <>
+      <textarea aria-label="File draft" onChange={() => onDirtyChange?.(true)} />
+      <button
+        type="button"
+        onClick={() =>
+          onSetActiveSelection({ start_index: 0, end_index: 5, anchor_content: "alpha" })
+        }
+      >
+        Select text
+      </button>
+    </>
+  ),
+}));
+vi.mock("./MonacoDiffViewer", () => ({
+  prepareDiffEditor: vi.fn(),
+  MonacoDiffViewer: () => <div data-testid="diff-viewer" />,
 }));
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
@@ -172,7 +216,10 @@ vi.mock("@/hooks/usePermissions", async (importOriginal) => ({
   useCanEdit: () => canEditMock(),
 }));
 const isMobileMock = vi.hoisted(() => vi.fn(() => false));
-vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => isMobileMock() }));
+vi.mock("@/hooks/useIsMobileViewport", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseIsMobileViewportModule>()),
+  useIsMobileViewport: () => isMobileMock(),
+}));
 const floatingPanesMock = vi.hoisted(() => vi.fn(() => false));
 vi.mock("./useFloatingPanes", () => ({
   useFloatingPanes: () => floatingPanesMock(),
@@ -195,6 +242,7 @@ afterEach(() => {
   isMobileMock.mockReturnValue(false);
   floatingPanesMock.mockReturnValue(false);
   canEditMock.mockReturnValue(true);
+  useRealFileViewer.current = false;
   Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
@@ -218,10 +266,14 @@ function pressTabNumber(digit: number): boolean {
 }
 
 /** File-viewer context whose guard stands in for the mounted viewer's unsaved-edits check. */
-function fileViewerContextWithGuard(guardFileNavigation: FileNavigationGuard) {
+function fileViewerContextWithGuard(
+  guardFileNavigation: FileNavigationGuard,
+  registerNavigationGuard?: (guard: FileNavigationGuard) => () => void,
+) {
   return {
     openFile: vi.fn(),
     guardFileNavigation,
+    registerNavigationGuard,
     openGithubTab: vi.fn(),
     isChangedPath: () => false,
     conversationId: "conv_ws",
@@ -260,8 +312,12 @@ function renderWorkspace(
     resizing?: boolean;
     inert?: boolean;
     mobileSideChatsOpen?: boolean;
+    mobileFileTarget?: HTMLElement | null;
+    onCommit?: ProfilerOnRenderCallback;
     queryClient?: QueryClient;
     initialPath?: string;
+    observeLocation?: boolean;
+    registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
     withHide?: boolean;
     permissionLevel?: number | null;
     /** Stands in for the mounted viewer's unsaved-edits check. */
@@ -283,7 +339,7 @@ function renderWorkspace(
     initialOverrides.queryClient ??
     new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onHide = vi.fn();
-  const tree = () => (
+  const panel = () => (
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
         conversationId={overrides.conversationId ?? "conv_ws"}
@@ -316,6 +372,7 @@ function renderWorkspace(
         agentCount={1}
         rootSessionId={null}
         selectedFilePath={overrides.selectedFilePath ?? null}
+        mobileFileTarget={overrides.mobileFileTarget}
         openFiles={overrides.openFiles ?? []}
         openFileViewer={openFileViewer}
         onCloseFile={onCloseFile}
@@ -340,12 +397,33 @@ function renderWorkspace(
       />
     </TooltipProvider>
   );
+  const tree = () =>
+    initialOverrides.onCommit ? (
+      <Profiler id="workspace" onRender={initialOverrides.onCommit}>
+        <output data-testid="transcript-session">{overrides.conversationId ?? "conv_ws"}</output>
+        {panel()}
+      </Profiler>
+    ) : (
+      panel()
+    );
   const fileViewerContext =
-    initialOverrides.fileGuard && fileViewerContextWithGuard(initialOverrides.fileGuard);
+    initialOverrides.fileGuard || initialOverrides.registerNavigationGuard
+      ? fileViewerContextWithGuard(
+          initialOverrides.fileGuard ?? ((_path, _options, next) => next()),
+          initialOverrides.registerNavigationGuard,
+        )
+      : null;
+  let navigate: ((path: string) => void) | undefined;
+  function LocationProbe() {
+    navigate = useNavigate();
+    const location = useLocation();
+    return <output data-testid="location">{location.pathname + location.search}</output>;
+  }
   // The panel reads session snapshots and renders router links.
   const Providers = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[initialOverrides.initialPath ?? "/"]}>
+        {initialOverrides.observeLocation && <LocationProbe />}
         {fileViewerContext ? (
           <FileViewerContext.Provider value={fileViewerContext}>
             {children}
@@ -359,6 +437,7 @@ function renderWorkspace(
   const view = render(tree(), { wrapper: Providers });
   return {
     queryClient,
+    navigate: (path: string) => navigate?.(path),
     rerender: (next: typeof overrides) => {
       overrides = { ...overrides, ...next };
       view.rerender(tree());
@@ -1094,6 +1173,240 @@ describe("WorkspacePanel open-file tabs", () => {
     expect(onCloseFile).not.toHaveBeenCalledWith("src/App.tsx");
     act(() => allowClose[0]!());
     expect(onCloseFile).toHaveBeenCalledWith("src/App.tsx");
+  });
+});
+
+describe("WorkspacePanel hidden session handoff", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it.each([
+    ["collapsed", { open: false }, false],
+    ["inert", { open: true, inert: true }, false],
+    ["zero width", { open: true, width: 0 }, false],
+    ["mobile", { open: true }, true],
+  ] as const)(
+    "unmounts %s content in the switch commit and mounts it after paint",
+    (_name, visibility, mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      const commits: (string | null)[][] = [];
+      const { rerender } = renderWorkspace({
+        ...visibility,
+        conversationId: "conv_a",
+        selectedFilePath: "notes.md",
+        onCommit: () =>
+          commits.push([
+            screen.getByTestId("transcript-session").textContent,
+            screen.queryByTestId("file-viewer-stub")?.getAttribute("data-session") ?? null,
+          ]),
+      });
+      commits.length = 0;
+      paneRenders.mockClear();
+      rerender({ conversationId: "conv_b", selectedFilePath: "current.md" });
+      expect(commits[0]).toEqual(["conv_b", null]);
+      expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+      expect(paneRenders).not.toHaveBeenCalledWith("file", "conv_b");
+      act(() => vi.advanceTimersToNextFrame());
+      expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+      act(() => vi.runOnlyPendingTimers());
+      expect(commits.at(-1)).toEqual(["conv_b", "conv_b"]);
+    },
+  );
+
+  it.each(["conv_c", "conv_a"])("cancels the intermediate handoff when switching to %s", (next) => {
+    const { rerender } = renderWorkspace({
+      open: false,
+      conversationId: "conv_a",
+      selectedFilePath: "notes.md",
+    });
+    paneRenders.mockClear();
+    rerender({ conversationId: "conv_b" });
+    act(() => vi.advanceTimersToNextFrame());
+    rerender({ conversationId: next });
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    act(() => vi.advanceTimersToNextFrame());
+    act(() => vi.runOnlyPendingTimers());
+    expect(paneRenders).not.toHaveBeenCalledWith("file", "conv_b");
+    expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-session", next);
+  });
+
+  it.each(["rail", "mobile overlay"])(
+    "reveals the current session synchronously in the %s",
+    (surface) => {
+      const mobile = surface === "mobile overlay";
+      isMobileMock.mockReturnValue(mobile);
+      const target = document.createElement("div");
+      document.body.appendChild(target);
+      try {
+        const commits: (string | null)[][] = [];
+        const { rerender } = renderWorkspace({
+          open: false,
+          conversationId: "conv_a",
+          selectedFilePath: "notes.md",
+          onCommit: () =>
+            commits.push([
+              screen.getByTestId("transcript-session").textContent,
+              screen.queryByTestId("file-viewer-stub")?.getAttribute("data-session") ?? null,
+            ]),
+        });
+        rerender({ conversationId: "conv_b", selectedFilePath: "current.md" });
+        act(() => vi.advanceTimersToNextFrame());
+        commits.length = 0;
+        rerender(mobile ? { mobileFileTarget: target } : { open: true });
+        expect(commits[0]).toEqual(["conv_b", "conv_b"]);
+        expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("current.md");
+        act(() => vi.runOnlyPendingTimers());
+        expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-session", "conv_b");
+      } finally {
+        target.remove();
+      }
+    },
+  );
+
+  it("keeps visible switches and same-session collapse and updates immediate", () => {
+    const { rerender } = renderWorkspace({
+      conversationId: "conv_a",
+      selectedFilePath: "notes.md",
+    });
+    const viewer = screen.getByTestId("file-viewer-stub");
+    viewer.scrollTop = 120;
+    rerender({ open: false });
+    rerender({ open: true });
+    expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+    expect(viewer.scrollTop).toBe(120);
+    rerender({ conversationId: "conv_b" });
+    expect(viewer).toHaveAttribute("data-session", "conv_b");
+    rerender({ open: false, selectedFilePath: "current.md" });
+    expect(viewer).toHaveTextContent("current.md");
+  });
+
+  it("removes the previous mobile overlay in the switch commit", () => {
+    isMobileMock.mockReturnValue(true);
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    try {
+      const { rerender } = renderWorkspace({
+        conversationId: "conv_a",
+        selectedFilePath: "notes.md",
+        mobileFileTarget: target,
+      });
+      expect(within(target).getByTestId("file-viewer-stub")).toBeInTheDocument();
+      rerender({ conversationId: "conv_b", selectedFilePath: null });
+      expect(within(target).queryByTestId("file-viewer-stub")).toBeNull();
+    } finally {
+      target.remove();
+    }
+  });
+
+  it("removes the previous viewer's URL and Escape effects during a hidden switch", () => {
+    useRealFileViewer.current = true;
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    queryClient.setQueryData(["workspace-changed-files", "conv_a"], {
+      available: true,
+      data: [{ path: "notes.md", name: "notes.md", status: "modified", bytes: 10 }],
+    });
+    const { rerender, navigate, onCloseFile } = renderWorkspace({
+      queryClient,
+      open: false,
+      conversationId: "conv_a",
+      selectedFilePath: "notes.md",
+      openFiles: ["notes.md"],
+      initialPath: "/c/conv_a?diff=1",
+      observeLocation: true,
+    });
+    expect(screen.getByTestId("file-viewer")).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: "Exit diff view", hidden: true }).length,
+    ).toBeGreaterThan(0);
+    act(() => {
+      navigate("/c/conv_b?keep=1");
+      rerender({
+        conversationId: "conv_b",
+        selectedFilePath: "current.md",
+        openFiles: ["current.md"],
+      });
+    });
+    expect(screen.queryByTestId("file-viewer")).toBeNull();
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_b?keep=1");
+    expect(screen.getByTestId("location")).not.toHaveTextContent("diff=");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onCloseFile).not.toHaveBeenCalled();
+  });
+
+  it("does not defer a dirty viewer or drop its beforeunload and navigation guards", () => {
+    useRealFileViewer.current = true;
+    let guard: FileNavigationGuard | undefined;
+    const registerNavigationGuard = (next: FileNavigationGuard) => {
+      guard = next;
+      return () => {
+        if (guard === next) guard = undefined;
+      };
+    };
+    const { rerender } = renderWorkspace({
+      open: false,
+      conversationId: "conv_a",
+      selectedFilePath: "notes.md",
+      registerNavigationGuard,
+    });
+    const viewer = screen.getByTestId("file-viewer");
+    const draft = screen.getByRole("textbox", { name: "File draft", hidden: true });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    const beforeUnload = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    expect(beforeUnload()).toBe(true);
+    rerender({ conversationId: "conv_b" });
+    expect(screen.getByTestId("file-viewer")).toBe(viewer);
+    expect(draft).toHaveValue("Unsaved draft");
+    expect(beforeUnload()).toBe(true);
+    const navigate = vi.fn();
+    act(() => guard!(null, undefined, navigate));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(draft).toHaveValue("Unsaved draft");
+  });
+
+  it("does not unmount when an edit and session switch are batched", () => {
+    useRealFileViewer.current = true;
+    const { rerender } = renderWorkspace({
+      open: false,
+      conversationId: "conv_a",
+      selectedFilePath: "notes.md",
+    });
+    const draft = screen.getByRole("textbox", { name: "File draft", hidden: true });
+    act(() => {
+      fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+      rerender({ conversationId: "conv_b" });
+    });
+    expect(screen.getByRole("textbox", { name: "File draft", hidden: true })).toBe(draft);
+    expect(draft).toHaveValue("Unsaved draft");
+  });
+
+  it("does not defer an open comment draft", () => {
+    useRealFileViewer.current = true;
+    const { rerender } = renderWorkspace({
+      open: false,
+      conversationId: "conv_a",
+      selectedFilePath: "notes.md",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Select text", hidden: true }));
+    const draft = screen.getByPlaceholderText("Add a comment…");
+    fireEvent.change(draft, { target: { value: "Unsent comment" } });
+    rerender({ conversationId: "conv_b" });
+    expect(screen.getByPlaceholderText("Add a comment…")).toBe(draft);
+    expect(draft).toHaveValue("Unsent comment");
+    fireEvent.click(screen.getAllByRole("button", { name: "Hide comments", hidden: true })[0]!);
+    rerender({ conversationId: "conv_c" });
+    expect(screen.queryByTestId("file-viewer")).toBeNull();
   });
 });
 

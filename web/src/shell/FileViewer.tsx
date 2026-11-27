@@ -429,6 +429,8 @@ interface FileViewerProps {
   onExitFullScreen?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
+  /** True while unmounting could drop an editor or comment draft. */
+  onUnsafeToUnmountChange?: (unsafe: boolean) => void;
   /**
    * Sort order for the prev/next navigation. Must match the order the
    * Changes list (`FilesPanel` → `FlatFileList`) is sorted by, or the
@@ -494,6 +496,7 @@ function FileViewerBody({
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
+  onUnsafeToUnmountChange,
   sort = DEFAULT_FILES_PANEL_PREFERENCES.sort,
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
@@ -520,6 +523,20 @@ function FileViewerBody({
   // effects below only force it open, never closed, so a restored-open value
   // survives and a restored-closed value can still be opened by ?comment=.
   const [commentsOpen, setCommentsOpen] = useState(false);
+  const commentsOpenRef = useRef(false);
+  const isEditorDirtyRef = useRef(false);
+  const changeCommentsOpen = useCallback(
+    (next: boolean) => {
+      commentsOpenRef.current = next;
+      setCommentsOpen(next);
+      onUnsafeToUnmountChange?.(next || isEditorDirtyRef.current);
+    },
+    [onUnsafeToUnmountChange],
+  );
+  useLayoutEffect(() => {
+    onUnsafeToUnmountChange?.(isEditorDirtyRef.current || commentsOpenRef.current);
+    return () => onUnsafeToUnmountChange?.(false);
+  }, [onUnsafeToUnmountChange]);
   // In frameless mode the panel is embedded in the parent aside — no own
   // width or slide animation. Still call the hook unconditionally to
   // satisfy Rules of Hooks; just pass false so it never animates.
@@ -612,11 +629,14 @@ function FileViewerBody({
   const pendingBodyRef = useRef("");
   const [isEditorDirty, setIsEditorDirty] = useState(false);
   // Acceptance clears this synchronously before entering another navigation guard.
-  const isEditorDirtyRef = useRef(false);
-  const handleDirtyChange = useCallback((dirty: boolean) => {
-    isEditorDirtyRef.current = dirty;
-    setIsEditorDirty(dirty);
-  }, []);
+  const handleDirtyChange = useCallback(
+    (dirty: boolean) => {
+      isEditorDirtyRef.current = dirty;
+      setIsEditorDirty(dirty);
+      onUnsafeToUnmountChange?.(dirty || commentsOpenRef.current);
+    },
+    [onUnsafeToUnmountChange],
+  );
   // Auto-save lifecycle reported up from the Monaco editor, shown as a status
   // chip in the toolbar (the editor itself no longer has a Save button).
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
@@ -848,7 +868,7 @@ function FileViewerBody({
     setActiveSelection(nextSelection);
     if (selection !== null) {
       commentsInitializedRef.current = true;
-      setCommentsOpen(true);
+      changeCommentsOpen(true);
     }
   };
 
@@ -863,7 +883,7 @@ function FileViewerBody({
     if (!comment) return;
     linkedCommentAppliedRef.current = true;
     commentsInitializedRef.current = true;
-    setCommentsOpen(true);
+    changeCommentsOpen(true);
     handleSetActiveSelection({
       start_index: comment.start_index,
       end_index: comment.end_index,
@@ -1571,7 +1591,7 @@ function FileViewerBody({
     active: commentsOpen,
     onSelect: () => {
       commentsInitializedRef.current = true;
-      setCommentsOpen((prev) => !prev);
+      changeCommentsOpen(!commentsOpenRef.current);
     },
   });
   if (!isPdf && !isDeletedFile && isDiffAvailable) {
