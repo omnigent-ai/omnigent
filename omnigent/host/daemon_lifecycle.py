@@ -61,6 +61,10 @@ class HostDaemonRecord:
         unknown or for records written by older daemons.
     :param org_pin: Immutable routing pin, including ``?o=`` for no selector;
         ``None`` for legacy records without a routing snapshot.
+    :param boot_id: Kernel boot id when the daemon started (Linux); ``None``
+        elsewhere and for records written by older daemons.
+    :param start_ticks: The daemon process's start time in clock ticks since
+        boot (Linux); ``None`` elsewhere and for older records.
     """
 
     pid: int
@@ -76,6 +80,9 @@ class HostDaemonRecord:
     # Launch-time routing binding; unlike workspace_id this is not a probe
     # result. None identifies a legacy record without an immutable snapshot.
     org_pin: str | None = None
+    # Clock-independent process identity (see process_start_identity).
+    boot_id: str | None = None
+    start_ticks: int | None = None
 
 
 def normalize_daemon_target(server_url: str | None, *, org_id: str | None = None) -> str:
@@ -404,7 +411,19 @@ def record_from_json(raw: Mapping[str, object]) -> HostDaemonRecord | None:
         config_sig=_text("config_sig"),
         workspace_id=_text("workspace_id"),
         org_pin=_text("org_pin"),
+        boot_id=_text("boot_id"),
+        start_ticks=_ticks(raw.get("start_ticks")),
     )
+
+
+def _ticks(value: object) -> int | None:
+    """Parse an optional ``start_ticks`` value; anything but an int is ``None``."""
+    if isinstance(value, bool) or not isinstance(value, str | int):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def read_daemon_record(path: Path) -> HostDaemonRecord | None:
@@ -433,16 +452,44 @@ def read_daemon_records(base_dir: Path | None = None) -> list[HostDaemonRecord]:
 
 DAEMON_PID_START_TOLERANCE_S = 5.0
 
+_LINUX_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def process_start_identity(pid: int) -> tuple[str, int] | None:
+    """Identify a process by the kernel's boot id and its start time in ticks.
+
+    Both values are immune to wall-clock steps (NTP syncing a clockless
+    board after boot), unlike epoch start times. ``None`` outside Linux or
+    when ``/proc`` can't be read, so callers fall back to clock-based checks.
+    Read from ``/proc`` directly rather than through psutil's boot-relative
+    start: that carries no boot id, so a pid reused after a reboot could
+    still match, and on psutil below 7 it is the wall-clock value again.
+
+    :param pid: Process to identify.
+    :returns: ``(boot_id, start_ticks)``, e.g. ``("7f0c...-...", 1234)``.
+    """
+    try:
+        boot_id = _LINUX_BOOT_ID_PATH.read_text(encoding="utf-8").strip()
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        # Fields after the parenthesised command name, which may contain spaces.
+        fields = stat[stat.rindex(")") + 2 :].split()
+        start_ticks = int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+    return (boot_id, start_ticks) if boot_id else None
+
 
 def pid_is_recorded_daemon(
     record: HostDaemonRecord, *, pid_alive: Callable[[int], bool] | None = None
 ) -> bool:
     """Whether *record*'s pid still names the recorded daemon, not a recycled pid.
 
-    A process created after the record's ``started_at`` (beyond a small clock
-    tolerance) cannot be the daemon that wrote it; an earlier one, even by
-    minutes, still is. Records without a start time, and pids whose creation
-    time can't be read, fall back to alive-only.
+    A record carrying the daemon's boot id and start ticks names it exactly:
+    the pid is the daemon only in the same boot with the same start ticks.
+    Otherwise a process created after the record's ``started_at`` (beyond a
+    small clock tolerance) cannot be the daemon that wrote it; an earlier
+    one, even by minutes, still is. Records without a start time, and pids
+    whose creation time can't be read, fall back to alive-only.
 
     :param record: Record to check.
     :param pid_alive: Existence check for a pid; defaults to a cross-platform
@@ -455,6 +502,10 @@ def pid_is_recorded_daemon(
         from omnigent.host.local_server import _pid_alive as pid_alive
     if not pid_alive(record.pid):
         return False
+    if record.boot_id is not None and record.start_ticks is not None:
+        identity = process_start_identity(record.pid)
+        if identity is not None:
+            return identity == (record.boot_id, record.start_ticks)
     if record.started_at <= 0:
         return True
     try:

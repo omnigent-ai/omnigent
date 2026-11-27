@@ -103,6 +103,9 @@ from omnigent.host.daemon_lifecycle import (
     normalize_daemon_target as _normalize_daemon_target_impl,
 )
 from omnigent.host.daemon_lifecycle import (
+    process_start_identity as _process_start_identity,
+)
+from omnigent.host.daemon_lifecycle import (
     record_flock_is_held as _record_flock_is_held,
 )
 from omnigent.host.daemon_lifecycle import write_daemon_record as _write_daemon_record_impl
@@ -3547,6 +3550,7 @@ def _foreground_daemon_record(
     :returns: Daemon registry record for ``os.getpid()``.
     """
     mode = "local" if target == _LOCAL_DAEMON_MARKER else "server"
+    boot_id, start_ticks = _process_start_identity(os.getpid()) or (None, None)
     return _HostDaemonRecord(
         pid=os.getpid(),
         target=target,
@@ -3558,6 +3562,8 @@ def _foreground_daemon_record(
         resolved_server_url=server_url.rstrip("/") if mode == "local" else None,
         config_sig=server_config_signature(include_features=mode == "local"),
         org_pin=_host_databricks_org_pin(server_url) if mode == "server" else None,
+        boot_id=boot_id,
+        start_ticks=start_ticks,
     )
 
 

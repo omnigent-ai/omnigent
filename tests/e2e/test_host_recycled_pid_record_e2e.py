@@ -22,8 +22,9 @@ omnigent daemon, with ``started_at`` backdated (the record always predates the
 recycled process). The recycled-PID stand-in is a ``sleep`` child: alive, a
 create time far newer than the record's ``started_at``, and a non-omnigent
 command line. Ownership is the one axis an unprivileged test cannot vary, so a
-correct fix must judge record identity by process start time / command line
-(which also covers same-user PID recycling), not merely by ownership.
+correct fix must judge record identity by something the process itself carries
+(its boot id and start ticks, or its start time / command line), not merely by
+ownership.
 
 Usage::
 
@@ -175,8 +176,9 @@ def _stage_stale_record(
 
     Runs the real ``omnigent host`` so the record is authored by product code,
     SIGKILLs it (reboot: no cleanup, flock dropped by the kernel), then
-    repoints the surviving record's ``pid`` at *recycled_pid* and backdates
-    ``started_at`` (the record always predates the recycled process).
+    repoints the surviving record's ``pid`` at *recycled_pid*, backdates
+    ``started_at`` (the record always predates the recycled process) and gives
+    the record the previous boot's id (a reboot changes it).
 
     :param server_url: Hanging server target the host connects to.
     :param env: Environment from :func:`_cli_env`.
@@ -209,6 +211,8 @@ def _stage_stale_record(
     assert record_path.exists(), "daemon record should survive the crash"
     record["pid"] = recycled_pid
     record["started_at"] = int(record["started_at"]) - _RECORD_BACKDATE_S
+    if record.get("boot_id"):
+        record["boot_id"] = f"previous-{record['boot_id']}"
     record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     return record_path
 

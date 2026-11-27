@@ -81,6 +81,7 @@ def main() -> None:
         HostDaemonRecord,
         daemon_target_server_url,
         normalize_daemon_target,
+        process_start_identity,
         write_daemon_record,
     )
     from omnigent.util.server_url import is_workspace_hosted_url
@@ -120,6 +121,7 @@ def main() -> None:
             if workspace_id is not None and workspace_lock is None:
                 _drop_own_record(lifecycle_lock)
                 return
+        boot_id, start_ticks = process_start_identity(os.getpid()) or (None, None)
         record = HostDaemonRecord(
             pid=os.getpid(),
             target=daemon_target,
@@ -131,6 +133,8 @@ def main() -> None:
             config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
             workspace_id=workspace_id,
             org_pin=os.environ.get(PINNED_DATABRICKS_ORG_ENV_VAR) if workspace_hosted else None,
+            boot_id=boot_id,
+            start_ticks=start_ticks,
         )
         write_daemon_record(record, update_legacy_pidfile=True)
 
