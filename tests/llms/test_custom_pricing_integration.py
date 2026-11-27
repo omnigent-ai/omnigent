@@ -233,8 +233,19 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
+@pytest.mark.parametrize(
+    "credential",
+    [
+        {"api_key": "expensive-key"},
+        {"api_key": "$PRICING_TEST_KEY"},
+        {"api_key_ref": "env:PRICING_TEST_KEY"},
+        {"api_key": "expensive-key", "base_url": "$PRICING_TEST_ENDPOINT"},
+    ],
+    ids=["inline", "unavailable-env", "unavailable-ref", "unavailable-endpoint"],
+)
 def test_fetch_pricing_with_explicit_provider_entry_beats_default(
     monkeypatch: pytest.MonkeyPatch,
+    credential: dict[str, str],
 ) -> None:
     """An explicit provider_entry uses that entry's rates, not the default's.
 
@@ -244,6 +255,10 @@ def test_fetch_pricing_with_explicit_provider_entry_beats_default(
     """
     from omnigent.onboarding.provider_config import load_providers
 
+    monkeypatch.delenv("PRICING_TEST_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_PRICING_TEST_KEY", raising=False)
+    monkeypatch.delenv("PRICING_TEST_ENDPOINT", raising=False)
+    monkeypatch.delenv("OMNIGENT_PRICING_TEST_ENDPOINT", raising=False)
     expensive_entry = load_providers(
         {
             "providers": {
@@ -251,7 +266,7 @@ def test_fetch_pricing_with_explicit_provider_entry_beats_default(
                     "kind": "key",
                     "anthropic": {
                         "base_url": "https://expensive.example/v1",
-                        "api_key": "expensive-key",
+                        **credential,
                         "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
                     },
                 }

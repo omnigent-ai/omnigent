@@ -95,6 +95,25 @@ describe("useComparisonFileDiff", () => {
     expect(reads.fetchText).not.toHaveBeenCalled();
   });
 
+  it("reads a repository folder's last-commit file from the host's listing", async () => {
+    const { comparison } = branchPoint(comparisonEntry("src/a.ts"));
+    state.comparison = {
+      base: "head",
+      note: null,
+      override: false,
+      retry: false,
+      listing: comparison,
+    };
+    const { result } = renderDiff("src/a.ts");
+    expect(result.current).toMatchObject({ base: "comparison", changed: true });
+    await waitFor(() =>
+      expect(result.current.base === "comparison" && result.current.query.data).toMatchObject({
+        after: "work",
+      }),
+    );
+    expect(reads.fetchText).toHaveBeenCalledWith(SESSION, "cmp_1", "src/a.ts", expect.anything());
+  });
+
   it("reads a listed file under the comparison, into the Changes review's cache entry", async () => {
     state.comparison = branchPoint(comparisonEntry("src/a.ts"));
     const { result, client } = renderDiff("src/a.ts");

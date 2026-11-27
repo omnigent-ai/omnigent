@@ -69,6 +69,16 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
       "omnigent://changes?compare-base=main",
       { place: { kind: "changes", comparison: { kind: "typed", base: "main", head: "" } } },
     ],
+    [
+      "omnigent://changes?compare=head&compare-root=/repo/.worktrees/feature",
+      {
+        place: {
+          kind: "changes",
+          comparison: { kind: "saved", intent: "head" },
+          comparisonRoot: "/repo/.worktrees/feature",
+        },
+      },
+    ],
     ["omnigent://pulls", { place: { kind: "pulls" } }],
     [
       `omnigent://pull?url=${encodeURIComponent(PR)}`,
@@ -86,6 +96,10 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
           line: { start: 3 },
         },
       },
+    ],
+    [
+      `omnigent://pull?url=${encodeURIComponent(PR)}&view=changes&list=1`,
+      { place: { kind: "pull", url: PR, view: "changes", list: true } },
     ],
     [
       `omnigent://pull?url=${encodeURIComponent(PR)}&focus=checks`,
@@ -136,9 +150,27 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
     expect(parsed("omnigent://files?path=a.ts&line=5-5")).toEqual({
       place: { kind: "files", path: "a.ts", line: { start: 5 } },
     });
+    expect(
+      parsed("omnigent://changes?compare=head&compare-root=/repo/./x/../.worktrees/feature/"),
+    ).toEqual({
+      place: {
+        kind: "changes",
+        comparison: { kind: "saved", intent: "head" },
+        comparisonRoot: "/repo/.worktrees/feature",
+      },
+    });
     expect(parsed("OMNIGENT://Files")).toEqual({ place: { kind: "files" } });
     expect(parsed("omnigent://files#ignored")).toEqual({ place: { kind: "files" } });
   });
+
+  it.each(["0", "true", "", "11"])(
+    "leaves a pull request out of list mode for list=%j",
+    (value) => {
+      expect(parsed(`omnigent://pull?url=${encodeURIComponent(PR)}&list=${value}`)).toEqual({
+        place: { kind: "pull", url: PR, view: "summary" },
+      });
+    },
+  );
 
   it("drops and reports parameters a kind doesn't take", () => {
     const result = parseWorkspaceLink("omnigent://pulls?path=a.ts&zoom=2&tab=t1");
@@ -176,6 +208,9 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
     ["omnigent://changes?compare-head=HEAD", "needs a base"],
     ["omnigent://changes?compare=sideways", "can't compare with “sideways”"],
     ["omnigent://changes?compare=head&compare-base=main", "not both"],
+    ["omnigent://changes?compare-root=/repo/wt", "needs a comparison too"],
+    ["omnigent://changes?compare=head&compare-root=wt", "must be an absolute path"],
+    ["omnigent://changes?compare=head&compare-root=/repo%00/wt", "NUL character"],
     ["omnigent://terminal", "needs an ID"],
     ["omnigent://agent", "needs an ID"],
     ["omnigent://files/abc", "doesn't take an ID"],

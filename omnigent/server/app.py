@@ -103,6 +103,9 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.background_session_titles import (
+    install_coordinator as install_background_title_coordinator,
+)
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
     DeploymentGate,
@@ -351,6 +354,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_workflow_id: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
+    # A sandbox that starts a new session each run also accepts ten-minute schedules;
+    # older servers require an hour.
+    scheduled_task_subhour_new_sandbox: bool = True
     # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
     # a reminder, and ``first_run_at``. Needs the database scheduler and the
     # ``one_time_automations`` release feature; absent on older servers.
@@ -2162,6 +2168,7 @@ def create_app(
         load_branding_snapshot,
         load_picker_curation,
         load_server_config,
+        read_only_code_hosts,
         session_title_instructions,
     )
 
@@ -2170,6 +2177,7 @@ def create_app(
     picker_curation = load_picker_curation(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     trigger_poll_minutes = automation_trigger_poll_minutes(resolved_server_config)
+    read_only_hosts = read_only_code_hosts(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     if harness_install is None:
         app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
@@ -2604,10 +2612,12 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        install_background_title_coordinator(background_title_coordinator)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            install_background_title_coordinator(None)
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:
@@ -4340,6 +4350,7 @@ def create_app(
         create_sessions_router(
             conversation_store,
             agent_store,
+            read_only_code_hosts=read_only_hosts,
             file_store=file_store,
             artifact_store=artifact_store,
             runner_router=runner_router,

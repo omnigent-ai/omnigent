@@ -144,6 +144,17 @@ describe("useComposerGitStatus", () => {
     expect(run({ workspace: "c:/repo" }).result.current.branch).toBe("feat");
   });
 
+  it("matches a workspace on a UNC share across separator and case differences", () => {
+    setWorktrees({
+      status: "ok",
+      worktrees: [wt({ path: "//Server/Share/repo", branch: "main" })],
+    });
+    setGithub(undefined);
+    const { result } = run({ workspace: "\\\\server\\share\\Repo\\packages\\web" });
+    expect(result.current.branchState).toBe("branch");
+    expect(result.current.branch).toBe("main");
+  });
+
   it("does not match a sibling whose path is a mere prefix", () => {
     setWorktrees({ status: "ok", worktrees: [wt({ path: "/home/a/repo", branch: "main" })] });
     setGithub(undefined);

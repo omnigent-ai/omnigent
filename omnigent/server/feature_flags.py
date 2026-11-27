@@ -66,6 +66,8 @@ class Feature(StrEnum):
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
     FLOATING_PANES = "floating_panes"
     SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
+    WARM_SWITCH_KEEP_MOUNTED_UI = "warm_switch_keep_mounted_ui"
+    PULL_REQUESTS_V2 = "pull_requests_v2"
 
 
 class FeatureIntent(StrEnum):
@@ -386,6 +388,21 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Share one session-updates WebSocket between a browser's tabs",
         owner="web",
         review_by_release="0.28.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WARM_SWITCH_KEEP_MOUNTED_UI,
+        description=(
+            "Switch the chat store before an in-app navigation to a session so the warm "
+            "chat surface stays mounted instead of remounting over a placeholder"
+        ),
+        owner="web",
+        review_by_release="0.28.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PULL_REQUESTS_V2,
+        description="Show pull requests on the new page and list in the tabs sidebar",
+        owner="web",
+        review_by_release="0.29.0",
     ),
 )
 

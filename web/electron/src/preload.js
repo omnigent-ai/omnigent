@@ -197,13 +197,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Report which menu commands this page can act on right now, plus the open
    * session's pin/archive state, so the native menu can enable and label them.
    * Fire-and-forget.
-   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean}} state
+   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean, pickListFocused?: boolean}} state
    */
   setDesktopCommandState: (state) => {
     ipcRenderer.send("omnigent:set-desktop-command-state", {
       commands: Array.isArray(state?.commands) ? state.commands.map(String) : [],
       sessionPinned: state?.sessionPinned === true,
       sessionArchived: state?.sessionArchived === true,
+      pickListFocused: state?.pickListFocused === true,
     });
   },
   /**
@@ -217,6 +218,26 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       typeof conversationId === "string" ? conversationId : null,
     );
   },
+  /**
+   * The menu commands this shell routes to the page, so it can leave their chords to the menu.
+   * Kept equal to DESKTOP_COMMANDS in desktopCommands.js, which a sandboxed preload can't load.
+   */
+  desktopCommands: Object.freeze([
+    "close",
+    "new-terminal",
+    "new-browser-tab",
+    "archive-session",
+    "toggle-pin-session",
+    "fork-session",
+    "go-back",
+    "go-forward",
+    "reload",
+    "focus-address-bar",
+    "reopen-closed-tab",
+    "previous-tab",
+    "next-tab",
+    "quit",
+  ]),
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
   /** Open a session in its own window on this server. Resolves whether it opened. */
@@ -313,6 +334,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {"start" | "stop" | "restart"} action
    */
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
+  /** Remote hosts trusted for localhost previews, as `{ server_url, host_id }` entries. */
+  getTrustedRemoteHosts: () => ipcRenderer.invoke("omnigent:get-trusted-remote-hosts"),
+  /** Trust one remote host for localhost previews; resolves `{ ok, hosts?, error? }`. */
+  addTrustedRemoteHost: (serverUrl, hostId) =>
+    ipcRenderer.invoke("omnigent:add-trusted-remote-host", serverUrl, hostId),
+  /** Remove one trusted remote host; resolves `{ ok, hosts?, error? }`. */
+  removeTrustedRemoteHost: (serverUrl, hostId) =>
+    ipcRenderer.invoke("omnigent:remove-trusted-remote-host", serverUrl, hostId),
   /**
    * Desktop feature gates the server can't know about: currently
    * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
@@ -590,6 +619,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Enable native Ctrl+Tab forwarding only while this renderer supports it. */
   browserSetRecentSessionSwitchSupported: (supported) =>
     ipcRenderer.invoke("omnigent:browser-set-recent-session-switch-supported", { supported }),
+  /**
+   * The app chords (physical modifiers plus `code` or `key`) a focused embedded
+   * page should hand to this renderer; an empty list hands over none.
+   * @param {{ key?: string, code?: string, metaKey: boolean, ctrlKey: boolean, altKey: boolean, shiftKey: boolean }[]} chords
+   */
+  browserSetForwardedChords: (chords) =>
+    ipcRenderer.invoke("omnigent:browser-set-forwarded-chords", { chords }),
+  /**
+   * A forwarded app chord from a focused embedded page, as keydown fields.
+   * @param {(payload: Record<string, unknown>) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserForwardedInput: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-forwarded-input", listener);
+    return () => ipcRenderer.removeListener("browser-forwarded-input", listener);
+  },
   /**
    * Subscribe to page links Cmd/Ctrl- or middle-clicked in an embedded browser
    * view (`{conversationId, url}`, where conversationId is the clicked view's id).

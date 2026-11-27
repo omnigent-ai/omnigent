@@ -20,6 +20,8 @@
 //   * This module never throws: a broken/old shell must not take down
 //     notifications in the browser path.
 
+import type { CodeHostDesktopApi, CodeHostDesktopFeatures } from "./nativeBridgeCodeHost";
+
 /**
  * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
  * `move` are live drag frames carrying an open fraction; `open` and `close`
@@ -54,6 +56,28 @@ export interface BrowserNavigationResult {
 
 export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
   return hostId ? { sourceHostId: hostId, sessionHostProtocol: SESSION_HOST_PROTOCOL } : {};
+}
+
+/** A chord as physical keys, which main matches against a focused embedded page's key presses. */
+export interface BrowserForwardedChord {
+  key?: string;
+  code?: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+}
+
+/** An app chord a focused embedded page handed over, as keydown fields. */
+export interface BrowserForwardedKeydown {
+  type: "keydown";
+  key: string;
+  code: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  repeat: boolean;
 }
 
 export interface BrowserRecentSessionInput {
@@ -209,7 +233,7 @@ export interface NativeViewModeParams {
  * server-served and may be newer than the installed shell, whose preload then
  * lacks these methods.
  */
-interface ElectronDesktopApi extends NativeShellApi {
+interface ElectronDesktopApi extends NativeShellApi, CodeHostDesktopApi {
   kind: "electron";
   /** The runner picked during onboarding for this server, returned once. */
   takeOnboardingRunner?: () => Promise<OnboardingRunner | null>;
@@ -236,6 +260,15 @@ interface ElectronDesktopApi extends NativeShellApi {
   onHostStatusChanged?: (callback: () => void) => () => void;
   /** Desktop feature gates; absent on older shells. */
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
+  /** Remote hosts trusted for localhost previews; absent on older shells. */
+  getTrustedRemoteHosts?: () => Promise<TrustedRemoteHostsResult>;
+  /** Trust one remote host for localhost previews; absent on older shells. */
+  addTrustedRemoteHost?: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+  /** Remove one trusted remote host; absent on older shells. */
+  removeTrustedRemoteHost?: (
+    serverUrl: string,
+    hostId: string,
+  ) => Promise<TrustedRemoteHostsResult>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
@@ -286,6 +319,11 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => Promise<{ ok: boolean; error?: string }>;
   /** Clear native key interception when the recent-session gesture was declined. */
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
+  /** Optional capability: the app chords a focused embedded page hands to this renderer. */
+  browserSetForwardedChords?: (
+    chords: BrowserForwardedChord[],
+  ) => Promise<{ ok: boolean; count?: number; error?: string }>;
+  onBrowserForwardedInput?: (callback: (input: BrowserForwardedKeydown) => void) => () => void;
   /**
    * Inspect the local Google Chrome profiles for cookies in the site tree the
    * conversation's view is on, and across every website. Metadata only (profile
@@ -314,6 +352,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => () => void;
   /** Report which menu commands this page can run now (fire-and-forget). */
   setDesktopCommandState?: (state: DesktopCommandState) => void;
+  /** The menu commands this shell routes to the page; absent on shells from before the list. */
+  desktopCommands?: readonly string[];
   /** Report the conversation this page has loaded, or null for none (fire-and-forget). */
   reportConversationShown?: (conversationId: string | null) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
@@ -455,6 +495,8 @@ export interface DesktopCommandState {
   commands: DesktopCommand[];
   sessionPinned: boolean;
   sessionArchived: boolean;
+  /** An open pick list has the keyboard and steps on Ctrl-N / Ctrl-P, which the menu then leaves. */
+  pickListFocused?: boolean;
 }
 
 /** One importable site tree and how many cookies a profile holds for it. */
@@ -591,7 +633,7 @@ export function workspaceSocketBridge():
  * Desktop-shell feature gates the server can't know about. All fields
  * optional: an older shell reports fewer.
  */
-export interface DesktopFeatures {
+export interface DesktopFeatures extends CodeHostDesktopFeatures {
   /**
    * Managed features (e.g. the Arca host option) are enabled.
    * Already scoped by the shell: true only when the flag is set AND the
@@ -608,6 +650,7 @@ export interface DesktopFeatures {
   chromeCookieImport?: boolean;
   /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
   sshLocalhostPreview?: boolean;
+  /** Shell can ask to trust a remote host for localhost previews. */
   trustedRemoteLocalhostPreview?: boolean;
   /** This shell can show the floating New Agent panel (macOS). */
   floatingComposer?: boolean;
@@ -631,6 +674,22 @@ export interface CliStatus {
   accepted?: boolean;
   /** Policy disables set/browse/reset of custom CLI paths. */
   customizationDisabled?: boolean;
+}
+
+/** One remote host trusted for localhost previews, in settings-file shape. */
+export interface TrustedRemoteHost {
+  server_url: string;
+  host_id: string;
+}
+
+/** Result of listing, adding, or removing trusted remote hosts. */
+export interface TrustedRemoteHostsResult {
+  ok: boolean;
+  serverUrl?: string;
+  error?: string;
+  hosts?: TrustedRemoteHost[];
+  added?: boolean;
+  removed?: boolean;
 }
 
 /** This machine's identity, read from local config (fast — no subprocess). */
@@ -836,7 +895,7 @@ export function serverManifestOf(info: ServerPickerInfo | null): ServerManifest 
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */
-function electronApi(): ElectronDesktopApi | undefined {
+export function electronApi(): ElectronDesktopApi | undefined {
   if (typeof window === "undefined") return undefined;
   const api = (window as unknown as { omnigentDesktop?: ElectronDesktopApi }).omnigentDesktop;
   return api?.kind === "electron" ? api : undefined;
@@ -913,6 +972,43 @@ export async function setBrowserRecentSessionSwitchSupported(supported: boolean)
   }
 }
 
+/** Whether a focused embedded page can hand app chords (such as ⌘K) to this renderer. */
+export function browserForwardsChords(): boolean {
+  const electron = electronApi();
+  return (
+    typeof electron?.browserSetForwardedChords === "function" &&
+    typeof electron.onBrowserForwardedInput === "function"
+  );
+}
+
+/** List the app chords a focused embedded page should hand over; an empty list hands over none. */
+export async function setBrowserForwardedChords(chords: BrowserForwardedChord[]): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserSetForwardedChords) return;
+  try {
+    const result = await electron.browserSetForwardedChords(chords);
+    if (result?.ok === false) {
+      console.warn("[nativeBridge] browser forwarded chords update refused:", result.error);
+    }
+  } catch (err) {
+    console.warn("[nativeBridge] browser forwarded chords update failed:", err);
+  }
+}
+
+/** Subscribe to app chords forwarded from a focused embedded page. */
+export function onBrowserForwardedInput(
+  callback: (input: BrowserForwardedKeydown) => void,
+): () => void {
+  const subscribe = electronApi()?.onBrowserForwardedInput;
+  if (typeof subscribe !== "function") return () => {};
+  try {
+    return subscribe(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] browser forwarded input subscription failed:", err);
+    return () => {};
+  }
+}
+
 /** Tell Electron that a forwarded Ctrl+Tab did not open the session switcher. */
 export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
   const electron = electronApi();
@@ -935,6 +1031,16 @@ export function supportsDesktopCommands(): boolean {
     typeof electron?.onDesktopCommand === "function" &&
     typeof electron.setDesktopCommandState === "function"
   );
+}
+
+/**
+ * True when the shell's menu routes every one of `commands` to this page, by the list it
+ * advertises. A shell from before that list may still route some, so it answers false.
+ */
+export function shellRoutesDesktopCommands(commands: readonly DesktopCommand[]): boolean {
+  if (!supportsDesktopCommands()) return false;
+  const routed = electronApi()?.desktopCommands;
+  return Array.isArray(routed) && commands.every((command) => routed.includes(command));
 }
 
 /** Subscribe to native menu commands; a no-op outside a supporting shell. */
@@ -1662,6 +1768,31 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
   }
 }
 
+/**
+ * The trusted-remote-hosts bridge, or null outside the shell / on shells too
+ * old to offer it. Callers must optional-chain; a missing bridge means the
+ * settings-file fallback is the only way to trust a host.
+ */
+export function trustedRemoteHostsBridge(): {
+  list: () => Promise<TrustedRemoteHostsResult>;
+  add: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+  remove: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+} | null {
+  const electron = electronApi();
+  if (
+    !electron?.getTrustedRemoteHosts ||
+    !electron?.addTrustedRemoteHost ||
+    !electron?.removeTrustedRemoteHost
+  ) {
+    return null;
+  }
+  return {
+    list: () => electron.getTrustedRemoteHosts!(),
+    add: (serverUrl, hostId) => electron.addTrustedRemoteHost!(serverUrl, hostId),
+    remove: (serverUrl, hostId) => electron.removeTrustedRemoteHost!(serverUrl, hostId),
+  };
+}
+
 /** Whether this desktop shell can connect the user's Arca instance as a host. */
 export function supportsArcaConnect(): boolean {
   return typeof electronApi()?.connectArcaHost === "function";
@@ -1855,3 +1986,5 @@ export async function droppedFilePath(file: File): Promise<string | null> {
     return null;
   }
 }
+
+export * from "./nativeBridgeCodeHost";

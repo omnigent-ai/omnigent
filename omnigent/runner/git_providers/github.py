@@ -284,11 +284,13 @@ class GitHubPullRequests:
 
         github_resource._set_preference(root, reference, account=account, remote=remote)
 
-    def repo_labels(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
-        """List the repository's labels with ``gh label list``."""
+    def repo_labels(
+        self, root: str, reference: PullRequestRef, *, text: str = ""
+    ) -> dict[str, Any]:
+        """List the repository's labels, or those matching ``text``, with ``gh label list``."""
         from omnigent.runner import github_resource
 
-        return github_resource._repo_labels(root, reference)
+        return github_resource._repo_labels(root, reference, text=text)
 
     def edit_labels(
         self,

@@ -1,9 +1,16 @@
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import type { BrowserNavigationResult } from "@/lib/nativeBridge";
-import { maybeOpenLinkInApp, onInAppLinkOpen, openLink, parseHttpUrl } from "@/lib/openLinkInApp";
+import {
+  maybeOpenLinkInApp,
+  onInAppLinkOpen,
+  openLink,
+  openLinkInSidebar,
+  openLinkWithOutcome,
+  parseHttpUrl,
+} from "@/lib/openLinkInApp";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -330,10 +337,97 @@ it.each([false, true])(
   },
 );
 
+describe("opening a link with its outcome", () => {
+  const PR = "https://github.com/acme/app/pull/7";
+
+  it("is routed, never blocked, where the in-app browser or the desktop shell takes it", async () => {
+    expect(openLinkWithOutcome(CONV, PR)).toBe("routed");
+    await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+    expect(window.open).not.toHaveBeenCalled();
+    writeOpenLinksInApp(false);
+    // The shell's window-open policy answers null though it opens the link.
+    expect(openLinkWithOutcome(CONV, PR)).toBe("routed");
+    expect(window.open).toHaveBeenCalledWith(PR, "_blank", "noopener,noreferrer");
+  });
+
+  it("opens a blank tab in a plain browser, cut off from this page, then leads it to the link", () => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    const tab = document.implementation.createHTMLDocument("");
+    const clicked: { href: string; rel: string; target: string; opener: unknown }[] = [];
+    const opened = { opener: window as unknown, document: tab };
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      clicked.push({ href: this.href, rel: this.rel, target: this.target, opener: opened.opener });
+    });
+    vi.mocked(window.open).mockReturnValue(opened as unknown as Window);
+    expect(openLinkWithOutcome(CONV, PR)).toBe("opened");
+    expect(window.open).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(clicked).toEqual([
+      { href: PR, rel: "noopener noreferrer", target: "_self", opener: null },
+    ]);
+  });
+
+  it("is blocked only when the browser refuses the blank tab", () => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    expect(openLinkWithOutcome(CONV, PR)).toBe("blocked");
+    expect(window.open).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the blank tab and reads as blocked when it can't be led to the link", () => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    const close = vi.fn();
+    const opened = {
+      opener: window as unknown,
+      close,
+      get document(): Document {
+        throw new DOMException("Blocked a frame", "SecurityError");
+      },
+    };
+    vi.mocked(window.open).mockReturnValue(opened as unknown as Window);
+    expect(openLinkWithOutcome(CONV, PR)).toBe("blocked");
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["javascript:alert(1)", "data:text/html,hi", "mailto:a@example.com"])(
+    "opens nothing for %s",
+    (href) => {
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+      expect(openLinkWithOutcome(CONV, href)).toBe("blocked");
+      expect(window.open).not.toHaveBeenCalled();
+    },
+  );
+});
+
 it("opens a link in a new window unless the in-app browser takes it", () => {
   openLink(CONV, URL_);
   expect(window.open).not.toHaveBeenCalled();
   writeOpenLinksInApp(false);
   openLink(CONV, URL_);
   expect(window.open).toHaveBeenCalledWith(URL_, "_blank", "noopener,noreferrer");
+});
+
+describe("openLinkInSidebar", () => {
+  it("opens the link in a sidebar browser tab with the link preference off", async () => {
+    writeOpenLinksInApp(false);
+    expect(openLinkInSidebar(CONV, URL_)).toBe(true);
+    await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+    expect(openOrNavigate.mock.calls[0][1]).toBe(URL_);
+    expect(window.open).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "the shell has no browser bridge",
+      CONV,
+      URL_,
+      () => Reflect.deleteProperty(window, "omnigentDesktop"),
+    ],
+    ["there is no conversation", undefined, URL_, () => {}],
+    ["the scheme is not web", CONV, "mailto:a@example.com", () => {}],
+  ])("does nothing when %s", (_label, conv, href, arrange) => {
+    arrange();
+    expect(openLinkInSidebar(conv, href)).toBe(false);
+    expect(openOrNavigate).not.toHaveBeenCalled();
+  });
 });

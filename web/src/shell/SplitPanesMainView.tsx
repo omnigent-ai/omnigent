@@ -90,6 +90,7 @@ import {
 import { usePublishMainTerminalKeys } from "./terminalPlacement";
 import { PublishedTerminalView } from "./PublishedTerminalView";
 import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
+import { usePaneShellExit } from "./paneShellExit";
 import { mainSplitTarget } from "./terminalSplitTarget";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { BELOW_SESSION_HEADER } from "./sessionHeaderInset";
@@ -178,6 +179,8 @@ function MainSplitPanes({
   const appPaneTitles = useAppPaneTitles(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
   const panesRef = useRef<HTMLDivElement>(null);
+  const keyboardOwner = usePaneKeyboardOwner(panesRef);
+  const observePaneShell = usePaneShellExit(target, cards, keyboardOwner);
   // One recovery per opening: a healthy agent spends it, so a later reap waits for Resume session.
   const agentRecovery = useRef<AgentRecoveryAllowance>({ attempted: false });
   const agentHealthy =
@@ -203,7 +206,6 @@ function MainSplitPanes({
   const chatInPane = visible && chatShown && splitBesideChat;
   const split = visible ? savedSplit : undefined;
 
-  const keyboardOwner = usePaneKeyboardOwner(panesRef);
   useReconcileMainSplit(
     conversationId,
     agentKey,
@@ -486,6 +488,9 @@ function MainSplitPanes({
         }
         panesRef={panesRef}
         cards={splitCards}
+        tabDropTarget
+        // Hidden under a chat shown alone, floating panes leave the preview to that chat.
+        tabDropPreview={visible || !cards}
         zoomedKey={zoomedKey}
         onUnzoom={(key) => {
           unzoomPane(target);
@@ -561,7 +566,11 @@ function MainSplitPanes({
               }
               focusRequest={requestFor(paneKey)}
               onFocusRequestTaken={(id) => settleTerminalFocus(conversationId, "main", id)}
-              onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
+              onStateChange={(state) => {
+                setTerminalConnectionState(terminal.id, state);
+                // The terminals list lags a shell's exit by seconds; the attach's end is immediate.
+                observePaneShell(paneKey, state);
+              }}
               onActivity={() => markTerminalActive(terminal.id)}
               onResume={runnerOffline ? onResume : undefined}
             />

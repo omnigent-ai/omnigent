@@ -2,6 +2,7 @@ import { CodeView } from "@pierre/diffs";
 import { describe, expect, it } from "vitest";
 import { reviewFile, reviewItemId } from "./diffReviewModel";
 import { computeFileDiff } from "./fileDiffComputation";
+import { findReviewMatches } from "./findMatches";
 import {
   buildReviewItems,
   changedLineCounts,
@@ -118,6 +119,29 @@ describe("reviewSearchLines", () => {
 
   it("searches files still loading by path only", () => {
     expect(reviewSearchLines([app], new Map()).map((line) => line.target)).toEqual(["currentPath"]);
+  });
+
+  it("finds a renamed file by its old name, listed before its new one as in its header", () => {
+    const renamed = { ...reviewFile("src/new.ts", "modified", {}), previousPath: "src/old.ts" };
+    const lines = reviewSearchLines([renamed], new Map());
+    expect(lines.map((line) => [line.text, line.target])).toEqual([
+      ["src/old.ts", "previousPath"],
+      ["src/new.ts", "currentPath"],
+    ]);
+    const options = { caseSensitive: false, wholeWord: false, regexp: false };
+    expect(findReviewMatches(lines, "old.ts", options).matches).toMatchObject([
+      { id: reviewItemId("src/new.ts"), target: "previousPath", from: 4, to: 10 },
+    ]);
+  });
+
+  it.each([
+    ["has no previous path", null],
+    ["kept its name", "src/app.ts"],
+  ])("lists a file that %s by its path once", (_case, previousPath) => {
+    const file = { ...app, previousPath };
+    expect(reviewSearchLines([file], new Map()).map((line) => line.target)).toEqual([
+      "currentPath",
+    ]);
   });
 });
 

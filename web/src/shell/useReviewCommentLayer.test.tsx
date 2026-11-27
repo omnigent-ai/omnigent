@@ -222,10 +222,15 @@ describe("useReviewCommentLayer with actions only", () => {
     sessionComments.list = [comment("here", "a.ts", 0, 5), otherComment];
   });
 
-  function actionsOnly() {
+  function actionsOnly(overrides: Partial<ReviewCommentContext> = {}) {
     const onAddComment = vi.fn();
     const onSetActiveSelection = vi.fn();
-    const layer = setup({ storedComments: false, onAddComment, onSetActiveSelection });
+    const layer = setup({
+      storedComments: false,
+      onAddComment,
+      onSetActiveSelection,
+      ...overrides,
+    });
     return { ...layer, onAddComment, onSetActiveSelection };
   }
 
@@ -279,6 +284,26 @@ describe("useReviewCommentLayer with actions only", () => {
       path: "a.ts",
       isDir: false,
       lineRange: { start: 1, end: 1 },
+    });
+  });
+
+  it("attaches a worktree's lines under the session's path for the file, keeping the lines", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const addComposerAttachment = vi
+      .spyOn(useChatStore.getState(), "addComposerAttachment")
+      .mockClear();
+    const { send, result } = actionsOnly({ sessionPath: (path) => `.worktrees/feature/${path}` });
+    send({ ...selection, start: 13, end: 26 });
+    const { getByRole } = render(result.current.actions as React.ReactElement);
+    act(() => {
+      getByRole("button", { name: "Attach to agent" }).dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    expect(addComposerAttachment).toHaveBeenCalledWith({
+      path: ".worktrees/feature/a.ts",
+      isDir: false,
+      lineRange: { start: 2, end: 2 },
     });
   });
 

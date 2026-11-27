@@ -18,8 +18,11 @@ lists its shell, then shows its terminal.
 
 from __future__ import annotations
 
+import contextlib
 import re
+import shutil
 import subprocess
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -50,15 +53,15 @@ _VIEWPORTS = {
 _TABS_CHUNK = re.compile(
     r"/assets/(?:WorkspaceTabsHost|workspaceTabsSessions|featurePaletteRows)-[^/]*\.js"
 )
-# Text only the tabs sidebar's code carries: its CodeMirror token class, history group,
-# New Tab picker and shortcut list. A chunk rule that pulled that code into an eager chunk,
-# or a lazy branch that loaded it, would bring one of them here.
+# Text only the tabs sidebar's code carries (token class, history group, New Tab picker); an
+# eager chunk or lazy load of that code would bring one here. Shortcut labels aren't markers:
+# they live in the shared registry every page loads.
 _TABS_CODE_MARKERS = (
     "cm-shiki-token",
     "Workspace history",
     "Open an app in this tab",
-    "Reopen closed workspace tab",
 )
+_PINNED_PAGES_KEY = "omnigent:pinned-workspace-tabs"
 _FILE = "tabs_sidebar_notes.py"
 _EDIT = "# saved from the tabs sidebar"
 _PR_TITLE = "Add the GitHub tab"
@@ -75,8 +78,19 @@ def workspace_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, st
         _cleanup_session_workdir(session_id)
 
 
-def _set_flag(page: Page, enabled: bool) -> None:
-    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``."""
+def _start_with_no_pinned_pages(page: Page) -> None:
+    """Start the session's strips with nothing pinned, for a journey that opens its own tabs."""
+    page.add_init_script(f"window.localStorage.setItem({_PINNED_PAGES_KEY!r}, JSON.stringify([]))")
+
+
+def _set_flag(page: Page, enabled: bool, *, settings_pins: bool = False) -> None:
+    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``.
+
+    With the flag on, a journey opens the tabs it needs, so its strips start with nothing
+    pinned unless ``settings_pins`` keeps Settings as shipped.
+    """
+    if enabled and not settings_pins:
+        _start_with_no_pinned_pages(page)
 
     def answer(route: Route) -> None:
         response = route.fetch()
@@ -302,6 +316,58 @@ def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
     expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
 
 
+def test_a_new_strip_starts_on_the_settings_pinned_pages(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """With Settings as shipped, a session's first strip shows its pinned pages, on Files."""
+    base_url, session_id = workspace_session
+    _set_flag(page, True, settings_pins=True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    files_tab = sidebar.get_by_role("tab", name=re.compile(r"^Files"))
+    expect(files_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    # Pull Requests and Tasks join only where the session offers them.
+    for page_name in ("Diffs", "Agents"):
+        expect(sidebar.get_by_role("tab", name=re.compile(rf"^{page_name}"))).to_have_count(1)
+    expect(sidebar.get_by_role("tab", name="New tab", exact=True)).to_have_count(0)
+
+
+def test_full_screen_chord_opens_the_sidebar_full_screen_and_leaves_it(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """⇧⌘F opens a closed sidebar straight into full screen, and leaves it again."""
+    base_url, session_id = workspace_session
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    collapse = sidebar.get_by_role("button", name="Collapse right panel")
+    expect(collapse).to_be_visible(timeout=60_000)
+    collapse.click()
+    expect(sidebar).to_have_count(0)
+    # The session remembers the closed rail, so it reloads without the sidebar ever showing.
+    page.reload()
+    expect(page.get_by_role("button", name="Expand right panel")).to_be_visible(timeout=60_000)
+    expect(sidebar).to_have_count(0)
+
+    maximized = page.locator("[data-maximized]")
+    # The chord binds once its code loads, which the closed rail doesn't wait for.
+    deadline = time.monotonic() + 60
+    while maximized.count() == 0:
+        assert time.monotonic() < deadline, "⇧⌘F never opened the sidebar"
+        page.keyboard.press("ControlOrMeta+Shift+F")
+        with contextlib.suppress(AssertionError):
+            expect(maximized).to_have_count(1, timeout=1_000)
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    full_screen = page.get_by_role("button", name=re.compile(r"full screen", re.IGNORECASE))
+    expect(full_screen).to_have_attribute("aria-pressed", "true")
+
+    page.keyboard.press("ControlOrMeta+Shift+F")
+    expect(full_screen).to_have_attribute("aria-pressed", "false")
+    expect(maximized).to_have_count(0)
+
+
 def test_files_menu_copies_the_path_and_a_link_to_the_file(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
@@ -333,7 +399,11 @@ def test_files_menu_copies_the_path_and_a_link_to_the_file(
 def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
-    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen."""
+    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen.
+
+    Settings stay as shipped, so the strip takes its pinned pages as the link opens; the
+    linked file keeps the selection.
+    """
     base_url, session_id = workspace_session
     anchor = "hello"
     response = httpx.post(
@@ -349,7 +419,7 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     )
     response.raise_for_status()
     comment_id = response.json()["id"]
-    _set_flag(page, True)
+    _set_flag(page, True, settings_pins=True)
     page.set_viewport_size(_VIEWPORTS["desktop"])
     page.goto(f"{base_url}/c/{session_id}?file={_FILE}&comment={comment_id}&fullscreen=1")
 
@@ -359,6 +429,10 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     expect(page.locator("[data-maximized]")).to_have_count(1)
     # The link is handed to the tab, so a reload doesn't open it again.
     expect(page).not_to_have_url(re.compile(r"[?&](?:file|comment|fullscreen)="))
+    expect(sidebar.get_by_role("tab", name=re.compile(r"^Agents"))).to_have_count(1)
+    file_tab = sidebar.get_by_role("tab", name=re.compile(rf"^{re.escape(_FILE)}"))
+    expect(file_tab).to_have_attribute("aria-selected", "true")
+    expect(viewer).to_contain_text("Say goodbye too")
 
 
 def test_tabs_sidebar_shell_tab_connects_then_shows_its_terminal(
@@ -679,6 +753,73 @@ def test_files_shows_a_folder_chain_as_one_row_through_the_workspace_api(
     )
 
 
+_BIG_FOLDER_FILES = 1200
+# Scroll the tree that holds `row` to its end.
+_SCROLL_TREE_TO_END = """(row) => {
+  for (let node = row.parentElement; node; node = node.parentElement) {
+    const scrolls = /(auto|scroll)/.test(getComputedStyle(node).overflowY);
+    if (scrolls && node.scrollHeight > node.clientHeight + 4) {
+      node.scrollTop = node.scrollHeight;
+      return;
+    }
+  }
+}"""
+
+
+def test_files_lists_a_folder_longer_than_one_listing_page_to_its_last_file(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A folder past one REST listing page of 1,000 entries lists all of them."""
+    # The runner's listing answers 1,000 entries a page, as a session's usually does.
+    base_url, session_id = seeded_session
+    environment = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default", timeout=10.0
+    )
+    environment.raise_for_status()
+    # Nothing may have written to the workspace yet, so its root is made along with the folder.
+    big = Path(environment.json()["metadata"]["root"]) / "big"
+    big.mkdir(parents=True)
+    try:
+        _list_big_folder_to_its_end(page, base_url, session_id, big)
+    finally:
+        shutil.rmtree(big, ignore_errors=True)
+
+
+def _list_big_folder_to_its_end(page: Page, base_url: str, session_id: str, big: Path) -> None:
+    for index in range(_BIG_FOLDER_FILES):
+        (big / f"f{index:04d}.txt").write_text(f"file {index}\n")
+    # Listed over REST, whose endpoint answers 1,000 entries a page; the workspace API's host
+    # may list a whole folder in one page.
+    page.route(
+        "**/workspace/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory",
+        lambda route: route.fulfill(
+            status=404,
+            content_type="application/json",
+            body='{"code": "not_found", "message": "listed over REST"}',
+        ),
+    )
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+
+    sidebar.get_by_role("treeitem", name="big", exact=True).click()
+    # Rows are virtualized and the host may list in any order, so a row's set size says how
+    # many entries the folder holds.
+    listed_file = sidebar.get_by_role("treeitem", name=re.compile(r"^f\d{4}\.txt$")).first
+    expect(listed_file).to_have_attribute("aria-setsize", str(_BIG_FOLDER_FILES), timeout=30_000)
+    # Scrolled to its end, the tree reaches the folder's last file.
+    last = sidebar.get_by_role("treeitem", name=f"f{_BIG_FOLDER_FILES - 1:04d}.txt", exact=True)
+    for _ in range(20):
+        if last.count():
+            break
+        listed_file.evaluate(_SCROLL_TREE_TO_END)
+        page.wait_for_timeout(200)
+    expect(last).to_be_visible(timeout=15_000)
+
+
 def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
     page: Page, git_session: tuple[str, str], tmp_path: Path
 ) -> None:
@@ -694,7 +835,7 @@ def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
     sidebar = page.get_by_role("complementary", name="Workspace")
     expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
     _open_app(page, sidebar, "Files")
-    # A full-screen workspace docks the tree, with its options beside the toggle.
+    # A full-screen workspace docks the tree, with its options in the tree's header.
     page.get_by_role("button", name="Full screen", exact=True).click()
     build = sidebar.get_by_role("treeitem", name=re.compile(r"^build\b"))
     expect(sidebar.get_by_role("treeitem", name="base.txt", exact=True)).to_be_visible(
@@ -703,7 +844,9 @@ def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
     expect(build).to_have_count(0)
 
     def switch_ignored_files() -> None:
-        sidebar.get_by_role("button", name="Files tree options", exact=True).click()
+        sidebar.get_by_test_id("files-page-tree-header").get_by_role(
+            "button", name="Tree options", exact=True
+        ).click()
         page.get_by_role("menuitemcheckbox", name="Show git-ignored files").click()
 
     switch_ignored_files()
@@ -714,3 +857,178 @@ def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
 
     switch_ignored_files()
     expect(build).to_have_count(0, timeout=30_000)
+
+
+def _add_worktree(tmp_path: Path) -> None:
+    """A worktree `.worktrees/wt` with its own change, beside one in the workspace."""
+    repository = tmp_path / "repository"
+    # Kept out of the workspace's own changes, as a project's ignore file would.
+    with (repository / ".git" / "info" / "exclude").open("a") as exclude:
+        exclude.write(".worktrees/\n")
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "wt", ".worktrees/wt"], cwd=repository, check=True
+    )
+    (repository / ".worktrees" / "wt" / "only_in_worktree.txt").write_text("worktree\n")
+    (repository / "only_in_workspace.txt").write_text("workspace\n")
+
+
+def _changed(sidebar: Locator, name: str) -> Locator:
+    return sidebar.get_by_role("button", name=f"Copy path {name}", exact=True)
+
+
+def _pick_comparison(page: Page, sidebar: Locator, choice: str) -> None:
+    sidebar.get_by_role("button", name="Change compared revisions").click()
+    picker = page.get_by_role("dialog", name="Compared revisions")
+    picker.get_by_role("group", name="Compare").get_by_role("button", name=choice).click()
+    expect(picker).to_have_count(0)
+
+
+def _pick_worktree_in_diffs(page: Page, sidebar: Locator) -> Locator:
+    """Diffs' folder name → the worktree `.worktrees/wt`; returns the folder name."""
+    folder = sidebar.get_by_test_id("changes-review-folder")
+    expect(folder).to_have_text("repository", timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
+    folder.click()
+    picker = page.get_by_test_id("workspace-picker")
+    expect(picker).to_be_visible(timeout=15_000)
+    # The browser hides dot-folders until asked to show them.
+    picker.get_by_test_id("workspace-picker-show-hidden").click()
+    picker.get_by_test_id("workspace-picker-entry-.worktrees").click()
+    picker.get_by_test_id("workspace-picker-entry-wt").click()
+    expect(picker.get_by_test_id("workspace-picker-breadcrumbs")).to_contain_text("wt")
+    picker.get_by_test_id("workspace-picker-select").click()
+    expect(folder).to_have_text("wt", timeout=30_000)
+    return folder
+
+
+def test_diffs_folder_name_picks_a_worktree_that_files_follows(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Diffs' folder name → pick a worktree inside the workspace → Diffs lists the worktree's
+    own change; a comparison changed there and Back keep the worktree; Files shows its folder →
+    the workspace again from ⌘K moves both back."""
+    base_url, session_id = git_session
+    _add_worktree(tmp_path)
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Diffs")
+
+    folder = _pick_worktree_in_diffs(page, sidebar)
+
+    # Diffs reviews the worktree on its own: its change, and none of the workspace's.
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_have_count(0)
+    expect(sidebar.get_by_text("Not available on this host yet.")).to_have_count(0)
+
+    # A comparison changed in the worktree is a step there: Back returns to the worktree's
+    # previous comparison, not to the workspace's.
+    trigger = sidebar.get_by_role("button", name="Change compared revisions")
+    _pick_comparison(page, sidebar, "All branch changes")
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    _pick_comparison(page, sidebar, "Last commit")
+    expect(trigger).to_contain_text("Last commit", timeout=30_000)
+    sidebar.get_by_role("group", name="Workspace history").get_by_role(
+        "button", name="Back"
+    ).click()
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(folder).to_have_text("wt")
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+
+    # Files moved with it.
+    _open_app(page, sidebar, "Files")
+    expect(sidebar.get_by_test_id("files-page-tree-header")).to_contain_text("wt", timeout=30_000)
+    expect(sidebar.get_by_role("treeitem", name="only_in_worktree.txt", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+
+    # Back to the workspace from ⌘K while Diffs is on screen, and Files follows.
+    strip = sidebar.get_by_role("tablist", name="Workspace tabs")
+    strip.get_by_role("tab", name=re.compile(r"^Diffs")).click()
+    page.keyboard.press("ControlOrMeta+k")
+    palette = page.get_by_test_id("command-palette-input")
+    expect(palette).to_be_focused(timeout=10_000)
+    palette.fill("Show repository in Diffs")
+    page.get_by_role("option", name=re.compile("Show repository in Diffs")).first.click()
+    expect(folder).to_have_text("repository", timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
+    strip.get_by_role("tab", name="Files", exact=True).click()
+    expect(
+        sidebar.get_by_role("treeitem", name="only_in_workspace.txt", exact=True)
+    ).to_be_visible(timeout=30_000)
+
+
+def test_back_and_reload_bring_diffs_back_to_a_visits_worktree(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A worktree's comparison in Diffs → Files returns to the workspace → Back, then a reload,
+    each show Diffs in that worktree with that comparison → a folder Files picks afterwards
+    stays."""
+    base_url, session_id = git_session
+    _add_worktree(tmp_path)
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    history = sidebar.get_by_role("group", name="Workspace history")
+    expect(history).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Diffs")
+    folder = _pick_worktree_in_diffs(page, sidebar)
+    trigger = sidebar.get_by_role("button", name="Change compared revisions")
+    _pick_comparison(page, sidebar, "All branch changes")
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+
+    # Files moves back to the workspace, and takes the session's folder with it.
+    _open_app(page, sidebar, "Files")
+    expect(sidebar.get_by_test_id("files-page-tree-header")).to_contain_text("wt", timeout=30_000)
+    sidebar.get_by_role("button", name="Back to working folder").click()
+    expect(
+        sidebar.get_by_role("treeitem", name="only_in_workspace.txt", exact=True)
+    ).to_be_visible(timeout=30_000)
+
+    # Back onto the Diffs visit shows its worktree again, with its comparison.
+    history.get_by_role("button", name="Back").click()
+    expect(folder).to_have_text("wt", timeout=30_000)
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+
+    # A reload forgets the session's folder; the saved Diffs visit brings it back.
+    page.reload()
+    expect(folder).to_have_text("wt", timeout=60_000)
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+
+    # A folder Files picks afterwards stays: Diffs follows it, and nothing pulls it back.
+    strip = sidebar.get_by_role("tablist", name="Workspace tabs")
+    strip.get_by_role("tab", name="Files", exact=True).click()
+    sidebar.get_by_role("button", name="Back to working folder").click()
+    expect(
+        sidebar.get_by_role("treeitem", name="only_in_workspace.txt", exact=True)
+    ).to_be_visible(timeout=30_000)
+    strip.get_by_role("tab", name=re.compile(r"^Diffs")).click()
+    expect(folder).to_have_text("repository", timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
+
+
+def test_diff_file_link_opens_its_diff_in_diffs(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A ``?file=`` link with ``diff=1`` to a changed file opens Diffs on that file's diff."""
+    base_url, session_id = git_session
+    (tmp_path / "repository" / "base.txt").write_text("Add the base\nedited for the link\n")
+    _set_flag(page, True)
+    page.set_viewport_size(_VIEWPORTS["desktop"])
+    page.goto(f"{base_url}/c/{session_id}?file=base.txt&diff=1")
+
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    strip = sidebar.get_by_role("tablist", name="Workspace tabs")
+    diffs = strip.get_by_role("tab", name=re.compile(r"^Diffs"))
+    expect(diffs).to_have_attribute("aria-selected", "true", timeout=60_000)
+    expect(sidebar.get_by_role("button", name="Copy path base.txt", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    expect(sidebar.get_by_text("edited for the link")).to_be_visible(timeout=30_000)
+    # The link is handed to the tab, so a reload doesn't open it again.
+    expect(page).not_to_have_url(re.compile(r"[?&](?:file|diff)="))

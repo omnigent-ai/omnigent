@@ -511,6 +511,183 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+@pytest.mark.parametrize(
+    "text,stage,interrupted,retained",
+    [
+        ("!ls", "forward_accepted", False, True),
+        ("!ls", "native_turn_started", False, True),
+        ("!ls", "native_turn_completed", False, True),
+        ("!ls", "native_turn_failed", False, True),
+        ("!ls", "native_turn_cancelled", False, False),
+        ("!ls", "forward_requested", False, False),
+        ("plain prompt", "forward_accepted", False, False),
+        ("!ls", "forward_accepted", True, False),
+    ],
+)
+def test_only_forwarded_uncancelled_shells_survive_pending_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    stage: str,
+    interrupted: bool,
+    retained: bool,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    pid = pending_inputs.record("conv_a", [_text_block(text)], stable_id="a" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", pid, "forward_requested")
+    if stage == "forward_accepted":
+        pending_inputs.mark_delivery_stage("conv_a", pid, "forward_accepted")
+    elif stage.startswith("native_turn_"):
+        pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage=stage)  # type: ignore[arg-type]
+    if interrupted:
+        pending_inputs.mark_interrupted("conv_a", [pid])
+    now[0] += pending_inputs._TTL_S + 1
+    assert pending_inputs.pending_id_for_stable_id("conv_a", "a" * 32) == (
+        pid if retained else None
+    )
+    assert not pending_inputs.has_pending("conv_a")
+    assert pending_inputs.snapshot_for("conv_a") == []
+    assert pending_inputs.pending_ids("conv_a") == []
+    assert pending_inputs.resolve_oldest("conv_a") is None
+    if retained:
+        # A later prompt must not drain correlation retained for a shell mirror.
+        later = pending_inputs.record("conv_a", [_text_block("next prompt")])
+        matched = pending_inputs.resolve_matching_text("conv_a", "next prompt")
+        assert matched.matched is not None and matched.matched.pending_id == later
+        assert matched.skipped == [] and matched.uncertain == []
+        assert pending_inputs.pending_id_for_stable_id("conv_a", "a" * 32) == pid
+        # A retry remains the same logical submission even after its active lease.
+        assert pending_inputs.record("conv_a", [_text_block(text)], stable_id="a" * 32) == pid
+        shell = pending_inputs.resolve_shell_command("conv_a", "ls")
+        assert shell is not None and shell.pending_id == pid
+
+
+@pytest.mark.parametrize("hold", [False, True])
+def test_shell_failure_and_rollback_do_not_reactivate_retained_correlation(
+    monkeypatch: pytest.MonkeyPatch,
+    hold: bool,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    first = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id="a" * 32)
+    second = pending_inputs.record("conv_a", [_text_block("!pwd")], stable_id="b" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", first, "forward_accepted")
+    pending_inputs.mark_delivery_stage("conv_a", second, "forward_accepted")
+    pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage="native_turn_failed")
+    assert pending_inputs.has_pending("conv_a")
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [second]
+    assert pending_inputs.pending_ids("conv_a") == [second]
+    # A delayed progress/acceptance report cannot undo terminal evidence.
+    pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage="native_turn_started")
+    pending_inputs.mark_delivery_stage("conv_a", first, "forward_accepted")
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [second]
+    drained = pending_inputs.resolve_shell_command("conv_a", "ls", hold=hold)
+    assert drained is not None and drained.pending_id == first
+    now[0] += pending_inputs._TTL_S + 1
+    pending_inputs.restore("conv_a", drained)
+    assert not pending_inputs.has_pending("conv_a")
+    assert pending_inputs.snapshot_for("conv_a") == []
+    assert pending_inputs.pending_ids("conv_a") == []
+    assert pending_inputs.resolve_oldest("conv_a") is None
+    replay = pending_inputs.resolve_shell_command("conv_a", "ls")
+    assert replay is not None and replay.pending_id == first
+
+
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("intervening_prompt", [False, True])
+@pytest.mark.parametrize("elapsed_s", [0.0, 601.0])
+def test_retired_shell_yields_to_live_identical_send(
+    monkeypatch: pytest.MonkeyPatch,
+    hold: bool,
+    intervening_prompt: bool,
+    elapsed_s: float,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    retired = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id="a" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", retired, "forward_accepted")
+    pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage="native_turn_failed")
+    now[0] += elapsed_s
+    prompt = (
+        pending_inputs.record("conv_a", [_text_block("next prompt")])
+        if intervening_prompt
+        else None
+    )
+    live = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id="b" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", live, "forward_accepted")
+
+    matched = pending_inputs.resolve_matching_text("conv_a", "ls", shell_command=True, hold=hold)
+    assert matched.matched is not None and matched.matched.pending_id == live
+    assert matched.skipped == [] and matched.uncertain == []
+    if hold:
+        # An append in progress must not expose retired fallback to another mirror.
+        assert pending_inputs.resolve_shell_command("conv_a", "ls") is None
+        pending_inputs.restore("conv_a", matched.matched)
+        replay = pending_inputs.resolve_shell_command("conv_a", "ls", hold=True)
+        assert replay is not None and replay.pending_id == live
+        pending_inputs.release("conv_a", replay)
+
+    expected_pending = [prompt] if prompt is not None else []
+    assert pending_inputs.pending_ids("conv_a") == expected_pending
+    assert [
+        entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")
+    ] == expected_pending
+    assert pending_inputs.has_pending("conv_a") is intervening_prompt
+    assert pending_inputs.pending_id_for_stable_id("conv_a", "a" * 32) == retired
+    delayed = pending_inputs.resolve_shell_command("conv_a", "ls")
+    assert delayed is not None and delayed.pending_id == retired
+    assert pending_inputs.pending_ids("conv_a") == expected_pending
+
+
+@pytest.mark.parametrize("hold", [False, True])
+def test_restoring_expired_shell_preserves_its_active_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    hold: bool,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    pid = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id="a" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", pid, "forward_accepted")
+    drained = pending_inputs.resolve_shell_command("conv_a", "ls", hold=hold)
+    assert drained is not None
+    now[0] += pending_inputs._TTL_S + 1
+    pending_inputs.restore("conv_a", drained)
+    assert not pending_inputs.has_pending("conv_a")
+    assert pending_inputs.snapshot_for("conv_a") == []
+    assert pending_inputs.pending_id_for_stable_id("conv_a", "a" * 32) == pid
+
+
+def test_shell_failure_during_held_append_survives_restore() -> None:
+    pid = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id="a" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", pid, "forward_accepted")
+    drained = pending_inputs.resolve_shell_command("conv_a", "ls", hold=True)
+    assert drained is not None
+    pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage="native_turn_failed")
+    pending_inputs.restore("conv_a", drained)
+    assert not pending_inputs.has_pending("conv_a")
+    assert pending_inputs.snapshot_for("conv_a") == []
+    mirrored = pending_inputs.resolve_shell_command("conv_a", "ls")
+    assert mirrored is not None and mirrored.pending_id == pid
+
+
+def test_shell_turn_completion_only_confirms_terminal_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    pid = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id="a" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", pid, "forward_accepted")
+    # Claude completes the runner turn after typing, before queued execution.
+    pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage="native_turn_completed")
+    assert pending_inputs.has_pending("conv_a")
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [pid]
+    now[0] += pending_inputs._TTL_S + 1
+    assert not pending_inputs.has_pending("conv_a")
+    assert pending_inputs.snapshot_for("conv_a") == []
+    mirrored = pending_inputs.resolve_shell_command("conv_a", "ls")
+    assert mirrored is not None and mirrored.pending_id == pid
+
+
 def test_restore_returns_a_drained_entry_to_the_front() -> None:
     """A restored entry reclaims the head of the FIFO.
 
@@ -630,10 +807,16 @@ def test_stable_id_dedup_scoped_per_conversation() -> None:
     assert id_a != id_b
 
 
-def test_record_evicts_the_oldest_entry_beyond_the_per_conversation_cap() -> None:
+@pytest.mark.parametrize("shell", [False, True])
+def test_record_evicts_the_oldest_entry_beyond_the_per_conversation_cap(shell: bool) -> None:
     """The queue is bounded: recording past the cap drops the oldest entry."""
     cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
-    ids = [pending_inputs.record("conv_a", [_text_block(f"m{i}")]) for i in range(cap + 2)]
+    ids = []
+    for i in range(cap + 2):
+        pid = pending_inputs.record("conv_a", [_text_block(f"{'!' if shell else ''}m{i}")])
+        if shell:
+            pending_inputs.mark_delivery_stage("conv_a", pid, "forward_accepted")
+        ids.append(pid)
 
     snapshot = pending_inputs.snapshot_for("conv_a")
 

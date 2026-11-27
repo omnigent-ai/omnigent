@@ -29,7 +29,7 @@ implements them separately, so a fix for one harness does not reach the others.
 - `agent-instructions`: supported native startup paths preserve authored instructions
   and add shared guidance for showing workspace screenshots; Pi authors can keep
   or replace its base prompt and disable automatic context files.
-- `long-term-memory`: on a server with memory on, Claude Code, Codex and Pi
+- `long-term-memory`: on a server with memory on, Claude Code, Codex, Pi and Antigravity
   sessions start with a note on the `memory_*` tools and a quoted index of up to
   100 saved memories (path, short description, last-updated date; the session's
   project first), and can save and recall memories across sessions and
@@ -383,6 +383,46 @@ disable the master gate or a harness flag: switches disappear for that scope,
 future launches ignore its saved preferences, and running sessions remain
 unchanged. Saved preferences remain available when the flags are re-enabled.
 
+**MCP inheritance:** `mcp: {inherit: false, allow: [names]}` in the user's
+`~/.omnigent/config.yaml`, optionally overridden under `harness.<id>.mcp`, makes
+Claude and Codex launches restrict inherited file-configured servers to `omnigent` plus the allowlist,
+apart from the plugin and unreadable-config limits below.
+It needs no server flag and has no UI. Project config cannot change it. Claude
+gets `allowedMcpServers` through `--settings`, and because Claude unions
+allowlists across settings sources, every other inherited user, project, local
+or managed `allowedMcpServers` entry (project and local files from the cwd, Git
+root and linked-worktree main checkout) is mirrored into `deniedMcpServers`, as
+are non-allowlisted `managed-mcp.json` and `managedMcpServers` names from
+managed settings and drop-ins, which bypass Claude's allowlist. Their URLs
+participate in transport-conflict detection too.
+Managed-host native launches read these for the wrapper-resolved cwd and
+environment (`apply_claude_launch_mcp_policy`); SDK launches use the executor cwd
+and CLI env with the SDK's selected setting scopes (managed policy always
+applies), and `omnigent claude` its own cwd and env (a `CLAUDE_LAUNCHER`
+plugin's wrapper is not modeled).
+Any inherited `serverCommand` entry, or a `serverUrl` entry when an allowlisted
+server uses HTTP or SSE, raises `McpStrictModeError`: Claude 2.1.283 admits stdio
+(or remote) servers only by command (or URL) once such an entry exists, even when
+the URL pattern differs. The error names the settings file and affected server
+without printing the URL. Host-launched Claude sessions also refuse `env` wrapper
+forms whose launch environment cannot be resolved before trust seeding. Codex
+gets an `enabled=false` override for every other discovered server (TOML 1.1
+layers and `-c` values are read with `tomlkit`) and no relaunch without them; a
+managed-layer `enabled = true` for any other server raises `McpStrictModeError`. A
+strict launch whose Claude settings or Codex config layer exists but is
+unreadable, or whose `-c mcp_servers` override is not a table, raises
+`McpStrictModeError` naming it. Malformed Omnigent fields warn once and are
+ignored per field; an unreadable or non-mapping `config.yaml` inherits. Claude 2.1.283 matches allowlisted
+names against configured servers only, so strict mode always blocks Claude
+plugin MCP servers. Codex plugin MCPs and macOS-managed preferences are not
+discovered. Arbitrary Claude launcher scripts that change context or discard
+injected settings are outside strict discovery; use direct Claude or a supported
+`env` wrapper when relying on the allowlist.
+A file-managed `allowManagedMcpServersOnly: true` refuses strict launch because
+the invocation allowlist cannot be relied on. Claude remote, MDM and Windows
+registry managed-policy sources are not inspected; this discovery covers managed
+settings files and their drop-ins.
+
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown once for the host desktop onboarding just connected → See more. It opens
@@ -712,9 +752,31 @@ Cross-harness journeys:
   checks authored instructions in actual scripted-provider requests before and
   after a real Pi fork with tool history. These checks do not prove browser
   launch, OS sandbox access or live-model adherence to the instructions.
-- **`long-term-memory`, Claude, Codex and Pi native:** start the instance's
+- **`agent-instructions`, Antigravity native:** startup text is composed by the
+  shared native instruction helper and written as an always-on rule under the
+  session's isolated `config/rules/omnigent_instructions.md`. Existing user rules
+  remain alongside it. Automatic launch, terminal re-creation and the CLI
+  fallback resolve the session's agent before composing the rule.
+  If a named child is unavailable, automatic launch and terminal re-creation
+  retain the shared resolver's parent-agent fallback; the CLI uses framework
+  guidance only. Existing fallback behavior is preserved in each path.
+  CLI instruction loading is best effort: fetch or corrupt-bundle failures warn
+  and use framework guidance. The runner's added fallback handles transient
+  instruction fetch failures. Relay initialization still requires a resolved
+  session bundle, so a persistent outage can prevent terminal creation.
+  For automatic launch and terminal re-creation, authorization and startup-policy
+  rejections remain launch failures. CLI instruction retrieval is separate from
+  authorization for its subsequent terminal request.
+  `tests/runner/test_app_native_startup_instructions.py::test_antigravity_startup_rule_is_ready_before_terminal_launch`
+  checks authored instructions, image guidance and memory before a mocked
+  terminal boundary, for fresh and resumed sessions.
+  `tests/harnesses/antigravity_native/test_antigravity_native.py::test_cli_fallback_delivers_effective_session_startup_instructions`
+  covers the CLI fallback, child-agent selection, missing children and missing
+  legacy bundles.
+  These component checks do not prove a native CLI consumed the rule.
+- **`long-term-memory`, Claude, Codex, Pi and Antigravity native:** start the instance's
   server with `OMNIGENT_FEATURES=memory`. The shared startup composer used by
-  all three launches is covered by
+  these launches is covered by
   `tests/runner/test_app_native_startup_instructions.py::test_startup_instructions_join_stable_text_notes_and_memory_in_order`
   and, with memory off,
   `tests/runner/test_app_native_startup_instructions.py::test_startup_instructions_without_memory_are_unchanged`.
@@ -1239,7 +1301,11 @@ Cross-harness journeys:
   For enablement, also run `tests/host/test_mcp_inventory.py` and
   `tests/server/routes/test_mcp_servers.py`. The non-browser journey
   `tests/e2e/test_mcp_disabled_servers.py` checks both native CLIs, a disabled
-  fixture, an enabled control, and the Omnigent relay without building the SPA.
+  fixture, an enabled control, and the Omnigent relay without building the SPA;
+  its `strict` cases do the same with `mcp: {inherit: false}` against a server
+  without the MCP flags.
+  Strict planning and config parsing are in `tests/test_mcp_disabled_servers*.py`
+  and `tests/test_mcp_inheritance.py`.
   Disabled plugin MCP rows stay visible without expansion or probes. Check
   same-name plugins from different marketplaces return their respective tools.
   HTTP probes honor the host's proxy and certificate environment settings.
@@ -1269,6 +1335,8 @@ Cross-harness journeys:
   Omnigent provider. Run `/<plugin>:<command> focus`: the body expands with the
   arguments. The skill is listed for the model and `/skill:<name>` works. Disable the
   plugin in Claude Code and launch again: both are gone. `~/.pi/agent` stays unchanged.
+  Repeat with `~/.claude/plugins/cache` linked to a shared cache: enabled resources
+  still load, while symlinked files and resource directories inside a plugin stay skipped.
   Without the flag, nothing changes.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm

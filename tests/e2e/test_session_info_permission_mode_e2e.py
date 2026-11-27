@@ -100,6 +100,7 @@ def test_session_info_reports_the_mode_each_session_is_in(tmp_path, isolated_moc
                 )
                 created.raise_for_status()
                 reader = created.json()["session_id"]
+                # Select both initial modes instead of relying on the CLIs' defaults.
                 codex_launch_args = PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
                 codex = create_native_session(
                     client,
@@ -116,7 +117,11 @@ def test_session_info_reports_the_mode_each_session_is_in(tmp_path, isolated_moc
                     client,
                     stack.base_url,
                     harness="claude",
-                    metadata={"title": "Claude", **placement},
+                    metadata={
+                        "title": "Claude",
+                        "terminal_launch_args": PERMISSION_LAUNCH_ARGS["claude-native"]["default"],
+                        **placement,
+                    },
                 )["session_id"]
 
                 def session(session_id):

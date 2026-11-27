@@ -7,6 +7,7 @@ import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
+import { OpenSessionPublisher } from "./openSession";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 
 // The QuickPick palette and its theme picker load only with quick_pick_palette, so the
@@ -17,8 +18,26 @@ const QuickPickCommandPalette = lazy(() =>
     default: module.QuickPickCommandPalette,
   })),
 );
+const FeatureFlagsPicker = lazy(() =>
+  import("./FeatureFlagsPicker").then((module) => ({ default: module.FeatureFlagsPicker })),
+);
 const ThemePicker = lazy(() =>
   import("./ThemePicker").then((module) => ({ default: module.ThemePicker })),
+);
+const QuickPickShortcutHost = lazy(() =>
+  import("./quickPickShortcuts/QuickPickShortcutHost").then((module) => ({
+    default: module.QuickPickShortcutHost,
+  })),
+);
+const SessionActionHost = lazy(() =>
+  import("./sessionCommands/SessionActionHost").then((module) => ({
+    default: module.SessionActionHost,
+  })),
+);
+const RecentSessionSwitchHost = lazy(() =>
+  import("./quickPickShortcuts/RecentSessionSwitchHost").then((module) => ({
+    default: module.RecentSessionSwitchHost,
+  })),
 );
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
@@ -93,16 +112,35 @@ export function AppShellOverlays({
           onGoToSession={goToSession}
         />
       </Suspense>
-      {/* "Select theme…" from ⌘K; previews each theme as the user moves through them. */}
+      {/* ⌘K's theme and UI feature-flag pickers. */}
       {quickPick && (
         <Suspense fallback={null}>
           <ThemePicker />
+          <FeatureFlagsPicker />
         </Suspense>
       )}
+      {/* Carry out a session's action picked from ⌘↵ on its ⌘K row. The key hosts get their
+          own boundaries, so their chords work without waiting for it. */}
+      {quickPick && (
+        <>
+          {/* Read by an action that settles after its host has gone, such as a Leave. */}
+          <OpenSessionPublisher sessionId={serverConversationId ?? null} />
+          <Suspense fallback={null}>
+            <SessionActionHost />
+          </Suspense>
+          <Suspense fallback={null}>
+            <QuickPickShortcutHost />
+          </Suspense>
+          <Suspense fallback={null}>
+            <RecentSessionSwitchHost />
+          </Suspense>
+        </>
+      )}
+      {/* With quick_pick_palette on, Ctrl+Tab steps through the sidebar instead. */}
       <RecentSessionsSwitcher
         conversations={allConversations}
         activeSessionId={serverConversationId ?? null}
-        enabled={isElectronShell()}
+        enabled={isElectronShell() && !quickPick}
       />
       {/* Transient toasts (e.g. "session archived"). Mounted once here so
           any surface can fire one via showToast(). */}

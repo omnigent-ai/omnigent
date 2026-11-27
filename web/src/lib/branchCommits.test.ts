@@ -12,11 +12,14 @@ import {
   setWorkspaceSidebarSourceForTests,
   WorkspaceMethodUnavailableError,
 } from "@/lib/workspaceSidebarSource";
+import { commitRevisions, type RevisionSpec } from "@/lib/customComparison";
 
 import {
   BRANCH_COMMITS_FAILED,
   BRANCH_COMMITS_NOT_SERVED,
+  BRANCH_RANGE,
   branchCommitsView,
+  commitsRange,
   fetchBranchCommits,
 } from "./branchCommits";
 
@@ -35,12 +38,12 @@ const BASE: WorkingCopyBase = {
   headIsWorkingCopy: false,
 };
 
-function answering(listBranchCommits: (sessionId: string, baseRevision: string) => unknown) {
+function answering(listBranchCommits: (sessionId: string, range: RevisionSpec) => unknown) {
   const spy = vi.fn(listBranchCommits);
   setWorkspaceSidebarSourceForTests({
     ...DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
-    listBranchCommits: (sessionId, baseRevision) =>
-      Promise.resolve(spy(sessionId, baseRevision)).then(
+    listBranchCommits: (sessionId, range) =>
+      Promise.resolve(spy(sessionId, range)).then(
         (response) => response as ListBranchCommitsResponse,
       ),
   });
@@ -87,7 +90,13 @@ describe("fetchBranchCommits", () => {
       truncated: true,
       baseDisplay: "origin/main",
     });
-    expect(listed).toHaveBeenCalledWith(SESSION, "");
+    expect(listed).toHaveBeenCalledWith(SESSION, BRANCH_RANGE);
+  });
+
+  it("asks for the range it's given", async () => {
+    const listed = answering(() => ({ base: BASE, commits: [], truncated: false }));
+    await fetchBranchCommits(SESSION, { base: "main", head: "feature" });
+    expect(listed).toHaveBeenCalledWith(SESSION, { base: "main", head: "feature" });
   });
 
   it("names the base by its reference when the host gives no display name", async () => {
@@ -122,6 +131,27 @@ describe("fetchBranchCommits", () => {
     await expect(fetchBranchCommits(SESSION)).rejects.toBeInstanceOf(
       WorkspaceMethodUnavailableError,
     );
+  });
+});
+
+describe("commitsRange", () => {
+  const TYPED = { base: "v1", head: "feature" };
+  const OTHER = { base: "main", head: "" };
+
+  it("lists the session's branch without a typed comparison", () => {
+    expect(commitsRange(null, OTHER)).toEqual(BRANCH_RANGE);
+  });
+
+  it("lists a typed comparison's own base and head, the working copy as HEAD", () => {
+    expect(commitsRange(TYPED, BRANCH_RANGE)).toEqual(TYPED);
+    expect(commitsRange({ base: "v1", head: "" }, BRANCH_RANGE)).toEqual({ base: "v1", head: "" });
+  });
+
+  it("keeps the previous range while a single commit is shown on its own", () => {
+    expect(commitsRange(commitRevisions(OID), TYPED)).toBe(TYPED);
+    expect(commitsRange(commitRevisions("b".repeat(64), { root: true }), TYPED)).toBe(TYPED);
+    // A typed range that ends at a commit, but from another base, is listed as typed.
+    expect(commitsRange({ base: "main", head: OID }, TYPED)).toEqual({ base: "main", head: OID });
   });
 });
 

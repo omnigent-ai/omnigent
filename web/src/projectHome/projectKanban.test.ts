@@ -5,11 +5,12 @@ import {
   SCHEDULED_TASK_LAUNCH_LABEL_KEY,
 } from "@/lib/automationSessions";
 import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
-import type { StatusBucket } from "@/shell/sidebarNav";
+import { statusBucket, type StatusBucket } from "@/shell/sidebarNav";
 import {
   filterKanbanCards,
   kanbanColumns,
   kanbanDropAction,
+  nestedAttentionLabel,
   projectBoardRows,
   takeArrivals,
 } from "./projectKanban";
@@ -46,8 +47,135 @@ describe("project kanban", () => {
     expect(ids("Done")).toEqual([["done_a"], ["done_b"]]);
   });
 
+  it("drops a nested failure older than the family's latest activity", () => {
+    const member = (id: string, fields: Partial<Conversation>) =>
+      ({
+        ...row(id, 1, true),
+        labels: { "omnigent.last_task_error_at": String(fields.updated_at) },
+        ...fields,
+      }) as Conversation;
+    const columnOf = (c: Conversation): StatusBucket =>
+      c.status === "failed" || (c.pending_elicitations_count ?? 0) > 0 ? "Needs attention" : "Done";
+    const cardOf = (...members: Conversation[]) =>
+      [...kanbanColumns(members, columnOf).values()].flat()[0];
+
+    const parent = member("parent", { status: "idle", updated_at: 200 });
+    const staleFailure = member("failed", { status: "failed", updated_at: 100 });
+    const stale = cardOf(parent, staleFailure);
+    expect(stale.column).toBe("Done");
+    expect(stale.attentionMembers).toEqual([]);
+
+    const freshFailure = member("failed", { status: "failed", updated_at: 300 });
+    const fresh = cardOf(parent, freshFailure);
+    expect(fresh.column).toBe("Needs attention");
+    expect(fresh.attentionMembers).toEqual([freshFailure]);
+    expect(nestedAttentionLabel(fresh)).toBe("1 failed");
+
+    // The worker last spoke at T100, the head at T150, then recovery failed at T200.
+    const silentFailure = member("failed", {
+      status: "failed",
+      updated_at: 100,
+      labels: { "omnigent.last_task_error_at": "200" },
+    });
+    const beforeFailure = member("parent", { status: "idle", updated_at: 150 });
+    expect(cardOf(beforeFailure, silentFailure).attentionMembers).toEqual([silentFailure]);
+    const afterFailure = member("parent", { status: "idle", updated_at: 250 });
+    expect(cardOf(afterFailure, silentFailure).column).toBe("Done");
+
+    for (const timestamp of [undefined, "", "invalid", "0", "-1", "Infinity"]) {
+      const unknownFailure = member("failed", {
+        status: "failed",
+        updated_at: 100,
+        labels: timestamp === undefined ? {} : { "omnigent.last_task_error_at": timestamp },
+      });
+      expect(cardOf(afterFailure, unknownFailure).attentionMembers).toEqual([unknownFailure]);
+    }
+
+    // An outstanding approval rolls up however old it is.
+    const asking = member("asking", {
+      status: "idle",
+      pending_elicitations_count: 1,
+      updated_at: 1,
+    });
+    const approval = cardOf(parent, asking);
+    expect(approval.column).toBe("Needs attention");
+    expect(nestedAttentionLabel(approval)).toBe("1 needs attention");
+  });
+
+  it("counts only fresh nested failures, ties included, and approvals on failed members", () => {
+    const member = (id: string, fields: Partial<Conversation>) =>
+      ({
+        ...row(id, 1, true),
+        labels: { "omnigent.last_task_error_at": String(fields.updated_at) },
+        ...fields,
+      }) as Conversation;
+    const columnOf = (c: Conversation): StatusBucket =>
+      c.status === "failed" || (c.pending_elicitations_count ?? 0) > 0 ? "Needs attention" : "Done";
+    const cardOf = (...members: Conversation[]) =>
+      [...kanbanColumns(members, columnOf).values()].flat()[0];
+    const parent = member("parent", { status: "idle", updated_at: 100 });
+
+    const older = member("older", { status: "failed", updated_at: 50 });
+    const newer = member("newer", { status: "failed", updated_at: 150 });
+    expect(cardOf(parent, older, newer).attentionMembers.map((m) => m.id)).toEqual(["newer"]);
+    const activeSibling = member("sibling", { status: "idle", updated_at: 200 });
+    const superseded = cardOf(parent, newer, activeSibling);
+    expect(superseded.column).toBe("Done");
+    expect(superseded.attentionMembers).toEqual([]);
+
+    const tied = member("tied", { status: "failed", updated_at: 100 });
+    expect(cardOf(parent, tied).column).toBe("Needs attention");
+
+    const askingFailed = member("asking", {
+      status: "failed",
+      pending_elicitations_count: 1,
+      updated_at: 1,
+    });
+    const asking = cardOf(parent, askingFailed);
+    expect(asking.column).toBe("Needs attention");
+    expect(nestedAttentionLabel(asking)).toBe("1 needs attention");
+  });
+
+  it("still rolls up an older nested turn parked on a terminal prompt, and a lone head", () => {
+    const columnOf = (c: Conversation) => statusBucket(c, false, false);
+    const parent = { ...row("parent", 1, true), status: "idle", updated_at: 200 } as Conversation;
+    const parked = {
+      ...row("parked", 2, true),
+      status: "running",
+      blocked_on: "permission prompt",
+      updated_at: 100,
+    } as Conversation;
+    const [card] = kanbanColumns([parent, parked], columnOf).get("Needs attention")!;
+    expect(card.attentionMembers).toEqual([parked]);
+    expect(nestedAttentionLabel(card)).toBe("1 needs attention");
+
+    const lone = { ...row("parent", 1, true), status: "failed", updated_at: 1 } as Conversation;
+    const [head] = kanbanColumns([lone], columnOf).get("Needs attention")!;
+    expect(head.members).toEqual([lone]);
+    expect(nestedAttentionLabel(head)).toBeNull();
+  });
+
+  it("keeps a failed head in Needs attention without a nested note", () => {
+    const failedHead = {
+      ...row("parent", 1, true),
+      status: "failed",
+      updated_at: 100,
+    } as Conversation;
+    const newer = { ...row("nested", 2, true), status: "idle", updated_at: 200 } as Conversation;
+    const columnOf = (c: Conversation): StatusBucket =>
+      c.status === "failed" ? "Needs attention" : "Done";
+    const [card] = kanbanColumns([failedHead, newer], columnOf).get("Needs attention")!;
+    expect(card.conversation.id).toBe("parent");
+    expect(nestedAttentionLabel(card)).toBeNull();
+  });
+
   it("moves cards only between Unread and Done", () => {
-    const card = (column: StatusBucket) => ({ conversation: row("a", 1), members: [], column });
+    const card = (column: StatusBucket) => ({
+      conversation: row("a", 1),
+      members: [],
+      column,
+      attentionMembers: [],
+    });
     expect(kanbanDropAction(card("Unread"), "Done")).toBe("mark_read");
     expect(kanbanDropAction(card("Done"), "Unread")).toBe("mark_unread");
     expect(kanbanDropAction(card("Unread"), "Working")).toBeNull();
@@ -58,11 +186,17 @@ describe("project kanban", () => {
   it("never drops a muted session into Unread", () => {
     const muted = { ...row("a", 1), labels: { [MUTED_LABEL_KEY]: "1" } } as Conversation;
     expect(
-      kanbanDropAction({ conversation: muted, members: [muted], column: "Done" }, "Unread"),
+      kanbanDropAction(
+        { conversation: muted, members: [muted], column: "Done", attentionMembers: [] },
+        "Unread",
+      ),
     ).toBeNull();
     // Clearing unread output stays available.
     expect(
-      kanbanDropAction({ conversation: muted, members: [muted], column: "Unread" }, "Done"),
+      kanbanDropAction(
+        { conversation: muted, members: [muted], column: "Unread", attentionMembers: [] },
+        "Done",
+      ),
     ).toBe("mark_read");
   });
 
@@ -72,6 +206,7 @@ describe("project kanban", () => {
       conversation: members[0],
       members,
       column: "Done" as const,
+      attentionMembers: [],
     });
     const lone = card(titled("a", "Fix login bug"));
     const withNested = card(titled("b", "Refactor"), titled("c", "Add LOGIN test"));

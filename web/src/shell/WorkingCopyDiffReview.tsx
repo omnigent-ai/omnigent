@@ -35,6 +35,7 @@ import {
   type ComparisonEntry,
   ComparisonFileError,
   type EffectiveComparison,
+  hostListing,
   isSettledFileReason,
   needsRelist,
   StaleComparisonReadError,
@@ -203,11 +204,9 @@ type LoaderScope =
   { base: "head" } | { base: "branch-point"; comparisonId: string; generation: number };
 
 function loaderScope(comparison: EffectiveComparison, generation: number): LoaderScope | null {
-  if (comparison.base === "head") return { base: "head" };
-  if (comparison.base === "branch-point") {
-    return { base: "branch-point", comparisonId: comparison.comparison.id, generation };
-  }
-  return null;
+  const listing = hostListing(comparison);
+  if (listing) return { base: "branch-point", comparisonId: listing.id, generation };
+  return comparison.base === "head" ? { base: "head" } : null;
 }
 
 function useDiffContentLoader(
@@ -524,10 +523,9 @@ export function WorkingCopyDiffReviewBody({
       </div>
     );
   }
+  const listing = hostListing(comparison);
   const footer =
-    showComparisonNotes && comparison.base === "branch-point"
-      ? unrepresentableNote(comparison.comparison.unrepresentableNames)
-      : null;
+    showComparisonNotes && listing ? unrepresentableNote(listing.unrepresentableNames) : null;
   return (
     <>
       {showComparisonNotes && (
@@ -545,7 +543,7 @@ export function WorkingCopyDiffReviewBody({
         contents={contents}
         onRetry={(path) => {
           // The person asked again, so the file gets another automatic re-list.
-          if (comparison.base === "branch-point") {
+          if (listing) {
             owner.allowRecovery(conversationId, path);
           }
           loader.retry(path);

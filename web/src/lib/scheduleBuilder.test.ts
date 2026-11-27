@@ -277,6 +277,27 @@ describe("minute cadence policy", () => {
           expect(validateSchedule(schedule, { executionTarget, sessionMode }) === null).toBe(
             interval >= 60 && interval <= 366 * 60,
           );
+          // A server that lets every target and session mode run every ten minutes.
+          const everyTarget = validateSchedule(schedule, {
+            executionTarget,
+            sessionMode,
+            subhourSupported: true,
+            newSandboxSubhourSupported: true,
+          });
+          expect(everyTarget === null).toBe(interval >= 10 && interval <= 366 * 60);
+          if (interval < 10) {
+            expect(everyTarget).toBe(
+              `Interval must be a whole number of at least 10 and at most ${366 * 60}.`,
+            );
+          }
+          // It still needs the sub-hour capability itself.
+          expect(
+            validateSchedule(schedule, {
+              executionTarget,
+              sessionMode,
+              newSandboxSubhourSupported: true,
+            }) === null,
+          ).toBe(interval >= 60 && interval <= 366 * 60);
         }
       }
       expect(

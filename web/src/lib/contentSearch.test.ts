@@ -3,9 +3,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import wholeWordCases from "@/lib/__fixtures__/contentSearchWholeWord.json";
 import {
   CONTENT_SEARCH_QUERY_LIMIT,
+  contentMatchRanges,
   contentSearchPattern,
+  contentSearchProblem,
+  type ContentSearchInput,
+  EMPTY_CONTENT_SEARCH,
   fetchContentSearch,
   fitsContentSearchLimit,
+  runContentSearch,
   wholeWordRegexProblem,
 } from "@/lib/contentSearch";
 import { authenticatedFetch } from "@/lib/identity";
@@ -184,5 +189,166 @@ describe("fetchContentSearch", () => {
       include: "src/**",
       exclude: "",
     });
+  });
+});
+
+const input = (overrides: Partial<ContentSearchInput> = {}): ContentSearchInput => ({
+  ...EMPTY_CONTENT_SEARCH,
+  ...overrides,
+});
+
+describe("contentSearchProblem", () => {
+  it("accepts any search without Whole word", () => {
+    expect(contentSearchProblem(input({ query: "foo)|(bar", regex: true }))).toBeNull();
+    expect(
+      contentSearchProblem(input({ query: "x".repeat(CONTENT_SEARCH_QUERY_LIMIT) })),
+    ).toBeNull();
+  });
+
+  it("says how to fix a Whole word search that can't keep its boundaries", () => {
+    expect(
+      contentSearchProblem(input({ query: "foo)|(bar", regex: true, wholeWord: true })),
+    ).toMatch(/closes a group it never opened/);
+    expect(contentSearchProblem(input({ query: "(?x)a b", regex: true, wholeWord: true }))).toMatch(
+      /verbose mode/,
+    );
+    expect(
+      contentSearchProblem(
+        input({ query: "é".repeat(CONTENT_SEARCH_QUERY_LIMIT), wholeWord: true }),
+      ),
+    ).toMatch(/too long to match whole words/);
+    expect(contentSearchProblem(input({ query: "needle", wholeWord: true }))).toBeNull();
+  });
+});
+
+describe("runContentSearch", () => {
+  it("sends the search as typed, with Whole word as its pattern", async () => {
+    const result = { matches: [], truncated: false, warning: null };
+    vi.mocked(searchTextViaWorkspaceApi).mockResolvedValue(result);
+    await expect(
+      runContentSearch("conv", input({ query: "needle", wholeWord: true, include: "src/**" })),
+    ).resolves.toBe(result);
+    expect(searchTextViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv",
+      "\\bneedle\\b",
+      { caseSensitive: false, regex: true, include: "src/**", exclude: "" },
+      undefined,
+    );
+  });
+});
+
+describe("contentMatchRanges", () => {
+  const line = (text: string, start: number, end: number) => ({
+    text,
+    match_start: start,
+    match_end: end,
+  });
+
+  it("marks every plain-text occurrence, ignoring case unless asked", () => {
+    const found = line("Needle, needle, NEEDLE", 0, 6);
+    expect(contentMatchRanges(found, input({ query: "needle" }))).toEqual([
+      { start: 0, end: 6 },
+      { start: 8, end: 14 },
+      { start: 16, end: 22 },
+    ]);
+    expect(
+      contentMatchRanges(
+        line("Needle, needle", 8, 14),
+        input({ query: "needle", caseSensitive: true }),
+      ),
+    ).toEqual([{ start: 8, end: 14 }]);
+  });
+
+  it("matches whole words only at word boundaries, including Unicode letters", () => {
+    const found = line("needle needles éneedle needle_x needle", 0, 6);
+    expect(contentMatchRanges(found, input({ query: "needle", wholeWord: true }))).toEqual([
+      { start: 0, end: 6 },
+      { start: 32, end: 38 },
+    ]);
+    // Punctuation edges need no boundary, as in the search engines.
+    expect(
+      contentMatchRanges(line("a C++ b C++", 2, 5), input({ query: "C++", wholeWord: true })),
+    ).toEqual([
+      { start: 2, end: 5 },
+      { start: 8, end: 11 },
+    ]);
+  });
+
+  it("finds a whole word that overlaps a rejected candidate", () => {
+    expect(
+      contentMatchRanges(line("xa-a-a", 3, 6), input({ query: "a-a", wholeWord: true })),
+    ).toEqual([{ start: 3, end: 6 }]);
+    expect(
+      contentMatchRanges(line("xa-a-a a-a", 3, 6), input({ query: "a-a", wholeWord: true })),
+    ).toEqual([
+      { start: 3, end: 6 },
+      { start: 7, end: 10 },
+    ]);
+  });
+
+  it("counts word characters as the search engines' Unicode \\w does", () => {
+    // A superscript digit isn't a word character; a zero-width joiner or a combining letter is.
+    const found = line("needle needle² needle\u200C needle\u200D needleᢅ", 0, 6);
+    expect(contentMatchRanges(found, input({ query: "needle", wholeWord: true }))).toEqual([
+      { start: 0, end: 6 },
+      { start: 7, end: 13 },
+    ]);
+    // A letterlike numeral is alphabetic, so it joins the word; ripgrep finds only the second.
+    expect(
+      contentMatchRanges(
+        line("Ⅻneedle ²needle", 9, 15),
+        input({ query: "needle", wholeWord: true }),
+      ),
+    ).toEqual([{ start: 9, end: 15 }]);
+  });
+
+  it("does not confirm a whole word against a cropped edge", () => {
+    const found = line("…needle, needle, needle…", 9, 15);
+    expect(contentMatchRanges(found, input({ query: "needle", wholeWord: true }))).toEqual([
+      { start: 9, end: 15 },
+    ]);
+    expect(contentMatchRanges(found, input({ query: "needle" }))).toEqual([
+      { start: 1, end: 7 },
+      { start: 9, end: 15 },
+      { start: 17, end: 23 },
+    ]);
+  });
+
+  it("treats regular-expression characters in plain text literally", () => {
+    const found = line("a.b axb a.b (x) [y]", 0, 3);
+    expect(contentMatchRanges(found, input({ query: "a.b" }))).toEqual([
+      { start: 0, end: 3 },
+      { start: 8, end: 11 },
+    ]);
+    expect(contentMatchRanges(line("(x) [y]", 0, 3), input({ query: "(x)" }))).toEqual([
+      { start: 0, end: 3 },
+    ]);
+    expect(contentMatchRanges(line("x/y-z x/y-z", 0, 5), input({ query: "x/y-z" }))).toHaveLength(
+      2,
+    );
+  });
+
+  it("keeps only the reported range for a regular expression", () => {
+    const found = line("foo1 foo2 foo3", 5, 9);
+    expect(contentMatchRanges(found, input({ query: "foo\\d", regex: true }))).toEqual([
+      { start: 5, end: 9 },
+    ]);
+  });
+
+  it("keeps the reported range when an overlapping occurrence starts earlier", () => {
+    expect(contentMatchRanges(line("aaa", 1, 3), input({ query: "aa" }))).toEqual([
+      { start: 1, end: 3 },
+    ]);
+  });
+
+  it("reports UTF-16 offsets past astral characters", () => {
+    expect(contentMatchRanges(line("🚀 go 🚀 go", 3, 5), input({ query: "go" }))).toEqual([
+      { start: 3, end: 5 },
+      { start: 9, end: 11 },
+    ]);
+  });
+
+  it("returns nothing for an empty reported range", () => {
+    expect(contentMatchRanges(line("x", 0, 0), input({ query: "", regex: true }))).toEqual([]);
   });
 });

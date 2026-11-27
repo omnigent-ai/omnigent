@@ -458,7 +458,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="run_command",
         shell_tool_prompt=_SHELL_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
         workspace_file_mentions=True,
     ),
     "goose-native": _C(

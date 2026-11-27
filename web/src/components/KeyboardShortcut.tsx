@@ -44,8 +44,9 @@ export const ADDRESS_BAR_KEYS = [MOD_KEY, "L"] as const;
 export const REOPEN_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "T"] as const;
 export const PREVIOUS_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "["] as const;
 export const NEXT_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "]"] as const;
-export const BACK_KEYS = shortcutKeys("history.back");
-export const FORWARD_KEYS = shortcutKeys("history.forward");
+// The same keys whether the page or the desktop Go menu takes them.
+export const BACK_KEYS = shortcutKeys("history.back", { goMenu: false });
+export const FORWARD_KEYS = shortcutKeys("history.forward", { goMenu: false });
 export const COMMAND_PALETTE_KEYS = shortcutKeys("palette.commands");
 // The browser chords; the desktop app's are below.
 export const SIDEBAR_TOGGLE_KEYS = shortcutKeys("sidebar.left", { native: false });

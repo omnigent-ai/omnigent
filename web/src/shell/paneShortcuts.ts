@@ -1,9 +1,8 @@
 // The panes view's own keys: split, move between, resize, equalize and maximize panes. They
 // extend the app's registry without joining it, so they bind only where a panes view is mounted.
 
-import { type Chord, chordKeys, chordMatches } from "@/lib/shortcuts/chord";
+import { type Chord, chordAriaShortcut, chordKeys, chordMatches } from "@/lib/shortcuts/chord";
 import { currentShortcutEnvironment, type ShortcutEnvironment } from "@/lib/shortcuts/registry";
-import { chordAriaShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 
 import { type PaneCommandId, paneCommandLabel } from "./paneCommandTable";
 

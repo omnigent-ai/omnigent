@@ -70,6 +70,8 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sidebar_saved_views": False,
         "floating_panes": False,
         "shared_session_updates_socket": False,
+        "warm_switch_keep_mounted_ui": False,
+        "pull_requests_v2": False,
     }
 
 
@@ -240,6 +242,18 @@ def test_workspace_sidebar_v2_is_an_opt_in_frontend_feature() -> None:
     assert flags.frontend_dict()["workspace_sidebar_v2"] is True
 
 
+def test_pull_requests_v2_is_opt_in_and_does_not_follow_workspace_sidebar_v2() -> None:
+    # The new sidebar rolls out on its own; the new pull request page waits for its own flag.
+    assert resolve_feature_flags({}).frontend_dict()["pull_requests_v2"] is False
+    sidebar_only = resolve_feature_flags({FEATURES_ENV_VAR: "workspace_sidebar_v2"})
+    assert sidebar_only.frontend_dict()["pull_requests_v2"] is False
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "workspace_sidebar_v2,pull_requests_v2"})
+
+    assert flags.enabled(Feature.PULL_REQUESTS_V2)
+    assert flags.frontend_dict()["pull_requests_v2"] is True
+
+
 def test_shared_session_updates_socket_is_an_opt_in_frontend_feature() -> None:
     assert not resolve_feature_flags({}).enabled(Feature.SHARED_SESSION_UPDATES_SOCKET)
 
@@ -256,6 +270,15 @@ def test_sidebar_saved_views_is_an_opt_in_frontend_feature() -> None:
 
     assert flags.enabled(Feature.SIDEBAR_SAVED_VIEWS)
     assert flags.frontend_dict()["sidebar_saved_views"] is True
+
+
+def test_warm_switch_keep_mounted_ui_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.WARM_SWITCH_KEEP_MOUNTED_UI)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "warm_switch_keep_mounted_ui"})
+
+    assert flags.enabled(Feature.WARM_SWITCH_KEEP_MOUNTED_UI)
+    assert flags.frontend_dict()["warm_switch_keep_mounted_ui"] is True
 
 
 @pytest.mark.parametrize(

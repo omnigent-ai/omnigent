@@ -31,7 +31,10 @@ retain configuration, fault injection and behavioral assertions.
 | Native-wrapper session | `create_native_session` in [native_session.py](native_session.py) | [Native workspace](../e2e_ui/messages/test_native_codex_workspace_cwd.py) |
 | Local Codex marketplace/plugin install | `install_codex_plugin` in [codex_plugins.py](codex_plugins.py), with caller-owned home/workspace and names | [Plugin catalog](../harnesses/codex_native/test_skill_discovery.py), [both composers](../e2e_ui/chat/test_codex_plugin_skills.py) |
 | Provider resolution without the developer's config, overlay or ambient credentials | `isolate_provider_resolution` in [providers.py](providers.py) | [Host model options](../host/test_connect.py) |
+| Whether the mock LLM server answers `/stats` yet, for a readiness loop | `mock_llm_answers` in [mock_llm.py](mock_llm.py) | [Process e2e fixture](../e2e/conftest.py), [browser e2e fixture](../e2e_ui/conftest.py) |
 | Tool names from captured mock-provider requests | `advertised_tool_names` in [mock_llm.py](mock_llm.py) | [MCP enablement](../e2e/test_mcp_disabled_servers.py), [sidecar allow-list](../e2e_ui/chat/test_sidecar_mcp_allowlist.py) |
+| Launch activation, strict MCP user settings and Claude/Codex config layers for executor hooks | `launch_activation`, `write_mcp_inheritance`, `isolate_codex_system_layers`, `isolate_claude_settings` in [mcp_disabled_servers.py](mcp_disabled_servers.py) | [launch planning](../test_mcp_disabled_servers.py), [Codex launch](../inner/test_codex_executor.py) |
+| A tool call's result text from captured mock-provider requests | `captured_tool_result` in [mock_llm.py](mock_llm.py) | [Nested-agent permission mode](../e2e/test_nested_agent_permission_mode_e2e.py) |
 | Hermetic stdio ACP agent process | `FAKE_ACP_AGENT_SCRIPT`, `FAKE_ACP_AGENT_REPLY` in [acp_agent.py](acp_agent.py) | [Files tab survives an ACP reply](../e2e_ui/files/test_files_tab_survives_acp_reply.py) |
 | Codex home with rollouts, `history_base` lineage and thread store | `CodexRollout`, `write_codex_thread_store` in [codex_rollout.py](codex_rollout.py) | [Codex import history](../e2e/test_host_import_codex_history_e2e.py) |
 

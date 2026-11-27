@@ -2,7 +2,7 @@
 // It binds only its own opener (⌘/Ctrl + /) and the menu event that opens it.
 // Mount it once near the app shell.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { Kbd } from "@/components/KeyboardShortcut";
 import {
@@ -24,7 +24,11 @@ import {
   supportsDesktopCommands,
 } from "@/lib/nativeBridge";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
-import { type ShortcutPageGroup, shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
+import {
+  type ShortcutPageContext,
+  type ShortcutPageGroup,
+  shortcutPageGroups,
+} from "@/lib/shortcuts/shortcutPage";
 import { ShortcutSettingsRow } from "@/pages/settings/search/ShortcutSettingsRow";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -37,19 +41,14 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-/**
- * The shortcut reference shared by the dialog and Settings page. The dialog
- * keeps the compact inline list; Settings uses section headings with bordered
- * list cards to match the rest of its content.
- */
-/** The Keyboard shortcuts page's groups here, computed at render so tests can vary the runtime. */
-export function useShortcutPageGroups(): ShortcutPageGroup[] {
+/** What the Keyboard shortcuts page lists here, computed at render so tests can vary the runtime. */
+export function useShortcutPageContext(): ShortcutPageContext {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const preventsKeyboardSubmit = isMobileViewport;
   const serverInfo = useServerInfo();
   const alwaysSteer = useAlwaysSteer();
-  return shortcutPageGroups({
+  return {
     native: isNativeShell(),
     electron: isElectronShell(),
     browser: supportsBrowser(),
@@ -61,15 +60,34 @@ export function useShortcutPageGroups(): ShortcutPageGroup[] {
     splitTerminal: !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
     desktopCommands: supportsDesktopCommands(),
     siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
-  });
+  };
 }
 
+/** The Keyboard shortcuts page's groups here, rebuilt only when a field of the context changes. */
+export function useShortcutPageGroups(): ShortcutPageGroup[] {
+  // A string, since every render makes a new context object.
+  const contextKey = JSON.stringify(useShortcutPageContext());
+  return useMemo(
+    () => shortcutPageGroups(JSON.parse(contextKey) as ShortcutPageContext),
+    [contextKey],
+  );
+}
+
+/**
+ * The shortcut reference shared by the dialog and Settings page. The dialog
+ * keeps the compact inline list; Settings uses section headings with bordered
+ * list cards to match the rest of its content.
+ */
 export function KeyboardShortcutsList({
   variant = "compact",
+  groups: shownGroups,
 }: {
   variant?: "compact" | "settings";
+  /** The groups to list, such as the Settings page's filtered ones; every group otherwise. */
+  groups?: readonly ShortcutPageGroup[];
 }) {
-  const groups = useShortcutPageGroups();
+  const context = useShortcutPageContext();
+  const groups = shownGroups ?? shortcutPageGroups(context);
   const settings = variant === "settings";
   return (
     <div className={settings ? "flex flex-col gap-10" : undefined}>
@@ -110,7 +128,7 @@ export function KeyboardShortcutsList({
                   </span>
                 </>
               );
-              // Settings lists each row so search can reveal it; the shortcut dialog doesn't.
+              // Settings lists each row so search can reveal it; the dialog doesn't.
               return settings ? (
                 <ShortcutSettingsRow
                   key={item.label}

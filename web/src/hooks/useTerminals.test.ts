@@ -705,6 +705,35 @@ describe("useCreateTerminal launch", () => {
     expect(isTerminalLaunching(opened.id)).toBe(false);
   });
 
+  it("keeps the opened shell when the page goes away before its create returns", async () => {
+    runnerOnlineMock.mockReturnValue(true);
+    let fail: (error: Error) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((_resolve, reject) => {
+          fail = reject;
+        }),
+    );
+    const onOpen = vi.fn();
+    const onError = vi.fn();
+    const { hook, cached } = renderLaunch("conv_reloaded");
+
+    act(() => hook.result.current.launch("zsh", { onOpen, onError }));
+    const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // A reload aborts the create as the page unloads; the shell may well exist by now.
+    window.dispatchEvent(new Event("pagehide"));
+    try {
+      await act(async () => fail(new TypeError("Failed to fetch")));
+      await vi.waitFor(() => expect(isTerminalLaunching(opened.id)).toBe(false));
+      expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
+      expect(onError).not.toHaveBeenCalled();
+    } finally {
+      window.dispatchEvent(new Event("pageshow"));
+    }
+  });
+
   it.each([undefined, false])(
     "opens at once but holds the attach when runner liveness is %s",
     async (online) => {

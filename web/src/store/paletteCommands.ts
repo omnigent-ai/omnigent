@@ -1,5 +1,5 @@
 import type { Chord } from "@/lib/shortcuts/chord";
-import type { ShortcutId } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import type { ShortcutId } from "@/lib/shortcuts/registry";
 import { createContext, useContext, useEffect } from "react";
 import type { LucideIcon } from "lucide-react";
 import { create } from "zustand";

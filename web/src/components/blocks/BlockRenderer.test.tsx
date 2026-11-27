@@ -3265,6 +3265,11 @@ describe("BlockRenderer pull request references", () => {
       available: true,
       repo: { name_with_owner: "acme/app", host: "github.com" },
       workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+      // The session links both numbers, so only the surface decides whether one links.
+      prs: [
+        { url: "https://github.com/acme/app/pull/4242", host: "github.com", number: 4242 },
+        { url: "https://github.com/acme/app/pull/5551234", host: "github.com", number: 5551234 },
+      ],
     });
     // A description field renders as Markdown prose, the same renderer as assistant text.
     const output = JSON.stringify({

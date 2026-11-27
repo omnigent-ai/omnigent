@@ -2,8 +2,11 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  baseIntentSource,
   readWorkingCopyBaseIntent,
+  resetFolderBaseIntentsForTests,
   subscribeWorkingCopyBaseIntent,
+  useBaseIntent,
   useWorkingCopyBaseIntent,
   writeWorkingCopyBaseIntent,
 } from "./workingCopyBasePreference";
@@ -12,6 +15,7 @@ const STORAGE_KEY = "omnigent.changes.base";
 
 afterEach(() => {
   window.localStorage.clear();
+  resetFolderBaseIntentsForTests();
 });
 
 describe("working copy base preference", () => {
@@ -46,6 +50,38 @@ describe("working copy base preference", () => {
     act(() => {
       writeWorkingCopyBaseIntent("head");
     });
+    expect(result.current).toBe("head");
+  });
+});
+
+describe("a repository folder's base", () => {
+  const FOLDER = ".worktrees/feature";
+
+  it("follows the workspace's preference until a base is chosen in the folder", () => {
+    const folder = baseIntentSource(FOLDER, "host_1\n/repo");
+    writeWorkingCopyBaseIntent("branch-point");
+    expect(folder.read()).toBe("branch-point");
+    folder.write("head");
+    expect(folder.read()).toBe("head");
+    writeWorkingCopyBaseIntent("automatic");
+    expect(folder.read()).toBe("head");
+  });
+
+  it("changes neither the workspace's preference nor a same-named folder elsewhere", () => {
+    baseIntentSource(FOLDER, "host_1\n/repo").write("head");
+    expect(readWorkingCopyBaseIntent()).toBe("automatic");
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(baseIntentSource(FOLDER, "host_1\n/other").read()).toBe("automatic");
+    expect(baseIntentSource(FOLDER, "host_2\n/repo").read()).toBe("automatic");
+    expect(baseIntentSource("", "host_1\n/repo").read()).toBe("automatic");
+  });
+
+  it("keeps a folder's review current with its own choice and the workspace's", () => {
+    const { result } = renderHook(() => useBaseIntent(FOLDER, "host_1\n/repo"));
+    expect(result.current).toBe("automatic");
+    act(() => writeWorkingCopyBaseIntent("branch-point"));
+    expect(result.current).toBe("branch-point");
+    act(() => baseIntentSource(FOLDER, "host_1\n/repo").write("head"));
     expect(result.current).toBe("head");
   });
 });

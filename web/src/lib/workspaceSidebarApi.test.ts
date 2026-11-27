@@ -92,7 +92,11 @@ describe("DEFAULT_WORKSPACE_SIDEBAR_API", () => {
     ["readBaseFile", "readBaseFileViaWorkspaceApi", [baseFile, signal]],
     ["readLinkText", "readLinkTextViaWorkspaceApi", ["link", signal]],
     ["listRepositoryRefs", "listRepositoryRefsViaWorkspaceApi", [signal]],
-    ["listBranchCommits", "listBranchCommitsViaWorkspaceApi", ["main", signal]],
+    [
+      "listBranchCommits",
+      "listBranchCommitsViaWorkspaceApi",
+      [{ base: "main", head: "feature" }, signal],
+    ],
     ["resolveRepositoryContext", "resolveRepositoryContextViaWorkspaceApi", [signal]],
   ] as const;
 

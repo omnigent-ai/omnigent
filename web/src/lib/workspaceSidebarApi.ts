@@ -3,6 +3,7 @@
 
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type { ContentSearchResult } from "@/lib/contentSearch";
+import type { RevisionSpec } from "@/lib/customComparison";
 import {
   type FileSearchOptions,
   type FoundEntries,
@@ -238,6 +239,8 @@ export interface ResolveRepositoryContextResponse {
   remotes: RepositoryRemote[];
   unsupportedRemoteCount: number;
   truncatedRemotes: boolean;
+  /** The workspace below the repository's root, such as `packages/app/`; absent from older hosts. */
+  workspacePrefix?: string;
 }
 
 // ── The API ───────────────────────────────────────────────────────────────────
@@ -272,16 +275,22 @@ export interface WorkspaceSidebarApi {
     sessionId: string,
     comparison: ComparisonInit,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<WorkingCopyBase | null>;
   listWorkingCopyChanges: (
     sessionId: string,
     comparison: ComparisonInit,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListWorkingCopyChangesResponse | null>;
   readBaseFile: (
     sessionId: string,
     file: { commit: string; path: string; object: string },
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<FileContentResponse | null>;
   readLinkText: (
     sessionId: string,
@@ -291,11 +300,15 @@ export interface WorkspaceSidebarApi {
   listRepositoryRefs: (
     sessionId: string,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListRepositoryRefsResponse | null>;
   listBranchCommits: (
     sessionId: string,
-    baseRevision: string,
+    range: RevisionSpec,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListBranchCommitsResponse | null>;
   resolveRepositoryContext: (
     sessionId: string,

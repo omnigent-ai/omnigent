@@ -913,6 +913,29 @@ describe("prompt-first automation setup", () => {
     expect(screen.queryByRole("button", { name: "Done" })).not.toBeInTheDocument();
     expect(screen.getByTestId("create-scheduled-task-dialog")).toBeVisible();
   });
+
+  it("closes the time picker and the Schedule popover together on a click outside both", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
+    openAutomationSection("Schedule");
+    const scheduleTrigger = screen.getByTestId("task-schedule-trigger");
+    expect(scheduleTrigger).toHaveAttribute("aria-expanded", "true");
+    await userEvent.click(screen.getByLabelText("Time", { exact: true }));
+    const timePicker = screen.getByTestId("schedule-time-picker");
+    const hours = within(timePicker).getByRole("listbox", { name: "Hours" });
+    // Picking an option lands inside the nested popper: the parent stays open.
+    await userEvent.click(within(hours).getByRole("option", { name: "17" }));
+    expect(screen.getByLabelText("Time", { exact: true })).toHaveValue("05:00 PM");
+    expect(screen.getByTestId("schedule-time-picker")).toBeVisible();
+    expect(scheduleTrigger).toHaveAttribute("aria-expanded", "true");
+    // One click on the form, outside every popper, closes both layers at once.
+    const prompt = screen.getByTestId("task-prompt-input");
+    await userEvent.click(prompt);
+    expect(screen.queryByTestId("schedule-time-picker")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("schedule-fields")).not.toBeInTheDocument();
+    expect(scheduleTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(prompt).toHaveFocus();
+    expect(screen.getByTestId("create-scheduled-task-dialog")).toBeVisible();
+  });
 });
 
 describe("agent picker readiness (needs-setup badges)", () => {
@@ -2117,12 +2140,13 @@ describe("CreateScheduledTaskDialog submit", () => {
   );
 
   it.each([
-    { sandbox: false, subhour: true, minimum: 10 },
-    { sandbox: true, subhour: true, minimum: 60 },
-    { sandbox: false, subhour: false, minimum: 60 },
+    { sandbox: false, subhour: true, newSandbox: false, minimum: 10 },
+    { sandbox: true, subhour: true, newSandbox: false, minimum: 60 },
+    { sandbox: true, subhour: true, newSandbox: true, minimum: 10 },
+    { sandbox: false, subhour: false, newSandbox: false, minimum: 60 },
   ])(
-    "offers minutes directly through Interval (sandbox=$sandbox, subhour=$subhour)",
-    async ({ sandbox, subhour, minimum }) => {
+    "offers minutes directly through Interval (sandbox=$sandbox, subhour=$subhour, newSandbox=$newSandbox)",
+    async ({ sandbox, subhour, newSandbox, minimum }) => {
       render(
         <CapabilitiesProvider
           info={{
@@ -2130,6 +2154,7 @@ describe("CreateScheduledTaskDialog submit", () => {
             features: { automations_v2: true },
             managed_sandboxes_enabled: sandbox,
             scheduled_task_subhour: subhour,
+            scheduled_task_subhour_new_sandbox: newSandbox,
           }}
         >
           <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
@@ -7377,6 +7402,47 @@ describe("CreateScheduledTaskDialog workflow", () => {
       name: "Triage flaky tests",
       prompt: run(""),
     });
+  });
+
+  it("saves a workflow's ten-minute schedule in a new sandbox each run", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          prompt: run(""),
+          rrule: "FREQ=MINUTELY;INTERVAL=10",
+          executionTarget: "managed_sandbox",
+        })}
+      />,
+      {
+        info: {
+          ...SESSION_MODE_INFO,
+          scheduled_task_subhour: true,
+          scheduled_task_subhour_new_sandbox: true,
+          managed_sandboxes_enabled: true,
+        },
+      },
+    );
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "New session each run",
+    );
+    openAutomationSection("Schedule");
+    expect(screen.getByLabelText("Repeat every")).toHaveValue(10);
+    expect(screen.queryByTestId("schedule-error")).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("Automation title"), {
+      target: { value: "Frequent triage" },
+    });
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).toMatchObject({ name: "Frequent triage", rrule: "FREQ=MINUTELY;INTERVAL=10" });
+    // Unchanged fields stay out of the PATCH, so the run target stays the sandbox.
+    expect(input).not.toHaveProperty("executionTarget");
+    expect(input).not.toHaveProperty("sessionMode");
   });
 
   it("keeps instructions an automation already saved with its workflow editable", async () => {

@@ -62,6 +62,11 @@ import {
 } from "@/lib/workspaceTabPreferences";
 import { CloseShellDialog } from "@/shell/CloseShellDialog";
 import {
+  joinShellTabsCloses,
+  type ShellTabsClose,
+  useShellCloseRequest,
+} from "@/shell/shellCloseCheck";
+import {
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
   useTabsSidebar,
@@ -255,13 +260,6 @@ export function GridSessionPane({
         .map(terminalTabKey),
     [terminals, killingTerminalIds, deletingTerminalId],
   );
-  const [pendingClose, setPendingClose] = useState<{
-    keys: string[];
-    callbacks?: ShellCloseCallbacks;
-  } | null>(null);
-  const terminalsToClose = terminals.filter((terminal) =>
-    pendingClose?.keys.includes(terminalTabKey(terminal)),
-  );
   const [workspace, setWorkspace] = useState<SessionWorkspaceState>(() => {
     const saved = readSessionWorkspaceState(sessionId);
     return {
@@ -276,6 +274,41 @@ export function GridSessionPane({
   const updateWorkspace = useCallback((patch: SessionWorkspaceState) => {
     setWorkspace((previous) => ({ ...previous, ...patch }));
   }, []);
+  const closeShell = useShellCloseRequest<ShellTabsClose>(sessionId, "grid_close", (closes) => {
+    const { keys, callbacks } = joinShellTabsCloses(closes);
+    callbacks.onConfirmed?.();
+    for (const terminal of terminals.filter((each) => keys.includes(terminalTabKey(each)))) {
+      const key = terminalTabKey(terminal);
+      setKillingTerminalIds((ids) => [...ids, terminal.id]);
+      // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
+      deleteTerminal
+        .mutateAsync(terminal.id)
+        .then(
+          // Read the selection when the delete lands, so a shell selected meanwhile stays selected.
+          () =>
+            setWorkspace((previous) =>
+              previous.selectedTerminalKey === key
+                ? { ...previous, selectedTerminalKey: null }
+                : previous,
+            ),
+          () => callbacks.onFailed?.(key),
+        )
+        .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== terminal.id)));
+    }
+  });
+  const pendingClose = closeShell.pending ? joinShellTabsCloses(closeShell.pending.items) : null;
+  const terminalsToClose = terminals.filter((terminal) =>
+    pendingClose?.keys.includes(terminalTabKey(terminal)),
+  );
+  // Closes idle shells at once and asks about the rest; a bulk close asks once for all of them.
+  // An older server can't tell, so there every close asks.
+  const requestCloseTerminals = (keys: string[], callbacks?: ShellCloseCallbacks) => {
+    if (keys.length === 0) return;
+    const ids = terminals
+      .filter((terminal) => keys.includes(terminalTabKey(terminal)))
+      .map((terminal) => terminal.id);
+    closeShell.request({ keys, callbacks }, ids.length === keys.length ? ids : null);
+  };
   const [sort, setSort] = useState<ChangedSort>(DEFAULT_FILES_PANEL_PREFERENCES.sort);
   const [showHidden, setShowHidden] = useState(false);
   const [position, setPosition] = useState<FilePosition>();
@@ -578,28 +611,9 @@ export function GridSessionPane({
             open={pendingClose !== null}
             shellCount={pendingClose?.keys.length}
             shellLabel={terminalsToClose.length === 1 ? terminalsToClose[0].name : null}
-            onCancel={() => setPendingClose(null)}
-            onConfirm={() => {
-              pendingClose?.callbacks?.onConfirmed?.();
-              for (const terminal of terminalsToClose) {
-                const key = terminalTabKey(terminal);
-                setKillingTerminalIds((ids) => [...ids, terminal.id]);
-                // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
-                deleteTerminal
-                  .mutateAsync(terminal.id)
-                  .then(
-                    () => {
-                      if (workspace.selectedTerminalKey === key)
-                        updateWorkspace({ selectedTerminalKey: null });
-                    },
-                    () => pendingClose?.callbacks?.onFailed?.(key),
-                  )
-                  .finally(() =>
-                    setKillingTerminalIds((ids) => ids.filter((id) => id !== terminal.id)),
-                  );
-              }
-              setPendingClose(null);
-            }}
+            busy={closeShell.pending?.busy}
+            onCancel={closeShell.cancel}
+            onConfirm={closeShell.confirm}
           />
         </section>
         {/* Keep inactive views mounted so switching cells preserves unsaved edits. */}
@@ -699,10 +713,8 @@ export function GridSessionPane({
                       : null
                   }
                   closingTerminalKeys={closingTerminalKeys}
-                  onCloseTerminal={(key, callbacks) => setPendingClose({ keys: [key], callbacks })}
-                  onCloseTerminals={(keys, callbacks) => {
-                    if (keys.length > 0) setPendingClose({ keys, callbacks });
-                  }}
+                  onCloseTerminal={(key, callbacks) => requestCloseTerminals([key], callbacks)}
+                  onCloseTerminals={requestCloseTerminals}
                   maximized={selected && workspacePanel.maximized}
                   permissionLevel={permissionLevel}
                   filesPanelSort={sort}

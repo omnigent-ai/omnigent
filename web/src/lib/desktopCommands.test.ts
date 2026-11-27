@@ -8,6 +8,7 @@ import {
   useAvailableDesktopCommands,
   useDesktopCommand,
 } from "./desktopCommands";
+import { PICK_LIST_INPUT_ATTRIBUTE } from "./listNavigationKeys";
 import type { DesktopCommandState } from "./nativeBridge";
 
 type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
@@ -38,6 +39,14 @@ function send(command: string, browserViewId: string | null = null): void {
 /** Let the queued state report run. */
 async function flushReports(): Promise<void> {
   await Promise.resolve();
+}
+
+/** The last reported pick-list focus, once a focus event or the list's attribute has reported. */
+async function settledPickListFocused(): Promise<boolean | undefined> {
+  // The event or attribute queues a report on one microtask, which runs on the next.
+  await flushReports();
+  await flushReports();
+  return setDesktopCommandState.mock.lastCall?.[0].pickListFocused;
 }
 
 beforeEach(() => {
@@ -166,6 +175,7 @@ describe("useDesktopCommand", () => {
       commands: ["archive-session", "close", "new-browser-tab", "toggle-pin-session"],
       sessionPinned: false,
       sessionArchived: false,
+      pickListFocused: false,
     });
 
     rerender({ pinned: true, browser: false });
@@ -174,6 +184,7 @@ describe("useDesktopCommand", () => {
       commands: ["archive-session", "close", "toggle-pin-session"],
       sessionPinned: true,
       sessionArchived: false,
+      pickListFocused: false,
     });
 
     unmount();
@@ -182,8 +193,44 @@ describe("useDesktopCommand", () => {
       commands: [],
       sessionPinned: false,
       sessionArchived: false,
+      pickListFocused: false,
     });
     expect(setDesktopCommandState).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports while an open pick list has the keyboard, so the menu leaves it Ctrl-N", async () => {
+    renderHook(() => useDesktopCommand("close", () => {}));
+    const field = document.createElement("input");
+    const other = document.createElement("input");
+    document.body.append(field, other);
+    expect(await settledPickListFocused()).toBe(false);
+
+    field.focus();
+    field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
+    expect(await settledPickListFocused()).toBe(true);
+    // The list closing drops its attribute, with the field still focused.
+    field.removeAttribute(PICK_LIST_INPUT_ATTRIBUTE);
+    expect(await settledPickListFocused()).toBe(false);
+    field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
+    expect(await settledPickListFocused()).toBe(true);
+    other.focus();
+    expect(await settledPickListFocused()).toBe(false);
+  });
+
+  it("corrects a report left by a removed pick list on the next Ctrl-N or Ctrl-P", async () => {
+    renderHook(() => useDesktopCommand("close", () => {}));
+    const field = document.createElement("input");
+    field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
+    document.body.append(field);
+    field.focus();
+    expect(await settledPickListFocused()).toBe(true);
+    // Removing the focused field moves focus to the body without a focus event.
+    field.remove();
+    await settledPickListFocused();
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "n", code: "KeyN", ctrlKey: true, bubbles: true }),
+    );
+    expect(await settledPickListFocused()).toBe(false);
   });
 
   it("coalesces a burst of registrations into one report", async () => {

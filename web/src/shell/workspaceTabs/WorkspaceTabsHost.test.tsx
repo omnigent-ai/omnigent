@@ -3,7 +3,10 @@ import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type * as SharedDiffWorkersModule from "@/components/diff-review/sharedDiffWorkers";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as HotkeysModule from "@/lib/hotkeys";
+import type * as IdentityModule from "@/lib/identity";
 import type { TerminalInfo } from "@/lib/terminals";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
@@ -15,6 +18,12 @@ const captured = vi.hoisted(() => ({
   panel: null as ComponentProps<typeof WorkspaceTabsPanel> | null,
   deleteTerminal: vi.fn(async (_id: string) => undefined),
   deleteOptions: undefined as { reportsFailure?: boolean } | undefined,
+  warmDiffWorkers: vi.fn(),
+}));
+// Who asks for the diff highlighting workers to start ahead of a review.
+vi.mock("@/components/diff-review/sharedDiffWorkers", async (importOriginal) => ({
+  ...(await importOriginal<typeof SharedDiffWorkersModule>()),
+  useWarmSharedDiffWorkers: () => captured.warmDiffWorkers(),
 }));
 vi.mock("./WorkspaceTabsPanel", () => ({
   WorkspaceTabsPanel: (props: ComponentProps<typeof WorkspaceTabsPanel>) => {
@@ -22,6 +31,27 @@ vi.mock("./WorkspaceTabsPanel", () => ({
     return <div data-testid="tabs-panel" />;
   },
 }));
+// The Mac app's tab chords are the ones a page can hand over.
+vi.mock("@/lib/hotkeys", async (importOriginal) => ({
+  ...(await importOriginal<typeof HotkeysModule>()),
+  isMacPlatform: () => true,
+}));
+// The runner's answer about a shell being closed; null fails the request, so the close asks.
+const shellState = vi.hoisted(() => ({ body: null as Record<string, unknown> | null }));
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return {
+    ...actual,
+    authenticatedFetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (!String(input).endsWith("/shell")) return actual.authenticatedFetch(input, init);
+      if (shellState.body === null) throw new TypeError("offline");
+      return new Response(JSON.stringify(shellState.body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  };
+});
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useDeleteTerminal: (_conversationId: string, options?: { reportsFailure?: boolean }) => {
@@ -68,16 +98,24 @@ function host(overrides: Partial<WorkspaceTabsHostProps> = {}) {
 }
 
 beforeEach(() => {
+  shellState.body = null;
   captured.panel = null;
   captured.deleteTerminal.mockClear();
 });
 afterEach(() => {
   cleanup();
+  delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
   resetWorkspaceTabsSessionsForTests();
   window.localStorage.clear();
 });
 
 describe("WorkspaceTabsHost", () => {
+  it("starts the diff highlighting workers with the sidebar, so Diffs finds them ready", () => {
+    captured.warmDiffWorkers.mockClear();
+    host();
+    expect(captured.warmDiffWorkers).toHaveBeenCalled();
+  });
+
   it("makes a collapsing rail inert a frame after the toggle, and an expanding one at once", async () => {
     const { rerender } = host({ open: true, inert: false });
     expect(captured.panel?.inert).toBe(false);
@@ -125,6 +163,16 @@ describe("WorkspaceTabsHost", () => {
     expect(captured.deleteTerminal).toHaveBeenCalledWith("t1");
   });
 
+  it("names the job a busy shell runs in the Close shell dialog", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    shellState.body = { state: "busy", foreground: "vim", background_jobs: 0 };
+    host();
+    act(() => {
+      void captured.panel!.confirmCloseShell("terminal:t1");
+    });
+    expect(await screen.findByRole("dialog")).toHaveTextContent("vim is running in zsh · s1");
+  });
+
   it("leaves a shell that won't end for the sidebar to report", async () => {
     host();
     captured.deleteTerminal.mockRejectedValueOnce(new Error("runner offline"));
@@ -168,6 +216,52 @@ describe("WorkspaceTabsHost", () => {
     expect(
       registeredPaletteCommands().some((row) => row.id === "workspace:conv_host:history:back"),
     ).toBe(true);
+  });
+
+  describe("a focused browser page's app chords", () => {
+    function desktopBridge() {
+      const browserSetForwardedChords = vi.fn().mockResolvedValue({ ok: true });
+      (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = {
+        kind: "electron",
+        browserSetForwardedChords,
+        onBrowserForwardedInput: () => () => {},
+      };
+      const listedCodes = () =>
+        ((browserSetForwardedChords.mock.lastCall?.[0] ?? []) as { code?: string }[]).flatMap(
+          (chord) => chord.code ?? [],
+        );
+      return { browserSetForwardedChords, listedCodes };
+    }
+
+    it("are asked for by the sidebar that binds history, Reopen once a tab can reopen", async () => {
+      const bridge = desktopBridge();
+      const { store } = workspaceTabsSession("conv_host");
+      await act(() => store.open({ place: { kind: "files" } }, { opener: "user" }));
+      await act(() =>
+        store.open({ place: { kind: "changes" } }, { opener: "user", disposition: "new" }),
+      );
+      host();
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyF"]);
+
+      await act(() => store.close(store.selectedTab()!.id, {}));
+      await vi.waitFor(() =>
+        expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyT", "KeyF"]),
+      );
+    });
+
+    it("leave full screen's chord with the page where the sidebar can't fill the window", () => {
+      const bridge = desktopBridge();
+      const { rerender } = host({ placement: "drawer" });
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
+      rerender({ placement: "rail", contained: true });
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
+    });
+
+    it("are left with the page by a cell that doesn't bind history", () => {
+      const bridge = desktopBridge();
+      host({ bindsHistory: false });
+      expect(bridge.browserSetForwardedChords).not.toHaveBeenCalled();
+    });
   });
 
   it("leaves Back and Forward to the cell that binds them", () => {

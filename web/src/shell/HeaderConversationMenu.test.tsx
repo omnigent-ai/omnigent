@@ -20,7 +20,9 @@ import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
+import { resetArchiveNavigationForTests } from "./sessionCommands/archiveNavigation";
 
 const mocks = vi.hoisted(() => ({
   isMobile: false,
@@ -511,6 +513,40 @@ describe("HeaderConversationMenu", () => {
       expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
       runCommand("Delete session");
       expect(screen.getByRole("dialog", { name: "Delete session?" })).toBeVisible();
+    });
+
+    describe("Archive session", () => {
+      afterEach(() => {
+        resetArchiveNavigationForTests();
+        useRecentSessionSwitchStore.setState({ history: [], readLiveSessionIds: null });
+      });
+
+      it("opens the session visited before it once the recent sessions are live", () => {
+        // As quick_pick_palette's recent-session host records them.
+        useRecentSessionSwitchStore.setState({
+          history: ["conv-1", "conv-0"],
+          readLiveSessionIds: () => new Set(["conv-0", "conv-1"]),
+          sessionsKnown: true,
+          sessionsFailed: false,
+        });
+        renderMenu();
+        runCommand("Archive session");
+        fireEvent.click(screen.getByRole("button", { name: "No, archive only" }));
+        expect(mocks.archive).toHaveBeenCalledWith(
+          expect.objectContaining({ id: "conv-1", archived: true }),
+        );
+        expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-0");
+      });
+
+      it("goes home without them, as before", () => {
+        renderMenu();
+        runCommand("Archive session");
+        fireEvent.click(screen.getByRole("button", { name: "No, archive only" }));
+        expect(mocks.archive).toHaveBeenCalledWith(
+          expect.objectContaining({ id: "conv-1", archived: true }),
+        );
+        expect(screen.getByTestId("location").textContent).toBe("/");
+      });
     });
 
     it("drops a row built for the previous session once another is shown", () => {

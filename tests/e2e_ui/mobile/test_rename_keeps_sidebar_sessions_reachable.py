@@ -38,10 +38,12 @@ from __future__ import annotations
 import os
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, BrowserContext, CDPSession, Locator, Page, expect
 
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.sessions._archived_sessions import delete_sessions
 
 # iPhone-13-class portrait profile with touch.
 _VIEWPORT = {"width": 390, "height": 844}
@@ -120,16 +122,21 @@ def _seed_filler_sessions(
     """Create ``count`` titled sessions so the sidebar list overflows."""
     ids: list[str] = []
     bundle = _build_hello_world_bundle()
-    for i in range(count):
-        resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
-        resp.raise_for_status()
-        sid = resp.json()["session_id"]
-        httpx.patch(
-            f"{base_url}/v1/sessions/{sid}",
-            json={"title": f"{title_prefix} {i:02d}"},
-            timeout=10.0,
-        ).raise_for_status()
-        ids.append(sid)
+    try:
+        for i in range(count):
+            resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
+            resp.raise_for_status()
+            sid = resp.json()["session_id"]
+            ids.append(sid)
+            httpx.patch(
+                f"{base_url}/v1/sessions/{sid}",
+                json={"title": f"{title_prefix} {i:02d}"},
+                timeout=10.0,
+            ).raise_for_status()
+    except httpx.HTTPError:
+        # The caller never gets the ids, so it can't clean a partial seed up itself.
+        delete_sessions(base_url, ids)
+        raise
     return ids
 
 
@@ -250,6 +257,7 @@ def _start_rename(cdp: CDPSession, page: Page, box: dict) -> Locator:
 def test_rename_keeps_sidebar_sessions_reachable(
     browser: Browser,
     seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
 ) -> None:
     """While a rename edit is active, every sidebar session must stay reachable.
 
@@ -263,9 +271,12 @@ def test_rename_keeps_sidebar_sessions_reachable(
     :param browser: Playwright browser to open a touch phone context on.
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
         runner-bound session.
+    :param request: pytest request, to delete the filler sessions afterwards.
     """
     base_url, session_id = seeded_session
-    _seed_filler_sessions(base_url, _FILLER_COUNT)
+    filler_ids = _seed_filler_sessions(base_url, _FILLER_COUNT)
+    # The shard shares one server; leftover rows break later sidebar checks.
+    request.addfinalizer(lambda: delete_sessions(base_url, filler_ids))
 
     context = _new_phone_context(browser)
     try:
@@ -411,15 +422,18 @@ def _edit_geometry(page: Page) -> dict:
 def test_rename_scrolls_edit_row_into_view_above_keyboard(
     browser: Browser,
     seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
 ) -> None:
     """The focused rename field must be visible once the keyboard is up.
 
     :param browser: Playwright browser to open a touch phone context on.
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
         runner-bound session.
+    :param request: pytest request, to delete the filler sessions afterwards.
     """
     base_url, session_id = seeded_session
-    _seed_filler_sessions(base_url, _FILLER_COUNT, title_prefix=_KEYBOARD_ROW_PREFIX)
+    filler_ids = _seed_filler_sessions(base_url, _FILLER_COUNT, title_prefix=_KEYBOARD_ROW_PREFIX)
+    request.addfinalizer(lambda: delete_sessions(base_url, filler_ids))
 
     context = _new_phone_context(browser)
     try:

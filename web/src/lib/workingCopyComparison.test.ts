@@ -1,3 +1,4 @@
+import { Code, ConnectError } from "@connectrpc/connect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -32,6 +33,10 @@ import {
   fetchBranchPointListing,
   fetchComparisonFileText,
   fetchRepositoryRefs,
+  comparisonProblemMessage,
+  FOLDER_NOT_SERVED,
+  hostListing,
+  FOLDER_REFUSED,
   RECONNECTING,
   forgetListedComparisons,
   resetListedComparisonsForTests,
@@ -212,6 +217,51 @@ describe("effectiveComparison", () => {
       base: "branch-point",
       comparison,
       status: { kind: "reconnecting", message: RECONNECTING },
+    });
+  });
+});
+
+describe("effectiveComparison in a repository folder", () => {
+  const LAST_COMMIT = { base: "HEAD", head: "" };
+  const lastCommitListing: BranchPointComparison = {
+    ...comparison,
+    id: "cmp_head",
+    revisions: { spec: LAST_COMMIT, baseDisplay: "HEAD", headDisplay: "", headIsWorkingCopy: true },
+  };
+  const atFolder = (overrides: Partial<EffectiveComparisonInput>) =>
+    input({ lastCommitSpec: LAST_COMMIT, revisionSupport: AVAILABLE, ...overrides });
+
+  it("shows the last commit from the host's listing, never the runner's", () => {
+    expect(effectiveComparison(atFolder({ intent: "head" }))).toEqual({
+      base: "pending",
+      message: COMPARING,
+    });
+    const shown = effectiveComparison(atFolder({ intent: "head", established: lastCommitListing }));
+    expect(shown).toMatchObject({ base: "head", listing: { id: "cmp_head" } });
+    expect(hostListing(shown)?.id).toBe("cmp_head");
+    // The workspace's last commit is the runner's, with no listing of the host's.
+    expect(hostListing(effectiveComparison(input({ intent: "head" })))).toBeNull();
+  });
+
+  it("never falls back from the branch point to uncommitted changes", () => {
+    expect(effectiveComparison(atFolder({ connectTimedOut: true }))).toEqual({
+      base: "pending",
+      message: COMPARING,
+    });
+    expect(
+      effectiveComparison(atFolder({ problem: { reason: "no_default_branch", transient: false } })),
+    ).toMatchObject({ base: "unavailable", retry: false });
+  });
+
+  it("says why a folder can't be listed in place of its last commit", () => {
+    expect(
+      effectiveComparison(
+        atFolder({ intent: "head", problem: { reason: FOLDER_NOT_SERVED, transient: false } }),
+      ),
+    ).toEqual({
+      base: "unavailable",
+      message: "Update Omnigent on this session's machine to see Diffs for this folder.",
+      retry: false,
     });
   });
 });
@@ -561,6 +611,7 @@ describe("comparison fetchers", () => {
       SESSION,
       { kind: ComparisonKind.BRANCH_POINT },
       undefined,
+      "",
     );
     asked.mockResolvedValue(listing([], { kind: ComparisonKind.REVISIONS }));
     const spec = { base: "v1 & more", head: "feature" };
@@ -569,6 +620,7 @@ describe("comparison fetchers", () => {
       SESSION,
       { kind: ComparisonKind.REVISIONS, baseRevision: "v1 & more", headRevision: "feature" },
       undefined,
+      "",
     );
   });
 
@@ -620,8 +672,73 @@ describe("comparison fetchers", () => {
       SESSION,
       { commit: BASE.base, path: "src/a b.ts", object: "base-src/a b.ts" },
       undefined,
+      "",
     );
     expect(readFile).toHaveBeenCalledWith(SESSION, "src/a b.ts", undefined);
+  });
+
+  it("lists and reads a worktree's files in its folder, apart from the workspace's", async () => {
+    const asked = vi.fn(async () => listing([changedFile("a.ts")]));
+    const readBaseFile = vi.fn(async () => text("old\n"));
+    const readFile = vi.fn(async () => text("new\n"));
+    serving({ listWorkingCopyChanges: asked, readBaseFile, readFile });
+    const folder = await fetchBranchPointListing(SESSION, { repository: ".worktrees/feature" });
+    const workspace = await fetchBranchPointListing(SESSION);
+    expect(asked).toHaveBeenNthCalledWith(
+      1,
+      SESSION,
+      { kind: ComparisonKind.BRANCH_POINT },
+      undefined,
+      ".worktrees/feature",
+    );
+    const folderId = folder.kind === "comparison" ? folder.comparison.id : "";
+    const workspaceId = workspace.kind === "comparison" ? workspace.comparison.id : "";
+    // A worktree shares its commits with the workspace, yet each keeps its own files.
+    expect(folderId).not.toBe(workspaceId);
+
+    await expect(fetchComparisonFileText(SESSION, folderId, "a.ts")).resolves.toMatchObject({
+      before: "old\n",
+      after: "new\n",
+    });
+    expect(readBaseFile).toHaveBeenLastCalledWith(
+      SESSION,
+      { commit: BASE.base, path: "a.ts", object: "base-a.ts" },
+      undefined,
+      ".worktrees/feature",
+    );
+    expect(readFile).toHaveBeenLastCalledWith(SESSION, ".worktrees/feature/a.ts", undefined);
+  });
+
+  it("says why a folder can't be listed: an older host, or one the host refuses", async () => {
+    serving({
+      listWorkingCopyChanges: async () => {
+        throw new WorkspaceMethodUnavailableError("listWorkingCopyChanges");
+      },
+    });
+    await expect(
+      fetchBranchPointListing(SESSION, { repository: ".worktrees/feature" }),
+    ).resolves.toEqual({
+      kind: "unavailable",
+      problem: { reason: FOLDER_NOT_SERVED, transient: false },
+    });
+    // The workspace's own listing still says no route serves it.
+    await expect(fetchBranchPointListing(SESSION)).rejects.toBeInstanceOf(
+      WorkspaceMethodUnavailableError,
+    );
+    serving({
+      listWorkingCopyChanges: async () => {
+        throw new ConnectError("escapes the workspace", Code.InvalidArgument);
+      },
+    });
+    const refused = await fetchBranchPointListing(SESSION, { repository: "link-out" });
+    expect(refused).toEqual({
+      kind: "unavailable",
+      problem: { reason: FOLDER_REFUSED, transient: false },
+    });
+    if (refused.kind !== "unavailable") throw new Error("expected the folder to be refused");
+    expect(comparisonProblemMessage(refused.problem)).toBe(
+      "Diffs can't show this folder. Choose a folder inside the workspace.",
+    );
   });
 
   it("keeps each session's listing when two sessions compare the same commits", async () => {

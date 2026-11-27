@@ -58,6 +58,16 @@ export function normalizeLinkPath(raw: string): string {
   return (absolute ? "/" : "") + segments.join("/");
 }
 
+/** `raw` as a link reads it, or null for a path a link refuses. */
+export function linkPathOrNull(raw: string): string | null {
+  try {
+    return normalizeLinkPath(raw);
+  } catch (error) {
+    if (error instanceof LinkError) return null;
+    throw error;
+  }
+}
+
 function parsePositive(value: string, name: string): number {
   const number = Number(value);
   if (!POSITIVE_INTEGER.test(value) || !Number.isSafeInteger(number)) {
@@ -184,6 +194,12 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
       }
       const comparison = parseComparison(params);
       if (comparison) place.comparison = comparison;
+      const comparisonRoot = params.path("compare-root");
+      if (comparisonRoot !== undefined) {
+        if (!comparison) refuse("A compared folder needs a comparison too.");
+        if (!comparisonRoot.startsWith("/")) refuse("A compared folder must be an absolute path.");
+        place.comparisonRoot = comparisonRoot;
+      }
       return place;
     }
     case "pulls":
@@ -220,6 +236,7 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
       const line = parseLineRange(params.get("line"), params.get("column"));
       if (path !== undefined) place.path = path;
       if (line !== undefined) place.line = line;
+      if (params.get("list") === "1") place.list = true;
       return place;
     }
     case "terminal":
@@ -324,6 +341,8 @@ function placeParams(place: WorkspacePlace): [string, string][] {
       }
       if (place.kind === "changes" && place.comparison) {
         entries.push(...formatComparison(place.comparison));
+        if (place.comparisonRoot !== undefined)
+          entries.push(["compare-root", place.comparisonRoot]);
       }
       if (place.kind === "changes" && place.fileTab && place.path !== undefined) {
         entries.push(["file-tab", "1"]);
@@ -337,6 +356,7 @@ function placeParams(place: WorkspacePlace): [string, string][] {
       if (place.commit !== undefined) entries.push(["commit", place.commit]);
       if (place.path !== undefined) entries.push(["path", place.path]);
       if (place.line) entries.push(...formatLine(place.line));
+      if (place.list) entries.push(["list", "1"]);
       return entries;
     }
     case "search":
@@ -400,7 +420,10 @@ export function formatWorkspaceLink(link: WorkspaceLink): string {
   if (link.tab !== undefined) entries.push(["tab", link.tab]);
   const id = placeId(place);
   const query = entries
-    .map(([name, value]) => `${name}=${encodeValue(value, name === "path")}`)
+    .map(
+      ([name, value]) =>
+        `${name}=${encodeValue(value, name === "path" || name === "compare-root")}`,
+    )
     .join("&");
   return `${SCHEME}${place.kind}${id === undefined ? "" : `/${encodeURIComponent(id)}`}${query ? `?${query}` : ""}`;
 }

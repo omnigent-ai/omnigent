@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { copyRichText, copyText } from "./clipboard";
+import { copyRichText, copyText, readClipboardText } from "./clipboard";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -165,5 +165,24 @@ describe("copyRichText", () => {
     await expect(copyRichText({ html: "<p>hi</p>", text: "hi" })).resolves.toBeUndefined();
 
     expect(writeText).toHaveBeenCalledWith("hi");
+  });
+});
+
+describe("readClipboardText", () => {
+  function clipboardReading(readText: () => Promise<string>) {
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      get: () => ({ readText }),
+    });
+  }
+
+  it("returns the clipboard's text", async () => {
+    clipboardReading(() => Promise.resolve("pasted"));
+    await expect(readClipboardText()).resolves.toBe("pasted");
+  });
+
+  it("returns null when the page may not read the clipboard", async () => {
+    clipboardReading(() => Promise.reject(new DOMException("denied", "NotAllowedError")));
+    await expect(readClipboardText()).resolves.toBeNull();
   });
 });

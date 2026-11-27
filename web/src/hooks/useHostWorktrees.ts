@@ -32,8 +32,36 @@ export interface HostWorktree {
   updated_at?: number | null;
 }
 
-/** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
-const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
+/**
+ * Windows absolute path: a drive (``C:\repo`` / ``C:/repo``) or a UNC share (``\\server\share`` /
+ * ``//server/share``), as the server's ``_is_unc_path`` reads it.
+ */
+const WINDOWS_ABS_PATH = /^(?:[A-Za-z]:[/\\]|\\\\|\/\/)/;
+
+/** Whether ``path`` is absolute on its host: POSIX or a Windows drive. */
+export function isAbsoluteHostPath(path: string): boolean {
+  return path.startsWith("/") || WINDOWS_ABS_PATH.test(path);
+}
+
+/** Whether ``path`` is a Windows absolute path, read as {@link matchWorktree} reads one. */
+export function isWindowsHostPath(path: string): boolean {
+  return WINDOWS_ABS_PATH.test(path);
+}
+
+/**
+ * ``path`` without trailing separators, where ``\`` is one only on Windows. A root keeps one:
+ * ``/`` stays ``/``, and ``C:\`` stays ``C:\``.
+ */
+export function trimHostPath(path: string): string {
+  if (!WINDOWS_ABS_PATH.test(path)) return path.replace(/(.)\/+$/, "$1");
+  const trimmed = path.replace(/[/\\]+$/, "");
+  return /^[A-Za-z]:$/.test(trimmed) ? path.slice(0, 3) : trimmed;
+}
+
+/** Whether ``path``, already trimmed, is a filesystem root: ``/`` or a drive such as ``C:\``. */
+export function isHostRoot(path: string): boolean {
+  return path === "/" || /^[A-Za-z]:[/\\]$/.test(path);
+}
 
 /**
  * Canonicalize a path for comparison, mirroring the backend boundary check in
@@ -58,6 +86,27 @@ function matchKind(root: string, workspace: string): MatchKind {
   // Boundary-aware containment: `/a/foo` is not under `/a/fo` (prefix collision).
   if (w.startsWith(`${r}/`)) return { kind: "contains", length: r.length };
   return { kind: "none" };
+}
+
+/** Whether ``path`` is worktree ``root`` itself, compared as {@link matchWorktree} does. */
+export function isWorktreeRoot(root: string, path: string): boolean {
+  return matchKind(root, path).kind === "exact";
+}
+
+/**
+ * ``path`` relative to worktree ``root``, compared as {@link matchWorktree} does: ``/``
+ * separators and the path's own spelling, ``""`` for the root itself, null outside it.
+ */
+export function pathInWorktree(root: string, path: string): string | null {
+  const match = matchKind(root, path);
+  if (match.kind !== "contains") return match.kind === "exact" ? "" : null;
+  const windows = WINDOWS_ABS_PATH.test(root) || WINDOWS_ABS_PATH.test(path);
+  const slashed = (text: string) => (windows ? text.replace(/\\/g, "/") : text);
+  // A filesystem root (``/``, ``C:\``) already ends in the separator the slice skips.
+  const base = slashed(root).replace(/\/+$/, "");
+  return slashed(path)
+    .slice(base.length)
+    .replace(/^\/+|\/+$/g, "");
 }
 
 /**
@@ -88,7 +137,8 @@ interface VerifiedGitWorktreeCache {
 
 function normalizedHostPath(path: string): string {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
-  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+  // Drive and UNC paths ignore case, as in {@link matchKind}.
+  return /^(?:[A-Za-z]:\/|\/\/)/.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 export function pathIsWithinWorktree(path: string, root: string): boolean {

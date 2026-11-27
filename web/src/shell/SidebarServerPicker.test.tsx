@@ -30,6 +30,7 @@ vi.mock("@/lib/nativeBridge", () => ({
   // Shortcut labels: a browser tab, without the desktop menu's Cmd/Ctrl+,.
   isNativeShell: () => false,
   supportsDesktopCommands: () => false,
+  shellRoutesDesktopCommands: () => false,
 }));
 
 vi.mock("@/hooks/useViewerId", () => ({

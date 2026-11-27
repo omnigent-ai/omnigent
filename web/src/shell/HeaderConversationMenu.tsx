@@ -72,17 +72,16 @@ import {
 import { type OpenSessionCommandId, useOpenSessionPaletteCommands } from "./openSessionCommands";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
+import { useAddSiblingSessionHotkey } from "@/hooks/useAddSiblingSessionHotkey";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
 import { isOwnSessionWindow } from "@/lib/sessionWindow";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
-import { useIsEmbedded } from "@/lib/embedded";
-import { getEmbedRoot } from "@/lib/host";
-import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { leaveSessionView } from "./sessionCommands/archiveNavigation";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { cn } from "@/lib/utils";
@@ -135,7 +134,6 @@ export function HeaderConversationMenu({
   const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
-  const isEmbedded = useIsEmbedded();
   const openSessionWindow = useOpenSessionWindow();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
@@ -190,32 +188,7 @@ export function HeaderConversationMenu({
     setAutomationOpen(false);
   }, [conversation.id]);
 
-  useEffect(() => {
-    if (!canAddAgent) return;
-    const handleAddAgent = (event: globalThis.KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.repeat ||
-        event.isComposing ||
-        !hasCommandModifier(event) ||
-        !event.altKey ||
-        event.shiftKey ||
-        event.getModifierState("AltGraph") ||
-        event.code !== "KeyA"
-      ) {
-        return;
-      }
-      const embedRoot = getEmbedRoot();
-      if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
-      if (isFocusInDialogOrMenu() || document.activeElement?.closest(".xterm, .monaco-editor"))
-        return;
-      event.preventDefault();
-      event.stopPropagation();
-      navigate(addAgentPath);
-    };
-    window.addEventListener("keydown", handleAddAgent);
-    return () => window.removeEventListener("keydown", handleAddAgent);
-  }, [addAgentPath, canAddAgent, isEmbedded, navigate]);
+  useAddSiblingSessionHotkey(() => navigate(addAgentPath), !!canAddAgent);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -273,8 +246,9 @@ export function HeaderConversationMenu({
     // the cached `archived` flag in onMutate), and we're viewing the session
     // being archived, so leave its chat surface now — synchronously, like
     // confirmDelete — rather than in an onSuccess callback that fires a
-    // round-trip later with a stale active session.
-    navigate("/", { replace: true });
+    // round-trip later with a stale active session. With quick_pick_palette it opens the
+    // session ⌃[ would, as ⌘K's and the sidebar's Archive do.
+    leaveSessionView("archive", { conversation, source: "header_menu", navigate, queryClient });
     archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
     // and per-call mutate callbacks don't fire once their observer unmounts.

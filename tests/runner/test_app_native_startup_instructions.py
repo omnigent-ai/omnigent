@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent.runner.app import (
@@ -105,17 +106,170 @@ async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
     assert memory_guidance == [(client, "sess", spec, "/work/omnigent")]
 
 
+@pytest.mark.parametrize(
+    ("external_id", "write_failure"),
+    [
+        (None, None),
+        ("existing-cascade", None),
+        (None, "permission"),
+        (None, "containment"),
+    ],
+    ids=["fresh", "resume", "rule-permission", "rule-containment"],
+)
+async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    memory_guidance: list[tuple[object, ...]],
+    external_id: str | None,
+    write_failure: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The real launch composer delivers authored text, image help and memory."""
+    from omnigent.harnesses.antigravity_native import bridge
+    from omnigent.runner.native import orchestration
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://server.invalid")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.launch.build_agy_launch",
+        lambda **_kwargs: (["agy"], {}),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.gateway.wrap_agy_gateway_launch",
+        lambda argv, _env: argv,
+    )
+
+    async def cancel_reader(_session_id: str) -> None:
+        pass
+
+    monkeypatch.setattr(orchestration, "_cancel_auto_forwarder_task", cancel_reader)
+    labels = {bridge.ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "startup-bridge"}
+    previous_rule = None
+    if write_failure is not None:
+        bridge_dir = bridge.bridge_dir_for_bridge_id("startup-bridge")
+        bridge.write_agent_instructions(bridge_dir, "Keep previous startup guidance.")
+        previous_rule = (
+            bridge.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+        ).read_text(encoding="utf-8")
+        error = (
+            PermissionError("read-only rules")
+            if write_failure == "permission"
+            else ValueError("rules outside isolated directory")
+        )
+
+        def fail_write(*_args: object) -> None:
+            raise error
+
+        monkeypatch.setattr(bridge, "write_agent_instructions", fail_write)
+    relays: list[dict[str, object]] = []
+
+    async def relay(_session_id: str, **kwargs: object) -> None:
+        relays.append(kwargs)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/sess"
+        return httpx.Response(
+            200,
+            json={
+                "workspace": str(workspace),
+                "labels": labels,
+                "external_session_id": external_id,
+            },
+        )
+
+    class LaunchObserved(Exception):
+        """Stop at the inert terminal boundary before any process can start."""
+
+    captured: list[str] = []
+
+    class Registry:
+        async def launch_required_terminal(self, **_kwargs: object) -> None:
+            rule = (
+                bridge.agy_gemini_dir(bridge.bridge_dir_for_bridge_id("startup-bridge"))
+                / "config"
+                / "rules"
+                / "omnigent_instructions.md"
+            )
+            captured.append(rule.read_text(encoding="utf-8"))
+            raise LaunchObserved
+
+    spec = _spec("Keep the session's authored instructions.")
+    async with httpx.AsyncClient(
+        base_url="http://server.invalid", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(LaunchObserved):
+            await orchestration._launch_antigravity(
+                orchestration.NativeLaunchContext(
+                    session_id="sess",
+                    resource_registry=Registry(),
+                    publish_event=lambda *_args: None,
+                    server_client=client,
+                    ensure_comment_relay=relay,
+                    agent_spec=spec,
+                )
+            )
+
+    if write_failure is not None:
+        assert captured == [previous_rule]
+        assert "Could not write Antigravity startup instructions" in caplog.text
+    else:
+        assert captured == [
+            "---\ntrigger: always_on\n---\n\n"
+            f"Keep the session's authored instructions.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+            "\n\nMEMORY GUIDANCE\n"
+        ]
+    assert memory_guidance == [(client, "sess", spec, workspace)]
+    assert relays[0]["session_labels"] == labels
+
+
 @pytest.mark.asyncio
-async def test_startup_instructions_without_a_spec_ask_the_server_nothing() -> None:
+@pytest.mark.parametrize("resolution_failure", [None, "fetch", "policy", "unexpected"])
+async def test_startup_instructions_without_a_spec_ask_the_server_nothing(
+    resolution_failure: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
     """With no spec there are no memory tools, so the launch makes no memory request."""
-    from omnigent.runner.native.orchestration import _native_startup_instructions
+    from omnigent.runner._entry import AgentSpecFetchError
+    from omnigent.runner.native.orchestration import (
+        _antigravity_startup_agent_spec,
+        _native_startup_instructions,
+    )
+    from omnigent.runner.policy import AgentStartPolicyError
+
+    error = {
+        "fetch": AgentSpecFetchError("bundle unavailable"),
+        "policy": AgentStartPolicyError("startup", "denied"),
+        "unexpected": RuntimeError("unexpected resolver failure"),
+    }.get(resolution_failure or "")
+
+    async def resolve(session_id: str) -> None:
+        assert session_id == "sess"
+        if error is not None:
+            raise error
+
+    if resolution_failure in ("policy", "unexpected"):
+        assert error is not None
+        with pytest.raises(type(error)) as raised:
+            await _antigravity_startup_agent_spec("sess", resolve)
+        assert raised.value is error
+        assert "preparing framework guidance" not in caplog.text
+        return
+
+    spec = await _antigravity_startup_agent_spec("sess", resolve)
+    assert spec is None
+    assert ("preparing framework guidance" in caplog.text) is (resolution_failure == "fetch")
 
     class _NoCalls:
         def __getattr__(self, name: str) -> object:
             raise AssertionError(f"unexpected server call: {name}")
 
     assert await _native_startup_instructions(
-        None, _NoCalls(), "sess"
+        spec, _NoCalls(), "sess"
     ) == _native_startup_instructions_from_spec(None)
 
 

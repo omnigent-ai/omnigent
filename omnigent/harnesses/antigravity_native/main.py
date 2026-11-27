@@ -106,6 +106,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     read_bridge_state,
     seed_isolated_agy_home,
     update_conversation_id,
+    write_agent_instructions,
     write_bridge_state,
     write_mcp_config,
     write_tmux_target,
@@ -151,6 +152,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.spec.tar_utils import ExtractionError
 
 _logger = logging.getLogger(__name__)
 
@@ -920,6 +922,70 @@ async def _prepare_antigravity_terminal_via_daemon(
     )
 
 
+async def _write_cli_startup_instructions(
+    client: httpx.AsyncClient, session_id: str, bridge_dir: Path
+) -> None:
+    """Resolve the session's authored startup text for a CLI fallback launch."""
+    from omnigent.runner._entry import _AgentSpecCache, _resolve_agent_spec_from_server
+    from omnigent.runner.native.orchestration import (
+        _native_startup_instructions,
+        _native_startup_instructions_from_spec,
+        _resolve_sub_agent_spec_entry,
+    )
+
+    try:
+        snapshot = await _fetch_antigravity_session(client, session_id)
+        agent_id = snapshot.get("agent_id")
+        with TemporaryDirectory(prefix="omnigent-agy-instructions-") as tmp_dir:
+            entry = (
+                await _resolve_agent_spec_from_server(
+                    client, _AgentSpecCache(Path(tmp_dir)), agent_id, session_id=session_id
+                )
+                if isinstance(agent_id, str) and agent_id
+                else None
+            )
+            sub_agent_name = snapshot.get("sub_agent_name")
+            if entry is not None and isinstance(sub_agent_name, str) and sub_agent_name:
+                entry = _resolve_sub_agent_spec_entry(entry, sub_agent_name)
+            instructions = await _native_startup_instructions(
+                entry, client, session_id, workspace=Path.cwd().resolve()
+            )
+    except (
+        httpx.HTTPError,
+        RuntimeError,
+        click.ClickException,
+        OSError,
+        ValueError,
+        ExtractionError,
+        OmnigentError,
+        yaml.YAMLError,
+    ) as error:
+        _logger.warning(
+            "Could not resolve Antigravity startup instructions (%s)",
+            type(error).__name__,
+            extra={"session_id": session_id},
+        )
+        click.echo(
+            "Warning: Could not load your agent's startup instructions. "
+            "Continuing with framework guidance; retry the launch to apply your instructions.",
+            err=True,
+        )
+        instructions = _native_startup_instructions_from_spec(None)
+    try:
+        await asyncio.to_thread(write_agent_instructions, bridge_dir, instructions)
+    except (OSError, ValueError) as error:
+        _logger.warning(
+            "Could not write Antigravity startup instructions (%s)",
+            type(error).__name__,
+            extra={"session_id": session_id},
+        )
+        click.echo(
+            "Warning: Could not refresh Antigravity startup instructions. "
+            "Continuing; the agent may be missing its configured guidance.",
+            err=True,
+        )
+
+
 async def _launch_and_record(
     client: httpx.AsyncClient,
     *,
@@ -1016,6 +1082,7 @@ async def _launch_and_record(
             trusted_workspace=Path.cwd().resolve(),
         ),
     }
+    await _write_cli_startup_instructions(client, session_id, bridge_dir)
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
     # is up would be silently lost (#1494). Disable it in the isolated dir agy reads

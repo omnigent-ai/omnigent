@@ -168,6 +168,25 @@ describe("showAgentBrowserTab", () => {
   });
 });
 
+describe("loadGoToFileHost", () => {
+  it("loads the host, or one that renders nothing when its code can't load", async () => {
+    const { loadGoToFileHost } = await routing();
+    const GoToFileHost = () => null;
+    expect((await loadGoToFileHost(async () => ({ GoToFileHost }))).default).toBe(GoToFileHost);
+    const failed = await loadGoToFileHost(async () => {
+      throw new Error("Failed to fetch dynamically imported module");
+    });
+    const props = {
+      sessionId: "conv",
+      openFile: () => {},
+      showTextSearch: () => {},
+      textSearch: false,
+    };
+    expect(render(createElement(failed.default, props)).container).toBeEmptyDOMElement();
+    expect(console.error).toHaveBeenCalled();
+  });
+});
+
 describe("loadFileActionHost", () => {
   it("loads the host, or one that does nothing when its code can't load", async () => {
     const { loadFileActionHost } = await routing();

@@ -12,7 +12,7 @@ import {
   useWorkspaceServeable,
   type WorkspaceChangedFilesResult,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { useComparisonOwner } from "@/hooks/useComparisonOwner";
+import { useChoosingComparisonOwner, useComparisonOwner } from "@/hooks/useComparisonOwner";
 import { useSession } from "@/hooks/useSession";
 import type { ComparisonWorkspace, RevisionSpec } from "@/lib/customComparison";
 import { canBrowseWorkspaceFiles } from "@/lib/permissionsApi";
@@ -21,19 +21,21 @@ import {
   type BranchPointSupport,
   effectiveComparison,
   type EffectiveComparison,
+  hostListing,
   RECONNECTING,
 } from "@/lib/workingCopyComparison";
-import type {
-  ComparisonConsumerKind,
-  ComparisonOwnerSnapshot,
-  WorkingCopyComparisonOwner,
+import {
+  type ComparisonConsumerKind,
+  type ComparisonOwnerSnapshot,
+  LAST_COMMIT_SPEC,
+  type WorkingCopyComparisonOwner,
 } from "@/lib/workingCopyComparisonOwner";
 import { workingCopyComparisons } from "@/lib/workingCopyComparisons";
 import {
   type WorkingCopyBaseCommand,
   workingCopyBaseCommands,
 } from "@/lib/workingCopyBaseCommands";
-import { useWorkingCopyBaseIntent } from "@/lib/workingCopyBasePreference";
+import { baseIntentSource, useBaseIntent } from "@/lib/workingCopyBasePreference";
 
 function useSessionHostId(sessionId: string | undefined): string | null {
   return useSyncExternalStore(subscribeSessionHostChanges, () =>
@@ -85,18 +87,22 @@ export function useWorkingCopyChanges(
   { enabled = true, kind }: { enabled?: boolean; kind: ComparisonConsumerKind },
 ): WorkingCopyChanges {
   const owner = useComparisonOwner();
-  const intent = useWorkingCopyBaseIntent();
+  // A repository folder's review keeps its own base; the workspace's is the device's preference.
+  const intent = useBaseIntent(owner.repository, owner.workspaceKey);
   // Every view checks the session's own file permission, so losing a grant stops them all.
   const { session } = useSession(sessionId);
   const permitted = canBrowseWorkspaceFiles(session);
   const allowed = enabled && permitted;
-  const head = useWorkspaceChangedFiles(sessionId, { enabled: allowed });
+  // The runner lists only the workspace; a repository folder's changes come from the host.
+  const { repository } = owner;
+  const head = useWorkspaceChangedFiles(sessionId, { enabled: allowed && !repository });
   const serveable = useWorkspaceServeable(sessionId);
   const environment = useWorkspaceEnvironment(sessionId, { enabled: allowed });
   const sessionHostId = useSessionHostId(sessionId);
   const readable =
     allowed && !!sessionId && serveable !== false && environment.data?.available === true;
 
+  // Always the workspace's root: a folder's owner resolves `repository` against it.
   const root = environment.data?.root ?? null;
   const consumer = useMemo(
     () => ({ kind, enabled: readable, sessionHostId, root }),
@@ -122,8 +128,8 @@ export function useWorkingCopyChanges(
 
   const snapshot = useOwnerSnapshot(owner, sessionId);
   const multipleRepositories = useMemo(
-    () => head.data?.data.some((file) => !!file.repository_root) ?? false,
-    [head.data],
+    () => (!repository && head.data?.data.some((file) => !!file.repository_root)) || false,
+    [repository, head.data],
   );
   const comparison = useMemo((): EffectiveComparison => {
     const effective = effectiveComparison({
@@ -136,26 +142,26 @@ export function useWorkingCopyChanges(
       headOverride: snapshot.headOverride,
       custom: snapshot.custom,
       revisionSupport: snapshot.revisionSupport,
+      lastCommitSpec: repository ? LAST_COMMIT_SPEC : null,
     });
     // The workspace can't be reached for now: the comparison stays on screen until it's back.
     if (effective.base === "branch-point" && !effective.status && allowed && !readable) {
       return { ...effective, status: { kind: "reconnecting", message: RECONNECTING } };
     }
     return effective;
-  }, [intent, snapshot, multipleRepositories, allowed, readable]);
-  const branchPointData = useMemo<WorkspaceChangedFilesResult | undefined>(
-    () =>
-      comparison.base === "branch-point"
-        ? { available: true, data: comparison.comparison.entries }
-        : undefined,
-    [comparison],
+  }, [intent, snapshot, multipleRepositories, allowed, readable, repository]);
+  const listing = hostListing(comparison);
+  const hostData = useMemo<WorkspaceChangedFilesResult | undefined>(
+    () => (listing ? { available: true, data: listing.entries } : undefined),
+    [listing],
   );
 
   const { refetch: refetchHead } = head;
   const refetch = useCallback(() => {
     if (sessionId) owner.invalidate(sessionId);
-    return refetchHead();
-  }, [owner, sessionId, refetchHead]);
+    // A repository folder's changes are all the host's, so the runner isn't asked.
+    return repository ? Promise.resolve() : refetchHead();
+  }, [owner, sessionId, refetchHead, repository]);
   const shared = {
     comparison,
     support: snapshot.support,
@@ -181,6 +187,18 @@ export function useWorkingCopyChanges(
       dataUpdatedAt: 0,
     };
   }
+  if (listing) {
+    return {
+      ...shared,
+      // Kept through a brief loss of the runner or host; only permission takes it away.
+      data: hostData,
+      isError: false,
+      error: null,
+      isSuccess: true,
+      isLoading: false,
+      dataUpdatedAt: listing.listedAt,
+    };
+  }
   if (comparison.base === "head") {
     return {
       ...shared,
@@ -190,18 +208,6 @@ export function useWorkingCopyChanges(
       isSuccess: head.isSuccess,
       isLoading: head.isLoading,
       dataUpdatedAt: head.dataUpdatedAt,
-    };
-  }
-  if (comparison.base === "branch-point") {
-    return {
-      ...shared,
-      // Kept through a brief loss of the runner or host; only permission takes it away.
-      data: branchPointData,
-      isError: false,
-      error: null,
-      isSuccess: true,
-      isLoading: false,
-      dataUpdatedAt: comparison.comparison.listedAt,
     };
   }
   return {
@@ -232,14 +238,16 @@ function useOwnerSnapshot(
  */
 export function useWorkingCopyBaseCommands(
   sessionId: string | undefined,
-  { headIsKnown = true }: { headIsKnown?: boolean } = {},
+  {
+    headIsKnown = true,
+    owner: givenOwner,
+  }: { headIsKnown?: boolean; owner?: WorkingCopyComparisonOwner } = {},
 ): WorkingCopyBaseCommand[] {
-  const intent = useWorkingCopyBaseIntent();
-  // Base commands change the session's own comparison, whichever owner the view reads.
-  const { support, revisionSupport, custom } = useOwnerSnapshot(
-    workingCopyComparisons(),
-    sessionId,
-  );
+  // Base commands change the session's own comparison, or a repository folder's review's.
+  const choosing = useChoosingComparisonOwner();
+  const owner = givenOwner ?? choosing;
+  const intent = useBaseIntent(owner.repository, owner.workspaceKey);
+  const { support, revisionSupport, custom } = useOwnerSnapshot(owner, sessionId);
   const queryClient = useQueryClient();
   return useMemo(
     () =>
@@ -251,17 +259,20 @@ export function useWorkingCopyBaseCommands(
             support,
             revisionSupport,
             headIsKnown,
-            owner: workingCopyComparisons(),
+            owner,
             queryClient,
+            writeIntent: baseIntentSource(owner.repository, owner.workspaceKey).write,
           })
         : [],
-    [sessionId, intent, custom, support, revisionSupport, headIsKnown, queryClient],
+    [sessionId, intent, custom, support, revisionSupport, headIsKnown, owner, queryClient],
   );
 }
 
-/** A session's comparison recoveries, for its status row and placeholder. */
-export function workingCopyComparisonActions(sessionId: string) {
-  const owner = workingCopyComparisons();
+/** A session's comparison recoveries, for its status row and placeholder, through `owner`. */
+export function workingCopyComparisonActions(
+  sessionId: string,
+  owner: WorkingCopyComparisonOwner = workingCopyComparisons(),
+) {
   return {
     retry: () => owner.retry(sessionId),
     showLastCommit: () => owner.showLastCommit(sessionId),
