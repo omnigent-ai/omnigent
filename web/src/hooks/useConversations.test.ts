@@ -50,6 +50,7 @@ import {
   markRecentlyCreated,
   clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
+  PROJECTS_REFETCH_INTERVAL_MS,
   type Conversation,
   type PinnedConversationsResult,
 } from "./useConversations";
@@ -2866,6 +2867,33 @@ describe("useProjects", () => {
     const { result } = renderHook(() => useProjects(), { wrapper });
 
     await waitFor(() => expect(result.current.isError).toBe(true));
+  });
+
+  it("refetches on its own, so a project created without a push to this tab still appears", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const before = [{ id: "p_x", name: "Customer X" }];
+    const after = [...before, { id: "p_y", name: "Created elsewhere" }];
+    fetchMock
+      .mockResolvedValueOnce(mockResponse(before))
+      .mockResolvedValueOnce(mockResponse(after));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useProjects(), { wrapper });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(result.current.data).toEqual(before);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PROJECTS_REFETCH_INTERVAL_MS);
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.current.data).toEqual(after);
   });
 });
 

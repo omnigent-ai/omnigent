@@ -96,6 +96,7 @@ import { isSessionWorking } from "./useSessionState";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
+export const PROJECTS_REFETCH_INTERVAL_MS = 60_000;
 
 /**
  * Client-side deadline for a *search* page fetch (`?search_query=`). Content
@@ -2460,6 +2461,9 @@ export function useProjects({ enabled = true }: { enabled?: boolean } = {}) {
       return (await res.json()) as ProjectSummary[];
     },
     staleTime: 30_000,
+    // A `projects_changed` push reaches only the updates streams on the replica
+    // that handled the write, so this poll picks up projects made elsewhere.
+    refetchInterval: PROJECTS_REFETCH_INTERVAL_MS,
     enabled,
   });
 }
