@@ -1884,6 +1884,46 @@ async def test_an_image_read_waits_its_own_time_for_each_reply(
     )
 
 
+async def test_an_image_part_after_the_metadata_waits_the_images_time_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_api, "_REPLY_TIMEOUT_S", 60.0)
+    # Long enough to deliver the metadata under load; the part after it never comes.
+    monkeypatch.setattr(workspace_api, "_IMAGE_REPLY_TIMEOUT_S", 0.5)
+    tunnel = _tunnel(tmp_path)
+    stream = _image_stream(tunnel)
+    first = asyncio.create_task(anext(stream))
+    await tunnel.frame_sent()
+    metadata = pb.ReadPullRequestImageResponse(
+        metadata=pb.PullRequestImageMetadata(content_type="image/png", size=10)
+    )
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id, message=metadata.SerializeToString()
+        ),
+    )
+    await first
+
+    with pytest.raises(ConnectError) as lost:
+        await anext(stream)
+
+    assert lost.value.code == Code.DEADLINE_EXCEEDED
+
+
+def test_the_first_image_reply_wait_covers_every_phase_of_the_host_read() -> None:
+    """Account lookup, PR read, slot wait and fetch all come before the metadata."""
+    from omnigent.runner import github_resource
+
+    phases = (
+        github_resource._PR_EDIT_REQUEST_SECONDS
+        + github_images._READ_PULL_REQUEST_SECONDS
+        + github_images.SLOT_WAIT_SECONDS
+        + github_images.FETCH_DEADLINE_SECONDS
+    )
+    assert phases < workspace_api._IMAGE_REPLY_TIMEOUT_S
+
+
 async def test_a_caller_that_leaves_an_image_read_ends_its_call(tmp_path: Path) -> None:
     tunnel = _tunnel(tmp_path)
     stream = _image_stream(tunnel)

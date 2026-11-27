@@ -71,8 +71,9 @@ _UPLOAD_METHOD = "UploadAttachment"
 # An auto-merge batch reads and changes each of its pull requests in turn.
 _AUTO_MERGE_REPLY_TIMEOUT_S = 120.0
 _AUTO_MERGE_METHOD = "EnableAutoMerge"
-# An image's first reply follows the pull request read and the whole fetch.
-_IMAGE_REPLY_TIMEOUT_S = 60.0
+# An image's first reply follows the account lookup (15 s), the pull request read (15 s),
+# the wait for a read slot (10 s) and the whole fetch (30 s).
+_IMAGE_REPLY_TIMEOUT_S = 75.0
 # The pull request methods that answer with its overview, which lists the session's PRs.
 _OVERVIEW_METHODS = frozenset({"GetPullRequest", "SetPullRequestAccount"})
 _COMMENT_WRITES = frozenset({"CreateComment", "CreateReviewThread", "ReplyToReviewThread"})

@@ -4924,7 +4924,8 @@ export declare const WorkspaceService: GenService<{
   /**
    * Streams an image the pull request links to: its metadata, then its bytes. Only the
    * session's owner may call it. A caller that leaves early may hold one of the host's four
-   * image reads for up to 30 seconds. A client may keep an image in memory, keyed by
+   * image reads for up to 30 seconds, or, while a DNS lookup stalls, until the system
+   * resolver gives up. A client may keep an image in memory, keyed by
    * `(pr_url, image_url)`, for as long as the page that shows it stays open.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ReadPullRequestImage
