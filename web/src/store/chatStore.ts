@@ -217,7 +217,7 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
-import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
+import { getSessionHost, isHostKeyless, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
@@ -7268,6 +7268,8 @@ export async function startStreamPump(
   let hasConnected = false;
   // The open currently live, so routing changes and missed events can recycle it.
   let liveAttempt: AbortController | null = null;
+  // Whether that open has connected, rather than still awaiting its response.
+  let liveAttemptConnected = false;
   let backfillRuns = 0;
   const missedEventRecovery: MissedEventRecovery = {
     recycleStream: () => {
@@ -7341,14 +7343,22 @@ export async function startStreamPump(
   // A host can be learned while an open is pending or backing off; the bind
   // snapshot may predate that gap even without a successful open.
   let hostReaddressed = false;
-  // The host the latest open was addressed to.
+  // The host the latest open was addressed to, and whether it went keyless.
   let openedHost = getSessionHost(id);
+  let openedKeyless = openedHost !== null && isHostKeyless(openedHost);
   const unsubscribeHost = isDatabricksWorkspace()
     ? subscribeSessionHostChanges(() => {
         const host = getSessionHost(id);
-        if (host !== null && host !== openedHost) {
+        if (host === null) return;
+        if (host !== openedHost) {
           hostReaddressed = true;
           liveAttempt?.abort();
+        } else if (isHostKeyless(host) !== openedKeyless) {
+          // Keyless requests reach another replica, whose parked prompts the
+          // keyed bind snapshot lacks. A pending open re-addresses itself.
+          openedKeyless = !openedKeyless;
+          hostReaddressed = true;
+          if (liveAttemptConnected) liveAttempt?.abort();
         }
       })
     : undefined;
@@ -7383,7 +7393,9 @@ export async function startStreamPump(
       // an open that has hung past the stale window, not just a dead body.
       streamAttemptActivity.set(attempt, Date.now());
       openedHost = getSessionHost(id);
+      openedKeyless = openedHost !== null && isHostKeyless(openedHost);
       liveAttempt = attempt;
+      liveAttemptConnected = false;
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
       // Whether this attempt opened, so its close is signaled exactly once.
       let streamOpened = false;
@@ -7483,6 +7495,7 @@ export async function startStreamPump(
         if (!hasConnected) clearSseLog(id);
         hasConnected = true;
         streamOpened = true;
+        liveAttemptConnected = true;
         noteSessionStreamOpen(id, reconnecting);
         hostReaddressed = false;
         failedOpens = 0;

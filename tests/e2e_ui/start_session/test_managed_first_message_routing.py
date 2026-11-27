@@ -23,9 +23,11 @@ from typing import Any
 
 import httpx
 import pytest
-from playwright.async_api import async_playwright, expect
+from playwright.async_api import Browser, async_playwright, expect
 
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
+from omnigent.server.routes._antigravity_elicitation import to_elicitation_params
+from tests.e2e_ui.approvals.test_agy_permission_full_prompt import _load_pending_permission
 from tests.e2e_ui.conftest import _find_free_port, configure_mock_llm, set_fallback_mock_llm
 from tests.e2e_ui.start_session._managed_replica_server import terminate
 from tests.e2e_ui.start_session.test_start_session import _run_in_fresh_loop
@@ -660,6 +662,170 @@ async def _drive_long_launch(
             )
             assert not posts((await client.get(network_url)).json())
         finally:
+            for url in (rig.a, rig.b):
+                await client.post(f"{url}/__test/provision/release")
+            await browser.close()
+
+
+_PARKED_PROMPT = "Settle this managed session before it asks for approval."
+_PARKED_REPLY = "The managed session settled before asking."
+_PARKED_ELICITATION_ID = "elicit_parked_on_host_replica"
+_APPROVAL_CARD = '[data-testid="approval-card"]'
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("managed_replicas", [(True, False)], indirect=True)
+def test_fresh_page_shows_approval_parked_on_hosts_replica(
+    managed_replicas: ManagedReplicas,
+    mock_llm_server_url: str,
+) -> None:
+    """
+    A fresh page shows the approval behind a session's "Needs response" badge.
+
+    The create carries no host id, so the host connects without a key to the
+    default replica A, where its prompts park. A fresh page keys the session's
+    requests by that host and so reaches B: the snapshot answers there without
+    the prompt, and the stream is refused and retries without a key on A.
+    """
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _PARKED_REPLY, "stream": True}],
+        key="managed-parked-approval",
+        match=_PARKED_PROMPT,
+    )
+    _run_in_fresh_loop(_drive_parked_approval(managed_replicas))
+
+
+async def _create_settled_session(
+    browser: Browser, client: httpx.AsyncClient, rig: ManagedReplicas
+) -> str:
+    """Create a managed session without a host id and wait for its first reply on A."""
+    context = await browser.new_context(viewport={"width": 1440, "height": 960})
+    page = await context.new_page()
+    await page.goto(rig.ui)
+    agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
+    agent_id = next(agent["id"] for agent in agents if agent["name"] == "routing_probe")
+    await page.get_by_test_id("new-chat-landing-agent-select").click()
+    await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+    await page.get_by_test_id("new-chat-landing-input").fill(_PARKED_PROMPT)
+    await page.get_by_test_id("new-chat-landing-submit").click()
+
+    def created(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        return next(
+            (
+                row
+                for row in rows
+                if row["path"] == "/v1/sessions" and row["method"] == "POST" and row["closed"]
+            ),
+            None,
+        )
+
+    rows = await _poll(
+        client, f"{rig.ingress}/__test/network", lambda rows: created(rows) is not None
+    )
+    create = created(rows)
+    assert create is not None and create["status"] == 201, create
+    session_path = f"/v1/sessions/{json.loads(create['body'])['id']}"
+    (await client.post(f"{rig.a}/__test/provision/release")).raise_for_status()
+    await _poll(
+        client,
+        rig.a + session_path,
+        lambda body: (
+            bool(body["host_id"] and body["runner_id"])
+            and len(_persisted_messages(body, "assistant", _PARKED_REPLY)) == 1
+        ),
+        timeout=90,
+    )
+    await context.close()
+    return session_path.rsplit("/", 1)[-1]
+
+
+async def _park_approval(rig: ManagedReplicas, session_id: str) -> httpx.Response:
+    """Hold a recorded permission prompt on the replica holding the host's tunnel."""
+    params = to_elicitation_params(dict(_load_pending_permission()))
+    async with httpx.AsyncClient(timeout=120, trust_env=False) as hook_client:
+        return await hook_client.post(
+            f"{rig.a}/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": _PARKED_ELICITATION_ID, "params": params.model_dump()},
+        )
+
+
+def _assert_opened_off_the_prompts_replica(
+    rows: list[dict[str, Any]], session_path: str, host_id: str
+) -> None:
+    """The page bound from B's prompt-less snapshot; its stream retried keyless to A."""
+    snapshots = [
+        json.loads(row["body"])
+        for row in rows
+        if row["path"] == session_path
+        and row["method"] == "GET"
+        and row["replica"] == "b"
+        and row["closed"]
+        and row["status"] == 200
+    ]
+    assert any(snapshot["pending_elicitations"] == [] for snapshot in snapshots), rows
+    streams = [row for row in rows if row["path"] == f"{session_path}/stream"]
+    assert any(row["key"] == host_id and '"wrong_replica"' in row["body"] for row in streams)
+    assert any(row["key"] is None and row["status"] == 200 for row in streams), streams
+
+
+async def _drive_parked_approval(rig: ManagedReplicas) -> None:
+    async with (
+        async_playwright() as playwright,
+        httpx.AsyncClient(timeout=10, trust_env=False) as client,
+    ):
+        browser = await playwright.chromium.launch()
+        # Its own context: no routing learned while creating the session.
+        fresh = await browser.new_context(viewport={"width": 1440, "height": 960})
+        page = await fresh.new_page()
+        hook: asyncio.Task[httpx.Response] | None = None
+        network_url = f"{rig.ingress}/__test/network"
+        try:
+            session_id = await _create_settled_session(browser, client, rig)
+            session_path = f"/v1/sessions/{session_id}"
+            hook = asyncio.create_task(_park_approval(rig, session_id))
+            parked = await _poll(
+                client, rig.a + session_path, lambda body: bool(body["pending_elicitations"])
+            )
+            # Only A holds the prompt; B counts it through the persisted row.
+            assert (await client.get(rig.b + session_path)).json()["pending_elicitations"] == []
+            opened_at = len((await client.get(network_url)).json())
+
+            await page.goto(f"{rig.ui}/c/{session_id}")
+            row = page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+            badge = row.locator('[data-testid="session-state-badge"][data-state="awaiting"]')
+            await expect(badge).to_be_visible(timeout=20_000)
+            rows = await _poll(
+                client,
+                network_url,
+                lambda rows: any(
+                    row["path"] == f"{session_path}/stream" and row["status"] == 200
+                    for row in rows[opened_at:]
+                ),
+            )
+            _assert_opened_off_the_prompts_replica(
+                rows[opened_at:], session_path, parked["host_id"]
+            )
+
+            card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
+            await expect(card).to_be_visible(timeout=15_000)
+            await page.screenshot(path=str(rig.logs / "parked-approval.png"))
+            await card.get_by_role("button", name="Approve", exact=True).click()
+            verdict = await asyncio.wait_for(hook, timeout=30)
+            assert verdict.json()["action"] == "accept"
+            await expect(badge).to_have_count(0, timeout=20_000)
+            await page.screenshot(path=str(rig.logs / "approved.png"))
+        finally:
+            rows = (await client.get(network_url)).json()
+            (rig.logs / "network.json").write_text(json.dumps(rows, indent=2))
+            await page.screenshot(path=str(rig.logs / "final.png"))
+            if hook is not None and not hook.done():
+                await client.post(
+                    f"{rig.a}/v1/sessions/{session_id}/elicitations/"
+                    f"{_PARKED_ELICITATION_ID}/resolve",
+                    json={"action": "decline"},
+                )
+                await asyncio.wait_for(hook, timeout=30)
             for url in (rig.a, rig.b):
                 await client.post(f"{url}/__test/provision/release")
             await browser.close()

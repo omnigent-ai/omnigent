@@ -1,11 +1,30 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  clearHostKeyless,
   getSessionHostRouting,
+  markHostKeyless,
   parentIdFromLabels,
   setSessionHost,
   setSessionParent,
+  subscribeSessionHostChanges,
 } from "./sessionHost";
+
+describe("keyless host demotion", () => {
+  it("notifies routing subscribers only when a host's demotion changes", () => {
+    let notifications = 0;
+    const unsubscribe = subscribeSessionHostChanges(() => {
+      notifications += 1;
+    });
+    markHostKeyless("demoted-host");
+    markHostKeyless("demoted-host");
+    expect(notifications).toBe(1);
+    clearHostKeyless("demoted-host");
+    clearHostKeyless("demoted-host");
+    expect(notifications).toBe(2);
+    unsubscribe();
+  });
+});
 
 describe("getSessionHostRouting", () => {
   it("tracks observations along the routing ancestry without including unrelated sessions", () => {

@@ -22,7 +22,10 @@ const _sessionRoutingRevisions = new Map<string, number>();
 let _nextRoutingRevision = 0;
 const _hostChangeListeners = new Set<() => void>();
 
-/** Subscribe to host/parent changes so live streams can recheck their effective host. */
+/**
+ * Subscribe to host/parent changes and keyless demotions, so live streams can
+ * recheck where their requests route.
+ */
 export function subscribeSessionHostChanges(listener: () => void): () => void {
   _hostChangeListeners.add(listener);
   return () => {
@@ -165,7 +168,9 @@ const _keylessHosts = new Set<string>();
 /** Record that host `hostId` should be addressed WITHOUT a key (its tunnels
  * live on the default replica). Called after a keyless re-address to it succeeds. */
 export function markHostKeyless(hostId: string): void {
+  if (_keylessHosts.has(hostId)) return;
   _keylessHosts.add(hostId);
+  notifySessionHostChanges();
 }
 
 /** Whether `hostId` is demoted to keyless routing (see {@link markHostKeyless}). */
@@ -177,7 +182,7 @@ export function isHostKeyless(hostId: string): boolean {
  * came back wrong_replica, so keying wasn't the problem; re-evaluate by
  * letting the next request key normally. */
 export function clearHostKeyless(hostId: string): void {
-  _keylessHosts.delete(hostId);
+  if (_keylessHosts.delete(hostId)) notifySessionHostChanges();
 }
 
 // ── Modal host_id for host-less / cross-host routes ─────────────────────────
