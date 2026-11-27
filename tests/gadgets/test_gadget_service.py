@@ -2382,6 +2382,48 @@ def test_an_epoch_left_without_its_first_revision_is_finished_by_the_next_writer
         card(restarted, app, "d", "doing")
 
 
+def test_finding_the_rule_epoch_stays_bounded_while_retirement_is_held_up(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Retirement is held up (a stopped remover's ticket) while writers keep rotating: the
+    # epochs pile up, yet each write finds its epoch with a few probes, never a listing.
+    monkeypatch.setattr(constraints_module, "EPOCH_WRITES", 2)
+    monkeypatch.setattr(
+        constraints_module,
+        "GUARD_LIMITS",
+        StoreLimits(max_records_per_collection=200, max_list_entries=400),
+    )
+    held_up = {"on": True}
+    real_retire = documents_module.ImmutableDocumentStore.retire
+
+    def retire(self, collection, id, actor):  # type: ignore[no-untyped-def]
+        return False if held_up["on"] else real_retire(self, collection, id, actor)
+
+    monkeypatch.setattr(documents_module.ImmutableDocumentStore, "retire", retire)
+    service = gadgets.service()
+    app = publish_ruled_board(service, [{**WIP_LIMIT, "max": 3}])
+    document = card(service, app, "a", "todo")
+    for n in range(60):
+        document = move(service, app, document, "doing" if n % 2 == 0 else "todo", f"m-{n}")
+    epochs = gadgets.store.gadget_files(app["id"]).list_paths("data/_guard/epochs")
+    assert len(epochs) > 20  # The backlog.
+
+    reads: list[str] = []
+    gadgets.store.after_list = lambda path, _entries: reads.append(path)
+    document = move(service, app, document, "doing", "m-probe")
+    gadgets.store.after_list = None
+    epoch_reads = [path for path in reads if path.startswith("data/_guard/epochs")]
+    assert "data/_guard/epochs" not in epoch_reads
+    assert len(epoch_reads) <= 3 * (2 * len(epochs).bit_length() + 6)
+
+    # Once retirement goes through again, the backlog is retired a couple per write.
+    held_up["on"] = False
+    for n in range(len(epochs)):
+        document = move(service, app, document, "todo" if n % 2 == 0 else "doing", f"r-{n}")
+    left = gadgets.store.gadget_files(app["id"]).list_paths("data/_guard/epochs")
+    assert len(left) <= 4
+
+
 def test_the_rule_state_rotates_without_losing_counts(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

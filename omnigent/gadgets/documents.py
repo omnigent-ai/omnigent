@@ -1728,17 +1728,31 @@ class ImmutableDocumentStore:
                     self._files.delete_tree(path)
             self._files.delete_tree(tickets)
 
-    def _removal_tickets(self, tickets: str) -> _IntList:
+    def _ticket_exists(self, tickets: str, number: int) -> bool:
         try:
-            names = self._files.list_paths(tickets)
-        except NotFound:
-            return []
-        numbers = []
-        for entry in names:
-            match = _REVISION_NAME_RE.fullmatch(posixpath.basename(str(entry).rstrip("/")))
-            if match is not None:
-                numbers.append(int(match.group(1)))
-        return sorted(numbers)
+            self._files.read_json(f"{tickets}/{number:0{_REVISION_DIGITS}d}.json")
+        except (NotFound, CorruptData):
+            return False
+        return True
+
+    def _newest_ticket(self, tickets: str) -> int:
+        """The newest removal ticket's number, or 0, in O(log tickets) probes.
+
+        Tickets are numbered from 1 without gaps (each takes the next number) and none is
+        removed until the purge removes them all, so this never lists them.
+        """
+        if not self._ticket_exists(tickets, 1):
+            return 0
+        low, high = 1, 2
+        while self._ticket_exists(tickets, high):
+            low, high = high, high * 2
+        while high - low > 1:
+            middle = (low + high) // 2
+            if self._ticket_exists(tickets, middle):
+                low = middle
+            else:
+                high = middle
+        return low
 
     def _take_removal_ticket(self, tickets: str) -> int | None:
         """A new removal ticket's number, or ``None`` while another remover holds one.
@@ -1746,10 +1760,10 @@ class ImmutableDocumentStore:
         A ticket older than ``purge_abandon_s`` belongs to a remover that stopped; the
         next number takes over, and the stopped remover then finds it is not the newest.
         """
-        held = self._removal_tickets(tickets)
-        if held:
+        newest = self._newest_ticket(tickets)
+        if newest:
             try:
-                taken = self._files.read_json(f"{tickets}/{held[-1]:0{_REVISION_DIGITS}d}.json")
+                taken = self._files.read_json(f"{tickets}/{newest:0{_REVISION_DIGITS}d}.json")
             except NotFound:
                 return None
             at = taken.get("at") if isinstance(taken, dict) else None
@@ -1757,7 +1771,7 @@ class ImmutableDocumentStore:
                 return None
             if self._seconds_since(at) < self._limits.purge_abandon_s:
                 return None
-        number = (held[-1] if held else 0) + 1
+        number = newest + 1
         self._files.mkdirs(tickets)
         try:
             self._files.create_json(
@@ -1773,8 +1787,7 @@ class ImmutableDocumentStore:
         head = self._load_head(ref)
         if head is None or head.latest.digest != marker.digest:
             return False
-        held = self._removal_tickets(tickets)
-        return bool(held) and held[-1] == ticket
+        return self._newest_ticket(tickets) == ticket
 
     # -- values, tokens and cursors ----------------------------------------
 

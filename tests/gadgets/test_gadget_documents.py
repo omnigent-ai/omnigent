@@ -555,6 +555,39 @@ def test_only_the_ticket_holder_removes_a_record_until_it_stops(env: Env) -> Non
     assert env.docs._still_removing(ref, marker, tickets, 1) is False
 
 
+def test_removers_that_keep_stopping_are_taken_over_in_bounded_work(env: Env) -> None:
+    a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
+    env.clock.advance(61)
+    ref = env.docs._ref("cards", "a")
+    head = env.docs._load_head(ref)
+    assert head is not None
+    original = env.docs._finish_purge
+    env.docs._finish_purge = lambda ref, marker: None  # type: ignore[method-assign]
+    env.docs._purge(ref, head)
+    env.docs._finish_purge = original  # type: ignore[method-assign]
+    marker = env.docs._load_head(ref).latest  # type: ignore[union-attr]
+    tickets = f"{env.docs._root}/.removals/cards/a/{marker.digest[:32]}"
+    # Many removers in turn take over the abandoned ticket and stop too.
+    for number in range(1, 65):
+        assert env.docs._take_removal_ticket(tickets) == number
+        env.clock.advance(env.docs._limits.purge_abandon_s + 1)
+    listed: list[str] = []
+    reads: list[str] = []
+    files = env.docs._files
+    real_list, real_read = files.list_paths, files.read_json
+    files.list_paths = lambda path: listed.append(path) or real_list(path)  # type: ignore[method-assign]
+    files.read_json = lambda path: reads.append(path) or real_read(path)  # type: ignore[method-assign]
+
+    env.docs._finish_purge(ref, marker)
+
+    assert env.docs.verify_record("cards", "a") is None
+    # The tickets are never listed, and finding the newest reads a few of them, not all 64.
+    assert not any(path.startswith(tickets) for path in listed)
+    # Two lookups (take a ticket, then check it is still the newest), each O(log tickets).
+    assert sum(path.startswith(tickets) for path in reads) <= 2 * (2 * (65).bit_length() + 1) + 2
+
+
 def test_a_record_being_removed_makes_its_writers_wait(env: Env) -> None:
     a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
     env.docs.delete("cards", "a", a.version, "del-a", ACTOR)

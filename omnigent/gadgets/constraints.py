@@ -150,6 +150,8 @@ _STATE_FORMAT = 4
 # Entries per directory of a target's reference index.
 _INDEX_PER_SEGMENT = 1000
 _INDEX_APPEND_ATTEMPTS = 16
+# Retired epochs whose marker a stopped writer left out, marked per call.
+_FLOOR_REPAIRS_PER_CALL = 4
 
 
 class _IndexNeedsRebuild(Exception):
@@ -1194,20 +1196,60 @@ class ConstraintGuard:
                     self._index_add(directory, record.id)
 
     def _epochs(self) -> list[str]:
-        """The newest epochs, oldest first: all of them where old ones are retired (a few),
-        else the last two, found by probing numbered epochs instead of listing them all."""
+        """The epochs a write needs, oldest first: the oldest two still to retire and the
+        newest two. Found by probing numbered epochs, never by listing them all, so a
+        backlog left by retirements that were held up costs no more to find.
+
+        Epochs are made in order, and retired in order (see :meth:`_current`), so the ones
+        still there run without gaps from the first not yet retired (``retired/<n>.json``
+        markers, also in order) to the newest. A store that can't delete keeps them all.
+        """
         root = f"{self.guard_root}/{_GUARD_COLLECTION}"
-        if not self.files.supports_delete:
-            newest = self._newest_epoch_number(root)
-            if not newest:
-                return []
-            return [_epoch_name(n) for n in range(max(1, newest - 1), newest + 1)]
+        floor = self._epoch_floor(root) if self.files.supports_delete else 1
+        newest = self._newest_epoch_number(root, floor)
+        if not newest:
+            return []
+        wanted = {floor, floor + 1, newest - 1, newest}
+        return [_epoch_name(n) for n in sorted(wanted) if floor <= n <= newest]
+
+    def _marker_exists(self, path: str) -> bool:
         try:
-            paths = self.files.list_paths(root)
-        except NotFound:
-            paths = []
-        names = (path.rsplit("/", 1)[-1] for path in paths)
-        return sorted((name for name in names if _EPOCH.fullmatch(name)), key=lambda n: int(n[1:]))
+            self.files.read_json(path)
+        except (NotFound, CorruptData):
+            return False
+        return True
+
+    def _first_unretired(self) -> int:
+        """The lowest n without a ``retired/<n>.json`` marker, in O(log n) probes."""
+        markers = f"{self.guard_root}/retired"
+        if not self._marker_exists(f"{markers}/1.json"):
+            return 1
+        low, high = 1, 2
+        while self._marker_exists(f"{markers}/{high}.json"):
+            low, high = high, high * 2
+        while high - low > 1:
+            middle = (low + high) // 2
+            if self._marker_exists(f"{markers}/{middle}.json"):
+                low = middle
+            else:
+                high = middle
+        return high
+
+    def _mark_retired(self, number: int) -> None:
+        self.files.mkdirs(f"{self.guard_root}/retired")
+        with contextlib.suppress(Conflict):  # Another writer marked it.
+            self.files.create_json(f"{self.guard_root}/retired/{number}.json", {})
+
+    def _epoch_floor(self, root: str) -> int:
+        """The first epoch not yet retired. An epoch removed whose marker a stopped writer
+        never wrote is marked now (a few per call)."""
+        floor = self._first_unretired()
+        for _ in range(_FLOOR_REPAIRS_PER_CALL):
+            if self._epoch_exists(root, floor) or not self._epoch_exists(root, floor + 1):
+                break
+            self._mark_retired(floor)
+            floor += 1
+        return floor
 
     def _epoch_exists(self, root: str, number: int) -> bool:
         try:
@@ -1216,17 +1258,16 @@ class ConstraintGuard:
             return False
         return True
 
-    def _newest_epoch_number(self, root: str) -> int:
-        """The highest epoch number, or 0 for none, in O(log epochs) probes.
+    def _newest_epoch_number(self, root: str, start: int = 1) -> int:
+        """The highest epoch number from *start*, or 0 for none, in O(log epochs) probes.
 
-        On a store that can't delete, epochs are never removed and each is made only after
-        its predecessor, so they run from 1 with no gaps.
+        The epochs from *start* to the newest are all there (see :meth:`_epochs`).
         """
-        if not self._epoch_exists(root, 1):
+        if not self._epoch_exists(root, start):
             return 0
-        low, high = 1, 2
+        low, high = start, start + 1
         while self._epoch_exists(root, high):
-            low, high = high, high * 2
+            low, high = high, start + 2 * (high - start)
         # low exists, high does not.
         while high - low > 1:
             middle = (low + high) // 2
@@ -1244,7 +1285,11 @@ class ConstraintGuard:
         # Sealed epochs two behind the current one have no readers left: retire a couple per
         # call, so the guard keeps a few records however many writes the gadget takes.
         for old in epochs[:-2][:2]:
-            self.guard.retire(_GUARD_COLLECTION, old, "omnigent-gadget-rules")
+            # In order: one held up stops the others, so the epochs left run without gaps.
+            if not self.guard.retire(_GUARD_COLLECTION, old, "omnigent-gadget-rules"):
+                break
+            if self.files.supports_delete:
+                self._mark_retired(int(old[1:]))
         epoch = epochs[-1]
         state = self.guard.get(_GUARD_COLLECTION, epoch)
         if state is None:
