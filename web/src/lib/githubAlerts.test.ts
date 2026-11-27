@@ -46,17 +46,23 @@ describe("rehypeGitHubAlerts", () => {
     ["emphasis", "> [!NOTE]\n> **Next line**", "<strong>Next line</strong>"],
     ["code", "> [!NOTE]\n> `Next line`", "<code>Next line</code>"],
     ["a link", "> [!NOTE]\n> [Next line](https://example.com)", ">Next line</a>"],
+    ["a line break", "> [!NOTE]\n> <br>Body", "<p><br>Body</p>"],
   ])("keeps %s that opens the next line in the alert", (_label, markdown, kept) => {
     expect(alertKinds(markdown)).toEqual(["note"]);
     expect(html(markdown)).toContain(kept);
   });
 
-  it("keeps the blocks after the first paragraph, and finds alerts in nested quotes", () => {
+  it("keeps the blocks after the first paragraph, and leaves a nested marker as a quote", () => {
     const rendered = html("> [!TIP]\n> First\n>\n> - item\n>\n> > [!CAUTION]\n> > Inner");
     expect(rendered).toContain('<p class="markdown-alert-title">Tip</p>');
     expect(rendered).toContain("<p>First</p>");
     expect(rendered).toMatch(/<li>\s*(<p>)?item/);
-    expect(rendered).toContain('<p class="markdown-alert-title">Caution</p>');
-    expect(rendered).toContain("Inner");
+    expect(alertKinds("> [!TIP]\n> First\n>\n> > [!CAUTION]\n> > Inner")).toEqual(["tip"]);
+    expect(rendered).toContain("[!CAUTION]");
+  });
+
+  it("renders alerts only at the top level, as GitHub does", () => {
+    expect(alertKinds("> Quote\n>\n> > [!NOTE]\n> > Inner")).toEqual([]);
+    expect(alertKinds("- item\n\n  > [!WARNING]\n  > Inside a list")).toEqual([]);
   });
 });

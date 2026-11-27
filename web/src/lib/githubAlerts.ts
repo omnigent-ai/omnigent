@@ -1,7 +1,7 @@
 // GitHub's `> [!NOTE]`-style alerts in rendered PR Markdown. A quote is an alert when its first
 // block is a paragraph whose first line is just the marker, as on GitHub; everything after the
 // marker, in that paragraph and in the blocks that follow, stays in the alert. Any other quote,
-// such as one opening with a list, stays an ordinary quote with all of its content.
+// such as one opening with a list or one nested in another block, stays an ordinary quote.
 
 import type { Element, ElementContent, Root, RootContent } from "hast";
 
@@ -37,7 +37,7 @@ function alertFor(quote: Element): Element | null {
   const [opening, next] = firstLine;
   const endedWithNewline = /\n$/.test(match[0]);
   if (after !== "") firstLine.unshift({ type: "text", value: after });
-  else if (opening?.type === "element" && opening.tagName === "br") {
+  else if (!endedWithNewline && opening?.type === "element" && opening.tagName === "br") {
     // A hard break (two spaces or a backslash) ended the marker's line instead.
     firstLine.shift();
     if (next?.type === "text") firstLine[0] = { ...next, value: next.value.replace(/^\r?\n/, "") };
@@ -70,13 +70,13 @@ function alertFor(quote: Element): Element | null {
   };
 }
 
+// GitHub renders alerts only at the top level: one inside a quote, list or other block stays a quote.
 function replaceAlerts(children: RootContent[]): void {
   for (let index = 0; index < children.length; index += 1) {
     const child = children[index]!;
-    if (child.type !== "element") continue;
-    const alert = child.tagName === "blockquote" ? alertFor(child) : null;
+    if (child.type !== "element" || child.tagName !== "blockquote") continue;
+    const alert = alertFor(child);
     if (alert) children[index] = alert;
-    replaceAlerts((alert ?? child).children);
   }
 }
 
