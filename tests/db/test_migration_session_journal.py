@@ -20,8 +20,27 @@ _ENTRIES = "session_journal_entries"
 _HEADS = "session_journal_heads"
 
 
-def test_mysql_journal_content_is_bounded_bytes_the_store_encodes() -> None:
-    migration = import_module("omnigent.db.migrations.versions.5d872cd6632a_add_session_journal")
+@pytest.mark.parametrize(
+    ("revision", "column", "ddl", "limit"),
+    [
+        (
+            "5d872cd6632a_add_session_journal",
+            SqlSessionJournalEntry.__table__.c.content,
+            "content VARBINARY(16383) NOT NULL",
+            16_383,
+        ),
+        (
+            "ce6afa56e9f7_add_session_journal_plan_progress",
+            SqlSessionJournalHead.__table__.c.plan_progress,
+            "ADD COLUMN plan_progress VARBINARY(2048)",
+            2048,
+        ),
+    ],
+)
+def test_mysql_journal_payloads_are_bounded_bytes_the_store_encodes(
+    revision: str, column: sa.Column, ddl: str, limit: int
+) -> None:
+    migration = import_module(f"omnigent.db.migrations.versions.{revision}")
     dialect = mysql.dialect()
     output = StringIO()
     context = MigrationContext.configure(
@@ -29,15 +48,14 @@ def test_mysql_journal_content_is_bounded_bytes_the_store_encodes() -> None:
     )
     with Operations.context(context):
         migration.upgrade()
-    column = SqlSessionJournalEntry.__table__.c.content
-    assert str(column.type.compile(dialect=dialect)) == "VARBINARY(16383)"
-    assert "content VARBINARY(16383) NOT NULL" in output.getvalue()
-    # The journal store encodes content itself, so the column passes bytes through.
+    assert str(column.type.compile(dialect=dialect)) == f"VARBINARY({limit})"
+    assert ddl in output.getvalue()
+    # The journal store encodes these itself, so the column passes bytes through.
     bind = column.type.dialect_impl(dialect).bind_processor(dialect)
     stored = b"\x00\x00{}"
     assert bind is not None and bind(stored) == stored
     with pytest.raises(ValueError):
-        bind(stored + b"x" * 16_383)
+        bind(stored + b"x" * limit)
 
 
 @pytest.mark.parametrize(
@@ -136,5 +154,34 @@ def test_upgrade_matches_models_and_downgrade_drops_tables(tmp_path: Path) -> No
         assert connection.execute(
             sa.text("SELECT version_num FROM alembic_version")
         ).scalars().all() == ["27d16059fab9"]
+    engine.dispose()
+    clear_engine_cache()
+
+
+def test_plan_progress_downgrade_keeps_heads_and_reupgrades(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'journal.db'}"
+    engine = sa.create_engine(uri)
+    _migrate(uri, engine, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                f"INSERT INTO {_HEADS} (workspace_id, conversation_id, next_position, "
+                "plan_progress, plan_progress_position) VALUES (0, :conversation, 3, :progress, 3)"
+            ),
+            {"conversation": b"\x01" * 16, "progress": b'\x00\x00{"total": 1}'},
+        )
+
+    _migrate(uri, engine, "47d3e8fc3e25", down=True)
+    columns = [column["name"] for column in sa.inspect(engine).get_columns(_HEADS)]
+    assert columns == ["workspace_id", "conversation_id", "next_position"]
+    with engine.connect() as connection:
+        assert connection.execute(sa.text(f"SELECT next_position FROM {_HEADS}")).scalar() == 3
+
+    _migrate(uri, engine, "head")
+    with engine.connect() as connection:
+        # The columns return empty: the next plan or status write records them.
+        assert connection.execute(
+            sa.text(f"SELECT next_position, plan_progress, plan_progress_position FROM {_HEADS}")
+        ).one() == (3, None, None)
     engine.dispose()
     clear_engine_cache()

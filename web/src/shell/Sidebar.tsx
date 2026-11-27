@@ -83,6 +83,7 @@ import {
   ListChevronsDownUpIcon,
   ListChevronsUpDownIcon,
   ListFilterIcon,
+  ListTodoIcon,
   LaptopIcon,
   LayoutDashboardIcon,
   Loader2Icon,
@@ -240,6 +241,11 @@ import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import {
+  type PlanProgressLine,
+  planProgressLine,
+  samePlanProgress,
+} from "@/lib/sessionPlanProgress";
 import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -5860,6 +5866,40 @@ function SessionTooltipDetail({
   );
 }
 
+const PLAN_LEAD_TONES = {
+  waiting: "font-medium text-brand-accent",
+  failed: "font-medium text-destructive",
+  muted: "",
+} as const;
+
+// A workflow run's card row: its finished steps, then the step it's on or how it
+// finished, with "+2" for more in progress. The step gets a line of its own, so a
+// long name wraps to two lines before it's cut short.
+function SessionTasksDetail({ line }: { line: PlanProgressLine }) {
+  return (
+    <div data-testid="session-tooltip-tasks" className="flex flex-col gap-0.5 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <span className="shrink-0 text-muted-foreground">Tasks</span>
+        <span className="flex items-center gap-1.5">
+          <ListTodoIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="tabular-nums">
+            {line.finished}/{line.total}
+          </span>
+        </span>
+      </div>
+      <p className="line-clamp-2 break-words">
+        {line.lead && (
+          <>
+            <span className={PLAN_LEAD_TONES[line.lead.tone]}>{line.lead.text}</span>:{" "}
+          </>
+        )}
+        {line.text}
+        {line.more > 0 && <span className="text-muted-foreground"> +{line.more}</span>}
+      </p>
+    </div>
+  );
+}
+
 // The session that started this one. The card mounts on open, so each opening
 // rechecks access; a creator the viewer can't read is never named.
 function SessionCreatorDetail({ sessionId }: { sessionId: string }) {
@@ -5892,10 +5932,12 @@ function SessionTooltipDetails({
   conversation,
   familyDetail,
   familyParentId,
+  planLine,
 }: {
   conversation: Conversation;
   familyDetail?: ReactNode;
   familyParentId?: string;
+  planLine: PlanProgressLine | null;
 }) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
@@ -5937,6 +5979,7 @@ function SessionTooltipDetails({
   const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
   if (
+    planLine === null &&
     !shownFamilyDetail &&
     creatorId === null &&
     createdBy === null &&
@@ -5948,6 +5991,7 @@ function SessionTooltipDetails({
   }
   return (
     <SessionTooltipDetailsBlock>
+      {planLine && <SessionTasksDetail line={planLine} />}
       {shownFamilyDetail}
       {creatorId !== null && <SessionCreatorDetail sessionId={creatorId} />}
       {createdBy !== null && (
@@ -6023,12 +6067,14 @@ function LegacySessionTooltipContent({
   hasError,
   shared,
   familyDetail,
+  planLine,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   shared: SessionSharing | null;
   familyDetail?: ReactNode;
+  planLine: PlanProgressLine | null;
 }) {
   return (
     <TooltipContent
@@ -6063,7 +6109,12 @@ function LegacySessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
-      {familyDetail && <SessionTooltipDetailsBlock>{familyDetail}</SessionTooltipDetailsBlock>}
+      {(planLine || familyDetail) && (
+        <SessionTooltipDetailsBlock>
+          {planLine && <SessionTasksDetail line={planLine} />}
+          {familyDetail}
+        </SessionTooltipDetailsBlock>
+      )}
       {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
@@ -6077,6 +6128,7 @@ function SessionTooltipContent({
   shared,
   familyDetail,
   familyParentId,
+  planLine,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
@@ -6084,6 +6136,8 @@ function SessionTooltipContent({
   shared: SessionSharing | null;
   familyDetail?: ReactNode;
   familyParentId?: string;
+  /** A workflow run's progress, for its Tasks row. */
+  planLine: PlanProgressLine | null;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -6094,6 +6148,7 @@ function SessionTooltipContent({
         hasError={hasError}
         shared={shared}
         familyDetail={familyDetail}
+        planLine={planLine}
       />
     );
   }
@@ -6123,6 +6178,7 @@ function SessionTooltipContent({
         conversation={conversation}
         familyDetail={familyDetail}
         familyParentId={familyParentId}
+        planLine={planLine}
       />
       {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
@@ -6443,6 +6499,10 @@ function ConversationRowImpl({
     metaProject !== null || metaEnvironment !== null || metaRepo !== null || metaBranch !== null
       ? "top-4 md:top-3.5"
       : "top-1/2";
+  // A waiting prompt keeps a finished plan's card from saying it's done while a step is still open.
+  const planLine = conversation.plan_progress
+    ? planProgressLine(conversation.plan_progress, sessionState?.kind === "awaiting")
+    : null;
 
   // Owners' live rows reorder; any row in the same list is a target.
   const canReorder = reorderGroup !== undefined && isOwner && !isArchived;
@@ -6858,6 +6918,7 @@ function ConversationRowImpl({
               hasError={sessionState?.kind === "error"}
               shared={sharing}
               familyDetail={familyDetail}
+              planLine={planLine}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -6872,6 +6933,7 @@ function ConversationRowImpl({
               shared={sharing}
               familyDetail={familyDetail}
               familyParentId={familyParentId}
+              planLine={planLine}
             />
           </Tooltip>
         )
@@ -6897,6 +6959,7 @@ function ConversationRowImpl({
             hasError={sessionState?.kind === "error"}
             shared={sharing}
             familyDetail={familyDetail}
+            planLine={planLine}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -6933,6 +6996,7 @@ function ConversationRowImpl({
             shared={sharing}
             familyDetail={familyDetail}
             familyParentId={familyParentId}
+            planLine={planLine}
           />
         </Tooltip>
       )}
@@ -7200,7 +7264,11 @@ function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
     if (a[key] !== b[key]) return false;
   }
   // `labels` is an object; compare by value (rename/project moves ride here).
-  return JSON.stringify(a.labels) === JSON.stringify(b.labels);
+  // So is `plan_progress`, which every streamed row carries as a new object.
+  return (
+    JSON.stringify(a.labels) === JSON.stringify(b.labels) &&
+    samePlanProgress(a.plan_progress, b.plan_progress)
+  );
 }
 
 // Memoized with a render-field comparator (not shallow identity): a row
@@ -7288,6 +7356,7 @@ function PinnedProjectFlyoutContent({
   hasError,
   shared,
   familyDetail,
+  planLine,
 }: {
   title: string;
   projectName: string;
@@ -7296,6 +7365,7 @@ function PinnedProjectFlyoutContent({
   hasError: boolean;
   shared: SessionSharing | null;
   familyDetail?: ReactNode;
+  planLine: PlanProgressLine | null;
 }) {
   return (
     <HoverCardContent
@@ -7322,7 +7392,12 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
-      {familyDetail && <SessionTooltipDetailsBlock>{familyDetail}</SessionTooltipDetailsBlock>}
+      {(planLine || familyDetail) && (
+        <SessionTooltipDetailsBlock>
+          {planLine && <SessionTasksDetail line={planLine} />}
+          {familyDetail}
+        </SessionTooltipDetailsBlock>
+      )}
       {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </HoverCardContent>

@@ -275,6 +275,7 @@ from omnigent.server.schemas import (
     SessionList,
     SessionListItem,
     SessionManagedHostRequest,
+    SessionPlanProgress,
     SessionProjectSummary,
     SessionPullRequestSummary,
     SessionResponse,
@@ -284,12 +285,14 @@ from omnigent.server.schemas import (
     SupersessionReason,
     UpdateSessionRequest,
 )
-from omnigent.server.session_journal import titled_for_workflow_run
+from omnigent.server.session_journal import open_store as open_journal_store
+from omnigent.server.session_journal import record_copied_plan_progress, titled_for_workflow_run
 from omnigent.server.session_orchestration import (
     require_archive_outside_source_lineage,
     require_named_source_private,
     require_orchestration_source,
 )
+from omnigent.server.workflows import workflows_enabled
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -649,6 +652,7 @@ class _SessionBatchReads:
     child_ids_by_parent: dict[str, list[str]]
     comments_fingerprints: dict[str, CommentsFingerprint]
     pull_request_summaries: dict[str, SessionSummary]
+    plan_progress: dict[str, SessionPlanProgress]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2983,6 +2987,7 @@ def register_core_routes(
                             ),
                             comments_fingerprints=_comments_fingerprints_sync(conv_ids),
                             pull_request_summaries=_pull_request_summaries_sync(conv_ids),
+                            plan_progress=_plan_progress_sync(request.app.state, conv_ids),
                         )
                     )
                 return _SessionPageReads(
@@ -3046,6 +3051,7 @@ def register_core_routes(
                         comments_fingerprint=comments_fingerprints.get(conv.id),
                         pull_request=pull_requests.get(conv.id, (None, None))[0],
                         pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                        plan_progress=batch.plan_progress.get(conv.id),
                     )
                     for conv in list_batch
                     if conv.agent_id is not None
@@ -3121,6 +3127,39 @@ def register_core_routes(
             _logger.warning("Could not load session pull requests", exc_info=True)
             return {}
 
+    def _plan_progress_sync(app_state: Any, conv_ids: list[str]) -> dict[str, SessionPlanProgress]:
+        """
+        Read where each session's plan stands from its journal heads row, in one query.
+
+        Shared by the ``GET /v1/sessions`` page builder and
+        ``WS /v1/sessions/updates``, so a step that starts or finishes reaches
+        the sidebar through the stream's diff. Safe inside
+        :func:`shared_read_scope`, like :func:`_pull_request_summaries_sync`.
+
+        :param app_state: The server's ``app.state``, which says whether workflows are on.
+        :param conv_ids: Session ids to read, e.g. ``["conv_abc123"]``.
+        :returns: Progress by session id; empty when workflows are off, without
+            journal storage, or when the read fails.
+        """
+        if not conv_ids or not workflows_enabled(app_state):
+            return {}
+        journal = open_journal_store(conversation_store)
+        if journal is None:
+            return {}
+        try:
+            stored = journal.plan_progress_by_session(conv_ids)
+        except Exception:  # The list must load even if progress can't be read.
+            rollback_shared_reads()
+            _logger.warning("Could not load session plan progress", exc_info=True)
+            return {}
+        progress: dict[str, SessionPlanProgress] = {}
+        for conv_id, value in stored.items():
+            try:
+                progress[conv_id] = SessionPlanProgress.model_validate(value)
+            except ValidationError:
+                _logger.warning("Unreadable plan progress for session %s", conv_id)
+        return progress
+
     async def _pull_requests_for(
         conv_ids: list[str],
     ) -> dict[str, tuple[SessionPullRequestSummary | None, bool]]:
@@ -3169,6 +3208,7 @@ def register_core_routes(
     async def _fetch_watched_items(
         watched: list[str],
         user_id: str | None,
+        app_state: Any,
     ) -> list[dict[str, Any]]:
         """
         Build current list-item payloads for the watched ids.
@@ -3191,6 +3231,8 @@ def register_core_routes(
             deduplicated and length-capped by the caller.
         :param user_id: The authenticated requesting user, or ``None``
             when permissions are disabled, e.g. ``"alice@example.com"``.
+        :param app_state: The server's ``app.state``, which says whether
+            workflows are on.
         :returns: One JSON-ready dict per accessible, existing watched
             session, in no particular order.
         """
@@ -3243,6 +3285,7 @@ def register_core_routes(
             child_ids_by_parent,
             comments_fingerprints,
             pull_requests,
+            plan_progress,
         ) = await asyncio.gather(
             asyncio.to_thread(_session_agent_metadata, convs),
             asyncio.to_thread(
@@ -3251,6 +3294,7 @@ def register_core_routes(
             ),
             _comments_fingerprints_for(conv_ids),
             _pull_requests_for(conv_ids),
+            asyncio.to_thread(_plan_progress_sync, app_state, conv_ids),
         )
         agent_names_by_id, harnesses_by_id = agent_metadata
         pending_counts = pending_elicitations.counts_for(conv_ids)
@@ -3268,6 +3312,7 @@ def register_core_routes(
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 pull_request=pull_requests.get(conv.id, (None, None))[0],
                 pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                plan_progress=plan_progress.get(conv.id),
             )
             for conv in convs
         ]
@@ -3383,7 +3428,7 @@ def register_core_routes(
         async def _emit_snapshot() -> None:
             """Send a full snapshot for the current watch-set and reset the
             diff baseline to it."""
-            items = await _fetch_watched_items(watched, user_id)
+            items = await _fetch_watched_items(watched, user_id, websocket.app.state)
             dumps = {item["id"]: item for item in items}
             last_sent.clear()
             last_sent.update(dumps)
@@ -3395,7 +3440,7 @@ def register_core_routes(
             been idle."""
             nonlocal last_send_monotonic
             if watched:
-                items = await _fetch_watched_items(watched, user_id)
+                items = await _fetch_watched_items(watched, user_id, websocket.app.state)
                 current = {item["id"]: item for item in items}
                 changed = [dump for cid, dump in current.items() if last_sent.get(cid) != dump]
                 # Removed = a still-watched id that no longer resolves (lost
@@ -3521,7 +3566,7 @@ def register_core_routes(
                         continue
                     async with emit_lock:
                         try:
-                            items = await _fetch_watched_items([sid], user_id)
+                            items = await _fetch_watched_items([sid], user_id, websocket.app.state)
                             if items and sid in watched:
                                 # The interval diff covers the row, but a grant
                                 # that leaves the row unchanged (e.g. a direct
@@ -5718,6 +5763,7 @@ def register_core_routes(
             if clone_location is not None:
                 await _delete_unreturned_agent_copy(new_conv.id, fork_agent_id, clone_location)
             raise
+        await asyncio.to_thread(record_copied_plan_progress, conversation_store, new_conv.id)
 
         # Create the fork-owned rows the rewritten items now reference —
         # before the fork is announced or returned, so no reader sees the ids

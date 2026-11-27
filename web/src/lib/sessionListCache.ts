@@ -14,6 +14,7 @@ import { scopeBoundaryRow } from "@/lib/sidebarData";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 import { sessionVisibility } from "@/lib/sessionVisibility";
+import { samePlanProgress, type SessionPlanProgress } from "@/lib/sessionPlanProgress";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -111,9 +112,9 @@ export function nullsToUndefined(wire: SessionListWireItem): SessionListWireItem
  *
  * Lets the merge skip rewriting rows that are already up to date, so a
  * snapshot frame (which restates the whole watch-set, mostly unchanged)
- * doesn't churn the cache and re-render the sidebar. `labels` and
- * `pull_request` are compared structurally because every parsed frame yields
- * a fresh object reference.
+ * doesn't churn the cache and re-render the sidebar. `labels`, `pull_request`,
+ * `family` and `plan_progress` are compared structurally because every parsed
+ * frame yields a fresh object reference.
  *
  * @param conv - The cached conversation row.
  * @param wire - The incoming wire item overlaying it.
@@ -127,7 +128,11 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels" || key === "pull_request" || key === "family") {
+    if (key === "plan_progress") {
+      if (!samePlanProgress(current as SessionPlanProgress, value as SessionPlanProgress)) {
+        changed.add(key);
+      }
+    } else if (key === "labels" || key === "pull_request" || key === "family") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);

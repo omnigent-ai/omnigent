@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from omnigent.entities import NON_CONTENT_ITEM_TYPES, Agent, Conversation, ScheduledTask
+from omnigent.server.session_journal import record_copied_plan_progress
 from omnigent.stores.conversation_store import (
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -223,6 +224,7 @@ def copy_session(
         file_id_map=file_id_map,
         created_by=created_by,
     )
+    record_copied_plan_progress(conversation_store, conv.id)
     # The copy's file rows point at the source's blobs, as a fork's do, so no
     # bytes move. A row that fails would leave history naming a missing file.
     if file_store is not None and artifact_store is not None:

@@ -578,6 +578,86 @@ describe("Sidebar session list", () => {
     }
   });
 
+  it("names a workflow run's step on its card, not its row, and keeps it current", async () => {
+    const run = (progress: Conversation["plan_progress"], partial: Partial<Conversation> = {}) =>
+      conv("run", "Claude Code", { plan_progress: progress, ...partial });
+    // A stable projects array keeps context churn from bypassing the memo comparator.
+    projectRowsRef.current = [];
+    mockConversations([
+      run({
+        total: 5,
+        done: 2,
+        started: 3,
+        step: { name: "Open PRs for safe upgrades", state: "started" },
+      }),
+    ]);
+    const { refresh } = renderGroupingSidebar();
+    const link = screen.getByRole("link", { name: "run" });
+    expect(link).not.toHaveTextContent("Open PRs");
+
+    fireEvent.pointerMove(link, { pointerType: "mouse" });
+    const card = await screen.findByTestId("session-tooltip-content");
+    const tasks = () => within(card).getByTestId("session-tooltip-tasks");
+    expect(tasks()).toHaveTextContent("Tasks2/5Open PRs for safe upgrades +2");
+
+    mockConversations([
+      run(
+        {
+          total: 5,
+          done: 3,
+          needs_input: 1,
+          step: { name: "Approve major upgrades", state: "needs_input" },
+        },
+        { pending_elicitations_count: 1 },
+      ),
+    ]);
+    refresh();
+    expect(tasks()).toHaveTextContent("3/5Waiting for you: Approve major upgrades");
+    mockConversations([run({ total: 5, done: 4, failed: 1 })]);
+    refresh();
+    expect(tasks()).toHaveTextContent("5/5Finished, 1 failed");
+    // A cleared summary takes the row away.
+    mockConversations([run(null)]);
+    refresh();
+    expect(within(card).queryByTestId("session-tooltip-tasks")).toBeNull();
+  });
+
+  it("names a workflow run's step on the card from before sidebar grouping", async () => {
+    mockConversations([
+      conv("legacy_run", "Claude Code", {
+        plan_progress: {
+          total: 2,
+          done: 1,
+          started: 1,
+          step: { name: "Ship it", state: "started" },
+        },
+      }),
+    ]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "legacy_run" }), {
+      pointerType: "mouse",
+    });
+    const card = await screen.findByTestId("session-tooltip-content");
+    expect(within(card).getByTestId("session-tooltip-tasks")).toHaveTextContent("1/2Ship it");
+  });
+
+  it("names a pinned workflow run's step on its project card", async () => {
+    projectsMock.push("Customer X");
+    seedPins(["pinned_run"]);
+    mockConversations([
+      conv("pinned_run", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        plan_progress: { total: 3, done: 1, step: { name: "Ship it", state: "next" } },
+      }),
+    ]);
+    renderSidebar();
+
+    fireEvent.focus(screen.getByRole("link", { name: "pinned_run" }));
+    const card = await screen.findByTestId("pinned-project-flyout");
+    expect(within(card).getByTestId("session-tooltip-tasks")).toHaveTextContent("1/3Next: Ship it");
+  });
+
   describe.each(["legacy", "grouping", "pinned"] as const)(
     "%s hover surface sharing explanation",
     (surface) => {

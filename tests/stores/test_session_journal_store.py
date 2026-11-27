@@ -13,7 +13,14 @@ import sqlalchemy as sa
 
 from omnigent.db import current_query_name
 from omnigent.db.compression import EncryptedTextPayload, decode, encode_encrypted
-from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlSessionJournalEntry
+from omnigent.db.db_models import (
+    MAX_STORED_VALUE_BYTES,
+    PLAN_PROGRESS_MAX_STORED_BYTES,
+    SqlSessionJournalEntry,
+    SqlSessionJournalHead,
+    current_workspace_id,
+)
+from omnigent.db.enum_codecs import encode_journal_entry_kind
 from omnigent.db.utils import get_or_create_engine, shared_read_scope
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.session_journal import (
@@ -942,6 +949,7 @@ def test_an_automation_runs_start_plan_is_its_first(
         scheduled_task_run_id=RUN,
     )
     journal.append(OTHER, "note", {"body": "x"}, idempotency_key="k3", scheduled_task_run_id=RUN)
+    assert journal.plan_progress_by_session([SESSION])[SESSION]["step"] is None
 
     plans = journal.run_start_plans([(RUN, SESSION), (other_run, SESSION), (RUN, OTHER)])
     assert [plan.id if plan else None for plan in plans] == [first.id, None, None]
@@ -986,6 +994,9 @@ def test_an_automation_runs_start_plan_is_its_first(
     second = journal.run_start_plans([(other_run, SESSION)])[0]
     assert second is not None
     assert second.content["steps"] == first.content["steps"]
+    # The next run's progress starts over, whichever write starts it.
+    progress = journal.plan_progress_by_session([SESSION])[SESSION]
+    assert (progress["done"], progress["step"]["name"]) == (0, "First")
     assert journal.run_latest_plans([first, second]) == [replan, second]
     assert not journal.is_current_run(SESSION, first.id, RUN)
     assert journal.is_current_run(SESSION, second.id, other_run)
@@ -1057,9 +1068,16 @@ def test_a_deployment_encrypts_content_a_batch_at_a_time(
         SESSION, "status", {"status": "done", "text": "ok"}, idempotency_key="k2", step="a"
     )
     sealed.calls.clear()
-    # Revision metadata comes from the plan before encrypting the new status.
+    # Revision metadata comes from the plan before encrypting the new status; the
+    # plan's progress then reads its steps' statuses and is encrypted like content.
     sealed.append(SESSION, "status", {"status": "started"}, idempotency_key="k3", step="b")
-    assert sealed.calls == [("decrypt", 1), ("decrypt", 1), ("encrypt", 1)]
+    assert sealed.calls == [
+        ("decrypt", 1),
+        ("decrypt", 1),
+        ("encrypt", 1),
+        ("decrypt", 1),
+        ("encrypt", 1),
+    ]
 
     sealed.calls.clear()
     entries = sealed.list_entries(SESSION).entries
@@ -1071,6 +1089,11 @@ def test_a_deployment_encrypts_content_a_batch_at_a_time(
     }
     assert sealed.calls == [("decrypt", 3), ("decrypt", 2)]
 
+    sealed.calls.clear()
+    progress = sealed.plan_progress_by_session([SESSION, OTHER])
+    assert progress[SESSION]["step"] == {"name": "B", "state": "started"}
+    assert sealed.calls == [("decrypt", 1)]
+
     # Stored values say they're encrypted, so a store without the key fails closed.
     with sa.create_engine(db_uri).connect() as conn:
         stored = conn.execute(
@@ -1078,6 +1101,11 @@ def test_a_deployment_encrypts_content_a_batch_at_a_time(
             {"id": bytes.fromhex(SESSION)},
         ).scalars()
         assert {bytes(value)[:2] for value in stored} == {b"\x00\x02"}
+        stored_progress = conn.execute(
+            sa.text("SELECT plan_progress FROM session_journal_heads WHERE conversation_id = :id"),
+            {"id": bytes.fromhex(SESSION)},
+        ).scalar_one()
+        assert bytes(stored_progress)[:2] == b"\x00\x02"
     with pytest.raises(ValueError, match="decryptor"):
         SessionJournalStore(db_uri).list_entries(SESSION)
 
@@ -1085,6 +1113,20 @@ def test_a_deployment_encrypts_content_a_batch_at_a_time(
     bloated = _SealedJournal(db_uri, overhead=MAX_STORED_VALUE_BYTES)
     with pytest.raises(JournalEntryTooLargeError):
         _note(bloated, "k4")
+
+
+def test_progress_that_outgrows_its_column_is_cleared_not_written(
+    db_uri: str, conversations: SqlAlchemyConversationStore
+) -> None:
+    del conversations
+    SessionJournalStore(db_uri).append(SESSION, "plan", _plan("a"), idempotency_key="k1")
+    bloated = _SealedJournal(db_uri, overhead=PLAN_PROGRESS_MAX_STORED_BYTES)
+
+    # The status still goes through; only the progress is left out.
+    bloated.append(SESSION, "status", {"status": "started"}, idempotency_key="k2", step="a")
+
+    assert bloated.plan_progress_by_session([SESSION]) == {}
+    assert [entry.step for entry in bloated.list_entries(SESSION, kind="status").entries] == ["a"]
 
 
 def test_a_full_journal_refuses_new_entries_but_returns_retried_ones(
@@ -1126,3 +1168,214 @@ def test_a_full_journal_refuses_new_entries_but_returns_retried_ones(
     )
     assert next_run.entry.position == 5
     assert retry.entry == next_run.entry and not retry.created
+
+
+# ── Plan progress ─────────────────────────────────────
+
+
+def _status(journal: SessionJournalStore, key: str, step: str, value: str) -> None:
+    content = {"status": value, **({} if value == "started" else {"text": "x"})}
+    journal.append(SESSION, "status", content, idempotency_key=key, step=step)
+
+
+def _progress(journal: SessionJournalStore) -> dict[str, object]:
+    return journal.plan_progress_by_session([SESSION])[SESSION]
+
+
+def test_plan_and_status_writes_record_where_the_plan_stands(
+    journal: SessionJournalStore,
+) -> None:
+    steps = [
+        {"id": "build", "name": "Build"},
+        {"id": "ship", "name": "Ship", "depends_on": ["build"]},
+    ]
+    journal.append(SESSION, "plan", {"name": "Release", "steps": steps}, idempotency_key="k0")
+    assert _progress(journal) == {
+        "total": 2,
+        "done": 0,
+        "failed": 0,
+        "started": 0,
+        "needs_input": 0,
+        "step": {"name": "Build", "state": "next"},
+    }
+
+    _status(journal, "k1", "build", "started")
+    assert _progress(journal)["step"] == {"name": "Build", "state": "started"}
+    _status(journal, "k2", "build", "done")
+    assert _progress(journal)["step"] == {"name": "Ship", "state": "next"}
+    _status(journal, "k3", "ship", "needs_input")
+    assert _progress(journal)["step"] == {"name": "Ship", "state": "needs_input"}
+    _status(journal, "k4", "ship", "done")
+    finished = _progress(journal)
+    assert finished["done"] == 2 and finished["step"] is None
+
+    # A note, a retried write and a refused one leave it as it is.
+    _note(journal, "k5")
+    _status(journal, "k1", "build", "started")
+    with pytest.raises(InvalidJournalEntryError):
+        _status(journal, "k6", "ship", "bogus")
+    assert _progress(journal) == finished
+    # Sessions without a plan, or that don't exist, have none.
+    assert journal.plan_progress_by_session([OTHER, MISSING]) == {}
+    assert journal.plan_progress_by_session([]) == {}
+
+
+def test_a_replan_keeps_the_runs_statuses_and_a_rerun_starts_afresh(
+    journal: SessionJournalStore,
+) -> None:
+    journal.append(SESSION, "plan", _plan("a", "b"), idempotency_key="k0", workflow_id=WORKFLOW)
+    _status(journal, "k1", "a", "done")
+    _status(journal, "k2", "b", "started")
+
+    journal.append(SESSION, "plan", _plan("a", "b", "c"), idempotency_key="k3")
+    replanned = _progress(journal)
+    assert (replanned["total"], replanned["done"], replanned["started"]) == (3, 1, 1)
+    assert replanned["step"] == {"name": "B", "state": "started"}
+
+    # Running the workflow again starts its steps over.
+    journal.append(SESSION, "plan", _plan("a", "b"), idempotency_key="k4", workflow_id=WORKFLOW)
+    rerun = _progress(journal)
+    assert (rerun["done"], rerun["started"], rerun["step"]) == (
+        0,
+        0,
+        {"name": "A", "state": "next"},
+    )
+
+
+def test_a_copied_journal_records_its_progress_when_refreshed(
+    journal: SessionJournalStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    journal.append(SESSION, "plan", _plan("build", "ship"), idempotency_key="k0")
+    _status(journal, "k1", "build", "done")
+    _status(journal, "k2", "ship", "started")
+    fork = conversations.fork_conversation(SESSION)
+    # Copying entries isn't an append, so it records nothing on its own.
+    assert journal.plan_progress_by_session([fork.id]) == {}
+
+    journal.refresh_plan_progress(fork.id)
+
+    assert journal.plan_progress_by_session([fork.id])[fork.id] == _progress(journal)
+    # Sessions without a journal, or that don't exist, are left alone.
+    journal.refresh_plan_progress(OTHER)
+    journal.refresh_plan_progress(MISSING)
+    assert journal.plan_progress_by_session([OTHER, MISSING]) == {}
+
+
+def test_a_legacy_replan_before_a_done_final_step_keeps_the_plan_open(
+    journal: SessionJournalStore,
+) -> None:
+    work = {"id": "work", "name": "Work"}
+    journal.append(
+        SESSION,
+        "plan",
+        {
+            "name": "Plan",
+            "steps": [work, {"id": "report", "name": "Report", "depends_on": ["work"]}],
+        },
+        idempotency_key="k0",
+    )
+    _status(journal, "k1", "work", "done")
+    _status(journal, "k2", "report", "done")
+    inserted = [
+        work,
+        {"id": "review", "name": "Review", "depends_on": ["work"]},
+        {"id": "report", "name": "Report", "depends_on": ["review"]},
+    ]
+    journal.append(SESSION, "plan", {"name": "Plan", "steps": inserted}, idempotency_key="k3")
+    # The journal was written before graph revisions.
+    with sa.create_engine(journal.storage_location).begin() as connection:
+        for entry in journal.list_entries(SESSION).entries:
+            content = {
+                key: value for key, value in entry.content.items() if key != "graph_revision"
+            }
+            connection.execute(
+                sa.update(SqlSessionJournalEntry)
+                .where(SqlSessionJournalEntry.id == entry.id)
+                .values(content=journal._stored_contents([content])[0])
+            )
+
+    # A save that only renames it keeps the legacy graph, which began after report was done.
+    journal.append(SESSION, "plan", {"name": "Renamed", "steps": inserted}, idempotency_key="k4")
+
+    assert _progress(journal)["step"] == {"name": "Review", "state": "next"}
+
+
+def test_progress_an_older_server_left_behind_is_ignored_until_rewritten(
+    journal: SessionJournalStore,
+) -> None:
+    journal.append(SESSION, "plan", _plan("build", "ship"), idempotency_key="k0")
+    _status(journal, "k1", "build", "started")
+    assert _progress(journal)["step"] == {"name": "Build", "state": "started"}
+
+    # A server that doesn't record progress finishes build: it appends and
+    # advances the head, leaving the progress as it was.
+    plan = journal.current_plan(SESSION)
+    assert plan is not None
+    position = len(journal.list_entries(SESSION).entries)
+    done = {"status": "done", "text": "x", "graph_revision": plan.content["graph_revision"]}
+    with sa.create_engine(journal.storage_location).begin() as connection:
+        connection.execute(
+            sa.insert(SqlSessionJournalEntry).values(
+                workspace_id=current_workspace_id(),
+                conversation_id=SESSION,
+                position=position,
+                created_at=1,
+                id="e" * 32,
+                kind=encode_journal_entry_kind("status"),
+                step="build",
+                idempotency_key="older-server",
+                content=journal._stored_contents([done])[0],
+            )
+        )
+        connection.execute(
+            sa.update(SqlSessionJournalHead)
+            .where(SqlSessionJournalHead.conversation_id == SESSION)
+            .values(next_position=position + 1)
+        )
+    assert journal.plan_progress_by_session([SESSION]) == {}
+
+    # A note doesn't make the old progress current again.
+    _note(journal, "k2")
+    assert journal.plan_progress_by_session([SESSION]) == {}
+    # The next status write records it afresh, counting the older server's write.
+    _status(journal, "k3", "ship", "started")
+    progress = _progress(journal)
+    assert (progress["done"], progress["step"]) == (1, {"name": "Ship", "state": "started"})
+
+
+class _UnreadableProgressJournal(SessionJournalStore):
+    """A codec that can't read a batch naming the step "Unreadable", or anything when broken."""
+
+    def __init__(self, storage_location: str, *, broken: bool = False) -> None:
+        super().__init__(storage_location)
+        self.broken = broken
+        self.calls = 0
+
+    def _decode_contents(self, stored: Sequence[bytes]) -> list[str]:
+        self.calls += 1
+        texts = super()._decode_contents(stored)
+        if self.broken or any("Unreadable" in text for text in texts):
+            raise ValueError("no key for this value")
+        return texts
+
+
+def test_an_unreadable_progress_value_hides_only_its_own_session(
+    journal: SessionJournalStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    journal.append(SESSION, "plan", _plan("unreadable"), idempotency_key="k0")
+    journal.append(OTHER, "plan", _plan("fine"), idempotency_key="k1")
+
+    reader = _UnreadableProgressJournal(journal.storage_location)
+
+    assert set(reader.plan_progress_by_session([SESSION, OTHER])) == {OTHER}
+
+    # A codec that reads nothing is tried value by value only a few times per page.
+    sessions = [SESSION, OTHER]
+    for index in range(4):
+        session_id = f"{index + 1:032x}"
+        conversations.create_conversation(conversation_id=session_id)
+        journal.append(session_id, "plan", _plan("fine"), idempotency_key="k")
+        sessions.append(session_id)
+    broken = _UnreadableProgressJournal(journal.storage_location, broken=True)
+    assert broken.plan_progress_by_session(sessions) == {}
+    assert broken.calls == 1 + 3

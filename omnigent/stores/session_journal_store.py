@@ -5,7 +5,10 @@ session's metadata. An append locks the session's ``session_journal_heads`` row,
 which allocates positions, so one session's appends run one at a time while
 other sessions' appends and the session's metadata updates don't wait. An
 append carries an idempotency key, so a retried append returns the entry its
-first attempt wrote instead of writing it twice.
+first attempt wrote instead of writing it twice. A plan or status write also
+rewrites the heads row's plan progress, which session lists read by primary key,
+with the position it was recorded at, so progress a server that doesn't record
+it left behind is ignored rather than shown.
 
 An entry's content is the kind's compressed JSON, at most
 :data:`~omnigent.db.db_models.MAX_STORED_VALUE_BYTES` bytes stored. The store
@@ -19,12 +22,14 @@ call. The size check runs on the encoded bytes, so an agent gets
 from __future__ import annotations
 
 import json
+import logging
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from itertools import batched
 from typing import Any, TypeVar
 
-from sqlalchemy import Select, delete, func, select, tuple_, update
+from sqlalchemy import Select, case, delete, func, select, tuple_, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -33,6 +38,7 @@ from sqlalchemy.orm import Session
 from omnigent.db import compression
 from omnigent.db.db_models import (
     MAX_STORED_VALUE_BYTES,
+    PLAN_PROGRESS_MAX_STORED_BYTES,
     SqlConversationMetadata,
     SqlSessionJournalEntry,
     SqlSessionJournalHead,
@@ -46,6 +52,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.entities.plan_progress import plan_progress
 from omnigent.entities.session_journal import (
     IDEMPOTENCY_KEY_MAX_CHARS,
     JOURNAL_KINDS,
@@ -65,6 +72,8 @@ from omnigent.entities.session_journal import (
 from omnigent.errors import StaleCursorError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
+_logger = logging.getLogger(__name__)
+
 _PLAN_KIND = encode_journal_entry_kind("plan")
 _STATUS_KIND = encode_journal_entry_kind("status")
 _PLAN_STATUS_KIND = encode_journal_entry_kind("plan_status")
@@ -79,6 +88,10 @@ JOURNAL_DELETE_BATCH = 200
 JOURNAL_COPY_BATCH = 200
 
 _Statement = TypeVar("_Statement", bound=Select[Any])
+# Leaves a heads row's plan progress as it is.
+_UNSET: Any = object()
+# After this many unreadable progress values in a row, a page read stops decoding them.
+_PROGRESS_DECODE_FAILURES = 3
 
 
 def _using(statement: _Statement, index: str) -> _Statement:
@@ -106,15 +119,39 @@ class JournalSessionNotFoundError(Exception):
     """The session doesn't exist, or was deleted while the append ran."""
 
 
-def _set_next_position(session: Session, conversation_id: str, next_position: int) -> None:
-    """Advance a session's heads row, a primary-key update."""
-    session.execute(
-        update(SqlSessionJournalHead)
-        .where(
-            SqlSessionJournalHead.workspace_id == current_workspace_id(),
-            SqlSessionJournalHead.conversation_id == conversation_id,
+def _set_next_position(
+    session: Session,
+    conversation_id: str,
+    next_position: int,
+    plan_progress: Any = _UNSET,
+    *,
+    carried_from: int | None = None,
+) -> None:
+    """Advance a session's heads row, a primary-key update.
+
+    :param plan_progress: The encoded progress to store, recorded as of
+        *next_position*; ``None`` clears it. Left out, it stays as it is.
+    :param carried_from: The row's next position before this write. Progress left
+        as it is stays current only if it was current then, so progress an older
+        server left out of date stays out of date.
+    """
+    heads = SqlSessionJournalHead
+    values: dict[str, Any] = {"next_position": next_position}
+    if plan_progress is not _UNSET:
+        values["plan_progress"] = plan_progress
+        values["plan_progress_position"] = next_position
+    elif carried_from is not None:
+        values["plan_progress_position"] = case(
+            (heads.plan_progress_position == carried_from, next_position),
+            else_=heads.plan_progress_position,
         )
-        .values(next_position=next_position)
+    session.execute(
+        update(heads)
+        .where(
+            heads.workspace_id == current_workspace_id(),
+            heads.conversation_id == conversation_id,
+        )
+        .values(**values)
         .with_hint("FORCE INDEX (PRIMARY)", dialect_name="mysql")
     )
 
@@ -401,6 +438,52 @@ class SessionJournalStore:
             )
         ).scalar_one_or_none()
 
+    def _plan_progress_value(
+        self,
+        session: Session,
+        plan: JournalEntry,
+        *,
+        start_position: int | None,
+        fresh_run: bool,
+        written: JournalEntry | None,
+    ) -> bytes | None:
+        """The plan's progress after a write, encoded for the session's heads row.
+
+        One kind-and-step lookup per plan step reads its newest status in the run. A
+        plan from before graph revisions also reads where its graph began, in
+        bounded batches, as :meth:`plan_graph_revisions` does.
+
+        :param plan: The session's current plan, e.g. the one this write appends.
+        :param start_position: The current run's boundary, or ``None`` for a
+            session that never started one.
+        :param fresh_run: Whether this write starts a run, so no earlier status counts.
+        :param written: The status this write appends, which the lookups don't see.
+        :returns: The encoded progress, or ``None`` when it doesn't fit the column.
+        """
+        conversation_id = plan.conversation_id
+        steps = plan.content["steps"]
+        revision = plan.content.get("graph_revision")
+        if not isinstance(revision, str):
+            revision = self._legacy_graph_position(
+                plan, lambda _name: nullcontext(session), time_limited=False
+            )
+        rows = []
+        if not fresh_run:
+            for step in steps:
+                row = self._newest_status_row(
+                    session, conversation_id, step["id"], start_position=start_position
+                )
+                if row is not None:
+                    rows.append(row)
+        statuses = {entry.step: entry for entry in self._entries(rows) if entry.step}
+        if written is not None and written.step:
+            statuses[written.step] = written
+        progress = plan_progress(steps, statuses, graph_revision=revision)
+        (stored,) = self._encode_contents(
+            [json.dumps(progress, ensure_ascii=False, separators=(",", ":"))]
+        )
+        return stored if len(stored) <= PLAN_PROGRESS_MAX_STORED_BYTES else None
+
     def append(
         self,
         conversation_id: str,
@@ -462,6 +545,7 @@ class SessionJournalStore:
 
         def write(session: Session) -> tuple[SqlSessionJournalEntry, bool, dict[str, Any] | None]:
             position = self._lock_head(session, conversation_id)
+            head_position = position
             if not self._session_exists(session, conversation_id):
                 raise JournalSessionNotFoundError(f"session {conversation_id!r} not found")
             earlier = session.execute(
@@ -550,13 +634,46 @@ class SessionJournalStore:
                     **({"graph_revision": graph_revision} if graph_revision is not None else {}),
                 }
                 entry_text = self._stored_contents([entry_content])[0]
-            if (
-                position + 1 + int(starts_run) + int(copied_plan_text is not None)
-                > JOURNAL_MAX_ENTRIES
-            ):
+            entry_position = position + int(starts_run) + int(copied_plan_text is not None)
+            if entry_position + 1 > JOURNAL_MAX_ENTRIES:
                 raise JournalFullError(JOURNAL_MAX_ENTRIES)
             stamp = now_epoch()
             entry_id = uuid.uuid4().hex
+            progress = _UNSET
+            written = JournalEntry(
+                id=entry_id,
+                conversation_id=conversation_id,
+                position=entry_position,
+                created_at=stamp,
+                kind=kind,
+                step=entry_step,
+                scheduled_task_run_id=scheduled_task_run_id,
+                content=entry_content,
+            )
+            current_plan = written if kind == "plan" else None
+            # A status's plan is the current one; a note decodes it only when it starts a run.
+            if kind != "plan" and previous is not None and previous_content:
+                # A new run's copied plan comes just before what this write appends.
+                current_plan = JournalEntry(
+                    id=previous.id,
+                    conversation_id=conversation_id,
+                    position=entry_position - 1 if starts_run else previous.position,
+                    created_at=previous.created_at,
+                    kind="plan",
+                    step=None,
+                    scheduled_task_run_id=previous.scheduled_task_run_id,
+                    content={**previous_content, "graph_revision": graph_revision}
+                    if starts_run
+                    else previous_content,
+                )
+            if current_plan is not None:
+                progress = self._plan_progress_value(
+                    session,
+                    current_plan,
+                    start_position=boundary.position if boundary is not None else None,
+                    fresh_run=starts_run,
+                    written=written if kind == "status" else None,
+                )
             if starts_run:
                 session.add(
                     SqlSessionJournalEntry(
@@ -605,7 +722,9 @@ class SessionJournalStore:
                 content=entry_text,
             )
             session.add(row)
-            _set_next_position(session, conversation_id, position + 1)
+            _set_next_position(
+                session, conversation_id, position + 1, progress, carried_from=head_position
+            )
             return row, True, entry_content
 
         row, created, entry_content = run_write_transaction(
@@ -625,6 +744,46 @@ class SessionJournalStore:
             workflow_id=row.workflow_id,
         )
         return JournalAppend(entry=entry, created=created)
+
+    def refresh_plan_progress(self, conversation_id: str) -> None:
+        """Record where the session's plan stands from its journal as it is now.
+
+        For a journal written without :meth:`append`, such as a fork's copy. Locks
+        the heads row as an append does, so it can't overwrite a newer write's.
+
+        :param conversation_id: The session, e.g. a fork that copied a run.
+        """
+
+        def write(session: Session) -> None:
+            heads = SqlSessionJournalHead
+            next_position = session.execute(
+                select(heads.next_position)
+                .where(
+                    heads.workspace_id == current_workspace_id(),
+                    heads.conversation_id == conversation_id,
+                )
+                .with_for_update()
+                .with_hint(heads, "FORCE INDEX (PRIMARY)", "mysql")
+            ).scalar_one_or_none()
+            plan_row = (
+                self._newest_kind_row(session, conversation_id, _PLAN_KIND)
+                if next_position is not None
+                else None
+            )
+            if next_position is None or plan_row is None:
+                return
+            (plan,) = self._entries([plan_row])
+            boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+            progress = self._plan_progress_value(
+                session,
+                plan,
+                start_position=boundary.position if boundary is not None else None,
+                fresh_run=False,
+                written=None,
+            )
+            _set_next_position(session, conversation_id, next_position, progress)
+
+        run_write_transaction(self._session_immediate, "refresh_plan_progress", write)
 
     # ── Reads ─────────────────────────────────────────
 
@@ -712,6 +871,82 @@ class SessionJournalStore:
             row = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
         return None if row is None else self._entries([row])[0]
 
+    def plan_progress_by_session(
+        self, conversation_ids: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Where each session's current plan stands, for a page of session rows.
+
+        One primary-key read of the sessions' heads rows; no journal is read.
+
+        :param conversation_ids: The sessions, e.g. a page of the session list.
+        :returns: Each session's progress by ID, as
+            :func:`~omnigent.entities.plan_progress.plan_progress` returns it. A
+            session is left out until a plan or status write records it, and
+            while a server that doesn't record progress has written since.
+        """
+        ids = list(dict.fromkeys(conversation_ids))
+        if not ids:
+            return {}
+        heads = SqlSessionJournalHead
+        with self._session("read_plan_progress") as session:
+            rows = session.execute(
+                select(
+                    heads.conversation_id,
+                    heads.next_position,
+                    heads.plan_progress_position,
+                    heads.plan_progress,
+                )
+                .where(
+                    heads.workspace_id == current_workspace_id(),
+                    heads.conversation_id.in_(ids),
+                )
+                .with_hint(heads, "FORCE INDEX (PRIMARY)", "mysql")
+            ).all()
+        recorded = [
+            (row.conversation_id, row.plan_progress)
+            for row in rows
+            if row.plan_progress and row.plan_progress_position == row.next_position
+        ]
+        progress: dict[str, dict[str, Any]] = {}
+        for (conversation_id, _), text in zip(
+            recorded, self._decode_progress([stored for _, stored in recorded]), strict=True
+        ):
+            try:
+                value = json.loads(text) if text is not None else None
+            except ValueError:
+                value = None
+            if isinstance(value, dict):
+                progress[conversation_id] = value
+        return progress
+
+    def _decode_progress(self, stored: Sequence[bytes]) -> list[str | None]:
+        """Decode a page's progress values in one batch, or one at a time if that fails.
+
+        One at a time, an unreadable value reads as ``None`` instead of hiding every
+        session's progress. Three failures in a row mean the codec itself is failing,
+        so the rest read as ``None`` without a call each.
+        """
+        try:
+            return list(self._decode_contents(stored))
+        except Exception:
+            _logger.warning("Could not decode a page of plan progress", exc_info=True)
+        texts: list[str | None] = []
+        failures = 0
+        for value in stored:
+            if failures >= _PROGRESS_DECODE_FAILURES:
+                texts.append(None)
+                continue
+            try:
+                (text,) = self._decode_contents([value])
+            except Exception:
+                _logger.debug("Skipped an unreadable plan progress value", exc_info=True)
+                failures += 1
+                texts.append(None)
+            else:
+                failures = 0
+                texts.append(text)
+        return texts
+
     def run_latest_plans(self, plans: Sequence[JournalEntry]) -> list[JournalEntry]:
         """Each run's latest plan before the next invocation, in input order.
 
@@ -763,50 +998,72 @@ class SessionJournalStore:
         Legacy history is read in bounded batches and stops at a changed graph
         or invocation boundary. Metadata-only saves don't reopen completed work.
         """
-        entries = SqlSessionJournalEntry
         revisions: list[str | int] = []
         for plan in plans:
             revision = plan.content.get("graph_revision")
-            if isinstance(revision, str):
-                revisions.append(revision)
-                continue
-            with self._history_session("read_plan_graph_boundary") as session:
-                boundary = self._newest_kind_row(
-                    session, plan.conversation_id, _PLAN_STATUS_KIND, before_position=plan.position
-                )
-                boundary_position = boundary.position if boundary else -1
-            graph = _plan_graph(plan.content)
-            position = plan.position
-            while True:
-                with self._history_session("read_plan_graph_revisions") as session:
-                    rows = list(
-                        session.execute(
-                            _using(
-                                select(entries)
-                                .prefix_with("/*+ MAX_EXECUTION_TIME(1000) */", dialect="mysql")
-                                .where(
-                                    entries.workspace_id == current_workspace_id(),
-                                    entries.conversation_id == plan.conversation_id,
-                                    entries.kind == _PLAN_KIND,
-                                    entries.position < position,
-                                    entries.position > boundary_position,
-                                )
-                                .order_by(entries.position.desc())
-                                .limit(JOURNAL_COPY_BATCH),
-                                "ix_session_journal_entries_kind",
-                            )
-                        ).scalars()
-                    )
-                for previous in self._entries(rows):
-                    if _plan_graph(previous.content) != graph:
-                        break
-                    position = previous.position
-                else:
-                    if len(rows) == JOURNAL_COPY_BATCH:
-                        continue
-                break
-            revisions.append(position)
+            revisions.append(
+                revision
+                if isinstance(revision, str)
+                else self._legacy_graph_position(plan, self._history_session)
+            )
         return revisions
+
+    def _legacy_graph_position(
+        self,
+        plan: JournalEntry,
+        sessions: Callable[[str], AbstractContextManager[Session]],
+        *,
+        time_limited: bool = True,
+    ) -> int:
+        """Where a plan without a graph revision got its graph: the position of the
+        earliest plan since its run's boundary with the same steps and dependencies.
+
+        Reads history in bounded batches and stops at a changed graph or the boundary.
+
+        :param sessions: Opens a session for a named query, one per read.
+        :param time_limited: Cap each MySQL read's run time, as a page read does. A
+            write passes ``False``: a slow read must not fail the append it's part of.
+        """
+        entries = SqlSessionJournalEntry
+        with sessions("read_plan_graph_boundary") as session:
+            boundary = self._newest_kind_row(
+                session, plan.conversation_id, _PLAN_STATUS_KIND, before_position=plan.position
+            )
+            boundary_position = boundary.position if boundary else -1
+        graph = _plan_graph(plan.content)
+        position = plan.position
+        while True:
+            with sessions("read_plan_graph_revisions") as session:
+                statement = select(entries)
+                if time_limited:
+                    statement = statement.prefix_with(
+                        "/*+ MAX_EXECUTION_TIME(1000) */", dialect="mysql"
+                    )
+                rows = list(
+                    session.execute(
+                        _using(
+                            statement.where(
+                                entries.workspace_id == current_workspace_id(),
+                                entries.conversation_id == plan.conversation_id,
+                                entries.kind == _PLAN_KIND,
+                                entries.position < position,
+                                entries.position > boundary_position,
+                            )
+                            .order_by(entries.position.desc())
+                            .limit(JOURNAL_COPY_BATCH),
+                            "ix_session_journal_entries_kind",
+                        )
+                    ).scalars()
+                )
+            for previous in self._entries(rows):
+                if _plan_graph(previous.content) != graph:
+                    break
+                position = previous.position
+            else:
+                if len(rows) == JOURNAL_COPY_BATCH:
+                    continue
+            break
+        return position
 
     def current_run_plan_ids(self, plans: Sequence[JournalEntry]) -> set[str]:
         """Which plans belong to their session's latest run, including its replans.

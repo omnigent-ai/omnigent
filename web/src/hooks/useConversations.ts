@@ -90,6 +90,7 @@ import {
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
+import type { SessionPlanProgress } from "@/lib/sessionPlanProgress";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
 import { isSessionWorking } from "./useSessionState";
@@ -297,6 +298,12 @@ export interface Conversation {
    * older servers.
    */
   pull_requests_synced?: boolean | null;
+  /**
+   * Where the session's current plan stands, so a workflow run's row names its
+   * step without reading the journal. Absent for a session with no plan and on
+   * older servers.
+   */
+  plan_progress?: SessionPlanProgress | null;
   /**
    * Whether the viewer owns this session and has shared it with anyone else.
    * Absent for non-owners and on older servers; treat absent as "not shared".
