@@ -389,9 +389,11 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             global_config[key] = {**current, flag: True}
             global_config[key + "At"] = now_ms
         native_config.write_text(json.dumps(global_config))
+        env["CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF"] = "1"
         native_feature_profile = {
             "flag": flag,
             "fixture_value": True,
+            "cache_reader_with_telemetry_off": True,
             "binary_sha256": binary_digest,
             "config_path": str(native_config),
             "diagnostic_only": True,
