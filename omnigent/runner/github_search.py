@@ -30,7 +30,8 @@ def _searching(root: str, reference: PullRequestRef) -> Iterator[str | None]:
     """One deadline for a search's calls, and the token of its repository's account.
 
     The host is checked first, so no ``gh`` call, the token lookup included, names a host
-    the user never set up for GitHub.
+    the user never set up for GitHub. With no account chosen, or its token unreadable, the
+    search runs as gh's active account, as the reviewer picker's read does.
     """
     if not github._known_github_host(reference.host):
         raise PullRequestError(_UNKNOWN_HOST)

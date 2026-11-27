@@ -347,6 +347,16 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
             pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png"),
             "The attachment is empty",
         ),
+        (
+            "SearchReviewers",
+            pb.SearchReviewersRequest(pr_url=_PR, page_size=21),
+            "Ask for at most 20 reviewers",
+        ),
+        (
+            "SearchCompletions",
+            pb.SearchCompletionsRequest(pr_url=_PR, text="al"),
+            "Choose what to complete: people or pull requests",
+        ),
     ],
     ids=[
         "account-without-pr",
@@ -357,6 +367,8 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         "upload-long-name",
         "upload-long-url",
         "upload-empty",
+        "reviewer-page-too-large",
+        "completion-of-no-kind",
     ],
 )
 async def test_a_request_the_api_doesnt_serve_is_refused_before_the_vouch(

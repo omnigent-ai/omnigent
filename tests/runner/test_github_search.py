@@ -39,6 +39,7 @@ class FakeGraphQL:
         }
         self.raw_output: str | None = None
         self.exit_code = 0
+        self.token_exit_code = 0
         # The teams with access to the repository, or ``None`` when GitHub refuses the list.
         self.teams: list[dict[str, Any]] | None = []
 
@@ -49,6 +50,8 @@ class FakeGraphQL:
             self.calls.append(argv[1:])
             self.envs.append(env)
             if argv[1:3] == ["auth", "token"]:
+                if self.token_exit_code:
+                    return self.token_exit_code, "", "no oauth token found for octocat"
                 return 0, TOKEN + "\n", ""
             assert argv[1] == "api", argv
             if argv[-1].startswith(f"repos/{REPOSITORY}/teams"):
@@ -223,6 +226,20 @@ def test_a_search_runs_as_the_account_saved_for_the_repository(
     api_envs = [env for call, env in zip(fake.calls, fake.envs, strict=True) if call[0] == "api"]
     assert len(api_envs) == 2
     assert all(env is not None and env["GH_TOKEN"] == TOKEN for env in api_envs)
+
+
+def test_a_saved_account_whose_token_cant_be_read_searches_as_ghs_active_one(
+    tmp_path: Path, fake: FakeGraphQL, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As the reviewer picker's read: a read falls back rather than fail outright."""
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _key: "octocat")
+    fake.token_exit_code = 1
+
+    github_search.search_reviewers(str(tmp_path), _reference(), text="a", page_size=0)
+
+    api_envs = [env for call, env in zip(fake.calls, fake.envs, strict=True) if call[0] == "api"]
+    assert len(api_envs) == 2
+    assert all(env is None or "GH_TOKEN" not in env for env in api_envs)
 
 
 def test_a_pr_on_a_host_never_set_up_runs_no_gh_with_an_enterprise_token(
