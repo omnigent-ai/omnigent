@@ -280,6 +280,7 @@ jobs:
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: claude
+          version: "2.1.323"
 
       - name: Install Codex CLI
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
