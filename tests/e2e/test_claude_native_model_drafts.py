@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge, model_switch
+from omnigent.process_logging import redact_log_text
 from tests._helpers.mock_llm import advertised_tool_names
 from tests._helpers.native_claude import (
     _PINNED_CLAUDE_MODELS,
@@ -312,7 +313,16 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
                             indent=2,
                         )
                     )
-                    assert response.status_code == 200, response.text
+                    assert response.status_code == 200, {
+                        "response": response.text,
+                        "model_control_failure": [
+                            redact_log_text(line, include_whitespace_credentials=True)[:2048]
+                            for line in (tmp_path / "server" / "server.log")
+                            .read_text(errors="replace")
+                            .splitlines()
+                            if "Model change not applied to the terminal" in line
+                        ][-1:],
+                    }
                     assert pending, "Model control must finish before the active turn is released"
                     assert claude_settings_snapshot(settings_path) == saved_settings
                     poll_until(
