@@ -834,7 +834,7 @@ signal.pause()
             assert not stalled_worker, "Request worker stalled after pinned and launcher cleanup"
 
 
-@pytest.mark.skipif(shutil.which("bwrap") is None, reason="requires Bubblewrap")
+@pytest.mark.skipif(shutil.which("bwrap", path=os.defpath) is None, reason="requires Bubblewrap")
 @pytest.mark.parametrize("ending", ["complete", "timeout", "cancel"])
 @pytest.mark.timeout(60)
 def test_real_request_retires_the_namespace_and_detached_output_holders(
