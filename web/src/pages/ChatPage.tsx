@@ -455,7 +455,8 @@ export function BtwSidechatAnswer({ answer }: { answer: string }) {
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
   const activeConversationId = useChatStore((s) => s.conversationId);
-  const warmSwitchPending = isWarmSwitchPending(activeConversationId, urlConvId);
+  const rebasePath = useRebasePath();
+  const warmSwitchPending = isWarmSwitchPending(activeConversationId, urlConvId, rebasePath);
   const effectiveConvId = warmSwitchPending ? (activeConversationId ?? undefined) : urlConvId;
   const [sessionUi, setSessionUi] = useState({ conversationId: effectiveConvId, key: 0 });
   if (sessionUi.conversationId !== effectiveConvId) {
@@ -470,7 +471,6 @@ export function ChatPage() {
   const sessionConvId = isTempConvId(effectiveConvId) ? undefined : effectiveConvId;
   const navigate = useNavigate();
   const { pathname, search } = useLocation();
-  const rebasePath = useRebasePath();
   const appName = useAppName();
   const {
     data: agents,

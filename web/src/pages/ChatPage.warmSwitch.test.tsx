@@ -1,11 +1,25 @@
 // Warm session switches with `warm_switch_keep_mounted_ui`: a sidebar-style
 // click switches the store with the navigation, so the commit landing
 // `/c/:id` skips the hydrating placeholder and the chat surface stays mounted.
-import { useLayoutEffect } from "react";
+import { forwardRef, useLayoutEffect } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Link, MemoryRouter, Route, Routes, useParams } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, Route, Routes, useParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getBasePath, withBasePath } from "@/lib/basePath";
+import {
+  basenamedRouting,
+  Link,
+  reactRouterRouting,
+  RoutingProvider,
+  useRebasePath,
+  type OmnigentLinkProps,
+  type RoutingApi,
+} from "@/lib/routing";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Sidebar } from "@/shell/Sidebar";
+import { conversation } from "@/test/sidebarMockHelpers";
+import { sessionRowsPage } from "@/lib/sidebarData";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import * as capabilities from "@/lib/capabilities";
@@ -79,19 +93,38 @@ function SessionLink({
   cancelNavigation?: boolean;
   deferNavigation?: boolean;
 }) {
+  const rebasePath = useRebasePath();
   return (
     <Link
       to={`/c/${id}`}
       onClick={(event) => {
-        switchSessionBeforeNavigate(id);
+        switchSessionBeforeNavigate(id, rebasePath);
         if (cancelNavigation || deferNavigation) event.preventDefault();
-        if (deferNavigation && !cancelNavigation) window.history.pushState({}, "", `/c/${id}`);
+        if (deferNavigation && !cancelNavigation) {
+          window.history.pushState({}, "", withBasePath(rebasePath(`/c/${id}`)));
+        }
       }}
     >
       {label}
     </Link>
   );
 }
+
+const CancelingHostLink = forwardRef<HTMLAnchorElement, OmnigentLinkProps>(
+  function CancelingHostLink({ onClick, ...props }, ref) {
+    const BaseLink = reactRouterRouting.Link;
+    return (
+      <BaseLink
+        {...props}
+        ref={ref}
+        onClick={(event) => {
+          onClick?.(event);
+          event.preventDefault();
+        }}
+      />
+    );
+  },
+);
 
 function renderPage(
   features: Record<string, boolean>,
@@ -101,10 +134,15 @@ function renderPage(
     deferNavigation?: boolean;
     initialConversationId?: string;
     info?: Partial<capabilities.ServerInfo>;
+    routing?: RoutingApi;
+    sidebar?: boolean;
   } = {},
 ) {
   const info = { ...FALLBACK_SERVER_INFO, ...options.info, features };
-  const initialPath = `/c/${options.initialConversationId ?? "conv_a"}`;
+  const routing = options.routing ?? reactRouterRouting;
+  const initialPath = withBasePath(
+    routing.rebasePath(`/c/${options.initialConversationId ?? "conv_a"}`),
+  );
   window.history.replaceState({}, "", initialPath);
   const Router = options.deferNavigation ? MemoryRouter : BrowserRouter;
   vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue(info);
@@ -112,37 +150,44 @@ function renderPage(
     <QueryClientProvider client={qc}>
       <CapabilitiesProvider info={info}>
         <SidebarDataProvider>
-          <Router initialEntries={[initialPath]}>
-            <Routes>
-              <Route
-                path="c/:conversationId"
-                element={
-                  <>
-                    <RouteCommitLog />
-                    <SessionLink
-                      id="conv_a"
-                      label="open alpha"
-                      deferNavigation={options.deferNavigation}
-                    />
-                    <SessionLink
-                      id="conv_b"
-                      label="open beta"
-                      cancelNavigation={options.cancelBetaNavigation}
-                      deferNavigation={options.deferNavigation}
-                    />
-                    <SessionLink
-                      id="conv_c"
-                      label="open gamma"
-                      deferNavigation={options.deferNavigation}
-                    />
-                    <Link to="/c/conv_a">finish alpha navigation</Link>
-                    <Link to="/c/conv_b">finish beta navigation</Link>
-                    <Link to="/c/conv_c">finish gamma navigation</Link>
-                    <ChatPage />
-                  </>
-                }
-              />
-            </Routes>
+          <Router initialEntries={[initialPath]} basename={getBasePath() || undefined}>
+            <RoutingProvider value={routing}>
+              <Routes>
+                <Route
+                  path={routing.rebasePath("/c/:conversationId")}
+                  element={
+                    <>
+                      <RouteCommitLog />
+                      {options.sidebar && (
+                        <TooltipProvider>
+                          <Sidebar open onClose={() => {}} />
+                        </TooltipProvider>
+                      )}
+                      <SessionLink
+                        id="conv_a"
+                        label="open alpha"
+                        deferNavigation={options.deferNavigation}
+                      />
+                      <SessionLink
+                        id="conv_b"
+                        label="open beta"
+                        cancelNavigation={options.cancelBetaNavigation}
+                        deferNavigation={options.deferNavigation}
+                      />
+                      <SessionLink
+                        id="conv_c"
+                        label="open gamma"
+                        deferNavigation={options.deferNavigation}
+                      />
+                      <Link to="/c/conv_a">finish alpha navigation</Link>
+                      <Link to="/c/conv_b">finish beta navigation</Link>
+                      <Link to="/c/conv_c">finish gamma navigation</Link>
+                      <ChatPage />
+                    </>
+                  }
+                />
+              </Routes>
+            </RoutingProvider>
           </Router>
         </SidebarDataProvider>
       </CapabilitiesProvider>
@@ -154,6 +199,8 @@ function renderWarmComposer(
   options: {
     session?: Partial<Session>;
     info?: Partial<capabilities.ServerInfo>;
+    routing?: RoutingApi;
+    sidebar?: boolean;
   } = {},
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -172,7 +219,11 @@ function renderWarmComposer(
     });
   }
   useChatStore.setState({ boundAgentId: "agent_example" });
-  renderPage({ warm_switch_keep_mounted_ui: true }, qc, { info: options.info });
+  renderPage({ warm_switch_keep_mounted_ui: true }, qc, {
+    info: options.info,
+    routing: options.routing,
+    sidebar: options.sidebar,
+  });
 }
 
 beforeEach(() => {
@@ -229,6 +280,53 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
       ]),
     );
   });
+
+  it.each([false, true])(
+    "uses the host routing prefix for the real sidebar and chat (canceled: %s)",
+    async (canceled) => {
+      const basename = "/ml/omnigent-embed";
+      const rows = sessionRowsPage([conversation("conv_a"), conversation("conv_b")]);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string) => {
+          if (String(url).includes("/projects")) return Promise.resolve(new Response("[]"));
+          if (String(url).includes("/v1/sessions?"))
+            return Promise.resolve(new Response(JSON.stringify(rows)));
+          return new Promise<Response>(() => {});
+        }),
+      );
+      const routing = basenamedRouting(
+        basename,
+        canceled ? { ...reactRouterRouting, Link: CancelingHostLink } : reactRouterRouting,
+      );
+      renderWarmComposer({ routing, sidebar: true });
+      const row = await screen.findByText("conv_b");
+      await screen.findByText("alpha transcript");
+      const surface = transcriptNode();
+      const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+      vi.useFakeTimers();
+
+      fireEvent.click(row);
+      expect(useChatStore.getState().conversationId).toBe("conv_b");
+      if (!canceled) {
+        expect(screen.getByText("beta transcript")).toBeInTheDocument();
+        expect(screen.queryByText("Loading conversation…")).toBeNull();
+        expect(transcriptNode()).toBe(surface);
+      }
+      await act(() => vi.advanceTimersByTimeAsync(0));
+
+      const target = canceled ? "conv_a" : "conv_b";
+      expect(useChatStore.getState().conversationId).toBe(target);
+      expect(window.location.pathname).toBe(`${basename}/c/${target}`);
+      expect(commitLog.at(-1)).toMatchObject({ urlConvId: target, activeConversationId: target });
+      expect(screen.queryByText("Loading conversation…")).toBeNull();
+      if (canceled) expect(screen.getByText("alpha transcript")).toBeInTheDocument();
+      else {
+        expect(transcriptNode()).toBe(surface);
+        expect(switchTo.mock.calls).not.toContainEqual(["conv_a"]);
+      }
+    },
+  );
 
   it("flag off: the placeholder commits and the surface remounts as before", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -323,7 +421,6 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     expect(switchTo.mock.calls).not.toContainEqual(["conv_a"]);
     fireEvent.click(screen.getByRole("link", { name: "finish beta navigation" }));
     expect(commitLog.at(-1)).toMatchObject({ urlConvId: "conv_b", activeConversationId: "conv_b" });
-    expect(isWarmSwitchPending("conv_b", "conv_b")).toBe(false);
     expect(transcriptNode()).toBe(surface);
   });
 
@@ -592,7 +689,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
       window.history.pushState({}, "", "/c/conv_a");
       useChatStore.setState({ conversationId: "conv_a" });
     });
-    expect(isWarmSwitchPending("conv_a", temporaryId)).toBe(true);
+    expect(isWarmSwitchPending("conv_a", temporaryId, reactRouterRouting.rebasePath)).toBe(true);
     expect(screen.getByRole("textbox")).toBe(input);
     fireEvent.click(screen.getByRole("link", { name: "finish alpha navigation" }));
 

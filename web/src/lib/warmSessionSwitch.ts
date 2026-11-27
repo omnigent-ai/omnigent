@@ -1,5 +1,6 @@
 import { matchPath } from "react-router-dom";
-import { getBasePath } from "@/lib/basePath";
+import { withBasePath } from "@/lib/basePath";
+import type { RoutingApi } from "@/lib/routing";
 import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { isConversationStreamCurrent, useChatStore } from "@/store/chatStore";
@@ -8,24 +9,32 @@ export function warmSwitchKeepMountedEnabled(): boolean {
   return isFeatureEnabled(getCachedServerInfo() ?? "loading", "warm_switch_keep_mounted_ui");
 }
 
-function conversationIdFromPath(pathname: string): string | undefined {
-  return matchPath(`${getBasePath()}/c/:conversationId`, pathname)?.params.conversationId;
+function conversationIdFromPath(
+  pathname: string,
+  rebasePath: RoutingApi["rebasePath"],
+): string | undefined {
+  // Routing owns embed mounts; the server base path covers standalone proxies.
+  return matchPath(withBasePath(rebasePath("/c/:conversationId")), pathname)?.params.conversationId;
 }
 
 export function isWarmSwitchPending(
   activeConversationId: string | null,
   urlConvId: string | null | undefined,
+  rebasePath: RoutingApi["rebasePath"],
 ): boolean {
-  // Read the browser path during render: history moves before React's transitioned location.
+  // Read the browser path during render: history moves before React commits the route.
   return (
     warmSwitchKeepMountedEnabled() &&
     activeConversationId !== null &&
     activeConversationId !== urlConvId &&
-    conversationIdFromPath(window.location.pathname) === activeConversationId
+    conversationIdFromPath(window.location.pathname, rebasePath) === activeConversationId
   );
 }
 
-export function switchSessionBeforeNavigate(conversationId: string): void {
+export function switchSessionBeforeNavigate(
+  conversationId: string,
+  rebasePath: RoutingApi["rebasePath"],
+): void {
   if (!warmSwitchKeepMountedEnabled()) return;
   const fromConversationId = useChatStore.getState().conversationId;
   if (
@@ -37,7 +46,8 @@ export function switchSessionBeforeNavigate(conversationId: string): void {
   )
     return;
   const fromPathname = window.location.pathname;
-  const sourceConversationId = conversationIdFromPath(fromPathname) ?? fromConversationId;
+  const sourceConversationId =
+    conversationIdFromPath(fromPathname, rebasePath) ?? fromConversationId;
   if (isTempConvId(sourceConversationId)) return;
   window.setTimeout(() => {
     if (

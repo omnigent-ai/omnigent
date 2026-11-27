@@ -100,6 +100,7 @@ describe("Sidebar warm switch activation", () => {
     fireEvent.click(await screen.findByText("conv_a"));
 
     expect(switchTo).not.toHaveBeenCalled();
+    expect(useChatStore.getState().conversationId).toBe("conv_a");
   });
 
   it.each([

@@ -472,7 +472,7 @@ const IsMobileContext = createContext<boolean>(false);
 const ViewerIdContext = createContext<string | null>(null);
 const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loading");
 const RowActivationContext = createContext<
-  (id: string, event: MouseEvent<HTMLAnchorElement>) => void
+  (id: string, event: MouseEvent<HTMLAnchorElement>, href: string) => void
 >(() => {});
 // True while a pin, unpin, or reorder is saving; pin controls are disabled then.
 const PinSavingContext = createContext(false);
@@ -528,7 +528,7 @@ function SidebarRowDataProvider({
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
-  onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
+  onActivate: ContextType<typeof RowActivationContext>;
   onReorder: (fromId: string, toId: string) => void;
   nestMoves: ContextType<typeof NestMoveContext>;
   children: ReactNode;
@@ -2450,6 +2450,7 @@ function ConversationList({
   const startingId = useStartingConversationId(statusView);
   const mutedProjects = useMutedProjects();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
+  const rebasePath = useRebasePath();
   // Resolve the active conversation's top-level root once here (rows get a plain
   // `isActive` prop, not their own query). Falls back to the raw id while the
   // parent walk loads — a top-level session resolves to itself.
@@ -2621,10 +2622,13 @@ function ConversationList({
 
   const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
   useEffect(() => setOptimisticActiveId(null), [activeId]);
-  const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
-    if (!isPlainPrimaryClick(event)) return;
-    setOptimisticActiveId(id);
-  }, []);
+  const activateRow = useStableCallback(
+    (id: string, event: MouseEvent<HTMLAnchorElement>, href: string) => {
+      if (!isPlainPrimaryClick(event)) return;
+      setOptimisticActiveId(id);
+      if (href === `/c/${id}`) switchSessionBeforeNavigate(id, rebasePath);
+    },
+  );
   const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
   // Freeze the open chat's sort key until you navigate away, so sending doesn't reorder it.
   const [activeOverride, setActiveOverride] = useState<ActiveChatOverride | null>(null);
@@ -6754,10 +6758,7 @@ function ConversationRowImpl({
             onToggleSelected(conversation.id, e.shiftKey);
             return;
           }
-          activateRow(conversation.id, e);
-          if (isPlainPrimaryClick(e) && rowHref === `/c/${conversation.id}`) {
-            switchSessionBeforeNavigate(conversation.id);
-          }
+          activateRow(conversation.id, e, rowHref);
           onClick(e);
         }}
         onDoubleClick={(e) => {

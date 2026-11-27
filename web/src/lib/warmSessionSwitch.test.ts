@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { basenamedRouting, reactRouterRouting } from "@/lib/routing";
 import * as capabilities from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useChatStore } from "@/store/chatStore";
@@ -9,6 +10,7 @@ import {
 } from "./warmSessionSwitch";
 
 const initialStoreState = useChatStore.getState();
+const rebasePath = reactRouterRouting.rebasePath;
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -72,13 +74,26 @@ describe("isWarmSwitchPending", () => {
       spyFeatures({ warm_switch_keep_mounted_ui: true });
       window.__OMNIGENT_BASE_PATH__ = base;
       window.history.replaceState({}, "", pathname);
-      expect(isWarmSwitchPending(active, url)).toBe(expected);
+      expect(isWarmSwitchPending(active, url, rebasePath)).toBe(expected);
     },
   );
 
+  it.each([
+    ["/ml/omnigent-embed/c/conv_b", true],
+    ["/ml/omnigent-embed/canvas/c/conv_b", false],
+    ["/c/conv_b", false],
+    ["/ml/omnigent-embed-other/c/conv_b", false],
+  ] as const)("matches the active embed route at %s: %s", (pathname, expected) => {
+    spyFeatures({ warm_switch_keep_mounted_ui: true });
+    window.history.replaceState({}, "", pathname);
+    expect(
+      isWarmSwitchPending("conv_b", "conv_a", basenamedRouting("/ml/omnigent-embed").rebasePath),
+    ).toBe(expected);
+  });
+
   it("does not retain the mismatch when the flag is off", () => {
     window.history.replaceState({}, "", "/c/conv_b");
-    expect(isWarmSwitchPending("conv_b", "conv_a")).toBe(false);
+    expect(isWarmSwitchPending("conv_b", "conv_a", rebasePath)).toBe(false);
   });
 });
 
@@ -89,7 +104,7 @@ describe("switchSessionBeforeNavigate", () => {
     useChatStore.setState({ conversationId: "conv_a" });
     const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
 
-    switchSessionBeforeNavigate("conv_b");
+    switchSessionBeforeNavigate("conv_b", rebasePath);
     expect(useChatStore.getState().conversationId).toBe("conv_b");
     expect(useChatStore.getState().loadingConversation).toBe(false);
     window.history.pushState({}, "", "/c/conv_b");
@@ -99,16 +114,22 @@ describe("switchSessionBeforeNavigate", () => {
     expect(useChatStore.getState().conversationId).toBe("conv_b");
   });
 
-  it.each([{ targets: ["conv_b"] }, { targets: ["conv_b", "conv_c"] }])(
-    "restores canceled clicks to the browser source on the next task: $targets",
-    ({ targets }) => {
+  it.each([
+    { targets: ["conv_b"], basename: "" },
+    { targets: ["conv_b", "conv_c"], basename: "" },
+    { targets: ["conv_b", "conv_c"], basename: "/ml/omnigent-embed" },
+  ])(
+    "restores canceled clicks to the browser source on the next task: $targets under $basename",
+    ({ targets, basename }) => {
       spyFeatures({ warm_switch_keep_mounted_ui: true });
       seedLive("conv_a", "conv_b", "conv_c");
       useChatStore.setState({ conversationId: "conv_a" });
       const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+      const clickRebasePath = basename ? basenamedRouting(basename).rebasePath : rebasePath;
+      window.history.replaceState({}, "", clickRebasePath("/c/conv_a"));
 
-      for (const target of targets) switchSessionBeforeNavigate(target);
-      window.history.replaceState({}, "", "/c/conv_a?diff=1");
+      for (const target of targets) switchSessionBeforeNavigate(target, clickRebasePath);
+      window.history.replaceState({}, "", clickRebasePath("/c/conv_a?diff=1"));
       expect(useChatStore.getState().conversationId).toBe(targets.at(-1));
       vi.runOnlyPendingTimers();
 
@@ -123,7 +144,7 @@ describe("switchSessionBeforeNavigate", () => {
     useChatStore.setState({ conversationId: "conv_a" });
     const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
 
-    switchSessionBeforeNavigate("conv_b");
+    switchSessionBeforeNavigate("conv_b", rebasePath);
     void useChatStore.getState().switchTo("conv_c");
     vi.runOnlyPendingTimers();
 
@@ -138,7 +159,7 @@ describe("switchSessionBeforeNavigate", () => {
     window.history.replaceState({}, "", "/c/temp:source");
     const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
 
-    switchSessionBeforeNavigate("conv_b");
+    switchSessionBeforeNavigate("conv_b", rebasePath);
     vi.runOnlyPendingTimers();
 
     expect(switchTo).not.toHaveBeenCalled();
@@ -148,7 +169,7 @@ describe("switchSessionBeforeNavigate", () => {
   it("leaves the store alone when the flag is off", () => {
     useChatStore.setState({ conversationId: "conv_a" });
     const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
-    switchSessionBeforeNavigate("conv_b");
+    switchSessionBeforeNavigate("conv_b", rebasePath);
     expect(switchTo).not.toHaveBeenCalled();
     expect(conversationRegistry.peek("conv_b")).toBeUndefined();
   });
@@ -174,7 +195,7 @@ describe("switchSessionBeforeNavigate", () => {
       useChatStore.setState({ conversationId: source });
       const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
 
-      switchSessionBeforeNavigate(target);
+      switchSessionBeforeNavigate(target, rebasePath);
       vi.runOnlyPendingTimers();
 
       expect(switchTo).not.toHaveBeenCalled();
