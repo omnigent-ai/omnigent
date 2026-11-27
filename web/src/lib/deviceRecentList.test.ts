@@ -60,7 +60,7 @@ it("puts a batch first, its last item first, and keeps the list to its limit", (
   expect(list.read(SCOPE)).toEqual(["b", "e", "d"]);
 });
 
-it("keeps the saved lists while the workspace user isn't known, and drops another user's once one is", () => {
+it("keeps the saved lists through an unresolved identity, for the same user signing in", () => {
   list.record(SCOPE, ["a"], list.owner());
   const stop = list.subscribe(() => {});
   // A page loads before identity resolves, or its first request fails.
@@ -68,7 +68,13 @@ it("keeps the saved lists while the workspace user isn't known, and drops anothe
   expect(list.hasSaved()).toBe(true);
   identityBecomes("user-1");
   expect(list.read(SCOPE)).toEqual(["a"]);
-  // A different user is a known owner: the first user's lists go.
+  stop();
+});
+
+it("drops the saved lists once a different user is confirmed, even after an unresolved identity", () => {
+  list.record(SCOPE, ["a"], list.owner());
+  const stop = list.subscribe(() => {});
+  identityBecomes(null);
   identityBecomes("user-2");
   expect(list.hasSaved()).toBe(false);
   identityBecomes("user-1");
