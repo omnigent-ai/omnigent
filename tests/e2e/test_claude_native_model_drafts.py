@@ -224,7 +224,6 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
             metadata={
                 "host_id": host_id,
                 "workspace": str(workspace),
-                "cost_control_mode_override": "off",
             },
         )
         session_id = str(created["session_id"])
@@ -232,7 +231,8 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
             _require_session_only_claude(base_url, session_id)
             saved_settings = claude_settings_snapshot(settings_path)
             selected = client.patch(
-                f"/v1/sessions/{session_id}", json={"model_override": "sonnet"}
+                f"/v1/sessions/{session_id}",
+                json={"model_override": "sonnet", "cost_control_mode_override": "off"},
             )
             assert selected.status_code == 200, selected.text
             initial_model = _PINNED_CLAUDE_MODELS["sonnet"]
