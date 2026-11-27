@@ -170,6 +170,8 @@ describe("sidebarEntryPaletteCommands", () => {
     expect(sort.choices.map((choice) => choice.label)).toEqual(["Alphabetically", "Manual order"]);
     void chooseSettingValue(sort, "Manual order");
     expect(run.changeSort).toHaveBeenCalledWith("manual");
+    commands.find((command) => command.label === "Expand All Projects")!.run();
+    expect(run.runExpansion).toHaveBeenCalledWith("expand-all");
   });
 
   it("offers none of the project controls, nor Select Sessions, while selecting", () => {
