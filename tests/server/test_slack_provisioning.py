@@ -230,3 +230,60 @@ def test_a_lead_host_owned_by_someone_else_is_not_used(db_uri: str) -> None:
     failed = asyncio.run(provisioner.provision(project, binding, actor_user_id=None))
     assert failed.state == "needs_reconnect"
     assert registry.frames == [] and service.calls == []
+
+
+def test_a_link_needs_no_server_settings(db_uri: str) -> None:
+    """The link names its automation URL; the relay URL is where it was saved from."""
+    store = ProjectSlackStore(db_uri)
+    service = _FakeService()
+    provisioner = SlackProvisioner(
+        SlackAutomationConfig(),
+        store,
+        connection_store=_Connections(_Connection()),
+        connection_client=SimpleNamespace(),
+        transport=httpx.MockTransport(service.handler),
+    )
+    project = SimpleNamespace(id=uuid.uuid4().hex, name="zz-slack (throwaway)", user_id="ann")
+    claim = {
+        "slack_team_id": None,
+        "channel_id": "C0002",
+        "channel_name": None,
+        "owner_user_id": "ann",
+        "actor_user_id": "ann",
+    }
+    relay = {"relay_url": "https://factory.example.com"}
+    bare = store.claim(project.id, destination=relay, **claim)
+    waiting = asyncio.run(provisioner.provision(project, bare, actor_user_id="ann"))
+    assert waiting.state == "claimed" and "automation API URL" in (waiting.last_error or "")
+    assert service.calls == []
+
+    destination = {
+        "automation_url": "https://automation.example.com/api/2.0/agent",
+        "relay_url": "https://factory.example.com",
+    }
+    binding = store.claim(project.id, destination=destination, **claim)
+    active = asyncio.run(provisioner.provision(project, binding, actor_user_id="ann"))
+    assert active.state == "active"
+    method, path, body = service.calls[0]
+    assert (method, path) == ("POST", "/api/2.0/agent/scheduled-tasks")
+    spec = body["scheduled_task"]["spec"]
+    assert (spec["org"], spec["repo"]) == ("omnigent-ai", "omnigent")
+    assert "https://factory.example.com/v1/slack-relay/" in spec["prompt"]
+
+
+def test_automation_url_must_be_the_api_not_the_tasks_page() -> None:
+    import pytest
+
+    from omnigent.errors import OmnigentError
+    from omnigent.server.routes.project_slack import clean_automation_url
+
+    api = "https://automation.example.com/api/2.0/agent"
+    assert clean_automation_url(api + "/") == api
+    assert clean_automation_url(api + "/scheduled-tasks") == api
+    for bad in (
+        "https://automation.example.com/tasks/app?o=123",
+        "http://automation.example.com/api/2.0/agent",
+        "https://automation.example.com/api/2.0/agent?o=1",
+    ):
+        with pytest.raises(OmnigentError):
+            clean_automation_url(bad)

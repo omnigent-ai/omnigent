@@ -26,7 +26,13 @@ async def test_agents_cannot_change_the_link_and_only_the_lead_replies(
 
     # An agent, even the owner's own Lead, can't link, pause, resume or unlink.
     assert (await client.put(base, json=LINK, headers=lead)).status_code == 403
-    assert (await client.put(base, json=LINK, headers=_as_user(ALICE))).status_code == 200
+    linked = await client.put(
+        base, json=LINK, headers={**_as_user(ALICE), "X-Forwarded-Host": "factory.example.com"}
+    )
+    assert linked.status_code == 200, linked.text
+    # With no automation URL yet, it waits; the watcher would call back where it was saved.
+    assert linked.json()["state"] == "claimed"
+    assert linked.json()["destination"]["relay_url"].endswith("://factory.example.com")
     for method, path in (("POST", "/disable"), ("POST", "/enable"), ("DELETE", "")):
         refused = await client.request(method, base + path, headers=lead)
         assert refused.status_code == 403, (method, path, refused.text)

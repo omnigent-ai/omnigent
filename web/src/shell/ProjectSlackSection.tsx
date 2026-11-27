@@ -24,6 +24,15 @@ const STATE_TEXT: Record<ProjectSlackState, string> = {
   needs_reconnect: "Needs the owner to sign in; see below",
 };
 
+// States where the watcher isn't running and saving again or retrying sets it up.
+const RETRY_STATES: ReadonlySet<ProjectSlackState> = new Set(["claimed", "error", "needs_reconnect"]);
+
+/** The link's saved settings to send again, minus what the server fills in. */
+function savedDestination(link: ProjectSlackLink | undefined): Record<string, string> {
+  const { relay_url: _relayUrl, ...rest } = link?.destination ?? {};
+  return rest;
+}
+
 function channelLabel(link: ProjectSlackLink): string {
   return link.channel_name ? `#${link.channel_name}` : (link.channel_id ?? "");
 }
@@ -41,16 +50,29 @@ export function ProjectSlackSection({
   const link = useQuery({ queryKey, queryFn: () => getProjectSlack(projectId) });
   const [channelLink, setChannelLink] = useState("");
   const [channelName, setChannelName] = useState("");
+  const [automationUrl, setAutomationUrl] = useState("");
   const onDone = (next: ProjectSlackLink) => queryClient.setQueryData(queryKey, next);
   const save = useMutation({
-    mutationFn: () =>
-      linkProjectSlack(projectId, {
-        channel_link: channelLink.trim(),
-        channel_name: channelName.trim() || undefined,
-      }),
+    mutationFn: () => {
+      const current = link.data;
+      const destination = savedDestination(current);
+      if (automationUrl.trim()) destination.automation_url = automationUrl.trim();
+      const channel = channelLink.trim()
+        ? { channel_link: channelLink.trim() }
+        : {
+            channel_id: current?.channel_id,
+            slack_team_id: current?.slack_team_id ?? undefined,
+          };
+      return linkProjectSlack(projectId, {
+        ...channel,
+        channel_name: channelName.trim() || current?.channel_name || undefined,
+        destination,
+      });
+    },
     onSuccess: (next) => {
       setChannelLink("");
       setChannelName("");
+      setAutomationUrl("");
       onDone(next);
     },
   });
@@ -65,9 +87,12 @@ export function ProjectSlackSection({
   const failure = [save, toggle, unlink].find((mutation) => mutation.isError)?.error as
     | Error
     | undefined;
+  const canSave =
+    channelLink.trim() !== "" || (data?.linked === true && automationUrl.trim() !== "");
+  const savedAutomationUrl = data?.destination?.automation_url;
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
-    if (channelLink.trim()) save.mutate();
+    if (canSave) save.mutate();
   };
   return (
     <section
@@ -115,9 +140,18 @@ export function ProjectSlackSection({
                 loading={toggle.isPending}
                 disabled={busy}
                 data-testid="project-slack-toggle"
-                onClick={() => toggle.mutate(data.state === "disabled" || data.state === "error")}
+                onClick={() =>
+                  toggle.mutate(
+                    data.state === "disabled" ||
+                      (data.state !== undefined && RETRY_STATES.has(data.state)),
+                  )
+                }
               >
-                {data.state === "disabled" ? "Resume" : data.state === "error" ? "Retry" : "Pause"}
+                {data.state === "disabled"
+                  ? "Resume"
+                  : data.state !== undefined && RETRY_STATES.has(data.state)
+                    ? "Retry"
+                    : "Pause"}
               </Button>
               <Button
                 type="button"
@@ -153,15 +187,26 @@ export function ProjectSlackSection({
             aria-label="Slack channel name"
             data-testid="project-slack-channel-name"
           />
+          <Input
+            value={automationUrl}
+            onChange={(event) => setAutomationUrl(event.target.value)}
+            placeholder={
+              savedAutomationUrl
+                ? `Automation API URL: ${savedAutomationUrl}`
+                : "Automation API URL, e.g. https://<workspace>/api/2.0/<service>"
+            }
+            aria-label="Automation API URL"
+            data-testid="project-slack-automation-url"
+          />
           <Button
             type="submit"
             size="sm"
             className="self-start"
             loading={save.isPending}
-            disabled={busy || channelLink.trim() === ""}
+            disabled={busy || !canSave}
             data-testid="project-slack-save"
           >
-            {data?.linked ? "Change channel" : "Link channel"}
+            {!data?.linked ? "Link channel" : channelLink.trim() ? "Change channel" : "Save"}
           </Button>
         </form>
       )}

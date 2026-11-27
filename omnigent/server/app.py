@@ -4849,18 +4849,13 @@ def create_app(
                     SlackProvisioner,
                 )
 
-                _slack_automation = SlackAutomationConfig.from_env()
-                app.state.slack_provisioner = (
-                    SlackProvisioner(
-                        _slack_automation,
-                        app.state.project_slack_store,
-                        connection_store=getattr(app.state, "databricks_store", None),
-                        connection_client=getattr(app.state, "databricks_client", None),
-                        host_registry=getattr(app.state, "host_registry", None),
-                        conversations=conversation_store,
-                    )
-                    if _slack_automation is not None
-                    else None
+                app.state.slack_provisioner = SlackProvisioner(
+                    SlackAutomationConfig.from_env(),
+                    app.state.project_slack_store,
+                    connection_store=getattr(app.state, "databricks_store", None),
+                    connection_client=getattr(app.state, "databricks_client", None),
+                    host_registry=getattr(app.state, "host_registry", None),
+                    conversations=conversation_store,
                 )
                 from omnigent.server.routes.slack_relay import create_slack_relay_router
                 from omnigent.stores.project_slack_relay_store import SlackRelayStore

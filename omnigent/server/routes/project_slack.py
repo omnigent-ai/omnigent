@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,7 +37,7 @@ _CLIENT_LINK = re.compile(r"^https://app\.slack\.com/client/([A-Z0-9]+)/([A-Z0-9
 _ARCHIVE_LINK = re.compile(
     r"^https://[a-z0-9-]+\.(?:enterprise\.)?slack\.com/archives/([A-Z0-9]+)/?(?:[?#].*)?$"
 )
-_DESTINATION_KEYS = ("org", "repo", "model", "username")
+_DESTINATION_KEYS = ("org", "repo", "model", "username", "automation_url")
 
 
 class SlackLinkBody(BaseModel):
@@ -56,9 +57,10 @@ class SlackLinkBody(BaseModel):
     channel_name: str | None = Field(default=None, max_length=128)
     destination: dict[str, str] | None = Field(
         default=None,
-        description="Where the watcher automation runs: org, repo, model, and the owner's "
-        "username on the automation service. "
-        "Omit to use the server's defaults.",
+        description="Where the watcher automation runs: automation_url (the automation "
+        "service's scheduled-task API, e.g. https://<workspace>/api/2.0/<service>), org, "
+        "repo, model, and the owner's username on the automation service. "
+        "Omit a setting to use the default.",
     )
 
 
@@ -90,18 +92,56 @@ def parse_channel(body: SlackLinkBody) -> tuple[str | None, str]:
     return team_id, channel_id
 
 
+def clean_automation_url(value: str) -> str:
+    """The scheduled-task API base a link names, e.g. ``https://<workspace>/api/2.0/<service>``.
+
+    :raises OmnigentError: ``INVALID_INPUT`` for anything but a plain HTTPS API URL.
+    """
+    parts = urlsplit(value.strip())
+    path = parts.path.rstrip("/").removesuffix("/scheduled-tasks")
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or parts.username
+        or parts.password
+        or parts.query
+        or parts.fragment
+        or not path.startswith("/api/")
+    ):
+        raise OmnigentError(
+            "Give the automation service's API URL, like https://<workspace>/api/2.0/<service>, "
+            "not the Tasks page in the browser",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return f"https://{parts.netloc}{path}"
+
+
 def clean_destination(destination: dict[str, str] | None) -> dict[str, str]:
     cleaned: dict[str, str] = {}
     for key, value in (destination or {}).items():
         if key not in _DESTINATION_KEYS:
             raise OmnigentError(
-                f"Unknown destination setting {key!r}; use org, repo, model or username",
+                f"Unknown destination setting {key!r}; use automation_url, org, repo, model "
+                "or username",
                 code=ErrorCode.INVALID_INPUT,
             )
         value = str(value).strip()
-        if value:
+        if not value:
+            continue
+        if key == "automation_url":
+            cleaned[key] = clean_automation_url(value[:512])
+        else:
             cleaned[key] = value[:128]
     return cleaned
+
+
+def request_base_url(request: Request) -> str:
+    """The address the caller used to reach this server, behind a proxy too."""
+    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if not host:
+        return str(request.base_url).rstrip("/")
+    return f"{proto or request.url.scheme}://{host}"
 
 
 def binding_json(binding: SlackBinding | None, *, can_manage: bool) -> dict[str, Any]:
@@ -189,6 +229,18 @@ def create_project_slack_router(
         actor, project = await load_manager(request, project_id)
         team_id, channel_id = parse_channel(body)
         destination = clean_destination(body.destination)
+        # The watcher calls back on the address the link was saved from.
+        destination["relay_url"] = request_base_url(request)
+        active = provisioner(request)
+        existing = await asyncio.to_thread(slack_store.get, project.id)
+        if active is not None and existing is not None and existing.automation_id:
+            moved_to = destination.get("automation_url") or active.config.api_url
+            if moved_to.rstrip("/") != active.config.api_url_for(existing):
+                raise OmnigentError(
+                    "This link's watcher runs in another automation workspace. Unlink, then "
+                    "link again to move it.",
+                    code=ErrorCode.CONFLICT,
+                )
         try:
             binding = await asyncio.to_thread(
                 slack_store.claim,
@@ -206,7 +258,6 @@ def create_project_slack_router(
                 "first; a channel can belong to one project.",
                 code=ErrorCode.CONFLICT,
             ) from None
-        active = provisioner(request)
         if active is not None:
             binding = await active.provision(project, binding, actor_user_id=actor)
         return binding_json(binding, can_manage=True)

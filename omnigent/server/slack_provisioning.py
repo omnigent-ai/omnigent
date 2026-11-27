@@ -11,8 +11,11 @@ that workspace.
 
 Each provisioning mints a fresh per-link relay key, stores only its hash, and
 writes the key into the automation's instructions; the watcher presents it on
-every relay call. Configured by environment (see :meth:`SlackAutomationConfig.from_env`);
-with no automation URL set, links stay ``claimed`` and nothing is provisioned.
+every relay call. Each link names its automation API URL in Project settings;
+the relay URL is the address people use to save the link, and the repository
+defaults to ``omnigent-ai/omnigent``, so no server configuration is needed. The
+environment can still set defaults (see :meth:`SlackAutomationConfig.from_env`).
+A link with no automation URL stays ``claimed`` and nothing is provisioned.
 """
 
 from __future__ import annotations
@@ -42,6 +45,9 @@ _ACTIVE = "SCHEDULED_TASK_STATE_ACTIVE"
 _PAUSED = "SCHEDULED_TASK_STATE_PAUSED"
 # Marks automations this server manages, so overlap checks can tell them apart.
 AUTOMATION_NAME_PREFIX = "[omnigent-slack]"
+# The repository the watcher's sandbox checks out unless a link names another.
+DEFAULT_ORG = "omnigent-ai"
+DEFAULT_REPO = "omnigent"
 
 
 def relay_key_hash(relay_key: str) -> str:
@@ -54,11 +60,14 @@ def _host(url: str) -> str:
 
 @dataclass(frozen=True)
 class SlackAutomationConfig:
-    """Where watcher automations run and how they call back.
+    """Defaults for where watcher automations run and how they call back.
+
+    A link's own ``automation_url`` and ``relay_url`` take precedence.
 
     :param api_url: Base URL of the automation service's scheduled-task API, e.g.
-        ``https://automation.example.com/api/2.0/agent``.
-    :param relay_url: This server's public URL, which the watcher calls.
+        ``https://automation.example.com/api/2.0/agent``, or ``""`` for none.
+    :param relay_url: This server's public URL, which the watcher calls, or ``""``
+        to use the address the link was saved from.
     :param org: Default repository org for the automation's sandbox.
     :param repo: Default repository name.
     :param branch: Default base branch.
@@ -66,40 +75,32 @@ class SlackAutomationConfig:
     :param cron: How often the watcher polls the channel.
     """
 
-    api_url: str
-    relay_url: str
-    org: str
-    repo: str
+    api_url: str = ""
+    relay_url: str = ""
+    org: str = DEFAULT_ORG
+    repo: str = DEFAULT_REPO
     branch: str = "main"
     model: str = ""
     cron: str = "*/2 * * * *"
 
-    @property
-    def workspace_host(self) -> str:
-        return _host(self.api_url)
+    def api_url_for(self, binding: SlackBinding) -> str:
+        return ((binding.destination or {}).get("automation_url") or self.api_url).rstrip("/")
+
+    def relay_url_for(self, binding: SlackBinding) -> str:
+        return (self.relay_url or (binding.destination or {}).get("relay_url") or "").rstrip("/")
 
     @classmethod
-    def from_env(cls) -> SlackAutomationConfig | None:
-        api_url = os.environ.get("OMNIGENT_SLACK_AUTOMATION_API_URL", "").strip().rstrip("/")
-        if not api_url:
-            return None
+    def from_env(cls) -> SlackAutomationConfig:
+        """Defaults from the environment; every setting is optional."""
         relay_url = os.environ.get("OMNIGENT_SLACK_RELAY_URL", "").strip().rstrip("/")
         if not relay_url:
             domain = os.environ.get("OMNIGENT_DOMAIN", "").strip()
             relay_url = f"https://{domain}" if domain else ""
-        org = os.environ.get("OMNIGENT_SLACK_AUTOMATION_ORG", "").strip()
-        repo = os.environ.get("OMNIGENT_SLACK_AUTOMATION_REPO", "").strip()
-        if not relay_url or not org or not repo:
-            _logger.warning(
-                "OMNIGENT_SLACK_AUTOMATION_API_URL is set but the relay URL, org or repo "
-                "is missing; Slack channel watchers stay off."
-            )
-            return None
         return cls(
-            api_url=api_url,
+            api_url=os.environ.get("OMNIGENT_SLACK_AUTOMATION_API_URL", "").strip().rstrip("/"),
             relay_url=relay_url,
-            org=org,
-            repo=repo,
+            org=os.environ.get("OMNIGENT_SLACK_AUTOMATION_ORG", "").strip() or DEFAULT_ORG,
+            repo=os.environ.get("OMNIGENT_SLACK_AUTOMATION_REPO", "").strip() or DEFAULT_REPO,
             branch=os.environ.get("OMNIGENT_SLACK_AUTOMATION_BRANCH", "").strip() or "main",
             model=os.environ.get("OMNIGENT_SLACK_AUTOMATION_MODEL", "").strip(),
             cron=os.environ.get("OMNIGENT_SLACK_AUTOMATION_CRON", "").strip() or "*/2 * * * *",
@@ -265,6 +266,7 @@ class SlackProvisioner:
         connection_store: Any,
         connection_client: Any,
         client: AutomationClient | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
         host_registry: Any = None,
         conversations: Any = None,
     ) -> None:
@@ -272,9 +274,15 @@ class SlackProvisioner:
         self._store = store
         self._connections = connection_store
         self._connection_client = connection_client
-        self._client = client or AutomationClient(config.api_url)
+        self._fixed_client = client
+        self._transport = transport
         self._host_registry = host_registry
         self._conversations = conversations
+
+    def _client(self, binding: SlackBinding) -> AutomationClient:
+        if self._fixed_client is not None:
+            return self._fixed_client
+        return AutomationClient(self.config.api_url_for(binding), transport=self._transport)
 
     async def _lead_host(self, project: Project, owner_user_id: str) -> ViaHost | None:
         """The Lead's host, when it is connected and is the owner's own host."""
@@ -293,17 +301,19 @@ class SlackProvisioner:
             return None
         return ViaHost(self._host_registry, connection)
 
-    async def _credential(self, project: Project, owner_user_id: str) -> str | ViaHost:
+    async def _credential(self, project: Project, binding: SlackBinding) -> str | ViaHost:
         """How to reach the automation API as the owner: their Lead's host, else a token.
 
         :raises AutomationAuthError: neither is available.
         """
-        via_host = await self._lead_host(project, owner_user_id)
+        via_host = await self._lead_host(project, binding.owner_user_id)
         if via_host is not None:
             return via_host
-        return await self._owner_token(owner_user_id)
+        return await self._owner_token(
+            binding.owner_user_id, _host(self.config.api_url_for(binding))
+        )
 
-    async def _owner_token(self, owner_user_id: str) -> str:
+    async def _owner_token(self, owner_user_id: str, automation_host: str) -> str:
         """The owner's server-side access token for the automation workspace.
 
         :raises AutomationAuthError: not connected, connected elsewhere, or expired.
@@ -319,13 +329,13 @@ class SlackProvisioner:
             raise AutomationAuthError(
                 "The project Lead's host isn't connected, so the channel watcher can't be set "
                 "up. Start the Lead (or its host) and retry; or connect Databricks to "
-                f"{self.config.workspace_host} under Settings → Connections"
+                f"{automation_host} under Settings → Connections"
             )
         token, workspace_host = resolved
-        if _host(workspace_host) != self.config.workspace_host:
+        if _host(workspace_host) != automation_host:
             raise AutomationAuthError(
                 f"The project owner's Databricks connection is for {_host(workspace_host)}, "
-                f"not {self.config.workspace_host}; reconnect it there, then retry"
+                f"not {automation_host}; reconnect it there, then retry"
             )
         return token
 
@@ -340,7 +350,7 @@ class SlackProvisioner:
             "prompt": watcher_prompt(
                 project_name=project.name,
                 binding=binding,
-                relay_url=self.config.relay_url,
+                relay_url=self.config.relay_url_for(binding),
                 relay_key=relay_key,
             ),
             "org": destination["org"],
@@ -386,17 +396,35 @@ class SlackProvisioner:
         Retrying is safe: creation is keyed on the link's id, so a lost response
         can't leave two watchers.
         """
+        missing = [
+            name
+            for name, value in (
+                ("automation API URL", self.config.api_url_for(binding)),
+                ("relay URL", self.config.relay_url_for(binding)),
+            )
+            if not value
+        ]
+        if missing:
+            return await asyncio.to_thread(
+                self._store.set_state,
+                project.id,
+                "claimed",
+                actor_user_id=actor_user_id,
+                last_error=f"Add the {' and '.join(missing)} in Slack settings, then save",
+                action="provision_waiting",
+            )
         relay_key = secrets.token_urlsafe(32)
+        client = self._client(binding)
         try:
-            token = await self._credential(project, binding.owner_user_id)
+            token = await self._credential(project, binding)
             task = self._task(project, binding, relay_key)
             if binding.automation_id:
                 owner, task_id = _split_automation_id(binding.automation_id)
-                await self._client.update(token, owner, task_id, task)
-                await self._client.set_state(token, owner, task_id, _ACTIVE)
+                await client.update(token, owner, task_id, task)
+                await client.set_state(token, owner, task_id, _ACTIVE)
                 automation_id = binding.automation_id
             else:
-                created = await self._client.create(token, {"scheduled_task": task})
+                created = await client.create(token, {"scheduled_task": task})
                 task_id = str(created.get("schedule_id") or "")
                 owner = str(created.get("username") or task["username"])
                 if not task_id or not owner:
@@ -420,9 +448,9 @@ class SlackProvisioner:
         """Pause the watcher; the link becomes ``disabled`` and keeps its channel."""
         if binding.automation_id:
             try:
-                token = await self._credential(project, binding.owner_user_id)
+                token = await self._credential(project, binding)
                 owner, task_id = _split_automation_id(binding.automation_id)
-                await self._client.set_state(token, owner, task_id, _PAUSED)
+                await self._client(binding).set_state(token, owner, task_id, _PAUSED)
             except (AutomationAuthError, AutomationError) as exc:
                 # Disabled here regardless: the relay refuses a disabled link's calls.
                 return await self._fail(
@@ -443,9 +471,9 @@ class SlackProvisioner:
         if not binding.automation_id:
             return
         try:
-            token = await self._credential(project, binding.owner_user_id)
+            token = await self._credential(project, binding)
             owner, task_id = _split_automation_id(binding.automation_id)
-            await self._client.delete(token, owner, task_id)
+            await self._client(binding).delete(token, owner, task_id)
         except (AutomationAuthError, AutomationError) as exc:
             await asyncio.to_thread(
                 self._store.record,
@@ -465,9 +493,9 @@ class SlackProvisioner:
         if not binding.automation_id:
             return []
         try:
-            token = await self._credential(project, binding.owner_user_id)
+            token = await self._credential(project, binding)
             owner, own_id = _split_automation_id(binding.automation_id)
-            tasks = await self._client.list(token, owner)
+            tasks = await self._client(binding).list(token, owner)
         except (AutomationAuthError, AutomationError):
             return []
         found = []

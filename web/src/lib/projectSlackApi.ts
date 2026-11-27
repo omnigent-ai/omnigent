@@ -27,6 +27,8 @@ export interface ProjectSlackLinkInput {
   slack_team_id?: string;
   channel_id?: string;
   channel_name?: string;
+  /** automation_url, org, repo, model, username; omitted ones use the defaults. */
+  destination?: Record<string, string>;
 }
 
 function slackPath(projectId: string, suffix = ""): string {
