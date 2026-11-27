@@ -304,6 +304,7 @@ export const GADGET_KIT_HELPERS = `
   // reads at most MAX_EXTRA_PAGES more pages; a longer collection is walked over several polls,
   // each resuming where the last stopped (complete false until the walk reaches the end, and
   // mergeKnown keeps the records already known meanwhile). A failed page keeps what is known.
+  // walkEveryMs and walkDelayMs space the walks out (below).
   var MAX_EXTRA_PAGES = 9;
   function watchEveryPage(collection, handler, options) {
     // An unfinished walk: where it stopped and the later pages it has read so far.
@@ -347,13 +348,25 @@ export const GADGET_KIT_HELPERS = `
         });
       })(walk ? walk.cursor : firstCursor);
     }
+    // Continuation pages are read on the first poll, then at most once per walkEveryMs
+    // (default: every poll), the second walk walkDelayMs later still so watches can take
+    // turns. A long collection's polling thus costs the bridge's request budget a bounded
+    // amount; the first page still comes every poll, and records on later pages stay known
+    // (complete false) until the next walk.
+    var walkEveryMs = options.walkEveryMs || 0;
+    var walkDelayMs = options.walkDelayMs || 0;
+    var nextWalkAt = 0;
     return collection.watch(function (snapshot) {
       if (snapshot.status === 'loading') return;
       var first = snapshot.items || [];
       if (walking) { waiting = { items: first, nextCursor: snapshot.nextCursor }; return; }
       if (!snapshot.nextCursor) { walk = null; handler(first, true); return; }
+      var now = Date.now();
+      if (now < nextWalkAt) { handler(first, false); return; }
+      nextWalkAt = now + walkEveryMs + walkDelayMs;
+      walkDelayMs = 0;
       start(first, snapshot.nextCursor);
-    }, options);
+    }, { intervalMs: options.intervalMs, limit: options.limit });
   }
   function mergeKnown(known, items, complete) {
     var next = byIdOf(items);

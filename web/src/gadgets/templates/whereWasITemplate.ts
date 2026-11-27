@@ -1799,6 +1799,8 @@ ${GADGET_KIT_HELPERS}
     }
     setInterval(function () { schedule(true); }, 1000);
     setInterval(schedule, 60000);
+    // How often the run and dismissal histories are read past their first page.
+    var RADAR_WALK_EVERY_MS = 60000;
 
     window.omnigent.connect().then(function (connected) {
       client = connected;
@@ -1820,8 +1822,10 @@ ${GADGET_KIT_HELPERS}
       if (viewFailure) report('failed', viewFailure.text);
       radarCollection.watch(onRadar, { intervalMs: 4000, limit: 5 });
       layoutCollection.watch(onLayout, { intervalMs: 8000, limit: 5 });
-      watchEveryPage(stepRuns, onRuns, { intervalMs: 4000, limit: 100 });
-      watchEveryPage(dismissed, onDismissed, { intervalMs: 8000, limit: 100 });
+      // Full walks once a minute each, half a minute apart, so a long history stays well
+      // inside the bridge's request budget and leaves room for the viewer's actions.
+      watchEveryPage(stepRuns, onRuns, { intervalMs: 4000, limit: 100, walkEveryMs: RADAR_WALK_EVERY_MS });
+      watchEveryPage(dismissed, onDismissed, { intervalMs: 8000, limit: 100, walkEveryMs: RADAR_WALK_EVERY_MS, walkDelayMs: RADAR_WALK_EVERY_MS / 2 });
       patternsCollection.watch(onPatterns, { intervalMs: 8000, limit: 5 });
       if (canAct && typeof client.agent.watch === 'function') client.agent.watch(onActions, { intervalMs: 3000 });
       schedule();

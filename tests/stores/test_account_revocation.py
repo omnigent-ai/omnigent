@@ -2349,6 +2349,52 @@ def test_a_long_cleanup_backlog_is_read_a_bounded_part_at_a_time(tmp_path, monke
     assert all(worked.count(user) == 1 for user in users[::3])
 
 
+def test_account_cleanup_refuses_a_store_whose_files_cannot_be_deleted(tmp_path) -> None:
+    """The queue moves on only by removing finished notes, so on files it can't remove it
+    would never reach the later ones: such a store is refused when the server starts."""
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class CreateOnly(LocalGadgetStore):
+        def user_files(self, user_id, *, owner_registration=None):  # type: ignore[no-untyped-def]
+            files = super().user_files(user_id, owner_registration=owner_registration)
+            files.supports_delete = False  # type: ignore[misc]
+            return files
+
+    with pytest.raises(ValueError, match="can be deleted"):
+        DeletedAccountGadgets(CreateOnly(str(tmp_path / "gadgets")), object())  # type: ignore[arg-type]
+
+
+def test_account_cleanup_follows_an_empty_page_that_continues(tmp_path) -> None:
+    """A store may answer a short or empty page that still continues: the next step, even
+    from a cleanup made again (a restart), reads on from there instead of starting over."""
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    calls: list[str | None] = []
+
+    class Sparse(LocalGadgetStore):
+        def list_owned_page(self, owner_id, *, limit, after=None, owner_registration=None):  # type: ignore[no-untyped-def]
+            calls.append(after)
+            if after is None:
+                return [], "next"
+            return super().list_owned_page(
+                owner_id, limit=limit, after=None, owner_registration=owner_registration
+            )
+
+    store = Sparse(str(tmp_path / "gadgets"))
+    board = store.create("alice", "Synthetic board", owner_registration="r1")
+    assert DeletedAccountGadgets(store, NoGrants())._step("alice", "r1") is False  # type: ignore[arg-type]
+    # Made again, as after a restart: it carries on from the saved continuation.
+    assert DeletedAccountGadgets(store, NoGrants())._step("alice", "r1") is True  # type: ignore[arg-type]
+    assert calls[:2] == [None, "next"]  # (owns_any may list again after)
+    assert store.get(board.id) is None
+
+
 def test_a_backlog_of_unqueued_intents_is_read_a_bounded_part_at_a_time(
     tmp_path, monkeypatch
 ) -> None:

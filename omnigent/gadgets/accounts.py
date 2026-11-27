@@ -442,6 +442,12 @@ class DeletedAccountGadgets:
             only notes the cleanup, and deletes nothing until gadgets are on again (what
             the gadget store holds stays shared with no one meanwhile).
         """
+        if not self._files_of(store).supports_delete:
+            # The queue moves on only by removing finished notes; on files it can't remove,
+            # it would go over the same first notes for good and never reach later ones.
+            raise ValueError(
+                "Deleting accounts' gadgets needs a gadget store whose files can be deleted"
+            )
         self._store = store
         self._access = access
         self._enabled = enabled
@@ -576,14 +582,38 @@ class DeletedAccountGadgets:
                 queue.done(number, f"{key}.json")
 
     def _step(self, user_id: str, registration: str | None) -> bool:
-        """Delete one page of the registration's gadgets; its shelf after the last."""
+        """Delete one page of the registration's gadgets; its shelf after the last.
+
+        Where the pass got to is kept in ``cursors/<key>/<n>.json`` (create-only, numbered,
+        found by probing), so a page that comes back short or empty with a continuation is
+        followed on the next step instead of read again from the start. A pass that ends
+        while gadgets are still owned (made behind its cursor meanwhile) starts another.
+        """
+        queue = self._queue()
+        progress = f"cursors/{_key(user_id, registration)}"
+        saved = queue._first_missing(progress) - 1
+        after: str | None = None
+        if saved:
+            try:
+                raw = self._files_of(self._store).read_json(f"{progress}/{saved}.json")
+            except (NotFound, CorruptData):
+                raw = {}
+            after = raw.get("after") if isinstance(raw.get("after"), str) else None
         page, cursor = self._store.list_owned_page(
-            user_id, limit=GADGETS_PER_CLEANUP, after=None, owner_registration=registration
+            user_id, limit=GADGETS_PER_CLEANUP, after=after, owner_registration=registration
         )
         for gadget in page:
             self._access.forget(gadget.id)
             self._store.delete(gadget.id)
+        files = self._files_of(self._store)
         if cursor is not None:
+            files.mkdirs(progress)
+            with contextlib.suppress(Conflict):  # Another step saved the same progress.
+                files.create_json(f"{progress}/{saved + 1}.json", {"after": cursor})
             return False
+        with contextlib.suppress(NotFound):
+            files.delete_tree(progress)
+        if after is not None and self._store.owns_any(user_id, owner_registration=registration):
+            return False  # Made behind the cursor while this pass ran: go round again.
         self._store.delete_user_files(user_id, owner_registration=registration)
         return True

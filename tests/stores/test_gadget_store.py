@@ -308,6 +308,60 @@ def test_reopening_removes_a_create_that_stopped_before_its_owner_marker(tmp_pat
     assert not list((location / ".creating").iterdir())
 
 
+def _hold_owner_index(store: LocalGadgetStore, location: Path, owner: str):  # type: ignore[no-untyped-def]
+    """Another process's hold on *owner*'s owner index."""
+    from filelock import FileLock
+
+    name = store._owner_dir(owner).name
+    (location / ".locks").mkdir(exist_ok=True)
+    return FileLock(str(location / ".locks" / f"{name}.lock"))
+
+
+def test_a_create_succeeds_when_its_cleanup_of_an_old_note_finds_a_busy_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # After the create commits, its sweep repairs another owner's stopped create, whose
+    # index another process holds: that repair waits for a later sweep; the create stands.
+    from omnigent.stores.gadget_store import local
+
+    location = tmp_path / "gadgets"
+    store = LocalGadgetStore(str(location))
+    stopped = store.create(BOB, "Half made")
+    [marker] = (location / "owners").rglob(stopped.id)
+    marker.unlink()
+    note = location / ".creating" / stopped.id
+    note.touch()
+    os.utime(note, (1_000_000_000, 1_000_000_000))
+    monkeypatch.setattr(local, "_OWNER_INDEX_WAIT_S", 0.05)
+
+    with _hold_owner_index(store, location, BOB):
+        board = store.create(ALICE, "Board")
+
+    assert [gadget.id for gadget in store.iter_owned(ALICE)] == [board.id]
+    assert note.exists()  # Left for a later sweep.
+    LocalGadgetStore(str(location))
+    assert not note.exists() and store.get(stopped.id) is None
+
+
+def test_a_delete_succeeds_when_retiring_its_emptied_segment_finds_a_busy_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.stores.gadget_store import local
+
+    monkeypatch.setattr(local, "_OWNER_SEGMENT_SIZE", 1)
+    location = tmp_path / "gadgets"
+    store = LocalGadgetStore(str(location))
+    first = store.create(ALICE, "First")
+    second = store.create(ALICE, "Second")
+    monkeypatch.setattr(local, "_OWNER_INDEX_WAIT_S", 0.05)
+
+    with _hold_owner_index(store, location, ALICE):
+        assert store.delete(first.id) is True
+
+    assert store.get(first.id) is None
+    assert [gadget.id for gadget in store.iter_owned(ALICE)] == [second.id]
+
+
 def test_a_start_cleans_up_a_bounded_amount_and_never_lists_every_gadget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -399,7 +399,12 @@ class LocalGadgetStore(GadgetStore):
                     if note.stat().st_mtime >= cutoff:
                         continue  # Maybe a create still in progress.
                     if _GADGET_ID.fullmatch(note.name) is not None:
-                        self._finish_interrupted_create(note.name)
+                        try:
+                            self._finish_interrupted_create(note.name)
+                        except Conflict:
+                            # Its owner index is busy: the note stays for a later sweep, and
+                            # the call this sweep follows (which already committed) succeeds.
+                            continue
                     os.unlink(note.path)
 
     def _finish_interrupted_create(self, gadget_id: str) -> None:
@@ -698,7 +703,9 @@ class LocalGadgetStore(GadgetStore):
         owner_dir = self._owner_dir(gadget.owner_id, gadget.owner_registration)
         with contextlib.suppress(FileNotFoundError):
             (owner_dir / segment / gadget_id).unlink()
-        with contextlib.suppress(OSError):
+        # The delete has committed: a busy owner index only puts off retiring the emptied
+        # segment, which a later delete or page does, rather than failing a done delete.
+        with contextlib.suppress(OSError, Conflict):
             if not os.listdir(owner_dir / segment):
                 self._drop_empty_segment(owner_dir, segment)
         self._empty_trash()

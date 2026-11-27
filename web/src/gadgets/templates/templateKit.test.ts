@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { GADGET_KIT_HELPERS } from "./templateKit";
+import { WHERE_WAS_I_HTML } from "./whereWasITemplate";
 
 const plain = new Function(`${GADGET_KIT_HELPERS}; return plain;`)() as (value: unknown) => string;
 
@@ -42,7 +43,7 @@ const kit = new Function(
   watchEveryPage: (
     collection: unknown,
     handler: (items: Doc[], complete: boolean) => void,
-    options: { limit: number },
+    options: { limit: number; intervalMs?: number; walkEveryMs?: number; walkDelayMs?: number },
   ) => unknown;
   MAX_EXTRA_PAGES: number;
 };
@@ -179,5 +180,65 @@ describe("keyed", () => {
     } finally {
       Element.prototype.animate = original;
     }
+  });
+});
+
+describe("watchEveryPage polling budget", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A polled collection of `count` records, 100 a page, counting every bridge request. */
+  function polledCollection(count: number, intervalMs: number, requests: { n: number }) {
+    const page = (from: number): Page => ({
+      items: Array.from({ length: Math.min(100, count - from) }, (_, n) => ({
+        id: `r${from + n}`,
+        version: "v1",
+        value: {},
+      })),
+      nextCursor: from + 100 < count ? `c${from + 100}` : null,
+    });
+    return {
+      watch(listener: (snapshot: Snapshot) => void) {
+        const poll = () => {
+          requests.n += 1;
+          listener({ status: "ready", ...page(0) });
+        };
+        poll();
+        setInterval(poll, intervalMs);
+        return () => {};
+      },
+      list({ cursor }: { cursor?: string }): Promise<Page> {
+        requests.n += 1;
+        return Promise.resolve(page(Number(String(cursor).slice(1))));
+      },
+    };
+  }
+
+  it("keeps the template's long histories well inside the request budget", async () => {
+    vi.useFakeTimers();
+    // As the "Where was I?" template polls its run and dismissal histories.
+    expect(WHERE_WAS_I_HTML).toContain("walkEveryMs: RADAR_WALK_EVERY_MS });");
+    expect(WHERE_WAS_I_HTML).toContain("walkDelayMs: RADAR_WALK_EVERY_MS / 2 });");
+    const requests = { n: 0 };
+    kit.watchEveryPage(polledCollection(950, 4000, requests), () => {}, {
+      intervalMs: 4000,
+      limit: 100,
+      walkEveryMs: 60_000,
+    });
+    kit.watchEveryPage(polledCollection(950, 8000, requests), () => {}, {
+      intervalMs: 8000,
+      limit: 100,
+      walkEveryMs: 60_000,
+      walkDelayMs: 30_000,
+    });
+    const minutes = 5;
+    for (let second = 0; second < minutes * 60; second += 1) {
+      // oxlint-disable-next-line no-await-in-loop -- each tick lets the pages resolve.
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    // About 41 a minute, against 240 the bridge allows (and about 225 without spacing):
+    // the other watches and the viewer's actions keep most of the budget.
+    expect(requests.n / minutes).toBeLessThan(60);
   });
 });
