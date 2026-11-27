@@ -93,7 +93,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     )
     editor = tmp_path / "editor.py"
     editor.write_text(
-        "import json, sys\n"
+        "import json, re, sys\n"
         "from pathlib import Path\n"
         + process_context
         + f"instruction = Path({str(instruction)!r})\n"
@@ -104,7 +104,11 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "    stream.write(json.dumps({'program': program, "
         "'arguments': [arg if arg.startswith('-') else Path(arg).name "
         "for arg in sys.argv[sys.argv.index('--editor-program') + 2:]]}) + '\\n')\n"
-        "source = Path(sys.argv[-1])\n"
+        "location = sys.argv[-1]\n"
+        "if program in ('code', 'code-insiders') and "
+        "any(flag in sys.argv for flag in ('-g', '--goto')):\n"
+        "    location = re.sub(r':\\d+(?::\\d+)?$', '', location)\n"
+        "source = Path(location)\n"
         "content = source.read_bytes().decode('utf-8')\n"
         "request = json.loads(instruction.read_text())\n"
         "accepted = content == request['expected']\n"
