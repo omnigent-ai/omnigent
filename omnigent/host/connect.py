@@ -76,6 +76,7 @@ from omnigent.host.frames import (
     RUNNER_LOG_TAIL_HEADING,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostAutomationRequestFrame,
     HostCloneRepositoryFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -6299,6 +6300,12 @@ class HostProcess:
             await self._send_text(ws, self._encode_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, self._encode_frame(await self._handle_runner_status(frame)))
+        elif isinstance(frame, HostAutomationRequestFrame):
+            # Signing may shell out to the Databricks CLI; keep the event loop free.
+            from omnigent.host.automation_requests import run_automation_request
+
+            automation_result = await asyncio.to_thread(run_automation_request, frame)
+            await self._send_text(ws, self._encode_frame(automation_result))
         elif isinstance(frame, HostStatFrame):
             # Even a single metadata lookup can block on a mounted filesystem.
             stat_result = await asyncio.to_thread(self._handle_stat, frame)

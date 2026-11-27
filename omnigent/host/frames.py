@@ -254,6 +254,8 @@ class HostFrameKind(str, Enum):
     RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
     STAT_RESULT = "host.stat_result"
+    AUTOMATION_REQUEST = "host.automation_request"
+    AUTOMATION_RESULT = "host.automation_result"
     LIST_DIR = "host.list_dir"
     LIST_DIR_RESULT = "host.list_dir_result"
     CREATE_WORKTREE = "host.create_worktree"
@@ -653,6 +655,45 @@ class HostStatResultFrame:
     exists: bool = False
     type: str | None = None
     canonical_path: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostAutomationRequestFrame:
+    """Server → host: call a scheduled-task automation API as the host's owner.
+
+    The host signs the call with its owner's Databricks login for the URL's own
+    workspace, so the server needs no credential for that workspace. The host
+    refuses anything but a ``…/scheduled-tasks`` call over HTTPS.
+
+    :param request_id: Unique ID for correlating the result.
+    :param method: ``"GET"``, ``"POST"``, ``"PATCH"`` or ``"DELETE"``.
+    :param url: Full HTTPS URL, e.g.
+        ``"https://automation.example.com/api/2.0/agent/scheduled-tasks"``.
+    :param body: JSON body, or ``None``.
+    """
+
+    request_id: str
+    method: str
+    url: str
+    body: dict[str, Any] | None = None
+
+
+@dataclass
+class HostAutomationResultFrame:
+    """Host → server: outcome of an automation API call.
+
+    :param request_id: Correlates to the :class:`HostAutomationRequestFrame`.
+    :param status_code: The API's HTTP status, or ``0`` when the host couldn't
+        make the call (see *error*).
+    :param body: The response body as text, truncated to 64 KiB.
+    :param error: Why the host refused or couldn't sign the call, e.g. no
+        Databricks login for that workspace. ``None`` when a call was made.
+    """
+
+    request_id: str
+    status_code: int
+    body: str = ""
     error: str | None = None
 
 
@@ -1687,6 +1728,8 @@ HostFrame = (
     | HostRunnerStatusResultFrame
     | HostStatFrame
     | HostStatResultFrame
+    | HostAutomationRequestFrame
+    | HostAutomationResultFrame
     | HostListDirFrame
     | HostListDirResultFrame
     | HostCreateWorktreeFrame
@@ -1952,6 +1995,26 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "exists": frame.exists,
                 "type": frame.type,
                 "canonical_path": frame.canonical_path,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostAutomationRequestFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.AUTOMATION_REQUEST.value,
+                "request_id": frame.request_id,
+                "method": frame.method,
+                "url": frame.url,
+                "body": frame.body,
+            }
+        )
+    if isinstance(frame, HostAutomationResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.AUTOMATION_RESULT.value,
+                "request_id": frame.request_id,
+                "status_code": frame.status_code,
+                "body": frame.body,
                 "error": frame.error,
             }
         )
@@ -2785,6 +2848,10 @@ def _decode_known_host_frame(
             return _decode_stat(msg)
         case HostFrameKind.STAT_RESULT:
             return _decode_stat_result(msg)
+        case HostFrameKind.AUTOMATION_REQUEST:
+            return _decode_automation_request(msg)
+        case HostFrameKind.AUTOMATION_RESULT:
+            return _decode_automation_result(msg)
         case HostFrameKind.LIST_DIR:
             return _decode_list_dir(msg)
         case HostFrameKind.LIST_DIR_RESULT:
@@ -3203,6 +3270,33 @@ def _decode_stat_result(msg: _JsonObject) -> HostStatResultFrame:
         exists=_required_bool(msg, "exists"),
         type=_optional_nullable_str(msg, "type"),
         canonical_path=_optional_nullable_str(msg, "canonical_path"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_automation_request(msg: _JsonObject) -> HostAutomationRequestFrame:
+    """Decode a host.automation_request frame."""
+    body = msg.get("body")
+    if body is not None and not isinstance(body, dict):
+        raise ValueError("host.automation_request body must be an object or null")
+    return HostAutomationRequestFrame(
+        request_id=_required_str(msg, "request_id"),
+        method=_required_str(msg, "method"),
+        url=_required_str(msg, "url"),
+        body=body,
+    )
+
+
+def _decode_automation_result(msg: _JsonObject) -> HostAutomationResultFrame:
+    """Decode a host.automation_result frame."""
+    status_code = msg.get("status_code")
+    if not isinstance(status_code, int) or isinstance(status_code, bool):
+        raise ValueError("host.automation_result status_code must be an integer")
+    body = msg.get("body")
+    return HostAutomationResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status_code=status_code,
+        body=body if isinstance(body, str) else "",
         error=_optional_nullable_str(msg, "error"),
     )
 

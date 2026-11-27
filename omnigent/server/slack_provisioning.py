@@ -2,8 +2,12 @@
 
 The watcher runs as a scheduled task on an agent automation service in another
 workspace, owned by the project owner. This server creates, updates, pauses and
-deletes it with the owner's Databricks connection to that workspace, so people
-manage everything from Project settings and never edit the automation.
+deletes it, so people manage everything from Project settings and never edit the
+automation. The calls go through the project Lead's host, signed there with the
+owner's own Databricks login (see :mod:`omnigent.host.automation_requests`), so
+the server holds no credential for that workspace. When the Lead's host isn't
+connected, the owner's server-side Databricks connection is used if it is for
+that workspace.
 
 Each provisioning mints a fresh per-link relay key, stores only its hash, and
 writes the key into the automation's instructions; the watcher presents it on
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -109,6 +114,47 @@ class AutomationError(Exception):
     """The automation service refused or failed a request."""
 
 
+# How long the Lead's host may take to sign and make one call.
+_HOST_CALL_TIMEOUT_S = 60.0
+
+
+@dataclass(frozen=True)
+class ViaHost:
+    """Make a call on the owner's connected host, signed with the owner's login there."""
+
+    registry: Any
+    connection: Any
+
+    async def send(self, method: str, url: str, body: dict[str, Any] | None) -> tuple[int, str]:
+        from omnigent.host.frames import HostAutomationRequestFrame, encode_host_frame
+
+        request_id = secrets.token_hex(8)
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.connection.pending_automation_requests[request_id] = future
+        frame = HostAutomationRequestFrame(
+            request_id=request_id, method=method, url=url, body=body
+        )
+        try:
+            try:
+                self.registry.send_text(self.connection, encode_host_frame(frame))
+            except ConnectionError as exc:
+                raise AutomationError("The project Lead's host went offline; retry") from exc
+            try:
+                result = await asyncio.wait_for(future, timeout=_HOST_CALL_TIMEOUT_S)
+            except TimeoutError as exc:
+                raise AutomationError(
+                    "The project Lead's host didn't answer in time; retry"
+                ) from exc
+        finally:
+            self.connection.pending_automation_requests.pop(request_id, None)
+        if result.get("error"):
+            error = str(result["error"])
+            if "login" in error.lower():
+                raise AutomationAuthError(error)
+            raise AutomationError(f"The project Lead's host refused the call: {error}")
+        return int(result.get("status_code") or 0), str(result.get("body") or "")
+
+
 class AutomationClient:
     """Scheduled-task calls on the automation service, as the bearer's owner.
 
@@ -120,35 +166,45 @@ class AutomationClient:
         self._transport = transport
 
     async def _call(
-        self, method: str, path: str, token: str, body: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        token: str | ViaHost,
+        body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S, transport=self._transport) as http:
-            try:
-                response = await http.request(
-                    method,
-                    f"{self._base}{path}",
-                    json=body,
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-            except httpx.HTTPError as exc:
-                raise AutomationError(f"The automation service is unreachable: {exc}") from exc
-        if response.status_code in (401, 403):
+        """One call, made directly with a bearer *token* or on the owner's host."""
+        url = f"{self._base}{path}"
+        if isinstance(token, ViaHost):
+            status, text = await token.send(method, url, body)
+        else:
+            async with httpx.AsyncClient(
+                timeout=_HTTP_TIMEOUT_S, transport=self._transport
+            ) as http:
+                try:
+                    response = await http.request(
+                        method, url, json=body, headers={"Authorization": f"Bearer {token}"}
+                    )
+                except httpx.HTTPError as exc:
+                    raise AutomationError(f"The automation service is unreachable: {exc}") from exc
+            status, text = response.status_code, response.text
+        if status in (401, 403):
             raise AutomationAuthError(
-                f"The automation service refused the owner's connection ({response.status_code})"
+                f"The automation service refused the owner's login ({status}); sign in again"
             )
-        if response.status_code == 404 and method == "DELETE":
+        if status == 404 and method == "DELETE":
             return {}
-        if response.status_code >= 400:
-            raise AutomationError(
-                f"The automation service returned {response.status_code}: {response.text[:300]}"
-            )
-        return response.json() if response.content else {}
+        if status >= 400:
+            raise AutomationError(f"The automation service returned {status}: {text[:300]}")
+        try:
+            return json.loads(text) if text.strip() else {}
+        except ValueError as exc:
+            raise AutomationError("The automation service returned a non-JSON answer") from exc
 
-    async def create(self, token: str, task: dict[str, Any]) -> dict[str, Any]:
+    async def create(self, token: str | ViaHost, task: dict[str, Any]) -> dict[str, Any]:
         return await self._call("POST", "", token, task)
 
     async def update(
-        self, token: str, owner: str, task_id: str, task: dict[str, Any]
+        self, token: str | ViaHost, owner: str, task_id: str, task: dict[str, Any]
     ) -> dict[str, Any]:
         body = {
             "username": owner,
@@ -159,14 +215,16 @@ class AutomationClient:
         }
         return await self._call("PATCH", f"/{owner}/{task_id}", token, body)
 
-    async def set_state(self, token: str, owner: str, task_id: str, state: str) -> dict[str, Any]:
+    async def set_state(
+        self, token: str | ViaHost, owner: str, task_id: str, state: str
+    ) -> dict[str, Any]:
         body = {"username": owner, "schedule_id": task_id, "state": state}
         return await self._call("POST", f"/{owner}/{task_id}/state", token, body)
 
-    async def delete(self, token: str, owner: str, task_id: str) -> None:
+    async def delete(self, token: str | ViaHost, owner: str, task_id: str) -> None:
         await self._call("DELETE", f"/{owner}/{task_id}", token)
 
-    async def list(self, token: str, owner: str) -> list[dict[str, Any]]:
+    async def list(self, token: str | ViaHost, owner: str) -> list[dict[str, Any]]:
         tasks: list[dict[str, Any]] = []
         page_token = ""
         for _ in range(20):
@@ -207,15 +265,46 @@ class SlackProvisioner:
         connection_store: Any,
         connection_client: Any,
         client: AutomationClient | None = None,
+        host_registry: Any = None,
+        conversations: Any = None,
     ) -> None:
         self.config = config
         self._store = store
         self._connections = connection_store
         self._connection_client = connection_client
         self._client = client or AutomationClient(config.api_url)
+        self._host_registry = host_registry
+        self._conversations = conversations
+
+    async def _lead_host(self, project: Project, owner_user_id: str) -> ViaHost | None:
+        """The Lead's host, when it is connected and is the owner's own host."""
+        if self._host_registry is None or self._conversations is None:
+            return None
+        if not project.main_session_id:
+            return None
+        lead = await asyncio.to_thread(
+            self._conversations.get_conversation, project.main_session_id
+        )
+        host_id = getattr(lead, "host_id", None)
+        if not host_id:
+            return None
+        connection = self._host_registry.get(host_id)
+        if connection is None or connection.owner != owner_user_id:
+            return None
+        return ViaHost(self._host_registry, connection)
+
+    async def _credential(self, project: Project, owner_user_id: str) -> str | ViaHost:
+        """How to reach the automation API as the owner: their Lead's host, else a token.
+
+        :raises AutomationAuthError: neither is available.
+        """
+        via_host = await self._lead_host(project, owner_user_id)
+        if via_host is not None:
+            return via_host
+        return await self._owner_token(owner_user_id)
 
     async def _owner_token(self, owner_user_id: str) -> str:
-        """The owner's access token for the automation workspace.
+        """The owner's server-side access token for the automation workspace.
 
         :raises AutomationAuthError: not connected, connected elsewhere, or expired.
         """
@@ -228,8 +317,9 @@ class SlackProvisioner:
             )
         if resolved is None:
             raise AutomationAuthError(
-                f"The project owner needs to connect Databricks to {self.config.workspace_host} "
-                "(Settings → Connections), then retry"
+                "The project Lead's host isn't connected, so the channel watcher can't be set "
+                "up. Start the Lead (or its host) and retry; or connect Databricks to "
+                f"{self.config.workspace_host} under Settings → Connections"
             )
         token, workspace_host = resolved
         if _host(workspace_host) != self.config.workspace_host:
@@ -298,7 +388,7 @@ class SlackProvisioner:
         """
         relay_key = secrets.token_urlsafe(32)
         try:
-            token = await self._owner_token(binding.owner_user_id)
+            token = await self._credential(project, binding.owner_user_id)
             task = self._task(project, binding, relay_key)
             if binding.automation_id:
                 owner, task_id = _split_automation_id(binding.automation_id)
@@ -330,7 +420,7 @@ class SlackProvisioner:
         """Pause the watcher; the link becomes ``disabled`` and keeps its channel."""
         if binding.automation_id:
             try:
-                token = await self._owner_token(binding.owner_user_id)
+                token = await self._credential(project, binding.owner_user_id)
                 owner, task_id = _split_automation_id(binding.automation_id)
                 await self._client.set_state(token, owner, task_id, _PAUSED)
             except (AutomationAuthError, AutomationError) as exc:
@@ -353,7 +443,7 @@ class SlackProvisioner:
         if not binding.automation_id:
             return
         try:
-            token = await self._owner_token(binding.owner_user_id)
+            token = await self._credential(project, binding.owner_user_id)
             owner, task_id = _split_automation_id(binding.automation_id)
             await self._client.delete(token, owner, task_id)
         except (AutomationAuthError, AutomationError) as exc:
@@ -366,7 +456,7 @@ class SlackProvisioner:
                 detail={"automation_id": binding.automation_id, "error": str(exc)[:500]},
             )
 
-    async def overlaps(self, binding: SlackBinding) -> list[str]:
+    async def overlaps(self, project: Project, binding: SlackBinding) -> list[str]:
         """Other automations of the owner that also watch this channel (best effort).
 
         Uniqueness here can't stop another server or a hand-made automation from
@@ -375,7 +465,7 @@ class SlackProvisioner:
         if not binding.automation_id:
             return []
         try:
-            token = await self._owner_token(binding.owner_user_id)
+            token = await self._credential(project, binding.owner_user_id)
             owner, own_id = _split_automation_id(binding.automation_id)
             tasks = await self._client.list(token, owner)
         except (AutomationAuthError, AutomationError):

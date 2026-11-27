@@ -4856,6 +4856,8 @@ def create_app(
                         app.state.project_slack_store,
                         connection_store=getattr(app.state, "databricks_store", None),
                         connection_client=getattr(app.state, "databricks_client", None),
+                        host_registry=getattr(app.state, "host_registry", None),
+                        conversations=conversation_store,
                     )
                     if _slack_automation is not None
                     else None

@@ -39,6 +39,7 @@ from omnigent.host.frames import (
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     SERVER_CAPABILITIES,
     SERVER_CAPABILITIES_HEADER,
+    HostAutomationResultFrame,
     HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
@@ -994,6 +995,14 @@ async def _receive_loop(
             status_future = conn.pending_runner_status.pop(frame.request_id, None)
             if status_future is not None and not status_future.done():
                 status_future.set_result({"status": frame.status})
+            continue
+
+        if isinstance(frame, HostAutomationResultFrame):
+            automation_future = conn.pending_automation_requests.pop(frame.request_id, None)
+            if automation_future is not None and not automation_future.done():
+                automation_future.set_result(
+                    {"status_code": frame.status_code, "body": frame.body, "error": frame.error}
+                )
             continue
 
         if isinstance(frame, HostStatResultFrame):

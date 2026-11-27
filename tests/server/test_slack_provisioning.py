@@ -151,3 +151,82 @@ def test_undeletable_watcher_is_audited(db_uri: str) -> None:
     service.status = 500
     asyncio.run(provisioner.remove(project, active, actor_user_id=None))
     assert "automation_orphaned" in [entry.action for entry in store.audit(project.id)]
+
+
+class _HostConnection:
+    def __init__(self, owner: str) -> None:
+        self.owner = owner
+        self.pending_automation_requests: dict = {}
+
+
+class _HostRegistry:
+    """Answers each host.automation_request frame from a fake automation API."""
+
+    def __init__(self, connection: _HostConnection, service: _FakeService) -> None:
+        self.connection = connection
+        self.service = service
+        self.frames: list = []
+
+    def get(self, host_id: str):
+        return self.connection if host_id == "host-1" else None
+
+    def send_text(self, connection, text: str) -> None:
+        from omnigent.host.automation_requests import run_automation_request
+        from omnigent.host.frames import decode_host_frame
+
+        frame = decode_host_frame(text)
+        self.frames.append(frame)
+
+        class _Bearer(httpx.Auth):
+            def auth_flow(self, request):
+                request.headers["Authorization"] = "Bearer owner-token"
+                yield request
+
+        result = run_automation_request(
+            frame,
+            resolve_auth=lambda host: (_Bearer(), host),
+            transport=httpx.MockTransport(self.service.handler),
+        )
+        future = connection.pending_automation_requests[frame.request_id]
+        future.set_result(
+            {"status_code": result.status_code, "body": result.body, "error": result.error}
+        )
+
+
+def _via_host(db_uri: str, *, host_owner: str):
+    store, service, _, project, binding = _setup(db_uri, connection=None, channel_id="C0H01")
+    project.main_session_id = "lead-1"
+    registry = _HostRegistry(_HostConnection(host_owner), service)
+    conversations = SimpleNamespace(
+        get_conversation=lambda session_id: SimpleNamespace(host_id="host-1")
+    )
+    provisioner = SlackProvisioner(
+        CONFIG,
+        store,
+        connection_store=None,
+        connection_client=None,
+        host_registry=registry,
+        conversations=conversations,
+    )
+    return store, service, registry, provisioner, project, binding
+
+
+def test_provisions_through_the_lead_host_without_a_server_credential(db_uri: str) -> None:
+    _, service, registry, provisioner, project, binding = _via_host(
+        db_uri, host_owner="ann.lee@example.com"
+    )
+    active = asyncio.run(provisioner.provision(project, binding, actor_user_id=None))
+    assert active.state == "active" and active.automation_id == "ann_lee/s-1"
+    assert registry.frames[0].url == "https://automation.example.com/api/2.0/agent/scheduled-tasks"
+    paused = asyncio.run(provisioner.pause(project, active, actor_user_id=None))
+    assert paused.state == "disabled"
+    assert [call[0] for call in service.calls] == ["POST", "POST"]
+
+
+def test_a_lead_host_owned_by_someone_else_is_not_used(db_uri: str) -> None:
+    _, service, registry, provisioner, project, binding = _via_host(
+        db_uri, host_owner="mallory@example.com"
+    )
+    failed = asyncio.run(provisioner.provision(project, binding, actor_user_id=None))
+    assert failed.state == "needs_reconnect"
+    assert registry.frames == [] and service.calls == []

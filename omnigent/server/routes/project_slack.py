@@ -174,7 +174,7 @@ def create_project_slack_router(
         body = binding_json(binding, can_manage=can_manage)
         active = provisioner(request)
         if binding is not None and can_manage and active is not None:
-            body["overlaps"] = await active.overlaps(binding)
+            body["overlaps"] = await active.overlaps(project, binding)
         return body
 
     @router.put("")
