@@ -1017,16 +1017,17 @@ function FileViewerBody({
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
   // Monaco — mirrors CodeViewer's own base64/binary-path check.
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
-  // Show Δ button only when the file appears in the session's changed-files list.
+  // Whether the file appears in the comparison's listing, or else the session's changed files.
+  const isChangedFile = comparisonListing
+    ? comparisonListing.changed
+    : (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+  // Show Δ button only for a changed file that has a text diff to show.
   const isDiffAvailable =
-    !isImage &&
-    !isPdf &&
-    !isVideo &&
-    !isModel &&
-    !isSpreadsheet &&
-    (comparisonListing
-      ? comparisonListing.changed
-      : (changedFiles.data?.data.some((f) => f.path === path) ?? false));
+    !isImage && !isPdf && !isVideo && !isModel && !isSpreadsheet && isChangedFile;
+  // A page with a Changes review shows a changed file's changes there, media included. A
+  // deleted file already opens in its diff.
+  const showsChangesAction =
+    !isDeletedFile && (onShowChanges ? isChangedFile : !isPdf && isDiffAvailable);
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
   const repositoryContext = useRepositoryContext(conversationId, open && !isDeletedFile);
@@ -1590,7 +1591,7 @@ function FileViewerBody({
       setCommentsOpen((prev) => !prev);
     },
   });
-  if (!isPdf && !isDeletedFile && isDiffAvailable) {
+  if (showsChangesAction) {
     const toggleDiff = () =>
       guardDirty(() => {
         dismissFilePosition(position);

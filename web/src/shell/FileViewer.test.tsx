@@ -1146,6 +1146,54 @@ describe("FileViewer URL sync — diff param", () => {
     expect(onShowChanges).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["image.png", "document.pdf", "model.stl"])(
+    "offers a changed %s's changes in the page's Changes review, which has no inline diff",
+    async (path) => {
+      const files = [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }];
+      await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+        () =>
+          ({ data: { available: true, data: files } }) as ReturnType<
+            typeof useWorkspaceChangedFiles
+          >,
+        async () => {
+          useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+          const onShowChanges = vi.fn();
+          renderViewer({ open: true, path, onShowChanges });
+          fireEvent.click(screen.getByRole("button", { name: "Show changes" }));
+          expect(onShowChanges).toHaveBeenCalledTimes(1);
+          cleanup();
+
+          // Without a Changes review, the viewer still offers no diff for it.
+          renderViewer({ open: true, path });
+          expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+        },
+      );
+    },
+  );
+
+  it("opens a deleted file in its diff, with no Show changes or Open file, beside a Changes review", async () => {
+    const files = [
+      { path: "gone.py", bytes: 0, modified_at: null, name: "gone.py", status: "deleted" },
+    ];
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () =>
+        ({ data: { available: true, data: files } }) as ReturnType<typeof useWorkspaceChangedFiles>,
+      async () => {
+        useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+        renderViewer({ open: true, path: "gone.py", onShowChanges: vi.fn() });
+        expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
+        expect(screen.queryByRole("button", { name: "Open file" })).toBeNull();
+      },
+    );
+  });
+
+  it("offers no Show changes for an unchanged file, even beside a Changes review", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, path: "image.png", onShowChanges: vi.fn() });
+    expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
+  });
+
   it("removes ?diff from the URL when diff is toggled off", async () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
