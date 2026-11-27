@@ -369,7 +369,12 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         + "draft-end\n\nsecond line with spaces  \nthird line 😀\n"
     )
     if draft_mode == "launch-paste-diagnostic":
-        typed_draft = "native-paste-draft-end\n" + "continued pasted line\n" * 12
+        prefix = (
+            "This is turn 1. Context marker native-paste-draft-end. "
+            "Reply with exactly this token and nothing else: native-paste-reply\n\n"
+        )
+        typed_draft = prefix + ("wrapped continuation text " * 20)[: 336 - len(prefix)] + "\n"
+        assert len(typed_draft) == 337
 
     def observations() -> list[dict[str, object]]:
         if not observed.exists():
@@ -472,13 +477,20 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 raise AssertionError({"phase": "initial-composer", "pane": pane()}) from exc
             command("load-buffer", "-b", "editor-draft", "-", text=typed_draft)
             command("paste-buffer", "-d", "-p", "-b", "editor-draft", "-t", target)
-            poll_until(lambda: bridge._draft_in_input_box(pane(), "draft-end"), timeout_s=10)
+            if draft_mode == "launch-paste-diagnostic":
+                time.sleep(1.0)
+                picker_observations.append({"kind": "settled-paste-before-submit", "pane": pane()})
+            else:
+                poll_until(lambda: bridge._draft_in_input_box(pane(), "draft-end"), timeout_s=10)
             command("send-keys", "-t", target, "Enter")
             poll_until(hook_record.exists, timeout_s=15)
             poll_until(
                 lambda: (
                     "blocked-draft-ownership-probe" in pane()
-                    and bridge._draft_in_input_box(last_pane, "draft-end")
+                    and (
+                        draft_mode == "launch-paste-diagnostic"
+                        or bridge._draft_in_input_box(last_pane, "draft-end")
+                    )
                 ),
                 timeout_s=10,
             )
@@ -495,6 +507,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert owner["native_session_id"] == payload["session_id"]
             assert owner["process"] == payload["native_process"]
             if draft_mode == "launch-paste-diagnostic":
+                assert "<pasted_content" in draft, "The diagnostic did not reach a collapsed paste"
                 picker_observations.append({"kind": "before-observation", "pane": pane()})
                 count = len(observations())
                 instruction.write_text(
