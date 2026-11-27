@@ -22,6 +22,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from omnigent.stores.workflow_store import WorkflowStore
+from tests.gadgets.grant_store import GadgetGrantStore
 
 
 def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) -> None:
@@ -1566,7 +1567,7 @@ def _gadgets(db_uri: str, tmp_path, accounts: SqlAlchemyAccountStore):
     from omnigent.stores.gadget_store.local import LocalGadgetStore
 
     store = LocalGadgetStore(str(tmp_path / "gadgets"))
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     access = PermissionStoreGadgetAccess(store, permissions)
     accounts.attach_gadgets(DeletedAccountGadgets(store, access))
 
@@ -1598,7 +1599,7 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     db_uri: str, tmp_path
 ) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     store, access, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("bob")
@@ -1606,8 +1607,7 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     board = alice.create("Synthetic board")
     kept = service("bob").create("Bob's board")
     permissions.grant_for_gadget("bob", board["id"], 2)
-    permissions.grant_for_gadget("alice", kept["id"], 1)
-    alice.pin(kept["id"], {"pinned": True})
+    alice.pin(board["id"], {"pinned": True})
 
     assert accounts.delete_user("alice") is True
     assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
@@ -1615,11 +1615,10 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     assert permissions.list_for_gadget(board["id"]) == ([], None)
     assert access.shared_with("bob").items == []
 
-    # The name starts over: no gadgets, shares or pins come back with it.
+    # The name starts over: no gadgets or pins come back with it.
     accounts.create_user_with_password("alice", "replacement-hash")
     assert service("alice").list_owned() == {"items": [], "next_cursor": None}
     assert service("alice").shelf()["pinned"] == []
-    assert service("alice").shared() == {"items": [], "next_cursor": None}
     assert store.get(kept["id"]) is not None
 
 
@@ -1632,7 +1631,7 @@ def test_a_write_on_its_way_when_the_account_is_deleted_is_cleaned_up_after_it_l
     import threading
 
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     store, _, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("bob")
@@ -1729,7 +1728,7 @@ def _reopened_cleanup(db_uri: str, tmp_path):
     from omnigent.stores.gadget_store.local import LocalGadgetStore
 
     store = LocalGadgetStore(str(tmp_path / "gadgets"))
-    access = PermissionStoreGadgetAccess(store, SqlAlchemyPermissionStore(db_uri))
+    access = PermissionStoreGadgetAccess(store, GadgetGrantStore(db_uri))
     return store, DeletedAccountGadgets(store, access)
 
 
@@ -1829,7 +1828,7 @@ def test_a_gadget_whose_create_stopped_before_its_owner_marker_leaves_nothing_be
 
 def test_a_password_change_keeps_the_accounts_gadgets_and_pins(db_uri: str, tmp_path) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     _, access, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("bob")
@@ -1890,7 +1889,7 @@ def test_with_gadgets_off_deleting_an_account_only_notes_its_gadgets_cleanup(
 
     accounts = SqlAlchemyAccountStore(db_uri)
     store = LocalGadgetStore(str(tmp_path / "gadgets"), maintain=False)
-    access = PermissionStoreGadgetAccess(store, SqlAlchemyPermissionStore(db_uri))
+    access = PermissionStoreGadgetAccess(store, GadgetGrantStore(db_uri))
     accounts.attach_gadgets(DeletedAccountGadgets(store, access, enabled=lambda: False))
 
     def untouched(*_args, **_kwargs):  # type: ignore[no-untyped-def]
@@ -1915,7 +1914,7 @@ def test_a_cleanup_noted_while_gadgets_were_off_finishes_once_they_are_on(
     from omnigent.gadgets.accounts import DeletedAccountGadgets
 
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     store, access, service = _gadgets(db_uri, tmp_path, accounts)
     gadgets_on = {"value": True}
     cleanup = DeletedAccountGadgets(store, access, enabled=lambda: gadgets_on["value"])
@@ -1949,7 +1948,7 @@ def test_deleting_an_account_after_password_changes_removes_its_gadgets_for_good
     db_uri: str, tmp_path
 ) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     store, access, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("bob")
@@ -1968,40 +1967,11 @@ def test_deleting_an_account_after_password_changes_removes_its_gadgets_for_good
     assert service("alice").shelf()["pinned"] == []
 
 
-def test_reregistration_finishes_removing_the_gadget_grants_a_deleted_account_held(
-    db_uri: str, tmp_path, monkeypatch
-) -> None:
-    accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
-    _, _, service = _gadgets(db_uri, tmp_path, accounts)
-    accounts.create_user_with_password("alice", "alice-hash")
-    permissions.ensure_user("bob")
-    board = service("bob").create("Bob's board")
-    permissions.grant_for_gadget("alice", board["id"], 2)
-    original = accounts_module.delete_deleted_account_gadget_grants
-    # The grant cleanup fails during the deletion and the first re-registration.
-    monkeypatch.setattr(
-        accounts_module, "delete_deleted_account_gadget_grants", lambda *args, **kwargs: 0
-    )
-    assert accounts.delete_user("alice") is True
-    assert permissions.resolve_gadget_access(["alice"], board["id"]) == 2
-    with pytest.raises(OmnigentError) as refused:
-        accounts.create_user_with_password("alice", "replacement-hash")
-    assert refused.value.code == ErrorCode.CONFLICT
-    assert "gadget grants" in refused.value.message
-
-    monkeypatch.setattr(accounts_module, "delete_deleted_account_gadget_grants", original)
-    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
-    # The new Alice does not inherit the old one's access to Bob's board.
-    assert permissions.resolve_gadget_access(["alice"], board["id"]) is None
-    assert service("alice").shared() == {"items": [], "next_cursor": None}
-
-
 def test_a_name_registered_again_before_the_gadget_cleanup_inherits_nothing(
     db_uri: str, tmp_path, monkeypatch
 ) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     store, access, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("bob")
@@ -2074,7 +2044,7 @@ def test_a_username_registered_again_cannot_reach_a_copy_of_the_old_accounts_gad
     from omnigent.stores.gadget_store.local import LocalGadgetStore
 
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     # Two servers share the accounts and permissions database, each with its own gadgets;
     # only server B cleans up after deleted accounts here.
     root_a = LocalGadgetStore(str(tmp_path / "a"))
@@ -2110,7 +2080,7 @@ def test_a_name_registered_again_is_not_the_author_of_the_old_accounts_comments_
     from tests.gadgets.test_gadget_service import publish_actions_board
 
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     _, _, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("bob", "bob-hash")
     accounts.create_user_with_password("alice", "alice-hash")
@@ -2166,7 +2136,7 @@ def test_a_password_change_keeps_the_accounts_comments_and_actions_its_own(
     from tests.gadgets.test_gadget_service import publish_actions_board
 
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     _, _, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("bob", "bob-hash")
     accounts.create_user_with_password("alice", "alice-hash")
@@ -2202,7 +2172,7 @@ def test_a_large_accounts_gadgets_go_a_bounded_number_per_call_and_the_rest_late
 
     monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 2)
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     store, access, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     accounts.create_user_with_password("carol", "carol-hash")
@@ -2258,7 +2228,7 @@ def test_a_cleanup_resumed_from_another_workspace_removes_that_workspaces_grants
 
     monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 1)
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     store, access, _ = _gadgets(db_uri, tmp_path, accounts)
     with workspace_scope(202):
         accounts.create_user_with_password("alice", "alice-hash")
@@ -2288,7 +2258,7 @@ def test_a_cleanup_that_keeps_failing_never_blocks_the_others(
 
     monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 1)
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     store, _, service = _gadgets(db_uri, tmp_path, accounts)
     gadgets = accounts._gadgets
     # An unreadable note, and a deleted account whose gadgets can't be listed, both at the
@@ -2654,7 +2624,7 @@ def test_deletion_removes_the_accounts_own_records_in_other_peoples_gadgets(
     """Viewer-collection records live in the viewer's own files, which go with the account:
     the name registered again starts with none, and the gadget's owner keeps theirs."""
     accounts = SqlAlchemyAccountStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
     _, _, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("bob")

@@ -52,7 +52,7 @@ A deployment can replace three pieces without forking:
 | Piece | Default | Interface |
 | --- | --- | --- |
 | Storage | JSON files under `<data_dir>/gadgets` | `GadgetStore` (`omnigent/stores/gadget_store`) — gadget metadata plus a small create-only JSON file interface the record store is built on |
-| Access | owner plus grants in the `PermissionStore`, like sessions and workflows (the bundled SQL store keeps them in `gadget_shares`) | `GadgetAccess` — a viewer's `read` / `write_data` / `publish` / `manage` on a gadget, and the gadgets shared with them |
+| Access | owner plus grants in the `PermissionStore`, like sessions and workflows; the bundled SQL store keeps none yet, so gadgets stay private to their owners | `GadgetAccess` — a viewer's `read` / `write_data` / `publish` / `manage` on a gadget, and the gadgets shared with them |
 | Frame | sandboxed `srcdoc` iframe | the web host config's gadget frame, for hosts that serve gadgets from an isolated origin |
 
 `create_app(gadget_store=..., gadget_access=...)` takes custom implementations; the CLI passes
@@ -105,17 +105,16 @@ action ledger, rule state, and each viewer's shelf) is a revisioned JSON documen
 
 The server's relational stores keep what the rest of the server queries across users: the
 grants that share gadgets belong in the `PermissionStore`, like session and workflow shares.
-The bundled SQL store keeps them in `gadget_shares`, one row per grantee, user or group. A
-grant names the grantee's username, not one registration of it, so deleting an account
-removes the grants it held, a bounded batch at a time, and registering the username again
-is refused while any remain: a new account never inherits the old one's access. A store
-that keeps no grants reports `supports_gadget_grants` false: the server then advertises
+The bundled SQL store doesn't keep them yet (its `gadget_shares` table and grant code come in
+a follow-up), so it reports `supports_gadget_grants` false: the server advertises
 `gadget_sharing: false`, the web UI hides Share and the Shared list, and the share routes
-answer `FORBIDDEN`. A `PermissionStore` or `GadgetAccess` that keeps grants elsewhere, such
-as one backed by folder permissions, shares through the same routes. 
+answer `FORBIDDEN`. A `PermissionStore` or `GadgetAccess` that keeps grants elsewhere, such as
+one backed by folder permissions, shares through the same routes. A grant names a username,
+not one registration of it, so a store that keeps grants removes an account's grants when it
+is deleted and refuses to register the username again while any remain.
 
 That cleanup and refusal are what keep a username registered again from inheriting grants,
-so every server process that can delete or register accounts must run a release that has
+so with a store that keeps grants, every server process that can delete or register accounts must run a release that has
 them before gadget sharing is used. **Deployment order:** upgrade every replica, then enable
 the `gadgets` feature; on a server that already has it on, finish the rolling upgrade before
 anyone shares a gadget. A replica of an older release can delete and register the same

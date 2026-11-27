@@ -838,8 +838,8 @@ class PermissionStore(ABC):
     # and grants left on a deleted gadget are inert because IDs are never reused.
     # A grant names a username, not one registration of it: a store that keeps grants
     # must make sure a username registered again after its account was deleted does
-    # not inherit them (the SQL store removes them with the account, and refuses the
-    # new registration while any remain).
+    # not inherit them, for example by removing them with the account and refusing the
+    # new registration while any remain.
 
     @property
     def supports_gadget_grants(self) -> bool:
