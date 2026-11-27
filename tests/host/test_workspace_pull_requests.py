@@ -1119,8 +1119,11 @@ async def test_a_finder_naming_no_usable_url_is_refused_with_nothing_read(
         ("a..b", "branch name must not contain '..'"),
         ("a b", "branch name 'a b' contains an invalid character"),
         ("x" * 256, "The branch name is longer than 255 bytes"),
+        # 128 characters, but 256 bytes: the limit is on bytes.
+        ("é" * 128, "The branch name is longer than 255 bytes"),
+        ("HEAD", "branch name must not be 'HEAD'"),
     ],
-    ids=["empty", "flag", "dots", "space", "long"],
+    ids=["empty", "flag", "dots", "space", "long", "long-in-bytes", "head"],
 )
 async def test_a_branch_list_naming_no_branch_is_refused_with_nothing_read(
     tmp_path: Path, branch: str, refusal: str, finder_calls: list[tuple[str, str, dict[str, Any]]]
@@ -1133,6 +1136,23 @@ async def test_a_branch_list_naming_no_branch_is_refused_with_nothing_read(
     assert code == Code.INVALID_ARGUMENT.value
     assert message is not None and message.startswith(refusal)
     assert finder_calls == []
+
+
+@pytest.mark.parametrize(
+    "branch",
+    ["x" * 255, "é" * 127 + "x", "HEADS", "release/HEAD"],
+    ids=["255-bytes", "multibyte", "heads", "nested-head"],
+)
+async def test_a_branch_list_at_the_limits_is_read(
+    tmp_path: Path, branch: str, finder_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    request = pb.ListBranchPullRequestsRequest(branch=branch)
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "ListBranchPullRequests", request.SerializeToString())
+    )
+
+    assert code is None, message
+    assert [call[2] for call in finder_calls] == [{"branch": branch}]
 
 
 async def test_a_branch_list_github_cant_answer_is_a_precondition_failure(

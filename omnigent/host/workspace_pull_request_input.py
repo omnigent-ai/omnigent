@@ -176,6 +176,9 @@ def _branch_refusal(branch: str) -> str | None:
     """Why ``branch`` can't name a branch, by git's ref rules and its length limit."""
     if len(branch.encode()) > MAX_BRANCH_NAME_BYTES:
         return f"The branch name is longer than {MAX_BRANCH_NAME_BYTES} bytes"
+    # ``git check-ref-format --branch`` refuses it; it names the checkout, not a branch.
+    if branch == "HEAD":
+        return "branch name must not be 'HEAD'"
     try:
         validate_branch_name(branch)
     except WorktreeError as exc:

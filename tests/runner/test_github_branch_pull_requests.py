@@ -136,6 +136,28 @@ def test_a_branch_lists_its_pull_requests_in_the_workspaces_repository(
     assert fake.calls == [argv]
 
 
+@pytest.mark.parametrize(
+    "remote",
+    [
+        f"ssh://git@github.com:22/{REPOSITORY}.git",
+        f"https://github.com:443/{REPOSITORY}",
+        f"git@github.com:{REPOSITORY}.git",
+    ],
+    ids=["ssh-port", "https-port", "scp"],
+)
+def test_every_remote_form_lists_the_same_repository(
+    tmp_path: Path, fake: FakeGh, remote: str
+) -> None:
+    root = _checkout(tmp_path, origin=remote)
+    fake.listed = [_entry(7)]
+
+    rows = github_search.branch_pull_requests(root, branch="feature/login")["data"]
+
+    assert [row["url"] for row in rows] == [f"https://github.com/{REPOSITORY}/pull/7"]
+    argv = fake.list_arguments()
+    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
+
+
 def test_the_base_remote_gh_resolved_is_listed_before_origin(tmp_path: Path, fake: FakeGh) -> None:
     """A fork's pull requests live in the base repository ``gh repo set-default`` chose."""
     root = _checkout(
@@ -219,12 +241,17 @@ def test_a_workspace_without_a_repository_remote_has_none(
     assert fake.calls == []
 
 
+@pytest.mark.parametrize(
+    "remote",
+    [f"https://{GHES}/{REPOSITORY}.git", f"ssh://git@{GHES}:7999/{REPOSITORY}.git"],
+    ids=["https", "ssh-port"],
+)
 def test_a_remote_on_a_host_never_set_up_runs_no_gh_with_an_enterprise_token(
-    tmp_path: Path, fake: FakeGh, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake: FakeGh, monkeypatch: pytest.MonkeyPatch, remote: str
 ) -> None:
     """gh would treat every enterprise host as signed in and send it this token."""
     monkeypatch.setenv("GH_ENTERPRISE_TOKEN", TOKEN)
-    root = _checkout(tmp_path, origin=f"https://{GHES}/{REPOSITORY}.git")
+    root = _checkout(tmp_path, origin=remote)
 
     with pytest.raises(PullRequestError, match="isn't on a GitHub host set up here"):
         github_search.branch_pull_requests(root, branch="main")

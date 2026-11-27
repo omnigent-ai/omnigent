@@ -15,7 +15,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from omnigent.git_providers import host_of
+from omnigent.git_providers import EnvInstances, host_of
+from omnigent.git_providers.github import GitHubProvider
 from omnigent.runner import github_resource as github
 from omnigent.runner.pull_request_errors import InvalidPullRequestInput, PullRequestError
 from omnigent.runner.session_prs import PullRequestRef
@@ -242,16 +243,21 @@ def workspace_repository(root: str) -> tuple[str, str] | None:
     """The host and ``owner/repo`` of the workspace's base remote, read from git alone.
 
     :returns: e.g. ``("github.com", "example-org/example-repo")``, or ``None`` when the
-        remote is missing or doesn't name a repository.
+        remote is missing or doesn't name a repository on a host set up for GitHub.
+    :raises PullRequestError: For a remote on a host never set up for GitHub, so that
+        isn't reported as a branch with no pull requests.
     """
     rc, url, _ = github._git(["remote", "get-url", _base_remote(root)], cwd=root)
     if rc != 0:
         return None
+    # The provider's parser takes SSH and HTTPS remotes with a port, and checks the host.
+    parsed = GitHubProvider().parse_remote_url(url.strip(), EnvInstances())
+    if parsed is not None:
+        return parsed.host, parsed.repository
     host = host_of(url.strip())
-    repository = github._owner_repo_from_url(url.strip())
-    if not host or not repository:
-        return None
-    return host, repository
+    if host and not github._known_github_host(host):
+        raise PullRequestError(_UNKNOWN_WORKSPACE_HOST)
+    return None
 
 
 def _repository_token(root: str, host: str, repository: str) -> str | None:
@@ -288,8 +294,6 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
     if found is None:
         return {"object": "list", "data": []}
     host, repository = found
-    if not github._known_github_host(host):
-        raise PullRequestError(_UNKNOWN_WORKSPACE_HOST)
     with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
         rc, output, _ = github._gh(
             [
