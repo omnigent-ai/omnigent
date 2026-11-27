@@ -1922,7 +1922,8 @@ async def test_model_control_hold_preserves_user_changes_until_dismissal(
                 assert len(events) == 1 and isinstance(events[0], ExecutorError)
                 assert events[0].undelivered is True
                 if finish == "draft":
-                    assert "unrelated draft" in events[0].message
+                    assert "could not be confirmed as your saved message" in events[0].message
+                    assert "left untouched" in events[0].message
                     assert composer.text == "a person's unrelated draft"
                 else:
                     assert "model-switch confirmation" in events[0].message
