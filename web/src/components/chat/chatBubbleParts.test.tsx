@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElicitationBlock } from "@/lib/blocks";
 import { buildBubbles, type Bubble, type RenderItem } from "@/lib/renderItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import type { ConversationItem } from "@/lib/conversationItems";
 import type { PendingInput } from "@/lib/types";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import { PEER_SESSION_MESSAGES_STORAGE_KEY } from "@/lib/peerSessionMessagePreferences";
@@ -1265,9 +1266,12 @@ describe("undelivered startup messages", () => {
     }
   });
 
-  it("stay outside a skill command's typed echo and its indicator", () => {
-    const committed = buildBubbles(
-      itemsToBlocks([
+  it.each<{ derived: string; itemId: string; items: ConversationItem[]; bubbles: string[] }>([
+    {
+      derived: "a skill command's typed echo and its indicator",
+      itemId: "skill_1",
+      bubbles: ["skill_1:user", "assistant:skill_1"],
+      items: [
         {
           id: "skill_1",
           response_id: "resp_skill",
@@ -1277,21 +1281,55 @@ describe("undelivered startup messages", () => {
           name: "review",
           arguments: "the plan",
         },
-      ]),
-      null,
-    );
+      ],
+    },
+    {
+      derived: "an answered question's card and its tool row",
+      itemId: "fc_ask",
+      bubbles: ["assistant:fc_ask:answer", "assistant:fc_ask"],
+      items: [
+        {
+          id: "fc_ask",
+          response_id: "resp_ask",
+          type: "function_call",
+          status: "completed",
+          name: "AskUserQuestion",
+          call_id: "call_ask",
+          arguments: JSON.stringify({
+            questions: [
+              {
+                question: "Which library?",
+                header: "Library",
+                multiSelect: false,
+                options: [{ label: "date-fns", description: "Small" }],
+              },
+            ],
+          }),
+        },
+        {
+          id: "fco_ask",
+          response_id: "resp_ask",
+          type: "function_call_output",
+          status: "completed",
+          call_id: "call_ask",
+          output: 'Your questions have been answered: "Which library?"="date-fns".',
+        },
+      ],
+    },
+  ])("stay outside $derived", ({ itemId, items, bubbles }) => {
+    const committed = buildBubbles(itemsToBlocks(items), null);
+    const label = (bubble: Bubble) =>
+      bubble.kind === "assistant" ? `assistant:${bubble.stableId}` : bubble.itemId;
     const place = (neighbors: Pick<PendingInput, "precedingItemIds" | "followingItemIds">) =>
-      withUncommittedUserBubbles(committed, [], [{ ...lost, ...neighbors }], null).map((bubble) =>
-        bubble.kind === "assistant" ? bubble.kind : bubble.itemId,
-      );
-    expect(place({ precedingItemIds: [], followingItemIds: ["skill_1"] })).toEqual([
+      withUncommittedUserBubbles(committed, [], [{ ...lost, ...neighbors }], null).map(label);
+    expect(committed.map(label)).toEqual(bubbles);
+    // An earlier item that isn't loaded leaves the copy to anchor on the item's first bubble.
+    expect(place({ precedingItemIds: ["older"], followingItemIds: [itemId] })).toEqual([
       "pending_first",
-      "skill_1:user",
-      "assistant",
+      ...committed.map(label),
     ]);
-    expect(place({ precedingItemIds: ["skill_1"], followingItemIds: ["resource_event"] })).toEqual([
-      "skill_1:user",
-      "assistant",
+    expect(place({ precedingItemIds: [itemId], followingItemIds: ["resource_event"] })).toEqual([
+      ...committed.map(label),
       "pending_first",
     ]);
   });

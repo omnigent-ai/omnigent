@@ -86,6 +86,7 @@ import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
+  answeredElicitationItemId,
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
@@ -370,12 +371,19 @@ function bubbleSpansByItemId(committed: Bubble[]): Map<string, BubbleSpan> {
   return spans;
 }
 
-// A skill receipt also shows the user's typed command, under a derived id.
+// A skill receipt also shows the user's typed command, and an answered question or plan call
+// shows its rebuilt card, each under an id derived from the item's.
 function itemSpan(spans: Map<string, BubbleSpan>, id: string): BubbleSpan | undefined {
-  const own = spans.get(id);
-  const echo = spans.get(slashCommandEchoItemId(id));
-  if (own === undefined || echo === undefined) return own ?? echo;
-  return { first: Math.min(own.first, echo.first), last: Math.max(own.last, echo.last) };
+  let combined: BubbleSpan | undefined;
+  for (const key of [id, slashCommandEchoItemId(id), answeredElicitationItemId(id)]) {
+    const span = spans.get(key);
+    if (span === undefined) continue;
+    combined =
+      combined === undefined
+        ? span
+        : { first: Math.min(combined.first, span.first), last: Math.max(combined.last, span.last) };
+  }
+  return combined;
 }
 
 // After the newest rendered item saved before the message, else before the oldest rendered one
