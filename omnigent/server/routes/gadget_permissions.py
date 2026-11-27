@@ -48,7 +48,8 @@ class GadgetPermissionObject(BaseModel):
 
     :param user_id: The grantee's canonical ID, e.g. ``"alice@example.com"``.
     :param gadget_id: The gadget.
-    :param level: ``1`` (Can view), ``2`` (Can edit) or ``3`` (Can manage).
+    :param level: ``0`` (Can use as template), ``1`` (Can view), ``2`` (Can edit) or
+        ``3`` (Can manage).
     :param display_name: The grantee's name for display; the ID when the server
         has no other name.
     """
@@ -65,7 +66,8 @@ class GadgetGrantRequest(BaseModel):
 
     :param user_id: The user or group to share with, e.g. ``"alice@example.com"``;
         surrounding whitespace is ignored.
-    :param level: ``1`` (Can view), ``2`` (Can edit) or ``3`` (Can manage), as an
+    :param level: ``0`` (Can use as template), ``1`` (Can view), ``2`` (Can edit) or
+        ``3`` (Can manage), as an
         integer.
     :param ensure_minimum: Keep a higher existing grant instead of lowering it.
     """
@@ -203,7 +205,8 @@ def register_gadget_permissions_routes(
         require_grantee_id_fits(user_id)
         if body.level not in GADGET_GRANT_LEVELS:
             raise OmnigentError(
-                "Gadgets are shared at Can view (1), Can edit (2) or Can manage (3)",
+                "Gadgets are shared at Can use as template (0), Can view (1), Can edit (2) "
+                "or Can manage (3)",
                 code=ErrorCode.INVALID_INPUT,
             )
         # A gadget has no working directory, so a restricted mode only limits the level.

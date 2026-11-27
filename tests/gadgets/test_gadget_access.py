@@ -19,6 +19,7 @@ from omnigent.gadgets.access import (
 from omnigent.gadgets.accounts import DeletedAccountGadgets
 from omnigent.gadgets.service import GadgetService, GadgetViewer
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ
+from omnigent.server.session_sharing import LEVEL_GADGET_TEMPLATE
 from omnigent.stores.gadget_store import NotFound
 from omnigent.stores.gadget_store.local import LocalGadgetStore
 from tests.gadgets.grant_store import GadgetGrantStore
@@ -49,8 +50,12 @@ def setup(db_uri: str, tmp_path: Path) -> tuple[LocalGadgetStore, _GroupStore]:
 @pytest.mark.parametrize(
     ("level", "expected"),
     [
-        (LEVEL_READ, GadgetPermissions(read=True)),
-        (LEVEL_EDIT, GadgetPermissions(read=True, write_data=True, publish=True)),
+        (LEVEL_GADGET_TEMPLATE, GadgetPermissions(use_template=True)),
+        (LEVEL_READ, GadgetPermissions(read=True, use_template=True)),
+        (
+            LEVEL_EDIT,
+            GadgetPermissions(read=True, write_data=True, publish=True, use_template=True),
+        ),
         (LEVEL_MANAGE, FULL_ACCESS),
     ],
 )

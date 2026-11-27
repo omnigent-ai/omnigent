@@ -354,6 +354,7 @@ async def test_sharing_follows_the_grant_levels(client: httpx.AsyncClient) -> No
         "write_data": False,
         "publish": False,
         "manage": False,
+        "use_template": True,
     }
     shared = (await client.get("/v1/gadgets/shared", headers=_as(BOB))).json()["items"]
     assert [(item["id"], item["shared_via"], item["owner_email"]) for item in shared] == [
@@ -989,3 +990,26 @@ async def test_a_viewer_copies_a_shared_gadget_with_its_data(client: httpx.Async
     )
     assert [item["value"] for item in listed.json()["result"]["items"]] == [{"title": "Shared"}]
     assert (await client.get(f"/v1/gadgets/{copy['id']}", headers=_as(ALICE))).status_code == 404
+
+
+async def test_a_template_grantee_creates_their_own_gadget_without_opening_it(
+    client: httpx.AsyncClient,
+) -> None:
+    gadget = await _published(client)
+    base = f"/v1/gadgets/{gadget['id']}"
+    granted = await client.put(
+        f"{base}/permissions", json={"user_id": BOB, "level": 0}, headers=_as(ALICE)
+    )
+    assert granted.status_code == 200, granted.text and granted.json()["level"] == 0
+
+    assert (await client.get(base, headers=_as(BOB))).status_code == 404
+    assert (await client.get("/v1/gadgets/shared", headers=_as(BOB))).json()["items"] == []
+    templates = (await client.get("/v1/gadgets/templates", headers=_as(BOB))).json()["items"]
+    assert [(item["id"], item["owner_email"]) for item in templates] == [(gadget["id"], ALICE)]
+
+    made = await client.post(f"{base}/from-template", json={}, headers=_as(BOB))
+    assert made.status_code == 201, made.text
+    assert made.json()["owner_id"] == BOB and made.json()["published_revision"]
+    assert (
+        await client.post(f"{base}/from-template", json={}, headers=_as("carol@example.com"))
+    ).status_code == 404

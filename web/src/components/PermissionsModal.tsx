@@ -5,7 +5,7 @@
  * toggling public visibility. Only accessible to users with
  * manage-level (3) permission on the session. An automation or a workflow
  * is shared by its owner at read access only, with no public or link sharing.
- * A gadget is shared by its managers at Can view, Can edit or Can manage, also
+ * A gadget is shared by its managers at Can use as template, Can view, Can edit or Can manage, also
  * without public or link sharing.
  */
 
@@ -90,8 +90,12 @@ export type SharedWorkflow = Pick<SavedWorkflow, "id" | "name">;
 export type SharedGadget = Pick<Gadget, "id" | "name"> &
   Partial<Pick<Gadget, "owner_id" | "viewer_id">>;
 
-/** The levels a gadget can be shared at (read, edit, manage), as its share dialog names them. */
+/**
+ * The levels a gadget can be shared at, as its share dialog names them. "Can use as template"
+ * lets someone make their own gadget from it under New gadget, without opening it.
+ */
 const GADGET_LEVELS = [
+  { value: 0, label: "Can use as template" },
   { value: 1, label: "Can view" },
   { value: 2, label: "Can edit" },
   { value: 3, label: "Can manage" },
@@ -323,7 +327,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
         await grantAccess(
           trimmed,
           parseInt(newLevel, 10),
-          existingGrant?.level,
+          // No grant is below every level, "Can use as template" (0) included.
+          existingGrant?.level ?? -1,
           !!filePath || !!gadget,
         )
       ) {

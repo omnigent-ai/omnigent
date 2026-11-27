@@ -18,7 +18,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useInertRef } from "@/hooks/useInertRef";
+import { useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { gadgetBoardPath } from "@/gadgets/host/gadgetPages";
 import {
   type Gadget,
   type GadgetContent,
@@ -35,6 +37,8 @@ import {
   rememberGadgetTemplate,
 } from "@/gadgets/templates/gadgetTemplates";
 import { GadgetErrorNotice } from "./GadgetErrorNotice";
+import { IN_APP_GADGET_OPEN } from "./gadgetNavigation";
+import { SharedGadgetTemplates } from "./SharedGadgetTemplates";
 
 /** The longest name the server takes. */
 export const MAX_GADGET_NAME_LENGTH = 120;
@@ -130,6 +134,8 @@ export interface GadgetTemplateGalleryProps {
   minCardWidth?: number;
   /** Leaves out the blank template, where a description box beside the gallery starts one. */
   withoutBlank?: boolean;
+  /** Runs once a gadget made from a template shared with the viewer exists; the default opens it. */
+  onCreatedFromShared?: (gadget: Gadget) => void | Promise<void>;
 }
 
 export function GadgetTemplateGallery({
@@ -307,9 +313,12 @@ export function GadgetTemplateGallery({
   );
 }
 
-/** The gallery under an "Or start from a template" divider. */
+/** The gallery under an "Or start from a template" divider, then templates shared with the viewer. */
 export function GadgetTemplatesSection(props: GadgetTemplateGalleryProps) {
   const headingId = useId();
+  const navigate = useNavigate();
+  const openBoard = (gadget: Gadget) =>
+    navigate(gadgetBoardPath(gadget.id), { state: IN_APP_GADGET_OPEN });
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-3">
       <div className="flex items-center gap-3 before:flex-1 before:border-t before:border-border before:content-[''] after:flex-1 after:border-t after:border-border after:content-['']">
@@ -318,6 +327,10 @@ export function GadgetTemplatesSection(props: GadgetTemplateGalleryProps) {
         </h2>
       </div>
       <GadgetTemplateGallery {...props} />
+      <SharedGadgetTemplates
+        minCardWidth={props.minCardWidth}
+        onCreated={props.onCreatedFromShared ?? openBoard}
+      />
     </section>
   );
 }

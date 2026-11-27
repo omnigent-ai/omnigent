@@ -391,6 +391,14 @@ def create_gadgets_router(
         limit, cursor = _page(request, 100)
         return _json(await run(request, lambda service: service.shared(limit, cursor)))
 
+    @router.get("/gadgets/templates", openapi_extra={"parameters": _PAGE_PARAMETERS})
+    async def gadget_templates(request: Request) -> Response:
+        """A page of gadgets shared with the caller as templates only, ``{"items",
+        "next_cursor"}``, each ``{"id", "name", "owner_email", "shared_via"}``. A page can be
+        short and continue."""
+        limit, cursor = _page(request, 100)
+        return _json(await run(request, lambda service: service.templates(limit, cursor)))
+
     _SHELF_PARAMETERS = [
         {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
         {"name": "cursor", "in": "query", "schema": _STRING},
@@ -474,6 +482,18 @@ def create_gadgets_router(
         records. Answers the copy with 201."""
         body = await _body(request)
         result = await run(request, lambda service: service.copy(app_id, body))
+        return _json(result, 201)
+
+    @router.post(
+        "/gadgets/{app_id}/from-template",
+        status_code=201,
+        openapi_extra=_json_body({"name": _STRING}, []),
+    )
+    async def create_from_template(app_id: str, request: Request) -> Response:
+        """Make a gadget the caller owns from one they can use as a template, from
+        ``{"name"?}``: its published code and starter data. Answers the new gadget with 201."""
+        body = await _body(request)
+        result = await run(request, lambda service: service.create_from_template(app_id, body))
         return _json(result, 201)
 
     @router.get("/gadgets/{app_id}/session/status")

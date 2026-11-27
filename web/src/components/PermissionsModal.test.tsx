@@ -2127,6 +2127,30 @@ describe("PermissionsModal", () => {
       expect(grantMock).not.toHaveBeenCalled();
     });
 
+    it("shares it as a template, which nobody already holds", async () => {
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 0, "Bob")]));
+      grantShareMock.mockResolvedValue(grantee("carol@example.com", 0));
+
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true } }),
+      });
+
+      expect(
+        await screen.findByRole("combobox", { name: "Permission level for bob@example.com" }),
+      ).toHaveTextContent("Can use as template");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol@example.com" },
+      });
+      await chooseLevel(
+        screen.getByRole("combobox", { name: "New user permission" }),
+        "Can use as template",
+      );
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "carol@example.com", 0, true),
+      );
+    });
+
     it("names the owner and asks before a manager gives up their own access", async () => {
       const managed = { ...gadget, owner_id: "alice@example.com", viewer_id: "bob@example.com" };
       listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
