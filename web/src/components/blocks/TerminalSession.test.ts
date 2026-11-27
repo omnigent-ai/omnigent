@@ -17,6 +17,7 @@ import {
   hadRecentTerminalInput,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
+  rtlCharacterJoinRanges,
   openTerminalLink,
   parseTerminalClipboardMessage,
   resolveTerminalWorkspaceFileLink,
@@ -257,6 +258,49 @@ describe("tmux clipboard parsing", () => {
     expect(hadRecentTerminalInput(1000, 10_000)).toBe(false);
     expect(hadRecentTerminalInput(2000, 1000)).toBe(false);
   });
+});
+
+describe("rtlCharacterJoinRanges", () => {
+  it.each([
+    ["plain ASCII and 123", []],
+    ["שלום, עולם.", [[0, 10]]],
+    ["│ ── 中文 ── │", []],
+    ["שלום עולם", [[0, 9]]],
+    ["  שלום עולם  ", [[2, 11]]],
+    ["مرحبا بالعالم", [[0, 13]]],
+    ["می\u200cروم خانه", [[0, 11]]],
+    ["שָׁלוֹם", [[0, 7]]],
+    ["שלום 123 עולם!", [[0, 13]]],
+    [
+      "שלום GitHub עולם",
+      [
+        [0, 4],
+        [12, 16],
+      ],
+    ],
+    ["中文 שלום", [[3, 7]]],
+    ["שלום ./example/file.ts", [[0, 4]]],
+    [
+      "שלום  עולם",
+      [
+        [0, 4],
+        [6, 10],
+      ],
+    ],
+    [
+      "שלום\tעולם",
+      [
+        [0, 4],
+        [5, 9],
+      ],
+    ],
+    ["\u{1d11e} שלום", [[3, 7]]],
+  ] as [string, [number, number][]][])(
+    "joins RTL text in %j using UTF-16 offsets",
+    (text, expected) => {
+      expect(rtlCharacterJoinRanges(text)).toEqual(expected);
+    },
+  );
 });
 
 describe("loadWebglRenderer", () => {
@@ -808,6 +852,21 @@ describe("TerminalSession", () => {
     expect(container.dataset.terminalCols).toBeUndefined();
     expect(container.dataset.terminalRows).toBeUndefined();
     expect(container.dataset.terminalFitReserveWidth).toBeUndefined();
+    session.dispose();
+  });
+
+  it("shapes RTL output without changing the buffer or selected text", async () => {
+    const joiner = vi.spyOn(Terminal.prototype, "registerCharacterJoiner");
+    const { session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    expect(joiner).toHaveBeenCalledWith(rtlCharacterJoinRanges);
+    const text = "שלום GitHub עולם";
+    await new Promise<void>((resolve) => {
+      term.write(text, resolve);
+    });
+    expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe(text);
+    term.select(0, 0, text.length);
+    expect(term.getSelection()).toBe(text);
     session.dispose();
   });
 

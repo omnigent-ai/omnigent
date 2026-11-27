@@ -605,6 +605,48 @@ it("preserves ordinary code fences in reasoning", () => {
   expect(screen.queryByRole("button", { name: "Toggle word wrap" })).toBeNull();
 });
 
+describe("MessageResponse bidirectional text", () => {
+  it("chooses direction per prose block and isolates inline code and links", () => {
+    const markdown = [
+      "שלום **עולם**, החיבור ל־`example/repository` עובד דרך [GitHub](https://example.com).",
+      "",
+      "English paragraph with שלום inside.",
+      "",
+      "## כותרת בעברית",
+      "",
+      "- פריט בעברית",
+      "- عنصر بالعربية",
+      "",
+      "```sh",
+      "git status",
+      "```",
+    ].join("\n");
+    const { container } = render(<MessageResponse>{markdown}</MessageResponse>);
+    const paragraphs = container.querySelectorAll("p");
+    expect(paragraphs[0]).toHaveAttribute("dir", "auto");
+    expect(paragraphs[1]).toHaveAttribute("dir", "auto");
+    expect(container.querySelector("h2")).toHaveAttribute("dir", "auto");
+    expect(container.querySelector("ul")).toHaveAttribute("dir", "auto");
+    for (const item of container.querySelectorAll("li")) {
+      expect(item).toHaveAttribute("dir", "auto");
+    }
+    expect(container.querySelector('a[href="https://example.com/"]')).toHaveAttribute(
+      "dir",
+      "auto",
+    );
+    expect(container.querySelector('[data-streamdown="inline-code"]')).toHaveAttribute(
+      "dir",
+      "ltr",
+    );
+    expect(paragraphs[0]).toHaveTextContent(
+      "שלום עולם, החיבור ל־example/repository עובד דרך GitHub.",
+    );
+    expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent(
+      "git status",
+    );
+  });
+});
+
 describe("MessageResponse table fullscreen", () => {
   const tableMarkdown = "| Name | Value |\n| --- | --- |\n| Alpha | One |";
 

@@ -22,6 +22,7 @@ import { terminalSurfaceColors } from "@/lib/terminalPalette";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
+import { TerminalBidi } from "./TerminalBidi";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
 import { parseTmuxRepliesMessage, suppressRepliesTmuxSends } from "./TerminalQueryReplies";
 
@@ -310,6 +311,21 @@ interface TerminalCore {
   _core?: {
     coreMouseService?: { activeEncoding?: string };
   };
+}
+
+const RTL_TERMINAL_WORD = String.raw`[\p{Script=Hebrew}\p{Script=Arabic}][\p{Script=Hebrew}\p{Script=Arabic}\p{Mark}\u200c\u200d]*`;
+const RTL_TERMINAL_PHRASE = new RegExp(
+  `${RTL_TERMINAL_WORD}(?:(?:\\p{P}|\\p{N}| (?! ))+${RTL_TERMINAL_WORD})*`,
+  "gu",
+);
+
+/** Shape adjacent RTL words together; keep terminal columns and LTR tokens separate. */
+export function rtlCharacterJoinRanges(text: string): [number, number][] {
+  const ranges: [number, number][] = [];
+  for (const match of text.matchAll(RTL_TERMINAL_PHRASE)) {
+    if (match[0].length > 1) ranges.push([match.index, match.index + match[0].length]);
+  }
+  return ranges;
 }
 
 /**
@@ -654,7 +670,8 @@ export class TerminalSession {
   private readonly term: Terminal;
   private readonly fit: FitAddon;
   /** WebGL renderer addon, or ``null`` when WebGL is unavailable. */
-  private readonly webgl: WebglAddon | null;
+  private webgl: WebglAddon | null;
+  private readonly bidi: TerminalBidi;
   private readonly ws: WebSocket;
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
@@ -762,9 +779,15 @@ export class TerminalSession {
     // renders them as plain text.
     this.term.registerLinkProvider(new TerminalLinkProvider(this.term, activateLink));
     this.term.open(container);
+    this.term.registerCharacterJoiner(rtlCharacterJoinRanges);
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.
     this.webgl = loadWebglRenderer(this.term);
+    this.bidi = new TerminalBidi(this.term, () => {
+      this.webgl?.dispose();
+      this.webgl = null;
+      this.sendResize();
+    });
     try {
       this.fit.fit();
     } catch (err) {
@@ -1094,6 +1117,7 @@ export class TerminalSession {
     }
     // Dispose the WebGL renderer before the terminal so its canvas and
     // GL context are released while the terminal still owns them.
+    this.bidi.dispose();
     this.webgl?.dispose();
     this.term.dispose();
   }

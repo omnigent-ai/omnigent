@@ -132,6 +132,29 @@ describe("Mermaid diagram width", () => {
   });
 });
 
+describe("Bidirectional response width", () => {
+  it.each(["שלום עולם", "مرحبا بالعالم", "English with עברית"])(
+    "uses the full chat column so paragraphs can align independently: %s",
+    (text) => {
+      const bubble: Extract<Bubble, { kind: "assistant" }> = {
+        kind: "assistant",
+        responseId: "resp_bidi",
+        stableId: "bidi",
+        lifecycle: "completed",
+        error: null,
+        items: [{ kind: "text", itemId: "bidi_text", text, final: true }],
+      };
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <BubbleView bubble={bubble} isLastAssistant={false} />
+        </QueryClientProvider>,
+      );
+      expect(screen.getByTestId("message-bubble")).toHaveClass("max-w-full", "rtl-response");
+      expect(screen.getByTestId("message-bubble").firstElementChild).toHaveClass("w-full");
+    },
+  );
+});
+
 describe("AssistantBubble fork source", () => {
   const bubble: Extract<Bubble, { kind: "assistant" }> = {
     kind: "assistant",
