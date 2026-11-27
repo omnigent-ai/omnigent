@@ -1,6 +1,6 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
-import { isWarmSwitchPending } from "@/lib/warmSessionSwitch";
+import { useWarmSwitchConversationId } from "@/lib/warmSessionSwitch";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -456,8 +456,8 @@ export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
   const activeConversationId = useChatStore((s) => s.conversationId);
   const rebasePath = useRebasePath();
-  const warmSwitchPending = isWarmSwitchPending(activeConversationId, urlConvId, rebasePath);
-  const effectiveConvId = warmSwitchPending ? (activeConversationId ?? undefined) : urlConvId;
+  const effectiveConvId = useWarmSwitchConversationId(urlConvId);
+  const warmSwitchPending = effectiveConvId !== urlConvId;
   const [sessionUi, setSessionUi] = useState({ conversationId: effectiveConvId, key: 0 });
   if (sessionUi.conversationId !== effectiveConvId) {
     // Session creation promotes the same draft; every other switch starts fresh local UI.

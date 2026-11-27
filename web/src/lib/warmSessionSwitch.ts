@@ -1,6 +1,6 @@
 import { matchPath } from "react-router-dom";
 import { withBasePath } from "@/lib/basePath";
-import type { RoutingApi } from "@/lib/routing";
+import { useRebasePath, type RoutingApi } from "@/lib/routing";
 import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { isConversationStreamCurrent, useChatStore } from "@/store/chatStore";
@@ -29,6 +29,14 @@ export function isWarmSwitchPending(
     activeConversationId !== urlConvId &&
     conversationIdFromPath(window.location.pathname, rebasePath) === activeConversationId
   );
+}
+
+export function useWarmSwitchConversationId(urlConvId: string | undefined): string | undefined {
+  const activeConversationId = useChatStore((state) => state.conversationId);
+  const rebasePath = useRebasePath();
+  return isWarmSwitchPending(activeConversationId, urlConvId, rebasePath)
+    ? (activeConversationId ?? undefined)
+    : urlConvId;
 }
 
 export function switchSessionBeforeNavigate(
