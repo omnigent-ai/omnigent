@@ -3457,7 +3457,15 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
 
 
 @pytest.mark.parametrize(
-    "scenario", ["allowed", "foreign_host", "restricted", "shared_source", "launch_refused"]
+    "scenario",
+    [
+        "allowed",
+        "foreign_host",
+        "restricted",
+        "shared_source",
+        "launch_refused",
+        "bound_during_rollback",
+    ],
 )
 @pytest.mark.parametrize("nested", [False, True])
 async def test_scripted_host_worktree_respects_ownership_and_policy(
@@ -3467,7 +3475,6 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
     from omnigent.host.frames import (
         HostCreateWorktreeFrame,
         HostLaunchRunnerFrame,
-        HostListWorktreesFrame,
         HostRemoveWorktreeFrame,
         HostStatFrame,
         decode_host_frame,
@@ -3512,25 +3519,27 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
             )
         elif isinstance(frame, HostLaunchRunnerFrame):
             connection.pending_launches[frame.request_id].set_result({"status": "launched"})
-        elif isinstance(frame, HostListWorktreesFrame):
-            connection.pending_list_worktrees[frame.request_id].set_result(
-                {
-                    "status": "ok",
-                    "worktrees": [{"path": "/repos/review", "branch": "review", "is_main": False}],
-                }
-            )
         elif isinstance(frame, HostRemoveWorktreeFrame):
             connection.pending_remove_worktrees[frame.request_id].set_result({"status": "ok"})
         else:
             pytest.fail(f"Unexpected host frame: {frame}")
 
     monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
-    if scenario == "launch_refused":
+    if scenario in {"launch_refused", "bound_during_rollback"}:
 
         async def refuse_launch(*_args, **_kwargs):
             raise OmnigentError("Host runtime is too old", code=ErrorCode.CONFLICT)
 
         monkeypatch.setattr(auth_app.state.host_registry, "admit_launch", refuse_launch)
+    if scenario == "bound_during_rollback":
+        delete_conversation = SqlAlchemyConversationStore.delete_conversation
+
+        async def bind_before_delete(conversation_store, conversation_id, **kwargs):
+            # Another request binds the session after the rollback has read it.
+            assert store.set_runner_id(conversation_id, "runner_concurrent")
+            return await delete_conversation(conversation_store, conversation_id, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "delete_conversation", bind_before_delete)
     before = {s.id for s in store.list_conversations().data}
     result = json.loads(
         await execute_tool(
@@ -3550,13 +3559,21 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
     )
     if scenario != "allowed":
         assert "error" in result, result
-        assert {s.id for s in store.list_conversations().data} == before
-        if scenario == "launch_refused":
-            removed = next(f for f in frames if isinstance(f, HostRemoveWorktreeFrame))
-            assert (removed.worktree_path, removed.branch) == ("/repos/review", "review")
-            assert removed.delete_branch
-            assert not any(isinstance(f, HostLaunchRunnerFrame) for f in frames)
+        created = {s.id for s in store.list_conversations().data} - before
+        removed = [
+            (f.worktree_path, f.branch, f.delete_branch)
+            for f in frames
+            if isinstance(f, HostRemoveWorktreeFrame)
+        ]
+        assert not any(isinstance(f, HostLaunchRunnerFrame) for f in frames)
+        if scenario == "bound_during_rollback":
+            assert [store.get_conversation(c).runner_id for c in created] == ["runner_concurrent"]
+            assert removed == []
+        elif scenario == "launch_refused":
+            assert not created
+            assert removed == [("/repos/review", "review", True)]
         else:
+            assert not created
             assert not frames
         return
     assert "error" not in result, result

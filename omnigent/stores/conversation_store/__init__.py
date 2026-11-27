@@ -2719,7 +2719,11 @@ class ConversationStore(ABC):
 
     @abstractmethod
     async def delete_conversation(
-        self, conversation_id: str, *, preserve_host_binding: str | None = None
+        self,
+        conversation_id: str,
+        *,
+        preserve_host_binding: str | None = None,
+        require_unbound: bool = False,
     ) -> bool:
         """
         Delete a conversation and all its items.
@@ -2731,7 +2735,9 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param preserve_host_binding: Keep the root's metadata reservation when
             it is bound to this host, for replacement under the same session id.
-        :returns: ``True`` if the conversation existed,
-            ``False`` otherwise.
+        :param require_unbound: Delete only while no runner is bound, atomically
+            with runner binding; a session bound first is kept.
+        :returns: ``True`` if the conversation existed (and, with
+            *require_unbound*, was unbound), ``False`` otherwise.
         """
         ...

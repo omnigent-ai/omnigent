@@ -7667,7 +7667,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
     async def delete_conversation(
-        self, conversation_id: str, *, preserve_host_binding: str | None = None
+        self,
+        conversation_id: str,
+        *,
+        preserve_host_binding: str | None = None,
+        require_unbound: bool = False,
     ) -> bool:
         """
         Delete a conversation and all of its descendants, cleaning up
@@ -7683,8 +7687,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"conv_abc123"``.
         :param preserve_host_binding: Keep the root's metadata reservation for
             same-host replacement. Creation consumes it under the host lock.
-        :returns: ``True`` if the conversation existed,
-            ``False`` otherwise.
+        :param require_unbound: Delete only while the root has no runner bound.
+            Its metadata row goes first, so a later bind finds no row to update.
+        :returns: ``True`` if the conversation existed (and, with
+            *require_unbound*, was unbound), ``False`` otherwise.
         """
         # AP rows are deleted first so the conversation is immediately unreachable;
         # Omnigent-side rows (metadata/comments/policies/permissions) are cleaned up
@@ -7694,6 +7700,28 @@ class SqlAlchemyConversationStore(ConversationStore):
         # and only an explicit agent removal deletes one.
 
         from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+
+        released_host_ids: list[str] = []
+        if require_unbound:
+
+            def release_unbound(session: Session) -> list[str] | None:
+                meta = session.get(
+                    SqlConversationMetadata,
+                    (current_workspace_id(), conversation_id),
+                    with_for_update=True,
+                )
+                if meta is None or meta.runner_id is not None:
+                    return None
+                host_ids = [meta.host_id] if meta.host_id is not None else []
+                session.delete(meta)
+                return host_ids
+
+            released = run_write_transaction(
+                self._session_immediate, "delete_unbound_conversation_metadata", release_unbound
+            )
+            if released is None:
+                return False
+            released_host_ids = released
 
         def delete_ap(ap_sess: Session) -> tuple[list[str], dict[str, str]] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
@@ -7772,6 +7800,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .distinct()
             ).all()
+            if conversation_id in batch_ids:
+                host_ids = [*host_ids, *released_host_ids]
             hosts = session.scalars(
                 select(SqlHost)
                 .where(

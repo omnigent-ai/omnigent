@@ -844,14 +844,18 @@ def register_core_routes(
                 exc_info=True,
             )
 
-    async def _delete_unreturned_session(session_id: str) -> None:
-        """Delete a session whose creating request failed, with its unshared files."""
+    async def _delete_session_files(session_id: str) -> None:
+        """Delete a session's uploaded files and their unshared blobs."""
         if file_store is not None:
             blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
             if artifact_store is not None:
                 for blob_key in blob_keys:
                     with contextlib.suppress(Exception):
                         await asyncio.to_thread(artifact_store.delete, blob_key)
+
+    async def _delete_unreturned_session(session_id: str) -> None:
+        """Delete a session whose creating request failed, with its unshared files."""
+        await _delete_session_files(session_id)
         await conversation_store.delete_conversation(session_id)
 
     async def _delete_unlaunched_session(
@@ -860,8 +864,12 @@ def register_core_routes(
         """Delete a created session whose host launch failed before binding a runner."""
         try:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None or conv.runner_id is not None:
+            # Another request may bind the session meanwhile; the delete then keeps it.
+            if conv is None or not await conversation_store.delete_conversation(
+                session_id, require_unbound=True
+            ):
                 return
+            await _delete_session_files(session_id)
             if (
                 body.git is not None
                 and not body.git.existing_worktree
@@ -869,21 +877,24 @@ def register_core_routes(
                 and conv.workspace
                 and conv.host_id
             ):
-                from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
-
-                await _remove_session_worktree_best_effort(
-                    host_id=conv.host_id,
-                    worktree_path=conv.workspace,
-                    branch=conv.git_branch,
-                    delete_branch=not body.git.existing_branch,
-                    host_registry=getattr(request.app.state, "host_registry", None),
-                    reason="create-rollback",
-                    host_store=getattr(request.app.state, "host_store", None),
-                    conversation_store=conversation_store,
-                    exclude_conversation_id=session_id,
-                    expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
+                from omnigent.server.routes._host_worktree import (
+                    WORKTREE_ROOT_LABEL_KEY,
+                    recorded_worktree_root,
                 )
-            await _delete_unreturned_session(session_id)
+
+                worktree_root = recorded_worktree_root(
+                    conv.workspace, conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+                )
+                if worktree_root is not None:
+                    await _remove_session_worktree_best_effort(
+                        host_id=conv.host_id,
+                        worktree_path=worktree_root,
+                        branch=conv.git_branch,
+                        delete_branch=not body.git.existing_branch,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        reason="create-rollback",
+                        host_store=getattr(request.app.state, "host_store", None),
+                    )
         except Exception:
             _logger.exception("Failed to delete unlaunched session %s", session_id)
 

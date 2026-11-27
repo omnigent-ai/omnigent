@@ -392,7 +392,8 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   launch afterward, so the runner treats them as uncertain and never auto-retries.
   An early wrong-replica refusal creates no row; a host launch refused before a
   runner is bound deletes the saved row and any worktree it created, since its
-  first task would never be sent. Other unconfirmed results, such as a lost
+  first task would never be sent. The delete is unbound-only, so a session another
+  request binds first is kept. Other unconfirmed results, such as a lost
   response, may still leave a row to inspect. Keyless legacy routing must be
   configured on the runner; independent creation has no automatic routing fallback.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;

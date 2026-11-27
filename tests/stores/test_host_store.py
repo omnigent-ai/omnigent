@@ -126,6 +126,38 @@ async def test_session_delete_keeps_shared_sandbox_until_last_binding(
     assert conversations.get_conversation(first.id) is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split_database", [False, True])
+async def test_unbound_only_session_delete_keeps_bound_sessions(
+    host_store: HostStore, db_uri: str, split_database, tmp_path
+) -> None:
+    host_id = uuid.uuid4().hex
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    conversations = SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+    bound = conversations.create_conversation(host_id=host_id, workspace="/work")
+    unbound = conversations.create_conversation(host_id=host_id, workspace="/work")
+    assert conversations.set_runner_id(bound.id, "runner_bound")
+    assert not await conversations.delete_conversation(bound.id, require_unbound=True)
+    assert conversations.get_conversation(bound.id).runner_id == "runner_bound"
+    assert await conversations.delete_conversation(unbound.id, require_unbound=True)
+    assert conversations.get_conversation(unbound.id) is None
+    assert not conversations.set_runner_id(unbound.id, "runner_late")
+    assert host_store.get_host(host_id) is not None
+    conversations.clear_runner_id(bound.id)
+    assert await conversations.delete_conversation(bound.id, require_unbound=True)
+    assert host_store.get_host(host_id) is None
+
+
 @pytest.mark.parametrize("split_database", [False, True])
 @pytest.mark.parametrize("uploaded_agent", [False, True])
 def test_last_session_delete_races_new_binding(
