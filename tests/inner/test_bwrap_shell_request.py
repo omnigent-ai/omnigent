@@ -135,10 +135,15 @@ def test_launcher_probe_uses_the_selected_executable_and_rechecks_replacements(
     monkeypatch.setattr(shell_request.subprocess, "run", run)
     shell_request._has_request_options.cache_clear()
     try:
+        for error in (OSError("temporary probe failure"), subprocess.TimeoutExpired("bwrap", 2)):
+            run.side_effect = error
+            assert request_launcher(_policy(tmp_path), executable=str(executable)) is None
+        assert run.call_count == 2
+        run.side_effect = None
         for _ in range(2):
             assert request_launcher(_policy(tmp_path)) == str(executable)
         which.assert_called_with("bwrap", path="/selected/host-tools")
-        run.assert_called_once()
+        assert run.call_count == 3
         assert run.call_args.args[0] == [str(executable), "--help"]
         assert run.call_args.kwargs["env"] == {"PATH": os.defpath, "LANG": "C"}
         case.launcher = str(executable)
@@ -148,11 +153,12 @@ def test_launcher_probe_uses_the_selected_executable_and_rechecks_replacements(
         assert which.call_count == 2
         assert case.spawn.call_args.args[0][0] == str(executable)
         assert case.spawn.call_args.args[1] == {"PATH": os.defpath, "LANG": "C"}
-        run.assert_called_once()
+        assert run.call_count == 3
         executable.write_text("replacement with no request flags")
         run.return_value = subprocess.CompletedProcess([], 0, stdout="--unshare-pid")
-        assert request_launcher(_policy(tmp_path), executable=str(executable)) is None
-        assert run.call_count == 2
+        for _ in range(2):
+            assert request_launcher(_policy(tmp_path), executable=str(executable)) is None
+        assert run.call_count == 4
     finally:
         shell_request._has_request_options.cache_clear()
 

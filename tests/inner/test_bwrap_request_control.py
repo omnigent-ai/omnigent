@@ -153,26 +153,31 @@ def test_required_output_encoding_is_bound_to_the_validated_readiness(
 
 
 @pytest.mark.parametrize(
-    "problem",
+    "problem, encoding_required",
     [
-        "token",
-        "missing-credentials",
-        "sender",
-        "uid",
-        "not-pid-one",
-        "dead-pidfd",
-        "foreign-pidfd",
-        "extra-handle",
-        "truncated",
-        "unexpected-before-rights",
-        "family",
-        "launcher",
-    ],
+        (problem, False)
+        for problem in (
+            "token",
+            "missing-credentials",
+            "sender",
+            "uid",
+            "not-pid-one",
+            "dead-pidfd",
+            "foreign-pidfd",
+            "extra-handle",
+            "truncated",
+            "unexpected-before-rights",
+            "family",
+            "launcher",
+        )
+    ]
+    + [(problem, True) for problem in ("token", "sender", "truncated", "payload-truncated")],
 )
 def test_invalid_readiness_never_admits_and_releases_every_received_handle(
     monkeypatch: pytest.MonkeyPatch,
     readiness: tuple[MagicMock, MagicMock, MagicMock],
     problem: str,
+    encoding_required: bool,
 ) -> None:
     control, process, close = readiness
     payload, metadata, flags, address = control.recvmsg.return_value
@@ -213,12 +218,21 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
         metadata[0] = (socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", handles).tobytes())
     elif problem == "truncated":
         flags = socket.MSG_CTRUNC
+    elif problem == "payload-truncated":
+        flags = socket.MSG_TRUNC
     else:
         metadata.insert(0, (socket.SOL_SOCKET, -1, b"unknown"))
+    if encoding_required:
+        payload += b":utf-8"
     control.recvmsg.return_value = (payload, metadata, flags, address)
     with pytest.raises((OSError, ValueError)):
         request_control.BwrapRequestControl.receive(
-            control, process, _TOKEN, expected_init_pid=73, launcher_pidfd=_LAUNCHER_FD
+            control,
+            process,
+            _TOKEN,
+            expected_init_pid=73,
+            launcher_pidfd=_LAUNCHER_FD,
+            encoding_required=encoding_required,
         )
     assert sorted(call.args[0] for call in close.call_args_list) == sorted(handles)
     control.send.assert_not_called()

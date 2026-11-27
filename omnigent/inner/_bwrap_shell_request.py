@@ -34,18 +34,15 @@ def _launcher_env() -> dict[str, str]:
 @functools.lru_cache(maxsize=16)
 def _has_request_options(executable: str, identity: tuple[int, ...]) -> bool:
     del identity  # An executable replacement must invalidate the cached probe.
-    try:
-        result = subprocess.run(
-            [executable, "--help"],
-            env=_launcher_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    result = subprocess.run(
+        [executable, "--help"],
+        env=_launcher_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=2,
+        check=False,
+    )
     return result.returncode == 0 and all(option in result.stdout for option in _REQUEST_OPTIONS)
 
 
@@ -76,10 +73,10 @@ def request_launcher(policy: SandboxPolicy, *, executable: str | None = None) ->
             os.close(descriptor)
         descriptor = os.memfd_create("shell-capability", os.MFD_CLOEXEC)
         os.close(descriptor)
-    except OSError:
+        identity = (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
+        return executable if _has_request_options(executable, identity) else None
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    identity = (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
-    return executable if _has_request_options(executable, identity) else None
 
 
 @functools.lru_cache(maxsize=1)
