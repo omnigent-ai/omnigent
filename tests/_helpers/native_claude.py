@@ -126,8 +126,12 @@ def _assert_mock_claude_turn(
             request_session == native_session
             and len(text_blocks) == 1
             and text_blocks[0].startswith(
-                f"<session>\n{user_text}\n</session>\n\n"
-                "Write the title in the predominant language of the session"
+                # Native titles can trim trailing LF; conversation text stays exact.
+                tuple(
+                    f"<session>\n{title_text}\n</session>\n\n"
+                    "Write the title in the predominant language of the session"
+                    for title_text in (user_text, user_text.rstrip("\n"))
+                )
             )
             and any(
                 text.startswith(
