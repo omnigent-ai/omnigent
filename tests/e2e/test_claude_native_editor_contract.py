@@ -33,6 +33,7 @@ from tests.e2e.conftest import get_mock_message_requests
 pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
 
 
+@pytest.mark.parametrize("draft_mode", ["editor", "picker"])
 @pytest.mark.parametrize("editor_source", ["configured", "configured-code", "default"])
 def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     monkeypatch: pytest.MonkeyPatch,
@@ -41,6 +42,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     claude_managed_settings: None,
     record_property: Callable[[str, object], None],
     editor_source: str,
+    draft_mode: str,
 ) -> None:
     claude, tmux_binary = shutil.which("claude"), shutil.which("tmux")
     assert claude is not None and tmux_binary is not None
@@ -139,6 +141,24 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         )
     )
     editor = tmp_path / "editor.py"
+    saved_settings = config / "settings.json"
+    saved_contents: bytes | None = None
+    picker_observations: list[dict[str, object]] = []
+    if draft_mode == "picker":
+        value = json.loads(settings.read_text())
+        value["modelPicker"] = {
+            "replaceBuiltInOptions": True,
+            "options": [
+                {"model": _PINNED_CLAUDE_MODELS["sonnet"], "label": "Draft initial"},
+                {"model": "draft-test-model", "label": "Draft target"},
+            ],
+        }
+        value["statusLine"] = bridge.build_hook_settings(
+            bridge_dir, python_executable=sys.executable
+        )["statusLine"]
+        settings.write_text(json.dumps(value))
+        saved_contents = json.dumps({"model": "draft-saved-default"}).encode()
+        saved_settings.write_bytes(saved_contents)
     editor.write_text(
         "import json, re, sys\n"
         "from pathlib import Path\n"
@@ -180,8 +200,9 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "current_owner=current_owner, cancelled=lambda: request['cancelled'])\n"
         "with observed.open('a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps({'kind': 'manual', 'content': content, 'accepted': accepted, "
+        "'observe_only': request.get('observe_only', False), "
         "'program': program, 'native_context': native_context()}) + '\\n')\n"
-        "if not accepted:\n"
+        "if not accepted or request.get('observe_only', False):\n"
         "    sys.exit(1)\n"
         "source.write_bytes(request['replacement'].encode('utf-8'))\n"
     )
@@ -424,6 +445,122 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert owner["bridge_session_id"] == bridge.read_active_session_id(bridge_dir)
             assert owner["native_session_id"] == payload["session_id"]
             assert owner["process"] == payload["native_process"]
+            if draft_mode == "picker":
+
+                def raw_status() -> dict[str, object]:
+                    return bridge._read_json_file(bridge_dir / bridge.CONTEXT_RAW_FILE)
+
+                def wait_status(model: str, *, after: int | None = None) -> None:
+                    def matching() -> bool:
+                        current = raw_status()
+                        native_model = current.get("model")
+                        return (
+                            current.get("session_id") == payload["session_id"]
+                            and current.get("version") == "2.1.323"
+                            and isinstance(native_model, dict)
+                            and native_model.get("id") == model
+                            and (
+                                after is None
+                                or (bridge_dir / bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns
+                                > after
+                            )
+                        )
+
+                    poll_until(matching, timeout_s=15)
+                    picker_observations.append(
+                        {
+                            "kind": "status",
+                            "raw": raw_status(),
+                            "after_ns": after,
+                            "mtime_ns": (bridge_dir / bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns,
+                        }
+                    )
+
+                def live_picker():
+                    rendered = pane()
+                    footer = model_switch._PICKER_FOOTER.search(rendered)
+                    # The fixture's known draft contains no picker-shaped text.
+                    return model_switch._picker(rendered[: footer.end()]) if footer else None
+
+                def open_picker() -> None:
+                    command("send-keys", "-t", target, "M-p")
+                    poll_until(lambda: live_picker() is not None, timeout_s=10)
+
+                def choose(label: str, *, commit: bool) -> None:
+                    open_picker()
+                    for _ in range(4):
+                        current = live_picker()
+                        assert current is not None
+                        rows = [
+                            row for row in current.rows if model_switch._row_label(row) == label
+                        ]
+                        assert len(rows) == 1, current
+                        if current.selected.number == rows[0].number:
+                            break
+                        direction = "Up" if current.selected.number > rows[0].number else "Down"
+                        command("send-keys", "-t", target, direction)
+                        poll_until(
+                            lambda current=current: (
+                                (new := live_picker()) is not None
+                                and new.selected != current.selected
+                            ),
+                            timeout_s=5,
+                        )
+                    else:
+                        pytest.fail("Could not select the declared live picker row")
+                    picker_observations.append(
+                        {"kind": "picker", "label": label, "pane": pane(), "commit": commit}
+                    )
+                    command("send-keys", "-t", target, "s" if commit else "Escape")
+                    poll_until(lambda: live_picker() is None, timeout_s=10)
+
+                def observe_without_import() -> None:
+                    count = len(observations())
+                    instruction.write_text(
+                        json.dumps(
+                            {
+                                "expected": draft,
+                                "replacement": "must-never-be-imported",
+                                "owner": owner,
+                                "cancelled": False,
+                                "observe_only": True,
+                            }
+                        )
+                    )
+                    command("send-keys", "-t", target, "C-g")
+                    wait_for_editor(count, draft)
+                    observed_draft = observations()[-1]
+                    assert observed_draft["content"] == draft
+                    assert observed_draft["accepted"] is True
+                    assert observed_draft["observe_only"] is True
+                    assert (
+                        observed_draft["native_context"]["editor_environment_sha256"]
+                        == editor_environment_digest
+                    )
+
+                wait_status(_PINNED_CLAUDE_MODELS["sonnet"])
+                before = (bridge_dir / bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns
+                choose("Draft target", commit=True)
+                wait_status("draft-test-model", after=before)
+                observe_without_import()
+                open_picker()
+                current = live_picker()
+                assert current is not None
+                checked = [row for row in current.rows if model_switch._row_is_current(row)]
+                assert len(checked) == 1 and model_switch._row_label(checked[0]) == "Draft target"
+                picker_observations.append({"kind": "current", "pane": pane()})
+                command("send-keys", "-t", target, "Escape")
+                observe_without_import()
+                choose("Draft initial", commit=False)
+                wait_status("draft-test-model")
+                observe_without_import()
+                before = (bridge_dir / bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns
+                choose("Draft initial", commit=True)
+                wait_status(_PINNED_CLAUDE_MODELS["sonnet"], after=before)
+                observe_without_import()
+                assert saved_settings.read_bytes() == saved_contents
+                assert get_mock_message_requests(isolated_mock_llm_server_url) == []
+                return
             for phase in ("prepared", "committed"):
                 count = len(observations())
                 with pytest.raises(editor_transaction.NativeDraftEditRefused):
@@ -538,6 +675,11 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 diagnostics = {
                     "version": version.strip(),
                     "editor_source": editor_source,
+                    "draft_mode": draft_mode,
+                    "picker_observations": picker_observations,
+                    "saved_model_settings_unchanged": saved_settings.read_bytes() == saved_contents
+                    if saved_contents is not None
+                    else None,
                     "editor_delegation_source_sha256": hashlib.sha256(
                         Path(editor_delegate.__file__).read_bytes()
                     ).hexdigest(),
