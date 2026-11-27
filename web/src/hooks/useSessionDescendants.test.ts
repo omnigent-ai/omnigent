@@ -125,6 +125,33 @@ describe("fetchSessionDescendants", () => {
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["null depths", (id: string) => row(id, { depth: null })],
+    ["a deeper row without its parent", (id: string) => row(id, { depth: 2 })],
+  ])(
+    "walks the tree when the listing has %s, so no grandchild is left out",
+    async (_case, listed) => {
+      vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+        const url = new URL(String(input), "http://test.local");
+        // The listing answers like the direct children; the walk then reads each child's own.
+        if (url.pathname.includes("conv_position_root"))
+          return page([listed("conv_position_child")]);
+        if (url.pathname.includes("conv_position_child"))
+          return page([row("conv_position_grandchild")]);
+        return page([]);
+      });
+
+      const result = await fetchSessionDescendants("conv_position_root");
+
+      expect(result.rows.map((entry) => [entry.info.id, entry.parentId, entry.depth])).toEqual([
+        ["conv_position_child", "conv_position_root", 1],
+        ["conv_position_grandchild", "conv_position_child", 2],
+      ]);
+      expect(getSessionParent("conv_position_grandchild")).toBe("conv_position_child");
+      expect(result.truncated).toBe(false);
+    },
+  );
+
   it("stops the walk at the row cap and says the list is cut short", async () => {
     let next = 0;
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {

@@ -55,8 +55,12 @@ export function useSectionPicker(enabled: boolean) {
     sectionProps: {
       ref: sectionRef,
       onClick: (event: ReactMouseEvent<HTMLElement>) => {
-        // Selecting a reviewer's login or a label's name to copy it isn't a press.
-        if (!opensPicker(event.target) || !!window.getSelection()?.toString()) return;
+        // Selecting a reviewer's login or a label's name to copy it isn't a press; a selection
+        // elsewhere on the page doesn't stop one.
+        const selection = window.getSelection();
+        const selectingHere =
+          !!selection?.toString() && !!sectionRef.current?.contains(selection.anchorNode);
+        if (!opensPicker(event.target) || selectingHere) return;
         setOpen((current) => !current);
       },
       className: enabled ? "group/picker cursor-pointer" : undefined,

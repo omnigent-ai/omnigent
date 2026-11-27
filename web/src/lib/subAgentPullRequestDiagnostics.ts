@@ -5,9 +5,11 @@
 /** Which read failed: the sub-agent tree, or one sub-agent's stored pull requests. */
 export type SubAgentReadStage = "descendants" | "member_pull_requests";
 
-/** What asked for the read: its first load, or a refresh of data already shown. */
-/** `open`: a PR opened in its own place whose sub-agent links the cache hadn't answered for. */
-/** `composer`: the composer's PR chip, counting the sub-agents' PRs while the list is closed. */
+/**
+ * What asked for the read: `initial`, its first load; `refresh`, of data already shown; `open`, a
+ * PR opened in its own place whose sub-agent links the cache hadn't answered for; `composer`, the
+ * composer's PR chip, counting the sub-agents' PRs while the list is closed.
+ */
 export type SubAgentReadTrigger = "initial" | "refresh" | "open" | "composer";
 
 /** The closed failure categories. `http` means the server answered with a status. */
@@ -37,6 +39,11 @@ export function formatSubAgentReadFailure(failure: SubAgentReadFailure): string 
   return `[omnigent] sub-agent pull requests read failed ${fields.join(" ")}`;
 }
 
+// What `fetch` rejects with when the request never got an answer: Chromium, Firefox and WebKit.
+// Any other TypeError is a bug in handling the answer, so it isn't called a network error.
+const FETCH_FAILED =
+  /^(Failed to fetch|NetworkError when attempting to fetch resource\.|Load failed)/;
+
 /** The failure category of a thrown read error: an HTTP status, a network error, or a parse error. */
 export function classifySubAgentReadError(error: unknown): {
   reason: SubAgentReadReason;
@@ -44,7 +51,7 @@ export function classifySubAgentReadError(error: unknown): {
 } {
   const status = (error as { status?: unknown } | null)?.status;
   if (typeof status === "number") return { reason: "http", status };
-  if (error instanceof TypeError) return { reason: "network" };
+  if (error instanceof TypeError && FETCH_FAILED.test(error.message)) return { reason: "network" };
   if (error instanceof SyntaxError) return { reason: "invalid_response" };
   return { reason: "other" };
 }

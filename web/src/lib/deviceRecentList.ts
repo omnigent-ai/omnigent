@@ -56,6 +56,17 @@ export interface DeviceRecentList<Item> {
   resetForTests: () => void;
 }
 
+function isOwner(text: string): boolean {
+  try {
+    const owner: unknown = JSON.parse(text);
+    return (
+      Array.isArray(owner) && owner.length === 2 && owner.every((part) => typeof part === "string")
+    );
+  } catch {
+    return false;
+  }
+}
+
 function deviceStorage(): Storage | null {
   try {
     return typeof window === "undefined" ? null : window.localStorage;
@@ -74,7 +85,26 @@ export function createDeviceRecentList<Item>({
   retention = "current-owner",
 }: DeviceRecentListOptions<Item>): DeviceRecentList<Item> {
   const savedSchema = z.object({ usedAt: z.number() }).passthrough();
-  const itemsSchema = z.array(item).max(maxItems);
+  // A list saved under a higher limit reads as its first items, so lowering it loses nothing else.
+  const itemsSchema = z.array(item).transform((items) => items.slice(0, maxItems));
+  // Every key of this kind: the prefix, then the owner as a JSON array, so a longer prefix's
+  // lists, such as `${storagePrefix}:branches`, are never this kind's.
+  const keyStart = `${storagePrefix}:[`;
+
+  /** The owner part of a key, as `userPrefix` writes it, or null for a key it never writes. */
+  const ownerOf = (key: string): string | null => {
+    if (!key.startsWith(keyStart)) return null;
+    // The owner is a JSON array of two strings and the scope after it starts with `:[`; a string
+    // may hold `]:[` too, so try each until one reads as the owner.
+    for (
+      let end = key.indexOf("]:[", keyStart.length);
+      end !== -1;
+      end = key.indexOf("]:[", end + 1)
+    ) {
+      if (isOwner(key.slice(keyStart.length - 1, end + 1))) return key.slice(0, end + 2);
+    }
+    return null;
+  };
 
   const userPrefix = (): string | null => {
     const server = durableServerScope();
@@ -109,10 +139,10 @@ export function createDeviceRecentList<Item>({
     try {
       for (let index = 0; index < storage.length; index++) {
         const key = storage.key(index);
-        if (key?.startsWith(`${storagePrefix}:`)) keys.push(key);
+        if (key?.startsWith(keyStart)) keys.push(key);
       }
     } catch {
-      // Unreadable: nothing to list.
+      // Storage that can't be listed keeps no lists this can read either.
     }
     return keys;
   };
@@ -125,22 +155,33 @@ export function createDeviceRecentList<Item>({
     }
   };
 
-  const prune = () => {
+  const prune = (written: string | null = null) => {
     const storage = deviceStorage();
     if (!storage) return;
     const prefix = userPrefix();
-    const mine: { key: string; usedAt: number }[] = [];
+    const byOwner = new Map<string, { key: string; usedAt: number }[]>();
     for (const key of savedKeys(storage)) {
       const usedAt = parse(storage, key)?.usedAt ?? null;
-      const ownKey = !!prefix && key.startsWith(prefix);
+      const owner = ownerOf(key);
       // Only a known owner drops another's: an unresolved or failed identity keeps every list.
-      const anotherOwners = retention === "current-owner" && !!prefix && !ownKey;
-      if (usedAt === null || anotherOwners) remove(storage, key);
-      else if (ownKey) mine.push({ key, usedAt });
+      const anotherOwners = retention === "current-owner" && !!prefix && owner !== prefix;
+      if (usedAt === null || owner === null || anotherOwners) {
+        remove(storage, key);
+        continue;
+      }
+      const lists = byOwner.get(owner) ?? [];
+      lists.push({ key, usedAt });
+      byOwner.set(owner, lists);
     }
-    // Only the current owner's are capped: another owner's wait, untouched, for them.
-    mine.sort((left, right) => right.usedAt - left.usedAt);
-    for (const { key } of mine.slice(maxScopes)) remove(storage, key);
+    // Each owner keeps its newest; on a tie the list just written counts as newest.
+    for (const lists of byOwner.values()) {
+      lists.sort(
+        (left, right) =>
+          right.usedAt - left.usedAt ||
+          Number(right.key === written) - Number(left.key === written),
+      );
+      for (const { key } of lists.slice(maxScopes)) remove(storage, key);
+    }
   };
 
   const read = (scope: readonly string[]): Item[] => {
@@ -154,14 +195,13 @@ export function createDeviceRecentList<Item>({
     const key = storageKey(scope);
     if (!storage || !key) return;
     try {
-      // Past the limit a stored list wouldn't parse, and pruning would drop it: keep the first.
       const kept = items.slice(0, maxItems);
       if (kept.length === 0) storage.removeItem(key);
       else storage.setItem(key, JSON.stringify({ usedAt: Date.now(), [field]: kept }));
     } catch {
-      // Full or denied: pickers list what they read, as before.
+      // Quota exceeded or denied: the list stored before stays as it was.
     }
-    prune();
+    prune(key);
     changed();
   };
 
@@ -185,7 +225,7 @@ export function createDeviceRecentList<Item>({
     });
     // Another window on this device changed a list of this kind, or cleared storage.
     const onStorage = (event: StorageEvent) => {
-      if (event.key === null || event.key.startsWith(`${storagePrefix}:`)) changed();
+      if (event.key === null || event.key.startsWith(keyStart)) changed();
     };
     if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
     stopFollowing = () => {
@@ -193,25 +233,36 @@ export function createDeviceRecentList<Item>({
       if (typeof window !== "undefined") window.removeEventListener("storage", onStorage);
     };
   };
-  // One array per version and scope, so a picker re-renders only when its items changed.
-  let cached: { key: string | null; version: number; items: Item[] } | null = null;
+  // One array per version and scope, so each picker re-renders only when its own items changed.
+  let cachedVersion = -1;
+  const cached = new Map<string, Item[]>();
   const none: Item[] = [];
   const snapshot = (scope: readonly string[] | null, current: number): Item[] => {
     const key = scope ? storageKey(scope) : null;
     if (!scope || !key) return none;
-    if (cached?.key !== key || cached.version !== current) {
-      cached = { key, version: current, items: read(scope) };
+    if (cachedVersion !== current) {
+      cachedVersion = current;
+      cached.clear();
     }
-    return cached.items;
+    let items = cached.get(key);
+    if (!items) {
+      items = read(scope);
+      cached.set(key, items);
+    }
+    return items;
+  };
+
+  const subscribe = (listener: () => void) => {
+    listeners.add(listener);
+    follow();
+    return () => {
+      listeners.delete(listener);
+    };
   };
 
   const useItems = (scope: readonly string[] | null): Item[] => {
     const current = useSyncExternalStore(
-      (listener) => {
-        listeners.add(listener);
-        follow();
-        return () => listeners.delete(listener);
-      },
+      subscribe,
       () => version,
       () => 0,
     );
@@ -225,11 +276,7 @@ export function createDeviceRecentList<Item>({
     record,
     prune,
     useItems,
-    subscribe: (listener) => {
-      listeners.add(listener);
-      follow();
-      return () => listeners.delete(listener);
-    },
+    subscribe,
     hasSaved: () => {
       const storage = deviceStorage();
       return !!storage && savedKeys(storage).length > 0;
@@ -238,7 +285,8 @@ export function createDeviceRecentList<Item>({
       stopFollowing?.();
       stopFollowing = null;
       listeners.clear();
-      cached = null;
+      cached.clear();
+      cachedVersion = -1;
       version = 0;
     },
   };

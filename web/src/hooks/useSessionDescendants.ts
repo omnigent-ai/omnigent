@@ -182,7 +182,8 @@ async function walkSubAgentTree(rootId: string, signal: AbortSignal): Promise<Se
 /**
  * Every sub-agent under a session, down to {@link MAX_TREE_DEPTH}, in one listing. Pages until
  * the last page or the cap. Falls back to a level-by-level walk when the server answers without
- * depths, which an older server or a tree too large for one read does. Each row's real parent is
+ * depths, which an older server or a tree too large for one read does, or with a deeper
+ * row that doesn't name its parent. Each row's real parent is
  * registered with `setSessionParent`, so a grandchild routes through its own parent.
  *
  * Exported for unit testing; production code calls {@link useSessionDescendants}.
@@ -200,13 +201,19 @@ export async function fetchSessionDescendants(
   }
 }
 
+/**
+ * Whether a listed row says where it sits in the tree. An older server, or one whose tree was too
+ * large for one read, lists direct children only, with a null or absent depth.
+ */
+const hasTreePosition = (row: ChildSessionWire): boolean =>
+  typeof row.depth === "number" && (row.depth <= 1 || !!row.parent_session_id);
+
 async function listSessionDescendants(
   rootId: string,
   signal: AbortSignal,
 ): Promise<SessionDescendants> {
   const rows: ChildSessionWire[] = [];
   let after: string | null = null;
-  let withDepth: boolean | undefined;
   let hasMore: boolean;
   /* oxlint-disable no-await-in-loop */
   do {
@@ -217,8 +224,7 @@ async function listSessionDescendants(
       ...(after ? { after } : {}),
     });
     const page = await fetchChildPage(rootId, query, signal);
-    withDepth ??= page.data.length === 0 ? true : page.data[0]!.depth !== undefined;
-    if (!withDepth) return walkSubAgentTree(rootId, signal);
+    if (!page.data.every(hasTreePosition)) return walkSubAgentTree(rootId, signal);
     rows.push(...page.data);
     hasMore = page.has_more === true;
     after = hasMore && page.last_id ? page.last_id : null;
