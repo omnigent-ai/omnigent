@@ -27,14 +27,18 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
+import signal
+import stat
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 import httpx
+import psutil
 import pytest
 
-from omnigent.harnesses.claude_native import bridge, editor_handoff, model_switch
+from omnigent.harnesses.claude_native import bridge, editor_handoff, editor_owner, model_switch
 from omnigent.runner.turn_routing import read_pending_replay, turn_routing_marker_present
 from omnigent.server.smart_routing import models_in_family
 from tests._helpers.native_claude import (
@@ -52,7 +56,7 @@ from tests._helpers.session import (
     ordered_message_items,
     send_user_text,
 )
-from tests.e2e.conftest import get_mock_requests, set_fallback_mock_llm
+from tests.e2e.conftest import get_mock_message_requests, get_mock_requests, set_fallback_mock_llm
 from tests.e2e.routing._helpers import (
     arm_in,
     capture_pane,
@@ -93,12 +97,105 @@ pytestmark = [pytest.mark.smart_routing, pytest.mark.timeout(900)]
 _SPAWN_TIMEOUT_S = 300.0
 
 
+def _observe_pending_native_export(bridge_dir: Path) -> dict:
+    """Read the real default editor's export, then close that owned editor without saving."""
+    owner = editor_handoff.read_controller_editor_binding(bridge_dir)
+    assert owner is not None
+    native = psutil.Process(owner.owner.process.pid)
+    assert native.create_time() == owner.owner.process.created_at
+    selected: psutil.Process | None = None
+    descriptor: int | None = None
+    result: dict = {}
+
+    def observe() -> bool:
+        nonlocal selected, descriptor, result
+        assert editor_handoff.read_controller_editor_binding(bridge_dir) == owner
+        for child in native.children(recursive=True):
+            try:
+                if child.name() not in {"vi", "vim", "vim.tiny", "vim.basic", "nvim", "nano"}:
+                    continue
+                locations = [
+                    argument
+                    for argument in child.cmdline()[1:]
+                    if Path(argument).name.startswith("claude-prompt-")
+                    and argument.endswith(".md")
+                ]
+                if len(locations) != 1:
+                    continue
+                created = child.create_time()
+                path = Path(locations[0])
+                if not path.is_absolute():
+                    path = Path(child.cwd()) / path
+                exported = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(exported, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    assert stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                    assert info.st_nlink == 1
+                    content = stream.read(1024 * 1024 + 1)
+                assert len(content) <= 1024 * 1024
+                text = content.decode("utf-8")
+
+                def current_owner():
+                    current = editor_handoff.read_controller_editor_binding(bridge_dir)
+                    return current.owner if current == owner else None
+
+                assert editor_owner.exported_draft_matches_owner(
+                    path,
+                    expected_text=text,
+                    expected_owner=owner.owner,
+                    current_owner=current_owner,
+                    cancelled=lambda: False,
+                )
+                pinned = os.pidfd_open(child.pid)
+                try:
+                    assert psutil.Process(child.pid).create_time() == created
+                except BaseException:
+                    os.close(pinned)
+                    raise
+                selected = child
+                descriptor = pinned
+                result = {
+                    "content": text,
+                    "length": len(text),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "editor": child.name(),
+                    "editor_pid": child.pid,
+                    "editor_created_at": created,
+                    "owner": repr(owner),
+                }
+                return True
+            except psutil.NoSuchProcess:
+                continue
+        return False
+
+    with bridge._bridge_injection_lock(bridge_dir), bridge._bridge_injection_file_lock(bridge_dir):
+        try:
+            bridge._run_tmux(owner.socket_path, "send-keys", "-t", owner.tmux_target, "C-g")
+            poll_until(observe, timeout_s=15, interval_s=0.1)
+        finally:
+            if descriptor is not None:
+                try:
+                    with contextlib.suppress(ProcessLookupError):
+                        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                    assert selected is not None
+                    try:
+                        selected.wait(timeout=2)
+                    except psutil.TimeoutExpired:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                        selected.wait(timeout=2)
+                finally:
+                    os.close(descriptor)
+    assert editor_handoff.read_controller_editor_binding(bridge_dir) == owner
+    return result
+
+
 def _assert_mock_created_session_preserves_default(
     mock_url: str,
     tmp_path: Path,
     *,
     entry: str = "create",
     type_into_tui: Callable[[str, str, str], None] | None = None,
+    observe_pending_export: bool = False,
     record_property: Callable[[str, object], None],
 ) -> None:
     judge_model = "mock-claude-routing-judge"
@@ -170,6 +267,32 @@ def _assert_mock_created_session_preserves_default(
                     type_into_tui(socket_path, target, prompt)
                 else:
                     send_user_text(client, session_id=session_id, text=prompt)
+                if observe_pending_export:
+
+                    def saved_notice() -> bool:
+                        response = client.get(
+                            f"/v1/sessions/{session_id}/items", params={"limit": 100}
+                        )
+                        response.raise_for_status()
+                        return any(
+                            item.get("code") == "turn_routing_replay_pending"
+                            for item in response.json().get("data", [])
+                        )
+
+                    poll_until(saved_notice, timeout_s=30)
+                    pending = read_pending_replay(bridge_dir)
+                    assert pending is not None and "<pasted_content" in pending.prompt
+                    observed = _observe_pending_native_export(bridge_dir)
+                    record_property(
+                        "pending_export_diagnostic",
+                        json.dumps(
+                            {"typed": prompt, "pending": pending.prompt, "observed": observed}
+                        ),
+                    )
+                    assert claude_settings_snapshot(settings_path) == saved_settings
+                    assert read_pending_replay(bridge_dir) == pending
+                    assert get_mock_message_requests(mock_url) == []
+                    return
                 poll_until(
                     lambda reply=reply: any(
                         item.get("role") == "assistant" and message_item_text(item) == reply
@@ -307,6 +430,7 @@ def _assert_mock_created_session_preserves_default(
         pytest.param("mock-provider", marks=pytest.mark.mock_only),
         pytest.param("mock-chat", marks=pytest.mark.mock_only),
         pytest.param("mock-terminal", marks=pytest.mark.mock_only),
+        pytest.param("mock-terminal-export-diagnostic", marks=pytest.mark.mock_only),
     ],
 )
 def test_claude_session_create_routes_the_model_and_then_the_spawn(
@@ -318,9 +442,12 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
 ) -> None:
     require_tmux()
     if creation_case.startswith("mock-"):
-        entry = {"mock-provider": "create", "mock-chat": "chat", "mock-terminal": "terminal"}[
-            creation_case
-        ]
+        entry = {
+            "mock-provider": "create",
+            "mock-chat": "chat",
+            "mock-terminal": "terminal",
+            "mock-terminal-export-diagnostic": "terminal",
+        }[creation_case]
         _assert_mock_created_session_preserves_default(
             request.getfixturevalue("isolated_mock_llm_server_url"),
             tmp_path,
@@ -328,6 +455,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
             type_into_tui=request.getfixturevalue("type_into_tui")
             if entry == "terminal"
             else None,
+            observe_pending_export=creation_case == "mock-terminal-export-diagnostic",
             record_property=record_property,
         )
         return
