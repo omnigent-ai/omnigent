@@ -40,6 +40,7 @@ function registerSessions({
     sessionsFailed: failed,
   });
   useSidebarSessionOrderStore.setState({
+    published: true,
     orderedSessionIds: order,
     activeSessionId: open,
     pendingSessionId: null,
@@ -78,6 +79,7 @@ afterEach(() => {
     sessionsFailed: false,
   });
   useSidebarSessionOrderStore.setState({
+    published: false,
     orderedSessionIds: [],
     activeSessionId: null,
     pendingSessionId: null,
@@ -157,7 +159,11 @@ describe("navigateAfterArchiving", () => {
   it("keeps waiting while the sidebar stops publishing, as when it unmounts", () => {
     registerSessions({ history: ["a"], known: false });
     archive();
-    useSidebarSessionOrderStore.setState({ orderedSessionIds: [], activeSessionId: null });
+    useSidebarSessionOrderStore.setState({
+      published: false,
+      orderedSessionIds: [],
+      activeSessionId: null,
+    });
     useRecentSessionSwitchStore.setState({ sessionsKnown: true });
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/?project=Payments", { replace: true });
     expect(landed()).toEqual(["pending", "new_session"]);

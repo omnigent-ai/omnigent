@@ -143,14 +143,6 @@ function follow(request: ArchiveNavigationRequest, landing: ArchiveLanding): boo
   return true;
 }
 
-/** No sidebar is publishing: it lists nothing and shows no session. */
-function isUnpublished(state: {
-  orderedSessionIds: readonly string[];
-  activeSessionId: string | null;
-}) {
-  return state.orderedSessionIds.length === 0 && state.activeSessionId === null;
-}
-
 function cancelPendingNavigation(): void {
   pending?.stop();
   pending = null;
@@ -181,7 +173,7 @@ export function navigateAfterArchiving(request: ArchiveNavigationRequest): void 
   // The first time the user opens another entry, the choice is theirs, even if they come back.
   // A sidebar that stops publishing, as when it unmounts, says nothing about the route.
   const stopWatchingRoute = useSidebarSessionOrderStore.subscribe((state) => {
-    if (pending === null || isUnpublished(state)) return;
+    if (pending === null || !state.published) return;
     if (currentSidebarSessionId() === openAtCommit) return;
     record("user_left");
     cancelPendingNavigation();

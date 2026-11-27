@@ -44,6 +44,7 @@ describe("usePublishSidebarSessionOrder", () => {
       wrapper: MemoryRouter,
     });
     expect(useSidebarSessionOrderStore.getState()).toEqual({
+      published: true,
       orderedSessionIds: ["a", "b"],
       activeSessionId: "b",
       pendingSessionId: null,
@@ -51,6 +52,7 @@ describe("usePublishSidebarSessionOrder", () => {
     });
     view.unmount();
     expect(useSidebarSessionOrderStore.getState()).toEqual({
+      published: false,
       orderedSessionIds: [],
       activeSessionId: null,
       pendingSessionId: null,

@@ -8,6 +8,8 @@ import { create } from "zustand";
 import { useLocation } from "@/lib/routing";
 
 interface SidebarSessionOrderState {
+  /** A sidebar is mounted and publishing, even while it lists no rows or shows no session. */
+  published: boolean;
   /** Visible rows in render order, without duplicates; empty while no sidebar lists any. */
   orderedSessionIds: readonly string[];
   /**
@@ -30,6 +32,7 @@ export const PENDING_SESSION_MS = 5_000;
 const NO_SESSIONS: readonly string[] = [];
 
 export const useSidebarSessionOrderStore = create<SidebarSessionOrderState>(() => ({
+  published: false,
   orderedSessionIds: NO_SESSIONS,
   activeSessionId: null,
   pendingSessionId: null,
@@ -47,11 +50,12 @@ export function usePublishSidebarSessionOrder(
     useSidebarSessionOrderStore.setState({ pendingSessionId: null });
   }, [locationKey]);
   useEffect(() => {
-    useSidebarSessionOrderStore.setState({ orderedSessionIds, activeSessionId });
+    useSidebarSessionOrderStore.setState({ published: true, orderedSessionIds, activeSessionId });
   }, [orderedSessionIds, activeSessionId]);
   useEffect(
     () => () =>
       useSidebarSessionOrderStore.setState({
+        published: false,
         orderedSessionIds: NO_SESSIONS,
         activeSessionId: null,
         pendingSessionId: null,
