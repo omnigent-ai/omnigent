@@ -2008,9 +2008,8 @@ async def test_events_model_change_settles_held_metadata_lock_without_late_write
     assert config_path.read_bytes() == original
 
 
-@pytest.mark.parametrize("phase", ["preflight", "picker", "commit", "status", "dialog"])
-async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_states(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, phase: str
+async def test_events_model_change_serializes_a_refused_dialog_without_session_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from omnigent.runner.app import _session_event_queues_ref
 
@@ -2022,17 +2021,10 @@ async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_sta
     def refuse(_bridge: Path, *, model: str, **_kwargs: Any) -> None:
         selections.append(model)
         assert _injection_deadline() is not None
-        if phase == "dialog":
-            error = claude_native_bridge.ClaudeTerminalDialog(
-                "Claude Code is waiting for an answer in its terminal (Trust this folder?)."
-            )
-            raise claude_native_bridge.ClaudeModelSwitchRefused(str(error)) from error
-        raise claude_native_bridge.ClaudeModelSwitchRefused(
-            "Session-only model selection refused; inspect the terminal before retrying.",
-            phase=phase,
-            unsupported=phase == "preflight",
-            model_may_have_changed=phase in {"commit", "status"},
+        error = claude_native_bridge.ClaudeTerminalDialog(
+            "Claude Code is waiting for an answer in its terminal (Trust this folder?)."
         )
+        raise claude_native_bridge.ClaudeModelSwitchRefused(str(error)) from error
 
     response = await _post_claude_control(
         monkeypatch,
@@ -2045,24 +2037,12 @@ async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_sta
     assert selections == ["claude-opus-4-7"]
     assert response.status_code == 503, response.text
     assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
-    if phase == "dialog":
-        assert response.json() == {
-            "error": "claude_native_model_failed",
-            "detail": "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
-            "answer or dismiss it, then switch models again.",
-            "waiting_on_person": True,
-        }
-    elif phase in {"commit", "status"}:
-        assert response.json()["error"] == "claude_native_model_unconfirmed"
-        assert "may have changed" in response.json()["detail"]
-        assert "Check the terminal's current model before retrying" in response.json()["detail"]
-    else:
-        assert response.json()["error"] == (
-            "claude_native_model_unsupported"
-            if phase == "preflight"
-            else "claude_native_model_failed"
-        )
-        assert "inspect the terminal" in response.json()["detail"]
+    assert response.json() == {
+        "error": "claude_native_model_failed",
+        "detail": "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+        "answer or dismiss it, then switch models again.",
+        "waiting_on_person": True,
+    }
 
 
 @pytest.mark.parametrize("catalog_source", ["cached", "stored"])

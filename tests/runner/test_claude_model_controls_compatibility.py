@@ -276,7 +276,7 @@ _PASSWORD_PANE_TAIL = (
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_detail", "waiting_on_person"),
+    ("error", "expected_detail", "waiting_on_person", "expected_code", "uncertainty_scope"),
     [
         pytest.param(
             bridge.ClaudePromptTimeout(
@@ -287,6 +287,8 @@ _PASSWORD_PANE_TAIL = (
             "on a prompt such as a password. Check the terminal, then switch models again."
             + _PASSWORD_PANE_TAIL,
             False,
+            "claude_native_model_failed",
+            None,
             id="launcher-password-prompt",
         ),
         pytest.param(
@@ -298,6 +300,8 @@ _PASSWORD_PANE_TAIL = (
             "Claude Code can't start until you sign in to Databricks. "
             "Finish the sign-in in the terminal, then switch models again.",
             True,
+            "claude_native_model_failed",
+            None,
             id="sign-in",
         ),
         pytest.param(
@@ -308,6 +312,8 @@ _PASSWORD_PANE_TAIL = (
             "Claude is waiting for an answer to a question or prompt. "
             "Answer it, then switch models again.",
             True,
+            "claude_native_model_failed",
+            None,
             id="permission-prompt",
         ),
         pytest.param(
@@ -318,6 +324,8 @@ _PASSWORD_PANE_TAIL = (
             "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
             "answer or dismiss it, then switch models again." + _PASSWORD_PANE_TAIL,
             True,
+            "claude_native_model_failed",
+            None,
             id="dialog",
         ),
         pytest.param(
@@ -328,8 +336,49 @@ _PASSWORD_PANE_TAIL = (
             "The Claude Code terminal has exited. Relaunch it, then switch models again."
             + _PASSWORD_PANE_TAIL,
             False,
+            "claude_native_model_failed",
+            None,
             id="exited",
         ),
+        pytest.param(
+            bridge.ClaudeModelSwitchRefused(
+                "Session-only model selection refused; inspect the terminal before retrying.",
+                phase="preflight",
+                unsupported=True,
+            ),
+            "Session-only model selection refused; inspect the terminal before retrying.",
+            False,
+            "claude_native_model_unsupported",
+            None,
+            id="model-preflight",
+        ),
+        pytest.param(
+            bridge.ClaudeModelSwitchRefused(
+                "Session-only model selection refused; inspect the terminal before retrying.",
+                phase="picker",
+            ),
+            "Session-only model selection refused; inspect the terminal before retrying.",
+            False,
+            "claude_native_model_failed",
+            None,
+            id="model-picker",
+        ),
+        *[
+            pytest.param(
+                bridge.ClaudeModelSwitchRefused(
+                    "Session-only model selection refused; inspect the terminal before retrying.",
+                    phase=phase,
+                    model_may_have_changed=True,
+                ),
+                "Claude may have changed the session model, but the selection could not "
+                "be confirmed. Check the terminal's current model before retrying.",
+                False,
+                "claude_native_model_unconfirmed",
+                "session_only",
+                id=f"model-{phase}",
+            )
+            for phase in ("commit", "status")
+        ],
     ],
 )
 async def test_model_control_names_the_step_a_blocked_terminal_needs(
@@ -338,10 +387,14 @@ async def test_model_control_names_the_step_a_blocked_terminal_needs(
     error: Exception,
     expected_detail: str,
     waiting_on_person: bool,
+    expected_code: str,
+    uncertainty_scope: str | None,
 ) -> None:
     controls, composer, _ = model_control
 
     def refuse(*args: Any, **kwargs: Any) -> None:
+        if isinstance(error, bridge.ClaudeModelSwitchRefused):
+            raise error
         raise bridge.ClaudeModelSwitchRefused(str(error)) from error
 
     monkeypatch.setattr(bridge, "inject_model_command", refuse)
@@ -349,11 +402,13 @@ async def test_model_control_names_the_step_a_blocked_terminal_needs(
 
     assert response.status_code == 503
     expected: dict[str, object] = {
-        "error": "claude_native_model_failed",
+        "error": expected_code,
         "detail": expected_detail,
     }
     if waiting_on_person:
         expected["waiting_on_person"] = True
+    if uncertainty_scope is not None:
+        expected["uncertainty_scope"] = uncertainty_scope
     assert json.loads(response.body) == expected
     assert composer.sends == []
 

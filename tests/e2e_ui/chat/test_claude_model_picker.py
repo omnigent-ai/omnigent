@@ -1244,6 +1244,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
                 ),
                 timeout_s=10,
             )
+            expect(page.locator(_WORKING)).to_have_count(1)
             _screenshot(page, "real-native-model-control-during-active-turn")
         finally:
             while model_client.post("/gate/release").json()["released"]:
