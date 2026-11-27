@@ -1375,6 +1375,7 @@ _PR_OWNER_METHODS = {
     "GetMergeQueue": {},
     "EnqueuePullRequest": {"expectedHeadOid": "a" * 40},
     "DequeuePullRequest": {},
+    "GetPullRequestStack": {},
 }
 
 

@@ -296,6 +296,8 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     ),
     **_REVIEW_OPS,
     **_MERGE_QUEUE_OPS,
+    # The stack read lists the repository's other pull requests as the host's account.
+    "GetPullRequestStack": _named(pr_actions.get_pull_request_stack),
     # The runner takes the media type from the bytes, as on the REST route.
     "UploadAttachment": lambda reader, call, request: pr_resource.upload_pr_attachment(
         _root(reader),

@@ -52,7 +52,6 @@ DECLARED_NOT_SERVED: frozenset[str] = frozenset(
         "EnableAutoMerge",
         "GetMergeReadiness",
         "GetPullRequestListStats",
-        "GetPullRequestStack",
         "ListBranchPullRequests",
         "LookupPullRequest",
         "PreviewReviewerPing",

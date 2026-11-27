@@ -107,6 +107,16 @@ _bound_pr_token: ContextVar[tuple[str, str | None] | None] = ContextVar(
     "bound_pr_token", default=None
 )
 
+
+@dataclass
+class GhCallCount:
+    """How many ``gh`` processes started inside a :func:`_gh_call_count_scope`."""
+
+    started: int = 0
+
+
+_gh_call_count: ContextVar[GhCallCount | None] = ContextVar("gh_call_count", default=None)
+
 # Always pass --json (bare gh pr view opens a pager); body, comments,
 # reviews, labels, and the merge fields feed the Summary and Comments tabs.
 _PR_VIEW_FIELDS = (
@@ -266,6 +276,8 @@ def _gh(
             _gh_timed_out.set(True)
             return None, "", "gh deadline exceeded"
     invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
+    if (count := _gh_call_count.get()) is not None:
+        count.started += 1
     result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     if (
         deadline is not None
@@ -290,6 +302,17 @@ def _gh_deadline_scope(deadline: float) -> Iterator[None]:
     finally:
         _gh_timed_out.reset(timed_out_token)
         _gh_deadline.reset(deadline_token)
+
+
+@contextmanager
+def _gh_call_count_scope() -> Iterator[GhCallCount]:
+    """Count every ``gh`` process the block starts, including inside other helpers."""
+    count = GhCallCount()
+    token = _gh_call_count.set(count)
+    try:
+        yield count
+    finally:
+        _gh_call_count.reset(token)
 
 
 # ── Account selection ────────────────────────────────────────────────────────

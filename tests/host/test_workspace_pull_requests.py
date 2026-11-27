@@ -23,7 +23,13 @@ from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_dict
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
-from omnigent.runner import github_merge_queue, github_resource, github_reviews, pr_resource
+from omnigent.runner import (
+    github_merge_queue,
+    github_resource,
+    github_reviews,
+    github_stack,
+    pr_resource,
+)
 from omnigent.runner.pull_request_errors import (
     CommentChangedError,
     PullRequestChangedError,
@@ -499,16 +505,24 @@ _QUEUE_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     ),
     "DequeuePullRequest": (pb.DequeuePullRequestRequest(pr_url=_PR), "dequeue", {}),
 }
+# The stack read: a valid request, the github_stack function it runs, and its arguments.
+_STACK_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "GetPullRequestStack": (pb.GetPullRequestStackRequest(pr_url=_PR), "pull_request_stack", {}),
+}
 # The methods that act on GitHub for the session's selected pull request.
-_SELECTED_PR_CALLS = {**_REVIEW_CALLS, **_QUEUE_CALLS}
+_SELECTED_PR_CALLS = {**_REVIEW_CALLS, **_QUEUE_CALLS, **_STACK_CALLS}
 
 
 def record_review_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[tuple[str, str, str, dict[str, Any]]]:
-    """Each GitHub review or merge queue call a method made: function, root, PR and arguments."""
+    """Each GitHub review, merge queue or stack call a method made: function, root, PR, args."""
     calls: list[tuple[str, str, str, dict[str, Any]]] = []
-    for table, module in ((_REVIEW_CALLS, github_reviews), (_QUEUE_CALLS, github_merge_queue)):
+    for table, module in (
+        (_REVIEW_CALLS, github_reviews),
+        (_QUEUE_CALLS, github_merge_queue),
+        (_STACK_CALLS, github_stack),
+    ):
         for function in {name for _request, name, _kwargs in table.values()}:
 
             def record(
@@ -559,6 +573,8 @@ def providers(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
 def test_every_owner_method_has_a_call_case() -> None:
     assert not set(_OWNER_CALLS) & set(_SELECTED_PR_CALLS)
     assert not set(_REVIEW_CALLS) & set(_QUEUE_CALLS)
+    assert not set(_REVIEW_CALLS) & set(_STACK_CALLS)
+    assert not set(_QUEUE_CALLS) & set(_STACK_CALLS)
     assert set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) == _PULL_REQUEST_OWNER_METHODS
 
 

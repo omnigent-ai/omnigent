@@ -81,6 +81,8 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "GetMergeQueue": WorkspaceGate.SESSION_OWNER,
     "EnqueuePullRequest": WorkspaceGate.SESSION_OWNER,
     "DequeuePullRequest": WorkspaceGate.SESSION_OWNER,
+    # The stack lists the repository's other pull requests, read as the host's account.
+    "GetPullRequestStack": WorkspaceGate.SESSION_OWNER,
 }
 
 
