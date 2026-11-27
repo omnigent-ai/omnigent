@@ -1,9 +1,25 @@
 import "@testing-library/jest-dom/vitest";
-import { configure } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import type * as ReactVirtualModule from "@tanstack/react-virtual";
 import { afterEach, vi } from "vitest";
 
+import type * as GitHubPollFocusModule from "@/lib/githubPollFocus";
+import type * as GitHubPollIdleModule from "@/lib/githubPollIdle";
 import { abortInFlightXhrs, FetchBackedXhr, sentXhrs } from "@/test/fetchBackedXhr";
+
+// The actual modules, so a file that mocks one keeps its mock and the real one still resets.
+// Loaded once here, so the reset below never waits between tests.
+const pollFocus = await vi.importActual<typeof GitHubPollFocusModule>("@/lib/githubPollFocus");
+const pollIdle = await vi.importActual<typeof GitHubPollIdleModule>("@/lib/githubPollIdle");
+
+// Each test starts with a fresh window-focus pause and idle clock; both count from first use,
+// and jsdom's window is never focused. Unmount first, so a component's pending frame can't
+// fire against what a test tore down, and wait for nothing, so no other timer fires either.
+afterEach(() => {
+  cleanup();
+  pollFocus.resetGitHubPollFocusForTests();
+  pollIdle.resetGitHubPollIdleForTests();
+});
 
 // Tooltip surfaces intentionally wait 1s; leave enough margin for async queries
 // to observe them without racing Testing Library's matching default timeout.
