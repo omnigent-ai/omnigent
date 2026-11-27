@@ -1,13 +1,13 @@
 """E2E: long user prompts collapse by default in the chat transcript.
 
-When a user sends a message longer than the threshold the UI
+When a user sends a message taller than fifteen rendered lines the UI
 collapses the bubble to a fixed-height preview and shows an expand button.
 Clicking the button expands the full text; clicking it again collapses.
 
 Selectors:
   - user bubble:   ``data-testid="message-bubble"`` + ``data-role="user"``
-  - expand button: accessible name matching /show full prompt/i
-  - collapse button: accessible name matching /collapse prompt/i
+  - expand button: accessible name "Show more"
+  - collapse button: accessible name "Show less"
 """
 
 from __future__ import annotations
@@ -16,10 +16,8 @@ from playwright.sync_api import Page, expect
 
 _COMPOSER_PLACEHOLDER = "Send a message…"
 _USER_BUBBLE = '[data-testid="message-bubble"][data-role="user"]'
-_THRESHOLD = 12_000
-
-# Generate a prompt just over the threshold.
-_LONG_PROMPT = "word " * (_THRESHOLD // 5 + 10)
+# Deliberately below the old character threshold, but taller than the visible cap.
+_LONG_PROMPT = "\n".join(f"Prompt line {line}" for line in range(1, 41))
 
 
 def _send(page: Page, text: str) -> None:
@@ -34,7 +32,7 @@ def test_long_user_prompt_collapses_by_default(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A prompt over THRESHOLD chars starts collapsed with an expand button visible.
+    """A tall prompt starts collapsed even when it is the newest user message.
 
     A failure here means the collapse threshold, initial state, or the button
     label regressed.
@@ -48,11 +46,11 @@ def test_long_user_prompt_collapses_by_default(
     expect(bubble).to_be_visible(timeout=15_000)
 
     # Expand button must be present immediately after send.
-    expand_btn = bubble.get_by_role("button", name="Show full prompt", exact=False)
+    expand_btn = bubble.get_by_role("button", name="Show more", exact=True)
     expect(expand_btn).to_be_visible(timeout=10_000)
 
     # Collapse button must NOT be visible while still collapsed.
-    collapse_btn = bubble.get_by_role("button", name="Collapse prompt", exact=True)
+    collapse_btn = bubble.get_by_role("button", name="Show less", exact=True)
     expect(collapse_btn).not_to_be_visible()
 
 
@@ -72,12 +70,12 @@ def test_long_user_prompt_expands_on_click(
     bubble = page.locator(_USER_BUBBLE).last
     expect(bubble).to_be_visible(timeout=15_000)
 
-    expand_btn = bubble.get_by_role("button", name="Show full prompt", exact=False)
+    expand_btn = bubble.get_by_role("button", name="Show more", exact=True)
     expect(expand_btn).to_be_visible(timeout=10_000)
     expand_btn.click()
 
     # After expanding: collapse button appears, expand button disappears.
-    collapse_btn = bubble.get_by_role("button", name="Collapse prompt", exact=True)
+    collapse_btn = bubble.get_by_role("button", name="Show less", exact=True)
     expect(collapse_btn).to_be_visible(timeout=5_000)
     expect(expand_btn).not_to_be_visible()
 
@@ -99,11 +97,11 @@ def test_long_user_prompt_collapses_again_on_second_click(
     expect(bubble).to_be_visible(timeout=15_000)
 
     # Expand then collapse.
-    expand_btn = bubble.get_by_role("button", name="Show full prompt", exact=False)
+    expand_btn = bubble.get_by_role("button", name="Show more", exact=True)
     expect(expand_btn).to_be_visible(timeout=10_000)
     expand_btn.click()
 
-    collapse_btn = bubble.get_by_role("button", name="Collapse prompt", exact=True)
+    collapse_btn = bubble.get_by_role("button", name="Show less", exact=True)
     expect(collapse_btn).to_be_visible(timeout=5_000)
     collapse_btn.click()
 
@@ -131,5 +129,5 @@ def test_short_user_prompt_never_collapses(
     expect(bubble).to_contain_text(short_prompt)
 
     # Neither collapse-related button should be present.
-    expect(bubble.get_by_role("button", name="Show full prompt", exact=False)).not_to_be_visible()
-    expect(bubble.get_by_role("button", name="Collapse prompt", exact=True)).not_to_be_visible()
+    expect(bubble.get_by_role("button", name="Show more", exact=True)).not_to_be_visible()
+    expect(bubble.get_by_role("button", name="Show less", exact=True)).not_to_be_visible()
