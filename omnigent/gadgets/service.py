@@ -1128,7 +1128,9 @@ class GadgetService:
         files = self._files(gadget)
         files.mkdirs("code/revisions")
         files.create_json(f"code/revisions/{revision_id}.json", value)
-        return {"id": revision_id}
+        # Naming the scopes back lets a client tell a server that kept them from an older one
+        # that dropped the field and would make every collection shared.
+        return {"id": revision_id, "collection_scopes": scopes}
 
     def publish(self, app_id: str, body: dict) -> dict:
         gadget, permissions = self._resolve(app_id)

@@ -113,18 +113,19 @@ one backed by folder permissions, shares through the same routes. A grant names 
 not one registration of it, so a store that keeps grants removes an account's grants when it
 is deleted and refuses to register the username again while any remain.
 
-That cleanup and refusal are what keep a username registered again from inheriting grants,
-so with a store that keeps grants, every server process that can delete or register accounts must run a release that has
-them before gadget sharing is used. **Deployment order:** upgrade every replica, then enable
-the `gadgets` feature; on a server that already has it on, finish the rolling upgrade before
-anyone shares a gadget. A replica of an older release can delete and register the same
-username again without removing its grants, and the new account then holds them; a later
-cleanup does not take them back once that account is live. **Rollback floor:** once a grant
-has been saved, don't run a release older than this one while the feature is on. Rolling back
-further needs the feature off first, and the `gadget_shares` downgrade drops every share, so
-it is safe only before the first one. Binding grants to a registration instead (a column on
-`gadget_shares`) would remove the ordering requirement; it is not done because group grants
-have no registration to bind to.
+That cleanup and refusal are what keep a username registered again from inheriting grants, so
+with a store that keeps grants, every server process that can delete or register accounts must
+run a release that has them before gadget sharing is used. **Deployment order:** upgrade every
+replica, then enable the `gadgets` feature; on a server that already has it on, finish the
+rolling upgrade before anyone shares a gadget. A replica of an older release can delete and
+register the same username again without removing its grants, and the new account then holds
+them; a later cleanup does not take them back once that account is live. **Rollback floor:**
+once a grant has been saved, don't run a release older than this one against that store.
+Turning the feature off is not enough, as it leaves the grants in place and that release's
+account deletion and registration would still let a new account inherit them; going further
+back needs the grants removed first, which drops every share. Binding grants to a registration
+instead (a column on `gadget_shares`) would remove the ordering requirement; it is not done
+because group grants have no registration to bind to.
 
 Moving the documents to SQL would be worth it if gadgets needed queries
 across gadgets or users (search over records, reporting), or transactions across records;

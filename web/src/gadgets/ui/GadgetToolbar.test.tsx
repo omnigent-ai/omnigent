@@ -209,6 +209,23 @@ describe("Make a copy", () => {
     expect(screen.getByRole("status", { name: "location" })).toHaveTextContent("/gadget/copy");
   });
 
+  it("keeps the dialog open with the error when the copy fails", async () => {
+    vi.mocked(copyGadget).mockRejectedValue(new Error("Too many records to copy."));
+    renderWithGadgets(<GadgetActions gadget={VIEW_ONLY} onDeleted={vi.fn()} shareInMenu={false} />);
+
+    openMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Make a copy" }));
+    const dialog = await screen.findByRole("dialog", { name: "Make a copy" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Make a copy" }));
+
+    expect(await within(dialog).findByText(/Too many records to copy/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Make a copy" })).toBeEnabled();
+    // Still where it was: the modal dialog hides the rest of the page from queries.
+    expect(screen.getByRole("status", { name: "location", hidden: true })).toHaveTextContent(
+      /^\/$/,
+    );
+  });
+
   it("isn't offered by a server that can't make copies", async () => {
     renderWithGadgets(
       <GadgetActions gadget={VIEW_ONLY} onDeleted={vi.fn()} shareInMenu={false} />,

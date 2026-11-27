@@ -2623,9 +2623,11 @@ def test_deletion_removes_the_accounts_own_records_in_other_peoples_gadgets(
 ) -> None:
     """Viewer-collection records live in the viewer's own files, which go with the account:
     the name registered again starts with none, and the gadget's owner keeps theirs."""
+    from omnigent.stores.gadget_store import NotFound as GadgetNotFound
+
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = GadgetGrantStore(db_uri)
-    _, _, service = _gadgets(db_uri, tmp_path, accounts)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("bob")
     bob = service("bob")
@@ -2657,10 +2659,16 @@ def test_deletion_removes_the_accounts_own_records_in_other_peoples_gadgets(
             {"collection": "progress", "id": record_id, "value": {}, "operation_id": record_id},
         )
 
-    write(service("alice"), "a1")
+    old_alice = service("alice")
+    write(old_alice, "a1")
     write(bob, "b1")
+    old_files = store.user_files("alice", owner_registration=old_alice.registration)
+    assert old_files.list_page("viewer-data", after=None, limit=1)[0] == [app["id"]]
 
     assert accounts.delete_user("alice") is True
+    # The old registration's files are gone, not only out of the new one's reach.
+    with pytest.raises(GadgetNotFound):
+        old_files.list_page("viewer-data", after=None, limit=1)
     accounts.create_user_with_password("alice", "replacement-hash")
     permissions.grant_for_gadget("alice", app["id"], 1)
 

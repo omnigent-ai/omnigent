@@ -238,9 +238,11 @@ gone. So:
    on, finish the rolling upgrade before anyone shares a gadget: an older
    replica can delete an account and register its username again without
    removing the grants, and the new account inherits them.
-2. Once anyone has shared a gadget, don't roll back to a release without
-   gadget sharing while `gadgets` is on. Turn the feature off first; dropping
-   the store's grants drops every share, so it is safe only before the first one.
+2. Once anyone has shared a gadget, don't run a release without gadget sharing
+   against that store, even with `gadgets` turned off: turning the feature off
+   leaves the grants in place, and that release's account deletion and
+   registration would let a new account inherit them. Roll back further only
+   after removing the grants, which drops every share.
 
 See [`designs/GADGETS.md`](../designs/GADGETS.md) for details.
 

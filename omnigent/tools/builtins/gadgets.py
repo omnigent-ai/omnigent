@@ -202,6 +202,8 @@ SysGadgetRevisionCreateTool = _gadget_tool(
             "items": {"type": "string", "enum": ["data.read", "data.write", "sessions.read"]},
         },
         "collections": {"type": "object"},
+        # Values "shared" or "viewer"; the skill explains them and the server checks them.
+        "collection_scopes": {"type": "object"},
         "guide": _STRING,
         "constraints": {"type": "array", "items": {"type": "object"}},
         "actions": {"type": "array", "items": {"type": "object"}},
