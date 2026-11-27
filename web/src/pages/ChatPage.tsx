@@ -1,5 +1,6 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
+import { isWarmSwitchPending } from "@/lib/warmSessionSwitch";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -453,19 +454,29 @@ export function BtwSidechatAnswer({ answer }: { answer: string }) {
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
-  // The id for every server-scoped fetch/hook — `undefined` while the URL holds
-  // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
-  // the session exists. `switchTo` still gets the raw `urlConvId`.
-  const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
+  const activeConversationId = useChatStore((s) => s.conversationId);
+  const rebasePath = useRebasePath();
+  const warmSwitchPending = isWarmSwitchPending(activeConversationId, urlConvId, rebasePath);
+  const effectiveConvId = warmSwitchPending ? (activeConversationId ?? undefined) : urlConvId;
+  const [sessionUi, setSessionUi] = useState({ conversationId: effectiveConvId, key: 0 });
+  if (sessionUi.conversationId !== effectiveConvId) {
+    // Session creation promotes the same draft; every other switch starts fresh local UI.
+    const promoting =
+      isTempConvId(sessionUi.conversationId) &&
+      effectiveConvId !== undefined &&
+      !isTempConvId(effectiveConvId);
+    setSessionUi({ conversationId: effectiveConvId, key: sessionUi.key + (promoting ? 0 : 1) });
+  }
+  // Client-only temp ids must not reach server-scoped hooks before the session exists.
+  const sessionConvId = isTempConvId(effectiveConvId) ? undefined : effectiveConvId;
   const navigate = useNavigate();
   const { pathname, search } = useLocation();
-  const rebasePath = useRebasePath();
   const appName = useAppName();
   const {
     data: agents,
     error: agentsError,
     refetch: refetchAgents,
-  } = useAgents({ enabled: !urlConvId });
+  } = useAgents({ enabled: !effectiveConvId });
   const { data: conversationsData } = useLoadedConversations();
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
@@ -491,6 +502,7 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    if (warmSwitchPending) return;
     // A temporary route has no client session after a reload. Return to its
     // board or the landing page so it cannot strand a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {
@@ -504,9 +516,9 @@ export function ChatPage() {
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate, pathname, search, rebasePath]);
+  }, [urlConvId, warmSwitchPending, navigate, pathname, search, rebasePath]);
 
-  useConversationRedirect(urlConvId);
+  useConversationRedirect(effectiveConvId);
 
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
@@ -539,7 +551,6 @@ export function ChatPage() {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
-  const activeConversationId = useChatStore((s) => s.conversationId);
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
@@ -576,15 +587,25 @@ export function ChatPage() {
     }
   }, [boundAgentId, agents, refetchAgents]);
 
-  const sendAgentId = initialPromptAgentId({ urlConvId, boundAgentId, agentId });
-  const dispatchFirstMessage = useCallback((prompt: PendingInitialPrompt, agent: string) => {
-    const { send, sendSlashCommand } = useChatStore.getState();
-    dispatchInitialPrompt(prompt, agent, send, sendSlashCommand);
-  }, []);
+  const sendAgentId = initialPromptAgentId({ urlConvId: effectiveConvId, boundAgentId, agentId });
+  const dispatchFirstMessage = useCallback(
+    (prompt: PendingInitialPrompt, agent: string) => {
+      if (!effectiveConvId) return;
+      const { send, sendSlashCommand } = useChatStore.getState();
+      dispatchInitialPrompt(
+        prompt,
+        agent,
+        (text, id, files) => send(text, id, files, { pinnedConversationId: effectiveConvId }),
+        (name, args, id) =>
+          sendSlashCommand(name, args, id, { pinnedConversationId: effectiveConvId }),
+      );
+    },
+    [effectiveConvId],
+  );
   useInitialPromptDispatch({
-    conversationId: urlConvId,
+    conversationId: effectiveConvId,
     agentId: sendAgentId,
-    loadingConversation,
+    loadingConversation: loadingConversation || activeConversationId !== effectiveConvId,
     dispatch: dispatchFirstMessage,
   });
 
@@ -616,13 +637,15 @@ export function ChatPage() {
   // effect uses. If the user switched away before the clone started, the
   // prompt stays pinned and waits; it never floats into another session.
   useEffect(() => {
-    if (pendingResumePrompt === null || !agentId || !urlConvId) return;
-    if (pendingResumePrompt.sessionId !== urlConvId) return;
+    if (pendingResumePrompt === null || !agentId || !effectiveConvId) return;
+    if (pendingResumePrompt.sessionId !== effectiveConvId) return;
     if (runnerOnline !== true) return;
     const { text, files, replyDraft } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files, { replyDraft });
-  }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
+    void useChatStore
+      .getState()
+      .send(text, agentId, files, { replyDraft, pinnedConversationId: effectiveConvId });
+  }, [pendingResumePrompt, runnerOnline, agentId, effectiveConvId]);
 
   // A pending blocking card parks the turn, so suppress shimmer. Must sit before the
   // early returns (Rules of Hooks); a boolean selector avoids re-rendering on every
@@ -821,10 +844,10 @@ export function ChatPage() {
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
       : (activeSession?.title ?? null);
   useEffect(() => {
-    const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
+    const fallback = effectiveConvId ? UNTITLED_CONVERSATION_LABEL : appName;
     const base = truncateTitle(activeConv?.title || sessionTabTitle || fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, sessionTabTitle, showsWorking, urlConvId, appName]);
+  }, [activeConv?.title, sessionTabTitle, showsWorking, effectiveConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const fallbackPickerKind = modelPickerKindForConv({
@@ -895,18 +918,18 @@ export function ChatPage() {
     activeSession,
     sessionLoading,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     conversationsData !== undefined,
   );
   const permissionPending = isPermissionLevelPending(
     activeSession,
     sessionLoading,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     conversationsData !== undefined,
   );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
-  const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);
+  const reconnectHostOnline = useSessionHostOnline(effectiveConvId ?? undefined);
   const {
     reconnect,
     reconnectsArca,
@@ -916,7 +939,7 @@ export function ChatPage() {
     localReconnect,
     arcaReconnect,
   } = useSessionReconnect({
-    sessionId: urlConvId ?? null,
+    sessionId: effectiveConvId ?? null,
     hostId: reconnectHostId,
     hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
     hostResumable: activeSession?.hostResumable ?? false,
@@ -936,25 +959,30 @@ export function ChatPage() {
     ) => {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
-      if (isTempConvId(urlConvId)) return;
+      if (isTempConvId(effectiveConvId)) return;
       // An unbound coding clone (fork-source label) needs a directory before
       // it can run: open the picker and stash this message to replay after
       // the bind. Pin the prompt to THIS session so it replays here, never
       // into a session the user may switch to first; carry any attachments
       // so the replay sends the same payload.
-      if (urlConvId && runnerOnline === false && routesToResumePicker) {
-        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [], replyDraft });
+      if (effectiveConvId && runnerOnline === false && routesToResumePicker) {
+        setPendingResumePrompt({
+          sessionId: effectiveConvId,
+          text,
+          files: files ?? [],
+          replyDraft,
+        });
         setResumeDirDialogOpen(true);
         return;
       }
       // Recover the unreachable host before dispatching another turn.
-      if (urlConvId && isUnreachable) {
+      if (effectiveConvId && isUnreachable) {
         void reconnect();
         // Posting now could record a failed turn, so the message waits for the host.
         if (sendReconnectsArca) {
           useChatStore
             .getState()
-            .enqueueMessage(text, files, replyDraft, urlConvId, { waitingForHost: true });
+            .enqueueMessage(text, files, replyDraft, effectiveConvId, { waitingForHost: true });
         }
         return;
       }
@@ -980,10 +1008,11 @@ export function ChatPage() {
           holdsInitialDraft(chat),
         )
       ) {
-        chat.enqueueMessage(text, files, replyDraft);
+        chat.enqueueMessage(text, files, replyDraft, effectiveConvId);
         return;
       }
       void useChatStore.getState().send(text, agentId, files, {
+        pinnedConversationId: effectiveConvId,
         replyDraft,
         onConversationCreated: (newId) => {
           // Eager URL update: the moment the server tells us this
@@ -996,7 +1025,7 @@ export function ChatPage() {
     },
     [
       agentId,
-      urlConvId,
+      effectiveConvId,
       runnerOnline,
       routesToResumePicker,
       isUnreachable,
@@ -1011,21 +1040,30 @@ export function ChatPage() {
       if (!agentId) return;
       // Slash commands aren't replayed (an edge), but still route an unbound
       // coding clone to the directory picker so it isn't a dead end.
-      if (urlConvId && runnerOnline === false && routesToResumePicker) {
+      if (effectiveConvId && runnerOnline === false && routesToResumePicker) {
         setResumeDirDialogOpen(true);
         return;
       }
-      if (urlConvId && isUnreachable) {
+      if (effectiveConvId && isUnreachable) {
         void reconnect();
         return;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        pinnedConversationId: effectiveConvId,
         onConversationCreated: (newId) => {
           navigate(`/c/${newId}`, { replace: true });
         },
       });
     },
-    [agentId, urlConvId, runnerOnline, routesToResumePicker, isUnreachable, reconnect, navigate],
+    [
+      agentId,
+      effectiveConvId,
+      runnerOnline,
+      routesToResumePicker,
+      isUnreachable,
+      reconnect,
+      navigate,
+    ],
   );
 
   const onStop = useCallback(() => {
@@ -1035,7 +1073,7 @@ export function ChatPage() {
   // A client-only conversation has no server session to POST to yet. Keep the
   // composer editable so the user can draft the next message during creation,
   // but gate submission until the temp id is promoted below.
-  const sendDisabledReason = isTempConvId(urlConvId) ? "Starting the session…" : null;
+  const sendDisabledReason = isTempConvId(effectiveConvId) ? "Starting the session…" : null;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Opening an asleep sandbox's session presses Reconnect host for the user. The
   // snapshot's launch stage counts too: the chat store may not have loaded it yet.
@@ -1060,8 +1098,8 @@ export function ChatPage() {
     // Keep the seeded native identity through the temp-to-real ID handoff,
     // until the session snapshot can supply its wrapper label and harness.
     if (
-      isTempConvId(urlConvId) ||
-      (composerSessionModelSeeded && activeConversationId === urlConvId)
+      isTempConvId(effectiveConvId) ||
+      (composerSessionModelSeeded && activeConversationId === effectiveConvId)
     ) {
       const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
       const seededLabels: Record<string, string | null> = nativeAgent
@@ -1077,7 +1115,7 @@ export function ChatPage() {
   }, [
     activeSession,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     composerSessionHarness,
     composerSessionModelSeeded,
     activeConversationId,
@@ -1148,21 +1186,27 @@ export function ChatPage() {
 
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
-  if (urlConvId) {
+  if (effectiveConvId) {
     const promotingTempConversation =
-      isTempConvId(urlConvId) &&
+      isTempConvId(effectiveConvId) &&
       activeConversationId !== null &&
       !isTempConvId(activeConversationId);
-    if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
+    if (
+      loadingConversation ||
+      (activeConversationId !== effectiveConvId && !promotingTempConversation)
+    )
       return <HydratingPlaceholder />;
     if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+      return (
+        <ConversationLoadError conversationId={effectiveConvId} error={conversationLoadError} />
+      );
     }
   }
 
   const mainAgent = (
     <MainAgentSurface
-      conversationId={urlConvId ?? null}
+      sessionUiKey={sessionUi.key}
+      conversationId={effectiveConvId ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1215,7 +1259,7 @@ export function ChatPage() {
   // first message and silently create a session — but sessions are
   // bound 1:1 to a local runner that only the CLI can launch. Show
   // the CLI instructions instead so users learn the right entry point.
-  if (!urlConvId) return <NewChatLandingScreen />;
+  if (!effectiveConvId) return <NewChatLandingScreen />;
 
   // Pick the reconnect dialog's state from the session's host binding, not
   // from liveness: the dialog opens both from an unreachable send AND from the
@@ -1236,7 +1280,7 @@ export function ChatPage() {
         onOpenChange={setDialogOpen}
         localReconnect={localReconnect}
         arcaReconnect={arcaReconnect}
-        conversationId={urlConvId}
+        conversationId={effectiveConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}
         harness={activeSession?.harness}
@@ -1254,7 +1298,7 @@ export function ChatPage() {
         <ResumeWithDirectoryDialog
           open={resumeDirDialogOpen}
           onOpenChange={setResumeDirDialogOpen}
-          sessionId={urlConvId}
+          sessionId={effectiveConvId}
           // Fork clone prefills from its source; a host-less session has none
           // and prefills from its own recorded host/workspace/branch instead.
           sourceSessionId={isUnboundFork ? forkSourceId : null}
@@ -1299,6 +1343,7 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 }
 
 interface MainAgentSurfaceProps {
+  sessionUiKey: number;
   onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
@@ -1505,6 +1550,7 @@ export function updateWarmTerminalSurfaces(
  * see ViewModeToggle) so the user can flip back to Chat.
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+  sessionUiKey,
   conversationId,
   status,
   isWorking,
@@ -1854,6 +1900,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           structurally non-interactive session), as SideChatPane does. */}
           {!composerReadOnly && (
             <SelectionPopup
+              key={`selection:${sessionUiKey}`}
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
               onAskInSideChat={
@@ -1865,6 +1912,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           )}
 
           <Composer
+            key={sessionUiKey}
             ref={composerRef}
             disabled={disabled}
             status={status}

@@ -70,6 +70,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sidebar_saved_views": False,
         "floating_panes": False,
         "shared_session_updates_socket": False,
+        "warm_switch_keep_mounted_ui": False,
         "pull_requests_v2": False,
     }
 
@@ -269,6 +270,15 @@ def test_sidebar_saved_views_is_an_opt_in_frontend_feature() -> None:
 
     assert flags.enabled(Feature.SIDEBAR_SAVED_VIEWS)
     assert flags.frontend_dict()["sidebar_saved_views"] is True
+
+
+def test_warm_switch_keep_mounted_ui_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.WARM_SWITCH_KEEP_MOUNTED_UI)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "warm_switch_keep_mounted_ui"})
+
+    assert flags.enabled(Feature.WARM_SWITCH_KEEP_MOUNTED_UI)
+    assert flags.frontend_dict()["warm_switch_keep_mounted_ui"] is True
 
 
 @pytest.mark.parametrize(

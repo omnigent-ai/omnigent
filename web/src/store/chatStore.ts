@@ -4815,7 +4815,7 @@ function isConversationDisposed(id: string): boolean {
  * next send. `switchTo` rebinds when this is false; `ensureBoundSession` makes
  * the same check before POSTing.
  */
-function isConversationStreamCurrent(id: string): boolean {
+export function isConversationStreamCurrent(id: string): boolean {
   const entry = conversationRegistry.peek(id);
   if (entry === undefined || entry.disposed) return false;
   const state = entry.getState();

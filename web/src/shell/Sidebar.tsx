@@ -18,6 +18,7 @@ import { GridSidebar } from "@/grid/GridWorkspace";
 import { GridDropTargets, SPLIT_EDGES, type GridDropTarget } from "@/grid/GridDropTargets";
 import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
+import { switchSessionBeforeNavigate } from "@/lib/warmSessionSwitch";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
 import {
   useProjectFolderCollapse,
@@ -471,7 +472,7 @@ const IsMobileContext = createContext<boolean>(false);
 const ViewerIdContext = createContext<string | null>(null);
 const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loading");
 const RowActivationContext = createContext<
-  (id: string, event: MouseEvent<HTMLAnchorElement>) => void
+  (id: string, event: MouseEvent<HTMLAnchorElement>, href: string) => void
 >(() => {});
 // True while a pin, unpin, or reorder is saving; pin controls are disabled then.
 const PinSavingContext = createContext(false);
@@ -527,7 +528,7 @@ function SidebarRowDataProvider({
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
-  onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
+  onActivate: ContextType<typeof RowActivationContext>;
   onReorder: (fromId: string, toId: string) => void;
   nestMoves: ContextType<typeof NestMoveContext>;
   children: ReactNode;
@@ -837,6 +838,17 @@ function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): s
   return incomplete ? `${label}; more automations not yet checked` : label;
 }
 
+function isPlainPrimaryClick(event: MouseEvent<HTMLAnchorElement>): boolean {
+  return (
+    !event.defaultPrevented &&
+    event.button === 0 &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey
+  );
+}
+
 function SidebarImpl({
   open,
   onClose,
@@ -981,9 +993,7 @@ function SidebarImpl({
   // clicks open tabs); we only close the drawer on a plain primary click on
   // mobile. Stable identity (useStableCallback) so it doesn't defeat the row memo.
   const onNavClick = useStableCallback((e: MouseEvent<HTMLAnchorElement>) => {
-    if (e.defaultPrevented) return;
-    if (e.button !== 0) return;
-    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (!isPlainPrimaryClick(e)) return;
     if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
   });
   // A search result that opens its row closes the phone's menu, as a section link does.
@@ -2440,6 +2450,7 @@ function ConversationList({
   const startingId = useStartingConversationId(statusView);
   const mutedProjects = useMutedProjects();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
+  const rebasePath = useRebasePath();
   // Resolve the active conversation's top-level root once here (rows get a plain
   // `isActive` prop, not their own query). Falls back to the raw id while the
   // parent walk loads — a top-level session resolves to itself.
@@ -2611,11 +2622,13 @@ function ConversationList({
 
   const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
   useEffect(() => setOptimisticActiveId(null), [activeId]);
-  const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
-    if (event.defaultPrevented || event.button !== 0) return;
-    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    setOptimisticActiveId(id);
-  }, []);
+  const activateRow = useStableCallback(
+    (id: string, event: MouseEvent<HTMLAnchorElement>, href: string) => {
+      if (!isPlainPrimaryClick(event)) return;
+      setOptimisticActiveId(id);
+      if (href === `/c/${id}`) switchSessionBeforeNavigate(id, rebasePath);
+    },
+  );
   const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
   // Freeze the open chat's sort key until you navigate away, so sending doesn't reorder it.
   const [activeOverride, setActiveOverride] = useState<ActiveChatOverride | null>(null);
@@ -6658,6 +6671,14 @@ function ConversationRowImpl({
     </>
   );
 
+  let rowHref = `/c/${conversation.id}`;
+  if (selectionMode) rowHref = "#";
+  else if (conversation.nested_draft_source_id) {
+    rowHref = `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`;
+  } else if (conversation.project_draft_name !== undefined) {
+    rowHref = `/?project=${encodeURIComponent(conversation.project_draft_name)}`;
+  }
+
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
@@ -6683,15 +6704,7 @@ function ConversationRowImpl({
         </button>
       )}
       <Link
-        to={
-          selectionMode
-            ? "#"
-            : conversation.nested_draft_source_id
-              ? `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`
-              : conversation.project_draft_name !== undefined
-                ? `/?project=${encodeURIComponent(conversation.project_draft_name)}`
-                : `/c/${conversation.id}`
-        }
+        to={rowHref}
         componentId="sidebar.conversation_switcher"
         aria-keyshortcuts={
           shortcutSlot !== undefined
@@ -6745,7 +6758,7 @@ function ConversationRowImpl({
             onToggleSelected(conversation.id, e.shiftKey);
             return;
           }
-          activateRow(conversation.id, e);
+          activateRow(conversation.id, e, rowHref);
           onClick(e);
         }}
         onDoubleClick={(e) => {
