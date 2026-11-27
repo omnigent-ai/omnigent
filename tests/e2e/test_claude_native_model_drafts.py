@@ -24,7 +24,7 @@ from tests._helpers.native_claude import (
     isolated_claude_mock_routing_stack,
 )
 from tests._helpers.polling import poll_until
-from tests._helpers.session import message_item_text, ordered_message_items
+from tests._helpers.session import message_item_text, ordered_message_items, send_user_text
 from tests.e2e.conftest import configure_mock_llm, get_mock_message_requests, set_fallback_mock_llm
 from tests.e2e.routing._helpers import claude_settings_snapshot
 from tests.harnesses.claude_native._model_status_oracle import native_claude_wire_model
@@ -245,14 +245,7 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
             marker, reply = f"warm-user-{nonce}", f"warm-reply-{nonce}"
             set_fallback_mock_llm(mock_url, "default", reply)
             set_fallback_mock_llm(mock_url, native_claude_wire_model(initial_model), reply)
-            client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": f"Reply with {reply}. {marker}"}],
-                },
-            ).raise_for_status()
+            send_user_text(client, session_id=session_id, text=f"Reply with {reply}. {marker}")
             poll_until(
                 lambda: any(
                     item.get("role") == "assistant" and message_item_text(item) == reply
@@ -288,14 +281,7 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
             )
             with httpx.Client(base_url=mock_url, timeout=10) as model_client:
                 try:
-                    client.post(
-                        f"/v1/sessions/{session_id}/events",
-                        json={
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": busy_prompt}],
-                        },
-                    ).raise_for_status()
+                    send_user_text(client, session_id=session_id, text=busy_prompt)
                     poll_until(
                         lambda: bool(model_client.get("/gate/pending").json()["pending"]),
                         timeout_s=30,
@@ -388,14 +374,7 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
                 match=marker,
                 required_tools=tool_names[:1],
             )
-            client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": f"Reply with {reply}. {marker}"}],
-                },
-            ).raise_for_status()
+            send_user_text(client, session_id=session_id, text=f"Reply with {reply}. {marker}")
             poll_until(
                 lambda: any(
                     item.get("role") == "assistant" and message_item_text(item) == reply
