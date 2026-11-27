@@ -206,8 +206,9 @@ class _CleanupQueue:
 
     # Intents are written without the queue's lock, into numbered segments of
     # INTENT_SEGMENT_SIZE slots: ``incoming/s<n>/<slot>.json``. ``incoming/made/<n>.json``
-    # says segment n was started and ``incoming/done/<n>.json`` that its reader finished it;
-    # neither is ever removed, and each is made in order, so both run from 1 without gaps and
+    # says segment n was started, ``incoming/done/<n>.json`` that its reader fenced it and
+    # ``incoming/retired/<n>.json`` that the reader queued its last intents; none is ever
+    # removed, and each is made in order, so all run from 1 without gaps and
     # are found by probing numbers, never by listing. Each call thus reads one segment and
     # O(log segments) markers, however many intents wait.
 
@@ -290,22 +291,34 @@ class _CleanupQueue:
     def take_incoming(self, limit: int) -> None:
         """Queue up to *limit* intents a deletion left without queueing them.
 
-        Reads only the oldest unfinished intent segment. Once it is empty and a later one was
-        started, it is marked finished, read once more for intents written meanwhile (which
-        the writer also records again elsewhere), and removed.
+        Reads only the oldest intent segment not yet retired. Once it is empty and a later one
+        was started, it is fenced (``done``: writers landing in it record their intent again
+        elsewhere), its last intents are queued, and only then is it retired (``retired``) and
+        removed. A call that stops or finds the queue busy between fencing and retiring leaves
+        the segment fenced but not retired, so the next call finishes that transfer.
         """
         if not self._files.supports_delete:
             return  # Nothing leaves the intents there, so they would hide later ones.
-        number = self._first_missing(f"{_INCOMING}/done")
+        number = self._first_missing(f"{_INCOMING}/retired")
         if not self._exists(f"{_INCOMING}/made/{number}.json"):
             return
-        taken = self._take_from(number, limit)
-        if taken or not self._exists(f"{_INCOMING}/made/{number + 1}.json"):
-            return
-        self._files.mkdirs(f"{_INCOMING}/done")
-        with contextlib.suppress(Conflict):  # Another reader finished it.
-            self._files.create_json(f"{_INCOMING}/done/{number}.json", {})
+        fenced = self._exists(f"{_INCOMING}/done/{number}.json")
+        if not fenced:
+            taken = self._take_from(number, limit)
+            if taken or not self._exists(f"{_INCOMING}/made/{number + 1}.json"):
+                return
+            self._files.mkdirs(f"{_INCOMING}/done")
+            with contextlib.suppress(Conflict):  # Another reader fenced it.
+                self._files.create_json(f"{_INCOMING}/done/{number}.json", {})
+        # The last transfer: anything written before the fence. If it fails (busy, or the
+        # call stops), the segment stays fenced and the next call goes on with it.
         self._take_from(number, INTENT_SEGMENT_SIZE)
+        left, _ = self._listed(_intent_segment(number), 1)
+        if left:
+            return  # One wasn't queued (an unreadable one is dropped, so not that): later.
+        self._files.mkdirs(f"{_INCOMING}/retired")
+        with contextlib.suppress(Conflict):  # Another reader retired it.
+            self._files.create_json(f"{_INCOMING}/retired/{number}.json", {})
         with contextlib.suppress(NotFound):
             self._files.delete_tree(_intent_segment(number))
 

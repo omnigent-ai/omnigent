@@ -400,6 +400,16 @@ class ConstraintGuard:
                 attempts += 1
                 self._finish(epoch, state)
                 continue
+            progress = current.get("rebuild")
+            if isinstance(progress, dict) and progress.get("digest") != self.digest:
+                # Rules published after this request was checked are being rebuilt: the live
+                # counts and keys are cleared meanwhile, and a write now would also land behind
+                # pages the rebuild already read. Refused before anything changes; a retry runs
+                # under the published rules.
+                raise Conflict(
+                    "The gadget's rules changed while this request was on its way; try again",
+                    reason="busy",
+                )
             if current.get("rules") != self.digest:
                 # Each step reads one page; a write helps finish the rebuild before its own.
                 rebuild_steps += 1

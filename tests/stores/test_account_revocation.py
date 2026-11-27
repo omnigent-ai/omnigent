@@ -2471,6 +2471,45 @@ def test_an_intent_written_as_its_segment_is_finished_is_recorded_again(tmp_path
     assert f"{gadget_accounts._key('bob', None)}.json" in {key for _, key in queue.front(8)}
 
 
+@pytest.mark.parametrize("how", ["busy", "stopped"])
+def test_a_fenced_segment_whose_last_transfer_failed_is_finished_later(
+    tmp_path, monkeypatch, how: str
+) -> None:
+    """An intent written just before the reader fenced its segment, whose last transfer then
+    finds the queue busy or stops: reopened, ordinary calls still queue it."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store import Conflict as StoreConflict
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    monkeypatch.setattr(gadget_accounts, "INTENT_SEGMENT_SIZE", 1)
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    files = DeletedAccountGadgets._files_of(store)
+    queue = gadget_accounts._CleanupQueue(files)
+    queue.intend("alice", None, 0)  # Segment 1, written just before the fence.
+    queue.intend("bob", None, 0)  # Segment 2 started, so segment 1 can be retired.
+    files.mkdirs("incoming/done")
+    files.create_json("incoming/done/1.json", {})  # The reader fenced segment 1.
+    real_add = gadget_accounts._CleanupQueue.add
+
+    def failing_add(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if how == "busy":
+            raise StoreConflict("The gadget cleanup queue is busy", reason="busy")
+        raise KeyboardInterrupt  # The process stops mid-transfer.
+
+    monkeypatch.setattr(gadget_accounts._CleanupQueue, "add", failing_add)
+    with pytest.raises((StoreConflict, KeyboardInterrupt)):
+        queue.take_incoming(8)
+    monkeypatch.setattr(gadget_accounts._CleanupQueue, "add", real_add)
+
+    reopened = gadget_accounts._CleanupQueue(DeletedAccountGadgets._files_of(store))
+    for _ in range(3):
+        reopened.take_incoming(8)
+    queued = {key for _, key in reopened.front(8)}
+    assert f"{gadget_accounts._key('alice', None)}.json" in queued
+    assert f"{gadget_accounts._key('bob', None)}.json" in queued
+
+
 def test_a_head_update_stopped_half_way_leaves_the_queue_readable(tmp_path, monkeypatch) -> None:
     """A note sent to a later segment, then the queue's head update stops while retiring the
     emptied first segment: reopened, the queue still finds the note, and only its cleanup
