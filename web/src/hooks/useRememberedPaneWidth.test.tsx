@@ -500,6 +500,10 @@ describe("the trees beside a Changes review", () => {
     view.rerender(<Pane spec={CHANGES_REVIEW_TREE_WIDTH} containerWidth={800} />);
     expect(widthOf(CHANGES_REVIEW_TREE_WIDTH)).toBe(288);
     expect(readPanelSharePreference("changesReviewTreeShare")).toBe(0.36);
+    // Docked, a measured review's tree may also pass 360px, up to the same 48%, as Files' does.
+    view.rerender(<Pane spec={CHANGES_REVIEW_TREE_WIDTH} containerWidth={820} />);
+    fireEvent.keyDown(handleOf(CHANGES_REVIEW_TREE_WIDTH), { key: "End" });
+    expect(widthOf(CHANGES_REVIEW_TREE_WIDTH)).toBe(393);
   });
 
   it("keep the session's and the pull request's choices apart", () => {
