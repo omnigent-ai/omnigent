@@ -107,6 +107,7 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     validate_claude_hook_interpreter_compatibility,
 )
+from omnigent.harnesses.claude_native.editor_launch import prepare_terminal_editor_environment
 from omnigent.harnesses.claude_native.forwarder import (
     reset_transcript_forward_state,
     supervise_forwarder,
@@ -7192,6 +7193,18 @@ def _claude_terminal_request(
         claude_args,
         model=claude_config.model if claude_config is not None else None,
     )
+    terminal_environment = {
+        **build_native_claude_terminal_env(claude_config, client_surface="cli"),
+        **claude_terminal_relay_env(bridge_dir),
+    }
+    editor_environment = prepare_terminal_editor_environment(
+        bridge_dir,
+        command=command,
+        arguments=list(claude_args),
+        environment={**os.environ, **terminal_environment},
+    )
+    if editor_environment is not None:
+        terminal_environment.update(editor_environment.overrides)
     args = augment_claude_args(
         claude_args,
         bridge_dir=bridge_dir,
@@ -7202,6 +7215,9 @@ def _claude_terminal_request(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
+        native_editor_executable=(
+            editor_environment.executable if editor_environment is not None else None
+        ),
     )
     # Let a registered launcher plugin (e.g. a wrapper such as isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
@@ -7230,10 +7246,7 @@ def _claude_terminal_request(
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
     # This wrapper is the CLI; don't trust a surface inherited from a session's shell.
-    spec["env"] = {
-        **build_native_claude_terminal_env(claude_config, client_surface="cli"),
-        **claude_terminal_relay_env(bridge_dir),
-    }
+    spec["env"] = terminal_environment
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove credentials that override the selected auth and the

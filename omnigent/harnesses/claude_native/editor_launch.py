@@ -10,9 +10,11 @@ import shutil
 import sys
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from omnigent.harnesses.claude_native import bridge
+from omnigent.host.harness_startup import env_wrapper_command, env_wrapper_environment
 
 _DEFAULT_EDITORS = (
     "code",
@@ -32,6 +34,59 @@ _DEFAULT_EDITORS = (
     "emacs",
     "open",
 )
+
+
+@dataclass(frozen=True)
+class PreparedEditorEnvironment:
+    """Delegate overrides paired with the executable they observe."""
+
+    executable: Path
+    overrides: dict[str, str]
+
+
+def prepare_terminal_editor_environment(
+    bridge_dir: Path,
+    *,
+    command: str,
+    arguments: list[str],
+    environment: Mapping[str, str],
+) -> PreparedEditorEnvironment | None:
+    """Prepare delegates only when launch wrappers preserve their environment."""
+    wrapper = env_wrapper_environment(command, arguments, environment)
+    wrapped = env_wrapper_command(command, arguments, environment)
+    effective = dict(environment)
+    if Path(command).name == "env":
+        if (
+            wrapper is None
+            or wrapped is None
+            or not wrapper.inherit
+            or ({"EDITOR", "VISUAL", "PATH"} & (set(wrapper.variables) | set(wrapper.unset)))
+        ):
+            return None
+        for key in wrapper.unset:
+            effective.pop(key, None)
+        effective.update(wrapper.variables)
+    selected = shutil.which(
+        wrapped[0] if wrapped is not None else command,
+        path=effective.get("PATH", os.defpath),
+    )
+    if selected is None:
+        return None
+    try:
+        executable = Path(selected).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    overrides = prepare_editor_environment(
+        bridge_dir, executable=executable, environment=effective
+    )
+    if overrides is None:
+        return None
+    if (
+        wrapped is not None
+        and env_wrapper_command(command, arguments, dict(environment) | overrides) != wrapped
+    ):
+        return None
+    return PreparedEditorEnvironment(executable, overrides)
 
 
 def prepare_editor_environment(

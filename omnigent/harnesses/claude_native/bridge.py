@@ -2681,6 +2681,7 @@ def build_hook_settings(
     launch_effort: str | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    native_editor_executable: Path | None = None,
 ) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
@@ -2737,6 +2738,8 @@ def build_hook_settings(
         routing round trip (25s worst case on a degraded server) in front of
         every prompt of every native session, to be told every time that the
         session does not route.
+    :param native_editor_executable: Native binary paired with prepared editor
+        delegates. ``None`` leaves ownership observation disabled.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -2865,8 +2868,27 @@ def build_hook_settings(
         wrap_python=_pin_runner_tmpdir,
     )
     hooks["PostToolUse"].append({"hooks": [observer_hook]})
+    if native_editor_executable is not None:
+        owner_hook = {
+            "type": "command",
+            "command": _python_hook_command(
+                [
+                    *command_parts[:4],
+                    "editor-owner",
+                    *command_parts[4:],
+                    "--native-editor-executable",
+                    str(native_editor_executable),
+                ]
+            )
+            + f" 2>> {observer_stderr}",
+        }
+        hooks["SessionStart"].append({"hooks": [owner_hook]})
+        if not turn_routing:
+            hooks["UserPromptSubmit"].append({"hooks": [owner_hook]})
     if turn_routing:
-        hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
+        hooks["UserPromptSubmit"].append(
+            {"hooks": [_claude_route_turn_hook(bridge_dir, python, native_editor_executable)]}
+        )
     if ap_server_url:
         _write_json_file(
             bridge_dir / _PERMISSION_HOOK_FILE,
@@ -3090,7 +3112,9 @@ def _claude_read_rule(directory: PurePath) -> str | None:
     return f"Read(/{posix_path.rstrip('/')}/**)"
 
 
-def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
+def _claude_route_turn_hook(
+    bridge_dir: Path, python: str, native_editor_executable: Path | None = None
+) -> _JsonObject:
     """
     Build the ``UserPromptSubmit`` entry for first-message model routing.
 
@@ -3103,10 +3127,16 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
     :param bridge_dir: Bridge directory holding both the endpoint
         advertisement and the hook's fast-skip marker.
     :param python: Python executable to run the hook module with.
+    :param native_editor_executable: Prepared delegate's native binary, if any.
     :returns: One Claude settings command-hook entry.
     """
     from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
 
+    owner_args = (
+        ["--native-editor-executable", str(native_editor_executable)]
+        if native_editor_executable is not None
+        else []
+    )
     return {
         "type": "command",
         "command": _python_hook_command(
@@ -3120,6 +3150,7 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
                 str(bridge_dir),
                 "--harness",
                 "claude-native",
+                *owner_args,
             ]
         ),
         # Outermost hop of the timeout ladder in ``omnigent.runner.turn_routing``:
@@ -3168,6 +3199,7 @@ def augment_claude_args(
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    native_editor_executable: Path | None = None,
     active_harnesses: Collection[str] | None = None,
     defer_inherited_mcp_discovery: bool = False,
 ) -> list[str]:
@@ -3224,6 +3256,7 @@ def augment_claude_args(
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
     :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
+    :param native_editor_executable: Prepared delegate's native binary, if any.
     :param defer_inherited_mcp_discovery: ``True`` when the caller resolves the
         launch cwd and environment later and then calls
         :func:`apply_claude_launch_mcp_policy`; otherwise strict MCP mode reads
@@ -3243,6 +3276,7 @@ def augment_claude_args(
         launch_effort=_launch_effort_arg(claude_args),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
+        native_editor_executable=native_editor_executable,
     )
     hook_settings = _apply_native_mcp_settings(
         hook_settings,

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import stat
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -132,3 +134,110 @@ def test_a_new_launch_keeps_previous_editor_delegates_immutable(tmp_path: Path) 
     )
     assert second is not None and first != second
     assert all(path.read_bytes() == content for path, content in files.items())
+
+
+@pytest.mark.parametrize("routing", [False, True])
+def test_owner_hooks_keep_the_existing_recorder_and_routing_hooks(
+    tmp_path: Path, routing: bool
+) -> None:
+    binary = tmp_path / "claude with spaces"
+    root = tmp_path / "bridge"
+    root.mkdir(mode=0o700)
+    original = editor_launch.bridge.build_hook_settings(root, turn_routing=routing)
+    prepared = editor_launch.bridge.build_hook_settings(
+        root, turn_routing=routing, native_editor_executable=binary
+    )
+
+    def commands(settings: dict[str, Any], event: str) -> list[str]:
+        return [h["command"] for group in settings["hooks"][event] for h in group["hooks"]]
+
+    for event in ("SessionStart", "UserPromptSubmit"):
+        before, after = commands(original, event), commands(prepared, event)
+        assert after[:2] == before[:2]
+        owner_commands = [command for command in after if "--native-editor-executable" in command]
+        assert len(owner_commands) == 1
+        command = owner_commands[0].split(" 2>>", 1)[0]
+        arguments = shlex.split(command)
+        assert arguments[arguments.index("--native-editor-executable") + 1] == str(binary)
+        if event == "UserPromptSubmit" and routing:
+            assert "route-turn" in arguments and "editor-owner" not in arguments
+        else:
+            assert "editor-owner" in arguments
+    for event in set(original["hooks"]) - {"SessionStart", "UserPromptSubmit"}:
+        assert prepared["hooks"][event] == original["hooks"][event]
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    ["direct", "env", "clear-env", "replace-editor", "remove-path", "unknown", "split-editor"],
+)
+def test_terminal_preparation_preserves_wrapper_arguments_and_editor_environment(
+    tmp_path: Path, wrapper: str
+) -> None:
+    binary = _executable(tmp_path / "claude")
+    editor = _executable(tmp_path / "vi")
+    environment = {"PATH": str(tmp_path), "EDITOR": str(editor)}
+    command, arguments = str(binary), ["--resume", "native-session"]
+    if wrapper != "direct":
+        command = "/usr/bin/env"
+        prefix = {
+            "env": ["-u", "UNUSED", "EXTRA=preserved"],
+            "clear-env": ["-i"],
+            "replace-editor": ["EDITOR=another-editor"],
+            "remove-path": ["-u", "PATH"],
+            "unknown": ["--unknown-option"],
+            "split-editor": ["-S", str(binary) + " --label=${EDITOR}"],
+        }[wrapper]
+        arguments = (
+            [*prefix, *arguments]
+            if wrapper == "split-editor"
+            else [*prefix, str(binary), *arguments]
+        )
+    original_environment, original_arguments = dict(environment), list(arguments)
+    prepared = editor_launch.prepare_terminal_editor_environment(
+        tmp_path / "bridge",
+        command=command,
+        arguments=arguments,
+        environment=environment,
+    )
+    assert environment == original_environment and arguments == original_arguments
+    if wrapper not in {"direct", "env"}:
+        assert prepared is None
+        return
+    assert prepared is not None and prepared.executable == binary
+    assert set(prepared.overrides) == {"EDITOR"}
+    shim = Path(shlex.split(prepared.overrides["EDITOR"])[0])
+    invocation = shlex.split(shim.read_text().splitlines()[1])
+    manifest = Path(invocation[invocation.index("--manifest") + 1])
+    value = json.loads(manifest.read_text())
+    assert value["command"] == [str(editor)]
+    assert value["restore_environment"] == {"EDITOR": str(editor)}
+
+
+@pytest.mark.parametrize("supported_editor", [False, True])
+def test_cli_terminal_request_pairs_prepared_delegates_with_its_hook_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supported_editor: bool
+) -> None:
+    from omnigent.harnesses.claude_native import main
+
+    binary = _executable(tmp_path / "claude")
+    editor = _executable(tmp_path / "vi")
+    original_editor = str(editor) if supported_editor else "missing-editor --wait"
+    monkeypatch.setenv("EDITOR", original_editor)
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    root = tmp_path / "bridge"
+    request = main._claude_terminal_request((), command=str(binary), bridge_dir=root)
+    specification = request["spec"]
+    assert specification["command"] == str(binary)
+    arguments = specification["args"]
+    settings = json.loads(Path(arguments[arguments.index("--settings") + 1]).read_text())
+    assert os.environ["EDITOR"] == original_editor
+    commands = [
+        hook["command"] for group in settings["hooks"]["SessionStart"] for hook in group["hooks"]
+    ]
+    assert any("editor-owner" in command for command in commands) is supported_editor
+    if supported_editor:
+        assert str(root / "editor-launches") in specification["env"]["EDITOR"]
+    else:
+        assert "EDITOR" not in specification["env"]

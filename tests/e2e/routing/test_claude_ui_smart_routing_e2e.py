@@ -24,13 +24,18 @@ native/provider turns, exact-once public delivery and an unchanged saved default
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native import bridge, editor_handoff
+from omnigent.runner.turn_routing import read_pending_replay, turn_routing_marker_present
 from omnigent.server.smart_routing import models_in_family
 from tests._helpers.native_claude import (
     _PINNED_CLAUDE_MODELS,
@@ -50,6 +55,7 @@ from tests._helpers.session import (
 from tests.e2e.conftest import get_mock_requests, set_fallback_mock_llm
 from tests.e2e.routing._helpers import (
     arm_in,
+    capture_pane,
     claude_settings_snapshot,
     claude_settings_unchanged,
     claude_user_settings_path,
@@ -58,6 +64,7 @@ from tests.e2e.routing._helpers import (
     session_snapshot,
     wait_for,
     wait_for_decision,
+    wait_for_session_pane,
 )
 from tests.e2e.routing._mock_router import CLAUDE_ARMS, CODEX_ARMS, MockRouter, decide
 from tests.e2e.routing.conftest import (
@@ -86,7 +93,14 @@ pytestmark = [pytest.mark.smart_routing, pytest.mark.timeout(900)]
 _SPAWN_TIMEOUT_S = 300.0
 
 
-def _assert_mock_created_session_preserves_default(mock_url: str, tmp_path: Path) -> None:
+def _assert_mock_created_session_preserves_default(
+    mock_url: str,
+    tmp_path: Path,
+    *,
+    entry: str = "create",
+    type_into_tui: Callable[[str, str, str], None] | None = None,
+    record_property: Callable[[str, object], None],
+) -> None:
     judge_model = "mock-claude-routing-judge"
     target_model = _PINNED_CLAUDE_MODELS["opus"]
     with isolated_claude_mock_routing_stack(
@@ -116,17 +130,15 @@ def _assert_mock_created_session_preserves_default(mock_url: str, tmp_path: Path
         agent_id = next(
             row["id"] for row in agents.json()["data"] if row["name"] == "claude-native-ui"
         )
-        created = client.post(
-            "/v1/sessions",
-            json={
-                "agent_id": agent_id,
-                "host_id": host_id,
-                "workspace": str(workspace),
-                "cost_control_mode_override": "on",
-                "smart_routing_message": marker_turn_prompt(1, *turns[0]),
-            },
-            timeout=120,
-        )
+        creation = {
+            "agent_id": agent_id,
+            "host_id": host_id,
+            "workspace": str(workspace),
+            "cost_control_mode_override": "on",
+        }
+        if entry == "create":
+            creation["smart_routing_message"] = marker_turn_prompt(1, *turns[0])
+        created = client.post("/v1/sessions", json=creation, timeout=120)
         created.raise_for_status()
         session_id = str(created.json()["id"])
         try:
@@ -135,27 +147,42 @@ def _assert_mock_created_session_preserves_default(mock_url: str, tmp_path: Path
                 _live_claude_snapshot(base_url, session_id)["cost_control_mode_override"] == "on"
             )
             assert claude_settings_snapshot(settings_path) == saved_settings
+            if entry != "create":
+                assert decisions(client, session_id) == []
+            snapshot = _live_claude_snapshot(base_url, session_id)
+            bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
+            bridge_dir = bridge.bridge_dir_for_bridge_id(bridge_id)
             native_sessions = []
+            delivered = []
             for index, (marker, reply) in enumerate(turns, start=1):
                 set_fallback_mock_llm(mock_url, "default", reply)
                 set_fallback_mock_llm(mock_url, native_claude_wire_model(target_model), reply)
-                send_user_text(
-                    client,
-                    session_id=session_id,
-                    text=marker_turn_prompt(index, marker, reply),
-                )
+                prompt = marker_turn_prompt(index, marker, reply)
+                if entry != "create" and index == 1:
+                    prefix = prompt + "\n\n"
+                    prompt = (
+                        prefix + ("wrapped continuation text " * 20)[: 336 - len(prefix)] + "\n"
+                    )
+                    assert len(prompt) == 337
+                if entry == "terminal":
+                    assert type_into_tui is not None
+                    socket_path, target = wait_for_session_pane(client, session_id, timeout=60)
+                    type_into_tui(socket_path, target, prompt)
+                else:
+                    send_user_text(client, session_id=session_id, text=prompt)
                 poll_until(
                     lambda reply=reply: any(
                         item.get("role") == "assistant" and message_item_text(item) == reply
                         for item in ordered_message_items(base_url, session_id)
                     ),
-                    timeout_s=30,
+                    timeout_s=120 if entry == "terminal" and index == 1 else 30,
                 )
                 messages = ordered_message_items(base_url, session_id)
                 assert len([item for item in messages if item.get("role") == "assistant"]) == index
                 native_session, user_text = _assert_native_claude_turn(
                     base_url, session_id, marker, reply, target_model
                 )
+                assert user_text == prompt
                 _assert_mock_claude_turn(
                     mock_url,
                     marker,
@@ -164,6 +191,13 @@ def _assert_mock_created_session_preserves_default(mock_url: str, tmp_path: Path
                     user_text=user_text,
                 )
                 native_sessions.append(native_session)
+                delivered.append(
+                    {
+                        "length": len(user_text),
+                        "sha256": hashlib.sha256(user_text.encode()).hexdigest(),
+                        "trailing_lf": user_text.endswith("\n"),
+                    }
+                )
                 routed = decisions(client, session_id)
                 assert routed and all(
                     row.get("applied") is True
@@ -174,25 +208,84 @@ def _assert_mock_created_session_preserves_default(mock_url: str, tmp_path: Path
                 assert len(get_mock_requests(mock_url, key=judge_model)) == 1
                 assert claude_settings_snapshot(settings_path) == saved_settings
                 assert not _live_claude_snapshot(base_url, session_id).get("last_task_error")
+                if entry == "terminal":
+                    owner = editor_handoff.read_controller_editor_binding(bridge_dir)
+                    assert owner is not None and owner.owner.native_session_id == native_session
+                    assert owner.owner.bridge_session_id == session_id
+                    assert turn_routing_marker_present(bridge_dir, session_id)
+                    assert read_pending_replay(bridge_dir) is None
             assert native_sessions[0] == native_sessions[1]
+            record_property(
+                "routing_acceptance",
+                json.dumps(
+                    {
+                        "entry": entry,
+                        "provider": "mock",
+                        "delivered": delivered,
+                        "turns": 2,
+                        "judge_calls": 1,
+                        "same_native_session": True,
+                        "saved_default_unchanged": True,
+                        "owner_verified": entry == "terminal",
+                    }
+                ),
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                snapshot = _live_claude_snapshot(base_url, session_id)
+                bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
+                bridge_dir = bridge.bridge_dir_for_bridge_id(bridge_id)
+                target = bridge.read_tmux_target(bridge_dir)
+                state_keys = ("status", "model_override", "llm_model", "last_task_error")
+                owner = editor_handoff.read_controller_editor_binding(bridge_dir)
+                record_property(
+                    "routing_failure",
+                    json.dumps(
+                        {
+                            "entry": entry,
+                            "state": {key: snapshot.get(key) for key in state_keys},
+                            "pending": repr(read_pending_replay(bridge_dir)),
+                            "owner": repr(owner),
+                            "pane": capture_pane(target["socket_path"], target["tmux_target"])
+                            if target is not None
+                            else None,
+                        }
+                    ),
+                )
+            raise
         finally:
             client.delete(f"/v1/sessions/{session_id}").raise_for_status()
 
 
 @pytest.mark.parametrize(
     "creation_case",
-    ["gateway-spawn", pytest.param("mock-provider", marks=pytest.mark.mock_only)],
+    [
+        "gateway-spawn",
+        pytest.param("mock-provider", marks=pytest.mark.mock_only),
+        pytest.param("mock-chat", marks=pytest.mark.mock_only),
+        pytest.param("mock-terminal", marks=pytest.mark.mock_only),
+    ],
 )
 def test_claude_session_create_routes_the_model_and_then_the_spawn(
     request: pytest.FixtureRequest,
     tmp_path: Path,
     creation_case: str,
     claude_managed_settings: None,
+    record_property: Callable[[str, object], None],
 ) -> None:
     require_tmux()
-    if creation_case == "mock-provider":
+    if creation_case.startswith("mock-"):
+        entry = {"mock-provider": "create", "mock-chat": "chat", "mock-terminal": "terminal"}[
+            creation_case
+        ]
         _assert_mock_created_session_preserves_default(
-            request.getfixturevalue("isolated_mock_llm_server_url"), tmp_path
+            request.getfixturevalue("isolated_mock_llm_server_url"),
+            tmp_path,
+            entry=entry,
+            type_into_tui=request.getfixturevalue("type_into_tui")
+            if entry == "terminal"
+            else None,
+            record_property=record_property,
         )
         return
     routing_client: httpx.Client = request.getfixturevalue("routing_client")

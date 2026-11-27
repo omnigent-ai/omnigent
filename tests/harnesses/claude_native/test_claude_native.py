@@ -126,6 +126,8 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     vector the runner now ignores) and the experimental Claude
     Channels flag is not snuck in.
     """
+    monkeypatch.setenv("EDITOR", "missing-test-editor --wait")
+    monkeypatch.delenv("VISUAL", raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
@@ -448,6 +450,8 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     Databricks gateway values to the terminal resource would leave
     Claude Code on its default provider path.
     """
+    monkeypatch.setenv("EDITOR", "missing-test-editor --wait")
+    monkeypatch.delenv("VISUAL", raising=False)
     config = claude_native.ClaudeNativeUcodeConfig(
         env={
             "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",

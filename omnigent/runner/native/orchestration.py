@@ -9685,6 +9685,7 @@ async def _auto_create_claude_terminal(
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
     )
+    from omnigent.harnesses.claude_native.editor_launch import prepare_terminal_editor_environment
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
     from omnigent.inner.bundle_skills import claude_agents_skill_overlay
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -10458,6 +10459,26 @@ async def _auto_create_claude_terminal(
         if offer_claim is not None:
             release_claude_memory_import_offer(*offer_claim)
 
+    terminal_environment = {
+        **build_native_claude_terminal_env(
+            claude_config,
+            client_surface=resource_registry.client_surface(session_id),
+        ),
+        **claude_terminal_relay_env(bridge_dir),
+        **claude_auto_memory_env,
+    }
+    launch_context = claude_terminal_spec(
+        resolve_harness_args("claude-native", tuple(base_claude_args), cfg=_harness_cfg),
+        terminal_environment,
+    )
+    editor_environment = prepare_terminal_editor_environment(
+        bridge_dir,
+        command=launch_command,
+        arguments=list(launch_context.args),
+        environment=_claude_terminal_pre_wrapper_env(launch_context),
+    )
+    if editor_environment is not None:
+        terminal_environment.update(editor_environment.overrides)
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
@@ -10485,6 +10506,9 @@ async def _auto_create_claude_terminal(
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
+        native_editor_executable=(
+            editor_environment.executable if editor_environment is not None else None
+        ),
     )
     skill_overlay = claude_agents_skill_overlay(bridge_dir)
     trusted_added_dirs = (skill_overlay,) if str(skill_overlay) in claude_args else ()
@@ -10508,14 +10532,7 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus model gateway env (ANTHROPIC_BASE_URL etc.) when
         # derived. Empty provider config still forces ENABLE_TOOL_SEARCH=true so
         # MCP schemas are loaded on demand.
-        {
-            **build_native_claude_terminal_env(
-                claude_config,
-                client_surface=resource_registry.client_surface(session_id),
-            ),
-            **claude_terminal_relay_env(bridge_dir),
-            **claude_auto_memory_env,
-        },
+        terminal_environment,
         scrollback=50000,
         # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
         # sub-agent worker whose CLI exits right after rendering its prompt on

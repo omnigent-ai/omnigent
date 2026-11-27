@@ -234,9 +234,12 @@ def test_side_channel_hooks_cannot_record_editor_ownership(
     assert not (context.root / "editor-owner.json").exists()
 
 
-@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("configured, owner_only", [(False, False), (True, False), (True, True)])
 def test_recorder_only_observes_editor_ownership_when_explicitly_configured(
-    monkeypatch: pytest.MonkeyPatch, binding_context: SimpleNamespace, configured: bool
+    monkeypatch: pytest.MonkeyPatch,
+    binding_context: SimpleNamespace,
+    configured: bool,
+    owner_only: bool,
 ) -> None:
     context = binding_context
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(context.payload)))
@@ -247,9 +250,64 @@ def test_recorder_only_observes_editor_ownership_when_explicitly_configured(
     arguments = ["--bridge-dir", str(context.root)]
     if configured:
         arguments += ["--native-editor-executable", str(context.binary)]
+    if owner_only:
+        arguments.insert(0, "editor-owner")
     assert hook.main(arguments) == 0
-    recorder.assert_called_once_with(context.root, context.payload, conversation_url=None)
+    if owner_only:
+        recorder.assert_not_called()
+    else:
+        recorder.assert_called_once_with(context.root, context.payload, conversation_url=None)
     if configured:
         binding.assert_called_once_with(context.root, context.payload, context.binary)
     else:
         binding.assert_not_called()
+
+
+@pytest.mark.parametrize("already_routed", [False, True])
+def test_route_turn_observes_the_owner_before_requesting_a_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_context: SimpleNamespace,
+    already_routed: bool,
+) -> None:
+    from omnigent.inner.hook_scripts import subagent_router
+    from omnigent.runner import turn_routing
+
+    context = binding_context
+    payload = {**context.payload, "hook_event_name": "UserPromptSubmit", "prompt": "saved draft"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(
+        subagent_router,
+        "read_router_endpoint",
+        lambda *args, **kwargs: SimpleNamespace(
+            url="http://127.0.0.1:1", token="unused", session_id="conversation"
+        ),
+    )
+    monkeypatch.setattr(turn_routing, "turn_routing_marker_present", lambda *args: already_routed)
+    order: list[str] = []
+
+    def observe(*args: object) -> None:
+        assert args == (context.root, payload, context.binary)
+        order.append("owner")
+
+    def post(*args: object) -> None:
+        assert order == ["owner"]
+        order.append("request")
+
+    monkeypatch.setattr(editor_handoff, "record_editor_bridge_binding", observe)
+    monkeypatch.setattr(hook, "_route_turn_post", post)
+    recorder = MagicMock()
+    monkeypatch.setattr(hook, "record_hook_payload", recorder)
+    assert (
+        hook.main(
+            [
+                "route-turn",
+                "--bridge-dir",
+                str(context.root),
+                "--native-editor-executable",
+                str(context.binary),
+            ]
+        )
+        == 0
+    )
+    assert order == ([] if already_routed else ["owner", "request"])
+    recorder.assert_not_called()

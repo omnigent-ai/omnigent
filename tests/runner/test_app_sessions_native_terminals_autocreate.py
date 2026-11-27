@@ -3174,6 +3174,8 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
+    monkeypatch.setenv("EDITOR", "missing-test-editor --wait")
+    monkeypatch.delenv("VISUAL", raising=False)
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")

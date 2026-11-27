@@ -235,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
         return _main_evaluate_policy(raw_argv[1:])
-    args = _parse_args(raw_argv)
+    owner_only = bool(raw_argv and raw_argv[0] == "editor-owner")
+    args = _parse_args(raw_argv[1:] if owner_only else raw_argv)
     raw = sys.stdin.read()
     try:
         payload = json.loads(raw or "{}")
@@ -245,24 +246,33 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(payload, dict):
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
-    output = record_hook_payload(
-        Path(args.bridge_dir), payload, conversation_url=args.conversation_url
+    output = (
+        None
+        if owner_only
+        else record_hook_payload(
+            Path(args.bridge_dir), payload, conversation_url=args.conversation_url
+        )
     )
-    if args.native_editor_executable is not None:
+    _record_editor_owner(Path(args.bridge_dir), payload, args.native_editor_executable)
+    if output is not None:
+        print(json.dumps(output))
+    return 0
+
+
+def _record_editor_owner(
+    bridge_dir: Path, payload: dict[str, object], executable: Path | None
+) -> None:
+    """Observe the native process in its hook child without duplicating events."""
+    if executable is not None:
         from omnigent.harnesses.claude_native.editor_handoff import record_editor_bridge_binding
 
         try:
-            record_editor_bridge_binding(
-                Path(args.bridge_dir), payload, args.native_editor_executable
-            )
+            record_editor_bridge_binding(bridge_dir, payload, executable)
         except (OSError, RuntimeError, ValueError) as exc:
             print(
                 f"omnigent claude hook: editor ownership unavailable ({type(exc).__name__})",
                 file=sys.stderr,
             )
-    if output is not None:
-        print(json.dumps(output))
-    return 0
 
 
 def record_hook_payload(
@@ -1510,6 +1520,7 @@ def _main_route_turn(argv: list[str]) -> int:
     )
     parser.add_argument("--bridge-dir", required=True)
     parser.add_argument("--harness", default="claude-native")
+    parser.add_argument("--native-editor-executable", type=Path)
     args = parser.parse_args(argv)
     bridge_dir = Path(args.bridge_dir)
 
@@ -1545,6 +1556,7 @@ def _main_route_turn(argv: list[str]) -> int:
     if turn_routing_marker_present(bridge_dir, session_id):
         return 0
 
+    _record_editor_owner(bridge_dir, payload, args.native_editor_executable)
     body = {
         "harness": args.harness,
         "prompt": prompt,
