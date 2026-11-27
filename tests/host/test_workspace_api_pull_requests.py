@@ -1041,6 +1041,7 @@ async def test_an_old_host_behind_the_new_server_offers_no_owner_method(
     reads_only_host: None,
     host_calls: list[HostWorkspaceCallFrame],
     owner_calls: list[tuple[str, str, dict[str, Any]]],
+    image_reads: list[tuple[str, str, str]],
 ) -> None:
     """A call made anyway gets the host's UNIMPLEMENTED, which says nothing was changed."""
     monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
@@ -1049,12 +1050,22 @@ async def test_an_old_host_behind_the_new_server_offers_no_owner_method(
     listed = await client.get_capabilities(pb.GetCapabilitiesRequest())
     with pytest.raises(ConnectError) as refused:
         await client.create_comment(_CREATE_COMMENT)
+    image = pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=host_tests._IMAGE_URL)
+    with pytest.raises(ConnectError) as image_refused:
+        await _image(client, image)
 
     assert set(listed.capabilities) >= _PULL_REQUEST_READS
     assert not set(listed.capabilities) & _PULL_REQUEST_OWNER_METHODS
+    assert "ReadPullRequestImage" in _PULL_REQUEST_OWNER_METHODS
     assert refused.value.code == Code.UNIMPLEMENTED
-    assert [call.method for call in host_calls] == ["GetCapabilities", "CreateComment"]
+    assert image_refused.value.code == Code.UNIMPLEMENTED
+    assert [call.method for call in host_calls] == [
+        "GetCapabilities",
+        "CreateComment",
+        "ReadPullRequestImage",
+    ]
     assert owner_calls == []
+    assert image_reads == []
 
 
 @pytest.mark.parametrize("session_owner", [True, False], ids=["owner", "non-owner"])

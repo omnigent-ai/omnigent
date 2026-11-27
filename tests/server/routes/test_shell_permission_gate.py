@@ -59,6 +59,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes.sessions import create_sessions_router
+from tests._helpers.connect_stream import connect_frame
 from tests.host.test_workspace_methods import (
     _PULL_REQUEST_OWNER_METHODS,
     _PULL_REQUEST_OWNER_STREAMS,
@@ -1302,7 +1303,7 @@ async def test_workspace_api_gates_a_repository_folder_like_the_workspace(
             "X-Forwarded-Email": "viewer@example.com",
             "Content-Type": "application/connect+json" if streaming else "application/json",
         },
-        content=b"\x00" + len(body).to_bytes(4, "big") + body if streaming else body,
+        content=connect_frame(body) if streaming else body,
     )
 
     if not passes:
@@ -1480,7 +1481,7 @@ async def test_workspace_api_pull_request_changes_are_the_session_owners_alone(
     content = json.dumps(body).encode()
     expected = _pull_request_call_passes(method, caller, session)
     if method in _PULL_REQUEST_OWNER_STREAMS:
-        content = b"\x00" + len(content).to_bytes(4, "big") + content
+        content = connect_frame(content)
         headers["Content-Type"] = "application/connect+json"
         # A stream that got past the gate ends with its error inside a 200 answer.
         expected = 200 if expected == 503 else expected
