@@ -8,6 +8,7 @@ viewers need an explicit notice and redirect.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import urllib.parse
 from collections.abc import Mapping
@@ -19,6 +20,11 @@ from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
 _logger = logging.getLogger(__name__)
 
 _PROJECT_CREATE_FIELDS = ("project_id", "workspace", "git")
+
+# The server refuses the redirect when it could not end the old session's loops,
+# so a few tries ride out a brief storage failure there.
+_REDIRECT_POST_ATTEMPTS = 3
+_REDIRECT_RETRY_SECONDS = 1.0
 
 
 def clear_replacement_create_body(
@@ -118,7 +124,9 @@ async def post_clear_supersession(
        the durable record — it survives reconnects.
     3. A transient ``external_session_superseded`` event the server
        republishes as ``session.superseded``, so a client *actively*
-       viewing the old conversation auto-redirects to the new one.
+       viewing the old conversation auto-redirects to the new one. It
+       also ends the old session's ``/loop`` timers, so a server error
+       (a 5xx reply) is retried up to ``_REDIRECT_POST_ATTEMPTS`` times.
 
     Each failure is logged and swallowed: the rotation has already
     completed and reset forwarder state, and a notification error must
@@ -180,20 +188,30 @@ async def post_clear_supersession(
             exc_info=True,
             extra={"session_id": old_session_id},
         )
-    try:
-        event_resp = await client.post(
-            events_path,
-            json={
-                "type": "external_session_superseded",
-                "data": {"target_conversation_id": new_session_id},
-            },
-        )
-        event_resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
-            extra={"session_id": old_session_id},
-        )
+    for attempt in range(1, _REDIRECT_POST_ATTEMPTS + 1):
+        try:
+            event_resp = await client.post(
+                events_path,
+                json={
+                    "type": "external_session_superseded",
+                    "data": {"target_conversation_id": new_session_id},
+                },
+            )
+            event_resp.raise_for_status()
+            return
+        except httpx.HTTPError as exc:
+            _logger.warning(
+                "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
+                old_session_id,
+                new_session_id,
+                exc_info=True,
+                extra={"session_id": old_session_id},
+            )
+            # Only a server error may clear up: a refusal won't, and an unreachable
+            # server would hold the bridge's poll loop for a timeout on every try.
+            server_error = (
+                isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+            )
+            if not server_error or attempt == _REDIRECT_POST_ATTEMPTS:
+                return
+        await asyncio.sleep(_REDIRECT_RETRY_SECONDS)

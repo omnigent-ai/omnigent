@@ -557,27 +557,51 @@ async def test_post_clear_supersession_skips_when_old_equals_new() -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_clear_supersession_swallows_post_failure() -> None:
+@pytest.mark.parametrize(
+    ("redirect_statuses", "redirect_posts"),
+    [
+        pytest.param([500, 500, 500], 3, id="server keeps failing"),
+        pytest.param([500, 200], 2, id="server recovers"),
+        pytest.param([404], 1, id="refused"),
+        pytest.param([None], 1, id="unreachable"),
+    ],
+)
+async def test_post_clear_supersession_swallows_post_failure(
+    monkeypatch: pytest.MonkeyPatch, redirect_statuses: list[int | None], redirect_posts: int
+) -> None:
     """
     A failed notice/redirect POST is swallowed, not raised.
 
     The rotation has already completed and reset forwarder state by the
     time this runs, so a notification error must not break the poll loop.
+    The redirect also ends the old session's loops, which the server refuses
+    to skip, so a server error there is retried a few times; a refusal is not,
+    nor is a server that can't be reached, which would stall the poll loop.
     """
+    monkeypatch.setattr("omnigent.native._native_supersession._REDIRECT_RETRY_SECONDS", 0)
+    redirects: list[int | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        """Fail every POST so both best-effort calls hit their except path."""
-        return httpx.Response(500, json={"error": {"message": "boom"}})
+        """Fail the status and notice POSTs; answer the redirect as scripted."""
+        if json.loads(request.content)["type"] != "external_session_superseded":
+            return httpx.Response(500, json={"error": {"message": "boom"}})
+        status = redirect_statuses[len(redirects)]
+        redirects.append(status)
+        if status is None:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(status, json={})
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
-        # Must not raise despite both POSTs returning 500.
+        # Must not raise despite the failed POSTs.
         await forwarder._post_clear_supersession(
             client,
             old_session_id="conv_old",
             new_session_id="conv_new",
             agent_name="claude-native-ui",
         )
+
+    assert len(redirects) == redirect_posts
 
 
 @pytest.mark.asyncio

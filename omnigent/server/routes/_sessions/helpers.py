@@ -6093,25 +6093,48 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
 
 async def _stop_superseded_loops(session_id: str, conversation_store: ConversationStore) -> None:
     """
-    End every user's ``/loop`` in a session another one has superseded.
+    End every user's ``/loop`` in a session another one is superseding.
 
     Its viewers follow to the successor, where a loop left ticking here would run
     unseen and out of reach of ``/loop stop``. The session is marked, and a marked
     session neither arms a loop nor fires one, so a loop being armed at this moment
-    ends too. Best-effort.
+    ends too. Call it before announcing the supersession.
 
     :param session_id: The superseded session, e.g. ``"conv_old"``.
+    :param conversation_store: Store holding the session's labels.
+    :raises Exception: Whatever the store raised. The mark was not saved, so the
+        caller must not move the session's viewers away.
+    """
+    from omnigent.stores.conversation_store import LOOP_TIMER_SUPERSEDED_LABEL_KEY
+
+    await asyncio.to_thread(
+        conversation_store.set_labels, session_id, {LOOP_TIMER_SUPERSEDED_LABEL_KEY: "1"}
+    )
+
+
+async def _resume_unsuperseded_loops(
+    session_id: str, conversation_store: ConversationStore
+) -> None:
+    """
+    Undo :func:`_stop_superseded_loops` for a supersession that then failed.
+
+    Best-effort: a mark it can't remove leaves the session refusing loops, which
+    is the safe side of a session its viewers never left.
+
+    :param session_id: The session that was not superseded, e.g. ``"conv_old"``.
     :param conversation_store: Store holding the session's labels.
     """
     from omnigent.stores.conversation_store import LOOP_TIMER_SUPERSEDED_LABEL_KEY
 
     try:
         await asyncio.to_thread(
-            conversation_store.set_labels, session_id, {LOOP_TIMER_SUPERSEDED_LABEL_KEY: "1"}
+            conversation_store.delete_label, session_id, LOOP_TIMER_SUPERSEDED_LABEL_KEY
         )
     except Exception:  # noqa: BLE001
         _logger.warning(
-            "Failed to end the loops of superseded session %s", session_id, exc_info=True
+            "Session %s was not superseded but stays marked, so it takes no loop",
+            session_id,
+            exc_info=True,
         )
 
 
@@ -13606,6 +13629,7 @@ __all__ = [
     "_resolve_skill_meta_text_via_runner",
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
+    "_resume_unsuperseded_loops",
     "_routing_decision_item_from_sse",
     "_same_provider_family",
     "_same_provider_family_impl",

@@ -493,6 +493,72 @@ async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(
     assert message_texts(store, source_id) == ["Q1", "A1", "Q2", "A2"]
 
 
+@pytest.mark.parametrize("failure", ["saving the mark", "releasing the source"])
+async def test_claude_sdk_clear_that_fails_leaves_the_source_running_its_loops(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """The mark ending the source's loops is part of the move, not a best-effort notice.
+
+    It is saved while the source is still whole, so a mark that can't be saved fails
+    the clear with the source untouched; and a clear that fails after it takes the
+    mark back, so the source still runs loops. A retry then moves the session.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    runner_id = store.get_conversation(source_id).runner_id
+    set_labels = SqlAlchemyConversationStore.set_labels
+    clear_runner_id = SqlAlchemyConversationStore.clear_runner_id
+
+    def lose_the_mark(
+        self: SqlAlchemyConversationStore, conversation_id: str, updates: dict[str, str]
+    ) -> None:
+        if LOOP_TIMER_SUPERSEDED_LABEL_KEY in updates:
+            raise OmnigentError("database unavailable", code=ErrorCode.INTERNAL_ERROR)
+        set_labels(self, conversation_id, updates)
+
+    def keep_the_source_bound(
+        self: SqlAlchemyConversationStore, conversation_id: str, **kwargs: Any
+    ) -> Any:
+        if conversation_id == source_id:
+            raise OmnigentError("database unavailable", code=ErrorCode.INTERNAL_ERROR)
+        return clear_runner_id(self, conversation_id, **kwargs)
+
+    with monkeypatch.context() as store_down:
+        if failure == "saving the mark":
+            store_down.setattr(SqlAlchemyConversationStore, "set_labels", lose_the_mark)
+        else:
+            store_down.setattr(
+                SqlAlchemyConversationStore, "clear_runner_id", keep_the_source_bound
+            )
+        failed = await client.post(
+            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+        )
+
+    assert failed.status_code == 500, failed.text
+    assert live_runner.superseded == []
+    assert [
+        conv.id
+        for conv in store.list_conversations(limit=100, kind=None).data
+        if conv.host_id == _HOST_ID
+    ] == [source_id]
+    source = store.get_conversation(source_id)
+    assert source.runner_id == runner_id
+    assert LOOP_TIMER_SUPERSEDED_LABEL_KEY not in source.labels
+
+    retried = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert retried.status_code == 202, retried.text
+    assert live_runner.superseded == [(source_id, retried.json()["session_id"], "clear")]
+    assert LOOP_TIMER_SUPERSEDED_LABEL_KEY in store.get_conversation(source_id).labels
+
+
 async def test_claude_sdk_clear_re_addresses_a_runner_that_moved_before_release(
     app: FastAPI,
     client: httpx.AsyncClient,

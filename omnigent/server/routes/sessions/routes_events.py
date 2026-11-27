@@ -2752,6 +2752,7 @@ def register_events_routes(
                     "data.target_conversation_id",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            # The loops end first: viewers are not sent away from ones still running.
             await _stop_superseded_loops(session_id, conversation_store)
             _publish_session_superseded(session_id, target_conversation_id.strip())
             return {"queued": False}

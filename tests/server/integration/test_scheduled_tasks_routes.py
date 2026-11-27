@@ -42,6 +42,7 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, SharingMode
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
+from omnigent.server.routes.sessions import routes_events
 from omnigent.server.scheduled import harness_settings
 from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
@@ -8329,11 +8330,15 @@ async def test_a_loop_a_failed_replace_or_stop_leaves_behind_is_one_the_session_
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
 async def test_a_loops_label_stays_on_the_server_and_goes_when_the_loop_does(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A client never sees the label naming a loop, so one that copies a session's labels
     (a native ``/clear`` creating its replacement) carries none; and the label goes when
-    the loop is cancelled by id or its session is superseded."""
+    the loop is cancelled by id or its session is superseded. A supersession whose mark
+    can't be saved is refused, so no viewer is sent away from a loop still running."""
     session_id = _owned_session(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
     label = loop_timer_label_key("alice@example.com")
@@ -8369,15 +8374,46 @@ async def test_a_loops_label_stays_on_the_server_and_goes_when_the_loop_does(
     # Superseded, as /clear and /rewind leave a session: its viewers follow the new one,
     # so the session is marked and its loop's next firing retires it (test_claimed_fire).
     second = await arm()
-    superseded = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_session_superseded",
-            "data": {"target_conversation_id": replacement.json()["id"]},
-        },
-        headers=_headers(),
+    redirects: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        routes_events,
+        "_publish_session_superseded",
+        lambda source, target: redirects.append((source, target)),
     )
+
+    async def supersede() -> httpx.Response:
+        return await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": replacement.json()["id"]},
+            },
+            headers=_headers(),
+        )
+
+    set_labels = SqlAlchemyConversationStore.set_labels
+
+    def lose_the_mark(
+        self: SqlAlchemyConversationStore, conversation_id: str, updates: dict[str, str]
+    ) -> None:
+        if LOOP_TIMER_SUPERSEDED_LABEL_KEY in updates:
+            raise RuntimeError("label store down")
+        set_labels(self, conversation_id, updates)
+
+    # The mark can't be saved: the supersession fails for the bridge to retry, nobody
+    # is redirected, and the loop is still the one its session names.
+    with monkeypatch.context() as store_down:
+        store_down.setattr(SqlAlchemyConversationStore, "set_labels", lose_the_mark)
+        with pytest.raises(RuntimeError, match="label store down"):
+            await supersede()
+    labels = conversations.get_conversation(session_id).labels
+    assert (redirects, labels.get(label)) == ([], second)
+    assert LOOP_TIMER_SUPERSEDED_LABEL_KEY not in labels
+
+    # The store is back and the bridge's retry lands.
+    superseded = await supersede()
     assert superseded.status_code == 202, superseded.text
+    assert redirects == [(session_id, replacement.json()["id"])]
     assert LOOP_TIMER_SUPERSEDED_LABEL_KEY in conversations.get_conversation(session_id).labels
     snapshot = (await auth_client.get(f"/v1/sessions/{session_id}", headers=_headers())).json()
     assert not [key for key in snapshot["labels"] if key.startswith("omnigent.loop_timer.")]
