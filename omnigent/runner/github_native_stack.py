@@ -34,7 +34,7 @@ _LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?:\[bot\])?")
 _INT_MIN, _INT_MAX = -(2**31), 2**31 - 1
 _NODE_ID = re.compile(r"[A-Za-z0-9_=-]{1,256}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _STATES = frozenset({"OPEN", "CLOSED", "MERGED"})
 _REVIEW_DECISIONS = frozenset({"APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"})
@@ -82,12 +82,25 @@ def _unreadable() -> PullRequestError:
 
 
 def _text(value: Any) -> str | None:
-    return value if isinstance(value, str) else None
+    """``value`` if it's text that encodes as UTF-8; JSON may carry an unpaired surrogate."""
+    if not isinstance(value, str):
+        return None
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        return None
+    return value
+
+
+def _one_of(value: Any, allowed: frozenset[str]) -> str | None:
+    """``value`` if it's one of ``allowed``; any other type, list or object included, isn't."""
+    return value if isinstance(value, str) and value in allowed else None
 
 
 def _ref_name(value: Any) -> str | None:
     """A branch name: 1 to 255 bytes, with no control characters."""
-    if not isinstance(value, str) or not value or len(value.encode()) > MAX_REF_BYTES:
+    value = _text(value)
+    if not value or len(value.encode()) > MAX_REF_BYTES:
         return None
     return (
         None if any(ord(character) < 32 or ord(character) == 127 for character in value) else value
@@ -124,11 +137,12 @@ def _lacks_stacks(error: Any) -> bool:
     extensions = error.get("extensions") if isinstance(error, dict) else None
     if not isinstance(extensions, dict) or extensions.get("code") != "undefinedField":
         return False
-    type_name = extensions.get("typeName")
-    if type_name not in _STACK_FIELDS:
+    type_name = _one_of(extensions.get("typeName"), frozenset(_STACK_FIELDS))
+    field_name = _text(extensions.get("fieldName"))
+    if type_name is None or field_name is None:
         return False
     fields = _STACK_FIELDS[type_name]
-    return fields is None or extensions.get("fieldName") in fields
+    return fields is None or field_name in fields
 
 
 def _hidden_parts(errors: list[Any], entry_count: int) -> dict[int, set[tuple[str, ...]]]:
@@ -171,8 +185,8 @@ def _member(node: Any, reference: PullRequestRef, hidden: set[tuple[str, ...]]) 
         return {"pullRequest": None, "outside_repository": True}
     number = _count(node.get("number"), least=1, most=2**63 - 1)
     head_ref = _ref_name(node.get("headRefName"))
-    state = node.get("state")
-    if number != found.number or head_ref is None or state not in _STATES:
+    state = _one_of(node.get("state"), _STATES)
+    if number != found.number or head_ref is None or state is None:
         return {"pullRequest": None}
     if not isinstance(node.get("isDraft"), bool):
         return {"pullRequest": None}
@@ -190,7 +204,7 @@ def _member(node: Any, reference: PullRequestRef, hidden: set[tuple[str, ...]]) 
         "state": state,
         "is_draft": node["isDraft"],
         "updated_at": _matching(_TIMESTAMP, node.get("updatedAt")),
-        "review_decision": review if review in _REVIEW_DECISIONS else None,
+        "review_decision": _one_of(review, _REVIEW_DECISIONS),
         "head_ref": head_ref,
         "head_sha": _matching(_SHA, node.get("headRefOid")),
         "base_ref": _ref_name(node.get("baseRefName")),
@@ -241,7 +255,9 @@ def _stack(stack: Any, reference: PullRequestRef, errors: list[Any]) -> dict[str
         if isinstance(node, dict)
         and _count(node.get("position"), least=_INT_MIN, most=_INT_MAX) is not None
     ]
-    return {**shaped, "entries": {"hasNextPage": has_next_page, "nodes": shaped_nodes}}
+    # An answer longer than the read asked for is cut, and says it has more.
+    more = has_next_page or len(nodes) > MAX_NATIVE_STACK_ENTRIES
+    return {**shaped, "entries": {"hasNextPage": more, "nodes": shaped_nodes}}
 
 
 def pull_request_native_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
@@ -277,8 +293,10 @@ def pull_request_native_stack(root: str, reference: PullRequestRef) -> dict[str,
         raise _unreadable() from exc
     if not isinstance(response, dict):
         raise _unreadable()
-    errors = response.get("errors") or []
-    if not isinstance(errors, list):
+    errors = response.get("errors")
+    if errors is None:
+        errors = []
+    elif not isinstance(errors, list):
         raise _unreadable()
     if errors and all(_lacks_stacks(error) for error in errors):
         return {"object": "pull_request_native_stack", "supported": False, "viewer": None}
@@ -290,6 +308,9 @@ def pull_request_native_stack(root: str, reference: PullRequestRef) -> dict[str,
     if login is None or not isinstance(pull_request, dict):
         raise _unreadable()
     if _count(pull_request.get("number"), least=1, most=2**63 - 1) != reference.number:
+        raise _unreadable()
+    # Both are asked for, so an answer without either isn't GitHub's; each may be null.
+    if "stackEntry" not in pull_request or "stack" not in pull_request:
         raise _unreadable()
     entry = pull_request.get("stackEntry")
     position = entry.get("position") if isinstance(entry, dict) else None

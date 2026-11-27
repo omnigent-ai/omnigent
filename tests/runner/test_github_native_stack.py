@@ -94,6 +94,11 @@ def _shaped(number: int, **fields: Any) -> dict[str, Any]:
     }
 
 
+def _undefined_naming(type_name: Any, field: Any) -> dict[str, Any]:
+    """An ``undefinedField`` error whose names aren't text."""
+    return {"extensions": {"code": "undefinedField", "typeName": type_name, "fieldName": field}}
+
+
 class FakeGraphQL:
     """Answers ``gh api graphql`` with ``answer``, recording each request and process."""
 
@@ -184,6 +189,12 @@ def test_a_stacked_pull_request_reads_its_whole_stack(fake: FakeGraphQL) -> None
     assert f"entries(first: {github_native_stack.MAX_NATIVE_STACK_ENTRIES})" in request["query"]
 
 
+def test_an_answer_with_null_errors_reads_as_one_with_none(fake: FakeGraphQL) -> None:
+    fake.answer["errors"] = None
+
+    assert _entries(_read())[1] == {"position": 2, "pullRequest": _shaped(2)}
+
+
 def test_a_pull_request_in_no_stack_says_so(fake: FakeGraphQL) -> None:
     pull_request = fake.answer["data"]["repository"]["pullRequest"]
     pull_request.update(stackEntry=None, stack=None)
@@ -193,12 +204,18 @@ def test_a_pull_request_in_no_stack_says_so(fake: FakeGraphQL) -> None:
     assert found["native_stack"] == {"stackEntry": None, "stack": None}
 
 
-@pytest.mark.parametrize("listed", [50, 51], ids=["a-full-read", "more-than-asked-for"])
-def test_a_stack_longer_than_one_read_says_there_are_more(fake: FakeGraphQL, listed: int) -> None:
-    """An answer with more entries than the read asked for is cut to the read's cap."""
+@pytest.mark.parametrize(
+    ("listed", "has_next_page"),
+    [(50, True), (51, True), (51, False)],
+    ids=["a-full-read", "more-than-asked-for", "more-than-asked-for-saying-none"],
+)
+def test_a_stack_longer_than_one_read_says_there_are_more(
+    fake: FakeGraphQL, listed: int, has_next_page: bool
+) -> None:
+    """An answer with more entries than the read asked for is cut, and says it has more."""
     count = github_native_stack.MAX_NATIVE_STACK_ENTRIES
     nodes = [{"position": n, "pullRequest": _member(n)} for n in range(1, listed + 1)]
-    fake.answer = _answer(nodes, has_next_page=True, size=count + 5)
+    fake.answer = _answer(nodes, has_next_page=has_next_page, size=count + 5)
 
     stack = _read()["native_stack"]["stack"]
 
@@ -248,10 +265,13 @@ def test_a_member_outside_the_repository_is_blanked(fake: FakeGraphQL, url: str)
         {"number": 4},
         {"number": "3"},
         {"state": "DELETED"},
+        {"state": []},
+        {"state": {}},
         {"isDraft": "no"},
         {"headRefName": ""},
         {"headRefName": "é" * 128},
         {"headRefName": "feature\nlogin"},
+        {"headRefName": "feature/\ud800"},
     ],
     ids=[
         "not-a-pr-url",
@@ -259,10 +279,13 @@ def test_a_member_outside_the_repository_is_blanked(fake: FakeGraphQL, url: str)
         "other-number",
         "number-as-text",
         "unknown-state",
+        "state-as-list",
+        "state-as-object",
         "draft-as-text",
         "empty-head",
         "head-256-bytes",
         "head-control-character",
+        "head-unpaired-surrogate",
     ],
 )
 def test_a_member_github_answered_wrongly_is_a_gap(
@@ -281,11 +304,16 @@ def test_a_member_github_answered_wrongly_is_a_gap(
         ({"title": 7}, {"title": ""}),
         ({"title": "é" * 1025}, {"title": "é" * 1024}),
         ({"reviewDecision": "LGTM"}, {"review_decision": None}),
+        ({"reviewDecision": {}}, {"review_decision": None}),
+        ({"reviewDecision": []}, {"review_decision": None}),
+        ({"title": "PR \ud800"}, {"title": ""}),
+        ({"updatedAt": "\uff12\uff10\uff12\uff16-01-02T03:04:05Z"}, {"updated_at": None}),
         ({"updatedAt": "yesterday"}, {"updated_at": None}),
         ({"updatedAt": "2026-01-02 03:04:05"}, {"updated_at": None}),
         ({"headRefOid": "A" * 40}, {"head_sha": None}),
         ({"baseRefOid": "abc"}, {"base_sha": None}),
         ({"baseRefName": "é" * 128}, {"base_ref": None}),
+        ({"baseRefName": "\udfff"}, {"base_ref": None}),
         ({"headRepository": None}, {"head_repository": None}),
         (
             {"headRepository": {"nameWithOwner": "example-org/../secret"}},
@@ -313,11 +341,16 @@ def test_a_member_github_answered_wrongly_is_a_gap(
         "title-not-text",
         "title-past-cap",
         "unknown-review",
+        "review-as-object",
+        "review-as-list",
+        "title-unpaired-surrogate",
+        "updated-other-digits",
         "updated-not-a-time",
         "updated-not-iso",
         "head-sha-uppercase",
         "base-sha-short",
         "base-ref-256-bytes",
+        "base-ref-unpaired-surrogate",
         "deleted-fork",
         "repository-dot-dot",
         "repository-257-characters",
@@ -502,6 +535,12 @@ def test_a_host_without_stacks_cant_say(fake: FakeGraphQL, fields: list[tuple[st
         [{"type": "FORBIDDEN", "path": [*_NODES, 7, "pullRequest"], "message": "no such entry"}],
         [{"type": "SOMETHING_NEW", "path": [*_NODES, 0, "pullRequest"], "message": "x"}],
         "not a list",
+        {},
+        "",
+        0,
+        [_undefined_naming(["PullRequest"], "stack")],
+        [_undefined_naming("PullRequest", ["stack"])],
+        [_undefined_naming({}, "stack")],
     ],
     ids=[
         "message-only",
@@ -513,6 +552,12 @@ def test_a_host_without_stacks_cant_say(fake: FakeGraphQL, fields: list[tuple[st
         "path-to-no-entry",
         "unknown-type",
         "errors-not-a-list",
+        "errors-empty-object",
+        "errors-empty-text",
+        "errors-zero",
+        "type-name-as-list",
+        "field-name-as-list",
+        "type-name-as-object",
     ],
 )
 def test_any_other_error_is_a_failure_that_names_nothing_github_said(
@@ -526,6 +571,12 @@ def test_any_other_error_is_a_failure_that_names_nothing_github_said(
         _read()
 
     assert str(failed.value) == UNREADABLE
+
+
+def _without(key: str) -> dict[str, Any]:
+    answer = _answer()
+    del answer["data"]["repository"]["pullRequest"][key]
+    return answer
 
 
 def _with(path: list[str], value: Any) -> dict[str, Any]:
@@ -559,6 +610,9 @@ def _with(path: list[str], value: Any) -> dict[str, Any]:
         _with(["repository", "pullRequest", "stack", "entries", "nodes"], "none"),
         {"data": None},
         ["not", "an", "answer"],
+        # Missing isn't null: an answer without the stack would read as no stack.
+        _without("stack"),
+        _without("stackEntry"),
     ],
     ids=[
         "viewer-with-space",
@@ -580,6 +634,8 @@ def _with(path: list[str], value: Any) -> dict[str, Any]:
         "nodes-not-a-list",
         "no-data",
         "list",
+        "no-stack-key",
+        "no-stack-entry-key",
     ],
 )
 def test_an_answer_that_isnt_githubs_is_a_failure(fake: FakeGraphQL, answer: Any) -> None:
