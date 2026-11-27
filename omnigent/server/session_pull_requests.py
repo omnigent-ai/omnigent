@@ -191,6 +191,8 @@ def ingest_info(
         # The selected PR's full read wins over its listed entry from the same response.
         fetched=[
             *listed_states(info.get("prs")),
+            # A summary read carries the other tracked PRs' states apart from ``prs``.
+            *listed_states(info.get("pr_states")),
             *([selected] if (selected := fetched_state(info)) is not None else []),
         ],
         requested_at=requested_at,
@@ -383,21 +385,33 @@ class PullRequestRefresher:
         :param turn_end_delay_s: Seconds to wait after a turn ends before refreshing.
         """
         self._refresh: Callable[[str], Awaitable[None]] | None = None
+        self._refresh_listed: Callable[[str], Awaitable[None]] | None = None
         self._semaphore = asyncio.Semaphore(concurrency)
         self._delay_s = turn_end_delay_s
         # Sessions with a turn no read has covered yet, by when that turn ended.
         self._turn_ended: dict[tuple[int, str], float] = {}
+        # Sessions whose next listed refresh must be a full read, by when the need arose: a
+        # turn-end refresh did not cover the turn, or a full read's discovery did not finish.
+        self._uncovered: dict[tuple[int, str], float] = {}
         # When each listed session was last refreshed, on the monotonic clock.
         self._attempted: dict[tuple[int, str], float] = {}
         self._running: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._closed = False
 
-    def bind(self, refresh: Callable[[str], Awaitable[None]]) -> None:
+    def bind(
+        self,
+        refresh: Callable[[str], Awaitable[None]],
+        listed: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         """Set how one session is refreshed; failures are logged.
 
         :param refresh: Reads the session's PR info from its runner or host and stores it.
+        :param listed: Refreshes a listed session's stored PR state; ``refresh``
+            serves when unset. Lists show only the state, draft flag and title, so
+            they need not pay for a full read.
         """
         self._refresh = refresh
+        self._refresh_listed = listed
 
     def turn_ended(self, session_id: str) -> None:
         """Refresh after a turn ends; a no-op outside an event loop."""
@@ -413,6 +427,21 @@ class PullRequestRefresher:
         ended = self._turn_ended.get(key)
         if ended is not None and requested_at >= ended:
             del self._turn_ended[key]
+        uncovered = self._uncovered.get(key)
+        if uncovered is not None and requested_at >= uncovered:
+            del self._uncovered[key]
+
+    def note_incomplete_read(self, session_id: str, requested_at: float) -> None:
+        """Keep listed refreshes full reads, which retry discovery, until one finishes it.
+
+        :param requested_at: Epoch seconds the incomplete read was sent; a later read clears it.
+        """
+        self._mark_uncovered((current_workspace_id(), session_id), requested_at)
+
+    def _mark_uncovered(self, key: tuple[int, str], since: float) -> None:
+        if key not in self._uncovered and len(self._uncovered) >= _ATTEMPTS_MAX:
+            del self._uncovered[next(iter(self._uncovered))]
+        self._uncovered[key] = max(since, self._uncovered.get(key, since))
 
     def request(self, session_id: str) -> None:
         """Refresh a listed session that needs it, at most once per :data:`FRESHNESS_S`."""
@@ -443,19 +472,27 @@ class PullRequestRefresher:
         session_id = key[1]
         try:
             if refresh_now:
-                await self._refresh_once(session_id)
+                await self._refresh_once(session_id, listed=key not in self._uncovered)
             while key in self._turn_ended:
                 await asyncio.sleep(self._delay_s)
-                if self._turn_ended.pop(key, None) is not None:
-                    await self._refresh_once(session_id)
+                ended = self._turn_ended.get(key)
+                if ended is None:
+                    break
+                await self._refresh_once(session_id)
+                # A read that covers the turn clears it through note_read; a newer turn
+                # ending meanwhile replaces it and keeps the loop going.
+                if self._turn_ended.get(key) == ended:
+                    del self._turn_ended[key]
+                    self._mark_uncovered(key, ended)
         finally:
             self._running.pop(key, None)
 
-    async def _refresh_once(self, session_id: str) -> None:
+    async def _refresh_once(self, session_id: str, *, listed: bool = False) -> None:
         assert self._refresh is not None
+        refresh = (self._refresh_listed if listed else None) or self._refresh
         async with self._semaphore:
             try:
-                await self._refresh(session_id)
+                await refresh(session_id)
             except Exception:
                 _logger.debug("Pull request refresh failed", exc_info=True)
 

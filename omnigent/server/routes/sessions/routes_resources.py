@@ -3770,11 +3770,14 @@ def register_resources_routes(
         )
 
     async def _with_server_pull_requests(
-        session_id: str, info: dict[str, Any], requested_at: float
+        session_id: str, info: dict[str, Any], requested_at: float, *, covers_turn: bool = True
     ) -> dict[str, Any]:
         """Store a runner or host payload's PRs, then answer with the server's list.
 
         :param requested_at: Epoch seconds the server sent the request ``info`` answers.
+        :param covers_turn: Whether ``info`` is a full
+            read that can stand in for the refresh after an ended turn. A summary
+            read cannot: it discovers no PRs the turn opened.
         """
         if pull_request_store is None:
             return info
@@ -3793,8 +3796,14 @@ def register_resources_routes(
                 extra={"session_id": session_id},
             )
             return info
-        if pull_request_refresher is not None:
-            pull_request_refresher.note_read(session_id, requested_at)
+        # A read whose discovery failed or is still running may miss PRs the turn opened.
+        discovered = info.get("discovery_incomplete") is not True
+        if pull_request_refresher is not None and covers_turn:
+            if discovered:
+                pull_request_refresher.note_read(session_id, requested_at)
+            else:
+                # Listed refreshes stay full reads, which retry discovery, until one finishes.
+                pull_request_refresher.note_incomplete_read(session_id, requested_at)
         return server_prs.answer(info, stored)
 
     async def _record_attached(session_id: str, info: dict[str, Any]) -> None:
@@ -3841,11 +3850,15 @@ def register_resources_routes(
         pr_url: str | None = None,
         *,
         allow_cached: bool = False,
+        summary: bool = False,
     ) -> dict[str, Any]:
         """Read PR context through the runner or host and store what it reports.
 
         :param allow_cached: The client polls again soon, so the runner may answer
             from its previous read.
+        :param summary: Ask only for the selected PR's
+            state, draft flag and title. Runners and hosts that predate it ignore
+            the flag and answer with a full read.
         """
         params = await _github_params(
             session_id,
@@ -3854,6 +3867,8 @@ def register_resources_routes(
                 **({"allow_cached": True} if allow_cached else {}),
             },
         )
+        if summary:
+            params = {**params, "summary": True}
         requested_at = time.time()
         info = await _fs_get_with_host_fallback(
             session_id,
@@ -3867,7 +3882,9 @@ def register_resources_routes(
         age = info.pop("cache_age_s", 0)
         if isinstance(age, int | float) and age > 0:
             requested_at -= age
-        return await _with_server_pull_requests(session_id, info, requested_at)
+        return await _with_server_pull_requests(
+            session_id, info, requested_at, covers_turn=not summary
+        )
 
     async def _update_host_pull_requests(
         session_id: str,
@@ -3945,8 +3962,13 @@ def register_resources_routes(
             and host_registry.get(conv.host_id) is not None
         )
 
-    async def _refresh_session_pull_requests(session_id: str) -> None:
-        """Read a session's PR info from its runner or host, which stores what it reports."""
+    async def _refresh_session_pull_requests(session_id: str, *, listed: bool = False) -> None:
+        """Read a session's PR info from its runner or host, which stores what it reports.
+
+        :param listed: The session was listed, which
+            shows only its first PR's state, draft flag and title. Once the server
+            has synced the session's PRs, a summary read keeps that state current.
+        """
         conv = await _validate_session(session_id)
         if not _tunnel_is_local(conv):
             return
@@ -3958,10 +3980,16 @@ def register_resources_routes(
         # Outside a git checkout, a synced session without PRs has none to refresh.
         if conv.git_branch is None and stored is not None and stored.synced and not stored.entries:
             return
-        await _github_info(session_id, conv)
+        summary = listed and stored is not None and stored.synced and bool(stored.entries)
+        await _github_info(session_id, conv, summary=summary)
+
+    async def _refresh_listed_session_pull_requests(session_id: str) -> None:
+        await _refresh_session_pull_requests(session_id, listed=True)
 
     if pull_request_refresher is not None and pull_request_store is not None:
-        pull_request_refresher.bind(_refresh_session_pull_requests)
+        pull_request_refresher.bind(
+            _refresh_session_pull_requests, _refresh_listed_session_pull_requests
+        )
 
     @router.get("/sessions/{session_id}/pull-requests", response_model=SessionPullRequestList)
     async def list_session_pull_requests(

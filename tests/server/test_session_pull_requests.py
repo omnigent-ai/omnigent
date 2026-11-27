@@ -223,10 +223,14 @@ async def test_turn_end_refresh_runs_once_more_for_a_turn_that_ends_during_it() 
     # A turn that ends during the refresh gets one more, not one per notification.
     refresher.turn_ended(SESSION)
     refresher.turn_ended(SESSION)
+    key = (current_workspace_id(), SESSION)
+    latest = refresher._turn_ended[key]
     release.set()
-    for _ in range(6):
-        await asyncio.sleep(0)
+    while refresher._running:
+        await asyncio.gather(*refresher._running.values())
     assert started == [SESSION, "other", SESSION]
+    # No read covered the later turn, so the next listed refresh is a full one.
+    assert refresher._uncovered[key] == latest
     await refresher.aclose()
 
 

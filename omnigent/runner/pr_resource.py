@@ -428,6 +428,72 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         }
 
 
+def _summary_info(
+    root: str,
+    reference: SessionPullRequest,
+    registry: SessionPrRegistry,
+    entries: list[SessionPullRequest],
+    request_deadline: float,
+) -> dict[str, Any]:
+    """The tracked GitHub PRs' states alone, for the server's lists.
+
+    Carries no ``prs`` or ``tracking_available``, so the server keeps its tracked
+    list as is. ``pr`` is ``None`` when GitHub could not say or the request budget
+    ran out first, and the server then keeps the state it has; ``pr_states`` holds
+    the other PRs read. Every read ends by ``request_deadline``.
+    """
+    # github_pr_state imports github_resource, which imports this module at load time.
+    from omnigent.runner import github_pr_state, github_resource
+
+    tracked = {entry.url: entry for entry in entries}
+    if reference.url not in tracked:
+        # A server-selected PR the registry does not hold keeps its read time apart.
+        try:
+            checked_at = registry.unlisted_checked_at(reference.url)
+        except (OSError, ValueError, FileLockTimeout):
+            checked_at = 0
+        tracked[reference.url] = reference.model_copy(update={"title_checked_at": checked_at})
+    # The longest-unchecked PR goes first, so the budget never skips the same ones. The
+    # check times live in the session's registry, so other sessions cannot evict them.
+    order = sorted(tracked.values(), key=lambda pr: (pr.title_checked_at, pr.url != reference.url))
+    now = time.time()
+    selected: dict[str, Any] | None = None
+    states: list[dict[str, Any]] = []
+    titles: dict[str, str | None] = {}
+    with github_resource._gh_deadline_scope(request_deadline):
+        for entry in order:
+            if time.monotonic() >= request_deadline:
+                break  # The rest keep their stored states until the next refresh.
+            state = github_pr_state.reference_state(root, entry)
+            title = state.get("title") if state is not None else None
+            titles[entry.url] = title if isinstance(title, str) else None
+            if entry.url == reference.url:
+                selected = state
+            elif state is not None:
+                states.append(state)
+    try:
+        # A failed read counts as a timed-out title lookup, which a full read retries soon.
+        registry.update_titles(
+            titles,
+            timestamp=now,
+            timed_out_urls=[url for url, title in titles.items() if title is None],
+        )
+    except (OSError, ValueError, FileLockTimeout):
+        _logger.debug("Could not cache session PR titles", exc_info=True)
+    return {
+        "object": "session.github.info",
+        "available": True,
+        "provider": reference.provider,
+        "selected_pr_url": reference.url,
+        "pr": selected,
+        "pr_states": states,
+    }
+
+
+# Marks a discovery result whose provider failed; ``pr_info`` leaves it out of its answer.
+_DISCOVERY_FAILED = "discovery_failed"
+
+
 def _discovery_info(root: str, resolution: ProviderResolution) -> dict[str, Any]:
     try:
         return _workspace_info(root, resolution)
@@ -439,6 +505,7 @@ def _discovery_info(root: str, resolution: ProviderResolution) -> dict[str, Any]
             "warnings": [
                 f"{resolution.provider} pull request discovery failed. Refresh to retry."
             ],
+            _DISCOVERY_FAILED: True,
         }
 
 
@@ -657,6 +724,7 @@ def pr_info(
     *,
     session_id: str | None = None,
     pr_url: str | None = None,
+    summary: bool = False,
 ) -> dict[str, Any]:
     """Read the selected session PR and discover untracked providers from all remotes.
 
@@ -664,6 +732,10 @@ def pr_info(
     :param session_id: Session whose tracked PRs to list; ``None`` reads only
         the workspace branch's PR.
     :param pr_url: The selected PR, which must be tracked by the session.
+    :param summary: Read only the tracked GitHub
+        PRs' states, draft flags and titles, skipping discovery and the tracked
+        PRs' list. Sessions tracking no PR, or a PR on another provider, get the
+        full read.
     :returns: A ``session.github.info`` payload.
     """
     if session_id is None:
@@ -681,6 +753,12 @@ def pr_info(
     reference = (
         _selected_pr(session_id, default_url) if default_url else entries[0] if entries else None
     )
+    if (
+        summary
+        and reference is not None
+        and all(entry.provider == "github" for entry in [reference, *entries])
+    ):
+        return _summary_info(root, reference, registry, entries, request_deadline)
     tracked_providers = {entry.provider for entry in entries}
     if reference is not None:
         tracked_providers.add(reference.provider)
@@ -694,6 +772,7 @@ def pr_info(
         ]
     )
     discovered: list[dict[str, Any]] = []
+    discovery_incomplete = False
     if not resolutions:
         assert reference is not None
         info = _reference_info(root, reference)
@@ -711,6 +790,7 @@ def pr_info(
                     key = (root, session_id, resolution.provider)
                     if _DISCOVERY_JOBS.get(key) is future:
                         del _DISCOVERY_JOBS[key]
+        discovery_incomplete = len(discovered) < len(pending)
     elif len(resolutions) == 1:
         discovered = [_discovery_info(root, resolutions[0])]
         info = discovered[0]
@@ -727,8 +807,15 @@ def pr_info(
     if reference is None:
         info = next((candidate for candidate in discovered if candidate.get("pr")), info)
     for candidate in discovered:
+        # Overlapping reads share a background discovery's result, so it is only read here.
+        if candidate.get(_DISCOVERY_FAILED) is True:
+            discovery_incomplete = True
         if candidate is not info:
             info.setdefault("discovery_warnings", []).extend(candidate.get("warnings", []))
+    info.pop(_DISCOVERY_FAILED, None)
+    if discovery_incomplete:
+        # The server then retries discovery on its next refresh instead of a summary.
+        info["discovery_incomplete"] = True
     info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
     if not pr_url:

@@ -1552,7 +1552,19 @@ def register_resource_routes(
         server_tracked: bool = False,
         default_pr_url: str | None = None,
         allow_cached: bool = False,
+        summary: bool = False,
     ) -> JSONResponse:
+        if summary:
+            # The server's listed-session refresh asks for a summary. It lacks the
+            # tracked list, so it neither takes nor feeds the panel's shared reads.
+            return await _github_call(
+                session_id,
+                "pr_info",
+                pr_url=pr_url,
+                server_tracked=server_tracked,
+                default_pr_url=default_pr_url,
+                summary=True,
+            )
         return await _github_call(
             session_id,
             "cached_pr_info",

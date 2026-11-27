@@ -7,6 +7,7 @@ import {
   applyPullRequestLabelChange,
   applyPullRequestReviewerChange,
   computeLinkedPullRequestPollInterval,
+  computePanelPullRequestPollInterval,
   computePullRequestPollInterval,
   fetchPullRequestInfo,
   normalizePullRequestInfo,
@@ -502,5 +503,52 @@ describe("computePullRequestPollInterval", () => {
         ),
       ).toBe(false);
     }
+  });
+
+  // The panel's poll for a session whose PRs the server tracks: each poll is a full PR read.
+  describe("in the panel of a tracked session", () => {
+    const tracked = (pr: Partial<NonNullable<PullRequestInfo["pr"]>> = {}): PullRequestInfo =>
+      ready({ tracking_available: true, pr: { ...ready().pr!, ...pr } });
+
+    it("polls every 10 s while there is something to watch", () => {
+      expect(
+        computePanelPullRequestPollInterval(tracked({ checks: checks({ total: 2, pending: 1 }) })),
+      ).toBe(10_000);
+      expect(computePanelPullRequestPollInterval(tracked({ checks: checks() }))).toBe(10_000);
+      expect(computePanelPullRequestPollInterval(tracked({ comments_partial: true }))).toBe(10_000);
+      expect(
+        computePanelPullRequestPollInterval(ready({ tracking_available: true, pr: null })),
+      ).toBe(10_000);
+    });
+
+    it("keeps watching an open PR whose checks settled for outside pushes, reviews and merges", () => {
+      expect(computePanelPullRequestPollInterval(tracked())).toBe(30_000);
+      expect(
+        computePanelPullRequestPollInterval(tracked({ checks: checks({ total: 2, failing: 2 }) })),
+      ).toBe(30_000);
+    });
+
+    it("rests a merged or closed PR, even while its details are partial", () => {
+      for (const state of ["MERGED", "CLOSED"]) {
+        expect(computePanelPullRequestPollInterval(tracked({ state }))).toBe(false);
+        expect(
+          computePanelPullRequestPollInterval(tracked({ state, comments_partial: true })),
+        ).toBe(false);
+        expect(
+          computePanelPullRequestPollInterval({
+            ...tracked({ state }),
+            warnings: ["Lookup failed."],
+          }),
+        ).toBe(false);
+      }
+    });
+
+    it("polls an untracked session as the plain poll does", () => {
+      const pending = ready({ pr: { ...ready().pr!, checks: checks({ total: 2, pending: 1 }) } });
+      for (const info of [undefined, ready(), pending, ready({ pr: null })]) {
+        expect(computePanelPullRequestPollInterval(info)).toBe(computePullRequestPollInterval(info));
+      }
+      expect(computePanelPullRequestPollInterval(pending)).toBe(5_000);
+    });
   });
 });

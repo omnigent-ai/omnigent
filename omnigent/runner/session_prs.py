@@ -68,6 +68,8 @@ class _Registry(_Associations):
     # file written before reporting existed, whose associations all count as unreported.
     unreported: dict[str, int] | None = None
     revision: int = 0
+    # When summaries last read server-selected PRs this registry does not hold.
+    unlisted_checked_at: dict[str, float] = Field(default_factory=dict)
 
 
 class _ProviderRegistry(_Associations):
@@ -245,8 +247,26 @@ class SessionPrRegistry:
                 entry.title_checked_at = now
                 entry.title_lookup_timed_out = title is None and entry.url in timed_out_urls
                 changed = True
+            listed = {entry.url for entry in state.prs}
+            if unlisted := [url for url in titles if url not in listed]:
+                # Only the latest summary's unlisted selection is kept, so this stays small.
+                state.unlisted_checked_at = {
+                    url: max(now, state.unlisted_checked_at.get(url, 0)) for url in unlisted
+                }
+                changed = True
             if changed:
                 self._write(state)
+
+    def unlisted_checked_at(self, url: str) -> float:
+        """When a summary last read ``url``, a server-selected PR this registry does not hold.
+
+        :raises ValueError: If the registry is corrupt.
+        :raises filelock.Timeout: If the registry is busy.
+        """
+        if not self.path.parent.exists():
+            return 0
+        with FileLock(str(self.path) + ".lock", timeout=1):
+            return self._read().unlisted_checked_at.get(url, 0)
 
     def pending_reports(self) -> tuple[int, Sequence[SessionPullRequest]]:
         """Return the registry revision and the associations the server has not acknowledged.
