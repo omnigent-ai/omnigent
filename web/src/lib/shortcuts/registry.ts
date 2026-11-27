@@ -138,7 +138,51 @@ interface ShortcutBindingDefinition {
   shownWhen?: (context: ShortcutPageContext) => boolean;
   /** Left off touch and narrow layouts, where Enter inserts a newline instead of submitting. */
   desktopOnly?: true;
+  /** More chords that run the action but are never shown, such as a variant with Shift held. */
+  secondaryChords?: (environment: ShortcutEnvironment) => Chord[];
+  /** The feature flag a binding waits for; it's left out of `SHORTCUT_BINDINGS` until then. */
+  flag?: "quick_pick_palette";
 }
+
+/** A binding the Keyboard shortcuts page leaves out, such as one its ⌘K command lists. */
+const NOT_LISTED = (): boolean => false;
+
+/** A session step's Ctrl+Tab chord and its Ctrl+Alt+Shift arrow, the one a browser tab reaches. */
+function sessionStepChords(
+  environment: ShortcutEnvironment,
+  tab: Chord,
+  arrow: "ArrowDown" | "ArrowUp",
+): Chord[] {
+  const arrowChord: Chord = { ctrl: true, alt: true, shift: true, key: arrow, exactKey: true };
+  return environment.native ? [tab, arrowChord] : [arrowChord, tab];
+}
+
+// The transcript's message steps. AltGr matches on macOS only, where Firefox reports Option as
+// AltGr; elsewhere AltGr types a character.
+function messageStepChord(key: "ArrowUp" | "ArrowDown", environment: ShortcutEnvironment): Chord {
+  return { mod: true, alt: true, key, exactKey: true, matchesAltGraph: environment.mac };
+}
+
+// Shift variants are macOS-only; elsewhere they're Next and Previous session's chords.
+function messageStepWithShift(
+  key: "ArrowUp" | "ArrowDown",
+  environment: ShortcutEnvironment,
+): Chord[] {
+  return environment.mac ? [{ ...messageStepChord(key, environment), shift: true }] : [];
+}
+
+/** The open session's Pin, Fork and Archive chords, as the desktop app's Session menu binds them. */
+export const OPEN_SESSION_CHORDS = {
+  pin: { mod: true, alt: true, code: "KeyP" },
+  fork: { mod: true, alt: true, code: "KeyF" },
+  archive: { mod: true, shift: true, key: "a" },
+} as const satisfies Record<string, Chord>;
+
+// The desktop menu owns these chords; elsewhere Ctrl+Alt+P and Ctrl+Alt+F are Go to a file
+// and Search text in files, so the browser takes Pin and Fork on macOS only.
+const browserOpenSessionChord =
+  (chord: Chord, alsoOffMac: boolean) => (environment: ShortcutEnvironment) =>
+    environment.desktopMenu || (!environment.mac && !alsoOffMac) ? [] : [chord];
 
 /** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
 export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
@@ -218,29 +262,29 @@ const APP_BINDINGS = {
     menuChords: (environment) =>
       environment.desktopMenu ? [{ mod: true, shift: true, code: "KeyW" }] : [],
   },
-  // The desktop app's Session menu items.
+  // The desktop app's Session menu items. With quick_pick_palette on, a browser runs them too.
   "session.pin": {
     group: "general",
     label: "Pin or unpin current session",
-    chords: () => [],
-    menuChords: (environment) =>
-      environment.desktopMenu ? [{ mod: true, alt: true, code: "KeyP" }] : [],
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.pin, false),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.pin] : []),
     shownWhen: (context) => context.desktopCommands,
   },
   "session.archive": {
     group: "general",
     label: "Archive current session",
-    chords: () => [],
-    menuChords: (environment) =>
-      environment.desktopMenu ? [{ mod: true, shift: true, key: "a" }] : [],
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.archive, true),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.archive] : []),
     shownWhen: (context) => context.desktopCommands,
   },
   "session.fork": {
     group: "general",
     label: "Fork current session",
-    chords: () => [],
-    menuChords: (environment) =>
-      environment.desktopMenu ? [{ mod: true, alt: true, code: "KeyF" }] : [],
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.fork, false),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.fork] : []),
     shownWhen: (context) => context.desktopCommands,
   },
   "app.quit": {
@@ -361,6 +405,44 @@ const APP_BINDINGS = {
     label: "Stop response",
     chords: () => [{ key: "Escape" }],
   },
+  "message.previous": {
+    group: "chats",
+    label: "Go to previous message",
+    chords: (environment) => [messageStepChord("ArrowUp", environment)],
+    secondaryChords: (environment) => messageStepWithShift("ArrowUp", environment),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  "message.next": {
+    group: "chats",
+    label: "Go to next message",
+    chords: (environment) => [messageStepChord("ArrowDown", environment)],
+    secondaryChords: (environment) => messageStepWithShift("ArrowDown", environment),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  // With quick_pick_palette on, each runs its ⌘K command, and Ctrl+Tab steps instead of
+  // opening the recent switcher. A browser keeps Ctrl+Tab, so the desktop app lists it first.
+  "session.next": {
+    group: "navigation",
+    label: "Next session",
+    chords: (environment) =>
+      sessionStepChords(environment, { ctrl: true, key: "Tab", exactKey: true }, "ArrowDown"),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  "session.previous": {
+    group: "navigation",
+    label: "Previous session",
+    chords: (environment) =>
+      sessionStepChords(
+        environment,
+        { ctrl: true, shift: true, key: "Tab", exactKey: true },
+        "ArrowUp",
+      ),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
   "sessions.recent": {
     group: "navigation",
     label: "Switch recent sessions",
@@ -397,6 +479,22 @@ const APP_BINDINGS = {
           ? { mod: true, key: digit, exactKey: true, matchesAltGraph: true }
           : { mod: true, alt: true, code: `Digit${digit}` },
       ),
+  },
+  // Hold Control and press ] or [ to walk recently visited sessions, then release to switch.
+  // macOS only: elsewhere Ctrl is the command key, and Ctrl+[ and Ctrl+] are taken.
+  "session.recent": {
+    group: "navigation",
+    label: "Switch to recent session",
+    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketRight" }] : []),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  "session.recentReverse": {
+    group: "navigation",
+    label: "Switch to recent session (reverse)",
+    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketLeft" }] : []),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
   },
   "view.mode": {
     group: "view",
@@ -780,6 +878,23 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
     label: "Open the focused row in a new tab (⇧ to switch to it)",
     chords: () => [mod({ key: "Enter" }), mod({ shift: true, key: "Enter" })],
   },
+  // The new pull request page's: delete the selected rows from its list, and step down and up a
+  // PR's stack as on github.com. Text fields and menus keep these keys.
+  "pullRequests.removeSelected": {
+    group: "workspace",
+    label: "Remove selected pull requests",
+    chords: () => [mod({ eitherCommandKey: true, key: "Backspace" })],
+  },
+  "pullRequestStack.next": {
+    group: "workspace",
+    label: "Next in stack",
+    chords: () => [{ shift: true, code: "KeyJ" }],
+  },
+  "pullRequestStack.previous": {
+    group: "workspace",
+    label: "Previous in stack",
+    chords: () => [{ shift: true, code: "KeyK" }],
+  },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
 const BINDINGS = { ...APP_BINDINGS, ...WORKSPACE_SIDEBAR_DEFINITIONS };
@@ -796,8 +911,17 @@ export interface ShortcutBinding extends ShortcutBindingDefinition {
 const toBindings = (definitions: Record<string, ShortcutBindingDefinition>): ShortcutBinding[] =>
   Object.entries(definitions).map(([id, binding]) => ({ id: id as ShortcutId, ...binding }));
 
-/** Every app binding, in registry order. */
-export const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = toBindings(APP_BINDINGS);
+/** Every app binding in Keyboard shortcuts page order, those waiting for a flag included. */
+export const APP_SHORTCUT_BINDINGS: readonly ShortcutBinding[] = toBindings(APP_BINDINGS);
+
+/** Every app binding, in registry order, apart from those waiting for a flag. */
+export const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = APP_SHORTCUT_BINDINGS.filter(
+  (binding) => binding.flag === undefined,
+);
+
+/** The bindings that wait for quick_pick_palette, which only its ⌘K and hotkeys use. */
+export const QUICK_PICK_SHORTCUT_BINDINGS: readonly ShortcutBinding[] =
+  APP_SHORTCUT_BINDINGS.filter((binding) => binding.flag === "quick_pick_palette");
 
 /** The workspace sidebar's bindings, in order, for the Keyboard Shortcuts page once it's routed. */
 export const WORKSPACE_SIDEBAR_BINDINGS: readonly ShortcutBinding[] = toBindings(
@@ -805,15 +929,25 @@ export const WORKSPACE_SIDEBAR_BINDINGS: readonly ShortcutBinding[] = toBindings
 );
 
 const BINDINGS_BY_ID = new Map<ShortcutId, ShortcutBinding>(
-  [...SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS].map((binding) => [binding.id, binding]),
+  [...APP_SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS].map((binding) => [binding.id, binding]),
 );
 
 export function shortcutBinding(id: ShortcutId): ShortcutBinding {
   return BINDINGS_BY_ID.get(id)!;
 }
 
-/** The chords that run `id` now, for this environment. */
+/** Every chord that runs `id` now, the shown ones first, for matching and conflict checks. */
 export function activeShortcutChords(
+  id: ShortcutId,
+  environment?: Partial<ShortcutEnvironment>,
+): Chord[] {
+  const resolved = currentShortcutEnvironment(environment);
+  const binding = shortcutBinding(id);
+  return [...binding.chords(resolved), ...(binding.secondaryChords?.(resolved) ?? [])];
+}
+
+/** The chords `id` shows now, never a secondary one. */
+export function primaryShortcutChords(
   id: ShortcutId,
   environment?: Partial<ShortcutEnvironment>,
 ): Chord[] {
@@ -844,7 +978,7 @@ export function matchesShortcut(
 /** Key caps for the first of `id`'s chords here, or none when it has no chord. */
 export function shortcutKeys(id: ShortcutId, environment?: Partial<ShortcutEnvironment>): string[] {
   const resolved = currentShortcutEnvironment(environment);
-  const chord = activeShortcutChords(id, resolved)[0];
+  const chord = primaryShortcutChords(id, resolved)[0];
   return chord ? chordKeys(chord, resolved.mac) : [];
 }
 
@@ -869,7 +1003,7 @@ export function menuShortcutChords(
 
 /** Key caps for the chord `id` shows here: its own first chord, else the desktop menu's. */
 export function shortcutShownKeys(id: ShortcutId, environment: ShortcutEnvironment): string[] {
-  const chord = activeShortcutChords(id, environment)[0] ?? menuShortcutChords(id, environment)[0];
+  const chord = primaryShortcutChords(id, environment)[0] ?? menuShortcutChords(id, environment)[0];
   return chord ? chordKeys(chord, environment.mac) : [];
 }
 
@@ -917,6 +1051,6 @@ export function shortcutAriaKeys(
   environment?: Partial<ShortcutEnvironment>,
 ): string | undefined {
   const resolved = currentShortcutEnvironment(environment);
-  const chord = activeShortcutChords(id, resolved)[0];
+  const chord = primaryShortcutChords(id, resolved)[0];
   return chord ? chordAriaShortcut(chord, resolved.mac) : undefined;
 }

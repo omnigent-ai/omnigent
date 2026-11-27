@@ -17,18 +17,31 @@ import {
   SearchOrder,
   ListBranchCommitsRequestSchema,
   ListBranchCommitsResponseSchema,
+  ListRepositoryRefsRequestSchema,
+  ListRepositoryRefsResponseSchema,
   ListWorkingCopyChangesRequestSchema,
   ListWorkingCopyChangesResponseSchema,
+  ReadBaseFileRequestSchema,
   ReadBaseFileResponseSchema,
+  ResolveWorkingCopyBaseRequestSchema,
   ResolveWorkingCopyBaseResponseSchema,
+  GetPullRequestResponseSchema,
+  CreateCommentResponseSchema,
+  PullRequestFailureSchema,
 } from "@/gen/omnigent/api/workspace/v1alpha1/workspace_pb";
 import { getCachedServerInfo, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { workspaceSocketBridge, type WorkspaceSocketResponse } from "@/lib/nativeBridge";
 import {
+  callPullRequestMethod,
+  callPullRequestWrite,
+  PullRequestMaybeSentError,
+  pullRequestFailureReason,
+  servingRoutes,
   listDirectoryViaWorkspaceApi,
   readFileViaWorkspaceApi,
   listBranchCommitsViaWorkspaceApi,
+  listRepositoryRefsViaWorkspaceApi,
   listWorkingCopyChangesViaWorkspaceApi,
   rankFilesViaWorkspaceApi,
   readBaseFileViaWorkspaceApi,
@@ -1551,6 +1564,127 @@ describe("Git comparisons through the workspace API", () => {
     expect(methodCalls("ListBranchCommits")).toHaveLength(0);
   });
 
+  it("names a repository folder only to a host that lists comparison.repository", async () => {
+    enable("workspace_api_server_access");
+    let features: string[] = [];
+    // The folder each request named, by method; every method answers, so a request sent
+    // by mistake is counted rather than lost to an unimplemented reply.
+    const folders: Record<string, string[]> = {};
+    const record = (method: string, repository: string) => {
+      (folders[method] ??= []).push(repository);
+    };
+    const proto = (body: Uint8Array<ArrayBuffer>) => new Response(body, { headers: PROTO_HEADERS });
+    serveMethods({
+      GetCapabilities: () =>
+        proto(
+          capabilitiesBody(
+            "ResolveWorkingCopyBase",
+            "ListWorkingCopyChanges",
+            "ReadBaseFile",
+            "ListRepositoryRefs",
+            "ListBranchCommits",
+            "branch_commits",
+            ...features,
+          ),
+        ),
+      ResolveWorkingCopyBase: (body) => {
+        record(
+          "ResolveWorkingCopyBase",
+          fromBinary(ResolveWorkingCopyBaseRequestSchema, body).repository,
+        );
+        return proto(
+          toBinary(
+            ResolveWorkingCopyBaseResponseSchema,
+            create(ResolveWorkingCopyBaseResponseSchema, {
+              base: { kind: ComparisonKind.BRANCH_POINT, base: "b".repeat(40) },
+            }),
+          ),
+        );
+      },
+      ListWorkingCopyChanges: (body) => {
+        record(
+          "ListWorkingCopyChanges",
+          fromBinary(ListWorkingCopyChangesRequestSchema, body).repository,
+        );
+        return proto(
+          toBinary(
+            ListWorkingCopyChangesResponseSchema,
+            create(ListWorkingCopyChangesResponseSchema, {
+              base: { kind: ComparisonKind.BRANCH_POINT, base: "b".repeat(40) },
+            }),
+          ),
+        );
+      },
+      // A server-streaming request arrives in one envelope: a 5-byte header, then the message.
+      ReadBaseFile: (body) => {
+        record("ReadBaseFile", fromBinary(ReadBaseFileRequestSchema, body.subarray(5)).repository);
+        return new Response(
+          frames([
+            toBinary(
+              ReadBaseFileResponseSchema,
+              create(ReadBaseFileResponseSchema, {
+                metadata: { size: 2n, encoding: ContentEncoding.UTF8 },
+                data: new TextEncoder().encode("hi"),
+              }),
+            ),
+          ]),
+          { headers: CONNECT_HEADERS },
+        );
+      },
+      ListRepositoryRefs: (body) => {
+        record("ListRepositoryRefs", fromBinary(ListRepositoryRefsRequestSchema, body).repository);
+        return proto(
+          toBinary(ListRepositoryRefsResponseSchema, create(ListRepositoryRefsResponseSchema, {})),
+        );
+      },
+      ListBranchCommits: (body) => {
+        record("ListBranchCommits", fromBinary(ListBranchCommitsRequestSchema, body).repository);
+        return proto(
+          toBinary(ListBranchCommitsResponseSchema, create(ListBranchCommitsResponseSchema, {})),
+        );
+      },
+    });
+    const branchPoint = { kind: ComparisonKind.BRANCH_POINT };
+    const file = { commit: "c".repeat(40), path: "a.ts", object: "o".repeat(40) };
+    const range = { base: "main", head: "" };
+    const folder = ".worktrees/feature";
+    const askAll = (session: string) => [
+      listWorkingCopyChangesViaWorkspaceApi(session, branchPoint, undefined, folder),
+      resolveWorkingCopyBaseViaWorkspaceApi(session, branchPoint, undefined, folder),
+      readBaseFileViaWorkspaceApi(session, file, undefined, folder),
+      listRepositoryRefsViaWorkspaceApi(session, undefined, folder),
+      listBranchCommitsViaWorkspaceApi(session, range, undefined, folder),
+    ];
+
+    // An older host would compare the workspace instead, so nothing is sent to it.
+    const older = "s-folder-older";
+    expect(await Promise.all(askAll(older))).toEqual([null, null, null, null, null]);
+    for (const method of [
+      "ListWorkingCopyChanges",
+      "ResolveWorkingCopyBase",
+      "ReadBaseFile",
+      "ListRepositoryRefs",
+      "ListBranchCommits",
+    ]) {
+      expect(methodCalls(method), method).toHaveLength(0);
+    }
+    // Its workspace listing still goes through, naming no folder.
+    await listWorkingCopyChangesViaWorkspaceApi(older, branchPoint);
+    expect(folders).toEqual({ ListWorkingCopyChanges: [""] });
+
+    // A host that lists the feature gets the folder on every one of the five requests.
+    features = ["comparison.repository"];
+    const answers = await Promise.all(askAll("s-folder-current"));
+    expect(answers.every((answer) => answer !== null)).toBe(true);
+    expect(folders).toEqual({
+      ListWorkingCopyChanges: ["", folder],
+      ResolveWorkingCopyBase: [folder],
+      ReadBaseFile: [folder],
+      ListRepositoryRefs: [folder],
+      ListBranchCommits: [folder],
+    });
+  });
+
   it("answers null when the host doesn't serve the method", async () => {
     enable("workspace_api_server_access");
     serveMethods({
@@ -1629,3 +1763,497 @@ describe("Git comparisons through the workspace API", () => {
 function envelopePayload(body: Uint8Array): Uint8Array {
   return body.subarray(5, 5 + new DataView(body.buffer, body.byteOffset).getUint32(1));
 }
+
+const prPayload = (payload: Record<string, unknown>): Uint8Array<ArrayBuffer> =>
+  toBinary(
+    GetPullRequestResponseSchema,
+    create(GetPullRequestResponseSchema, { payload: payload as never }),
+  ) as Uint8Array<ArrayBuffer>;
+const commentPosted = (): Uint8Array<ArrayBuffer> =>
+  toBinary(
+    CreateCommentResponseSchema,
+    create(CreateCommentResponseSchema, { payload: { id: "c-1" } }),
+  ) as Uint8Array<ArrayBuffer>;
+/** A refused call's Connect error body, with its reason detail. */
+function refusalBody(code: string, reason: string) {
+  const detail = toBinary(PullRequestFailureSchema, create(PullRequestFailureSchema, { reason }));
+  const value = btoa(String.fromCharCode(...detail)).replace(/=+$/, "");
+  return {
+    code,
+    message: "This pull request changed",
+    details: [{ type: "omnigent.api.workspace.v1alpha1.PullRequestFailure", value }],
+  };
+}
+/** The direct host's refusal of a pull request the token doesn't list. */
+const notGrantedFromSocket = (): WorkspaceSocketResponse =>
+  fromSocket(
+    new TextEncoder().encode(
+      JSON.stringify(refusalBody("failed_precondition", "pull_request_not_granted")),
+    ),
+    400,
+  );
+const directGrantResponse = () =>
+  Response.json({
+    host_id: "host-1",
+    socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
+    token: "tok",
+    expires_at: Date.now() / 1000 + 300,
+  });
+const PR_URL = "https://github.com/example/project/pull/7";
+/** A unary answer from the host's socket. */
+const unaryFromSocket = (body: Uint8Array<ArrayBuffer>): WorkspaceSocketResponse => ({
+  status: 200,
+  headers: PROTO_HEADERS,
+  body,
+});
+
+describe("callPullRequestMethod", () => {
+  const getPullRequest = (sessionId: string) =>
+    callPullRequestMethod(sessionId, "getPullRequest", async (client) => {
+      const response = await client.getPullRequest({ prUrl: PR_URL });
+      return response.payload;
+    });
+
+  it("reads through the server route where its host lists the method", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
+      GetPullRequest: () =>
+        new Response(prPayload({ object: "session.github.info", available: true }), {
+          headers: PROTO_HEADERS,
+        }),
+    });
+
+    expect(await getPullRequest("s-pr-read")).toEqual({
+      object: "session.github.info",
+      available: true,
+    });
+  });
+
+  it("leaves the read to REST when the route doesn't list it for this caller", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("ListDirectory"), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await getPullRequest("s-pr-unlisted")).toBeNull();
+    expect(methodCalls("GetPullRequest")).toHaveLength(0);
+  });
+
+  it("throws a refusal with its reason, and tries no other route", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    socket.mockImplementation(async (request) =>
+      methodOf((request as { path: string }).path) === "GetCapabilities"
+        ? unaryFromSocket(capabilitiesBody("GetPullRequest"))
+        : fromSocket(
+            new TextEncoder().encode(
+              JSON.stringify(refusalBody("failed_precondition", "pull_request_changed")),
+            ),
+            400,
+          ),
+    );
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
+      GetPullRequest: () =>
+        new Response(prPayload({ available: true }), { headers: PROTO_HEADERS }),
+    });
+
+    const refused = await getPullRequest("s-pr-refused").catch((error: unknown) => error);
+
+    expect(refused).toBeInstanceOf(ConnectError);
+    expect((refused as ConnectError).code).toBe(Code.FailedPrecondition);
+    expect(pullRequestFailureReason(refused)).toBe("pull_request_changed");
+    expect(methodCalls("GetPullRequest")).toHaveLength(0);
+  });
+
+  it("reads through the next route when the first one is away", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    socket.mockImplementation(async (request) =>
+      methodOf((request as { path: string }).path) === "GetCapabilities"
+        ? unaryFromSocket(capabilitiesBody("GetPullRequest"))
+        : fromSocket(new TextEncoder().encode('{"code":"unavailable"}'), 503),
+    );
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
+      GetPullRequest: () =>
+        new Response(prPayload({ available: true }), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await getPullRequest("s-pr-away")).toEqual({ available: true });
+    expect(methodCalls("GetPullRequest")).toHaveLength(1);
+  });
+
+  it("gets one fresh grant for a pull request the token doesn't list, then reads", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let reads = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("GetPullRequest"));
+      }
+      reads += 1; // linked after the first token was signed
+      return reads === 1 ? notGrantedFromSocket() : unaryFromSocket(prPayload({ available: true }));
+    });
+    serveMethods({ "direct-access": directGrantResponse });
+
+    expect(await getPullRequest("s-pr-newly-linked")).toEqual({ available: true });
+    expect(reads).toBe(2);
+    expect(grantRequests()).toBe(2);
+    expect(methodCalls("GetPullRequest")).toHaveLength(0);
+  });
+
+  it("throws the refusal when the fresh grant doesn't list the pull request either", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let reads = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("GetPullRequest"));
+      }
+      reads += 1;
+      return notGrantedFromSocket();
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
+    });
+
+    const refused = await getPullRequest("s-pr-not-granted").catch((error: unknown) => error);
+
+    expect(pullRequestFailureReason(refused)).toBe("pull_request_not_granted");
+    expect(reads).toBe(2);
+    expect(grantRequests()).toBe(2);
+    expect(methodCalls("GetPullRequest")).toHaveLength(0);
+  });
+});
+
+describe("callPullRequestWrite", () => {
+  const comment = (sessionId: string, signal?: AbortSignal) =>
+    callPullRequestWrite(
+      sessionId,
+      "createComment",
+      async (client) => {
+        const response = await client.createComment(
+          { prUrl: PR_URL, body: "Looks good" },
+          { signal },
+        );
+        return response.payload;
+      },
+      { signal },
+    );
+
+  it("doesn't send a comment again when the connection drops after the host posted it", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let posted = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      posted += 1; // the host ran gh, then the socket closed before its answer
+      throw new Error("socket hang up");
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    const failed = await comment("s-pr-drop").catch((error: unknown) => error);
+
+    expect(failed).toBeInstanceOf(PullRequestMaybeSentError);
+    expect((failed as Error).message).toBe("This may have been sent. Refresh to check.");
+    expect(posted).toBe(1);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("doesn't send it again when the server route fails mid-call", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => Response.json({ code: "unavailable" }, { status: 503 }),
+    });
+
+    await expect(comment("s-pr-server-drop")).rejects.toBeInstanceOf(PullRequestMaybeSentError);
+    expect(methodCalls("CreateComment")).toHaveLength(1);
+  });
+
+  it("gets one fresh grant for a refused token and posts once on the same route", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let refusedOnce = false;
+    let capabilityChecks = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        capabilityChecks += 1;
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      if (!refusedOnce) {
+        refusedOnce = true; // the host checks the token before it dispatches
+        return fromSocket(new TextEncoder().encode('{"code":"unauthenticated"}'), 401);
+      }
+      return unaryFromSocket(commentPosted());
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await comment("s-pr-expired")).toEqual({ id: "c-1" });
+    expect(grantRequests()).toBe(2);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+    // A restarted host may serve other methods, so the next write asks it again.
+    expect(await comment("s-pr-expired")).toEqual({ id: "c-1" });
+    expect(capabilityChecks).toBe(2);
+  });
+
+  it("throws a second refused token, without trying another route", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let sends = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      sends += 1; // a fresh token is refused too
+      return fromSocket(new TextEncoder().encode('{"code":"unauthenticated"}'), 401);
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    const refused = await comment("s-pr-refused-twice").catch((error: unknown) => error);
+
+    expect((refused as ConnectError).code).toBe(Code.Unauthenticated);
+    expect(sends).toBe(2);
+    expect(grantRequests()).toBe(2);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("gets one fresh grant for a pull request the token doesn't list, then posts once", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let sends = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      sends += 1; // the host checks the token's pull requests before it posts
+      return sends === 1 ? notGrantedFromSocket() : unaryFromSocket(commentPosted());
+    });
+    serveMethods({ "direct-access": directGrantResponse });
+
+    expect(await comment("s-pr-write-newly-linked")).toEqual({ id: "c-1" });
+    expect(sends).toBe(2);
+    expect(grantRequests()).toBe(2);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("throws the refusal when the fresh grant doesn't list the pull request either", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let sends = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      sends += 1;
+      return notGrantedFromSocket();
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+    });
+
+    const refused = await comment("s-pr-write-not-granted").catch((error: unknown) => error);
+
+    expect(pullRequestFailureReason(refused)).toBe("pull_request_not_granted");
+    expect(sends).toBe(2);
+    expect(grantRequests()).toBe(2);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("counts a connection refused after the capability check as maybe sent", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => {
+        throw new TypeError("Failed to fetch"); // refused, or dropped after sending
+      },
+    });
+
+    await expect(comment("s-pr-refused-after-check")).rejects.toBeInstanceOf(
+      PullRequestMaybeSentError,
+    );
+    expect(methodCalls("CreateComment")).toHaveLength(1);
+  });
+
+  it("moves on without sending when a route can't say what it serves", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    socket.mockRejectedValue(new Error("not a workspace socket on this machine"));
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await comment("s-pr-refused-socket")).toEqual({ id: "c-1" });
+    expect(methodCalls("CreateComment")).toHaveLength(1);
+  });
+
+  it("throws a refusal and sends nothing anywhere else", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let sends = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      sends += 1;
+      return fromSocket(
+        new TextEncoder().encode(
+          JSON.stringify(refusalBody("permission_denied", "read_only_code_host")),
+        ),
+        403,
+      );
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    const refused = await comment("s-pr-denied").catch((error: unknown) => error);
+
+    expect((refused as ConnectError).code).toBe(Code.PermissionDenied);
+    expect(pullRequestFailureReason(refused)).toBe("read_only_code_host");
+    expect(sends).toBe(1);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("posts once on the next route when a host lists the write but doesn't serve it", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let directSends = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      directSends += 1; // the host answers without acting
+      return fromSocket(new TextEncoder().encode('{"code":"unimplemented"}'), 501);
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await comment("s-pr-unimplemented")).toEqual({ id: "c-1" });
+    expect(await comment("s-pr-unimplemented")).toEqual({ id: "c-1" });
+    expect(directSends).toBe(1);
+    expect(methodCalls("CreateComment")).toHaveLength(2);
+  });
+
+  it("counts a write cancelled after it left as maybe sent, and doesn't send it again", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    const controller = new AbortController();
+    let posted = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      posted += 1;
+      controller.abort(); // the reader leaves while the host is posting
+      return new Promise<never>(() => {});
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    const failed = await comment("s-pr-cancelled", controller.signal).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failed).toBeInstanceOf(PullRequestMaybeSentError);
+    expect(posted).toBe(1);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("stops without sending when it's cancelled before the request leaves", async () => {
+    enable("workspace_api_server_access");
+    const controller = new AbortController();
+    controller.abort();
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+    });
+
+    await expect(comment("s-pr-cancelled-early", controller.signal)).rejects.toBe(
+      controller.signal.reason,
+    );
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("leaves the write to REST only when no route lists it", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await comment("s-pr-write-unlisted")).toBeNull();
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+});
+
+describe("servingRoutes", () => {
+  it("lists the routes that answered, in call order, and why the rest didn't", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    const away = new Error("not a workspace socket on this machine");
+    socket.mockRejectedValue(away);
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest", "CreateComment"), {
+          headers: PROTO_HEADERS,
+        }),
+    });
+
+    const answers = await servingRoutes("s-routes-partial");
+
+    expect(answers.serving.map(({ route }) => route)).toEqual(["server"]);
+    expect([...answers.serving[0]!.served].sort()).toEqual(["CreateComment", "GetPullRequest"]);
+    expect(answers.failures).toHaveLength(1);
+  });
+
+  it("answers nothing where no route is turned on", async () => {
+    enable();
+    expect(await servingRoutes("s-routes-none")).toEqual({ serving: [], failures: [] });
+  });
+
+  it("throws the cancel instead of counting it as a failed route", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(servingRoutes("s-routes-cancelled", controller.signal)).rejects.toBe(
+      controller.signal.reason,
+    );
+  });
+});

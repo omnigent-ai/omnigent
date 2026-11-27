@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { KeyChordInput } from "./chord";
+import { chordKeys, type KeyChordInput } from "./chord";
 import {
   activeShortcutChords,
+  APP_SHORTCUT_BINDINGS,
   codeMirrorKey,
   currentShortcutEnvironment,
   matchedShortcutChordIndex,
   matchesShortcut,
+  menuShortcutChords,
+  OPEN_SESSION_CHORDS,
+  primaryShortcutChords,
+  QUICK_PICK_SHORTCUT_BINDINGS,
   SHORTCUT_BINDINGS,
   SHORTCUT_GROUPS,
   shortcutBinding,
@@ -42,9 +47,6 @@ describe("shortcut registry", () => {
       "shortcuts.show",
       "tab.close",
       "window.close",
-      "session.pin",
-      "session.archive",
-      "session.fork",
       "app.quit",
       "composer.send",
       "composer.sendWithQueue",
@@ -90,13 +92,115 @@ describe("shortcut registry", () => {
       "slash.apply",
       "slash.dismiss",
     ]);
-    for (const binding of SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
+    for (const binding of APP_SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
     expect(shortcutBinding("settings.open").label).toBe("Open Settings");
   });
 
+  it("keeps the bindings that wait for quick_pick_palette apart, in page order", () => {
+    expect(QUICK_PICK_SHORTCUT_BINDINGS.map((binding) => binding.id)).toEqual([
+      "session.pin",
+      "session.archive",
+      "session.fork",
+      "message.previous",
+      "message.next",
+      "session.next",
+      "session.previous",
+      "session.recent",
+      "session.recentReverse",
+    ]);
+    expect(APP_SHORTCUT_BINDINGS).toHaveLength(
+      SHORTCUT_BINDINGS.length + QUICK_PICK_SHORTCUT_BINDINGS.length,
+    );
+    // The Session menu's three keep their page position, between Close window and Quit.
+    const ids = APP_SHORTCUT_BINDINGS.map((binding) => binding.id);
+    const pin = ids.indexOf("session.pin");
+    expect(ids.slice(pin - 1, pin + 4)).toEqual([
+      "window.close",
+      "session.pin",
+      "session.archive",
+      "session.fork",
+      "app.quit",
+    ]);
+  });
+
+  it("matches a secondary chord without showing it, and AltGr as the transcript does", () => {
+    const shiftPrevious = {
+      key: "ArrowUp",
+      code: "ArrowUp",
+      metaKey: true,
+      ctrlKey: false,
+      altKey: true,
+      shiftKey: true,
+    };
+    expect(matchesShortcut(shiftPrevious, "message.previous", mac)).toBe(true);
+    expect(primaryShortcutChords("message.previous", mac)).toEqual([
+      { mod: true, alt: true, key: "ArrowUp", exactKey: true, matchesAltGraph: true },
+    ]);
+    expect(shortcutKeys("message.previous", mac)).toEqual(["⌘", "⌥", "↑"]);
+    // Firefox on macOS reports Option as AltGr; elsewhere AltGr is Ctrl+Alt typing a character.
+    const altGraph = { ...shiftPrevious, shiftKey: false, altGraph: true };
+    expect(matchesShortcut(altGraph, "message.previous", mac)).toBe(true);
+    expect(
+      matchesShortcut({ ...altGraph, metaKey: false, ctrlKey: true }, "message.previous", other),
+    ).toBe(false);
+    expect(
+      matchesShortcut(
+        { ...altGraph, metaKey: false, ctrlKey: true, altGraph: false },
+        "message.previous",
+        other,
+      ),
+    ).toBe(true);
+  });
+
+  it("gives a binding that waits for quick_pick_palette no chord another has, in any environment", () => {
+    // Chords the registry already shares on purpose, each with why.
+    const shared: Record<string, string> = {
+      // With quick_pick_palette on, Ctrl+Tab steps sessions instead of switching recent ones.
+      "session.next sessions.recent": "takes over",
+      "session.previous sessions.recent": "takes over",
+      // A focused file editor adds a cursor and takes the key first; the message steps yield.
+      "file.addCursorAbove message.previous": "focused editor first",
+      "file.addCursorBelow message.next": "focused editor first",
+    };
+    const environments = [true, false].flatMap((isMac) =>
+      [true, false].flatMap((native) =>
+        [true, false].map((desktopMenu) => ({ mac: isMac, native, desktopMenu })),
+      ),
+    );
+    const collisions = new Set<string>();
+    for (const environment of environments) {
+      const owners = new Map<string, string[]>();
+      for (const binding of [...APP_SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS]) {
+        for (const chord of activeShortcutChords(binding.id, environment)) {
+          const signature = chordKeys(chord, environment.mac).join(" ");
+          owners.set(signature, [...(owners.get(signature) ?? []), binding.id]);
+        }
+      }
+      for (const ids of owners.values()) {
+        const distinct = [...new Set(ids)].toSorted();
+        const flagged = distinct.some((id) => shortcutBinding(id as ShortcutId).flag);
+        if (flagged && distinct.length > 1 && !(distinct.join(" ") in shared)) {
+          collisions.add(distinct.join(" "));
+        }
+      }
+    }
+    expect([...collisions]).toEqual([]);
+  });
+
+  it("gives a browser the Session menu's Pin, Fork and Archive keys, and the menu its own", () => {
+    const menu = { mac: true, native: true, desktopMenu: true };
+    expect(activeShortcutChords("session.pin", menu)).toEqual([]);
+    expect(menuShortcutChords("session.pin", menu)).toEqual([OPEN_SESSION_CHORDS.pin]);
+    expect(activeShortcutChords("session.pin", mac)).toEqual([OPEN_SESSION_CHORDS.pin]);
+    // Off macOS, Ctrl+Alt+P and Ctrl+Alt+F stay Go to a file and Search text in files.
+    expect(activeShortcutChords("session.pin", other)).toEqual([]);
+    expect(activeShortcutChords("session.fork", other)).toEqual([]);
+    expect(activeShortcutChords("session.archive", other)).toEqual([OPEN_SESSION_CHORDS.archive]);
+  });
+
   it("draws each alternative and part on a binding's own row", () => {
-    const ids = new Set<string>(SHORTCUT_BINDINGS.map((binding) => binding.id));
-    for (const binding of SHORTCUT_BINDINGS) {
+    const ids = new Set<string>(APP_SHORTCUT_BINDINGS.map((binding) => binding.id));
+    for (const binding of APP_SHORTCUT_BINDINGS) {
       const row = binding.alternateOf ?? binding.partOf;
       if (row === undefined) continue;
       expect(ids.has(row), binding.id).toBe(true);
@@ -128,6 +232,23 @@ describe("shortcut registry", () => {
         native: true,
       }),
     ).toBe(true);
+  });
+
+  it("removes selected pull requests with ⌘ or Control and Backspace on every platform", () => {
+    for (const environment of [mac, other]) {
+      for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
+        expect(
+          matchesShortcut(
+            press({ key: "Backspace", ...modifier }),
+            "pullRequests.removeSelected",
+            environment,
+          ),
+        ).toBe(true);
+      }
+      expect(
+        matchesShortcut(press({ key: "Backspace" }), "pullRequests.removeSelected", environment),
+      ).toBe(false);
+    }
   });
 
   it("renames with the physical R key, whatever character Option types", () => {

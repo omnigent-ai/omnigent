@@ -132,6 +132,8 @@ export interface QuickPickProps<Value> {
   groupActions?: (group: string) => readonly QuickPickGroupAction[];
   /** Each group's heading shows how many of its rows are listed. */
   groupCounts?: boolean;
+  /** Content under the query field across the picker's width, such as a search's filters. */
+  belowInput?: ReactNode;
   autoFocus?: boolean;
   /**
    * A row the caller wants active, such as the last row before ones still loading.
@@ -156,8 +158,15 @@ export interface QuickPickProps<Value> {
   /** Grow the results to fill the container, such as a full-screen sheet on phones. */
   fillHeight?: boolean;
   /**
+   * The active row's preview, shown beside the list, such as a file's contents. Without it the
+   * list takes the picker's whole width.
+   */
+  renderPreview?: (item: QuickPickItem<Value>) => ReactNode;
+  /**
    * `sidebar` is a search field in a sidebar: results show only while there is a query, as
-   * two-line rows, with the field in a muted well and a button that clears it.
+   * two-line rows, with the field in a muted well and a button that clears it. `switcher` is a
+   * compact list for a transient switcher driven by shortcuts: no visible query field, and the
+   * list sized to its rows.
    */
   presentation?: QuickPickPresentation;
   /** Receives the query field, such as to focus it from outside the picker. */
@@ -165,7 +174,7 @@ export interface QuickPickProps<Value> {
   className?: string;
 }
 
-export type QuickPickPresentation = "default" | "sidebar";
+export type QuickPickPresentation = "default" | "switcher" | "sidebar";
 
 function readRecents(historyKey: string | undefined): string[] {
   return historyKey ? readQuickPickHistory(historyKey) : [];
@@ -356,6 +365,64 @@ function navigationFor(
   }
 }
 
+/** The list's and the preview's height side by side, so neither jumps as the rows change. */
+const PREVIEW_HEIGHT = "h-[min(24rem,60vh)]";
+
+/** The result list's height: the container's, a switcher's rows, beside a preview, or capped. */
+function listHeightClass({
+  fillHeight,
+  switcher,
+  preview,
+}: {
+  fillHeight: boolean;
+  switcher: boolean;
+  preview: boolean;
+}): string {
+  if (fillHeight) return "min-h-0 flex-1";
+  if (switcher) return "max-h-[min(24rem,60vh)] min-h-16";
+  return preview ? PREVIEW_HEIGHT : "max-h-72";
+}
+
+/**
+ * The list alone, or beside the active row's preview when the picker has one. A row with
+ * nothing to preview, or no active row, shows "No preview" in the same place.
+ */
+function PreviewBeside({
+  enabled,
+  preview,
+  fillHeight,
+  hidden,
+  children,
+}: {
+  enabled: boolean;
+  preview: ReactNode;
+  fillHeight: boolean;
+  hidden: boolean;
+  children: ReactNode;
+}) {
+  if (!enabled) return children;
+  return (
+    <div className={cn("flex min-h-0", fillHeight && "flex-1", hidden && "hidden")}>
+      {children}
+      <div
+        data-slot="quick-pick-preview"
+        className={cn(
+          "min-w-0 flex-1 overflow-auto border-l border-border",
+          fillHeight ? "min-h-0" : PREVIEW_HEIGHT,
+        )}
+      >
+        {preview === undefined || preview === null || preview === false ? (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+            No preview
+          </div>
+        ) : (
+          preview
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function QuickPick<Value>({
   label,
   placeholder,
@@ -392,6 +459,8 @@ export function QuickPick<Value>({
   inputTestId,
   loop = false,
   fillHeight = false,
+  renderPreview,
+  belowInput,
   presentation = "default",
   inputRef,
   className,
@@ -402,6 +471,7 @@ export function QuickPick<Value>({
   // Keyed by the row, not its position, so an option keeps its ID when results above it change.
   const optionId = (row: QuickPickRow<Value>) => `${baseId}-option-${encodeURIComponent(row.key)}`;
   const sidebar = presentation === "sidebar";
+  const switcher = presentation === "switcher";
   // A sidebar search shows only its field until there is something to search for, so
   // no row is listed (or can be picked) while collapsed.
   const collapsed = sidebar && query.trim().length === 0;
@@ -1052,14 +1122,17 @@ export function QuickPick<Value>({
         className,
       )}
     >
+      {/* A switcher has no visible query; the field still holds focus and the list's keys, and
+          the header shows no other control, which would take focus where nothing shows. */}
       <div
         onKeyDown={handleHeaderKeyDown}
         className={cn(
           "flex items-center gap-2",
           sidebar ? "rounded-lg bg-muted px-2" : "border-b border-border px-3 py-2",
+          switcher && "sr-only",
         )}
       >
-        {onBack ? (
+        {onBack && !switcher ? (
           // No tooltip: an open tooltip would take Escape from the dialog. The footer shows esc Back.
           <Button
             type="button"
@@ -1093,6 +1166,7 @@ export function QuickPick<Value>({
           autoCorrect="off"
           spellCheck={false}
           placeholder={placeholder}
+          readOnly={switcher}
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
           onKeyDown={handleKeyDown}
@@ -1116,134 +1190,143 @@ export function QuickPick<Value>({
             <XIcon />
           </Button>
         )}
-        {inputEnd}
+        {!switcher && inputEnd}
       </div>
-      <div
-        ref={scrollRef}
-        data-slot="quick-pick-scroll"
-        onKeyDown={handleResultsKeyDown}
-        className={cn(
-          "overflow-y-auto p-1",
-          fillHeight ? "min-h-0 flex-1" : "max-h-72",
-          collapsed && "hidden",
-        )}
+      {belowInput}
+      <PreviewBeside
+        enabled={renderPreview !== undefined}
+        preview={renderPreview && activeRow ? renderPreview(activeRow.item) : null}
+        fillHeight={fillHeight}
+        hidden={collapsed}
       >
-        {status && <div data-slot="quick-pick-status">{status}</div>}
-        {/* Announces the empty message, shown, or the result count, visually hidden, with a
-            failure beside rows that remain. */}
         <div
-          role="status"
-          aria-live="polite"
-          data-slot={showEmpty ? "quick-pick-empty" : undefined}
-          className={
-            showEmpty && (loading || sourceError || emptyMessage)
-              ? "flex items-center justify-center gap-2 py-6 text-center text-ui"
-              : "sr-only"
-          }
-        >
-          {collapsed ? null : showEmpty ? (
-            loading ? (
-              <>
-                <Spinner aria-hidden role="presentation" />
-                Loading results…
-              </>
-            ) : (
-              (sourceError ?? emptyMessage)
-            )
-          ) : sourceError ? (
-            `${resultCountText(resultCount)}. ${sourceError}`
-          ) : (
-            resultCountText(resultCount)
+          ref={scrollRef}
+          data-slot="quick-pick-scroll"
+          onKeyDown={handleResultsKeyDown}
+          className={cn(
+            "overflow-y-auto p-1",
+            listHeightClass({ fillHeight, switcher, preview: renderPreview !== undefined }),
+            renderPreview && "w-[45%] shrink-0",
+            collapsed && "hidden",
           )}
-        </div>
-        {sourceError && !collapsed && (
-          // Outside the status region, which announces the failure itself.
+        >
+          {status && <div data-slot="quick-pick-status">{status}</div>}
+          {/* Announces the empty message, shown, or the result count, visually hidden, with a
+            failure beside rows that remain. */}
           <div
-            className={cn(
-              "flex items-center justify-center gap-2 text-sm",
-              showEmpty ? "pb-4" : "px-2 py-1.5 text-destructive",
-            )}
+            role="status"
+            aria-live="polite"
+            data-slot={showEmpty ? "quick-pick-empty" : undefined}
+            className={
+              showEmpty && (loading || sourceError || emptyMessage)
+                ? "flex items-center justify-center gap-2 py-6 text-center text-ui"
+                : "sr-only"
+            }
           >
-            {!showEmpty && <span>{sourceError}</span>}
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                retry();
-                // The button leaves once the retry starts, so the query keeps the keys.
-                queryFieldRef.current?.focus();
-              }}
-            >
-              Try again
-            </Button>
+            {collapsed ? null : showEmpty ? (
+              loading ? (
+                <>
+                  <Spinner aria-hidden role="presentation" />
+                  Loading results…
+                </>
+              ) : (
+                (sourceError ?? emptyMessage)
+              )
+            ) : sourceError ? (
+              `${resultCountText(resultCount)}. ${sourceError}`
+            ) : (
+              resultCountText(resultCount)
+            )}
           </div>
-        )}
-        <div role="presentation" className="relative">
-          <div ref={listboxRef} id={listId} role="listbox" aria-label={label}>
-            {sections.map((section, sectionIndex) => {
-              const headingId = section.heading ? `${baseId}-heading-${sectionIndex}` : undefined;
-              return (
-                <div
-                  key={section.heading?.key ?? `section-${sectionIndex}`}
-                  role="group"
-                  aria-labelledby={headingId}
-                  className="pb-1"
-                >
-                  {section.heading && renderHeading(section.heading, headingId)}
-                  {runsOf(section.rows, cardsShown).map((run) =>
-                    run.cards ? (
-                      // Cards flow two to a line where the list is wide enough; arrows keep reading order.
-                      <div
-                        key={run.rows[0].row.key}
-                        role="presentation"
-                        data-slot="quick-pick-cards"
-                        className="@container/cards"
-                      >
-                        <div className="grid grid-cols-1 gap-1 p-0.5 @[22rem]/cards:grid-cols-2">
-                          {run.rows.map(({ row, index }) => renderCard(row, index))}
-                        </div>
-                      </div>
-                    ) : (
-                      run.rows.map(({ row, index }) => renderOption(row, index))
-                    ),
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          {headingActionBars.map((bar) => (
+          {sourceError && !collapsed && (
+            // Outside the status region, which announces the failure itself.
             <div
-              key={bar.key}
-              data-slot="quick-pick-group-actions"
-              data-actions-for={bar.key}
-              style={{ top: bar.top, height: bar.height }}
-              className="absolute right-1 flex items-center gap-0.5"
+              className={cn(
+                "flex items-center justify-center gap-2 text-sm",
+                showEmpty ? "pb-4" : "px-2 py-1.5 text-destructive",
+              )}
             >
-              {(headingActions.get(bar.key) ?? NO_GROUP_ACTIONS).map((action) => (
-                <Button
-                  key={action.id}
-                  type="button"
-                  variant="ghost"
-                  size="xs"
-                  data-slot="quick-pick-group-action"
-                  aria-label={action.ariaLabel}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => {
-                    action.run();
-                    // The button may leave with its group, so the query keeps the keys.
-                    queryFieldRef.current?.focus();
-                  }}
-                  className="font-normal text-muted-foreground hover:text-foreground"
-                >
-                  {action.label}
-                </Button>
-              ))}
+              {!showEmpty && <span>{sourceError}</span>}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  retry();
+                  // The button leaves once the retry starts, so the query keeps the keys.
+                  queryFieldRef.current?.focus();
+                }}
+              >
+                Try again
+              </Button>
             </div>
-          ))}
+          )}
+          <div role="presentation" className="relative">
+            <div ref={listboxRef} id={listId} role="listbox" aria-label={label}>
+              {sections.map((section, sectionIndex) => {
+                const headingId = section.heading ? `${baseId}-heading-${sectionIndex}` : undefined;
+                return (
+                  <div
+                    key={section.heading?.key ?? `section-${sectionIndex}`}
+                    role="group"
+                    aria-labelledby={headingId}
+                    className="pb-1"
+                  >
+                    {section.heading && renderHeading(section.heading, headingId)}
+                    {runsOf(section.rows, cardsShown).map((run) =>
+                      run.cards ? (
+                        // Cards flow two to a line where the list is wide enough; arrows keep reading order.
+                        <div
+                          key={run.rows[0].row.key}
+                          role="presentation"
+                          data-slot="quick-pick-cards"
+                          className="@container/cards"
+                        >
+                          <div className="grid grid-cols-1 gap-1 p-0.5 @[22rem]/cards:grid-cols-2">
+                            {run.rows.map(({ row, index }) => renderCard(row, index))}
+                          </div>
+                        </div>
+                      ) : (
+                        run.rows.map(({ row, index }) => renderOption(row, index))
+                      ),
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            {headingActionBars.map((bar) => (
+              <div
+                key={bar.key}
+                data-slot="quick-pick-group-actions"
+                data-actions-for={bar.key}
+                style={{ top: bar.top, height: bar.height }}
+                className="absolute right-1 flex items-center gap-0.5"
+              >
+                {(headingActions.get(bar.key) ?? NO_GROUP_ACTIONS).map((action) => (
+                  <Button
+                    key={action.id}
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    data-slot="quick-pick-group-action"
+                    aria-label={action.ariaLabel}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => {
+                      action.run();
+                      // The button may leave with its group, so the query keeps the keys.
+                      queryFieldRef.current?.focus();
+                    }}
+                    className="font-normal text-muted-foreground hover:text-foreground"
+                  >
+                    {action.label}
+                  </Button>
+                ))}
+              </div>
+            ))}
+          </div>
+          {listEnd}
         </div>
-        {listEnd}
-      </div>
+      </PreviewBeside>
       {showFooter && (
         <div
           onKeyDown={handleFooterKeyDown}

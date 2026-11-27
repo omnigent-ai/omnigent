@@ -7,10 +7,11 @@ import { describe, expect, it } from "vitest";
 import type { Chord, KeyChordInput } from "@/lib/shortcuts/chord";
 import {
   activeShortcutChords,
+  APP_SHORTCUT_BINDINGS,
   codeMirrorKeys,
   matchesShortcut,
-  SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
+  type ShortcutPageContext,
   type ShortcutId,
   shortcutAriaKeys,
   shortcutBinding,
@@ -27,6 +28,20 @@ const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   ),
 );
 
+const EVERYTHING_SUPPORTED: ShortcutPageContext = {
+  native: true,
+  electron: true,
+  browser: true,
+  submitWithModEnter: false,
+  preventsKeyboardSubmit: false,
+  contentSearch: true,
+  grids: true,
+  splitTerminal: true,
+  siblingSessions: true,
+  desktopCommands: true,
+  alwaysSteer: false,
+};
+
 const environmentName = ({ mac, native, desktopMenu, submitWithModEnter }: ShortcutEnvironment) =>
   [
     mac ? "mac" : "other",
@@ -35,7 +50,7 @@ const environmentName = ({ mac, native, desktopMenu, submitWithModEnter }: Short
     submitWithModEnter ? "mod-enter-sends" : "enter-sends",
   ].join(" ");
 
-const IDS: ShortcutId[] = [...SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS].map(
+const IDS: ShortcutId[] = [...APP_SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS].map(
   (binding) => binding.id,
 );
 
@@ -56,7 +71,7 @@ function pressFor(chord: Chord, mac: boolean): KeyChordInput {
 
 const chordText = (chord: Chord) =>
   [
-    chord.mod && "mod",
+    chord.mod && (chord.eitherCommandKey ? "mod(either)" : "mod"),
     chord.ctrl && "ctrl",
     chord.alt && "alt",
     chord.shift && "shift",
@@ -85,8 +100,11 @@ function surfaceLine(id: ShortcutId, environment: ShortcutEnvironment): string {
 
 /** What a typed chord finds in Settings search, for each listed binding's searchable chords. */
 function searchLine(id: ShortcutId, environment: ShortcutEnvironment, listed: Set<ShortcutId>) {
-  const found = searchableChords(id, environment).map((chord) =>
-    [...rowsForChord(pressFor(chord, environment.mac), environment, listed)].toSorted().join(","),
+  const found = searchableChords(id, environment).map(
+    (chord) =>
+      [...rowsForChord(pressFor(chord, environment.mac), environment, listed)]
+        .toSorted()
+        .join(",") || "-",
   );
   return `${id} | search=${found.join(" ") || "-"}`;
 }
@@ -97,11 +115,16 @@ describe("shortcut surfaces", () => {
   });
 
   it("read as recorded in every environment", async () => {
-    const listed = new Set<ShortcutId>(SHORTCUT_BINDINGS.map((binding) => binding.id));
+    // Every row the page can list somewhere: all it reads but those it never lists.
+    const listed = new Set<ShortcutId>(
+      APP_SHORTCUT_BINDINGS.filter(
+        (binding) => binding.shownWhen?.(EVERYTHING_SUPPORTED) ?? true,
+      ).map((binding) => binding.id),
+    );
     const lines = ENVIRONMENTS.flatMap((environment) => [
       `# ${environmentName(environment)}`,
       ...IDS.map((id) => surfaceLine(id, environment)),
-      ...SHORTCUT_BINDINGS.map(({ id }) => searchLine(id, environment, listed)),
+      ...APP_SHORTCUT_BINDINGS.map(({ id }) => searchLine(id, environment, listed)),
     ]);
     await expect(`${lines.join("\n")}\n`).toMatchFileSnapshot("./shortcutSurfaces.golden.txt");
   });

@@ -165,6 +165,10 @@ export interface WorkspaceTabsStoreOptions {
   newDraftKey?: () => string;
   /** How many comparisons the person has chosen for the session, stamped on each landing. */
   choiceCount?: () => number;
+  /** Told the file's path each time an open or a navigation lands a tab on a file. */
+  onFileOpened?: (path: string) => void;
+  /** How many times the session's folder has moved, stamped on each landing. */
+  folderCount?: () => number;
 }
 
 /** A line, column or comment move inside the same file, which history records in place. */
@@ -205,6 +209,8 @@ export interface TabLanding {
   settled: boolean;
   /** The session's choice count as it landed; a pick since is newer than the visit. */
   choices: number;
+  /** The session's folder moves as it landed; a folder chosen since is newer than the visit. */
+  folders: number;
 }
 
 export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
@@ -221,12 +227,15 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     newViewKey = () => randomUUID(),
     newDraftKey = newPendingSideChatId,
     choiceCount = () => 0,
+    onFileOpened,
+    folderCount = () => 0,
   } = options;
 
   let tabs: WorkspaceTabRecord[] = withPinnedFirst([...options.initial.tabs]);
   // Each tab's latest landing on a visit by a step, a link or an open, which its view settles once.
   const landings = new Map<TabId, TabLanding>();
-  const land = (tabId: TabId) => landings.set(tabId, { settled: false, choices: choiceCount() });
+  const land = (tabId: TabId) =>
+    landings.set(tabId, { settled: false, choices: choiceCount(), folders: folderCount() });
   let selectedTabId: TabId | null = options.initial.selectedTabId;
   let closed: ClosedTab[] = [...options.initial.closed];
   let tabSettings: AppliedTabSettings | undefined = options.initial.tabSettings;
@@ -533,6 +542,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         commit();
         return applied;
       });
+      noteFileOpened(result.tabId);
       // A tab opened into an empty sidebar is selected even when the plan didn't ask.
       return { ok: true as const, ...result, selected: selectedTabId === result.tabId };
     };
@@ -574,6 +584,12 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     return tab.id;
   }
 
+  /** Tell `onFileOpened` about the file `tabId` now shows, if it shows one. */
+  function noteFileOpened(tabId: TabId | null) {
+    const tab = tabId === null ? undefined : findTab(tabId);
+    if (tab?.place.kind === "files" && tab.place.path !== undefined) onFileOpened?.(tab.place.path);
+  }
+
   /** Show `place` in `tabId` in place: a step when the tab is selected (or a replacement). */
   async function navigate(
     tabId: TabId,
@@ -600,6 +616,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
           }
         }
         commit();
+        noteFileOpened(tabId);
         return { ok: true as const };
       }),
     );
@@ -1349,6 +1366,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     recentlySelected = recentlySelected.filter((id) => id !== tabId || next.id === tabId);
     history.replaceNewTab(tabId, { tabId: next.id, place });
     commit();
+    noteFileOpened(next.id);
     return next.id;
   }
 

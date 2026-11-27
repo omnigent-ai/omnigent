@@ -3741,7 +3741,10 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
 
     captured_spec: dict[str, Any] = {}
 
-    snapshot = {"workspace": str(tmp_path / "workspace")}
+    snapshot = {
+        "workspace": str(tmp_path / "workspace"),
+        "labels": {"omnigent.test/source": "web"},
+    }
 
     class _SnapshotServerClient:
         async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
@@ -3795,6 +3798,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     assert relay_calls[0]["session_id"] == session_id
     assert relay_calls[0]["explicit_bridge_dir"] == bridge_dir
     assert relay_calls[0]["await_notify"] is False
+    assert relay_calls[0]["session_labels"] == {"omnigent.test/source": "web"}
 
     # 2) The relay mcp_config.json landed in the ISOLATED agy HOME, not ~/.gemini.
     mcp_config = iso_home / ".gemini" / "config" / "mcp_config.json"
@@ -3808,7 +3812,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
         "serve-mcp",
     ]
     assert str(bridge_dir) in server["args"]
-    assert "sys_session_create" in server["enabledTools"]
+    assert "enabledTools" not in server
     # The bridge token the shared relay needs was written into the bridge dir.
     assert (bridge_dir / "bridge.json").is_file()
 
@@ -3818,15 +3822,14 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     assert "HOME" not in captured_spec["env"]
     assert captured_spec["env"]["AGY_ENV"] == "1"
 
-    # 4) The session workspace is pre-trusted AND the feedback survey is disabled
-    #    in the SAME isolated settings.json agy reads under --gemini_dir (#1598 +
-    #    #1494), proving the trust seed and the survey-disable compose in the
-    #    isolated dir without one clobbering the other (the rebase conflict point).
+    # 4) The session workspace is pre-trusted, the Omnigent MCP relay is allowed,
+    #    and the feedback survey is disabled in the SAME isolated settings.json.
     settings = iso_gemini / "antigravity-cli" / "settings.json"
     assert settings.is_file()
     settings_data = json.loads(settings.read_text(encoding="utf-8"))
     workspace_key = str((tmp_path / "workspace").resolve())
     assert workspace_key in settings_data.get("trustedWorkspaces", [])
+    assert "mcp(omnigent/*)" in settings_data.get("permissions", {}).get("allow", [])
     assert settings_data.get("showFeedbackSurvey") is False
 
 

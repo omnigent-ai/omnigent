@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the antigravity-native (agy) CLI launch is scoped to a per-session Gemini dir.
 
-Run this on macOS (or Linux) before and after the #1477 / #1194 fix. It answers
+Run this on macOS (or Linux) when changing isolated relay setup. It answers
 four questions without a server, a runner, or a real agy launch:
 
 1. Does the CLI launch pass ``--gemini_dir=<per-session dir>``?
@@ -152,8 +152,27 @@ def main() -> int:
 
     # 2. The relay config, in the dir the flag points at.
     if relay_config.is_file():
-        tools = json.loads(relay_config.read_text())["mcpServers"]["omnigent"]["enabledTools"]
-        print(f"PASS  relay mcp_config.json written ({len(tools)} tools enabled)")
+        relay = json.loads(relay_config.read_text())["mcpServers"]["omnigent"]
+        expected_args = [
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
+        settings_path = iso_gemini / "antigravity-cli" / "settings.json"
+        settings = json.loads(settings_path.read_text())
+        allowed = settings.get("permissions", {}).get("allow", [])
+        if (
+            relay.get("command") == sys.executable
+            and relay.get("args") == expected_args
+            and "enabledTools" not in relay
+            and allowed.count("mcp(omnigent/*)") == 1
+        ):
+            print("PASS  isolated relay command, unrestricted discovery and permission rule")
+        else:
+            failures.append("isolated relay command, discovery or permission rule is incorrect")
     else:
         failures.append(f"no relay mcp_config.json at {relay_config}")
 

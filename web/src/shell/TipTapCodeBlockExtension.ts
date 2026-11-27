@@ -1,18 +1,30 @@
-// CodeBlock with a React node view (language selector + live mermaid preview),
-// registered in place of StarterKit's built-in codeBlock. Extending the base
-// keeps its `language` attribute and markdown handlers, so the fence language
-// still round-trips through markdown unchanged.
+// CodeBlock with a React node view (language selector + mermaid diagram/source),
+// registered in place of StarterKit's codeBlock. Extending the base keeps its
+// `language` attribute and markdown handlers, so fences round-trip unchanged.
 
 import { InputRule } from "@tiptap/core";
 import { CodeBlock } from "@tiptap/extension-code-block";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 import { TipTapCodeBlockView } from "./TipTapCodeBlockView";
+import { revealDecorationKey } from "./TipTapRevealDecoration";
 import { softBreaksToNewlines } from "./TipTapSoftBreak";
 import { fenceForBody } from "./markdownFence";
 
 export const CodeBlockWithLanguage = CodeBlock.extend({
   addNodeView() {
-    return ReactNodeViewRenderer(TipTapCodeBlockView);
+    return ReactNodeViewRenderer(TipTapCodeBlockView, {
+      // React node views skip re-rendering on decoration-only changes, but a
+      // mermaid block showing its diagram must reveal a find match or comment.
+      update: ({ oldNode, newNode, oldInnerDecorations, innerDecorations, updateProps }) => {
+        if (
+          newNode !== oldNode ||
+          revealDecorationKey(oldInnerDecorations) !== revealDecorationKey(innerDecorations)
+        ) {
+          updateProps();
+        }
+        return true;
+      },
+    });
   },
 
   // A code block holds text only, so converting a hard-wrapped paragraph would

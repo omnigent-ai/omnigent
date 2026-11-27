@@ -31,10 +31,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=⌃ ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=⌘ ⌥ V | aria=Meta+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact+altgr mod+alt+shift+key:ArrowUp+exact+altgr | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact+altgr mod+alt+shift+key:ArrowDown+exact+altgr | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=⌃ ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+key:b | keys=⌘ B | aria=Meta+B | editor=Mod-b | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+shift+key:b | keys=⌘ ⇧ B | aria=Meta+Shift+B | editor=Mod-Shift-b | matches=true
@@ -102,6 +108,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -134,10 +143,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=- -
+message.next | search=- -
+session.next | search=sessions.recent -
+session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -192,10 +207,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=⌃ ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=⌘ ⌥ V | aria=Meta+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact+altgr mod+alt+shift+key:ArrowUp+exact+altgr | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact+altgr mod+alt+shift+key:ArrowDown+exact+altgr | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=⌃ ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+key:b | keys=⌘ B | aria=Meta+B | editor=Mod-b | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+shift+key:b | keys=⌘ ⇧ B | aria=Meta+Shift+B | editor=Mod-Shift-b | matches=true
@@ -263,6 +284,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -295,10 +319,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=- -
+message.next | search=- -
+session.next | search=sessions.recent -
+session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -331,9 +361,9 @@ settings.open | Open Settings | group=general | chords=mod+alt+code:Comma | keys
 shortcuts.show | Show keyboard shortcuts | group=general | chords=mod+key:/+exact+altgr | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 tab.close | Close tab, or leave the session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 window.close | Close window | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.pin | Pin or unpin current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.archive | Archive current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.fork | Fork current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
+session.pin | Pin or unpin current session | group=general | chords=mod+alt+code:KeyP | keys=⌘ ⌥ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
+session.archive | Archive current session | group=general | chords=mod+shift+key:a | keys=⌘ ⇧ A | aria=Meta+Shift+A | editor=Mod-Shift-a | matches=true
+session.fork | Fork current session | group=general | chords=mod+alt+code:KeyF | keys=⌘ ⌥ F | aria=Meta+Alt+F | editor=Mod-Alt-f | matches=true
 app.quit | Quit Omnigent | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 composer.send | Send message | group=chats | chords=mod+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter | matches=true
 composer.sendWithQueue | Send now, with all queued messages | group=chats | chords=mod+shift+key:Enter | keys=⌘ ⇧ ↵ | aria=Meta+Shift+Enter | editor=Mod-Shift-Enter | matches=true
@@ -353,10 +383,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=⌃ ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=⌘ ⌥ V | aria=Meta+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact+altgr mod+alt+shift+key:ArrowUp+exact+altgr | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact+altgr mod+alt+shift+key:ArrowDown+exact+altgr | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=⌃ ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+key:b | keys=⌘ B | aria=Meta+B | editor=Mod-b | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+shift+key:b | keys=⌘ ⇧ B | aria=Meta+Shift+B | editor=Mod-Shift-b | matches=true
@@ -424,6 +460,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -434,9 +473,9 @@ settings.open | search=settings.open
 shortcuts.show | search=shortcuts.show
 tab.close | search=-
 window.close | search=-
-session.pin | search=-
-session.archive | search=-
-session.fork | search=-
+session.pin | search=session.pin
+session.archive | search=session.archive
+session.fork | search=session.fork
 app.quit | search=-
 composer.send | search=approval.accept,composer.send
 composer.sendWithQueue | search=composer.sendWithQueue
@@ -456,10 +495,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=- -
+message.next | search=- -
+session.next | search=sessions.recent -
+session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -492,9 +537,9 @@ settings.open | Open Settings | group=general | chords=mod+alt+code:Comma | keys
 shortcuts.show | Show keyboard shortcuts | group=general | chords=mod+key:/+exact+altgr | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 tab.close | Close tab, or leave the session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 window.close | Close window | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.pin | Pin or unpin current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.archive | Archive current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.fork | Fork current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
+session.pin | Pin or unpin current session | group=general | chords=mod+alt+code:KeyP | keys=⌘ ⌥ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
+session.archive | Archive current session | group=general | chords=mod+shift+key:a | keys=⌘ ⇧ A | aria=Meta+Shift+A | editor=Mod-Shift-a | matches=true
+session.fork | Fork current session | group=general | chords=mod+alt+code:KeyF | keys=⌘ ⌥ F | aria=Meta+Alt+F | editor=Mod-Alt-f | matches=true
 app.quit | Quit Omnigent | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 composer.send | Send message | group=chats | chords=key:Enter | keys=↵ | aria=Enter | editor=Enter | matches=true
 composer.sendWithQueue | Send now, with all queued messages | group=chats | chords=mod+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter | matches=true
@@ -514,10 +559,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=⌃ ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=⌘ ⌥ V | aria=Meta+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact+altgr mod+alt+shift+key:ArrowUp+exact+altgr | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact+altgr mod+alt+shift+key:ArrowDown+exact+altgr | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=⌃ ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=⌘ 1 | aria=Meta+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+key:b | keys=⌘ B | aria=Meta+B | editor=Mod-b | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+shift+key:b | keys=⌘ ⇧ B | aria=Meta+Shift+B | editor=Mod-Shift-b | matches=true
@@ -585,6 +636,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -595,9 +649,9 @@ settings.open | search=settings.open
 shortcuts.show | search=shortcuts.show
 tab.close | search=-
 window.close | search=-
-session.pin | search=-
-session.archive | search=-
-session.fork | search=-
+session.pin | search=session.pin
+session.archive | search=session.archive
+session.fork | search=session.fork
 app.quit | search=-
 composer.send | search=composer.send,question.next
 composer.sendWithQueue | search=approval.accept,composer.sendWithQueue
@@ -617,10 +671,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=- -
+message.next | search=- -
+session.next | search=sessions.recent -
+session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -675,10 +735,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=⌃ ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=⌘ ⌥ V | aria=Meta+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact+altgr mod+alt+shift+key:ArrowUp+exact+altgr | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact+altgr mod+alt+shift+key:ArrowDown+exact+altgr | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=⌃ ⌥ ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=⌃ ⌥ ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+alt+code:BracketLeft | keys=⌘ ⌥ [ | aria=Meta+Alt+[ | editor=Mod-Alt-[ | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+alt+code:BracketRight | keys=⌘ ⌥ ] | aria=Meta+Alt+] | editor=Mod-Alt-] | matches=true
@@ -746,6 +812,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -778,10 +847,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=- -
+message.next | search=- -
+session.next | search=- sessions.recent
+session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -836,10 +911,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=⌃ ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=⌘ ⌥ V | aria=Meta+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact+altgr mod+alt+shift+key:ArrowUp+exact+altgr | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact+altgr mod+alt+shift+key:ArrowDown+exact+altgr | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=⌃ ⌥ ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=⌃ ⌥ ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+alt+code:BracketLeft | keys=⌘ ⌥ [ | aria=Meta+Alt+[ | editor=Mod-Alt-[ | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+alt+code:BracketRight | keys=⌘ ⌥ ] | aria=Meta+Alt+] | editor=Mod-Alt-] | matches=true
@@ -907,6 +988,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -939,10 +1023,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=- -
+message.next | search=- -
+session.next | search=- sessions.recent
+session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -975,9 +1065,9 @@ settings.open | Open Settings | group=general | chords=mod+alt+code:Comma | keys
 shortcuts.show | Show keyboard shortcuts | group=general | chords=mod+key:/+exact+altgr | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 tab.close | Close tab, or leave the session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 window.close | Close window | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.pin | Pin or unpin current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.archive | Archive current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.fork | Fork current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
+session.pin | Pin or unpin current session | group=general | chords=mod+alt+code:KeyP | keys=⌘ ⌥ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
+session.archive | Archive current session | group=general | chords=mod+shift+key:a | keys=⌘ ⇧ A | aria=Meta+Shift+A | editor=Mod-Shift-a | matches=true
+session.fork | Fork current session | group=general | chords=mod+alt+code:KeyF | keys=⌘ ⌥ F | aria=Meta+Alt+F | editor=Mod-Alt-f | matches=true
 app.quit | Quit Omnigent | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 composer.send | Send message | group=chats | chords=mod+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter | matches=true
 composer.sendWithQueue | Send now, with all queued messages | group=chats | chords=mod+shift+key:Enter | keys=⌘ ⇧ ↵ | aria=Meta+Shift+Enter | editor=Mod-Shift-Enter | matches=true
@@ -997,10 +1087,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=⌃ ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=⌘ ⌥ V | aria=Meta+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact+altgr mod+alt+shift+key:ArrowUp+exact+altgr | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact+altgr mod+alt+shift+key:ArrowDown+exact+altgr | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=⌃ ⌥ ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=⌃ ⌥ ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+alt+code:BracketLeft | keys=⌘ ⌥ [ | aria=Meta+Alt+[ | editor=Mod-Alt-[ | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+alt+code:BracketRight | keys=⌘ ⌥ ] | aria=Meta+Alt+] | editor=Mod-Alt-] | matches=true
@@ -1068,6 +1164,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1078,9 +1177,9 @@ settings.open | search=settings.open
 shortcuts.show | search=shortcuts.show
 tab.close | search=-
 window.close | search=-
-session.pin | search=-
-session.archive | search=-
-session.fork | search=-
+session.pin | search=session.pin
+session.archive | search=session.archive
+session.fork | search=session.fork
 app.quit | search=-
 composer.send | search=approval.accept,composer.send
 composer.sendWithQueue | search=composer.sendWithQueue
@@ -1100,10 +1199,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=- -
+message.next | search=- -
+session.next | search=- sessions.recent
+session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -1136,9 +1241,9 @@ settings.open | Open Settings | group=general | chords=mod+alt+code:Comma | keys
 shortcuts.show | Show keyboard shortcuts | group=general | chords=mod+key:/+exact+altgr | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 tab.close | Close tab, or leave the session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 window.close | Close window | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.pin | Pin or unpin current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.archive | Archive current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.fork | Fork current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
+session.pin | Pin or unpin current session | group=general | chords=mod+alt+code:KeyP | keys=⌘ ⌥ P | aria=Meta+Alt+P | editor=Mod-Alt-p | matches=true
+session.archive | Archive current session | group=general | chords=mod+shift+key:a | keys=⌘ ⇧ A | aria=Meta+Shift+A | editor=Mod-Shift-a | matches=true
+session.fork | Fork current session | group=general | chords=mod+alt+code:KeyF | keys=⌘ ⌥ F | aria=Meta+Alt+F | editor=Mod-Alt-f | matches=true
 app.quit | Quit Omnigent | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 composer.send | Send message | group=chats | chords=key:Enter | keys=↵ | aria=Enter | editor=Enter | matches=true
 composer.sendWithQueue | Send now, with all queued messages | group=chats | chords=mod+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter | matches=true
@@ -1158,10 +1263,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=⌃ ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=⌘ ⌥ V | aria=Meta+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact+altgr mod+alt+shift+key:ArrowUp+exact+altgr | keys=⌘ ⌥ ↑ | aria=Meta+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact+altgr mod+alt+shift+key:ArrowDown+exact+altgr | keys=⌘ ⌥ ↓ | aria=Meta+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=⌃ ⌥ ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=⌃ ⌥ ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=⌃ Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=⌘ [ | aria=Meta+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=⌘ ] | aria=Meta+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=⌘ ⌥ 1 | aria=Meta+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=ctrl+code:BracketRight | keys=⌃ ] | aria=Control+] | editor=Ctrl-] | matches=true
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=ctrl+code:BracketLeft | keys=⌃ [ | aria=Control+[ | editor=Ctrl-[ | matches=true
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=⌘ ⌥ \ | aria=Meta+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+alt+code:BracketLeft | keys=⌘ ⌥ [ | aria=Meta+Alt+[ | editor=Mod-Alt-[ | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+alt+code:BracketRight | keys=⌘ ⌥ ] | aria=Meta+Alt+] | editor=Mod-Alt-] | matches=true
@@ -1229,6 +1340,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1239,9 +1353,9 @@ settings.open | search=settings.open
 shortcuts.show | search=shortcuts.show
 tab.close | search=-
 window.close | search=-
-session.pin | search=-
-session.archive | search=-
-session.fork | search=-
+session.pin | search=session.pin
+session.archive | search=session.archive
+session.fork | search=session.fork
 app.quit | search=-
 composer.send | search=composer.send,question.next
 composer.sendWithQueue | search=approval.accept,composer.sendWithQueue
@@ -1261,10 +1375,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=- -
+message.next | search=- -
+session.next | search=- sessions.recent
+session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -1319,10 +1439,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+key:b | keys=Ctrl B | aria=Control+B | editor=Mod-b | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+shift+key:b | keys=Ctrl ⇧ B | aria=Control+Shift+B | editor=Mod-Shift-b | matches=true
@@ -1390,6 +1516,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1422,10 +1551,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=-
+message.next | search=-
+session.next | search=sessions.recent -
+session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -1480,10 +1615,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+key:b | keys=Ctrl B | aria=Control+B | editor=Mod-b | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+shift+key:b | keys=Ctrl ⇧ B | aria=Control+Shift+B | editor=Mod-Shift-b | matches=true
@@ -1551,6 +1692,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1583,10 +1727,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=-
+message.next | search=-
+session.next | search=sessions.recent -
+session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -1620,7 +1770,7 @@ shortcuts.show | Show keyboard shortcuts | group=general | chords=mod+key:/+exac
 tab.close | Close tab, or leave the session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 window.close | Close window | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 session.pin | Pin or unpin current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.archive | Archive current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
+session.archive | Archive current session | group=general | chords=mod+shift+key:a | keys=Ctrl ⇧ A | aria=Control+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 app.quit | Quit Omnigent | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 composer.send | Send message | group=chats | chords=mod+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter | matches=true
@@ -1641,10 +1791,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+key:b | keys=Ctrl B | aria=Control+B | editor=Mod-b | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+shift+key:b | keys=Ctrl ⇧ B | aria=Control+Shift+B | editor=Mod-Shift-b | matches=true
@@ -1712,6 +1868,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1723,7 +1882,7 @@ shortcuts.show | search=shortcuts.show
 tab.close | search=-
 window.close | search=-
 session.pin | search=-
-session.archive | search=-
+session.archive | search=session.archive
 session.fork | search=-
 app.quit | search=-
 composer.send | search=approval.accept,composer.send
@@ -1744,10 +1903,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=-
+message.next | search=-
+session.next | search=sessions.recent -
+session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -1781,7 +1946,7 @@ shortcuts.show | Show keyboard shortcuts | group=general | chords=mod+key:/+exac
 tab.close | Close tab, or leave the session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 window.close | Close window | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 session.pin | Pin or unpin current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.archive | Archive current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
+session.archive | Archive current session | group=general | chords=mod+shift+key:a | keys=Ctrl ⇧ A | aria=Control+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 app.quit | Quit Omnigent | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 composer.send | Send message | group=chats | chords=key:Enter | keys=↵ | aria=Enter | editor=Enter | matches=true
@@ -1802,10 +1967,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+key:1+exact+altgr mod+key:2+exact+altgr mod+key:3+exact+altgr mod+key:4+exact+altgr mod+key:5+exact+altgr mod+key:6+exact+altgr mod+key:7+exact+altgr mod+key:8+exact+altgr mod+key:9+exact+altgr mod+key:0+exact+altgr | keys=Ctrl 1 | aria=Control+1 | editor=Mod-1 Mod-2 Mod-3 Mod-4 Mod-5 Mod-6 Mod-7 Mod-8 Mod-9 Mod-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+key:b | keys=Ctrl B | aria=Control+B | editor=Mod-b | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+shift+key:b | keys=Ctrl ⇧ B | aria=Control+Shift+B | editor=Mod-Shift-b | matches=true
@@ -1873,6 +2044,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1884,7 +2058,7 @@ shortcuts.show | search=shortcuts.show
 tab.close | search=-
 window.close | search=-
 session.pin | search=-
-session.archive | search=-
+session.archive | search=session.archive
 session.fork | search=-
 app.quit | search=-
 composer.send | search=composer.send,question.next
@@ -1905,10 +2079,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=-
+message.next | search=-
+session.next | search=sessions.recent -
+session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -1963,10 +2143,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+alt+code:BracketLeft | keys=Ctrl Alt [ | aria=Control+Alt+[ | editor=Mod-Alt-[ | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+alt+code:BracketRight | keys=Ctrl Alt ] | aria=Control+Alt+] | editor=Mod-Alt-] | matches=true
@@ -2034,6 +2220,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -2066,10 +2255,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=-
+message.next | search=-
+session.next | search=- sessions.recent
+session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -2124,10 +2319,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+alt+code:BracketLeft | keys=Ctrl Alt [ | aria=Control+Alt+[ | editor=Mod-Alt-[ | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+alt+code:BracketRight | keys=Ctrl Alt ] | aria=Control+Alt+] | editor=Mod-Alt-] | matches=true
@@ -2195,6 +2396,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -2227,10 +2431,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=-
+message.next | search=-
+session.next | search=- sessions.recent
+session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -2264,7 +2474,7 @@ shortcuts.show | Show keyboard shortcuts | group=general | chords=mod+key:/+exac
 tab.close | Close tab, or leave the session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 window.close | Close window | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 session.pin | Pin or unpin current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.archive | Archive current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
+session.archive | Archive current session | group=general | chords=mod+shift+key:a | keys=Ctrl ⇧ A | aria=Control+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 app.quit | Quit Omnigent | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 composer.send | Send message | group=chats | chords=mod+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter | matches=true
@@ -2285,10 +2495,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+alt+code:BracketLeft | keys=Ctrl Alt [ | aria=Control+Alt+[ | editor=Mod-Alt-[ | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+alt+code:BracketRight | keys=Ctrl Alt ] | aria=Control+Alt+] | editor=Mod-Alt-] | matches=true
@@ -2356,6 +2572,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -2367,7 +2586,7 @@ shortcuts.show | search=shortcuts.show
 tab.close | search=-
 window.close | search=-
 session.pin | search=-
-session.archive | search=-
+session.archive | search=session.archive
 session.fork | search=-
 app.quit | search=-
 composer.send | search=approval.accept,composer.send
@@ -2388,10 +2607,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=-
+message.next | search=-
+session.next | search=- sessions.recent
+session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right
@@ -2425,7 +2650,7 @@ shortcuts.show | Show keyboard shortcuts | group=general | chords=mod+key:/+exac
 tab.close | Close tab, or leave the session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 window.close | Close window | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 session.pin | Pin or unpin current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
-session.archive | Archive current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
+session.archive | Archive current session | group=general | chords=mod+shift+key:a | keys=Ctrl ⇧ A | aria=Control+Shift+A | editor=Mod-Shift-a | matches=true
 session.fork | Fork current session | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 app.quit | Quit Omnigent | group=general | chords=- | keys=- | aria=- | editor=- | matches=-
 composer.send | Send message | group=chats | chords=key:Enter | keys=↵ | aria=Enter | editor=Enter | matches=true
@@ -2446,10 +2671,16 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
+session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
+session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
 history.back | Go back | group=navigation | chords=mod+code:BracketLeft+altgr | keys=Ctrl [ | aria=Control+[ | editor=Mod-[ | matches=true
 history.forward | Go forward | group=navigation | chords=mod+code:BracketRight+altgr | keys=Ctrl ] | aria=Control+] | editor=Mod-] | matches=true
 session.number | Jump to a sidebar session (1–10) | group=navigation | chords=mod+alt+code:Digit1 mod+alt+code:Digit2 mod+alt+code:Digit3 mod+alt+code:Digit4 mod+alt+code:Digit5 mod+alt+code:Digit6 mod+alt+code:Digit7 mod+alt+code:Digit8 mod+alt+code:Digit9 mod+alt+code:Digit0 | keys=Ctrl Alt 1 | aria=Control+Alt+1 | editor=Mod-Alt-1 Mod-Alt-2 Mod-Alt-3 Mod-Alt-4 Mod-Alt-5 Mod-Alt-6 Mod-Alt-7 Mod-Alt-8 Mod-Alt-9 Mod-Alt-0 | matches=true true true true true true true true true true
+session.recent | Switch to recent session | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
+session.recentReverse | Switch to recent session (reverse) | group=navigation | chords=- | keys=- | aria=- | editor=- | matches=-
 view.mode | Toggle Chat / Terminal view | group=view | chords=mod+alt+code:Backslash | keys=Ctrl Alt \ | aria=Control+Alt+\ | editor=Mod-Alt-\ | matches=true
 sidebar.left | Toggle conversations sidebar | group=view | chords=mod+alt+code:BracketLeft | keys=Ctrl Alt [ | aria=Control+Alt+[ | editor=Mod-Alt-[ | matches=true
 sidebar.right | Toggle workspace sidebar | group=view | chords=mod+alt+code:BracketRight | keys=Ctrl Alt ] | aria=Control+Alt+] | editor=Mod-Alt-] | matches=true
@@ -2517,6 +2748,9 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -2528,7 +2762,7 @@ shortcuts.show | search=shortcuts.show
 tab.close | search=-
 window.close | search=-
 session.pin | search=-
-session.archive | search=-
+session.archive | search=session.archive
 session.fork | search=-
 app.quit | search=-
 composer.send | search=composer.send,question.next
@@ -2549,10 +2783,16 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
+message.previous | search=-
+message.next | search=-
+session.next | search=- sessions.recent
+session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
 history.back | search=history.back
 history.forward | search=history.forward
 session.number | search=session.number session.number session.number session.number session.number session.number session.number session.number session.number session.number
+session.recent | search=-
+session.recentReverse | search=-
 view.mode | search=view.mode
 sidebar.left | search=sidebar.left
 sidebar.right | search=sidebar.right

@@ -1541,6 +1541,10 @@ _SPEC_FETCH_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
 _SPEC_FETCH_MAX_RETRY_AFTER_S = 2.0
 
 
+class AgentSpecFetchError(RuntimeError):
+    """The session's agent bundle could not be retrieved after a transient failure."""
+
+
 class _AgentSpecCache:
     """Serialize worker-owned bundle loading and shutdown for one runner."""
 
@@ -1701,8 +1705,8 @@ async def _resolve_agent_spec_from_server(
     :returns: The parsed :class:`AgentSpec` plus its extracted bundle
         directory, or ``None`` when the server returns 404 for the
         requested agent.
-    :raises RuntimeError: If the server returns a non-200 status
-        other than 404, including a 429 that outlasts the retries.
+    :raises AgentSpecFetchError: For transport errors, 5xx responses or exhausted throttling.
+    :raises RuntimeError: For other non-200 responses except 404.
     """
     from omnigent.mcp_selection import MCP_SELECTION_HEADER
     from omnigent.native.native_terminal import request_with_429_retry
@@ -1717,11 +1721,16 @@ async def _resolve_agent_spec_from_server(
     path = f"/v1/sessions/{session_id}/agent/contents"
     # Every runner re-initializes its sessions when the server restarts, and the
     # resulting burst gets throttled; a failed fetch here fails the session's init.
-    resp = await request_with_429_retry(
-        lambda: server_client.get(path, headers={MCP_SELECTION_HEADER: "1"}),
-        delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
-        max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
-    )
+    try:
+        resp = await request_with_429_retry(
+            lambda: server_client.get(path, headers={MCP_SELECTION_HEADER: "1"}),
+            delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
+            max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
+        )
+    except httpx.TransportError as error:
+        raise AgentSpecFetchError(
+            f"spec_resolver: GET {path} failed ({type(error).__name__})"
+        ) from error
     if resp.status_code == 404:
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
@@ -1730,7 +1739,10 @@ async def _resolve_agent_spec_from_server(
         )
         return None
     if resp.status_code != 200:
-        raise RuntimeError(f"spec_resolver: GET {path} failed with HTTP {resp.status_code}")
+        message = f"spec_resolver: GET {path} failed with HTTP {resp.status_code}"
+        if resp.is_server_error or resp.status_code == 429:
+            raise AgentSpecFetchError(message)
+        raise RuntimeError(message)
     return await spec_cache.resolve(resp, agent_id)
 
 

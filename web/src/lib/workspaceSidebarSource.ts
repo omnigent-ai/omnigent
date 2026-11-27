@@ -79,26 +79,36 @@ export interface WorkspaceSidebarSource {
     sessionId: string,
     comparison: ComparisonInit,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<WorkingCopyBase>;
   listWorkingCopyChanges: (
     sessionId: string,
     comparison: ComparisonInit,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListWorkingCopyChangesResponse>;
   readBaseFile: (
     sessionId: string,
     file: { commit: string; path: string; object: string },
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<FileContentResponse>;
   readLinkText: (sessionId: string, path: string, signal?: AbortSignal) => Promise<Uint8Array>;
   listRepositoryRefs: (
     sessionId: string,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListRepositoryRefsResponse>;
   listBranchCommits: (
     sessionId: string,
     range: RevisionSpec,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListBranchCommitsResponse>;
   resolveRepositoryContext: (
     sessionId: string,
@@ -298,29 +308,29 @@ export const DEFAULT_WORKSPACE_SIDEBAR_SOURCE: WorkspaceSidebarSource = {
       throw error;
     }
   },
-  resolveWorkingCopyBase: (sessionId, comparison, signal) =>
+  resolveWorkingCopyBase: (sessionId, comparison, signal, repository) =>
     hostOnly("resolveWorkingCopyBase", signal, () =>
-      workspaceSidebarApi().resolveWorkingCopyBase(sessionId, comparison, signal),
+      workspaceSidebarApi().resolveWorkingCopyBase(sessionId, comparison, signal, repository),
     ),
-  listWorkingCopyChanges: (sessionId, comparison, signal) =>
+  listWorkingCopyChanges: (sessionId, comparison, signal, repository) =>
     hostOnly("listWorkingCopyChanges", signal, () =>
-      workspaceSidebarApi().listWorkingCopyChanges(sessionId, comparison, signal),
+      workspaceSidebarApi().listWorkingCopyChanges(sessionId, comparison, signal, repository),
     ),
-  readBaseFile: (sessionId, file, signal) =>
+  readBaseFile: (sessionId, file, signal, repository) =>
     hostOnly("readBaseFile", signal, () =>
-      workspaceSidebarApi().readBaseFile(sessionId, file, signal),
+      workspaceSidebarApi().readBaseFile(sessionId, file, signal, repository),
     ),
   readLinkText: (sessionId, path, signal) =>
     hostOnly("readLinkText", signal, () =>
       workspaceSidebarApi().readLinkText(sessionId, path, signal),
     ),
-  listRepositoryRefs: (sessionId, signal) =>
+  listRepositoryRefs: (sessionId, signal, repository) =>
     hostOnly("listRepositoryRefs", signal, () =>
-      workspaceSidebarApi().listRepositoryRefs(sessionId, signal),
+      workspaceSidebarApi().listRepositoryRefs(sessionId, signal, repository),
     ),
-  listBranchCommits: (sessionId, range, signal) =>
+  listBranchCommits: (sessionId, range, signal, repository) =>
     hostOnly("listBranchCommits", signal, () =>
-      workspaceSidebarApi().listBranchCommits(sessionId, range, signal),
+      workspaceSidebarApi().listBranchCommits(sessionId, range, signal, repository),
     ),
   resolveRepositoryContext: (sessionId, signal) =>
     hostOnly("resolveRepositoryContext", signal, () =>

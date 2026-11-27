@@ -127,4 +127,23 @@ describe("useVerifiedGitWorktrees", () => {
       expect(result.current).toEqual([]);
     },
   );
+
+  it("keeps a UNC share's worktrees while a folder in another case or separator loads", () => {
+    const worktrees: HostWorktree[] = [
+      { path: "\\\\Server\\Share\\repo", branch: "main", is_main: true, detached: false },
+    ];
+    const { result, rerender } = renderHook(
+      (props: { requestedPath: string; resolved: boolean }) =>
+        useVerifiedGitWorktrees({
+          hostId: "host_1",
+          worktrees: props.resolved ? worktrees : undefined,
+          ...props,
+        }),
+      { initialProps: { requestedPath: "\\\\Server\\Share\\repo", resolved: true } },
+    );
+    rerender({ requestedPath: "//server/share/Repo/src", resolved: false });
+    expect(result.current).toEqual(worktrees);
+    rerender({ requestedPath: "//server/other/repo", resolved: false });
+    expect(result.current).toEqual([]);
+  });
 });

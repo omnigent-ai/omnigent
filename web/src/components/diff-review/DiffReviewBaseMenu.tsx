@@ -21,11 +21,16 @@ import { cn } from "@/lib/utils";
 export interface DiffReviewBaseChoice {
   id: string;
   label: string;
+  /** A line under the label, such as what the choice compares with. */
+  description?: string;
   checked: boolean;
   /** Why it can't be chosen here; null when it can. */
   unavailableReason: string | null;
   onSelect: () => void;
 }
+
+/** Marks the menu's trigger, so focus can follow it into a review that replaces this one. */
+export const BASE_MENU_TRIGGER_ATTRIBUTE = "data-diff-review-base-menu";
 
 /** What a review's files are compared against. */
 export interface DiffReviewBase {
@@ -33,6 +38,8 @@ export interface DiffReviewBase {
   label: string;
   /** The tooltip's longer explanation. */
   description: string;
+  /** The menu's heading over the choices; "Compare changes with" by default. */
+  heading?: string;
   /** Bases to switch to from the label's menu; absent for a fixed base. */
   choices?: readonly DiffReviewBaseChoice[];
   /** Actions after the choices, such as refreshing. */
@@ -77,6 +84,7 @@ export function DiffReviewBaseMenu({
                 className,
               )}
               data-testid="diff-review-base"
+              {...{ [BASE_MENU_TRIGGER_ATTRIBUTE]: "" }}
               aria-label={`Compared ${base.label}. Change what changes are compared with`}
               aria-description={base.description}
             >
@@ -88,7 +96,7 @@ export function DiffReviewBaseMenu({
         <TooltipContent>{base.description}</TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="start" className="w-72">
-        <DropdownMenuLabel>Compare changes with</DropdownMenuLabel>
+        <DropdownMenuLabel>{base.heading ?? "Compare changes with"}</DropdownMenuLabel>
         <DropdownMenuRadioGroup value={checked}>
           {base.choices.map((choice) => (
             <DropdownMenuRadioItem
@@ -98,8 +106,14 @@ export function DiffReviewBaseMenu({
               onSelect={choice.onSelect}
               className="items-start"
             >
+              {/* Lines under a choice wrap within the menu's width instead of running past it. */}
               <span className="flex min-w-0 flex-col">
                 <span>{choice.label}</span>
+                {choice.description && (
+                  <span className="whitespace-normal text-xs text-muted-foreground">
+                    {choice.description}
+                  </span>
+                )}
                 {choice.unavailableReason && (
                   <span className="text-xs text-muted-foreground">{choice.unavailableReason}</span>
                 )}
