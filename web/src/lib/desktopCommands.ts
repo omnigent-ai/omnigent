@@ -8,7 +8,11 @@
 import { useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 
 import { isFocusInDialogOrMenu } from "@/lib/hotkeys";
-import { isPickListTarget, PICK_LIST_INPUT_ATTRIBUTE } from "@/lib/listNavigationKeys";
+import {
+  isPickListTarget,
+  PICK_LIST_INPUT_ATTRIBUTE,
+  readlineListStep,
+} from "@/lib/listNavigationKeys";
 import {
   type DesktopCommand,
   type DesktopCommandEvent,
@@ -102,11 +106,16 @@ function queueReport(): void {
 
 /**
  * Report as a pick list gains or loses the keyboard, so the shell's menu leaves it Ctrl-N:
- * focus moving, or a focused field's list opening or closing.
+ * focus moving, or a focused field's list opening or closing. Removing a focused list sends
+ * no focus event, so a Ctrl-N or Ctrl-P press checks again.
  */
 function watchPickListFocus(): () => void {
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (readlineListStep(event) !== null) queueReport();
+  };
   document.addEventListener("focusin", queueReport);
   document.addEventListener("focusout", queueReport);
+  document.addEventListener("keydown", onKeyDown, true);
   const observer = new MutationObserver(queueReport);
   observer.observe(document.documentElement, {
     subtree: true,
@@ -115,6 +124,7 @@ function watchPickListFocus(): () => void {
   return () => {
     document.removeEventListener("focusin", queueReport);
     document.removeEventListener("focusout", queueReport);
+    document.removeEventListener("keydown", onKeyDown, true);
     observer.disconnect();
   };
 }

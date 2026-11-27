@@ -215,6 +215,27 @@ describe("useDesktopCommand", () => {
     expect(await lastPickListFocused()).toBe(false);
   });
 
+  it("corrects a report left by a removed pick list on the next Ctrl-N or Ctrl-P", async () => {
+    renderHook(() => useDesktopCommand("close", () => {}));
+    const field = document.createElement("input");
+    field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
+    document.body.append(field);
+    const settle = async () => {
+      await flushReports();
+      await flushReports();
+      return setDesktopCommandState.mock.lastCall?.[0].pickListFocused;
+    };
+    field.focus();
+    expect(await settle()).toBe(true);
+    // Removing the focused field moves focus to the body without a focus event.
+    field.remove();
+    await settle();
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "n", code: "KeyN", ctrlKey: true, bubbles: true }),
+    );
+    expect(await settle()).toBe(false);
+  });
+
   it("coalesces a burst of registrations into one report", async () => {
     renderHook(() => {
       useDesktopCommand("close", () => {});

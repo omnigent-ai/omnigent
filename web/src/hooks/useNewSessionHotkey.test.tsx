@@ -208,6 +208,19 @@ describe("useNewSessionHotkey with an open pick list (native Windows/Linux)", ()
     expect(press(ctrlN).defaultPrevented).toBe(true);
     expect(navigate).toHaveBeenCalledWith("/");
   });
+
+  it("starts a session on Ctrl-N once the list's focused field is gone", () => {
+    // The desktop shell may still leave this Ctrl-N to the page, so the page must start the session.
+    shell.native = true;
+    renderHook(() => useNewSessionHotkey(true, false));
+    const field = document.createElement("input");
+    field.setAttribute("data-pick-list-input", "");
+    document.body.append(field);
+    field.focus();
+    field.remove();
+    expect(press({ key: "n", code: "KeyN", ctrlKey: true }).defaultPrevented).toBe(true);
+    expect(navigate).toHaveBeenCalledWith("/");
+  });
 });
 
 /** The app's new-session hotkey beside a real QuickPick, as on a native Windows or Linux shell. */
