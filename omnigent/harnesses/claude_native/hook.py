@@ -248,6 +248,18 @@ def main(argv: list[str] | None = None) -> int:
     output = record_hook_payload(
         Path(args.bridge_dir), payload, conversation_url=args.conversation_url
     )
+    if args.native_editor_executable is not None:
+        from omnigent.harnesses.claude_native.editor_handoff import record_editor_bridge_binding
+
+        try:
+            record_editor_bridge_binding(
+                Path(args.bridge_dir), payload, args.native_editor_executable
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(
+                f"omnigent claude hook: editor ownership unavailable ({type(exc).__name__})",
+                file=sys.stderr,
+            )
     if output is not None:
         print(json.dumps(output))
     return 0
@@ -1370,6 +1382,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m omnigent.harnesses.claude_native.hook")
     parser.add_argument("--bridge-dir", required=True)
     parser.add_argument("--conversation-url")
+    parser.add_argument("--native-editor-executable", type=Path)
     return parser.parse_args(argv)
 
 

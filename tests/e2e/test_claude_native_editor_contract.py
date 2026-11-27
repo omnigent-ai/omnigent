@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.harnesses.claude_native import bridge, editor_delegate, editor_owner
+from omnigent.harnesses.claude_native import bridge, editor_delegate, editor_handoff, editor_owner
 from tests._helpers.native_claude import _PINNED_CLAUDE_MODELS
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_message_requests
@@ -25,6 +25,7 @@ pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
 
 @pytest.mark.parametrize("editor_source", ["configured", "default"])
 def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     isolated_mock_llm_server_url: str,
     claude_managed_settings: None,
@@ -37,15 +38,21 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     workspace.mkdir()
     config = tmp_path / "claude-config"
     config.mkdir()
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        bridge, "_BRIDGE_ROOT", tmp_path / f"omnigent-{os.getuid()}" / "claude-native"
+    )
+    bridge_dir = bridge.prepare_bridge_dir("editor-contract-conversation", workspace=workspace)
     instruction = tmp_path / "editor-instruction.json"
     observed = tmp_path / "editor-observed.jsonl"
     invoked = tmp_path / "editor-invoked.jsonl"
     hook_record = tmp_path / "blocked-prompt.json"
     owner_source = hashlib.sha256(Path(editor_owner.__file__).read_bytes()).hexdigest()
+    handoff_source = hashlib.sha256(Path(editor_handoff.__file__).read_bytes()).hexdigest()
     process_context = (
         "import hashlib, os, psutil, shutil\n"
         "from dataclasses import asdict\n"
-        "from omnigent.harnesses.claude_native import editor_owner\n"
+        "from omnigent.harnesses.claude_native import editor_handoff, editor_owner\n"
         f"native_executable = Path({str(Path(claude).resolve())!r})\n"
         "def native_process_record():\n"
         "    identity = editor_owner.observe_native_editor_process(native_executable)\n"
@@ -56,6 +63,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "'name': p.name(), 'exe': p.exe()} for p in parents], "
         "'owner_source_sha256': hashlib.sha256("
         "Path(editor_owner.__file__).read_bytes()).hexdigest(), "
+        "'handoff_source_sha256': hashlib.sha256("
+        "Path(editor_handoff.__file__).read_bytes()).hexdigest(), "
         "'editor_environment_sha256': hashlib.sha256(json.dumps("
         "{key: os.environ.get(key) for key in ('VISUAL', 'EDITOR', 'PATH')}, "
         "sort_keys=True).encode()).hexdigest(), "
@@ -70,17 +79,23 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     )
     hook = tmp_path / "block-prompt.py"
     hook.write_text(
-        "import json, sys\n"
+        "import io, json, sys\n"
         "from pathlib import Path\n"
+        "from omnigent.harnesses.claude_native import hook as native_hook\n"
         + process_context
         + f"destination = Path({str(hook_record)!r})\n"
         "payload = json.load(sys.stdin)\n"
+        "sys.stdin = io.StringIO(json.dumps(payload))\n"
+        f"native_hook.main(['--bridge-dir', {str(bridge_dir)!r}, "
+        "'--native-editor-executable', str(native_executable)])\n"
+        f"binding = editor_handoff.read_editor_bridge_binding(Path({str(bridge_dir)!r}), "
+        "native_executable)\n"
         "temporary = destination.with_suffix('.tmp')\n"
         "record = {key: payload.get(key) for key in "
         "('prompt', 'session_id', 'hook_event_name')}\n"
         "record['native_context'] = native_context()\n"
         "record['native_process'] = native_process_record()\n"
-        "record['bridge_session_id'] = 'editor-contract-conversation'\n"
+        "record['owner_binding'] = asdict(binding) if binding is not None else None\n"
         "temporary.write_text(json.dumps(record))\n"
         "temporary.replace(destination)\n"
         "print(json.dumps({'decision': 'block', "
@@ -127,12 +142,9 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "content = source.read_bytes().decode('utf-8')\n"
         "request = json.loads(instruction.read_text())\n"
         "def current_owner():\n"
-        f"    producer = json.loads(Path({str(hook_record)!r}).read_text())\n"
-        "    process = editor_owner.observe_native_editor_process(native_executable)\n"
-        "    if process is None or asdict(process) != producer['native_process']:\n"
-        "        return None\n"
-        "    return editor_owner.NativeDraftOwner(producer['bridge_session_id'], "
-        "producer['session_id'], process)\n"
+        f"    binding = editor_handoff.read_editor_bridge_binding(Path({str(bridge_dir)!r}), "
+        "native_executable)\n"
+        "    return binding.owner if binding is not None else None\n"
         "claimed = request['owner']\n"
         "expected_owner = editor_owner.NativeDraftOwner("
         "claimed['bridge_session_id'], claimed['native_session_id'], "
@@ -151,6 +163,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     env = {
         "PATH": os.environ.get("PATH", os.defpath),
         "TERM": "xterm-256color",
+        "TMPDIR": str(tmp_path),
         "LANG": "C.UTF-8",
         "CLAUDE_CONFIG_DIR": str(config),
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
@@ -301,6 +314,9 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 check=True,
                 timeout=10,
             )
+            bridge.write_tmux_target(
+                bridge_dir, socket_path=Path(socket_dir) / "tmux.sock", tmux_target=target
+            )
             try:
                 poll_until(lambda: bridge._composer_box(pane()) is not None, timeout_s=30)
             except AssertionError as exc:
@@ -323,11 +339,12 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert isinstance(draft, str) and "\n" in draft and payload["session_id"]
             assert payload["native_process"] is not None, payload["native_context"]
             assert payload["native_context"]["owner_source_sha256"] == owner_source
-            owner = {
-                "bridge_session_id": payload["bridge_session_id"],
-                "native_session_id": payload["session_id"],
-                "process": payload["native_process"],
-            }
+            assert payload["native_context"]["handoff_source_sha256"] == handoff_source
+            assert payload["owner_binding"] is not None, payload
+            owner = payload["owner_binding"]["owner"]
+            assert owner["bridge_session_id"] == bridge.read_active_session_id(bridge_dir)
+            assert owner["native_session_id"] == payload["session_id"]
+            assert owner["process"] == payload["native_process"]
             wrong_session = {**owner, "native_session_id": "other-native-session"}
             wrong_process = {
                 **owner,
@@ -371,6 +388,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 assert actual == expected, {"step": index, "expected": expected, "actual": actual}
                 assert observation["accepted"] is accepted
                 assert observation["native_context"]["owner_source_sha256"] == owner_source
+                assert observation["native_context"]["handoff_source_sha256"] == handoff_source
                 assert (
                     observation["native_context"]["editor_environment_sha256"]
                     == editor_environment_digest
