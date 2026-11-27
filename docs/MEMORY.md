@@ -8,6 +8,18 @@ Memory is off by default. Turn it on for a server with `OMNIGENT_FEATURES=memory
 While it is off, agents get no memory tools and no startup note, and runners make
 no calls to the memory routes.
 
+## With memory off
+
+A harness's own memory stays on the machine that ran the session. When Claude
+Code is asked to remember something, it saves the note in its auto memory under
+`~/.claude/projects/<project>/memory/` (or under `$CLAUDE_CONFIG_DIR`), keyed by
+the project's path on that machine. A later session on the same host and in the
+same project directory gets the note back. A session in another project, on
+another host or in a fresh sandbox whose home starts empty does not. Codex's own
+memories work the same way: Codex sessions read them from the host's `~/.codex`
+(or `$CODEX_HOME`). To keep what an agent remembers across hosts and sandboxes,
+turn Omnigent memory on.
+
 ## Tools
 
 With memory on, every agent gets these tools unless its spec sets
