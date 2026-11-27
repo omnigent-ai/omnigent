@@ -48,6 +48,7 @@ import type {
 } from "@/lib/blocks";
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { subscribeSessionStreams } from "@/lib/sessionStreamSignals";
 import { latestActivityErrorState } from "@/lib/sessionError";
 import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles } from "@/lib/renderItems";
@@ -16376,6 +16377,160 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await vi.advanceTimersByTimeAsync(20);
     controller.abort();
     await loop;
+  });
+
+  describe("planned rotation catch-up", () => {
+    /** Open `/stream` into abortable sinks, each stamped with its epoch (or none). */
+    function routeRotatingStreamOpens(epochs: readonly (string | null)[]): StreamSink[] {
+      const sinks: StreamSink[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+          const sink = pushableStream();
+          sinks.push(sink);
+          // Like the real fetch, aborting the attempt severs the body read.
+          init?.signal?.addEventListener("abort", () =>
+            sink.error(new DOMException("aborted", "AbortError")),
+          );
+          const response = mockResponse(null, { bodyStream: sink.stream });
+          const epoch = epochs[sinks.length - 1];
+          if (epoch) response.headers.set("x-omnigent-stream-epoch", epoch);
+          return response;
+        }
+        return defaultFetchHandler(input, init);
+      });
+      return sinks;
+    }
+
+    /**
+     * Run one stream past its max age (or drop it), reopen it, and count the
+     * reads in the first second after the reopen (the reconcile) and over the
+     * next 21 s (the 3/8/20 s status re-reads), ending before the 60 s
+     * periodic status reconcile ticks at 300 s. Also counts journal-visible
+     * stream reopens.
+     */
+    async function readsAfterReopen(
+      id: string,
+      opts: { epochs: readonly (string | null)[]; reopen: "rotate" | "drop" },
+    ): Promise<{
+      reconcileItems: number;
+      reconcileSnapshots: number;
+      lateSnapshots: number;
+      reopens: number;
+    }> {
+      seedSession(id, []);
+      const sinks = routeRotatingStreamOpens(opts.epochs);
+      let reopens = 0;
+      const unsubscribe = subscribeSessionStreams((streamId, reopened) => {
+        if (streamId === id && reopened) reopens += 1;
+      });
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(1);
+      await advanceWithHeartbeats(
+        sinks[0]!,
+        opts.reopen === "rotate" ? SSE_MAX_STREAM_AGE_MS - 15_000 : 60_000,
+      );
+      const before = fetchMock.mock.calls.length;
+      if (opts.reopen === "rotate") {
+        await vi.advanceTimersByTimeAsync(15_001);
+      } else {
+        sinks[0]!.error();
+        await vi.advanceTimersByTimeAsync(20);
+      }
+      expect(sinks).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const atReconcile = fetchMock.mock.calls.length;
+      await advanceWithHeartbeats(sinks[1]!, 15_000);
+      await vi.advanceTimersByTimeAsync(6_000);
+      const urls = fetchMock.mock.calls.map(([input]) => String(input));
+      const snapshot = (url: string) => url.includes(`/v1/sessions/${id}?`);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(20);
+      controller.abort();
+      await loop;
+      unsubscribe();
+      return {
+        reconcileItems: urls
+          .slice(before, atReconcile)
+          .filter((url) => url.includes(`/v1/sessions/${id}/items`)).length,
+        reconcileSnapshots: urls.slice(before, atReconcile).filter(snapshot).length,
+        lateSnapshots: urls.slice(atReconcile).filter(snapshot).length,
+        reopens,
+      };
+    }
+
+    it("skips the 3/8/20 s status re-reads on a same-server rotation", async () => {
+      const reads = await readsAfterReopen("conv_rotate_same", {
+        epochs: ["epoch-1", "epoch-1"],
+        reopen: "rotate",
+      });
+      expect(reads.lateSnapshots).toBe(0);
+    });
+
+    it("still reconciles and signals the journal on a same-server rotation", async () => {
+      const reads = await readsAfterReopen("conv_rotate_reconcile", {
+        epochs: ["epoch-1", "epoch-1"],
+        reopen: "rotate",
+      });
+      expect(reads.reconcileItems).toBe(1);
+      expect(reads.reconcileSnapshots).toBeGreaterThanOrEqual(1);
+      expect(reads.reopens).toBe(1);
+    });
+
+    it("retries a failed reconnect backfill within seconds of a same-server rotation", async () => {
+      const id = "conv_rotate_backfill_fails";
+      seedSession(id, []);
+      const sinks = routeRotatingStreamOpens(["epoch-1", "epoch-1"]);
+      const routed = fetchMock.getMockImplementation()!;
+      let failNextItemsRead = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (failNextItemsRead && url.includes(`/v1/sessions/${id}/items`)) {
+          failNextItemsRead = false;
+          return mockResponse({ detail: "unavailable" }, { ok: false, status: 503 });
+        }
+        return routed(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(1);
+      await advanceWithHeartbeats(sinks[0]!, SSE_MAX_STREAM_AGE_MS - 15_000);
+      // The reconnect backfill's items read fails once.
+      failNextItemsRead = true;
+      await vi.advanceTimersByTimeAsync(15_001);
+      expect(sinks).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(failNextItemsRead).toBe(false);
+      const afterFailure = fetchMock.mock.calls.length;
+      await advanceWithHeartbeats(sinks[1]!, 15_000);
+      await vi.advanceTimersByTimeAsync(6_000);
+      const retries = fetchMock.mock.calls
+        .slice(afterFailure)
+        .filter(([input]) => String(input).includes(`/v1/sessions/${id}/items`)).length;
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(20);
+      controller.abort();
+      await loop;
+      // The 3/8/20 s status re-reads retry it; the 60 s periodic reconcile is too late.
+      expect(retries).toBeGreaterThanOrEqual(1);
+    });
+
+    it.each([
+      ["the stream dropped", { epochs: ["epoch-1", "epoch-1"], reopen: "drop" }],
+      ["the server epoch changed", { epochs: ["epoch-1", "epoch-2"], reopen: "rotate" }],
+      ["the server sends no epoch", { epochs: [null, null], reopen: "rotate" }],
+    ] as const)("still runs every status re-read when %s", async (label, opts) => {
+      const reads = await readsAfterReopen(`conv_catchup_${label.replaceAll(" ", "_")}`, opts);
+      expect(reads.reconcileItems).toBe(1);
+      expect(reads.reopens).toBe(1);
+      // The 3 s, 8 s and 20 s status re-reads.
+      expect(reads.lateSnapshots).toBeGreaterThanOrEqual(3);
+    });
   });
 
   it("reopens after a clean server-shutdown EOF without [DONE]", async () => {

@@ -7360,6 +7360,8 @@ export async function startStreamPump(
   // When login-page answers began, since the last successful stream open.
   let nonSseAnswersSince: number | null = null;
   let previousStreamEpoch: string | null = null;
+  // Set when the max-age timer, not a drop, ended the last connection.
+  let plannedRotation = false;
   const nativePreviewBaselines = new Map<string, string>();
   // A host can be learned while an open is pending or backing off; the bind
   // snapshot may predate that gap even without a successful open.
@@ -7410,6 +7412,8 @@ export async function startStreamPump(
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
       // Whether this attempt opened, so its close is signaled exactly once.
       let streamOpened = false;
+      const rotating = plannedRotation;
+      plannedRotation = false;
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -7503,6 +7507,13 @@ export async function startStreamPump(
 
         const reconnecting = hasConnected || hostReaddressed;
         const streamEpoch = streamRes.headers.get("x-omnigent-stream-epoch");
+        // A planned reopen onto the same server process: no restart can have
+        // left its snapshot reading a stale "running".
+        const sameServerRotation =
+          rotating &&
+          !hostReaddressed &&
+          streamEpoch !== null &&
+          streamEpoch === previousStreamEpoch;
         if (!hasConnected) clearSseLog(id);
         hasConnected = true;
         streamOpened = true;
@@ -7513,7 +7524,10 @@ export async function startStreamPump(
         nonSseAnswersSince = null;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
-        maxAgeTimer = setTimeout(() => attempt.abort(), SSE_MAX_STREAM_AGE_MS);
+        maxAgeTimer = setTimeout(() => {
+          plannedRotation = true;
+          attempt.abort();
+        }, SSE_MAX_STREAM_AGE_MS);
         if (reconnecting) {
           if (previousStreamEpoch === null || streamEpoch === null) {
             nativePreviewBaselines.clear();
@@ -7575,8 +7589,20 @@ export async function startStreamPump(
           // Re-read status a few times over the next ~20s so a status that
           // settles shortly after reconnect clears in seconds. Guarded +
           // idempotent, and scoped to the active conversation by
-          // reconcileActiveSessionStatus itself.
-          scheduleStatusCatchup(true);
+          // reconcileActiveSessionStatus itself. A same-server rotation had no
+          // restart, so it keeps only the launch-stage re-reads, unless the
+          // re-reads must also retry a failed backfill or a final item missed
+          // behind an interrupted preview.
+          scheduleStatusCatchup(
+            !sameServerRotation ||
+              missedEventRecovery.backfillOwed ||
+              get().blocks.some(
+                (block) =>
+                  isLiveProvisionalBlock(block) &&
+                  block.type === "text_done" &&
+                  block.previewInterrupted,
+              ),
+          );
         } else {
           // A launch's `ready` sent before this first open subscribed is in no snapshot
           // read yet, so re-read its stage over the next ~20 s while it still shows.
