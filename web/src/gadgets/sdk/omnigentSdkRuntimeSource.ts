@@ -758,6 +758,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
   var BLOCKED_REASONS = {
     write: 'You can view this gadget but not change it.',
     writeCapability: 'This gadget cannot change its records.',
+    ownWrite: 'You can view this gadget but not keep your own records in it.',
     action: 'Running actions needs Can edit access to this gadget.',
     previewAction: 'Actions run once you use this template.',
   };
@@ -825,6 +826,13 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
     if (requirement === 'write') {
       if (!context.permissions || !context.permissions.writeData) {
         return BLOCKED_REASONS.write;
+      }
+      return (context.capabilities || []).indexOf('data.write') === -1 ? BLOCKED_REASONS.writeCapability : null;
+    }
+    // Changes only the viewer's own records of a per-viewer collection.
+    if (requirement === 'own-write') {
+      if (!context.permissions || !(context.permissions.writeOwnData || context.permissions.writeData)) {
+        return BLOCKED_REASONS.ownWrite;
       }
       return (context.capabilities || []).indexOf('data.write') === -1 ? BLOCKED_REASONS.writeCapability : null;
     }
@@ -950,6 +958,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
         viewer: Object.freeze({ id: context.viewer.id, displayName: context.viewer.displayName }),
         permissions: Object.freeze({
           writeData: Boolean(context.permissions.writeData),
+          writeOwnData: Boolean(context.permissions.writeOwnData || context.permissions.writeData),
           publish: Boolean(context.permissions.publish),
         }),
         preview: context.preview === true,

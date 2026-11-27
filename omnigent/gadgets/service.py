@@ -1767,7 +1767,8 @@ class GadgetService:
         viewer_write = (
             method in {"data.v1.create", "data.v1.replace", "data.v1.delete"}
             and isinstance(params, dict)
-            and params.get("collection") in revision.get("collection_scopes", {})
+            and isinstance(params.get("collection"), str)
+            and params["collection"] in revision.get("collection_scopes", {})
         )
         try:
             result = self._rpc(gadget, permissions, revision, publication, method, params)

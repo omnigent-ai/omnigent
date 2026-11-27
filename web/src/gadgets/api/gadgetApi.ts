@@ -45,6 +45,8 @@ export interface GadgetContent {
    * (never a login or email). Older servers omit it.
    */
   viewer?: { id: string; display_name: string | null };
+  /** Collections where each viewer keeps their own records; older servers omit it. */
+  collection_scopes?: Record<string, "viewer">;
 }
 
 /** A rule across records that the server checks on every write (see `gadgets_constraints.py`). */
@@ -253,6 +255,15 @@ function parseContent(value: unknown): GadgetContent {
             id: viewer.id,
             display_name: typeof viewer.display_name === "string" ? viewer.display_name : null,
           },
+        }
+      : {}),
+    ...(isRecord(value.collection_scopes)
+      ? {
+          collection_scopes: Object.fromEntries(
+            Object.entries(value.collection_scopes)
+              .filter(([, scope]) => scope === "viewer")
+              .map(([name]) => [name, "viewer" as const]),
+          ),
         }
       : {}),
   };

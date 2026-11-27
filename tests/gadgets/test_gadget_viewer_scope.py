@@ -192,3 +192,25 @@ def test_a_viewers_first_viewer_record_marks_their_files(gadgets: Fixture) -> No
     call(owner, app, "create", "progress", value={}, operation_id="p1")
     call(owner, app, "create", "progress", value={}, operation_id="p2")
     assert files.read_json(VIEWER_DATA_MARKER) == {"viewer_data": True}
+
+
+@pytest.mark.parametrize("collection", [[], {}, ["progress"], {"name": "progress"}, 7, None])
+@pytest.mark.parametrize("method", ["create", "replace", "delete"])
+def test_a_malformed_collection_is_invalid_input(
+    gadgets: Fixture, method: str, collection: object
+) -> None:
+    owner = gadgets.service(1)
+    app = publish(owner)
+    with pytest.raises(InvalidInput):
+        owner.rpc(
+            app["id"],
+            app["published_revision"],
+            "data.v1." + method,
+            {
+                "collection": collection,
+                "value": {},
+                "id": "r1",
+                "if_version": "v",
+                "operation_id": "o",
+            },
+        )
