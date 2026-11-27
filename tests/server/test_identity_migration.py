@@ -13,6 +13,8 @@ is refused without ``--force``.
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
 from click.testing import CliRunner
 from sqlalchemy import select
@@ -24,6 +26,7 @@ from omnigent.db.db_models import (
     SqlComment,
     SqlHost,
     SqlPolicy,
+    SqlUser,
 )
 from omnigent.db.enum_codecs import (
     encode_account_token_kind,
@@ -38,6 +41,7 @@ from omnigent.server.identity_migration import build_domain_mapping, remap_ident
 from omnigent.server.passwords import hash_password
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.gadgets.grant_store import GadgetGrantStore
 
 
 def _conversation(db_uri: str) -> str:
@@ -101,6 +105,146 @@ def test_remap_moves_user_grant_and_admin(db_uri: str) -> None:
     moved = perm_store.get("alice@example.com", conv_id)
     assert moved is not None and moved.level == 3
     assert perm_store.get("alice", conv_id) is None
+
+
+def _gadget_service(db_uri: str, store, user: str):  # type: ignore[no-untyped-def]
+    """*user*'s gadget service, with the viewer the gadget routes would resolve."""
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.service import GadgetService, GadgetViewer
+
+    permissions = GadgetGrantStore(db_uri)
+    registration = permissions.account_registrations([user]).get(user)
+    access = PermissionStoreGadgetAccess(store, permissions)
+    return GadgetService(store, access, GadgetViewer(user, registration))
+
+
+def test_remap_refuses_a_user_with_gadgets_and_leaves_them_reachable(
+    db_uri: str, tmp_path
+) -> None:
+    """Gadgets live outside these tables, so a user holding them is refused, not stranded."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    accounts.create_user_with_password("alice", hash_password("password123"))
+    accounts.create_user_with_password("bob", hash_password("password123"))
+    accounts.create_user_with_password("carol", hash_password("password123"))
+    board = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+    _gadget_service(db_uri, store, "alice").pin(board["id"], {"pinned": True})
+    permissions.grant_for_gadget("bob", board["id"], 2)
+
+    report = remap_identities(
+        get_or_create_engine(db_uri),
+        {"alice": "alice@example.com", "carol": "carol@example.com"},
+        dry_run=False,
+        gadget_store=store,
+    )
+
+    assert report.refused_gadgets == ["alice -> alice@example.com"]
+    # Carol has no gadget data, so her remap goes ahead in the same run.
+    assert account_store_ids(db_uri) >= {"alice", "carol@example.com"}
+    assert accounts.get_user("carol") is None
+    # Alice keeps her gadget, her pin and her collaborator.
+    alice = _gadget_service(db_uri, store, "alice")
+    assert [item["id"] for item in alice.list_owned()["items"]] == [board["id"]]
+    assert [item["id"] for item in alice.shelf()["pinned"]] == [board["id"]]
+    assert [item["id"] for item in _gadget_service(db_uri, store, "bob").shared()["items"]] == [
+        board["id"]
+    ]
+
+
+@pytest.mark.parametrize("left", ["pinned", "shown_beside_a_session"])
+def test_remap_goes_ahead_once_a_user_deleted_a_gadget_still_on_their_shelf(
+    db_uri: str, tmp_path, left: str
+) -> None:
+    """Deleting the gadget is enough: the shelf keeping its ID strands nothing."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", hash_password("password123"))
+    alice = _gadget_service(db_uri, store, "alice")
+    board = alice.create("Synthetic board")
+    if left == "pinned":
+        alice.pin(board["id"], {"pinned": True})
+    else:
+        alice.link_session(board["id"], "a" * 32, {"linked": True})
+    alice.delete(board["id"])
+
+    report = remap_identities(
+        get_or_create_engine(db_uri),
+        {"alice": "alice@example.com"},
+        dry_run=False,
+        gadget_store=store,
+    )
+
+    assert report.refused_gadgets == []
+
+
+def test_remap_goes_ahead_once_a_user_deleted_their_gadgets_and_cleared_the_shelf(
+    db_uri: str, tmp_path
+) -> None:
+    """Following the refusal's advice works: unpinned, hidden and deleted, nothing of the
+    user's is left to strand, even though the shelf keeps its emptied documents."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", hash_password("password123"))
+    alice = _gadget_service(db_uri, store, "alice")
+    board = alice.create("Synthetic board")
+    alice.pin(board["id"], {"pinned": True})
+
+    def remap() -> list[str]:
+        report = remap_identities(
+            get_or_create_engine(db_uri),
+            {"alice": "alice@example.com"},
+            dry_run=False,
+            gadget_store=store,
+        )
+        return report.refused_gadgets
+
+    assert remap() == ["alice -> alice@example.com"]
+    alice.pin(board["id"], {"pinned": False})
+    alice.delete(board["id"])
+
+    assert remap() == []
+    assert accounts.get_user("alice@example.com") is not None
+
+
+@pytest.mark.parametrize("sessions", [49, 50, 51])
+def test_remap_goes_ahead_after_gadgets_were_shown_and_hidden_beside_many_sessions(
+    db_uri: str, tmp_path, sessions: int
+) -> None:
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", hash_password("password123"))
+    alice = _gadget_service(db_uri, store, "alice")
+    board = alice.create("Synthetic board")
+    for n in range(sessions):
+        session_id = f"s{n:03d}" + "0" * 28
+        alice.link_session(board["id"], session_id, {"linked": True})
+        alice.link_session(board["id"], session_id, {"linked": False})
+    alice.delete(board["id"])
+
+    report = remap_identities(
+        get_or_create_engine(db_uri),
+        {"alice": "alice@example.com"},
+        dry_run=False,
+        gadget_store=store,
+    )
+
+    assert report.refused_gadgets == []
+    assert accounts.get_user("alice@example.com") is not None
+
+
+def account_store_ids(db_uri: str) -> set[str]:
+    """Every user ID in the default workspace."""
+    with Session(get_or_create_engine(db_uri)) as session:
+        return set(session.execute(select(SqlUser.id)).scalars())
 
 
 def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
@@ -373,13 +517,251 @@ def test_cli_commit_applies(db_uri: str) -> None:
 
     result = CliRunner().invoke(
         cli,
-        ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com", "--commit"],
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--commit",
+        ],
     )
 
     assert result.exit_code == 0, result.output
     assert "COMMITTED" in result.output
     assert account_store.get_user("alice") is None
     assert account_store.get_user("alice@example.com") is not None
+
+
+def test_cli_reports_a_user_refused_for_their_gadgets(db_uri: str, tmp_path) -> None:
+    """``--gadget-dir`` names the server's gadgets, and a refused user is reported."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    _gadget_service(db_uri, store, "alice").create("Synthetic board")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--gadget-dir",
+            str(tmp_path / "gadgets"),
+            "--commit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "REFUSED (has gadgets" in result.output
+    assert account_store.get_user("alice") is not None
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_cli_refuses_a_gadget_dir_that_is_not_a_directory(
+    db_uri: str, tmp_path, kind: str
+) -> None:
+    """A mistyped ``--gadget-dir`` fails before anything changes, instead of skipping the
+    gadget check and cutting a gadget owner off from their gadgets."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    gadget = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+    wrong = tmp_path / "gadgetz"
+    if kind == "file":
+        wrong.write_text("not a directory")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--gadget-dir",
+            str(wrong),
+            "--commit",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--gadget-dir" in result.output
+    assert account_store.get_user("alice") is not None
+    assert account_store.get_user("alice@example.com") is None
+    assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
+    assert not wrong.is_dir()
+
+
+def test_cli_dry_run_writes_nothing_in_the_gadget_dir(db_uri: str, tmp_path) -> None:
+    """The gadget check only reads: a dry run leaves the directory byte for byte as it was,
+    stale index entries included."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    root = tmp_path / "gadgets"
+    store = LocalGadgetStore(str(root))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("bob", hash_password("password123"))
+    service = _gadget_service(db_uri, store, "bob")
+    # A marker whose gadget is gone: an ordinary owner page would repair it away.
+    gone = service.create("Synthetic gone")
+    shutil.rmtree(root / "gadgets" / gone["id"])
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes() if path.is_file() else b"<dir>"
+            for path in sorted(root.rglob("*"))
+        }
+
+    before = snapshot()
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--gadget-dir",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert snapshot() == before
+
+
+def test_cli_finds_the_gadgets_where_the_servers_config_keeps_them(db_uri: str, tmp_path) -> None:
+    """``--config`` checks the gadget location the server itself uses, so a gadget owner
+    on a server whose gadgets live outside the default directory is refused."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    config = tmp_path / "server" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text("gadget_location: custom-gadgets\n")
+    store = LocalGadgetStore(str(config.parent / "custom-gadgets"))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    gadget = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--config",
+            str(config),
+            "--commit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "REFUSED (has gadgets" in result.output
+    assert account_store.get_user("alice") is not None
+    assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
+
+
+@pytest.mark.parametrize("config_text", ["port: 8000\n", "gadget_location: missing\n"])
+def test_cli_stops_when_the_config_does_not_name_an_existing_gadget_directory(
+    db_uri: str, tmp_path, monkeypatch: pytest.MonkeyPatch, config_text: str
+) -> None:
+    """A config without gadget_location leaves the location to the server's data
+    directory, which this process can't see, and a named one must exist: either way the
+    command changes nothing rather than skip the check."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    # The server's data directory differs from the migration's.
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "migration-data"))
+    store = LocalGadgetStore(str(tmp_path / "server-data" / "gadgets"))
+    config = tmp_path / "server" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text(config_text)
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    gadget = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--config",
+            str(config),
+            "--commit",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "gadget" in result.output
+    assert account_store.get_user("alice") is not None
+    assert account_store.get_user("alice@example.com") is None
+    assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
+
+
+@pytest.mark.parametrize("has_default_dir", [False, True], ids=["no_default", "default"])
+def test_cli_without_a_gadget_option_works_as_before_gadgets(
+    db_uri: str, tmp_path, monkeypatch: pytest.MonkeyPatch, has_default_dir: bool
+) -> None:
+    """The command's form from before gadgets still runs: it checks this machine's default
+    gadget directory when there is one, and otherwise warns that gadgets went unchecked."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    account_store.create_user_with_password("bob", hash_password("password123"))
+    if has_default_dir:
+        store = LocalGadgetStore(str(tmp_path / "data" / "gadgets"))
+        _gadget_service(db_uri, store, "alice").create("Synthetic board")
+
+    result = CliRunner().invoke(
+        cli,
+        ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com", "--commit"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert account_store.get_user("bob@example.com") is not None
+    if has_default_dir:
+        # Alice owns a gadget there, so she is refused rather than cut off from it.
+        assert "REFUSED (has gadgets" in result.output
+        assert account_store.get_user("alice") is not None
+        assert "WARNING" not in result.output
+    else:
+        assert "gadget owners were not checked" in result.output
+        assert account_store.get_user("alice@example.com") is not None
+
+
+def test_cli_refuses_no_gadgets_with_a_gadget_location(db_uri: str, tmp_path) -> None:
+    """--no-gadgets can't be combined with a location: one of them would be ignored."""
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--no-gadgets",
+            "--gadget-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--no-gadgets" in result.output
 
 
 def test_cli_requires_a_mapping(db_uri: str) -> None:
@@ -404,6 +786,7 @@ def test_cli_map_overrides_domain(db_uri: str) -> None:
             "example.com",
             "--map",
             "alice=alice@corp.com",
+            "--no-gadgets",
             "--commit",
         ],
     )

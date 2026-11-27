@@ -227,6 +227,13 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings drops Harnesses when none is left. The import review modal's See
   more opens Harnesses and dismisses the modal. Import sessions contains only
   session imports.
+- `gadget-tools`: with the server's `gadgets` feature on, native sessions get the
+  `sys_gadget_*` tools and the `gadget` framework skill, like other builtin tool
+  groups. A runner whose server doesn't advertise gadgets drops the group (and the
+  skill with it) from the agent and its sub-agents, and bundles that set
+  `tool_groups.gadgets: false` (the researcher) never offer them. A policy that denies
+  the tools (as the proactive agent's does) refuses each call; it does not hide the
+  tools or the skill from the agent.
 
 ## How to get to it (user POV)
 
@@ -1595,6 +1602,12 @@ confirm `sys_scheduled_task_list` shows no `Reminder: ...` task. Ask again,
 approve, and confirm the list shows one while the Automations page does not, that
 the message arrives as a new turn about 15 minutes later, and that
 `GET /v1/scheduled-tasks/{id}` then reports it `completed`.
+
+**`gadget-tools`:** start the instance with `OMNIGENT_FEATURES=gadgets` and ask a
+native session to build a small gadget; it should call `sys_gadget_create`,
+`sys_gadget_revision_create` and `sys_gadget_publish`, and the gadget appears as a
+tab beside the session. `tests/runner/test_gadget_tool_dispatch.py` covers the tools
+against the real app, including retries and independent calls that share a call ID.
 
 ## Gotchas
 

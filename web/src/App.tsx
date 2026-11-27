@@ -114,6 +114,24 @@ const WorkflowDetailPage = withPageView(
     ),
   ),
 );
+const GadgetListPage = withPageView(
+  "gadgets",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetListPage").then((m) => ({ default: m.GadgetListPage }))),
+  ),
+);
+const GadgetStartPage = withPageView(
+  "gadgets.new",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetStart").then((m) => ({ default: m.GadgetStartPage }))),
+  ),
+);
+const GadgetOpenPage = withPageView(
+  "gadgets.open",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetOpenPage").then((m) => ({ default: m.GadgetOpenPage }))),
+  ),
+);
 const SettingsPage = withPaneLoading(
   lazy(() => import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage }))),
 );
@@ -332,6 +350,30 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="workflows">
                 <WorkflowDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetListPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget/new`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetStartPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget/:gadgetId`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetOpenPage />
               </FeatureGatedPage>
             }
           />

@@ -63,7 +63,8 @@ vi.mock("./useFloatingPanes", async (importOriginal) => ({
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({}) }));
 vi.mock("@/lib/capabilities", async (importOriginal) => ({
   ...(await importOriginal<typeof CapabilitiesModule>()),
-  isFeatureEnabled: () => true,
+  // Every release feature but gadgets, which keep the classic sidebar instead of these panes.
+  isFeatureEnabled: (_info: unknown, key: string) => key !== "gadgets",
 }));
 // Each pane's terminal, reporting what the sidebar asks of it.
 vi.mock("./TerminalPaneSurface", () => ({

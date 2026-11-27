@@ -415,6 +415,15 @@ describe("workspace_sidebar_v2", () => {
     expect(await screen.findAllByTestId("file-action-host")).toHaveLength(1);
   });
 
+  it("keeps the classic sidebar, which has gadget tabs, when the server has gadgets too", async () => {
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, gadgets: true } });
+
+    expect(await screen.findByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("tabs-host")).toBeNull();
+  });
+
   it("keeps the shell when the file action host throws", async () => {
     fileActionHost.throws = true;
     vi.spyOn(console, "error").mockImplementation(() => {});

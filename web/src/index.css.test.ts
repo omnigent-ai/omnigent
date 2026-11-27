@@ -10,6 +10,7 @@ import { type ComponentProps, createElement } from "react";
 import { createPortal } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "./components/ui/tooltip";
@@ -743,9 +744,14 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
       ),
       {
         container: shell,
-        // The panel reads session snapshots for its tab labels.
+        // The panel reads session snapshots for its tab labels, and the URL for
+        // a gadget filling the screen.
         wrapper: ({ children }) =>
-          createElement(QueryClientProvider, { client: queryClient }, children),
+          createElement(
+            MemoryRouter,
+            null,
+            createElement(QueryClientProvider, { client: queryClient }, children),
+          ),
       },
     );
     const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');
@@ -1912,5 +1918,34 @@ describe("index.css pane strip window-corner inset", () => {
     expect(
       ruleFor("html[data-electron-mac] [data-pane-strip][data-pane-strip-title-bar-row]"),
     ).toContain("height: var(--pane-window-top-row)");
+  });
+});
+
+describe("gadget Create session dimming", () => {
+  const rule = topLevelRules(indexCssSource).find((candidate) =>
+    candidate.selector.includes("[data-gadget-session-scrim]"),
+  );
+
+  it("drops the sidebar under the dimming only while the root is marked", () => {
+    // The sidebar carries z-50 on desktop, above the menu's z-49 scrim; without this it stays
+    // bright while everything else dims. A :has() over the page would restyle it on every
+    // DOM change, so the menu marks the root instead.
+    expect(rule?.selector).not.toContain(":has(");
+    const sidebar = document.createElement("aside");
+    sidebar.className = "conversations-sidebar";
+    sidebar.style.position = "relative";
+    document.body.appendChild(sidebar);
+    const root = document.documentElement;
+    withStyle(
+      `.conversations-sidebar { z-index: 50; }\n${rule?.selector} { ${rule?.body} }`,
+      () => {
+        expect(getComputedStyle(sidebar).zIndex).toBe("50");
+        root.setAttribute("data-gadget-session-scrim", "");
+        expect(getComputedStyle(sidebar).zIndex).toBe("auto");
+        root.removeAttribute("data-gadget-session-scrim");
+        expect(getComputedStyle(sidebar).zIndex).toBe("50");
+      },
+    );
+    sidebar.remove();
   });
 });

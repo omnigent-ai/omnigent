@@ -8,10 +8,16 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 /**
  * The sidebar shows as tabs where the server turns `workspace_sidebar_v2` on, at any window
  * width; a narrow window shows them in a drawer. Touch clients, the mobile apps and phone or
- * tablet browsers, keep the classic drawers.
+ * tablet browsers, keep the classic drawers. A server with gadgets keeps the classic sidebar
+ * too: only it has gadget tabs and their full screen, so gadgets opened in a session would
+ * otherwise have nowhere to show.
  */
 export function useTabsSidebar(): boolean {
   const serverInfo = useServerInfo();
   const touchClient = useTouchClient();
-  return isFeatureEnabled(serverInfo, "workspace_sidebar_v2") && !touchClient;
+  return (
+    isFeatureEnabled(serverInfo, "workspace_sidebar_v2") &&
+    !isFeatureEnabled(serverInfo, "gadgets") &&
+    !touchClient
+  );
 }

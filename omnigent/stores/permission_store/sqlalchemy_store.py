@@ -19,7 +19,12 @@ from sqlalchemy.orm import InstrumentedAttribute, Session
 from sqlalchemy.sql.dml import Insert
 from sqlalchemy.sql.elements import ColumnElement
 
-from omnigent.db.account_authority import account_generation, lock_account, require_active_account
+from omnigent.db.account_authority import (
+    account_generation,
+    account_registration,
+    lock_account,
+    require_active_account,
+)
 from omnigent.db.db_models import (
     SqlScheduledTask,
     SqlScheduledTaskShare,
@@ -167,7 +172,7 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
 
 def _upsert_grant(
     dialect: str,
-    model: type[SqlSessionPermission] | type[SqlScheduledTaskShare] | type[SqlWorkflowShare],
+    model: (type[SqlSessionPermission] | type[SqlScheduledTaskShare] | type[SqlWorkflowShare]),
     key: dict[str, str],
     level: int,
     *,
@@ -1063,6 +1068,57 @@ class SqlAlchemyPermissionStore(PermissionStore):
         with self._session("read_deleted_accounts") as session:
             deleted = session.execute(select(*probes)).one()
         return {user_id for user_id, gone in zip(wanted, deleted, strict=True) if gone}
+
+    def outlived_accounts(self, user_ids: Sequence[str]) -> set[str]:
+        """Accounts this request authenticated as that are gone. See base class."""
+        wanted = sorted({u for u in user_ids if account_generation(u) is not None})
+        if not wanted:
+            return set()
+        with self._session("read_outlived_accounts") as session:
+            rows = session.execute(
+                select(SqlUser.id, SqlUser.deleted_at, SqlUser.account_generation).where(
+                    SqlUser.workspace_id == current_workspace_id(), SqlUser.id.in_(wanted)
+                )
+            ).all()
+        live = {row.id: row.account_generation for row in rows if row.deleted_at is None}
+        return {
+            user_id
+            for user_id in wanted
+            if user_id in live and live[user_id] != account_generation(user_id)
+        } | {row.id for row in rows if row.deleted_at is not None and row.id not in live}
+
+    def account_registrations(self, user_ids: Sequence[str]) -> dict[str, str]:
+        """Name each live account's registration. See base class.
+
+        One primary-key probe per ID in a single statement, so each comes back as given.
+        """
+        wanted = sorted(set(user_ids))
+        if not wanted:
+            return {}
+        probes = [
+            select(SqlUser.created_at)
+            .where(
+                SqlUser.workspace_id == current_workspace_id(),
+                SqlUser.id == user_id,
+                SqlUser.deleted_at.is_(None),
+                # The account this request authenticated as, not one registered under the
+                # name since: a request that outlived its account names no registration.
+                *(
+                    [SqlUser.account_generation == generation]
+                    if (generation := account_generation(user_id)) is not None
+                    else []
+                ),
+            )
+            .scalar_subquery()
+            for user_id in wanted
+        ]
+        with self._session("read_account_registrations") as session:
+            created = session.execute(select(*probes)).one()
+        found = {
+            user_id: account_registration(created_at)
+            for user_id, created_at in zip(wanted, created, strict=True)
+        }
+        return {user_id: name for user_id, name in found.items() if name is not None}
 
     def user_exists(self, user_id: str) -> bool:
         """Check for a user row. See base class for contract."""

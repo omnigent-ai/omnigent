@@ -82,7 +82,8 @@ the header menu), and each place is a separate entry point.
   under **Session**: Add nested agent, Pin or Unpin, Share, Fork, Export,
   Rename, Mark as unread, Create automation, Archive or Unarchive, and Delete.
   The QuickPick palette (`quick_pick_palette`) always lists them; the default
-  palette lists them where `workspace_sidebar_v2` shows feature commands. They're
+  palette lists them where `workspace_sidebar_v2` shows feature commands (with the
+  `gadgets` feature on, sessions keep the classic sidebar, so it doesn't). They're
   offered to the session's owner, as the header menu is; one that can't run
   stays listed with the reason, and a dialog such as Rename opens with focus in
   it. With `quick_pick_palette`, **Go to Session…** turns the open palette into
@@ -400,6 +401,32 @@ the header menu), and each place is a separate entry point.
   with its cost, including its own sub-agents; an unpriced one shows no cost.
   A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
   Agents list and graph show the same costs beside each agent.
+- `gadgets`: with the server's `gadgets` feature on, a session's side panel
+  shows the gadgets linked to it as tabs, and **New → Gadget** adds one; with it
+  off none of this appears. A tab can fill the screen, leaving only the gadget
+  and its **Open session** button. Opening a gadget from inside the app (the
+  Gadget page, its pin under **Gadget** in the sidebar, an in-app link) fills the
+  screen and leaves the sidebar as it was; loading a gadget's link fresh fills
+  the screen with the sidebar collapsed. A gadget action that needs a session
+  keeps the gadget full screen: it goes to the linked session, or opens the
+  **Create session** menu over a dimmed page, and the session created there is
+  linked to the gadget and gets the action. On a phone, the session header's menu
+  lists each linked gadget by name; choosing one opens it in a drawer over the
+  session, and **Close** shows the session again. New gadgets start on the
+  Gadget page's **New** button (also at `/gadget/new`): describe one and press
+  **Build**, or open a template's **Preview** and press **Use template**; Blank
+  is made in one click. With gadgets on, sessions keep this side panel even when
+  `workspace_sidebar_v2` is on, because gadget tabs and full screen live only in
+  it. A gadget's toolbar renames it in place from its name, and has **Comments**
+  (where **Address all** sends the open comments to its session), **Share** (only where
+  the server offers gadget sharing; the bundled SQL store doesn't), and a **⋯** menu with **Gadget details** and **Delete gadget**. A gadget that asks to
+  read the viewer's sessions waits for **Allow** / **Don’t allow** first; a gadget
+  that navigated itself stops with **Reload gadget**, after which it asks again.
+  The Gadget page lists the viewer's gadgets and, with sharing, a **Shared with you** section; each
+  row's **⋯** menu has **Rename**, **Pin to sidebar** / **Unpin from sidebar** and
+  **Delete gadget**, as the viewer's access allows. Closing a gadget's tab takes it out
+  of that session's side panel for the viewer who closed it only; it stays linked for
+  others who show it there.
 
 ## How to get to it (user POV)
 
@@ -850,7 +877,7 @@ from the composer's add tray. Selecting assistant text also offers **Ask in side
 chat** unless the composer is read-only. Viewers and editors of a shared session
 see none of these. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
-chats** reopens it. With `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a touch client), side chats open as
+chats** reopens it. With `workspace_sidebar_v2` on and the `gadgets` feature off, in a desktop app or desktop browser (not a touch client), side chats open as
 tabs in the workspace sidebar, and **Side chats** shows the session's side chat
 tab, or a New tab to start one. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to
@@ -1621,6 +1648,18 @@ outside the checkout to retain recordings.
 The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 `web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and
 its discoverability.
+- **`gadgets`:** no browser test drives it. `web/src/shell/AppShell.test.tsx`
+  ("gadget full screen contract") renders the real shell: an in-app open keeps the
+  sidebar as it was, a fresh link collapses it. `web/src/gadgets/host/gadgetSession.test.ts`
+  (same name) covers actions staying full screen and the Create session menu;
+  `web/src/gadgets/ui/GadgetRailTabs.test.tsx` covers the tabs, New → Gadget and
+  full screen, and `web/src/gadgets/ui/GadgetOpenSessionButton.test.tsx` the menu.
+  By hand: start a local server with `OMNIGENT_FEATURES=gadgets`, create a gadget
+  from the Gadget page, open it from the sidebar pin (sidebar stays) and from its
+  copied link in a new tab (sidebar collapses). The templates' own buttons send
+  actions to the gadget's session the same way: Data story's **Find stories in my
+  work** (before a story exists) and **Refresh data**, and the agent-designed views'
+  **Back to the previous look**; `web/src/gadgets/templates/*.test.ts` drive them.
 
 ## Gotchas
 

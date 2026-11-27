@@ -66,6 +66,8 @@ from omnigent.extensions.assets import (
     parse_dev_bundle_overrides,
 )
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
+from omnigent.gadgets.access import GadgetAccess, PermissionStoreGadgetAccess
+from omnigent.gadgets.accounts import DeletedAccountGadgets
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
@@ -84,6 +86,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
+    gadgets,
     managed_host_keepalive,
     session_journal,
     session_live_state,
@@ -142,6 +145,7 @@ from omnigent.server.routes.default_policies import create_default_policies_rout
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.extension_assets import create_extension_assets_router
 from omnigent.server.routes.extensions import create_extensions_router
+from omnigent.server.routes.gadget_permissions import stores_gadget_grants
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.inbox_items import create_inbox_items_router
@@ -207,6 +211,7 @@ from omnigent.stores.conversation_store import (
     SessionConnectivity,
     runner_seen_is_fresh,
 )
+from omnigent.stores.gadget_store import GadgetStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.inbox_item_store import InboxItemStore
 from omnigent.stores.memory_store import MemoryStore
@@ -429,6 +434,12 @@ class ServerInfoResponse(BaseModel):
     # ``GET /v1/workflows/shared`` lists those shared with the caller: needs
     # ``workflows`` and a store that keeps workflow grants.
     workflow_sharing: bool = False
+    # /v1/gadgets, with the ``gadgets`` feature and a gadget store; absent on older
+    # servers, which clients treat as unsupported.
+    gadgets: bool = False
+    # Gadgets can be shared through ``/v1/gadgets/{id}/permissions``: needs
+    # ``gadgets`` and a store that keeps gadget grants.
+    gadget_sharing: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -1958,6 +1969,8 @@ def create_app(
     host_session_recovery: DeploymentGate = False,
     proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
     memory_store: MemoryStore | None = None,
+    gadget_store: GadgetStore | None = None,
+    gadget_access: GadgetAccess | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -2001,6 +2014,10 @@ def create_app(
         automation access without deleting saved tasks.
     :param preference_store: Optional shared-preference API; no launcher adoption.
     :param memory_store: Optional long-term memory backend; mounts ``/v1/memory`` when set.
+    :param gadget_store: Where gadgets are kept; mounts ``/v1/gadgets`` when set. The
+        routes and the ``sys_gadget_*`` tools also need the ``gadgets`` release feature.
+    :param gadget_access: Who may do what with a gadget; ``None`` gives the owner
+        everything and everyone else their gadget grants in ``permission_store``.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
@@ -2465,6 +2482,14 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # A deleted account's gadget cleanup noted while gadgets were off goes on once they
+        # are on, without waiting for the next account deletion or registration.
+        deleted_account_gadgets = getattr(app_inst.state, "deleted_account_gadgets", None)
+        if deleted_account_gadgets is not None and app_inst.state.gadgets_available():
+            try:
+                await asyncio.to_thread(deleted_account_gadgets.resume)
+            except Exception:
+                _logger.exception("Gadget cleanup of deleted accounts deferred at startup")
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -2800,6 +2825,9 @@ def create_app(
     app.state.proactive_agent_available = proactive_agent_available
     app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
 
+    app.state.gadgets_available = lambda: (
+        gadget_store is not None and app.state.feature_flags.enabled(Feature.GADGETS)
+    )
     app.state.memory_available = lambda: (
         memory_store is not None and app.state.feature_flags.enabled(Feature.MEMORY)
     )
@@ -4147,6 +4175,8 @@ def create_app(
         current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
         frontend_features = app.state.feature_flags.frontend_dict()
         frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
+        # The flag alone doesn't mount the gadget routes; the web reads this to show gadgets.
+        frontend_features[Feature.GADGETS.value] = app.state.gadgets_available()
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -4230,6 +4260,9 @@ def create_app(
                 "workflows": workflows_available,
                 "workflow_sharing": workflows_available
                 and stores_workflow_grants(permission_store),
+                "gadgets": app.state.gadgets_available(),
+                "gadget_sharing": app.state.gadgets_available()
+                and stores_gadget_grants(permission_store),
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
@@ -4621,6 +4654,27 @@ def create_app(
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
+        )
+    if gadget_store is not None:
+        resolved_gadget_access = gadget_access or PermissionStoreGadgetAccess(
+            gadget_store, permission_store
+        )
+        # Deleting an account deletes its gadgets, which live outside the database.
+        if account_store is not None and hasattr(account_store, "attach_gadgets"):
+            app.state.deleted_account_gadgets = DeletedAccountGadgets(
+                gadget_store, resolved_gadget_access, enabled=app.state.gadgets_available
+            )
+            account_store.attach_gadgets(app.state.deleted_account_gadgets)
+        app.include_router(
+            gadgets.create_gadgets_router(
+                gadget_store,
+                resolved_gadget_access,
+                conversation_store=conversation_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["gadgets"],
         )
     if memory_store is not None:
         app.include_router(

@@ -63,7 +63,8 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => false
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({}) }));
 vi.mock("@/lib/capabilities", async (importOriginal) => ({
   ...(await importOriginal<typeof CapabilitiesModule>()),
-  isFeatureEnabled: () => listed.splitsAllowed,
+  // Gadgets keep the classic sidebar instead of these panes.
+  isFeatureEnabled: (_info: unknown, key: string) => key !== "gadgets" && listed.splitsAllowed,
 }));
 // The Terminal view stands in for every state with nothing to show as panes.
 vi.mock("./MainTerminalView", () => ({

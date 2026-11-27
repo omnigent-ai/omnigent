@@ -81,6 +81,7 @@ export type FeatureKey =
   | "workspace_sidebar_v2"
   | "sidebar_saved_views"
   | "floating_panes"
+  | "gadgets"
   | "pull_requests_v2"
   | "shared_session_updates_socket";
 
@@ -387,6 +388,11 @@ export interface ServerInfo {
    * servers (off).
    */
   workflow_sharing?: boolean;
+  /**
+   * The server keeps gadget grants (``/v1/gadgets/{id}/permissions``), so gadgets
+   * can be shared; absent on older servers and on stores without grants (off).
+   */
+  gadget_sharing?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -814,6 +820,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_journal: data.session_journal === true,
           workflows: data.workflows === true,
           workflow_sharing: data.workflow_sharing === true,
+          gadget_sharing: data.gadget_sharing === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,

@@ -70,6 +70,7 @@ from omnigent.models.model_override import (
 )
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.policies.builtins.safety import scheduled_task_review_error
+from omnigent.runner.gadget_tools import GADGET_TOOL_NAMES, execute_gadget_tool
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.journal_tools import (
     JOURNAL_TOOL_NAMES,
@@ -491,6 +492,9 @@ _SCHEDULED_TASK_TOOLS = frozenset(
 # Priority 5l.2: The session journal — the runner proxies the server's
 # /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
 _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
+# Gadgets: the runner proxies the server's /v1/gadgets routes
+# (see omnigent/runner/gadget_tools.py). Registered when the server enables gadgets.
+_GADGET_TOOLS = GADGET_TOOL_NAMES
 # Priority 5l.2: Owner Inbox — the runner proxies /v1/inbox/items. Registered
 # only for agents that opt into ``tool_groups.user_inbox``.
 _USER_INBOX_TOOLS = frozenset({"sys_user_inbox_post", "sys_user_inbox_list"})
@@ -564,6 +568,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
+    | _GADGET_TOOLS
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
     | _TERMINAL_TOOLS
@@ -1086,6 +1091,7 @@ _ALL_LOCAL_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
+    | _GADGET_TOOLS
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
 )
@@ -1115,6 +1121,17 @@ def get_call_id(event: _JsonObject) -> str:
     """Extract the call_id from an action_required event."""
     call_id = _event_item(event).get("call_id")
     return call_id if isinstance(call_id, str) else ""
+
+
+def get_item_id(event: _JsonObject) -> str:
+    """Extract the output item ID of an action_required event, ``""`` when it has none.
+
+    The harness mints it once per tool invocation, so it tells apart two invocations
+    that share a call ID (a harness can derive call IDs from the call's content), while a
+    redelivered event keeps it.
+    """
+    item_id = _event_item(event).get("id")
+    return item_id if isinstance(item_id, str) else ""
 
 
 def get_arguments(event: _JsonObject) -> str:
@@ -7891,6 +7908,16 @@ async def _collect_global_sessions(
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),
+                # Unix seconds, as sys_session_get_info reports them, so an agent can
+                # keep only sessions active within a time window.
+                **{
+                    key: r[source]
+                    for key, source in (
+                        ("created_at", "created_at"),
+                        ("last_activity_at", "updated_at"),
+                    )
+                    if isinstance(r.get(source), (int, float))
+                },
                 # Only an archive-inclusive listing can return archived rows.
                 **({"archived": r.get("archived") is True} if include_archived else {}),
                 # Every "mine" row is the caller's; elsewhere an agent must be
@@ -8353,6 +8380,7 @@ async def execute_tool(
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     call_id: str | None = None,
+    invocation_id: str | None = None,
     caller_user_id: str | None = None,
     session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
@@ -8387,6 +8415,9 @@ async def execute_tool(
         runner can wake a session that is no longer in a turn.
     :param call_id: The harness's tool call ID, when the caller has one; the
         journal tools key their writes on it.
+    :param invocation_id: The harness's output item ID for this call (see
+        :func:`get_item_id`), when the caller has one; the gadget tools key derived
+        operation IDs on it.
     :param session_workspace: The session's own server-stored workspace, e.g.
         ``Path("/repo")``; ``None`` when it has none, or
         :data:`UNKNOWN_SESSION_WORKSPACE` when it could not be read. Bounds
@@ -8680,6 +8711,15 @@ async def execute_tool(
                 call_id=call_id,
                 publish_event=publish_event,
             )
+        elif tool_name in _GADGET_TOOLS:
+            output = await execute_gadget_tool(
+                tool_name,
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                call_id=call_id,
+                invocation_id=invocation_id,
+            )
         elif tool_name in _USER_INBOX_TOOLS:
             output = await _execute_user_inbox_tool(
                 tool_name,
@@ -8824,6 +8864,7 @@ async def dispatch_tool_locally(
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     caller_user_id: str | None = None,
+    invocation_id: str | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -8849,6 +8890,8 @@ async def dispatch_tool_locally(
         ``execute_tool`` for the granted-surface check.
     :param wake_on_async_result: Forwarded to ``execute_tool`` so a
         ``sys_call_async`` result can wake the session after its turn ends.
+    :param invocation_id: The event's output item ID (:func:`get_item_id`), forwarded
+        to ``execute_tool``.
     :returns: The tool output string.
     """
     if not conversation_id:
@@ -8878,6 +8921,7 @@ async def dispatch_tool_locally(
         effective_harness=effective_harness,
         wake_on_async_result=wake_on_async_result,
         call_id=call_id,
+        invocation_id=invocation_id,
         caller_user_id=caller_user_id,
     )
 
@@ -11064,7 +11108,8 @@ def _execute_skill_tool(
     :param agent_spec: The session's AgentSpec.
     :param runner_workspace: The runner's workspace path for
         host-scope skill discovery.
-    :param workflows_enabled: Whether the server enables workflow skills.
+    :param workflows_enabled: Whether the server enables workflow skills; the
+        others, such as ``gadget``, follow the spec's tool groups.
     :returns: Tool output string.
     """
     from omnigent.spec.skill_sources import framework_skills

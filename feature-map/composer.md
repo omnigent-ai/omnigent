@@ -435,6 +435,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   (`web/src/components/composer/useComposerAddPaletteCommands.test.tsx`).
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
+- `gadget-quotes`: selecting text inside a gadget offers **Reply**, **Ask in
+  side chat** and **Add comment**; the first two quote the selection, with where it
+  is in the gadget, in the session's composer or a side chat, and the third saves a
+  comment on it in the gadget's Comments. New session opened from a full screen
+  gadget keeps the gadget full screen; its **Create session** menu holds the
+  host, permission and harness pickers in one row and starts the session there.
 
 ## How to get to it (user POV)
 
@@ -1237,6 +1243,13 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   server agent keeps the dialog open with the server's reason.
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
+- **`gadget-quotes`:** no browser test drives it.
+  `web/src/lib/gadgetComposerQuotes.test.tsx` covers quotes reaching the session's
+  composer once it can take them, `web/src/pages/ChatPage.composer.test.tsx` the
+  composer accepting a queued quote, `web/src/components/chat/SelectionPopup.test.tsx`
+  the Reply / Ask in side chat buttons, and `web/src/shell/NewChatDialog.flow.test.tsx`
+  ("starts the session from a full screen gadget's Create session menu as Start does")
+  the Create session menu.
 
 ## Gotchas
 

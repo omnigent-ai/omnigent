@@ -206,6 +206,7 @@ class ToolManager:
         self._register_journal_tools()
         self._register_user_inbox_tools()
         self._register_memory_tools()
+        self._register_gadget_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -259,6 +260,15 @@ class ToolManager:
         from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 
         for tool_class in JOURNAL_TOOLS:
+            self._tools[tool_class.name()] = tool_class()
+
+    def _register_gadget_tools(self) -> None:
+        """Register the runner-dispatched gadget tools when enabled."""
+        if not self._spec.tool_groups.gadgets:
+            return
+        from omnigent.tools.builtins.gadgets import GADGET_TOOLS
+
+        for tool_class in GADGET_TOOLS:
             self._tools[tool_class.name()] = tool_class()
 
     def _register_user_inbox_tools(self) -> None:

@@ -230,6 +230,11 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
+import {
+  GADGET_FULL_SCREEN_PARAM,
+  gadgetCoversConversation,
+  useGadgetRailRequest,
+} from "@/lib/gadgetRailTabs";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -253,7 +258,7 @@ import {
   subscribeSessionHostChanges,
 } from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
-import { MobileHeaderControlPortal } from "@/shell/MobileHeaderControlsSlot";
+import { MobileHeaderControlPortal, SessionControlPortal } from "@/shell/MobileHeaderControlsSlot";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -296,6 +301,11 @@ import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWa
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import {
+  type GadgetComposerQuote,
+  retryGadgetComposerQuotes,
+  useGadgetComposerQuotes,
+} from "@/lib/gadgetComposerQuotes";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
@@ -486,9 +496,21 @@ export function ChatPage() {
 
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
-  // (every 4 s) so messages arriving while viewing are marked seen.
+  // (every 4 s) so messages arriving while viewing are marked seen. A gadget
+  // filling the screen hides the conversation, so its new messages stay new.
+  // That holds from the start: a URL naming the gadget hides the conversation until the side
+  // panel shows the gadget or finds it can't (then the conversation shows and is read).
+  const pageServerInfo = useServerInfo();
+  const gadgetsMaybeOn =
+    pageServerInfo === "loading" || isFeatureEnabled(pageServerInfo, "gadgets");
+  const urlGadget = gadgetsMaybeOn
+    ? new URLSearchParams(search).get(GADGET_FULL_SCREEN_PARAM)
+    : null;
+  const gadgetCoversChat = useGadgetRailRequest((state) =>
+    gadgetCoversConversation(state, sessionConvId, urlGadget),
+  );
   useMarkConversationSeen(
-    sessionConvId,
+    gadgetCoversChat ? undefined : sessionConvId,
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 
@@ -1862,6 +1884,18 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   });
 
   const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
+  // A gadget's Reply and Ask in side chat land here like the transcript's own; the
+  // terminal view switches to chat first.
+  useGadgetComposerQuotes(conversationId ?? null, (quote) =>
+    takeGadgetComposerQuote(quote, {
+      permissionPending: !!permissionPending,
+      composerReadOnly,
+      showTerminal,
+      showChat: () => terminalFirst?.setView("chat"),
+      composer: composerRef.current,
+      sideChat: supportsSideChat(selectionSessionHarness, canStartSideChat),
+    }),
+  );
 
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
@@ -2027,11 +2061,45 @@ export function ConversationLoadError({
   );
 }
 
+/**
+ * Adds a quote a gadget queued for this session's composer, as Reply and Ask in side chat do
+ * for a transcript selection. False keeps it queued, to be tried on a later render.
+ */
+export function takeGadgetComposerQuote(
+  quote: GadgetComposerQuote,
+  page: {
+    /** The session's permissions are still loading; a loaded session without any isn't. */
+    permissionPending: boolean;
+    composerReadOnly: boolean;
+    showTerminal: boolean;
+    showChat: () => void;
+    composer: Pick<ComposerHandle, "appendReplyQuote" | "canTakeQuote" | "startSideChat"> | null;
+    sideChat: boolean;
+  },
+): boolean {
+  if (page.permissionPending) return false;
+  // A read-only session can't use the quote, so it isn't kept.
+  if (page.composerReadOnly) return true;
+  if (page.showTerminal) {
+    page.showChat();
+    return false;
+  }
+  // The composer restores this session's saved draft first, which would replace the quote.
+  if (!page.composer?.canTakeQuote()) return false;
+  // A composer that can't take it yet (offline, read-only) keeps the quote queued.
+  if (quote.kind === "side_chat" && page.sideChat) return page.composer.startSideChat(quote.text);
+  return page.composer.appendReplyQuote(quote.text);
+}
+
 interface ComposerHandle {
-  appendReplyQuote: (text: string) => void;
+  /** Whether the quote went in; a blocked composer refuses it. */
+  appendReplyQuote: (text: string) => boolean;
+  /** Whether a quote added now stays: this session's saved draft has been restored. */
+  canTakeQuote: () => boolean;
   /** Load a sent message into the composer, confirming before replacing a draft. */
   editSentMessage: (message: SentMessage) => void;
-  startSideChat: (selectedText: string) => void;
+  /** Quote in a side chat; whether the quote was taken (not while offline or read-only). */
+  startSideChat: (selectedText: string) => boolean;
   /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
   focus: () => void;
 }
@@ -3986,14 +4054,24 @@ function ComposerImpl(
   });
 
   const replyQuoteInsertedRef = useRef(false);
+  // A quote a gadget queued while this composer couldn't take one (its draft still
+  // restoring, a Quick Answer open, the host unreachable) is tried again once it can.
+  const canTakeQuoteNow = settledConversationId === conversationId && !inputDisabled;
+  useEffect(() => {
+    if (canTakeQuoteNow) retryGadgetComposerQuotes();
+  }, [canTakeQuoteNow]);
   useImperativeHandle(ref, () => ({
     focus() {
       if (isMobileRef.current || composerLockedByBtw) return;
       textareaRef.current?.focus({ preventScroll: true });
     },
+    canTakeQuote() {
+      // The saved draft must be restored first, or it would replace the quote.
+      return settledConversationId === conversationId && !composerLockedByBtw;
+    },
     appendReplyQuote(text) {
       const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
-      if (blocked || composerLockedByBtw || !text.trim()) return;
+      if (blocked || composerLockedByBtw || !text.trim()) return false;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
@@ -4002,6 +4080,7 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+      return true;
     },
     editSentMessage(message) {
       editSentMessage(message);
@@ -4011,7 +4090,7 @@ function ComposerImpl(
       // A pending tab creates its fork only when the user sends.
       const sourceId = useChatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
-        return;
+        return false;
       }
       const store = useChatStore.getState();
       const target = store.sideChatSelectionTarget;
@@ -4023,6 +4102,7 @@ function ComposerImpl(
       } else {
         store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
       }
+      return true;
     },
   }));
 
@@ -4889,7 +4969,7 @@ function ComposerImpl(
                 onOpen={savedWorkflows.refresh}
               />
               {!subAgentLabel && composerSessionId && (
-                <MobileHeaderControlPortal sessionId={composerSessionId}>
+                <MobileHeaderControlPortal sessionId={composerSessionId} popoverSlot="host">
                   <HostBadge
                     sessionId={composerSessionId}
                     appearance={isMobile ? "header" : "composer"}
@@ -4905,31 +4985,40 @@ function ComposerImpl(
                 </MobileHeaderControlPortal>
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
-                <ComposerPermissionPicker
-                  label="Permission mode"
-                  value={permissionLabel || "Permission mode"}
-                  harness={sessionHarness}
-                  selectedValue={selectedPermissionMode}
-                  options={permissionOptions}
-                  disabled={!permissionControlInteractive || configBusy}
-                  disabledReason={
-                    isOwnerLevel(permissionLevel)
-                      ? undefined
-                      : "Only the session owner can change the permission mode"
-                  }
-                  // The message box takes ⇧Tab, so not while it's disabled.
-                  shortcut={
-                    nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
-                  }
-                  onSelect={(mode) => void changePermission(mode)}
-                  openNonce={permissionPickerOpenNonce}
-                />
+                <SessionControlPortal
+                  sessionId={composerSessionId}
+                  slot="permission"
+                  offered={composerSessionId !== null}
+                >
+                  <ComposerPermissionPicker
+                    label="Permission mode"
+                    value={permissionLabel || "Permission mode"}
+                    harness={sessionHarness}
+                    selectedValue={selectedPermissionMode}
+                    options={permissionOptions}
+                    disabled={!permissionControlInteractive || configBusy}
+                    disabledReason={
+                      isOwnerLevel(permissionLevel)
+                        ? undefined
+                        : "Only the session owner can change the permission mode"
+                    }
+                    // The message box takes ⇧Tab, so not while it's disabled.
+                    shortcut={
+                      nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
+                    }
+                    onSelect={(mode) => void changePermission(mode)}
+                    openNonce={permissionPickerOpenNonce}
+                  />
+                </SessionControlPortal>
               )}
             </>
           ),
           trailing: (
             <>
-              <MobileHeaderControlPortal sessionId={composerSessionId}>
+              <MobileHeaderControlPortal
+                sessionId={composerSessionId}
+                popoverSlot={composerSessionId === null ? undefined : "harness"}
+              >
                 <div className="flex min-w-0 items-center rounded-lg">
                   <SessionHarnessPicker
                     appearance={isMobile ? "header" : "composer"}
@@ -4938,6 +5027,16 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    renderIcon={(icon) => (
+                      <SessionControlPortal
+                        sessionId={composerSessionId}
+                        slot="icon"
+                        inPlace={false}
+                        offered={composerSessionId !== null}
+                      >
+                        {icon}
+                      </SessionControlPortal>
+                    )}
                     paletteSettingsSource={
                       composerSessionId &&
                       isFeatureEnabled(composerServerInfo, "quick_pick_palette")

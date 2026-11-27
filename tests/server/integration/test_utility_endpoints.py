@@ -106,6 +106,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "project_repository_creation": True,
         "quick_pick_palette": False,
         "workspace_sidebar_v2": False,
+        "gadgets": False,
         # Off: it follows workspace_sidebar_v2 while no deployment names it.
         "floating_panes": False,
         "session_orchestration": True,
@@ -119,6 +120,9 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "pull_requests_v2": False,
     }
     assert data["sibling_sessions"] is True
+    # Gadgets are off: the top-level capabilities the web reads say so too.
+    assert data["gadgets"] is False
+    assert data["gadget_sharing"] is False
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
     # installable_harnesses is the allowlist the SPA offers setup for; blank

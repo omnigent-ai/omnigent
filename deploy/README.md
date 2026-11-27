@@ -643,8 +643,16 @@ admins: [you@yourcompany.com]         # who can manage members
 across when you switch, so they keep their sessions and admin rights:
 
 ```bash
-omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com
+omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com \
+  --gadget-dir /data/gadgets
 ```
+
+`--gadget-dir` is the server's gadget directory (`<data dir>/gadgets` unless
+the config sets `gadget_location`), so the command can refuse users who own
+gadgets instead of cutting them off. A `--config` whose file sets
+`gadget_location` works too; pass `--no-gadgets` instead for a server that
+never kept any. Without any of these it checks only this machine's default
+gadget directory, and warns when there is none.
 
 For the provider-specific walkthroughs (GitHub OAuth, Google Workspace,
 generic OIDC), see

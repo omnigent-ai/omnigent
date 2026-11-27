@@ -3939,6 +3939,97 @@
         "title": "FunctionCallOutputData",
         "type": "object"
       },
+      "GadgetGrantRequest": {
+        "description": "Body of `PUT /v1/gadgets/{id}/permissions`.",
+        "properties": {
+          "ensure_minimum": {
+            "default": false,
+            "description": "Keep a higher existing grant instead of lowering it.",
+            "title": "Ensure Minimum",
+            "type": "boolean"
+          },
+          "level": {
+            "description": "`1` (Can view), `2` (Can edit) or `3` (Can manage), as an integer.",
+            "format": "int64",
+            "title": "Level",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "The user or group to share with, e.g. `\"alice@example.com\"`; surrounding whitespace is ignored.",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "level"
+        ],
+        "title": "GadgetGrantRequest",
+        "type": "object"
+      },
+      "GadgetPermissionList": {
+        "description": "One page of a gadget's grants, ordered by `user_id`.",
+        "properties": {
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/GadgetPermissionObject"
+            },
+            "title": "Permissions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "next_cursor"
+        ],
+        "title": "GadgetPermissionList",
+        "type": "object"
+      },
+      "GadgetPermissionObject": {
+        "description": "One grant on a gadget.",
+        "properties": {
+          "display_name": {
+            "description": "The grantee's name for display; the ID when the server has no other name.",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "gadget_id": {
+            "description": "The gadget.",
+            "title": "Gadget Id",
+            "type": "string"
+          },
+          "level": {
+            "description": "`1` (Can view), `2` (Can edit) or `3` (Can manage).",
+            "format": "int64",
+            "title": "Level",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "The grantee's canonical ID, e.g. `\"alice@example.com\"`.",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "gadget_id",
+          "level",
+          "display_name"
+        ],
+        "title": "GadgetPermissionObject",
+        "type": "object"
+      },
       "GrantPermissionRequest": {
         "description": "Request body for `PUT /v1/sessions/{id}/permissions`.",
         "properties": {
@@ -8105,6 +8196,16 @@
                 "type": "null"
               }
             ]
+          },
+          "gadget_sharing": {
+            "default": false,
+            "title": "Gadget Sharing",
+            "type": "boolean"
+          },
+          "gadgets": {
+            "default": false,
+            "title": "Gadgets",
+            "type": "boolean"
           },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",
@@ -18279,6 +18380,1543 @@
         "summary": "Get Extension Asset",
         "tags": [
           "extensions"
+        ]
+      }
+    },
+    "/v1/gadgets": {
+      "get": {
+        "description": "A page of the caller's own gadgets, in the store's order: `{\"items\", \"next_cursor\"}`.\n\nFollow `next_cursor`; a page can be short and still continue.",
+        "operationId": "list_gadgets_v1_gadgets_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Gadgets",
+        "tags": [
+          "gadgets"
+        ]
+      },
+      "post": {
+        "description": "Create a private gadget from `{\"name\"}`; answers the gadget with 201.",
+        "operationId": "create_gadget_v1_gadgets_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Gadget",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/sessions/{session_id}": {
+      "get": {
+        "description": "A page of the gadgets shown beside one of the caller's sessions, `{\"session_id\", \"items\", \"next_cursor\"}`.",
+        "operationId": "session_gadgets_v1_gadgets_sessions__session_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 20,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Gadgets",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/shared": {
+      "get": {
+        "description": "A page of other people's gadgets shared with the caller, `{\"items\", \"next_cursor\"}`, each with `shared_via` (`\"user\"` or `\"group\"`) and\n`owner_email` (the owner's display name). A page can be short and continue.",
+        "operationId": "shared_gadgets_v1_gadgets_shared_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Shared Gadgets",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/shelf": {
+      "get": {
+        "description": "A page of the caller's pins, `{\"pinned\": [{\"id\", \"name\"}], \"has_owned\", \"next_cursor\"}`, for the sidebar.",
+        "operationId": "shelf_v1_gadgets_shelf_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 50,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Shelf",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}": {
+      "delete": {
+        "description": "Delete a gadget for everyone; needs manage permission. With `?if_unbuilt=true`\nonly while it was never published nor taken by the caller's gadget session:\n`{\"deleted\": false}` when it was kept.",
+        "operationId": "delete_gadget_v1_gadgets__app_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "if_unbuilt",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Gadget",
+        "tags": [
+          "gadgets"
+        ]
+      },
+      "get": {
+        "description": "One gadget with the caller's `permissions`.",
+        "operationId": "get_gadget_v1_gadgets__app_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Gadget",
+        "tags": [
+          "gadgets"
+        ]
+      },
+      "patch": {
+        "description": "Rename a gadget for everyone with `{\"name\"}`; needs publish permission.",
+        "operationId": "rename_gadget_v1_gadgets__app_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Gadget",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/actions": {
+      "get": {
+        "description": "A page of the action ledger: `{\"items\", \"next_cursor\"}`.",
+        "operationId": "list_actions_v1_gadgets__app_id__actions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 50,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Actions",
+        "tags": [
+          "gadgets"
+        ]
+      },
+      "post": {
+        "description": "Queue `{\"action\", \"params\", \"operation_id\"}`; 201, or 200 when it joined an\nopen request for the same action (`\"merged\": true`).",
+        "operationId": "request_action_v1_gadgets__app_id__actions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "action": {
+                    "type": "string"
+                  },
+                  "operation_id": {
+                    "type": "string"
+                  },
+                  "params": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "action",
+                  "operation_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Joined an open request for the same action (`merged`)."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "The ledger entry: `id`, `value`, `version` and times."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Request Action",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/actions/progress": {
+      "get": {
+        "description": "Progress of `?ids=a,b`, or of the caller's open actions without ids.",
+        "operationId": "action_progress_v1_gadgets__app_id__actions_progress_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Action Progress",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/actions/{action_id}": {
+      "patch": {
+        "description": "Record `state`, `summary` or `session_id` with `if_version` and\n`operation_id`.",
+        "operationId": "update_action_v1_gadgets__app_id__actions__action_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "title": "Action Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "if_version": {
+                    "type": "string"
+                  },
+                  "operation_id": {
+                    "type": "string"
+                  },
+                  "session_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "state": {
+                    "enum": [
+                      "queued",
+                      "running",
+                      "done",
+                      "failed",
+                      "cancelled"
+                    ],
+                    "type": "string"
+                  },
+                  "summary": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "if_version",
+                  "operation_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "The ledger entry: `id`, `value`, `version` and times."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Action",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/actions/{action_id}/delivery": {
+      "post": {
+        "description": "Record that the web app posted the action into `{\"session_id\"}`.",
+        "operationId": "record_delivery_v1_gadgets__app_id__actions__action_id__delivery_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "title": "Action Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Delivery",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/comments": {
+      "get": {
+        "description": "A page of comments in the order they were made,\n`{\"items\", \"next_cursor\", \"can_comment\"}`, optionally only `?status=`; a page\ncan be short and still continue.",
+        "operationId": "list_comments_v1_gadgets__app_id__comments_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "enum": [
+                "draft",
+                "addressed"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Comments",
+        "tags": [
+          "gadgets"
+        ]
+      },
+      "post": {
+        "description": "Add `{\"body\", \"anchor\", \"operation_id\"}`; answers the comment with 201.",
+        "operationId": "create_comment_v1_gadgets__app_id__comments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Comment",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/comments/{comment_id}": {
+      "delete": {
+        "description": "Delete a comment: its author, or someone who manages the gadget.",
+        "operationId": "delete_comment_v1_gadgets__app_id__comments__comment_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "title": "Comment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Comment",
+        "tags": [
+          "gadgets"
+        ]
+      },
+      "patch": {
+        "description": "Change a comment's `body` (its author) or `status`.",
+        "operationId": "update_comment_v1_gadgets__app_id__comments__comment_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "title": "Comment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Comment",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/content": {
+      "get": {
+        "description": "The published revision's HTML and the capabilities granted to the caller.",
+        "operationId": "content_v1_gadgets__app_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Content",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/describe": {
+      "get": {
+        "description": "What an agent reads before working with the records: the published revision's\nguide, collection schemas, constraints and actions, without its HTML.",
+        "operationId": "describe_v1_gadgets__app_id__describe_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Describe",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/pin": {
+      "put": {
+        "description": "Pin or unpin a readable gadget with `{\"pinned\": bool}`; answers the shelf.",
+        "operationId": "pin_v1_gadgets__app_id__pin_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pin",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/publish": {
+      "post": {
+        "description": "Publish `{\"revision_id\", \"if_version\"}`; answers the gadget.",
+        "operationId": "publish_v1_gadgets__app_id__publish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "if_version": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "revision_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "revision_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Publish",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/revisions": {
+      "post": {
+        "description": "Upload an immutable revision; answers `{\"id\"}` with 201.",
+        "operationId": "create_revision_v1_gadgets__app_id__revisions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Revision",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/revisions/{revision_id}": {
+      "get": {
+        "description": "A revision's HTML and configuration; `published` names the published one.",
+        "operationId": "get_revision_v1_gadgets__app_id__revisions__revision_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "title": "Revision Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Revision",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/rpc": {
+      "post": {
+        "description": "The sandboxed frame's data bridge: `{\"protocol\": 1, \"request_id\", \"revision_id\", \"method\", \"params\"}` answers `{\"result\"}`.",
+        "operationId": "rpc_v1_gadgets__app_id__rpc_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rpc",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/session": {
+      "get": {
+        "description": "The caller's gadget session: `{\"session_id\", \"version\"}`.",
+        "operationId": "get_gadget_session_v1_gadgets__app_id__session_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Gadget Session",
+        "tags": [
+          "gadgets"
+        ]
+      },
+      "put": {
+        "description": "Register `{\"session_id\"}` as the caller's gadget session.",
+        "operationId": "set_gadget_session_v1_gadgets__app_id__session_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Gadget Session",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/session/status": {
+      "get": {
+        "description": "Whether the caller's gadget session and the sessions it started are working.",
+        "operationId": "gadget_session_status_v1_gadgets__app_id__session_status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Gadget Session Status",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/sessions/{session_id}": {
+      "put": {
+        "description": "Show a gadget beside a session (`{\"linked\": bool}`); answers its gadgets.\n\nShowing it there also sends the caller's actions from the gadget's page to that\nsession, unless the body has `\"handles_actions\": false`.",
+        "operationId": "link_session_v1_gadgets__app_id__sessions__session_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Session",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{gadget_id}/permissions": {
+      "get": {
+        "description": "List the grants on a gadget the caller manages. The owner holds no grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent, a server that cannot keep gadget grants or a caller who cannot manage it; the gadget 404 otherwise.",
+        "operationId": "list_gadget_permissions_v1_gadgets__gadget_id__permissions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "gadget_id",
+            "required": true,
+            "schema": {
+              "title": "Gadget Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: user_id to start after",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: user_id to start after",
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GadgetPermissionList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Gadget Permissions",
+        "tags": [
+          "gadgets"
+        ]
+      },
+      "put": {
+        "description": "Share a gadget with a user or group at Can view, Can edit or Can manage.\n\nReplaces an existing grant, or keeps a higher one with `ensure_minimum`.\nAuto-creates the grantee user if they don't exist yet.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent, the sharing policy, a server that cannot share gadgets or a caller who cannot manage it; 400 for an empty or over-long ID, the owner, `__public__` or the local user.",
+        "operationId": "grant_gadget_permission_v1_gadgets__gadget_id__permissions_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "gadget_id",
+            "required": true,
+            "schema": {
+              "title": "Gadget Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GadgetGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GadgetPermissionObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Grant Gadget Permission",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{gadget_id}/permissions/{target_user_id}": {
+      "delete": {
+        "description": "Stop sharing a gadget with a user or group. Idempotent: 204 when they hold none.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent, a server that cannot keep gadget grants or a caller who cannot manage it; the gadget 404 otherwise.",
+        "operationId": "revoke_gadget_permission_v1_gadgets__gadget_id__permissions__target_user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "gadget_id",
+            "required": true,
+            "schema": {
+              "title": "Gadget Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target_user_id",
+            "required": true,
+            "schema": {
+              "title": "Target User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Gadget Permission",
+        "tags": [
+          "gadgets"
         ]
       }
     },

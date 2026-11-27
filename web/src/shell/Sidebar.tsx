@@ -140,7 +140,6 @@ import { useIsMutating, useQueries, useQueryClient } from "@tanstack/react-query
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import {
   canFlagUnread,
-  isConversationMuted,
   isInMutedProject,
   isSessionMuted,
   showsUnreadFor,
@@ -277,13 +276,13 @@ import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/s
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { withUnreadState, type SessionState } from "@/hooks/useSessionState";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
+import { useSessionIndicatorState } from "@/hooks/useSessionIndicatorState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
   markConversationRead,
   markConversationUnread,
-  useConversationReadState,
   useReadStateSnapshot,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
@@ -336,6 +335,7 @@ import {
 } from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { GadgetSidebarNav, useFullScreenGadgetId } from "@/gadgets/ui/GadgetSidebarNav";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -662,6 +662,7 @@ function useActiveNavItem(): {
   isCanvasPage: boolean;
   isTasksPage: boolean;
   isWorkflowsPage: boolean;
+  isGadgetPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -687,6 +688,8 @@ function useActiveNavItem(): {
   // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
   const isWorkflowsPage =
     !isExtensionRoute && (leaf === "workflows" || segments.at(-2) === "workflows");
+  // /gadget (list), /gadget/new and /gadget/:gadgetId.
+  const isGadgetPage = !isExtensionRoute && (leaf === "gadget" || segments.at(-2) === "gadget");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -701,6 +704,7 @@ function useActiveNavItem(): {
     !isCanvasPage &&
     !isTasksPage &&
     !isWorkflowsPage &&
+    !isGadgetPage &&
     !isUsagePage &&
     !isExtensionRoute;
   const searchParams = new URLSearchParams(location.search);
@@ -718,6 +722,7 @@ function useActiveNavItem(): {
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
+    isGadgetPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -1037,16 +1042,20 @@ function SidebarImpl({
 
   // Which top-level nav button to highlight for the current route.
   const {
-    isNewChatPage,
+    isNewChatPage: isNewChatRoute,
     isInboxPage,
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
+    isGadgetPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
     projectHomeName,
   } = useActiveNavItem();
+  // A gadget filling the screen beside New session is what the sidebar marks, not New session.
+  const fullScreenGadgetId = useFullScreenGadgetId();
+  const isNewChatPage = isNewChatRoute && fullScreenGadgetId === null;
   const navigate = useNavigate();
   const projectKanban = useProjectKanbanEnabled();
   const openProjectHome = useStableCallback((projectName: string) => {
@@ -1654,6 +1663,7 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              <GadgetSidebarNav active={isGadgetPage} onNavigate={onNavClick} />
               {canvasEnabled && (
                 <PrimaryNavLink
                   to={navDestinations.canvas.to}
@@ -6507,42 +6517,11 @@ function ConversationRowImpl({
   const isProvisionalLabel =
     pendingTitle === null && conversation.title == null && optimisticTitle !== undefined;
   const hasDraft = useHasSessionDraft(conversation.id);
-  // A write for another conversation leaves this primitive snapshot unchanged,
-  // so useSyncExternalStore skips the heavy row render.
-  const readState = useConversationReadState(
-    conversation.id,
-    conversation.updated_at,
-    conversation.status,
+  const { sessionState, unread, hasUnseenMessages, isMuted } = useSessionIndicatorState(
+    conversation,
+    isActive,
   );
-  // Explicit unread overrides active-row suppression; running turns remain
-  // hidden through readState.unseen. Muting hides the dot without marking read.
-  useMutedProjects();
-  const isMuted = isConversationMuted(conversation);
-  const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
-  const hasUnseenMessages = showsUnreadFor(conversation, unread);
   const canMarkUnread = !unread;
-  // Approvals, turns and failures outrank the unread dot without clearing read
-  // state; background work alone yields to it.
-  const badgeConversations = useMemo(() => [conversation], [conversation]);
-  const [derivedState] = useSessionBadgeStates(badgeConversations);
-  const badgeState = withUnreadState(derivedState, hasUnseenMessages);
-  // The bound session's launch/relaunch window: a send is in flight (local
-  // status "streaming") or the runner is auto-creating the PTY
-  // (`terminalPending`), but the server hasn't confirmed `running` yet — a
-  // cold boot, or a send waking a disconnected runner. Without this the row
-  // shows nothing while the session is visibly "Starting up…" in the chat.
-  // Only the bound (open) conversation has this store state; other rows read
-  // false, and the server-derived states above win once they land.
-  const isStartingUp = useChatStore(
-    (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
-  );
-  // A send waking the session shows its startup spinner over background work.
-  const sessionState =
-    badgeState?.kind === "awaiting" || (badgeState?.kind === "running" && !badgeState.background)
-      ? badgeState
-      : isStartingUp
-        ? { kind: "starting" as const }
-        : badgeState;
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.

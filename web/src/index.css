@@ -1139,6 +1139,14 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   }
 }
 
+/* A gadget's Create session menu dims the whole page, the sidebar included: the sidebar's own
+   z-50 would lift it above the dimming (z-49) and leave it looking highlighted. The menu marks
+   the root element while it shows; a :has() selector there would restyle the page on every
+   DOM change. */
+:root[data-gadget-session-scrim] .conversations-sidebar {
+  z-index: auto;
+}
+
 .conversations-sidebar {
   @variant max-md {
     margin-top: -1px;

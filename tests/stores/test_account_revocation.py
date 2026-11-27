@@ -22,6 +22,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from omnigent.stores.workflow_store import WorkflowStore
+from tests.gadgets.grant_store import GadgetGrantStore
 
 
 def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) -> None:
@@ -1557,3 +1558,1061 @@ def test_prompt_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
         with pytest.raises(OmnigentError, match="revoked"):
             settings.set_prompt_override(None, actor="admin", require_admin=True)
     assert settings.read_prompt_override() == "Look for stale pull requests."
+
+
+def _gadgets(db_uri: str, tmp_path, accounts: SqlAlchemyAccountStore):
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.gadgets.service import GadgetService, GadgetViewer
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    permissions = GadgetGrantStore(db_uri)
+    access = PermissionStoreGadgetAccess(store, permissions)
+    accounts.attach_gadgets(DeletedAccountGadgets(store, access))
+
+    class AsAccount:
+        """A user's gadget service, each call made as a request of their account would be."""
+
+        def __init__(self, user: str) -> None:
+            account = accounts.get_user(user)
+            self.generation = account.account_generation if account is not None else None
+            self.user = user
+            # As the gadget routes resolve a request's viewer.
+            self.registration = permissions.account_registrations([user]).get(user)
+            viewer = GadgetViewer(user, self.registration)
+            self.service = GadgetService(store, access, viewer)
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            method = getattr(self.service, name)
+
+            def call(*args, **kwargs):  # type: ignore[no-untyped-def]
+                with account_authority_scope(self.user, self.generation):
+                    return method(*args, **kwargs)
+
+            return call
+
+    return store, access, AsAccount
+
+
+def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
+    db_uri: str, tmp_path
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    alice = service("alice")
+    board = alice.create("Synthetic board")
+    kept = service("bob").create("Bob's board")
+    permissions.grant_for_gadget("bob", board["id"], 2)
+    alice.pin(board["id"], {"pinned": True})
+
+    assert accounts.delete_user("alice") is True
+    assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
+    assert store.get(board["id"]) is None
+    assert permissions.list_for_gadget(board["id"]) == ([], None)
+    assert access.shared_with("bob").items == []
+
+    # The name starts over: no gadgets or pins come back with it.
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert service("alice").list_owned() == {"items": [], "next_cursor": None}
+    assert service("alice").shelf()["pinned"] == []
+    assert store.get(kept["id"]) is not None
+
+
+def test_a_write_on_its_way_when_the_account_is_deleted_is_cleaned_up_after_it_lands(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    """A create and a pin that had passed their checks before the account was deleted land
+    after its cleanup finished; they queue the cleanup again, so nothing of the deleted
+    registration stays behind, and the name registered again starts empty."""
+    import threading
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    kept = service("bob").create("Bob's board")
+    permissions.grant_for_gadget("alice", kept["id"], 1)
+    alice = service("alice")
+    registration = alice.registration
+    assert registration is not None
+
+    release = threading.Event()
+    paused = threading.Barrier(3)
+    real_create = store.create
+    real_user_files = store.user_files
+
+    def late_create(owner_id, name, **kwargs):  # type: ignore[no-untyped-def]
+        if owner_id == "alice":
+            paused.wait(timeout=10)
+            release.wait(timeout=10)
+        return real_create(owner_id, name, **kwargs)
+
+    class LateFiles:
+        waited = False
+
+        def __init__(self, files) -> None:  # type: ignore[no-untyped-def]
+            self._files = files
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(self._files, name)
+
+        def _pause(self) -> None:
+            # Only the pin's first write waits; the shelf is reopened on every call.
+            if not LateFiles.waited:
+                LateFiles.waited = True
+                paused.wait(timeout=10)
+                release.wait(timeout=10)
+
+        def mkdirs(self, path: str) -> None:
+            # Paused before the pin's first write, which recreates the deleted scope.
+            self._pause()
+            self._files.mkdirs(path)
+
+        def create_json(self, path: str, value: dict) -> None:
+            self._pause()
+            self._files.create_json(path, value)
+
+    def user_files(user_id, **kwargs):  # type: ignore[no-untyped-def]
+        files = real_user_files(user_id, **kwargs)
+        if user_id == "alice" and kwargs.get("owner_registration") == registration:
+            return LateFiles(files)
+        return files
+
+    monkeypatch.setattr(store, "create", late_create)
+    monkeypatch.setattr(store, "user_files", user_files)
+    errors: list[BaseException] = []
+
+    def run(call) -> None:  # type: ignore[no-untyped-def]
+        try:
+            call()
+        except BaseException as error:
+            errors.append(error)
+
+    writers = [
+        threading.Thread(target=run, args=(lambda: alice.create("Late board"),)),
+        threading.Thread(target=run, args=(lambda: alice.pin(kept["id"], {"pinned": True}),)),
+    ]
+    for writer in writers:
+        writer.start()
+    paused.wait(timeout=10)
+    # Both writes are past their checks; the account goes, and its cleanup finishes.
+    assert accounts.delete_user("alice") is True
+    release.set()
+    for writer in writers:
+        writer.join(timeout=10)
+    assert errors == []
+    # They landed after the cleanup, for the deleted registration.
+    assert len(list(store.iter_owned("alice", owner_registration=registration))) == 1
+    assert (store._user_dir("alice", registration)).exists()
+
+    monkeypatch.setattr(store, "user_files", real_user_files)
+    for _ in range(3):
+        accounts._gadgets.resume()
+    assert list(store.iter_owned("alice", owner_registration=registration)) == []
+    assert not store._user_dir("alice", registration).exists()
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert service("alice").list_owned() == {"items": [], "next_cursor": None}
+    assert service("alice").shelf()["pinned"] == []
+    assert store.get(kept["id"]) is not None
+
+
+def _reopened_cleanup(db_uri: str, tmp_path):
+    """The store and cleanup a restarted server would have, on the same files."""
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    access = PermissionStoreGadgetAccess(store, GadgetGrantStore(db_uri))
+    return store, DeletedAccountGadgets(store, access)
+
+
+def test_a_write_landing_after_the_cleanups_last_look_is_cleaned_up_too(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    """A create lands after the cleanup found nothing left but before it said so; the
+    cleanup must look again rather than finish over it."""
+    from omnigent.gadgets import accounts as cleanup_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    alice = service("alice")
+    registration = alice.registration
+    alice.create("Board")
+    real_done = cleanup_module._CleanupQueue.done
+    landed: list[str] = []
+
+    def done_after_a_late_write(queue, number, name):  # type: ignore[no-untyped-def]
+        if not landed:
+            gadget = store.create("alice", "Late board", owner_registration=registration)
+            landed.append(gadget.id)
+            cleanup_module.DeletedAccountGadgets.after_registration_write(
+                store, "alice", registration
+            )
+        return real_done(queue, number, name)
+
+    monkeypatch.setattr(cleanup_module._CleanupQueue, "done", done_after_a_late_write)
+    assert accounts.delete_user("alice") is True
+    monkeypatch.setattr(cleanup_module._CleanupQueue, "done", real_done)
+    assert store.get(landed[0]) is not None
+
+    store, cleanup = _reopened_cleanup(db_uri, tmp_path)
+    for _ in range(3):
+        cleanup.resume()
+    assert store.get(landed[0]) is None
+    assert list(store.iter_owned("alice", owner_registration=registration)) == []
+
+
+def test_a_key_left_without_its_note_never_keeps_a_later_cleanup_from_queueing(
+    db_uri: str, tmp_path
+) -> None:
+    """A stop between removing a finished note and its key leaves the key alone; a write
+    that lands later for the deleted registration still gets its cleanup queued."""
+    from omnigent.gadgets import accounts as cleanup_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    alice = service("alice")
+    registration = alice.registration
+    alice.create("Board")
+    assert accounts.delete_user("alice") is True
+    scope = store._user_dir(cleanup_module._CLEANUP_SCOPE, cleanup_module._CLEANUP_REGISTRATION)
+    key = cleanup_module._key("alice", registration)
+    # The state such a stop leaves: the key, naming a segment, without its note.
+    (scope / "keys").mkdir(parents=True, exist_ok=True)
+    (scope / "keys" / f"{key}.json").write_text('{"segment": 0}')
+    assert not (scope / "queue" / "s00000000" / f"{key}.json").exists()
+
+    late = store.create("alice", "Late board", owner_registration=registration)
+    cleanup_module.DeletedAccountGadgets.after_registration_write(store, "alice", registration)
+
+    store, cleanup = _reopened_cleanup(db_uri, tmp_path)
+    for _ in range(3):
+        cleanup.resume()
+    assert store.get(late.id) is None
+
+
+def test_a_gadget_whose_create_stopped_before_its_owner_marker_leaves_nothing_behind(
+    db_uri: str, tmp_path
+) -> None:
+    import os
+
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    alice = service("alice")
+    stopped = alice.create("Half made")
+    # The create stopped after its metadata, before its owner marker and its note's
+    # removal; owner pages, and so account cleanup, never see it.
+    location = tmp_path / "gadgets"
+    [marker] = (location / "owners").rglob(stopped["id"])
+    marker.unlink()
+    note = location / ".creating" / stopped["id"]
+    note.touch()
+    os.utime(note, (1_000_000_000, 1_000_000_000))
+
+    LocalGadgetStore(str(location))  # A restart finishes the interrupted create.
+    assert accounts.delete_user("alice") is True
+    assert store.get(stopped["id"]) is None
+    assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
+
+
+def test_a_password_change_keeps_the_accounts_gadgets_and_pins(db_uri: str, tmp_path) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    _, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    before = service("alice")
+    board = before.create("Synthetic board")
+    before.pin(board["id"], {"pinned": True})
+    permissions.grant_for_gadget("bob", board["id"], 1)
+
+    # Rotating the generation revokes Alice's sessions, not her gadgets.
+    for round_ in range(2):
+        accounts.update_password("alice", f"hash-{round_}", revoke_sessions=True)
+    after = service("alice")
+    assert after.generation != before.generation
+    assert after.registration == before.registration
+    assert [item["id"] for item in after.list_owned()["items"]] == [board["id"]]
+    assert [pin["id"] for pin in after.shelf()["pinned"]] == [board["id"]]
+    assert after.get(board["id"])["id"] == board["id"]
+    assert [item.gadget.id for item in access.shared_with("bob").items] == [board["id"]]
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "unwritable"])
+def test_a_password_change_needs_nothing_from_the_gadget_store(
+    db_uri: str, tmp_path, monkeypatch, failure: str
+) -> None:
+    from omnigent.stores.gadget_store import CorruptData
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    before = service("alice")
+    board = before.create("Synthetic board")
+    before.pin(board["id"], {"pinned": True})
+
+    error = CorruptData("Invalid file") if failure == "corrupt" else PermissionError("read-only")
+
+    def broken(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise error
+
+    # The gadget store is broken while the password changes: it is never asked.
+    for name in ("user_files", "create", "get", "iter_owned", "delete_user_files"):
+        monkeypatch.setattr(store, name, broken)
+    generation = accounts.update_password("alice", "hash-1", revoke_sessions=True)
+    assert generation is not None and generation != before.generation
+    assert not accounts.accepts_generation("alice", before.generation)
+    monkeypatch.undo()
+
+    after = service("alice")
+    assert [item["id"] for item in after.list_owned()["items"]] == [board["id"]]
+    assert [pin["id"] for pin in after.shelf()["pinned"]] == [board["id"]]
+
+
+def test_with_gadgets_off_deleting_an_account_only_notes_its_gadgets_cleanup(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store = LocalGadgetStore(str(tmp_path / "gadgets"), maintain=False)
+    access = PermissionStoreGadgetAccess(store, GadgetGrantStore(db_uri))
+    accounts.attach_gadgets(DeletedAccountGadgets(store, access, enabled=lambda: False))
+
+    def untouched(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("the gadget store's gadgets were used")
+
+    for name in ("list_owned_page", "iter_owned", "delete", "delete_user_files", "get"):
+        monkeypatch.setattr(store, name, untouched)
+    accounts.create_user_with_password("alice", "alice-hash")
+    accounts.update_password("alice", "hash-1", revoke_sessions=True)
+    assert accounts.delete_user("alice") is True
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+    # Only the cleanup note (and the lock its queue is written under) was written: no gadgets
+    # were listed or deleted, and opening the store with gadgets off ran no cleanup of its own.
+    root = tmp_path / "gadgets"
+    written = {path.relative_to(root).parts[0] for path in root.rglob("*") if path.is_file()}
+    assert written == {"users", ".locks"}
+
+
+def test_a_cleanup_noted_while_gadgets_were_off_finishes_once_they_are_on(
+    db_uri: str, tmp_path
+) -> None:
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    gadgets_on = {"value": True}
+    cleanup = DeletedAccountGadgets(store, access, enabled=lambda: gadgets_on["value"])
+    accounts.attach_gadgets(cleanup)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    old_board = service("alice").create("Old board")
+    service("alice").pin(old_board["id"], {"pinned": True})
+    permissions.grant_for_gadget("bob", old_board["id"], 1)
+
+    # Off: the deletion and a registration of the name again delete nothing.
+    gadgets_on["value"] = False
+    assert accounts.delete_user("alice") is True
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert store.get(old_board["id"]) is not None
+    # The new account owns nothing of the old one's, even before the cleanup runs.
+    assert service("alice").list_owned() == {"items": [], "next_cursor": None}
+    gadgets_on["value"] = True
+    new_board = service("alice").create("New board")
+
+    # On again: the next cleanup call (a server start, another deletion or registration)
+    # finishes the old registration's, and leaves the new account's alone.
+    cleanup.resume()
+    assert store.get(old_board["id"]) is None
+    assert permissions.list_for_gadget(old_board["id"]) == ([], None)
+    assert [item["id"] for item in service("alice").list_owned()["items"]] == [new_board["id"]]
+    assert service("alice").shelf()["pinned"] == []
+
+
+def test_deleting_an_account_after_password_changes_removes_its_gadgets_for_good(
+    db_uri: str, tmp_path
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    board = service("alice").create("Synthetic board")
+    permissions.grant_for_gadget("bob", board["id"], 1)
+    accounts.update_password("alice", "hash-1", revoke_sessions=True)
+    accounts.update_password("alice", "hash-2", revoke_sessions=True)
+
+    assert accounts.delete_user("alice") is True
+    assert store.get(board["id"]) is None
+    assert permissions.list_for_gadget(board["id"]) == ([], None)
+    accounts.create_user_with_password("alice", "replacement-hash")
+    # Bob's earlier access doesn't come back with the name, and the new Alice starts empty.
+    assert access.shared_with("bob").items == []
+    assert service("alice").list_owned() == {"items": [], "next_cursor": None}
+    assert service("alice").shelf()["pinned"] == []
+
+
+def test_a_name_registered_again_before_the_gadget_cleanup_inherits_nothing(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    old_alice = service("alice")
+    board = old_alice.create("Synthetic board")
+    permissions.grant_for_gadget("bob", board["id"], 1)
+    original = store.delete
+    # The gadget store can't delete while the account is deleted and registered again.
+    monkeypatch.setattr(store, "delete", lambda gadget_id: False)
+    assert accounts.delete_user("alice") is True
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+
+    # The old gadget is still stored, but neither the new Alice nor Bob reaches it.
+    assert store.get(board["id"]) is not None
+    alice = service("alice")
+    assert alice.list_owned() == {"items": [], "next_cursor": None}
+    assert access.permissions("alice", store.get(board["id"])).read is False
+    assert access.permissions("bob", store.get(board["id"])).read is False
+    assert access.shared_with("bob").items == []
+
+    # A later cleanup removes it, and never the new account's gadgets.
+    mine = alice.create("New board")
+    assert alice.registration != old_alice.registration
+    monkeypatch.setattr(store, "delete", original)
+    accounts._gadgets.delete_owned("alice", old_alice.registration)
+    assert store.get(board["id"]) is None
+    assert store.get(mine["id"]) is not None
+
+
+def test_a_cleanup_that_resumes_after_reregistration_leaves_the_new_accounts_gadgets(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    old_alice = service("alice")
+    board = old_alice.create("Synthetic board")
+    old_alice.pin(board["id"], {"pinned": True})
+    gadgets = accounts._gadgets
+    paused: list[tuple] = []
+    original = type(gadgets).delete_owned
+    # The first cleanup read the tombstone, then stopped before deleting anything.
+    monkeypatch.setattr(
+        type(gadgets), "delete_owned", lambda self, *args: paused.append((self, *args))
+    )
+    assert accounts.delete_user("alice") is True
+    monkeypatch.setattr(type(gadgets), "delete_owned", original)
+    # Another cleanup finishes, and the name is registered again and used.
+    accounts._delete_deleted_gadgets("alice")
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+    new_alice = service("alice")
+    mine = new_alice.create("New board")
+    new_alice.pin(mine["id"], {"pinned": True})
+
+    # The first cleanup resumes with what it read: the deleted account's generation.
+    assert len(paused) == 1
+    original(*paused[0])
+
+    assert store.get(mine["id"]) is not None
+    assert [pin["id"] for pin in new_alice.shelf()["pinned"]] == [mine["id"]]
+    assert new_alice.list_owned()["items"][0]["id"] == mine["id"]
+
+
+def test_a_username_registered_again_cannot_reach_a_copy_of_the_old_accounts_gadget(
+    db_uri: str, tmp_path
+) -> None:
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.service import GadgetService, GadgetViewer
+    from omnigent.stores.gadget_store import NotFound as StoreNotFound
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    # Two servers share the accounts and permissions database, each with its own gadgets;
+    # only server B cleans up after deleted accounts here.
+    root_a = LocalGadgetStore(str(tmp_path / "a"))
+    root_b, _, _ = _gadgets(db_uri, tmp_path / "b", accounts)
+    old = accounts.create_user_with_password("alice", "alice-hash")
+    old_registration = permissions.account_registrations(["alice"])["alice"]
+    with account_authority_scope("alice", old.account_generation):
+        board = GadgetService(
+            root_a,
+            PermissionStoreGadgetAccess(root_a, permissions),
+            GadgetViewer("alice", old_registration),
+        ).create("Synthetic board")
+
+    # Deleted and registered again through server B, which never had the gadget.
+    assert accounts.delete_user("alice") is True
+    new = accounts.create_user_with_password("alice", "replacement-hash")
+
+    access_a = PermissionStoreGadgetAccess(root_a, permissions)
+    new_registration = permissions.account_registrations(["alice"])["alice"]
+    assert new_registration != old_registration
+    service_a = GadgetService(root_a, access_a, GadgetViewer("alice", new_registration))
+    with account_authority_scope("alice", new.account_generation):
+        with pytest.raises(StoreNotFound):
+            service_a.get(board["id"])
+        assert service_a.list_owned() == {"items": [], "next_cursor": None}
+    assert root_b.get(board["id"]) is None
+
+
+def test_a_name_registered_again_is_not_the_author_of_the_old_accounts_comments_or_actions(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.gadgets.service import GadgetError
+    from tests.gadgets.test_gadget_service import publish_actions_board
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    _, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("bob", "bob-hash")
+    accounts.create_user_with_password("alice", "alice-hash")
+    board = publish_actions_board(service("bob").service)
+    permissions.grant_for_gadget("alice", board["id"], 2)
+    old_alice = service("alice")
+    comment = old_alice.create_comment(
+        board["id"], {"body": "Synthetic note", "anchor": {"text": "board"}, "operation_id": "c1"}
+    )
+    action = old_alice.request_action(
+        board["id"], {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "a1"}
+    )
+    assert comment["yours"] is True
+
+    # Alice's account goes, its name is registered again, and Bob shares the board afresh.
+    assert accounts.delete_user("alice") is True
+    accounts.create_user_with_password("alice", "replacement-hash")
+    permissions.grant_for_gadget("alice", board["id"], 2)
+    alice = service("alice")
+    assert alice.registration != old_alice.registration
+
+    # The comment and the action survive on Bob's board, but are not the new Alice's.
+    [listed] = alice.list_comments(board["id"])["items"]
+    assert listed["id"] == comment["id"] and listed["yours"] is False
+    with pytest.raises(GadgetError) as denied:
+        alice.update_comment(board["id"], comment["id"], {"body": "Changed"})
+    assert denied.value.status == 403
+    with pytest.raises(GadgetError):
+        alice.delete_comment(board["id"], comment["id"])
+    [entry] = alice.list_actions(board["id"])["items"]
+    assert entry["id"] == action["id"] and entry["yours"] is False
+    with pytest.raises(GadgetError):
+        alice.update_action(
+            board["id"],
+            {
+                "id": action["id"],
+                "if_version": action["version"],
+                "operation_id": "u1",
+                "state": "running",
+                "session_id": "s1",
+            },
+        )
+    # Retrying the old account's requests makes new records, not replays of the old ones.
+    again = alice.create_comment(
+        board["id"], {"body": "Synthetic note", "anchor": {"text": "board"}, "operation_id": "c1"}
+    )
+    assert again["id"] != comment["id"] and again["yours"] is True
+
+
+def test_a_password_change_keeps_the_accounts_comments_and_actions_its_own(
+    db_uri: str, tmp_path
+) -> None:
+    from tests.gadgets.test_gadget_service import publish_actions_board
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    _, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("bob", "bob-hash")
+    accounts.create_user_with_password("alice", "alice-hash")
+    board = publish_actions_board(service("bob").service)
+    permissions.grant_for_gadget("alice", board["id"], 2)
+    comment = service("alice").create_comment(
+        board["id"], {"body": "Synthetic note", "anchor": {"text": "board"}, "operation_id": "c1"}
+    )
+    action = service("alice").request_action(
+        board["id"], {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "a1"}
+    )
+    accounts.update_password("alice", "new-hash", revoke_sessions=True)
+    alice = service("alice")
+    assert alice.update_comment(board["id"], comment["id"], {"body": "Changed"})["yours"] is True
+    [entry] = alice.list_actions(board["id"])["items"]
+    assert entry["yours"] is True
+    alice.update_action(
+        board["id"],
+        {
+            "id": action["id"],
+            "if_version": action["version"],
+            "operation_id": "u1",
+            "state": "running",
+            "session_id": "s1",
+        },
+    )
+
+
+def test_a_large_accounts_gadgets_go_a_bounded_number_per_call_and_the_rest_later(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.gadgets import accounts as gadget_accounts
+
+    monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 2)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    accounts.create_user_with_password("carol", "carol-hash")
+    permissions.ensure_user("bob")
+    old_alice = service("alice")
+    boards = [old_alice.create(f"Synthetic board {n}") for n in range(5)]
+    for board in boards:
+        permissions.grant_for_gadget("bob", board["id"], 1)
+    old_alice.pin(boards[0]["id"], {"pinned": True})
+    deleted_store = store.delete
+    deletions: list[str] = []
+
+    def counting_delete(gadget_id: str) -> bool:
+        deletions.append(gadget_id)
+        return deleted_store(gadget_id)
+
+    monkeypatch.setattr(store, "delete", counting_delete)
+
+    def left() -> list[str]:
+        return [g.id for g in store.iter_owned("alice", owner_registration=old_alice.registration)]
+
+    # Deleting the account removes one bounded batch; the rest stays detached and shared
+    # with no one until later calls finish it.
+    assert accounts.delete_user("alice") is True
+    assert len(deletions) == 2 and len(left()) == 3
+    assert access.shared_with("bob").items == []
+
+    # The name is registered again; its new gadget is never part of the old cleanup.
+    accounts.create_user_with_password("alice", "replacement-hash")
+    alice = service("alice")
+    mine = alice.create("New board")
+    assert len(deletions) <= 4
+
+    # Other accounts' deletions and registrations move the old cleanup along to the end.
+    for name in ("dave", "erin", "frank"):
+        accounts.create_user_with_password(name, f"{name}-hash")
+    assert left() == []
+    assert len(deletions) == 5
+    assert set(deletions) == {board["id"] for board in boards}
+    assert store.get(mine["id"]) is not None
+    assert alice.shelf()["pinned"] == []
+    assert [g["id"] for g in alice.list_owned()["items"]] == [mine["id"]]
+    assert permissions.list_for_gadget(boards[4]["id"]) == ([], None)
+
+
+def test_a_cleanup_resumed_from_another_workspace_removes_that_workspaces_grants(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.access import workspace_registration
+    from omnigent.gadgets.service import GadgetService, GadgetViewer
+
+    monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 1)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, access, _ = _gadgets(db_uri, tmp_path, accounts)
+    with workspace_scope(202):
+        accounts.create_user_with_password("alice", "alice-hash")
+        raw = permissions.account_registrations(["alice"]).get("alice")
+        permissions.ensure_user("bob")
+        registration = workspace_registration(raw)
+        alice = GadgetService(store, access, GadgetViewer("alice", registration))
+        boards = [alice.create(f"Synthetic board {n}") for n in range(3)]
+        for board in boards:
+            permissions.grant_for_gadget("bob", board["id"], 1)
+        assert accounts.delete_user("alice") is True
+        assert len(list(store.iter_owned("alice", owner_registration=registration))) == 2
+    # Calls made in another workspace finish it, and the grants go with the gadgets.
+    for _ in range(3):
+        accounts._gadgets.resume()
+    with workspace_scope(202):
+        assert list(store.iter_owned("alice", owner_registration=registration)) == []
+        for board in boards:
+            assert permissions.list_for_gadget(board["id"]) == ([], None)
+
+
+def test_a_cleanup_that_keeps_failing_never_blocks_the_others(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.stores.gadget_store import CorruptData
+
+    monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 1)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = GadgetGrantStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    gadgets = accounts._gadgets
+    # An unreadable note, and a deleted account whose gadgets can't be listed, both at the
+    # front of the queue.
+    scope = store._user_dir(gadget_accounts._CLEANUP_SCOPE, gadget_accounts._CLEANUP_REGISTRATION)
+    gadgets._note("mallory", None)
+    (scope / gadget_accounts._segment(0) / ("0" * 32 + ".json")).write_text("{not json")
+    real_page = store.list_owned_page
+
+    def page(user_id, **kwargs):  # type: ignore[no-untyped-def]
+        if user_id == "mallory":
+            raise CorruptData("Invalid gadget metadata")
+        return real_page(user_id, **kwargs)
+
+    monkeypatch.setattr(store, "list_owned_page", page)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    alice = service("alice")
+    boards = [alice.create(f"Synthetic board {n}") for n in range(3)]
+    assert accounts.delete_user("alice") is True
+    for _ in range(3):
+        gadgets.resume()
+    assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
+    assert all(store.get(board["id"]) is None for board in boards)
+
+
+def test_a_long_cleanup_backlog_is_read_a_bounded_part_at_a_time(tmp_path, monkeypatch) -> None:
+    """However many deleted accounts wait, one call reads a bounded part of the queue (at most
+    two segments, and the newest when sending notes to the back) and works on a few notes;
+    each goes to the back, so every note gets its turn."""
+    import os
+
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store import local as local_module
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    segment = 5
+    monkeypatch.setattr(gadget_accounts, "QUEUE_SEGMENT_SIZE", segment)
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    gadgets = DeletedAccountGadgets(store, NoGrants())  # type: ignore[arg-type]
+    users = [f"user{n:03d}" for n in range(150)]
+    for user in users:
+        gadgets._note(user, None)
+
+    examined = 0
+    real_scandir = os.scandir
+
+    class CountingScandir:
+        def __init__(self, path: object) -> None:
+            self._it = real_scandir(path)
+
+        def __enter__(self) -> CountingScandir:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._it.close()
+
+        def __iter__(self) -> CountingScandir:
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            nonlocal examined
+            entry = next(self._it)
+            examined += 1
+            return entry
+
+    monkeypatch.setattr(local_module.os, "scandir", CountingScandir)
+    worked: list[str] = []
+
+    def step(user_id: str, registration: str | None) -> bool:
+        worked.append(user_id)
+        return user_id in users[::3]  # Some finish; the others need more calls.
+
+    monkeypatch.setattr(gadgets, "_step", step)
+    for _ in range(80):
+        examined = 0
+        gadgets.resume()
+        # Two front segments, and the newest once per note sent back: never the backlog.
+        bound = (2 + gadget_accounts.PENDING_PER_RESUME) * (segment + 1)
+        assert examined <= bound < len(users)
+    # Every waiting cleanup got its turn, not only those at the front.
+    assert set(worked) == set(users)
+    assert all(worked.count(user) == 1 for user in users[::3])
+
+
+def test_account_cleanup_refuses_a_store_whose_files_cannot_be_deleted(tmp_path) -> None:
+    """The queue moves on only by removing finished notes, so on files it can't remove it
+    would never reach the later ones: such a store is refused when the server starts."""
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class CreateOnly(LocalGadgetStore):
+        def user_files(self, user_id, *, owner_registration=None):  # type: ignore[no-untyped-def]
+            files = super().user_files(user_id, owner_registration=owner_registration)
+            files.supports_delete = False  # type: ignore[misc]
+            return files
+
+    with pytest.raises(ValueError, match="can be deleted"):
+        DeletedAccountGadgets(CreateOnly(str(tmp_path / "gadgets")), object())  # type: ignore[arg-type]
+
+
+def test_account_cleanup_follows_an_empty_page_that_continues(tmp_path) -> None:
+    """A store may answer a short or empty page that still continues: the next step, even
+    from a cleanup made again (a restart), reads on from there instead of starting over."""
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    calls: list[str | None] = []
+
+    class Sparse(LocalGadgetStore):
+        def list_owned_page(self, owner_id, *, limit, after=None, owner_registration=None):  # type: ignore[no-untyped-def]
+            calls.append(after)
+            if after is None:
+                return [], "next"
+            return super().list_owned_page(
+                owner_id, limit=limit, after=None, owner_registration=owner_registration
+            )
+
+    store = Sparse(str(tmp_path / "gadgets"))
+    board = store.create("alice", "Synthetic board", owner_registration="r1")
+    assert DeletedAccountGadgets(store, NoGrants())._step("alice", "r1") is False  # type: ignore[arg-type]
+    # Made again, as after a restart: it carries on from the saved continuation.
+    assert DeletedAccountGadgets(store, NoGrants())._step("alice", "r1") is True  # type: ignore[arg-type]
+    assert calls[:2] == [None, "next"]  # (owns_any may list again after)
+    assert store.get(board.id) is None
+
+
+def test_a_backlog_of_unqueued_intents_is_read_a_bounded_part_at_a_time(
+    tmp_path, monkeypatch
+) -> None:
+    """Deletions that found the queue busy leave intents; one call reads one intent segment
+    and a few numbered markers, however many intents wait, and every intent is queued."""
+    import os
+
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store import local as local_module
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    size = 4
+    monkeypatch.setattr(gadget_accounts, "INTENT_SEGMENT_SIZE", size)
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    gadgets = DeletedAccountGadgets(store, NoGrants())  # type: ignore[arg-type]
+    queue = gadgets._queue()
+    users = [f"user{n:03d}" for n in range(120)]
+    for user in users:
+        assert queue.intend(user, None, 0) is not None  # Never queued: the queue was busy.
+
+    examined = 0
+    real_scandir = os.scandir
+
+    def counting_scandir(path: object):  # type: ignore[no-untyped-def]
+        nonlocal examined
+        name = os.fspath(path)  # type: ignore[arg-type]
+        entries = list(real_scandir(path))
+        if "/incoming" in name:
+            examined += len(entries)
+        return _Entries(entries)
+
+    class _Entries(list):
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            pass
+
+    monkeypatch.setattr(local_module.os, "scandir", counting_scandir)
+    for _ in range(len(users)):
+        examined = 0
+        queue.take_incoming(gadget_accounts.INCOMING_PER_RESUME)
+        # One segment, listed at most twice: never the backlog.
+        assert examined <= 2 * size < len(users)
+    monkeypatch.setattr(local_module.os, "scandir", real_scandir)
+    queued = {key for _, key in queue.front(len(users) + 1)}
+    assert queued == {f"{gadget_accounts._key(user, None)}.json" for user in users}
+
+
+def test_an_intent_written_as_its_segment_is_finished_is_recorded_again(tmp_path) -> None:
+    """A writer that fills a slot after the reader marked its segment finished records the
+    intent again in a later segment, so the reader's last pass can't miss it."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    files = DeletedAccountGadgets._files_of(store)
+    queue = gadget_accounts._CleanupQueue(files)
+    queue.intend("alice", None, 0)
+    # The reader marked segment 1 finished, but the writer still sees it as the newest.
+    files.mkdirs("incoming/done")
+    files.create_json("incoming/done/1.json", {})
+
+    path = queue.intend("bob", None, 0)
+
+    assert path is not None and path.startswith("incoming/s00000002/")
+    queue.take_incoming(8)
+    assert f"{gadget_accounts._key('bob', None)}.json" in {key for _, key in queue.front(8)}
+
+
+@pytest.mark.parametrize("how", ["busy", "stopped"])
+def test_a_fenced_segment_whose_last_transfer_failed_is_finished_later(
+    tmp_path, monkeypatch, how: str
+) -> None:
+    """An intent written just before the reader fenced its segment, whose last transfer then
+    finds the queue busy or stops: reopened, ordinary calls still queue it."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store import Conflict as StoreConflict
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    monkeypatch.setattr(gadget_accounts, "INTENT_SEGMENT_SIZE", 1)
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    files = DeletedAccountGadgets._files_of(store)
+    queue = gadget_accounts._CleanupQueue(files)
+    queue.intend("alice", None, 0)  # Segment 1, written just before the fence.
+    queue.intend("bob", None, 0)  # Segment 2 started, so segment 1 can be retired.
+    files.mkdirs("incoming/done")
+    files.create_json("incoming/done/1.json", {})  # The reader fenced segment 1.
+    real_add = gadget_accounts._CleanupQueue.add
+
+    def failing_add(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if how == "busy":
+            raise StoreConflict("The gadget cleanup queue is busy", reason="busy")
+        raise KeyboardInterrupt  # The process stops mid-transfer.
+
+    monkeypatch.setattr(gadget_accounts._CleanupQueue, "add", failing_add)
+    with pytest.raises((StoreConflict, KeyboardInterrupt)):
+        queue.take_incoming(8)
+    monkeypatch.setattr(gadget_accounts._CleanupQueue, "add", real_add)
+
+    reopened = gadget_accounts._CleanupQueue(DeletedAccountGadgets._files_of(store))
+    for _ in range(3):
+        reopened.take_incoming(8)
+    queued = {key for _, key in reopened.front(8)}
+    assert f"{gadget_accounts._key('alice', None)}.json" in queued
+    assert f"{gadget_accounts._key('bob', None)}.json" in queued
+
+
+def test_a_head_update_stopped_half_way_leaves_the_queue_readable(tmp_path, monkeypatch) -> None:
+    """A note sent to a later segment, then the queue's head update stops while retiring the
+    emptied first segment: reopened, the queue still finds the note, and only its cleanup
+    runs."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    files = DeletedAccountGadgets._files_of(store)
+    stop = {"heads": False}
+
+    class StoppingFiles:
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(files, name)
+
+        def create_json(self, path: str, value: dict) -> None:
+            if stop["heads"] and path.startswith("queue/head"):
+                raise OSError("stopped writing the head")
+            files.create_json(path, value)
+
+    queue = gadget_accounts._CleanupQueue(StoppingFiles())  # type: ignore[arg-type]
+    queue.add("alice", "r1", 0)
+    name = f"{gadget_accounts._key('alice', 'r1')}.json"
+    queue.to_back(0, name, queue.read(0, name))  # Now in segment 1; segment 0 is empty.
+    stop["heads"] = True
+    with pytest.raises(OSError):
+        queue.front(5)  # Retiring segment 0 stops at the head update.
+
+    worked: list[str | None] = []
+    reopened = DeletedAccountGadgets(LocalGadgetStore(str(tmp_path / "gadgets")), NoGrants())  # type: ignore[arg-type]
+    monkeypatch.setattr(reopened, "_step", lambda user, registration: worked.append(user) or True)
+    reopened.resume()
+    assert worked == ["alice"]
+    assert reopened._queue().front(5) == []
+
+
+def test_a_deletion_whose_queueing_fails_is_cleaned_up_after_a_restart(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    """The queue is busy when the deletion tries to queue its cleanup: the intent it wrote
+    first gets it queued later, so a restarted server finishes it without the name being
+    registered again."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store import Conflict as StoreConflict
+
+    monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 1)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    alice = service("alice")
+    boards = [alice.create(f"Synthetic board {n}") for n in range(3)]
+
+    real_add = gadget_accounts._CleanupQueue.add
+    calls = {"n": 0}
+
+    def busy_once(self, user_id, registration, workspace, **kwargs):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StoreConflict("The gadget cleanup queue is busy", reason="busy")
+        return real_add(self, user_id, registration, workspace, **kwargs)
+
+    monkeypatch.setattr(gadget_accounts._CleanupQueue, "add", busy_once)
+    assert accounts.delete_user("alice") is True
+    left = list(store.iter_owned("alice", owner_registration=alice.registration))
+    assert left, "one call deletes one gadget here, so some are left for later"
+
+    restarted = DeletedAccountGadgets(store, access)
+    for _ in range(5):
+        restarted.resume()
+    assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
+    assert all(store.get(board["id"]) is None for board in boards)
+
+
+def test_an_account_named_like_the_cleanup_scope_keeps_the_others_cleanup_notes(
+    tmp_path, monkeypatch
+) -> None:
+    """A user ID may be any string, even the cleanup notes' scope name; deleting that
+    account's files must not delete the notes other deleted accounts' cleanups wait on."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    gadgets = DeletedAccountGadgets(store, NoGrants())  # type: ignore[arg-type]
+    gadgets._note("mallory", None)
+    # Mallory's cleanup is not run in this call, so only the scope-named account's goes.
+    monkeypatch.setattr(gadget_accounts, "PENDING_PER_RESUME", 0)
+    assert gadgets.delete_owned(gadget_accounts._CLEANUP_SCOPE, None) is True
+
+    resumed: list[str] = []
+    monkeypatch.setattr(gadget_accounts, "PENDING_PER_RESUME", 4)
+    monkeypatch.setattr(
+        gadgets, "_step", lambda user_id, registration: resumed.append(user_id) or True
+    )
+    gadgets.resume()
+    assert resumed == ["mallory"]

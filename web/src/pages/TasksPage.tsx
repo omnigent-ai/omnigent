@@ -44,7 +44,7 @@ import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates
 import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
-import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
+import { useNavigate, useRebasePath, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
   useCloneScheduledTask,
@@ -157,9 +157,16 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const [shareOpen, setShareOpen] = useState(false);
   const viewerId = useViewerId();
   const [templateId, setTemplateId] = useState<string | null>(null);
+  // A link (from a gadget, say) that opens New automation filled in.
+  const [linkedDraft, setLinkedDraft] = useState<{
+    name: string;
+    prompt: string;
+    schedule?: string;
+  } | null>(null);
   const selectedTemplate = AUTOMATION_TEMPLATES.find((template) => template.id === templateId);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const replaceSearchParams = useReplaceSearchParams();
   const info = useServerInfo();
   const sharedListAvailable = sharedAutomationsListed(info);
   const requestedViewParam = searchParams.get("view");
@@ -196,7 +203,25 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       : "Automation templates are not available on this server. You can still create an automation from scratch.";
   const sessionLink = getShareableSessionLink(SESSION_LINK_ID_PLACEHOLDER, rebasePath);
 
+  // `?new=1&name=…&prompt=…&schedule=<RRULE>` opens New automation filled in, for review.
+  useEffect(() => {
+    if (searchParams.get("new") !== "1") return;
+    setLinkedDraft({
+      name: searchParams.get("name") ?? "",
+      prompt: searchParams.get("prompt") ?? "",
+      schedule: searchParams.get("schedule") ?? undefined,
+    });
+    setTemplateId(null);
+    setEditingTask(null);
+    setManualOpen(true);
+    // Consume the link once, so closing the dialog doesn't reopen it.
+    const remaining = new URLSearchParams(searchParams);
+    for (const key of ["new", "name", "prompt", "schedule"]) remaining.delete(key);
+    replaceSearchParams(remaining);
+  }, [searchParams, replaceSearchParams]);
+
   function openManual() {
+    setLinkedDraft(null);
     setTemplateId(null);
     setEditingTask(null);
     setManualOpen(true);
@@ -204,6 +229,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
 
   function openFromTemplate(id: string) {
     trackClick(`tasks.template.${id}`, "button");
+    setLinkedDraft(null);
     setTemplateId(id);
     setEditingTask(null);
     setManualOpen(true);
@@ -228,6 +254,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   function handleManualOpenChange(next: boolean) {
     setManualOpen(next);
     if (!next) {
+      setLinkedDraft(null);
       setTemplateId(null);
       setEditingTask(null);
     }
@@ -354,8 +381,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     <CreateScheduledTaskDialog
       open={manualOpen}
       onOpenChange={handleManualOpenChange}
-      initialName={selectedTemplate?.prefill.name}
-      initialPrompt={selectedTemplate?.prefill.prompt}
+      initialName={linkedDraft?.name ?? selectedTemplate?.prefill.name}
+      initialPrompt={linkedDraft?.prompt ?? selectedTemplate?.prefill.prompt}
+      initialSchedule={linkedDraft?.schedule}
       initialTrigger={selectedTemplate?.trigger}
       initialTemplateId={selectedTemplate?.id}
       sessionLink={sessionLink}
