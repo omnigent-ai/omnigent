@@ -10,6 +10,8 @@ import {
   openSidebarSession,
   useSidebarSessionOrderStore,
 } from "@/hooks/useSidebarSessionOrder";
+import { useIsEmbedded } from "@/lib/embedded";
+import { getEmbedRoot } from "@/lib/host";
 import { isMacPlatform } from "@/lib/hotkeys";
 import {
   type RecentSessionDirection,
@@ -346,6 +348,7 @@ export function useRecentSessionHotkey(isMac = isMacPlatform()): void {
   const navigate = useNavigate();
   const latestNavigate = useRef(navigate);
   latestNavigate.current = navigate;
+  const isEmbedded = useIsEmbedded();
 
   useEffect(() => {
     if (!isMac) return;
@@ -357,6 +360,9 @@ export function useRecentSessionHotkey(isMac = isMacPlatform()): void {
         if (!event.ctrlKey && event.key !== "Escape") releaseRecentSessionSwitcher();
         return;
       }
+      // Embedded in a host page, a chord from outside the embed is the host's.
+      const embedRoot = getEmbedRoot();
+      if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
       const focused = document.activeElement instanceof Element ? document.activeElement : null;
       if (focused?.closest(CHORD_OWNING_SURFACES)) return;
 
@@ -402,5 +408,5 @@ export function useRecentSessionHotkey(isMac = isMacPlatform()): void {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       cancelRecentSessionSwitcher();
     };
-  }, [isMac]);
+  }, [isMac, isEmbedded]);
 }

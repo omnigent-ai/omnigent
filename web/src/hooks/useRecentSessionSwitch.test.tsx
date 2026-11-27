@@ -4,6 +4,8 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { EmbeddedProvider } from "@/lib/embedded";
+import { setEmbedRoot } from "@/lib/host";
 import { shortcutKeys } from "@/lib/shortcuts/registry";
 
 import {
@@ -83,12 +85,35 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setEmbedRoot(null);
   document.body.innerHTML = "";
   sidebar([], null);
   vi.restoreAllMocks();
 });
 
 describe("useRecentSessionHotkey", () => {
+  it("leaves the host page's own ⌃] alone when embedded, and switches inside the embed", () => {
+    const root = document.createElement("div");
+    const inside = document.createElement("input");
+    const hostInput = document.createElement("input");
+    root.appendChild(inside);
+    document.body.append(root, hostInput);
+    setEmbedRoot(root);
+    renderHook(() => useRecentSessionHotkey(true), { wrapper: EmbeddedProvider });
+
+    hostInput.focus();
+    expect(press(ctrlBracketRight, hostInput).defaultPrevented).toBe(false);
+    expect(switcher()).toBeNull();
+
+    inside.focus();
+    expect(press(ctrlBracketRight, inside).defaultPrevented).toBe(true);
+    // A press the host page sees doesn't step a switch started inside the embed.
+    expect(press(ctrlBracketRight, hostInput).defaultPrevented).toBe(false);
+    expect(selected()).toBe("b");
+    releaseControl();
+    expect(opened()).toEqual(["/c/b"]);
+  });
+
   it("⌃] opens the switcher one step back, without leaving the open session", () => {
     renderHook(() => useRecentSessionHotkey(true));
     const event = press(ctrlBracketRight);
