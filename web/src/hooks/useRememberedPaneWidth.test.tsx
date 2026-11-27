@@ -488,6 +488,20 @@ describe("the trees beside a Changes review", () => {
     expect(fireEvent.keyDown(handle, { key: "a" })).toBe(true);
   });
 
+  it("widen the session's tree in proportion in a full screen review, as Files does", () => {
+    writePanelSharePreference("changesReviewTreeShare", 0.36);
+    resetRememberedPaneWidthForTesting(CHANGES_REVIEW_TREE_WIDTH);
+    const view = render(<Pane spec={CHANGES_REVIEW_TREE_WIDTH} containerWidth={800} />);
+    expect(widthOf(CHANGES_REVIEW_TREE_WIDTH)).toBe(288);
+    // Past the 360px it stops at before the review is measured, up to 48% of the review.
+    view.rerender(<Pane spec={CHANGES_REVIEW_TREE_WIDTH} containerWidth={1900} />);
+    expect(widthOf(CHANGES_REVIEW_TREE_WIDTH)).toBe(684);
+    expect(handleOf(CHANGES_REVIEW_TREE_WIDTH)).toHaveAttribute("aria-valuemax", "912");
+    view.rerender(<Pane spec={CHANGES_REVIEW_TREE_WIDTH} containerWidth={800} />);
+    expect(widthOf(CHANGES_REVIEW_TREE_WIDTH)).toBe(288);
+    expect(readPanelSharePreference("changesReviewTreeShare")).toBe(0.36);
+  });
+
   it("keep the session's and the pull request's choices apart", () => {
     render(
       <>
