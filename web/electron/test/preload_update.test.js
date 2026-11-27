@@ -307,6 +307,7 @@ describe("desktop command bridge", () => {
       sessionArchived: true,
       pickListFocused: "yes",
     });
+    h.desktop.setDesktopCommandState({ commands: ["go-back"], pickListFocused: true });
     h.desktop.setDesktopCommandState(undefined);
     assert.deepEqual(JSON.parse(JSON.stringify(h.sends)), [
       {
@@ -316,6 +317,15 @@ describe("desktop command bridge", () => {
           sessionPinned: false,
           sessionArchived: true,
           pickListFocused: false,
+        },
+      },
+      {
+        channel: "omnigent:set-desktop-command-state",
+        args: {
+          commands: ["go-back"],
+          sessionPinned: false,
+          sessionArchived: false,
+          pickListFocused: true,
         },
       },
       {

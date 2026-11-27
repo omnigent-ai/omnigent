@@ -34,6 +34,11 @@ _GO_COMMANDS = '["close", "go-back", "go-forward", "quit"]'
 _SETTINGS_SECTION = re.compile(r"/settings/[a-z-]+$")
 
 
+def _boot_shell(page: Page, bridge: str | None) -> None:
+    """Install the shell and its bridge as one script: init-script order isn't guaranteed."""
+    page.add_init_script(MAC_SHELL_INIT_SCRIPT + (bridge or ""))
+
+
 def _open_settings_from_home(page: Page, base_url: str) -> None:
     """Open the home page, then Settings in-app, so Back has a page to return to."""
     page.goto(f"{base_url}/")
@@ -51,9 +56,7 @@ def _open_settings_from_home(page: Page, base_url: str) -> None:
 def test_an_older_shell_leaves_back_and_forward_to_the_page(
     page: Page, live_server: str, bridge: str | None
 ) -> None:
-    page.add_init_script(MAC_SHELL_INIT_SCRIPT)
-    if bridge:
-        page.add_init_script(bridge)
+    _boot_shell(page, bridge)
     _open_settings_from_home(page, live_server)
 
     page.keyboard.press("Meta+BracketLeft")
@@ -65,8 +68,7 @@ def test_an_older_shell_leaves_back_and_forward_to_the_page(
 def test_a_shell_that_lists_the_go_menu_owns_back_and_forward(
     page: Page, live_server: str
 ) -> None:
-    page.add_init_script(MAC_SHELL_INIT_SCRIPT)
-    page.add_init_script(_COMMAND_BRIDGE % _GO_COMMANDS)
+    _boot_shell(page, _COMMAND_BRIDGE % _GO_COMMANDS)
     _open_settings_from_home(page, live_server)
     settings_url = page.url
 
