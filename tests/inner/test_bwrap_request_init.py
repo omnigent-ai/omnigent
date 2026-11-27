@@ -9,6 +9,8 @@ import json
 import signal
 import socket
 import subprocess
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -267,6 +269,81 @@ def test_config_preserves_exact_command_and_environment(monkeypatch: pytest.Monk
     result = request_init._read_request_config(41)
     assert result.argv == tuple(config["argv"])
     assert result.cwd == config["cwd"] and result.env == config["env"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"relay": []},
+        {"relay": {"source": "relative", "port": 1234, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": True, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": 65536, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": 1234, "socket_path": "relative"}},
+        {"report_encoding": "yes"},
+    ],
+)
+def test_invalid_relay_and_encoding_options_are_rejected_before_activation(
+    monkeypatch: pytest.MonkeyPatch, change: dict[str, object]
+) -> None:
+    config = {"token": _TOKEN.decode(), "argv": ["/bin/sh"], "cwd": "/workspace", "env": {}}
+    config.update(change)
+    monkeypatch.setattr(
+        request_init.os, "fdopen", lambda *_a, **_k: io.StringIO(json.dumps(config))
+    )
+    with pytest.raises(ValueError):
+        request_init._read_request_config(41)
+
+
+@pytest.mark.parametrize("utf8_mode", [False, True])
+def test_request_starts_its_own_relay_after_protection_and_reports_the_child_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+    init_calls: tuple[MagicMock, MagicMock],
+    utf8_mode: bool,
+) -> None:
+    control = _control_socket()
+    control.recv.return_value = b"admit:" + _TOKEN
+    control.sendmsg.side_effect = lambda buffers, _metadata: len(buffers[0])
+    control.send.side_effect = len
+    monkeypatch.setattr(request_init, "_wait_for_command", lambda *_: 0)
+    monkeypatch.setattr(
+        request_init, "sys", SimpleNamespace(flags=SimpleNamespace(utf8_mode=utf8_mode))
+    )
+    monkeypatch.setattr(request_init.locale, "getencoding", lambda: "ISO-8859-1")
+
+    def start_relay(port: int, path: str) -> SimpleNamespace:
+        init_calls[0].assert_called_once()
+        init_calls[1].assert_not_called()
+        control.sendmsg.assert_not_called()
+        assert (port, path) == (1234, "/private/broker.sock")
+        return SimpleNamespace(wait=lambda _timeout: True)
+
+    load = MagicMock(return_value={"start_relay": start_relay})
+    monkeypatch.setattr(request_init.runpy, "run_path", load)
+    config = replace(
+        _CONFIG,
+        relay=request_init._RelayConfig("/runtime/relay.py", 1234, "/private/broker.sock"),
+        report_encoding=True,
+    )
+    request_init._run_request(control, config)
+    load.assert_called_once_with("/runtime/relay.py")
+    expected = b"utf-8" if utf8_mode else b"ISO-8859-1"
+    assert control.sendmsg.call_args.args[0] == [b"ready:" + _TOKEN + b":" + expected]
+    init_calls[1].assert_called_once()
+
+
+def test_relay_start_failure_never_publishes_readiness_or_runs_a_command(
+    monkeypatch: pytest.MonkeyPatch, init_calls: tuple[MagicMock, MagicMock]
+) -> None:
+    control = _control_socket()
+    start = MagicMock(side_effect=OSError("relay bind failed"))
+    monkeypatch.setattr(request_init.runpy, "run_path", lambda _path: {"start_relay": start})
+    config = replace(
+        _CONFIG, relay=request_init._RelayConfig("/runtime/relay.py", 1234, "/broker.sock")
+    )
+    with pytest.raises(OSError, match="relay bind failed"):
+        request_init._run_request(control, config)
+    control.sendmsg.assert_not_called()
+    init_calls[1].assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import codecs
 import contextlib
 import errno
 import os
@@ -30,6 +31,7 @@ class BwrapRequestResult:
     stderr: bytes
     exit_code: int | None
     timed_out: bool
+    encoding: str | None = None
 
 
 class RequestCancelled(RuntimeError):
@@ -80,6 +82,8 @@ class BwrapRequestControl:
         token: bytes,
         init_pidfd: int,
         launcher_pidfd: int,
+        *,
+        encoding: str | None = None,
     ) -> None:
         _validate_control_socket(control)
         self._control = control
@@ -87,6 +91,7 @@ class BwrapRequestControl:
         self._token = token
         self._init_pidfd = init_pidfd
         self._launcher_pidfd = launcher_pidfd
+        self._encoding = encoding
         self._owned_pidfds: tuple[int, int] | None = (init_pidfd, launcher_pidfd)
         self._lock = threading.Lock()
         self._stop_reason: str | None = None
@@ -103,6 +108,7 @@ class BwrapRequestControl:
         *,
         expected_init_pid: int,
         launcher_pidfd: int,
+        encoding_required: bool = False,
     ) -> BwrapRequestControl:
         """Take ownership only after validating the init's actual transferred pidfd."""
         _validate_control_socket(control)
@@ -112,7 +118,7 @@ class BwrapRequestControl:
             raise OSError("Request launcher identity is invalid")
         integer_size = array.array("i").itemsize
         payload, ancillary, flags, _ = control.recvmsg(
-            len(_READY) + len(token) + 1,
+            len(_READY) + len(token) + (130 if encoding_required else 1),
             socket.CMSG_SPACE(integer_size) + socket.CMSG_SPACE(_CREDENTIALS.size),
             socket.MSG_CMSG_CLOEXEC,
         )
@@ -136,7 +142,21 @@ class BwrapRequestControl:
                     unexpected_metadata = True
             if unexpected_metadata:
                 raise OSError("Unexpected request readiness metadata")
-            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or payload != _READY + token:
+            ready = _READY + token
+            encoding = None
+            if encoding_required and payload.startswith(ready + b":"):
+                try:
+                    encoding = payload[len(ready) + 1 :].decode("ascii")
+                    if not encoding or len(encoding) > 128:
+                        raise ValueError("Missing or oversized encoding")
+                    codecs.lookup(encoding)
+                except (LookupError, UnicodeError, ValueError) as exc:
+                    raise OSError("Request output encoding is invalid") from exc
+            if (
+                flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+                or (encoding_required and encoding is None)
+                or (not encoding_required and payload != ready)
+            ):
                 raise OSError("Request readiness was incomplete or belongs to another request")
             if len(descriptors) != 1 or len(credentials) != 1:
                 raise OSError("Request readiness needs one init handle and kernel credentials")
@@ -151,7 +171,9 @@ class BwrapRequestControl:
             ):
                 raise OSError("Request readiness is not from the pinned namespace init")
             os.set_inheritable(descriptors[0], False)
-            instance = cls(control, process, token, descriptors[0], launcher_pidfd)
+            instance = cls(
+                control, process, token, descriptors[0], launcher_pidfd, encoding=encoding
+            )
             descriptors.clear()
             return instance
         finally:
@@ -262,7 +284,9 @@ class BwrapRequestControl:
                     exit_code = self._read_result()
                     if exit_code is None:
                         raise OSError("Request result was lost; the command must not be replayed")
-                return BwrapRequestResult(*outputs, None if timed_out else exit_code, timed_out)
+                return BwrapRequestResult(
+                    *outputs, None if timed_out else exit_code, timed_out, self._encoding
+                )
         finally:
             self._finish()
 

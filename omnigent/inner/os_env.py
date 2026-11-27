@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import base64
 import codecs
@@ -19,8 +20,8 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO, TypeAlias, TypedDict, cast
@@ -36,7 +37,7 @@ from omnigent.util.json_types import JsonValue
 
 from ._proc import run_isolated
 from .agent_env import strip_desktop_session_env
-from .async_utils import run_sync_on_thread
+from .async_utils import run_sync_cleanup, run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
@@ -62,8 +63,7 @@ from .sandbox import (
 from .tcp_egress import TcpEgressBroker, apply_tcp_egress_env, start_tcp_egress_broker
 
 if TYPE_CHECKING:
-    import asyncio
-
+    from ._bwrap_shell_request import BwrapShellRequest
     from .claude_model_access import ClaudeModelAccess
     from .egress import EgressProxyHandle
     from .egress.proxy import EgressProxy
@@ -368,6 +368,16 @@ class OSEnvironment(ABC):
     ) -> OpResult:
         raise NotImplementedError
 
+    async def isolated_shell(
+        self,
+        command: str,
+        timeout: int | None = None,
+        max_output: int | None = None,
+    ) -> OpResult:
+        """Retire a shell's complete lifetime before its environment can be reused."""
+        del command, timeout, max_output
+        return {"error": "This environment does not support reusable shell requests"}
+
     def run_git(
         self, argv: list[str], cwd: Path, timeout: float
     ) -> subprocess.CompletedProcess[bytes]:
@@ -406,6 +416,13 @@ class OSEnvironment(ABC):
         handles, etc.). The default is a no-op so stateless environments
         don't need to implement it.
         """
+
+
+@dataclass(frozen=True)
+class _PreparedHelper:
+    sandbox: SandboxPolicy
+    cwd: Path
+    env: dict[str, str]
 
 
 class _HelperProcessClient:
@@ -448,6 +465,7 @@ class _HelperProcessClient:
         # Recompute callable and value of the running helper's launch fingerprint.
         self._launch: tuple[Callable[[], object], object] | None = None
         self._launch_env: dict[str, str] | None = None
+        self._prepared: _PreparedHelper | None = None
         # Parent-held containment handle from the sandbox backend's
         # post_spawn hook (e.g. a Windows Job Object). Closed in
         # ``_stop_locked`` to tear down the helper's process tree.
@@ -465,6 +483,9 @@ class _HelperProcessClient:
         self._git_ssh_broker: GitSshBroker | None = None
         self._tcp_egress_broker: TcpEgressBroker | None = None
         self._lock = threading.Lock()
+        self._shell_request_lock = threading.Lock()
+        self._active_shell_request: BwrapShellRequest | None = None
+        self._closing = False
         # bwrap --die-with-parent kills the helper when the thread that spawned it
         # exits, and each request runs on its own short-lived thread.
         self._spawner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="os-env-helper")
@@ -498,11 +519,97 @@ class _HelperProcessClient:
             return self._request_locked(payload, allow_retry=True)
 
     def close(self) -> None:
+        with self._shell_request_lock:
+            self._closing = True
+            if self._active_shell_request is not None:
+                self._active_shell_request.cancel()
         with self._lock:
             self._closed = True
             self._stop_locked()
         self._spawner.shutdown(wait=False)
         atexit.unregister(self.close)
+
+    def shell_request(
+        self,
+        command: str,
+        timeout: int,
+        max_output: int,
+        request: BwrapShellRequest,
+    ) -> OpResult:
+        # The helper lock retains its brokers and credential policy until retirement.
+        with self._lock:
+            with self._shell_request_lock:
+                if self._closed or self._closing:
+                    return {"error": "OS environment helper is closed"}
+                self._active_shell_request = request
+            try:
+                return self._shell_request_locked(command, timeout, max_output, request)
+            finally:
+                with self._shell_request_lock:
+                    self._active_shell_request = None
+
+    def _shell_request_locked(
+        self, command: str, timeout: int, max_output: int, request: BwrapShellRequest
+    ) -> OpResult:
+        if request.cancelled.is_set():
+            from ._bwrap_request_control import RequestCancelled
+
+            raise RequestCancelled("Shell request was cancelled before preparation")
+        self._ensure_started_locked()
+        assert self._prepared is not None
+        prepared = self._prepared
+        env = _child_shell_env(prepared.env)
+        _authorize_proxy_env(env, self._egress_auth_token)
+        try:
+            completed = request.run(
+                argv=_shell_argv(self.shell_path, command),
+                cwd=prepared.cwd,
+                policy=prepared.sandbox,
+                launch_env=prepared.env.copy(),
+                command_env=env,
+                timeout=timeout,
+                spawn=self._spawn_shell_request,
+            )
+            if completed.encoding is None:
+                raise OSError("Shell request did not identify its output encoding")
+            stdout, stderr = (
+                value.decode(completed.encoding).replace("\r\n", "\n").replace("\r", "\n")
+                for value in (completed.stdout, completed.stderr)
+            )
+        except OSError as exc:
+            return {
+                "error": (
+                    "Lost the isolated shell request; it may already have run, "
+                    f"so it was not sent again: {exc}"
+                )
+            }
+        except UnicodeError as exc:
+            return {"error": f"os_env helper exception: {exc}"}
+        return _shell_result(
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=completed.exit_code,
+            timed_out=completed.timed_out,
+            timeout=timeout,
+            shell_path=self.shell_path,
+            cwd=prepared.cwd,
+            max_output=max_output,
+        )
+
+    def _spawn_shell_request(
+        self, argv: list[str], env: dict[str, str], descriptors: tuple[int, ...]
+    ) -> subprocess.Popen[bytes]:
+        return self._spawner.submit(
+            lambda: subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(self.cwd),
+                env=env,
+                pass_fds=descriptors,
+            )
+        ).result()
 
     def _request_locked(
         self,
@@ -809,6 +916,7 @@ class _HelperProcessClient:
         except Exception:
             self._stop_locked()
             raise
+        self._prepared = _PreparedHelper(sandbox, helper_cwd, env.copy())
 
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
@@ -838,6 +946,7 @@ class _HelperProcessClient:
         self._proc = None
         self._launch = None
         self._launch_env = None
+        self._prepared = None
         try:
             if proc is None:
                 return
@@ -1166,6 +1275,63 @@ class CallerProcessOSEnvironment(OSEnvironment):
             request["max_output"] = max_output
         result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
+
+    async def isolated_shell(
+        self,
+        command: str,
+        timeout: int | None = None,
+        max_output: int | None = None,
+    ) -> OpResult:
+        from ._bwrap_shell_request import BwrapShellRequest
+
+        if not isinstance(command, str) or not command.strip():
+            return {"error": "command must be a non-empty string"}
+        resolved_timeout = 120 if timeout is None else timeout
+        if resolved_timeout < 1:
+            return {"error": "timeout must be >= 1"}
+        if max_output is not None and (not isinstance(max_output, int) or max_output < 1):
+            return {"error": "max_output must be >= 1"}
+        if (
+            not self._relaunch_when_stale
+            or self.spec.fork
+            or self._start_in_scratch
+            or self._copy_on_write_environment is not None
+        ):
+            return {"error": "This environment does not support reusable shell requests"}
+        request = BwrapShellRequest()
+        result: Future[OpResult] = Future()
+
+        def run() -> None:
+            try:
+                result.set_result(
+                    self._helper.shell_request(
+                        command,
+                        resolved_timeout if isinstance(resolved_timeout, int) else 120,
+                        min(
+                            max_output if max_output is not None else _MAX_TOOL_OUTPUT_CHARS,
+                            5_000_000,
+                        ),
+                        request,
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 — forward the owned worker's failure
+                result.set_exception(exc)
+
+        # Start before awaiting so loop-wide cancellation cannot discard the worker's owner.
+        worker = threading.Thread(target=run, name="os-env-shell-request", daemon=True)
+        worker.start()
+        try:
+            while not result.done():
+                await asyncio.sleep(0.001)
+            return result.result()
+        except BaseException:
+            try:
+                request.cancel()
+            finally:
+                # Repeated cancellation cannot return a lease while its worker owns resources.
+                with contextlib.suppress(BaseException):
+                    await run_sync_cleanup(worker.join, component="os_env_shell_request")
+            raise
 
     def run_git(
         self, argv: list[str], cwd: Path, timeout: float
@@ -2045,34 +2211,58 @@ def _shell_impl(
         # consumers treat as a plain string.
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return {
-            "stdout": _truncate_output(stdout, "stdout", max_output),
-            "stderr": _truncate_output(stderr, "stderr", max_output),
-            "exit_code": None,
-            "timed_out": True,
-            "error": f"Command timed out after {timeout} seconds",
-            "shell": shell_path,
-            "cwd": str(cwd),
-        }
+        return _shell_result(
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=None,
+            timed_out=True,
+            timeout=timeout,
+            shell_path=shell_path,
+            cwd=cwd,
+            max_output=max_output,
+        )
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
-    stdout = _truncate_output(completed.stdout, "stdout", max_output)
-    stderr = _truncate_output(completed.stderr, "stderr", max_output)
+    return _shell_result(
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        exit_code=completed.returncode,
+        timed_out=False,
+        timeout=timeout,
+        shell_path=shell_path,
+        cwd=cwd,
+        max_output=max_output,
+    )
+
+
+def _shell_result(
+    *,
+    stdout: str,
+    stderr: str,
+    exit_code: int | None,
+    timed_out: bool,
+    timeout: int,
+    shell_path: str,
+    cwd: Path,
+    max_output: int,
+) -> OpResult:
     result: OpResult = {
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": completed.returncode,
-        "timed_out": False,
+        "stdout": _truncate_output(stdout, "stdout", max_output),
+        "stderr": _truncate_output(stderr, "stderr", max_output),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
         "shell": shell_path,
         "cwd": str(cwd),
     }
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+    if timed_out:
+        result["error"] = f"Command timed out after {timeout} seconds"
+    elif exit_code != 0:
+        detail = stderr.strip() or stdout.strip()
         if detail:
-            result["error"] = f"Command exited with status {completed.returncode}: {detail}"
+            result["error"] = f"Command exited with status {exit_code}: {detail}"
         else:
-            result["error"] = f"Command exited with status {completed.returncode}"
+            result["error"] = f"Command exited with status {exit_code}"
     return result
 
 
@@ -2134,7 +2324,7 @@ def _same_path(entry: str, root: Path) -> bool:
         return os.path.normpath(entry) == os.path.normpath(str(root))
 
 
-def _child_shell_env() -> dict[str, str]:
+def _child_shell_env(helper_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """
     Environment for agent shell commands, minus omnigent's own package root.
 
@@ -2147,7 +2337,7 @@ def _child_shell_env() -> dict[str, str]:
     project). Strip only omnigent's entry — any other ``PYTHONPATH`` the caller
     set is preserved, in order.
     """
-    env = os.environ.copy()
+    env = dict(os.environ if helper_env is None else helper_env)
     raw = env.get("PYTHONPATH")
     if not raw:
         return env
@@ -2158,6 +2348,23 @@ def _child_shell_env() -> dict[str, str]:
     else:
         env.pop("PYTHONPATH", None)
     return env
+
+
+def _authorize_proxy_env(env: MutableMapping[str, str], token: str | None) -> None:
+    """Add broker authorization only to an in-process or FD-delivered environment."""
+    if not token:
+        return
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        current = env.get(key)
+        if not current:
+            continue
+        parts = urlparse(current)
+        if not parts.hostname:
+            continue
+        netloc = f"omnigent:{token}@{parts.hostname}"
+        if parts.port is not None:
+            netloc += f":{parts.port}"
+        env[key] = urlunparse(parts._replace(netloc=netloc))
 
 
 def _read_config_from_fd(fd: int) -> JsonValue:
@@ -2242,20 +2449,7 @@ def _run_helper(config: JsonValue) -> int:
     # any external observer's view.
     token_value = config.get("egress_auth_token")
     if isinstance(token_value, str) and token_value:
-        # ``urllib.parse`` correctly handles ``http://127.0.0.1:5678``
-        # and leaves us a hostname+port we can re-anchor with the
-        # auth token spliced into the userinfo.
-        for env_key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-            current = os.environ.get(env_key)
-            if not current:
-                continue
-            parts = urlparse(current)
-            if not parts.hostname:
-                continue
-            netloc = f"omnigent:{token_value}@{parts.hostname}"
-            if parts.port is not None:
-                netloc += f":{parts.port}"
-            os.environ[env_key] = urlunparse(parts._replace(netloc=netloc))
+        _authorize_proxy_env(os.environ, token_value)
 
     cwd = Path(cwd_value)
     os.chdir(cwd)

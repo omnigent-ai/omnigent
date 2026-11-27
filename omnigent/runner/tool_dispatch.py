@@ -9122,10 +9122,10 @@ async def _execute_os_env_tool(
         ``GET …/changes`` endpoint can surface them. ``sys_os_shell``
         is not tracked — shell side-effects cannot be attributed to a
         session.
-    :param resource_registry: Owner of the session's reusable environment;
-        ordinary shells use a separate disposable helper. Scratch-mode calls
-        share their private workspace until the shell retires it. Without a
-        registry (or a session id) each call starts its own helper.
+    :param resource_registry: Owner of the session's reusable environment.
+        Supported Linux shells own separate request lifetimes; other shells
+        use disposable helpers. Scratch calls retain their private workspace
+        until shell retirement. Without a registry each call owns its helper.
     :returns: Serialized tool result string.
     """
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
@@ -9133,6 +9133,7 @@ async def _execute_os_env_tool(
     os_env = None
     owns_environment = True
     tool_lease: ToolEnvironmentLease | None = None
+    isolated_shell = False
     completed = False
     try:
         if agent_spec is None and canonicalize_harness(effective_harness) == "claude-sdk":
@@ -9178,18 +9179,21 @@ async def _execute_os_env_tool(
             if (
                 resource_registry is not None
                 and conversation_id is not None
-                and (tool_name != SysOsShellTool.name() or effective_spec.start_in_scratch)
                 and not effective_spec.fork
                 and (
                     effective_spec.sandbox is None
                     or effective_spec.sandbox.credential_proxy is None
                 )
             ):
-                # Scratch calls share their private workspace until retirement.
-                # Other shells stay disposable, leaving cached file helpers intact.
-                tool_lease = await resource_registry.lease_tool_environment(
-                    conversation_id, effective_spec
-                )
+                if tool_name == SysOsShellTool.name() and not effective_spec.start_in_scratch:
+                    tool_lease = await resource_registry.lease_tool_environment(
+                        conversation_id, effective_spec, for_shell=True
+                    )
+                    isolated_shell = tool_lease is not None
+                else:
+                    tool_lease = await resource_registry.lease_tool_environment(
+                        conversation_id, effective_spec
+                    )
             if tool_lease is not None:
                 os_env = tool_lease.environment
                 owns_environment = False
@@ -9284,15 +9288,15 @@ async def _execute_os_env_tool(
                     _path, "modified", conversation_id, lambda: _read_os_env_text(os_env, _path)
                 )
         elif tool_name == SysOsShellTool.name():
-            result = await os_env.shell(
+            shell = os_env.isolated_shell if isolated_shell else os_env.shell
+            result = await shell(
                 command=cast("str", args.get("command", "")),
                 timeout=cast("int | None", args.get("timeout")),
             )
         else:
             return f"Error: {tool_name} not implemented"
-        # Shell descendants can outlive a successful command. Retire the whole
-        # tool helper until shell requests have their own complete lifetime boundary.
-        completed = tool_name != SysOsShellTool.name() and not (
+        # Only isolated shell requests retire every descendant before lease release.
+        completed = (tool_name != SysOsShellTool.name() or isolated_shell) and not (
             isinstance(result, dict) and ("error" in result or result.get("timed_out"))
         )
     except Exception as exc:

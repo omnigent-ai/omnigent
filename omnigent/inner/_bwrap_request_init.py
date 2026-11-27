@@ -1,7 +1,7 @@
 """Trusted PID-namespace init for an explicitly admitted shell request.
 
 This bootstrap uses only the standard library so its source can be passed to
-an isolated interpreter. It is not an entry point for the current shell path.
+an isolated interpreter without importing the application's dependency tree.
 """
 
 from __future__ import annotations
@@ -9,7 +9,9 @@ from __future__ import annotations
 import array
 import ctypes
 import json
+import locale
 import os
+import runpy
 import select
 import signal
 import socket
@@ -38,11 +40,20 @@ def _validate_control_socket(control: socket.socket) -> None:
 
 
 @dataclass(frozen=True)
+class _RelayConfig:
+    source: str
+    port: int
+    socket_path: str
+
+
+@dataclass(frozen=True)
 class _RequestConfig:
     token: bytes
     argv: tuple[str, ...]
     cwd: str
     env: dict[str, str]
+    relay: _RelayConfig | None = None
+    report_encoding: bool = False
 
 
 def _read_request_config(descriptor: int) -> _RequestConfig:
@@ -54,6 +65,8 @@ def _read_request_config(descriptor: int) -> _RequestConfig:
     argv = config.get("argv")
     cwd = config.get("cwd")
     env = config.get("env")
+    relay = config.get("relay")
+    report_encoding = config.get("report_encoding", False)
     if (
         not isinstance(token, str)
         or len(token) != 64
@@ -79,7 +92,32 @@ def _read_request_config(descriptor: int) -> _RequestConfig:
         for key, value in env.items()
     ):
         raise ValueError("Request environment is invalid")
-    return _RequestConfig(token.encode("ascii"), tuple(argv), cwd, dict(env))
+    if not isinstance(report_encoding, bool):
+        raise ValueError("Request output encoding option is invalid")
+    relay_config = None
+    if relay is not None:
+        if not isinstance(relay, dict):
+            raise ValueError("Request relay configuration is invalid")
+        source, port, socket_path = (
+            relay.get("source"),
+            relay.get("port"),
+            relay.get("socket_path"),
+        )
+        if (
+            not isinstance(source, str)
+            or "\0" in source
+            or not os.path.isabs(source)
+            or type(port) is not int
+            or not 1 <= port <= 65535
+            or not isinstance(socket_path, str)
+            or "\0" in socket_path
+            or not os.path.isabs(socket_path)
+        ):
+            raise ValueError("Request relay configuration is invalid")
+        relay_config = _RelayConfig(source, port, socket_path)
+    return _RequestConfig(
+        token.encode("ascii"), tuple(argv), cwd, dict(env), relay_config, report_encoding
+    )
 
 
 def _protect_init() -> None:
@@ -118,10 +156,19 @@ def _run_request(control: socket.socket, config: _RequestConfig) -> None:
     _protect_init()
     control.set_inheritable(False)
     control.settimeout(_ADMISSION_TIMEOUT_S)
+    if config.relay is not None:
+        # Reuse the maintained stdlib relay inside this request's network namespace.
+        start_relay = runpy.run_path(config.relay.source)["start_relay"]
+        relay_ready = start_relay(config.relay.port, config.relay.socket_path)
+        if not relay_ready.wait(_ADMISSION_TIMEOUT_S):
+            raise TimeoutError("Shell request relay did not become ready")
     # The owner receives the actual init's handle, without a numeric-PID race.
     descriptor = os.pidfd_open(1)
     try:
         ready = _READY + config.token
+        if config.report_encoding:
+            encoding = "utf-8" if sys.flags.utf8_mode else locale.getencoding()
+            ready += b":" + encoding.encode("ascii")
         sent = control.sendmsg(
             [ready],
             [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [descriptor]))],

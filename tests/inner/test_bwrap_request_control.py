@@ -115,6 +115,43 @@ def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
 
 
 @pytest.mark.parametrize(
+    "encoding",
+    [b"utf-8", b"ISO-8859-1", b"", b"unknown-encoding", b"x" * 129, b"\xff", None],
+)
+def test_required_output_encoding_is_bound_to_the_validated_readiness(
+    readiness: tuple[MagicMock, MagicMock, MagicMock], encoding: bytes | None
+) -> None:
+    control, process, close = readiness
+    payload, metadata, flags, address = control.recvmsg.return_value
+    if encoding is not None:
+        payload += b":" + encoding
+    control.recvmsg.return_value = (payload, metadata, flags, address)
+    if encoding in (b"utf-8", b"ISO-8859-1"):
+        owner = request_control.BwrapRequestControl.receive(
+            control,
+            process,
+            _TOKEN,
+            expected_init_pid=73,
+            launcher_pidfd=_LAUNCHER_FD,
+            encoding_required=True,
+        )
+        assert owner._encoding == encoding.decode("ascii")
+        close.assert_not_called()
+    else:
+        with pytest.raises(OSError, match=r"encoding|readiness"):
+            request_control.BwrapRequestControl.receive(
+                control,
+                process,
+                _TOKEN,
+                expected_init_pid=73,
+                launcher_pidfd=_LAUNCHER_FD,
+                encoding_required=True,
+            )
+        close.assert_called_once_with(_INIT_FD)
+    control.send.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "problem",
     [
         "token",
