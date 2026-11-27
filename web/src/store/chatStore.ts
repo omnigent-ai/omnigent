@@ -830,6 +830,11 @@ export interface ConversationState {
     pendingId?: string;
     contentKey?: string;
   }[];
+  /**
+   * Pending ids that command receipts named before any bubble here had adopted
+   * them: a send still posting settles when its reply returns one of these.
+   */
+  settledCommandIds: string[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -2476,6 +2481,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   pendingUserMessages: [],
   failedUploads: [],
   settledShellInputs: [],
+  settledCommandIds: [],
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -3361,15 +3367,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
         setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId
-              ? {
-                  ...p,
-                  posted: true,
-                  ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
-                }
-              : p,
-          ),
+          // A command whose receipt beat this reply is already in the transcript.
+          pendingUserMessages:
+            postResult.pendingId && s.settledCommandIds.includes(postResult.pendingId)
+              ? s.pendingUserMessages.filter((p) => p.tempId !== tempId)
+              : s.pendingUserMessages.map((p) =>
+                  p.tempId === tempId
+                    ? {
+                        ...p,
+                        posted: true,
+                        ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                      }
+                    : p,
+                ),
           settledShellInputs: s.settledShellInputs.map((entry) =>
             entry.tempId === tempId && postResult.pendingId
               ? { ...entry, pendingId: postResult.pendingId }
@@ -7088,13 +7098,20 @@ async function reconcileOnReconnect(
       ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
-    // the durable equivalent of its FIFO acknowledgement.
-    const recoveredUserInputs = unseen.filter(
-      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
-    ).length;
-    if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
+    // the durable equivalent of its FIFO acknowledgement. A message no human
+    // typed (a /loop run) settles its own replayed entry, never the FIFO head.
+    let pending = s.pendingUserMessages;
+    for (const block of unseen) {
+      if (block.type !== "user_message" || isSystemUserContent(block.content)) continue;
+      if (block.origin === undefined) {
+        pending = pending.slice(1);
+        continue;
+      }
+      const key = contentKeyOf(block.content);
+      const at = pending.findIndex((p) => p.replayed && contentKeyOf(p.content) === key);
+      if (at >= 0) pending = [...pending.slice(0, at), ...pending.slice(at + 1)];
     }
+    if (pending !== s.pendingUserMessages) patch.pendingUserMessages = pending;
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
@@ -10093,10 +10110,31 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // persistence for these (no `session.input.consumed` fires),
       // so the optimistic bubble in `pendingUserMessages` would
       // otherwise linger next to the rendered SlashCommandBlock
-      // until refresh. Pop the FIFO head here to ack the local
-      // send; observing clients and drafts still held locally cannot
-      // acknowledge a send, so they just render the block.
+      // until refresh. The receipt names the pending entry it settles,
+      // and only that bubble goes: a command nobody queued here (typed
+      // in the terminal, a /loop run) leaves every bubble alone.
       applyToConversation((s) => {
+        const named = event.clearedPendingId;
+        if (named === null) return {};
+        if (named !== undefined) {
+          const at = s.pendingUserMessages.findIndex(
+            (p) => p.tempId === named || p.pendingId === named,
+          );
+          if (at < 0) {
+            // Its send may still be posting; the reply settles it (see `send`).
+            return {
+              settledCommandIds: [...s.settledCommandIds, named].slice(-MAX_SETTLED_SHELL_INPUTS),
+            };
+          }
+          return {
+            pendingUserMessages: [
+              ...s.pendingUserMessages.slice(0, at),
+              ...s.pendingUserMessages.slice(at + 1),
+            ],
+          };
+        }
+        // No owner named (a composer skill's receipt, an older server): pop the
+        // FIFO head to ack the local send, unless it is a draft still held here.
         if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };

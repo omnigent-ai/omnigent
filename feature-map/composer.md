@@ -263,7 +263,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `/loop stop` still works. Otherwise a typed `/loop` is sent as text, so Claude
   Code's own `/loop` runs in a native session. A prompt that a native harness
   records as a command (`/loop 5m /some-skill`) comes back as a command item,
-  which carries no "Loop" label. Selecting **/loop** in Commands fills
+  which carries no "Loop" label; it names the queued entry it settles, so it
+  never clears a message the user has pending. Selecting **/loop** in Commands fills
   `/loop ` to complete. States: "Loop armed: every 5m, next run at …", "Loop
   stopped.", "No loop is running in this session.", usage and interval errors
   under the composer with the text kept, a server refusal with the text

@@ -625,6 +625,7 @@ beforeEach(() => {
     blocks: [],
     pendingUserMessages: [],
     settledShellInputs: [],
+    settledCommandIds: [],
     queuedMessages: [],
     activeResponse: null,
     status: "idle",
@@ -12178,6 +12179,87 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     });
+
+    const command = (clearedPendingId: string | null): StreamEvent => ({
+      type: "slash_command",
+      kind: "skill",
+      name: "review",
+      arguments: "the parser",
+      output: null,
+      agentName: "claude-native-ui",
+      clearedPendingId,
+      itemId: "item_slash_named",
+      responseId: "resp_slash_named",
+    });
+    const mine: PendingUserMessage = {
+      tempId: "pend_mine",
+      pendingId: "pending_mine",
+      posted: true,
+      content: [{ type: "input_text", text: "also check the logs" }],
+    };
+    const queuedRun: PendingUserMessage = {
+      tempId: "pending_loop",
+      replayed: true,
+      content: [{ type: "input_text", text: "/review the parser" }],
+    };
+
+    it.each<[string, PendingUserMessage[], string | null]>([
+      // The run has no bubble here, so the message the user sent meanwhile is not its.
+      ["a /loop run recorded as a command", [mine], "pending_loop"],
+      ["a /loop run this tab replayed as pending", [mine, queuedRun], "pending_loop"],
+      ["a command typed in the terminal", [mine], null],
+    ])("%s leaves the user's own pending message alone", (_, pending, cleared) => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(command(cleared));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([mine]);
+    });
+
+    it("settles the bubble the receipt names, not the oldest one", () => {
+      const typedCommand: PendingUserMessage = {
+        tempId: "pend_command",
+        pendingId: "pending_command",
+        posted: true,
+        content: [{ type: "input_text", text: "/review the parser" }],
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [mine, typedCommand] });
+
+      handleSessionEvent(command("pending_command"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([mine]);
+    });
+
+    it("settles a command whose receipt beat its POST acknowledgement", async () => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+        pendingUserMessages: [mine],
+      });
+      let resolvePost: (() => void) | null = null;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/v1/sessions/conv_existing/events") &&
+          init?.method === "POST"
+        ) {
+          return new Promise<Response>((resolve) => {
+            resolvePost = () =>
+              resolve(mockResponse({ queued: true, pending_id: "pending_command" }));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const sending = useChatStore.getState().send("/review the parser", "agent_xyz");
+      await vi.waitFor(() => expect(resolvePost).not.toBeNull());
+
+      // The bubble has no server id yet, so the receipt can't name it: nothing moves.
+      handleSessionEvent(command("pending_command"));
+      expect(useChatStore.getState().pendingUserMessages).toHaveLength(2);
+
+      resolvePost!();
+      await sending;
+      expect(useChatStore.getState().pendingUserMessages).toEqual([mine]);
+    });
   });
 
   describe("terminal_command (claude-native !cmd)", () => {
@@ -20163,6 +20245,56 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await teardown(controller, loop);
       setSessionHost(id, null);
     });
+
+    it.each<[string, PendingUserMessage[]]>([
+      ["that had no bubble here", []],
+      [
+        "this tab replayed as pending",
+        [
+          {
+            tempId: "pending_loop",
+            replayed: true,
+            content: [{ type: "input_text", text: "check CI" }],
+          },
+        ],
+      ],
+    ])(
+      "a /loop run %s, committed in the gap, acks no message the user typed",
+      async (_, queued) => {
+        workspaceMode();
+        const id = "conv_rekey_loop";
+        const before = userMessage("loop_pre", "before the gap");
+        seedSession(id, [before]);
+        const extras = new Map<string, Record<string, unknown>>([[id, { host_id: null }]]);
+        routeKeyedStreamOpens({ snapshotExtras: extras });
+        const controller = new AbortController();
+        const mine = postedBubble("pend_mine", "still on its way");
+        useChatStore.setState({
+          conversationId: id,
+          abortController: controller,
+          blocks: itemsToBlocks([before]),
+          pendingUserMessages: [...queued, mine],
+        });
+
+        const loop = startStreamPump(id, controller, setState, getState);
+        await drainAsync();
+
+        // The run was delivered while this stream sat on the wrong replica.
+        const run = { ...userMessage("loop_gap", "check CI"), origin: "loop" };
+        seedSessionItems(id, [before, run]);
+        extras.set(id, { host_id: "host_b" });
+        setSessionHost(id, "host_b");
+        await drainAsync(50);
+
+        // The run settles its own replayed entry, if this tab had one, and nothing else.
+        const state = useChatStore.getState();
+        expect(state.pendingUserMessages).toEqual([mine]);
+        expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, run.id]);
+
+        await teardown(controller, loop);
+        setSessionHost(id, null);
+      },
+    );
 
     it("forces gap reconciliation when the host is learned while the first open is still pending", async () => {
       workspaceMode();

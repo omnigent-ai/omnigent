@@ -6961,16 +6961,20 @@ async def test_claude_native_retried_mirror_leaves_the_queue_alone() -> None:
 @pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
 async def test_claude_native_mirrored_slash_command_drains_its_queued_entry(
     prior_state: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A web-typed command mirrored as a slash_command clears its own queued entry.
 
     Without this the entry outlives the executed command and the next ordinary
     message would skip it, persisting a false "not delivered" error for a
-    command Claude ran. Older entries are left in place.
+    command Claude ran. Older entries are left in place, and the receipt names
+    the command's entry so clients drop that bubble, not their oldest.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
 
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(session_stream, "publish", lambda _sid, event: published.append(event))
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
     sid = "64a784c3aa907d1774f44313546947c6"
@@ -6981,7 +6985,7 @@ async def test_claude_native_mirrored_slash_command_drains_its_queued_entry(
         pending_inputs.mark_uncertain(sid)
     elif prior_state == "interrupted":
         pending_inputs.mark_interrupted(sid, [older])
-    pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
     body = SessionEventInput(
         type="external_conversation_item",
         data={
@@ -7006,6 +7010,7 @@ async def test_claude_native_mirrored_slash_command_drains_its_queued_entry(
         )
 
         assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [event["cleared_pending_id"] for event in published] == [command]
         assert pending_inputs.pending_ids(sid) == [older]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
             [] if prior_state == "interrupted" else [older]
@@ -11992,11 +11997,17 @@ async def test_claude_native_top_level_local_command_echo_drains_its_queued_entr
 @pytest.mark.parametrize("typed", ["/simplify the lexer", "/review the parser"])
 async def test_claude_native_plugin_slash_command_leaves_a_different_queued_command(
     typed: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Trying the bare name never settles an entry with other arguments or another command."""
+    """Trying the bare name never settles an entry with other arguments or another command.
+
+    The receipt says so: it names no entry, so clients leave their bubbles alone.
+    """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
 
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(session_stream, "publish", lambda _sid, event: published.append(event))
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
     sid = "64a784c3aa907d1774f44313546947c6"
@@ -12027,6 +12038,7 @@ async def test_claude_native_plugin_slash_command_leaves_a_different_queued_comm
         )
 
         assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [event["cleared_pending_id"] for event in published] == [None]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [other]
     finally:
         pending_inputs.reset_for_tests()

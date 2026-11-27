@@ -3469,9 +3469,9 @@ def _publish_external_conversation_item(
 
     :param session_id: Session/conversation identifier.
     :param item: Persisted conversation item.
-    :param cleared_pending_id: For a native user message, the id of the
-        optimistic pending-input entry the caller drained for it (so
-        clients drop that bubble by id), or ``None``. The drain happens
+    :param cleared_pending_id: For a native user message or slash command,
+        the id of the optimistic pending-input entry the caller drained for
+        it (so clients drop that bubble by id), or ``None``. The drain happens
         at the persist site — see :func:`_persist_external_conversation_item`
         — because it also folds the entry's file blocks into the durable
         item before append.
@@ -3496,6 +3496,10 @@ def _publish_external_conversation_item(
     payload = event.model_dump()
     if message_id is not None:
         payload["message_id"] = message_id
+    if item.type == _SLASH_COMMAND_TYPE:
+        # A command has no consumed receipt, so its item names the queued entry it
+        # settles: ``None`` when no client queued it (typed in the terminal).
+        payload["cleared_pending_id"] = cleared_pending_id
     session_stream.publish(session_id, payload)
 
 
