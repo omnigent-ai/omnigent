@@ -220,7 +220,25 @@ import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import {
+  type ProjectExpansionCommand,
+  type ProjectExpansionId,
+  type ProjectMoveDestination,
+  type ProjectOrderingFacts,
+  type ProjectSortChoice,
+  type ProjectSortOrder,
+  PROJECT_MOVE_DESTINATIONS,
+  PROJECT_MOVE_MENU_LABELS,
+} from "./projectCommands/ordering";
+import { usePublishProjectOrdering } from "./projectCommands/projectOrderingStore";
 import { useSidebarNavCommands, useSidebarNavDestinations } from "./sidebarNavCommands";
+import {
+  projectListControls,
+  SELECT_SESSIONS,
+  type SelectionScope,
+  selectSessionsEntry,
+  sidebarEntryPaletteCommands,
+} from "./sidebarEntryCommands";
 import {
   useQuickPickPaletteCommands,
   useQuickPickPaletteEnabled,
@@ -237,6 +255,7 @@ import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { useSessionActions } from "./useSessionActions";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { useProjectActionStore } from "./projectCommands/projectActionStore";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
@@ -580,7 +599,6 @@ const SIDEBAR_FILTER_EMPTY: Record<SidebarTab, string> = {
 // Bulk-selection targets either the flat "Sessions" list or the sessions
 // nested inside project folders; the active scope decides which rows show
 // checkboxes and where the bulk-action bar renders.
-type SelectionScope = "sessions" | "projects";
 
 interface SidebarProps {
   open: boolean;
@@ -2590,7 +2608,7 @@ function ConversationList({
   // pinned rows stop taking drops until the current write settles.
   const pinWriting = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
   const { mutate: reorderPins } = useReorderPinnedConversations();
-  const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
+  const moveProject = (name: string, destination: ProjectMoveDestination) => {
     if (saveOrder.isPending) return;
     const from = projects.findIndex((p) => p.name === name);
     const to =
@@ -3055,6 +3073,11 @@ function ConversationList({
     if (projectHomeName !== oldName) return;
     navigate({ pathname: projectHomePath(newName), search: location.search }, { replace: true });
   });
+  // A rename from ⌘K carries the expansion over too.
+  const hostRename = useProjectActionStore((state) => state.lastRename);
+  useEffect(() => {
+    if (hostRename) renameExpandedProject(hostRename.oldName, hostRename.newName);
+  }, [hostRename, renameExpandedProject]);
 
   const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {
@@ -3565,6 +3588,113 @@ function ConversationList({
     onToggleSelected,
     onProjectAssigned: expandProject,
   };
+  // The Projects header's controls and the Select sessions entry points: the headers render
+  // from these, and ⌘K offers the same rows while they're offered.
+  const orderLoaded = projectOrder.data !== undefined;
+  const orderSaving = saveOrder.isPending;
+  const editingTitles = editingIds.size > 0;
+  const orderingFacts = useMemo<ProjectOrderingFacts>(
+    () => ({
+      orderLoaded,
+      saving: orderSaving,
+      selecting: selectionMode,
+      editing: editingTitles,
+    }),
+    [orderLoaded, orderSaving, selectionMode, editingTitles],
+  );
+  const projectsSectionShown = !grouped && !showShared;
+  // A unified selection starts from the Projects header's own button.
+  const hasProjectSessions =
+    !unifiedSelection && sections.projectGroups.some((group) => group.conversations.length > 0);
+  // Pinned rows can't be selected, so they don't make a sessions selection worth starting.
+  const hasLooseSessions = sections.shared.length + sections.sessions.length > 0;
+  const selectEntry = useMemo(
+    () =>
+      selectSessionsEntry({
+        selectionMode,
+        unifiedSelection,
+        projectsSectionShown,
+        hasLooseSessions,
+        hasProjectSessions,
+      }),
+    [selectionMode, unifiedSelection, projectsSectionShown, hasLooseSessions, hasProjectSessions],
+  );
+  const manualProjectOrder = projectOrder.data?.sort_mode === "manual";
+  const projectNamesInList = useMemo(
+    () => sections.projectGroups.map((group) => group.name),
+    [sections.projectGroups],
+  );
+  const projectsSectionCollapsed = effectiveCollapsedSections.includes("Projects");
+  const projectControls = useMemo(
+    () =>
+      projectListControls({
+        selectionMode,
+        sectionShown: projectsSectionShown,
+        selectProjectSessions: selectEntry.projectMenuItem,
+        manualOrder: manualProjectOrder,
+        ordering: orderingFacts,
+        projectNames: projectNamesInList,
+        expandedProjects,
+        sectionCollapsed: projectsSectionCollapsed,
+      }),
+    [
+      selectionMode,
+      projectsSectionShown,
+      selectEntry.projectMenuItem,
+      manualProjectOrder,
+      orderingFacts,
+      projectNamesInList,
+      expandedProjects,
+      projectsSectionCollapsed,
+    ],
+  );
+  const changeProjectSort = (order: ProjectSortOrder) => {
+    const ranks = new Map(projectOrder.data?.ordered_project_ids?.map((id, index) => [id, index]));
+    const restored = [...projects].sort(
+      (a, b) => (ranks.get(a.id ?? "") ?? Infinity) - (ranks.get(b.id ?? "") ?? Infinity),
+    );
+    saveOrder.mutate(order === "manual" ? restored : null);
+  };
+  const runProjectExpansion = (id: ProjectExpansionId) => {
+    if (id === "expand-all") expandAllProjects(projectNamesInList);
+    else collapseAllProjects();
+  };
+  // ⌘K's rows run what the controls would run now, not what they ran when the rows were built.
+  const latestProjectRun = useRef({
+    changeProjectSort,
+    runProjectExpansion,
+    enterSelection: onEnterSelectionMode,
+    moveProject,
+  });
+  latestProjectRun.current = {
+    changeProjectSort,
+    runProjectExpansion,
+    enterSelection: onEnterSelectionMode,
+    moveProject,
+  };
+  const projectListCommands = useMemo(
+    () =>
+      sidebarEntryPaletteCommands(projectControls, selectEntry, {
+        changeSort: (order) => latestProjectRun.current.changeProjectSort(order),
+        runExpansion: (id) => latestProjectRun.current.runProjectExpansion(id),
+        enterSelection: (scope) => latestProjectRun.current.enterSelection(scope),
+      }),
+    [projectControls, selectEntry],
+  );
+  useQuickPickPaletteCommands("sidebar-projects", "Projects", projectListCommands);
+  // ⌘K moves the project in view with the folder menu's facts and move.
+  const projectOrderNames = useMemo(() => projects.map((project) => project.name), [projects]);
+  const publishedOrdering = useMemo(
+    () => ({
+      names: projectOrderNames,
+      facts: orderingFacts,
+      move: (name: string, destination: ProjectMoveDestination) =>
+        latestProjectRun.current.moveProject(name, destination),
+    }),
+    [projectOrderNames, orderingFacts],
+  );
+  usePublishProjectOrdering(publishedOrdering);
+
   const sessionsBulkBar =
     sessionsSelecting && !unifiedSelection ? (
       <BulkActionBar
@@ -3584,7 +3714,7 @@ function ConversationList({
           type="button"
           variant="ghost"
           size="icon-xs"
-          aria-label="Select sessions"
+          aria-label={SELECT_SESSIONS.menuLabel}
           data-testid="toggle-selection-mode"
           className="text-muted-foreground mobile-touch-target"
           onClick={(event) => {
@@ -3595,7 +3725,7 @@ function ConversationList({
           <ListChecksIcon className="size-3.5" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">Select sessions</TooltipContent>
+      <TooltipContent side="bottom">{SELECT_SESSIONS.menuLabel}</TooltipContent>
     </Tooltip>
   );
   // A unified selection puts "Select sessions" on the Projects header instead.
@@ -3628,7 +3758,7 @@ function ConversationList({
           New session
         </TooltipContent>
       </Tooltip>
-      {!unifiedSelection && selectSessionsButton}
+      {selectEntry.sessionsHeaderButton && selectSessionsButton}
     </div>
   ) : undefined;
   const sessionsFilterMenu = (
@@ -3882,38 +4012,16 @@ function ConversationList({
                               hostId={defaultProjectHostId}
                               hosts={hosts}
                               hostsLoading={hostsLoading}
-                              onOrderChange={(manual) => {
-                                const ranks = new Map(
-                                  projectOrder.data?.ordered_project_ids?.map((id, index) => [
-                                    id,
-                                    index,
-                                  ]),
-                                );
-                                const restored = [...projects].sort(
-                                  (a, b) =>
-                                    (ranks.get(a.id ?? "") ?? Infinity) -
-                                    (ranks.get(b.id ?? "") ?? Infinity),
-                                );
-                                saveOrder.mutate(manual ? restored : null);
-                              }}
-                              manualOrder={projectOrder.data?.sort_mode === "manual"}
-                              orderDisabled={saveOrder.isPending || !projectOrder.data}
-                              projectNames={sections.projectGroups.map((group) => group.name)}
-                              collapsed={effectiveCollapsedSections.includes("Projects")}
-                              expandedProjects={expandedProjects}
-                              // A unified selection starts from the header's own button.
-                              hasProjectSessions={
-                                !unifiedSelection &&
-                                sections.projectGroups.some(
-                                  (group) => group.conversations.length > 0,
-                                )
-                              }
-                              onExpandAll={expandAllProjects}
-                              onCollapseAll={collapseAllProjects}
+                              menuShown={projectControls.menuShown}
+                              sortChoices={projectControls.sort}
+                              onSortChange={changeProjectSort}
+                              expansion={projectControls.expansion}
+                              onExpansion={runProjectExpansion}
+                              selectProjectSessions={selectEntry.projectMenuItem}
                               onProjectCreated={expandProject}
                               onEnterSelectionMode={() => onEnterSelectionMode("projects")}
                             />
-                            {unifiedSelection && selectSessionsButton}
+                            {selectEntry.projectsHeaderButton && selectSessionsButton}
                           </>
                         ) : undefined
                       }
@@ -4708,42 +4816,32 @@ function ProjectHeaderActions({
   hostId,
   hosts,
   hostsLoading,
-  onOrderChange,
-  manualOrder,
-  orderDisabled,
-  projectNames,
-  collapsed,
-  expandedProjects,
-  hasProjectSessions,
-  onExpandAll,
-  onCollapseAll,
+  menuShown,
+  sortChoices,
+  onSortChange,
+  expansion,
+  onExpansion,
+  selectProjectSessions,
   onProjectCreated,
   onEnterSelectionMode,
 }: {
   hostId: string | null;
   hosts: Host[];
   hostsLoading: boolean;
-  onOrderChange: (manual: boolean) => void;
-  manualOrder: boolean;
-  orderDisabled: boolean;
-  projectNames: string[];
-  collapsed: boolean;
-  expandedProjects: string[];
-  /** Whether any project holds sessions — gates the "Select sessions" item, so
-      it isn't offered when there's nothing under any folder to select. */
-  hasProjectSessions: boolean;
-  onExpandAll: (projectNames: string[]) => void;
-  onCollapseAll: () => void;
+  /** Whether the project list menu shows, from the shared model ⌘K reads. */
+  menuShown: boolean;
+  /** From the shared ordering model, as ⌘K offers them. */
+  sortChoices: readonly ProjectSortChoice[];
+  onSortChange: (order: ProjectSortOrder) => void;
+  /** Expand all and collapse all, only where each would change something. */
+  expansion: readonly ProjectExpansionCommand[];
+  onExpansion: (id: ProjectExpansionId) => void;
+  /** Whether the menu's Select sessions item shows, as `selectSessionsEntry` decides. */
+  selectProjectSessions: boolean;
   onProjectCreated: (projectName: string) => void;
   onEnterSelectionMode: () => void;
 }) {
-  const showExpandControls = !collapsed && projectNames.length > 0;
-  const allExpanded =
-    projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
-  const anyExpanded = projectNames.some((name) => expandedProjects.includes(name));
-  // Hide the menu when there are no projects or sessions to organize.
-  const showMenu = showExpandControls || hasProjectSessions || projectNames.length > 0;
-
+  const sortReason = sortChoices.find((choice) => !choice.availability.available)?.availability;
   return (
     <div className="flex items-center gap-0.5">
       <NewProjectButton
@@ -4751,8 +4849,9 @@ function ProjectHeaderActions({
         hostId={hostId}
         hosts={hosts}
         hostsLoading={hostsLoading}
+        inPalette
       />
-      {showMenu && (
+      {menuShown && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
@@ -4769,43 +4868,44 @@ function ProjectHeaderActions({
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-40">
             <DropdownMenuSub>
-              <DropdownMenuSubTrigger disabled={orderDisabled}>
+              <DropdownMenuSubTrigger disabled={sortReason !== undefined}>
                 Sort projects by
               </DropdownMenuSubTrigger>
               <DropdownMenuSubContent className="min-w-40">
                 <DropdownMenuRadioGroup
-                  value={manualOrder ? "manual" : "alphabetical"}
-                  onValueChange={(value) => onOrderChange(value === "manual")}
+                  value={sortChoices.find((choice) => choice.selected)?.value}
+                  onValueChange={(value) => onSortChange(value as ProjectSortOrder)}
                 >
-                  <DropdownMenuRadioItem value="alphabetical">Alphabetically</DropdownMenuRadioItem>
-                  <DropdownMenuRadioItem value="manual">Manual order</DropdownMenuRadioItem>
+                  {sortChoices.map((choice) => (
+                    <DropdownMenuRadioItem key={choice.value} value={choice.value}>
+                      {choice.menuLabel}
+                    </DropdownMenuRadioItem>
+                  ))}
                 </DropdownMenuRadioGroup>
               </DropdownMenuSubContent>
             </DropdownMenuSub>
-            {/* Gated independently: each hides only when it would be a no-op, so
-                a mixed set offers both. */}
-            {showExpandControls && !allExpanded && (
-              <DropdownMenuItem
-                data-testid="expand-all-projects"
-                onSelect={() => onExpandAll(projectNames)}
-              >
-                <Maximize2Icon className="size-3.5" />
-                Expand all
-              </DropdownMenuItem>
-            )}
-            {showExpandControls && anyExpanded && (
-              <DropdownMenuItem data-testid="collapse-all-projects" onSelect={onCollapseAll}>
-                <Minimize2Icon className="size-3.5" />
-                Collapse all
-              </DropdownMenuItem>
-            )}
-            {hasProjectSessions && (
+            {expansion.map((command) => {
+              const Icon = command.id === "expand-all" ? Maximize2Icon : Minimize2Icon;
+              return (
+                <DropdownMenuItem
+                  key={command.id}
+                  data-testid={
+                    command.id === "expand-all" ? "expand-all-projects" : "collapse-all-projects"
+                  }
+                  onSelect={() => onExpansion(command.id)}
+                >
+                  <Icon className="size-3.5" />
+                  {command.menuLabel}
+                </DropdownMenuItem>
+              );
+            })}
+            {selectProjectSessions && (
               <DropdownMenuItem
                 data-testid="projects-select-sessions"
                 onSelect={() => onEnterSelectionMode()}
               >
                 <ListChecksIcon className="size-3.5" />
-                Select sessions
+                {SELECT_SESSIONS.menuLabel}
               </DropdownMenuItem>
             )}
           </DropdownMenuContent>
@@ -7448,7 +7548,7 @@ function ProjectFolderMenuItems({
             Move
           </C.SubTrigger>
           <C.SubContent>
-            {(["up", "down", "top", "bottom"] as const).map((destination) => (
+            {PROJECT_MOVE_DESTINATIONS.map((destination) => (
               <C.Item
                 key={destination}
                 disabled={
@@ -7459,9 +7559,7 @@ function ProjectFolderMenuItems({
                 }
                 onSelect={() => actions.ordering!.move(destination)}
               >
-                {destination === "top" || destination === "bottom"
-                  ? `Move to ${destination}`
-                  : `Move ${destination}`}
+                {PROJECT_MOVE_MENU_LABELS[destination]}
               </C.Item>
             ))}
           </C.SubContent>
