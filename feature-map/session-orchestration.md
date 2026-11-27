@@ -47,6 +47,33 @@ MCP independent creation.
   and workspace apply unless given. A session whose message the server refused is
   still printed, with a non-zero exit (`tests/cli/test_session_create.py`,
   `tests/e2e/test_session_create_cli_e2e.py`).
+- `cli-messaging`: `omnigent session send <id>` queues a message like a web composer
+  send. With `--wait` it returns once the turn was seen (as `running`, or as a reply,
+  tool call or error after the sent message) and the session then reads idle with no
+  input waiting for its terminal, confirmed by a second transcript read 2s later, since
+  a native terminal can report the end before its last reply is mirrored. An idle read
+  from before the turn doesn't end the wait. The sent message is found by the ack's
+  item id, or by its text for a held input, never by someone else's message; a
+  native terminal's `/command` or `!command` is found by the command item it records
+  instead, a plugin skill under its qualified name too. The cursor is the newest item
+  of any type, so an earlier identical command stays before it. A held text that more
+  than one item matches is refused (exit 1). Turn
+  output means tool calls, reasoning, errors, compaction, terminal output or assistant
+  messages, not metadata such as resource events. A stored `omnigent
+  login` token is renewed from its refresh grant during the wait. It prints
+  the final reply, or nothing with a stderr note when the turn left none; `--json` adds
+  every message after the sent one. It stops early, with the status shown, when a
+  prompt waits for a person, the turn fails, or a held message is listed as never
+  delivered (both exit 1). A failure already on the session before the send counts
+  only with a new status, a different error, or an error item after the message, and a
+  failure must hold for 2s with nothing waiting for the terminal, since a turn queued
+  behind one that fails starts right after that failure.
+  `--timeout` bounds the whole exchange, send included.
+  `omnigent session get <id>` prints the fields `sys_session_get_info` returns plus
+  the URL, with cost and tokens under `--usage`. `omnigent session read <id>` prints
+  the newest messages oldest first, without tool calls (`--last N`, `--after <message
+  id>`). Each request goes to the replica holding the session's host
+  (`tests/cli/test_session_messaging.py`, `tests/e2e/test_session_create_cli_e2e.py`).
 - `created-by`: independent workers record their creating session. The session
   header does not show it. The worker's sidebar card looks the creator up through
   an access-checked read each time it opens: its "Created by" row names the
@@ -257,6 +284,32 @@ MCP independent creation.
   with `sys_session_create`. Covered by
   `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
 
+### Scripting workers from a shell
+
+A script drives workers with `omnigent session` commands, acting as the signed-in
+user; each request goes to the replica holding the session's host:
+
+- `omnigent session create --agent claude --title T --message-file task.md` starts a
+  session on this machine's host in the current directory (`--host-id` with an
+  absolute `--workspace` for another owned host, `--project-id` to file it) and prints
+  its id; `--json` adds its URL.
+- `omnigent session send <id> -m "..." --wait` hands it the next task and prints the
+  final reply when the turn ends; `--message-file FILE` (or `-` for stdin) reads the
+  message instead. `--json` gives `delivered`, `status`, `pending_approvals`, `reply`
+  and every message after the sent one, and `--timeout SECONDS` bounds it.
+- `send`, `get` and `read` use the configured server, or a local one; `--server URL`
+  overrides it.
+- `omnigent session get <id>` shows its status, approvals waiting, host, workspace
+  and last activity (`--usage` adds cost and tokens, `--json` the
+  `sys_session_get_info` fields plus the URL).
+- `omnigent session read <id>` shows its newest messages (`--last N`, `--after <message
+  id>` for only what's new, `--json`).
+
+For a manual check, create a worker with a short task, then `send --wait` a follow-up
+and confirm the reply prints when the turn ends. `read` should show both exchanges
+and `get --usage` an idle session with its cost. Repeat `send --wait --timeout 1` on a
+slow task and confirm it times out promptly.
+
 ### Scripted review sessions
 
 With the server release flag `scripted_sessions` enabled (default on;
@@ -361,6 +414,12 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   `tests/runner/test_session_orchestration.py`, and
   `tests/server/integration/test_session_orchestration.py`; persisted settings and
   storage failures are covered by `tests/server/routes/test_sessions_sharing_mode.py`.
+- CLI scripting (no browser): `uv run --no-sync pytest tests/cli/test_session_create.py
+  tests/cli/test_session_messaging.py` covers request shapes, outputs and the reply-wait
+  rules against a fake server, and `uv run --no-sync pytest
+  tests/e2e/test_session_create_cli_e2e.py` (mock LLM, no credentials) runs `create`,
+  `send --wait`, `read` and `get` as separate processes with a real host daemon and
+  runner.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
 - Admin/UI component tests cover all three destination modes; server integration
@@ -368,6 +427,14 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   runner tests cover MCP refusal before creation.
 
 ## Gotchas
+
+- `omnigent session send --wait` reads a native terminal session's reply from the
+  transcript the terminal mirrors, and the session gives no signal that a turn's
+  transcript is complete. The terminal can report idle before its last items
+  arrive, and it retries a failed transcript post for up to 30s. A mirror more than
+  the 2s settle behind can therefore end the wait on an earlier progress message, or
+  with no reply. `omnigent session read` shows the final reply once it's mirrored.
+  SDK sessions write their items before they report idle.
 
 - "Created by" records origin only: workers remain independent and have their own
   permissions and lifecycle. Sharing a worker does not share its creator; only

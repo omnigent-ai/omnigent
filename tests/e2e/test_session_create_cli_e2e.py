@@ -1,10 +1,12 @@
-"""``omnigent session create`` starts a worker from a script, end to end.
+"""A script drives a worker with ``omnigent session create|send|read|get``, end to end.
 
 The CLI runs as its own process, the way a worker-pool script calls it. With
-no ``--host-id`` it starts this machine's host daemon against the server, binds
-the new session to that host and the current directory, queues the task, prints
-the session id and exits. The runner then answers the task from the mock LLM,
-which proves the queued message reached the session's turn.
+no ``--host-id``, ``create`` starts this machine's host daemon against the
+server, binds the new session to that host and the current directory, queues
+the task, prints the session id and exits. The runner then answers the task
+from the mock LLM, which proves the queued message reached the session's turn.
+``send --wait`` then hands the worker a follow-up and returns its reply, and
+``read`` and ``get`` report the transcript and the idle session.
 
 Runs against the mock LLM server; no credentials needed::
 
@@ -42,14 +44,16 @@ def _omnigent(
     )
 
 
-def test_session_create_starts_a_worker_on_this_host_and_queues_its_task(
+def test_a_script_creates_a_worker_then_messages_and_reads_it(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
     marker = f"SESSION_CREATE_CLI_OK_{uuid.uuid4().hex}"
-    configure_mock_llm(mock_llm_server_url, [{"text": marker}], match=marker)
+    follow_up = f"SESSION_SEND_CLI_OK_{uuid.uuid4().hex}"
+    # Both prompts name the first marker, so both turns draw from this queue in order.
+    configure_mock_llm(mock_llm_server_url, [{"text": marker}, {"text": follow_up}], match=marker)
     agent_id = lookup_agent_id(
         http_client, upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
     )
@@ -101,5 +105,42 @@ def test_session_create_starts_a_worker_on_this_host_and_queues_its_task(
             http_client, session_id=session_id, marker=marker, timeout=180
         )
         assert marker in answer
+
+        on_server = ("--server", live_server)
+        sent = _omnigent(
+            [
+                *("session", "send", session_id, *on_server, "--message-file", "-"),
+                *("--wait", "--timeout", "180", "--json"),
+            ],
+            env=env,
+            cwd=workspace,
+            stdin=f"Follow-up for {marker}: reply with exactly the literal string {follow_up}.",
+        )
+        assert sent.returncode == 0, sent.stderr
+        report = json.loads(sent.stdout)
+        assert (report["status"], report["pending_approvals"]) == ("idle", 0)
+        assert follow_up in report["reply"]
+
+        read = _omnigent(
+            ["session", "read", session_id, *on_server, "--last", "2", "--json"],
+            env=env,
+            cwd=workspace,
+        )
+        assert read.returncode == 0, read.stderr
+        latest = json.loads(read.stdout)["messages"]
+        assert [message["role"] for message in latest] == ["user", "assistant"]
+        assert all(follow_up in message["text"] for message in latest)
+
+        got = _omnigent(
+            ["session", "get", session_id, *on_server, "--json"], env=env, cwd=workspace
+        )
+        assert got.returncode == 0, got.stderr
+        info = json.loads(got.stdout)
+        assert (info["session_id"], info["status"], info["title"], info["host_id"]) == (
+            session_id,
+            "idle",
+            "CLI worker",
+            host_id,
+        )
     finally:
         _omnigent(["host", "stop", "--server", live_server], env=env, cwd=workspace)

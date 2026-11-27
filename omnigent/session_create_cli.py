@@ -135,7 +135,7 @@ def project_has_saved_workspace(client: httpx.Client, project_id: str) -> bool:
         raise click.ClickException(
             f"Could not read project {project_id} ({resp.status_code}): {server_error(resp)}"
         )
-    config = _json_object(resp).get("config")
+    config = response_object(resp).get("config")
     return isinstance(config, dict) and isinstance(config.get("workspace"), str)
 
 
@@ -182,7 +182,7 @@ def create_session(client: httpx.Client, spec: ScriptedSession) -> str:
         raise click.ClickException(
             f"The server refused the session ({resp.status_code}): {server_error(resp)}"
         )
-    payload = _json_object(resp)
+    payload = response_object(resp)
     session_id = payload.get("id") or payload.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise click.ClickException("The server created no session id.")
@@ -199,33 +199,52 @@ def queue_message(client: httpx.Client, session_id: str, text: str) -> None:
     :raises click.ClickException: When the server refused, denied or did not
         confirm the message.
     """
-    event = {
-        "type": "message",
-        "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
-    }
     try:
         resp = client.post(
-            f"/v1/sessions/{session_id}/events", json=event, timeout=_MESSAGE_TIMEOUT
+            f"/v1/sessions/{session_id}/events",
+            json=message_event(text),
+            timeout=_MESSAGE_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         raise click.ClickException(
             f"Session {session_id} was created, but its message could not be confirmed "
             f"({exc}). Check the session before sending it again."
         ) from exc
+    refusal = message_refusal(resp, "its message")
+    if refusal is not None:
+        raise click.ClickException(f"Session {session_id} was created, but {refusal}.")
+
+
+def message_event(text: str) -> JsonObject:
+    """
+    Build the user-message event a web composer send posts.
+
+    :param text: The message, e.g. ``"Fix tests/test_x.py"``.
+    :returns: The ``POST /v1/sessions/{id}/events`` body.
+    """
+    return {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+    }
+
+
+def message_refusal(resp: httpx.Response, noun: str) -> str | None:
+    """
+    Say why the server did not queue a posted message.
+
+    :param resp: The ``POST /v1/sessions/{id}/events`` response.
+    :param noun: How to name the message, e.g. ``"its message"``.
+    :returns: A clause such as ``"a policy denied its message"``, or ``None``
+        when the message was queued.
+    """
     if resp.status_code >= 400:
-        raise click.ClickException(
-            f"Session {session_id} was created, but the server refused its message "
-            f"({resp.status_code}): {server_error(resp)}"
-        )
-    ack = _json_object(resp)
+        return f"the server refused {noun} ({resp.status_code}): {server_error(resp)}"
+    ack = response_object(resp)
     if ack.get("denied") is True:
-        raise click.ClickException(
-            f"Session {session_id} was created, but a policy denied its message."
-        )
+        return f"a policy denied {noun}"
     if ack.get("queued") is not True:
-        raise click.ClickException(
-            f"Session {session_id} was created, but the server did not queue its message."
-        )
+        return f"the server did not queue {noun}"
+    return None
 
 
 def server_error(resp: httpx.Response) -> str:
@@ -235,7 +254,7 @@ def server_error(resp: httpx.Response) -> str:
     :param resp: An error response, e.g. ``{"error": {"message": "..."}}``.
     :returns: The message, e.g. ``"workspace must be an absolute path"``.
     """
-    error = _json_object(resp).get("error")
+    error = response_object(resp).get("error")
     if isinstance(error, dict) and isinstance(error.get("message"), str):
         return error["message"]
     if isinstance(error, str):
@@ -243,7 +262,7 @@ def server_error(resp: httpx.Response) -> str:
     return resp.text[:500]
 
 
-def _json_object(resp: httpx.Response) -> JsonObject:
+def response_object(resp: httpx.Response) -> JsonObject:
     """
     Decode *resp* as a JSON object.
 

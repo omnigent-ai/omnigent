@@ -7651,6 +7651,9 @@ def session(ctx: click.Context) -> None:
     \b
     Examples:
       omnigent session create --agent claude -m "Fix the flaky test"
+      omnigent session send conv_abc123 -m "Now add a test" --wait
+      omnigent session get conv_abc123
+      omnigent session read conv_abc123
       omnigent session export --id conv_abc123
       omnigent session export --id conv_abc123 --output transcript.jsonl
       omnigent session export --id conv_abc123 --server https://myserver.com
@@ -8195,6 +8198,244 @@ def session_create(
             _report(False)
             raise
     _report(text is not None)
+
+
+def _session_command_server(server: str | None) -> str:
+    """
+    Resolve the server ``session send``/``get``/``read`` talk to.
+
+    :param server: The ``--server`` value, or ``None``.
+    :returns: The base URL, without a trailing slash.
+    :raises click.ClickException: When no server is configured or running.
+    """
+    from omnigent.session_cli import command_error
+
+    base_url = _resolve_attach_server(server, _load_effective_config().get("server"))
+    if base_url is None:
+        raise command_error(
+            "No Omnigent server found: pass --server, or set the server in your config."
+        )
+    return base_url.rstrip("/")
+
+
+_SESSION_SERVER_HELP = "Omnigent server URL. Defaults to the configured server, or a local one."
+
+
+def _session_id_argument(_ctx: click.Context, _param: click.Parameter, value: str) -> str:
+    """Refuse a session id that would change the request's route, such as one with ``/``."""
+    from omnigent.util.route_ids import route_identifier
+
+    try:
+        return route_identifier(value, "Session")
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+
+@session.command("send")
+@click.argument("session_id", callback=_session_id_argument)
+@click.option("-m", "--message", default=None, help="Message to send.")
+@click.option(
+    "--message-file",
+    type=click.File("r", encoding="utf-8"),
+    default=None,
+    help="Read the message from FILE ('-' for stdin).",
+)
+@click.option("--wait", is_flag=True, help="Wait for the session's reply, then print it.")
+@click.option(
+    "--timeout",
+    type=click.FloatRange(min=0, min_open=True),
+    default=None,
+    metavar="SECONDS",
+    help="With --wait, give up after SECONDS, counting the send. Waits as long as the turn "
+    "takes by default.",
+)
+@click.option("--server", default=None, help=_SESSION_SERVER_HELP)
+@click.option("--json", "json_output", is_flag=True, help="Print the result as JSON.")
+def session_send(
+    session_id: str,
+    message: str | None,
+    message_file: TextIO | None,
+    wait: bool,
+    timeout: float | None,
+    server: str | None,
+    json_output: bool,
+) -> None:
+    """Send a message to a session, optionally waiting for its reply.
+
+    The message is queued like one typed in the web UI, so a busy session takes
+    it when it gets to it. Without --wait the command exits once the message is
+    queued. With --wait it prints the session's final reply once the session is
+    idle again (--json adds every message after yours); a turn that ends without
+    one prints nothing and says so on stderr. It stops early when the turn fails,
+    exiting 1, or when the session waits for an approval or an answer.
+
+    A native terminal session (Claude Code, Codex) mirrors its transcript and
+    gives no sign that a turn's transcript is complete. If the mirror falls more
+    than a couple of seconds behind the turn's end, --wait can return before the
+    final reply arrives; `session read` shows it once mirrored.
+
+    \b
+    Examples:
+      omnigent session send conv_abc123 -m "Now add a test"
+      reply=$(omnigent session send conv_abc123 --message-file next.md --wait)
+      omnigent session send conv_abc123 -m "Status?" --wait --json | jq -r .reply
+    """
+    import asyncio
+
+    from omnigent.session_cli import (
+        command_error,
+        open_session_client,
+        send_and_wait,
+        send_message,
+    )
+
+    if message is not None and message_file is not None:
+        raise click.UsageError("Pass --message or --message-file, not both.")
+    text = message_file.read() if message_file is not None else message
+    if text is None:
+        raise click.UsageError("Pass --message or --message-file.")
+    if not text.strip():
+        raise click.UsageError("The message is empty.")
+    if timeout is not None and not wait:
+        raise click.UsageError("--timeout only applies with --wait.")
+    base_url = _session_command_server(server)
+
+    async def _send() -> None:
+        if not wait:
+            async with open_session_client(base_url) as client:
+                message = await send_message(client, session_id, text)
+            if json_output:
+                sent = {"session_id": session_id, "message_id": message.item_id}
+                click.echo(json.dumps({**sent, "message_queued": True}))
+            return
+        # The --timeout deadline covers opening the client, including a login renewal.
+        message, result = await send_and_wait(base_url, session_id, text, timeout_s=timeout)
+        if json_output:
+            report = {
+                "session_id": session_id,
+                "message_id": message.item_id,
+                "delivered": result.delivered,
+                "status": result.status,
+                "pending_approvals": result.pending_approvals,
+                "reply": result.reply,
+                "messages": result.messages,
+            }
+            click.echo(json.dumps(report))
+        elif result.reply is not None:
+            click.echo(result.reply)
+        if result.delivered and result.status == "idle" and result.reply is None:
+            click.echo(f"Session {session_id}'s turn ended without a reply.", err=True)
+        if result.pending_approvals:
+            click.echo(
+                f"Session {session_id} is waiting for you ({result.pending_approvals} "
+                "approval or question); answer it in the web UI.",
+                err=True,
+            )
+        if not result.delivered:
+            raise command_error(
+                f"Session {session_id} couldn't deliver the message, so nothing ran. "
+                f"`{cli_invocation()} session get {session_id}` shows its state."
+            )
+        if result.status == "failed":
+            raise command_error(
+                f"The turn failed. `{cli_invocation()} session read {session_id}` shows "
+                "what the session said."
+            )
+
+    asyncio.run(_send())
+
+
+@session.command("get")
+@click.argument("session_id", callback=_session_id_argument)
+@click.option(
+    "--usage",
+    "include_usage",
+    is_flag=True,
+    help="Also show cost and tokens so far, summed over the session's sub-agents.",
+)
+@click.option("--server", default=None, help=_SESSION_SERVER_HELP)
+@click.option("--json", "json_output", is_flag=True, help="Print the result as JSON.")
+def session_get(
+    session_id: str, include_usage: bool, server: str | None, json_output: bool
+) -> None:
+    """Show a session's status and settings.
+
+    Status is idle, running or failed. A session waiting for an approval or an
+    answer shows how many. --json prints the fields sys_session_get_info gives an
+    agent, plus the session's url. Use `session read` for what it said.
+
+    \b
+    Examples:
+      omnigent session get conv_abc123
+      omnigent session get conv_abc123 --usage --json | jq .usage.total_cost_usd
+    """
+    import asyncio
+
+    from omnigent.conversation_browser import conversation_url
+    from omnigent.session_cli import format_info, open_session_client, session_info
+
+    base_url = _session_command_server(server)
+
+    async def _get() -> _JsonObject:
+        async with open_session_client(base_url) as client:
+            return await session_info(client, session_id, include_usage=include_usage)
+
+    info = {**asyncio.run(_get()), "url": conversation_url(base_url, session_id)}
+    click.echo(json.dumps(info) if json_output else format_info(info))
+
+
+@session.command("read")
+@click.argument("session_id", callback=_session_id_argument)
+@click.option(
+    "--last",
+    type=click.IntRange(1, 1000),
+    default=None,
+    metavar="N",
+    help="Show the newest N messages. Defaults to 10, or to all of them with --after.",
+)
+@click.option(
+    "--after",
+    default=None,
+    metavar="MESSAGE_ID",
+    help="Only show messages after this one, e.g. the last id a previous read printed.",
+)
+@click.option("--server", default=None, help=_SESSION_SERVER_HELP)
+@click.option("--json", "json_output", is_flag=True, help="Print the result as JSON.")
+def session_read(
+    session_id: str,
+    last: int | None,
+    after: str | None,
+    server: str | None,
+    json_output: bool,
+) -> None:
+    """Show a session's latest messages, oldest first.
+
+    Only messages are shown, not tool calls; `session export` writes the whole
+    transcript. Each message shows its id, so a script can pass the newest one
+    to --after next time and read only what is new.
+
+    \b
+    Examples:
+      omnigent session read conv_abc123
+      omnigent session read conv_abc123 --last 1 --json | jq -r '.messages[0].text'
+      omnigent session read conv_abc123 --after msg_abc --json
+    """
+    import asyncio
+
+    from omnigent.session_cli import format_messages, list_messages, open_session_client
+
+    base_url = _session_command_server(server)
+    newest = last if last is not None or after is not None else 10
+
+    async def _read() -> list[_JsonObject]:
+        async with open_session_client(base_url) as client:
+            return await list_messages(client, session_id, last=newest, after=after)
+
+    messages = asyncio.run(_read())
+    if json_output:
+        click.echo(json.dumps({"session_id": session_id, "messages": messages}))
+    elif messages:
+        click.echo(format_messages(messages))
 
 
 # Shared option help for ``run`` and the harness commands. These are the same
