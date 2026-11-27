@@ -90,10 +90,13 @@ the header menu), and each place is a separate entry point.
   also lists the open screen's own actions, each run by its button's handler.
   Under **Conversation**: Copy latest response, Copy link to latest response,
   Fork from latest response… (the message's Fork, opening the same dialog), Copy
-  latest prompt, Copy link to latest prompt, Scroll to newest message, and Stop
-  response while a turn runs. They target the latest message the transcript
-  shows, and one that can't run yet, such as before the first response or for
-  an attachment-only prompt, stays listed with the reason. Under **Canvas**,
+  latest prompt, Copy link to latest prompt, Go to previous message and Go to
+  next message (⌘⌥↑ / ⌘⌥↓, Ctrl+Alt off macOS, the transcript's own steps),
+  Scroll to newest message, and Stop response while a turn runs. They target
+  the latest message the transcript shows, and one that can't run yet, such as
+  before the first response or for an attachment-only prompt, stays listed with
+  the reason. With the flag on, Ctrl+Alt+Shift+↑/↓ off macOS is Previous and
+  Next session rather than a message step. Under **Canvas**,
   while a conversation pane is open: Back to canvas when it fills the window,
   else Focus conversation or Show canvas beside conversation, and Close
   conversation pane. The open grid's sidebar row adds Rename grid…, which edits

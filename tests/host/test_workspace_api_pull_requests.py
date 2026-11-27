@@ -315,8 +315,8 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         ),
         (
             "ListLabels",
-            pb.ListLabelsRequest(pr_url=_PR, text="bug"),
-            "Label search isn't available on this host",
+            pb.ListLabelsRequest(pr_url=_PR, text="a" * 257),
+            "The label search is longer than 256 characters",
         ),
         (
             "UploadAttachment",
@@ -343,7 +343,7 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         "account-without-pr",
         "account-with-remote",
         "merge-as-no-account",
-        "label-search",
+        "label-search-too-long",
         "upload-no-name",
         "upload-long-name",
         "upload-long-url",
@@ -724,6 +724,8 @@ async def test_an_unavailable_answer_after_the_frame_leaves_the_change_unconfirm
 
 # The pull request changes; the review changes have their own cases below.
 _WRITES = sorted(_PULL_REQUEST_WRITES - set(host_tests._REVIEW_CALLS))
+# A valid request for each of those changes.
+_WRITE_REQUESTS = {**host_tests._OWNER_CALLS, **host_tests._QUEUE_CALLS}
 
 
 async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str) -> ConnectError:
@@ -745,8 +747,8 @@ async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str
 
 
 def test_every_write_has_a_request_case() -> None:
-    assert set(_WRITES) <= set(host_tests._OWNER_CALLS)
-    assert len(_WRITES) == 11
+    assert set(_WRITES) <= set(_WRITE_REQUESTS)
+    assert len(_WRITES) == 13
 
 
 @pytest.mark.parametrize("method", _WRITES)
@@ -755,7 +757,7 @@ async def test_a_host_failure_after_a_change_was_sent_is_unconfirmed(
 ) -> None:
     """A host error shaping GitHub's answer may follow a change GitHub made."""
     tunnel = _tunnel(tmp_path)
-    error = await _end_after_frame(tunnel, method, host_tests._OWNER_CALLS[method][0], "internal")
+    error = await _end_after_frame(tunnel, method, _WRITE_REQUESTS[method][0], "internal")
 
     assert (error.code, error.message) == (Code.UNKNOWN, _unconfirmed_for(method))
 
@@ -1057,19 +1059,19 @@ def _failure_reasons(error: ConnectError) -> list[str]:
 
 @pytest.fixture
 def review_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
-    """Each GitHub review call a review method made on the host."""
+    """Each GitHub review or merge queue call a method made on the host."""
     return host_tests.record_review_calls(monkeypatch)
 
 
-@pytest.mark.parametrize("method", sorted(host_tests._REVIEW_CALLS))
-async def test_a_review_change_to_a_linked_pr_runs_on_the_servers_word(
+@pytest.mark.parametrize("method", sorted(host_tests._SELECTED_PR_CALLS))
+async def test_a_github_change_to_a_linked_pr_runs_on_the_servers_word(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],
     review_calls: list[tuple[str, str, str, dict[str, Any]]],
     method: str,
 ) -> None:
-    request, function, _kwargs = host_tests._REVIEW_CALLS[method]
+    request, function, _kwargs = host_tests._SELECTED_PR_CALLS[method]
     client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
 
     response = await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
@@ -1081,15 +1083,15 @@ async def test_a_review_change_to_a_linked_pr_runs_on_the_servers_word(
     assert [(call[0], call[2]) for call in review_calls] == [(function, _PR)]
 
 
-@pytest.mark.parametrize("method", sorted(host_tests._REVIEW_CALLS))
-async def test_a_review_change_to_an_unlinked_pr_is_refused_before_the_host(
+@pytest.mark.parametrize("method", sorted(host_tests._SELECTED_PR_CALLS))
+async def test_a_github_change_to_an_unlinked_pr_is_refused_before_the_host(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],
     review_calls: list[tuple[str, str, str, dict[str, Any]]],
     method: str,
 ) -> None:
-    request, _function, _kwargs = host_tests._REVIEW_CALLS[method]
+    request, _function, _kwargs = host_tests._SELECTED_PR_CALLS[method]
     client = _client(tmp_path, monkeypatch, _Store(_linked(_OTHER_PR)))
 
     with pytest.raises(ConnectError) as refused:

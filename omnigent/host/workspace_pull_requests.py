@@ -194,6 +194,13 @@ _REVIEW_OPS: dict[str, PullRequestOp] = {
     "RemoveReaction": _named(pr_actions.remove_reaction, "kind", "comment_id", "content"),
 }
 
+# The session owner's merge queue: where the pull request stands, and adding or removing it.
+_MERGE_QUEUE_OPS: dict[str, PullRequestOp] = {
+    "GetMergeQueue": _named(pr_actions.get_merge_queue),
+    "EnqueuePullRequest": _named(pr_actions.enqueue_pull_request, "expected_head_oid"),
+    "DequeuePullRequest": _named(pr_actions.dequeue_pull_request),
+}
+
 
 PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "GetPullRequest": lambda reader, call, request: reader.github_info(
@@ -235,7 +242,7 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     ),
     # The session owner's: what the edit controls offer, and the changes themselves.
     "ListLabels": lambda reader, call, request: reader.github_labels(
-        call.session_id, _url(request)
+        call.session_id, _url(request), request.text
     ),
     "ListReviewerCandidates": lambda reader, call, request: reader.github_reviewers(
         call.session_id, _url(request)
@@ -288,6 +295,7 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
         _root(reader), session_id=call.session_id, pr_url=_url(request)
     ),
     **_REVIEW_OPS,
+    **_MERGE_QUEUE_OPS,
     # The runner takes the media type from the bytes, as on the REST route.
     "UploadAttachment": lambda reader, call, request: pr_resource.upload_pr_attachment(
         _root(reader),

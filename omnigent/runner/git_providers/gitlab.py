@@ -651,8 +651,10 @@ class GitLabPullRequests:
         if account is not None or remote is not None:
             raise ValueError("Use glab on the host to select a GitLab account or remote.")
 
-    def repo_labels(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
-        del root, reference
+    def repo_labels(
+        self, root: str, reference: PullRequestRef, *, text: str = ""
+    ) -> dict[str, Any]:
+        del root, reference, text
         raise ValueError("Editing GitLab merge request labels is not supported yet.")
 
     def edit_labels(
