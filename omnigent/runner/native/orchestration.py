@@ -9306,6 +9306,8 @@ def _ensure_orchestrator_skills_in_bundle(
     enabled = {"build-omnigent"}
     spec = _unwrap_resolved_spec(agent_spec)
     if isinstance(spec, AgentSpec):
+        # ``gadget`` follows the spec's tool group, which the runner turns off for a
+        # server without gadgets.
         enabled.update(framework_skill_names(spec))
     if not workflows_enabled:
         enabled.difference_update(WORKFLOW_FRAMEWORK_SKILLS)

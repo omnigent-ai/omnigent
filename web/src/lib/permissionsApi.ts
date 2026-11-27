@@ -1,15 +1,16 @@
 /**
  * Typed client for the `/v1/sessions/{id}/permissions`,
- * `/v1/scheduled-tasks/{id}/permissions` and `/v1/workflows/{id}/permissions`
- * endpoints. Mirrors the handlers in
+ * `/v1/scheduled-tasks/{id}/permissions`, `/v1/workflows/{id}/permissions` and
+ * `/v1/gadgets/{id}/permissions` endpoints. Mirrors the handlers in
  * `omnigent/server/routes/sessions/routes_permissions.py`,
- * `omnigent/server/routes/scheduled_task_permissions.py` and
- * `omnigent/server/routes/workflow_permissions.py`.
+ * `omnigent/server/routes/scheduled_task_permissions.py`,
+ * `omnigent/server/routes/workflow_permissions.py` and the gadget sharing routes.
  */
 
 import { isTempConvId } from "@/lib/tempConversationId";
 import type { Conversation } from "@/hooks/useConversations";
 import {
+  isFeatureEnabled,
   isSharingOff,
   isSingleUserMode,
   SHARING_OFF_REASON,
@@ -21,12 +22,14 @@ import { authenticatedFetch } from "./identity";
 
 /**
  * What a share dialog shares: a session, an automation whose runs' sessions follow
- * it, or a saved workflow, which people it is shared with can view, run and copy.
+ * it, a saved workflow, which people it is shared with can view, run and copy, or a
+ * gadget, which they can view, edit or manage.
  */
 export type ShareTarget =
   | { kind: "session"; id: string }
   | { kind: "automation"; id: string }
-  | { kind: "workflow"; id: string };
+  | { kind: "workflow"; id: string }
+  | { kind: "gadget"; id: string };
 
 /** Numeric read level, the only level an automation or a workflow can be shared at. */
 export const LEVEL_READ = 1;
@@ -201,6 +204,12 @@ export interface WorkflowPermission extends ShareGrant {
   display_name: string;
 }
 
+/** One grant on a gadget; each carries the grantee's display name. */
+export interface GadgetPermission extends ShareGrant {
+  gadget_id: string;
+  display_name: string;
+}
+
 /** The viewer's automation that sets a session's sharing on each run. */
 export interface ManagingAutomation {
   id: string;
@@ -221,6 +230,7 @@ const PERMISSION_COLLECTIONS: Record<ShareTarget["kind"], string> = {
   session: "sessions",
   automation: "scheduled-tasks",
   workflow: "workflows",
+  gadget: "gadgets",
 };
 
 function permissionsPath(target: ShareTarget): string {
@@ -276,6 +286,13 @@ export async function listWorkflowPermissions(
   workflowId: string,
 ): Promise<GrantList<WorkflowPermission>> {
   return listAllGrants<WorkflowPermission>({ kind: "workflow", id: workflowId });
+}
+
+/** Everyone a gadget is shared with, which only its managers may list. */
+export async function listGadgetPermissions(
+  gadgetId: string,
+): Promise<GrantList<GadgetPermission>> {
+  return listAllGrants<GadgetPermission>({ kind: "gadget", id: gadgetId });
 }
 
 export async function getSessionOwner(sessionId: string): Promise<string | null> {
@@ -406,4 +423,17 @@ export const UNSHAREABLE_WORKFLOW_MESSAGE =
  */
 export function workflowSharingAvailable(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.workflow_sharing === true && !isSingleUserMode(info);
+}
+
+/**
+ * Whether the server has gadgets, keeps their grants and has other users to share
+ * them with; a viewer also needs manage access to the gadget.
+ */
+export function gadgetSharingAvailable(info: ServerInfo | "loading"): boolean {
+  return (
+    isFeatureEnabled(info, "gadgets") &&
+    info !== "loading" &&
+    info.gadget_sharing === true &&
+    !isSingleUserMode(info)
+  );
 }

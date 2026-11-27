@@ -68,7 +68,7 @@ together in Comments.
 
 - `rail`: Open a session, expand Workspace, choose Pull Requests, then open Changes.
 - `composer-desktop`: Click the desktop composer's PR link, then open Changes.
-- `tabs-sidebar`: With `workspace_sidebar_v2` on, in a desktop app or desktop
+- `tabs-sidebar`: With `workspace_sidebar_v2` on and the `gadgets` feature off, in a desktop app or desktop
   browser (not a touch client), open a session and choose **New tab → Pull
   Requests** in the workspace sidebar; in a window narrower than 1181px, choose
   Pull Requests from the session-actions menu, which opens the Workspace drawer.

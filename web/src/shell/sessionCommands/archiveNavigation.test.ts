@@ -7,7 +7,7 @@ import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
 import {
   type ArchiveNavigationRequest,
   hasPendingArchiveNavigation,
-  isLeavingOpenSession,
+  leavingSessionOfOpenView,
   leaveSessionView,
   navigateAfterArchiving,
   newSessionPathFor,
@@ -255,10 +255,13 @@ describe("helpers", () => {
     expect(newSessionPathFor(queryClient, { labels: {}, project_id: "p-9" })).toBe("/");
   });
 
-  it("knows the open session leaves with its archived parent", () => {
+  it("names the archived session the open one leaves with: itself, else its nearest ancestor", () => {
     queryClient.setQueryData(["session", "child"], { parentSessionId: "a" });
-    expect(isLeavingOpenSession(queryClient, "child", ["a"])).toBe(true);
-    expect(isLeavingOpenSession(queryClient, "b", ["a"])).toBe(false);
-    expect(isLeavingOpenSession(queryClient, null, ["a"])).toBe(false);
+    queryClient.setQueryData(["session", "a"], { parentSessionId: "root" });
+    expect(leavingSessionOfOpenView(queryClient, "child", ["b", "root", "a"])).toBe("a");
+    expect(leavingSessionOfOpenView(queryClient, "child", ["b", "root"])).toBe("root");
+    expect(leavingSessionOfOpenView(queryClient, "child", ["child", "a"])).toBe("child");
+    expect(leavingSessionOfOpenView(queryClient, "b", ["a"])).toBeNull();
+    expect(leavingSessionOfOpenView(queryClient, null, ["a"])).toBeNull();
   });
 });

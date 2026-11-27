@@ -50,6 +50,9 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "ListReviewThreadComments": WorkspaceGate.READ,
     "ListLabels": WorkspaceGate.SESSION_OWNER,
     "ListReviewerCandidates": WorkspaceGate.SESSION_OWNER,
+    # Searches as the host's account, for the owner's reviewer picker and comment editor.
+    "SearchReviewers": WorkspaceGate.SESSION_OWNER,
+    "SearchCompletions": WorkspaceGate.SESSION_OWNER,
     "GetMergeOptions": WorkspaceGate.SESSION_OWNER,
     "CreateComment": WorkspaceGate.SESSION_OWNER,
     "CreateReviewThread": WorkspaceGate.SESSION_OWNER,
@@ -86,6 +89,11 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "DequeuePullRequest": WorkspaceGate.SESSION_OWNER,
     # The stack lists the repository's other pull requests, read as the host's account.
     "GetPullRequestStack": WorkspaceGate.SESSION_OWNER,
+    # So does a branch's list, in the workspace's own repository.
+    "ListBranchPullRequests": WorkspaceGate.SESSION_OWNER,
+    # Read any pull request the host's account can see, so the owner can choose what to link.
+    "LookupPullRequest": WorkspaceGate.SESSION_OWNER,
+    "GetPullRequestListStats": WorkspaceGate.SESSION_OWNER,
     # Fetched with the host account's token, which sees its private repositories' images.
     "ReadPullRequestImage": WorkspaceGate.SESSION_OWNER,
 }

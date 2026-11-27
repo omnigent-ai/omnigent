@@ -1961,7 +1961,7 @@ def test_framework_skills_gate_each_on_its_own_tool_group(
     memory_on: bool, workflows_enabled: bool
 ) -> None:
     """Workflow skills need the workflows flag; the memory skill needs only its tool group."""
-    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(memory=memory_on))
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(memory=memory_on, gadgets=False))
 
     names = {s.name for s in framework_skills(spec, workflows_enabled=workflows_enabled)}
 

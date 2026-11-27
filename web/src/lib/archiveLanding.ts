@@ -25,18 +25,27 @@ export interface ArchiveLandingInputs {
   listState: "loading" | "loaded" | "failed";
 }
 
+/** The nearest of `leavingIds` among `entryId` and its parents, or null when none is leaving. */
+export function leavingAncestor(
+  entryId: string,
+  leavingIds: ReadonlySet<string>,
+  parentOf: (entryId: string) => string | null,
+): string | null {
+  let id: string | null = entryId;
+  for (let hop = 0; id !== null && hop <= MAX_PARENT_HOPS; hop++) {
+    if (leavingIds.has(id)) return id;
+    id = parentOf(id);
+  }
+  return null;
+}
+
 /** Whether `entryId` is one of `leavingIds` or sits anywhere under one of them. */
 export function isInLeavingSubtree(
   entryId: string,
   leavingIds: ReadonlySet<string>,
   parentOf: (entryId: string) => string | null,
 ): boolean {
-  let id: string | null = entryId;
-  for (let hop = 0; id !== null && hop <= MAX_PARENT_HOPS; hop++) {
-    if (leavingIds.has(id)) return true;
-    id = parentOf(id);
-  }
-  return false;
+  return leavingAncestor(entryId, leavingIds, parentOf) !== null;
 }
 
 /** The entry to open after archiving `leavingIds`, or why there isn't one yet. */

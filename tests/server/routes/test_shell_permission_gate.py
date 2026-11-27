@@ -1393,6 +1393,13 @@ _PR_OWNER_METHODS = {
     "EnqueuePullRequest": {"expectedHeadOid": "a" * 40},
     "DequeuePullRequest": {},
     "GetPullRequestStack": {},
+    "SearchReviewers": {"text": "al", "pageSize": 5},
+    "SearchCompletions": {"kind": "COMPLETION_KIND_MENTION", "text": "al"},
+    "LookupPullRequest": {},
+    # Names its pull requests in a list of URLs, not in ``prUrl``.
+    "GetPullRequestListStats": {"prUrls": ["https://github.com/example/app/pull/8"]},
+    # Names no pull request: it finds them by the workspace's branch.
+    "ListBranchPullRequests": {"branch": "main"},
     "ReadPullRequestImage": {
         "imageUrl": "https://github.com/user-attachments/assets/0f1e2d3c-aaaa"
     },
@@ -1476,7 +1483,8 @@ async def test_workspace_api_pull_request_changes_are_the_session_owners_alone(
     if caller is not None:
         headers["X-Forwarded-Email"] = caller
     fields = _PR_OWNER_METHODS[method]
-    pr_url = {} if "pullRequests" in fields else {"prUrl": "https://github.com/example/app/pull/7"}
+    named = "pullRequests" in fields or "prUrls" in fields or "branch" in fields
+    pr_url = {} if named else {"prUrl": "https://github.com/example/app/pull/7"}
     body = {**pr_url, **fields}
     content = json.dumps(body).encode()
     expected = _pull_request_call_passes(method, caller, session)

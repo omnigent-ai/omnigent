@@ -1284,6 +1284,19 @@ describe("CreateScheduledTaskDialog prefill (seed-on-open + reset)", () => {
     );
   });
 
+  it("says a prefilled schedule it can't show is unsupported instead of using the default", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialName="Once"
+        initialPrompt="Check it"
+        initialSchedule="FREQ=DAILY;COUNT=1"
+      />,
+    );
+    expect(screen.getByText(/This schedule can.t be edited in this form yet/)).toBeVisible();
+  });
+
   it("starts EMPTY when opened with no initial values (manual path)", () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
     expect((screen.getByTestId("task-name-input") as HTMLInputElement).value).toBe("");

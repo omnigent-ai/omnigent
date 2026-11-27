@@ -80,6 +80,29 @@ async def test_framework_skills_load_only_when_server_and_tool_group_enable_them
 
 
 @pytest.mark.parametrize("workflows_enabled", [False, True])
+@pytest.mark.parametrize("gadgets", [False, True])
+def test_the_gadget_skill_loads_exactly_when_the_gadget_tools_are_offered(
+    tmp_path: Path, isolated_home: Path, workflows_enabled: bool, gadgets: bool
+) -> None:
+    from omnigent.automations_availability import without_gadget_tools
+
+    spec = AgentSpec(spec_version=1, skills_filter="none")
+    if not gadgets:
+        spec = without_gadget_tools(spec)
+    loaded = _execute_skill_tool(
+        "load_skill",
+        {"name": "gadget"},
+        agent_spec=spec,
+        runner_workspace=tmp_path,
+        workflows_enabled=workflows_enabled,
+    )
+    if gadgets:
+        assert "# Gadgets" in loaded and "client.agent.watch" in loaded
+    else:
+        assert "not found" in loaded
+
+
+@pytest.mark.parametrize("workflows_enabled", [False, True])
 @pytest.mark.parametrize("memory_on", [False, True])
 def test_memory_import_skill_loads_only_with_the_memory_tool_group(
     tmp_path: Path,

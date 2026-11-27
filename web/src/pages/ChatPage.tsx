@@ -158,6 +158,7 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { quoteTextStart, settleQuoteLines } from "@/lib/replyDraftDocument";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -229,6 +230,11 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
+import {
+  GADGET_FULL_SCREEN_PARAM,
+  gadgetCoversConversation,
+  useGadgetRailRequest,
+} from "@/lib/gadgetRailTabs";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -252,7 +258,7 @@ import {
   subscribeSessionHostChanges,
 } from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
-import { MobileHeaderControlPortal } from "@/shell/MobileHeaderControlsSlot";
+import { MobileHeaderControlPortal, SessionControlPortal } from "@/shell/MobileHeaderControlsSlot";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -295,6 +301,11 @@ import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWa
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import {
+  type GadgetComposerQuote,
+  retryGadgetComposerQuotes,
+  useGadgetComposerQuotes,
+} from "@/lib/gadgetComposerQuotes";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
@@ -485,9 +496,21 @@ export function ChatPage() {
 
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
-  // (every 4 s) so messages arriving while viewing are marked seen.
+  // (every 4 s) so messages arriving while viewing are marked seen. A gadget
+  // filling the screen hides the conversation, so its new messages stay new.
+  // That holds from the start: a URL naming the gadget hides the conversation until the side
+  // panel shows the gadget or finds it can't (then the conversation shows and is read).
+  const pageServerInfo = useServerInfo();
+  const gadgetsMaybeOn =
+    pageServerInfo === "loading" || isFeatureEnabled(pageServerInfo, "gadgets");
+  const urlGadget = gadgetsMaybeOn
+    ? new URLSearchParams(search).get(GADGET_FULL_SCREEN_PARAM)
+    : null;
+  const gadgetCoversChat = useGadgetRailRequest((state) =>
+    gadgetCoversConversation(state, sessionConvId, urlGadget),
+  );
   useMarkConversationSeen(
-    sessionConvId,
+    gadgetCoversChat ? undefined : sessionConvId,
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 
@@ -1861,6 +1884,18 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   });
 
   const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
+  // A gadget's Reply and Ask in side chat land here like the transcript's own; the
+  // terminal view switches to chat first.
+  useGadgetComposerQuotes(conversationId ?? null, (quote) =>
+    takeGadgetComposerQuote(quote, {
+      permissionPending: !!permissionPending,
+      composerReadOnly,
+      showTerminal,
+      showChat: () => terminalFirst?.setView("chat"),
+      composer: composerRef.current,
+      sideChat: supportsSideChat(selectionSessionHarness, canStartSideChat),
+    }),
+  );
 
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
@@ -2026,11 +2061,45 @@ export function ConversationLoadError({
   );
 }
 
+/**
+ * Adds a quote a gadget queued for this session's composer, as Reply and Ask in side chat do
+ * for a transcript selection. False keeps it queued, to be tried on a later render.
+ */
+export function takeGadgetComposerQuote(
+  quote: GadgetComposerQuote,
+  page: {
+    /** The session's permissions are still loading; a loaded session without any isn't. */
+    permissionPending: boolean;
+    composerReadOnly: boolean;
+    showTerminal: boolean;
+    showChat: () => void;
+    composer: Pick<ComposerHandle, "appendReplyQuote" | "canTakeQuote" | "startSideChat"> | null;
+    sideChat: boolean;
+  },
+): boolean {
+  if (page.permissionPending) return false;
+  // A read-only session can't use the quote, so it isn't kept.
+  if (page.composerReadOnly) return true;
+  if (page.showTerminal) {
+    page.showChat();
+    return false;
+  }
+  // The composer restores this session's saved draft first, which would replace the quote.
+  if (!page.composer?.canTakeQuote()) return false;
+  // A composer that can't take it yet (offline, read-only) keeps the quote queued.
+  if (quote.kind === "side_chat" && page.sideChat) return page.composer.startSideChat(quote.text);
+  return page.composer.appendReplyQuote(quote.text);
+}
+
 interface ComposerHandle {
-  appendReplyQuote: (text: string) => void;
+  /** Whether the quote went in; a blocked composer refuses it. */
+  appendReplyQuote: (text: string) => boolean;
+  /** Whether a quote added now stays: this session's saved draft has been restored. */
+  canTakeQuote: () => boolean;
   /** Load a sent message into the composer, confirming before replacing a draft. */
   editSentMessage: (message: SentMessage) => void;
-  startSideChat: (selectedText: string) => void;
+  /** Quote in a side chat; whether the quote was taken (not while offline or read-only). */
+  startSideChat: (selectedText: string) => boolean;
   /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
   focus: () => void;
 }
@@ -2429,19 +2498,24 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  const composerEngine = useRequestedComposerEngine();
+  // On the CodeMirror engine the whole draft is one document; ChatComposer says when it switches.
   const {
     draft,
     value,
     setValue,
     fullText,
     storedReplyDraft,
+    replyDocument,
+    setReplyDocument,
+    setSingleDocument,
     activeTextId,
     focusText,
     editText,
     replaceText,
     appendQuote,
     removeQuote,
-  } = useReplyDraft();
+  } = useReplyDraft(composerEngine === "codemirror");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   useDismissOnEscape(commandError !== null, () => setCommandError(null));
@@ -2523,14 +2597,53 @@ function ComposerImpl(
     setTailTextareaNode(element);
     if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
   }, []);
-  const composerEngine = useRequestedComposerEngine();
   // An engine switch replaces every input; keep the active one current even without focus.
   const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
     textareaRef.current = target;
   }, []);
+  // A take in the one document: the document before it, the one dictation last left, and
+  // whether anything else edited it since. See onVoiceDiscard.
+  const voiceTakeRef = useRef<{ before: string; last: string; clean: boolean } | null>(null);
+  // Set while dictation writes through the editor, so its own change doesn't count as another edit.
+  const writingDictationRef = useRef(false);
+  // In the one document dictation writes through the editor, so its card rules apply.
+  // Only a final is an undo step, so undo takes back a whole utterance and never shows a partial.
+  const writeDictation = (
+    next: string,
+    change: { from: number; to: number; insert: string },
+    final: boolean,
+  ) => {
+    const target = textareaRef.current;
+    if (replyDocument === null) return setValue(next);
+    if (!target || isComposerTextarea(target)) {
+      // No editor to apply the card rules, so the document is settled here.
+      const settled = settleQuoteLines(next);
+      setReplyDocument(settled);
+      return settled;
+    }
+    const take = voiceTakeRef.current;
+    if (take && target.value !== take.last) take.clean = false;
+    writingDictationRef.current = true;
+    try {
+      target.insertText(change.insert, change.from, change.to, { history: final });
+    } finally {
+      writingDictationRef.current = false;
+    }
+    if (take) take.last = target.value;
+    return target.value;
+  };
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(value, setValue, textareaRef);
+  const dictation = useDictationInsert(
+    replyDocument ?? value,
+    writeDictation,
+    textareaRef,
+    // The editor holds the whole document, and a keystroke there can beat its render.
+    () => {
+      const target = textareaRef.current;
+      return replyDocument !== null && target && !isComposerTextarea(target) ? target.value : null;
+    },
+  );
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -3941,14 +4054,24 @@ function ComposerImpl(
   });
 
   const replyQuoteInsertedRef = useRef(false);
+  // A quote a gadget queued while this composer couldn't take one (its draft still
+  // restoring, a Quick Answer open, the host unreachable) is tried again once it can.
+  const canTakeQuoteNow = settledConversationId === conversationId && !inputDisabled;
+  useEffect(() => {
+    if (canTakeQuoteNow) retryGadgetComposerQuotes();
+  }, [canTakeQuoteNow]);
   useImperativeHandle(ref, () => ({
     focus() {
       if (isMobileRef.current || composerLockedByBtw) return;
       textareaRef.current?.focus({ preventScroll: true });
     },
+    canTakeQuote() {
+      // The saved draft must be restored first, or it would replace the quote.
+      return settledConversationId === conversationId && !composerLockedByBtw;
+    },
     appendReplyQuote(text) {
       const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
-      if (blocked || composerLockedByBtw || !text.trim()) return;
+      if (blocked || composerLockedByBtw || !text.trim()) return false;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
@@ -3957,6 +4080,7 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+      return true;
     },
     editSentMessage(message) {
       editSentMessage(message);
@@ -3966,7 +4090,7 @@ function ComposerImpl(
       // A pending tab creates its fork only when the user sends.
       const sourceId = useChatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
-        return;
+        return false;
       }
       const store = useChatStore.getState();
       const target = store.sideChatSelectionTarget;
@@ -3978,6 +4102,7 @@ function ComposerImpl(
       } else {
         store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
       }
+      return true;
     },
   }));
 
@@ -3987,8 +4112,10 @@ function ComposerImpl(
     replyQuoteInsertedRef.current = false;
     const textarea = tailTextareaRef.current;
     if (!textarea) return;
+    // Under the new card, set before focus, or the editor would take focus at its start.
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
     if (!isMobileRef.current) textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(0, 0);
+    if (!isComposerTextarea(textarea)) textarea.revealCaret();
     const inputArea = composerTargetElement(textarea).closest("[data-composer-input-area]");
     if (inputArea) inputArea.scrollTop = inputArea.scrollHeight;
     onGrowthRef.current?.();
@@ -4399,7 +4526,9 @@ function ComposerImpl(
       !e.altKey
     ) {
       const ta = e.currentTarget;
-      if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+      // In the one document the caret's top is under any cards that open it.
+      const top = replyDocument === null ? 0 : quoteTextStart(ta.value);
+      if (e.key === "ArrowUp" && ta.selectionStart === top) {
         // Empty-composer recall takes the last queued row before browsing history.
         if (composerEmptyForRecall) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
@@ -4431,7 +4560,10 @@ function ComposerImpl(
     const input = e.currentTarget;
     noteMentionTextChange(e);
     slashCompletion.onSelectionChange(input);
-    editText(id, input.value);
+    // Any edit but dictation's own keeps the take from being discarded, even one undone by hand.
+    if (voiceTakeRef.current && !writingDictationRef.current) voiceTakeRef.current.clean = false;
+    if (replyDocument !== null) setReplyDocument(input.value);
+    else editText(id, input.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
@@ -4582,9 +4714,11 @@ function ComposerImpl(
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
+        onRenderedEngineChange={(engine) => setSingleDocument(engine === "codemirror")}
         input={{
           ref: bindTailTextarea,
-          value: draft.text,
+          value: replyDocument ?? draft.text,
+          replyQuotes: true,
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
@@ -4621,7 +4755,7 @@ function ComposerImpl(
                         ? "Send a follow-up (queued) — Esc to stop"
                         : readyPlaceholder,
           rows: 1,
-          heightMode: draft.quotes.length > 0 ? "unbounded" : "compact",
+          heightMode: draft.quotes.length > 0 && replyDocument === null ? "unbounded" : "compact",
           disabled: inputDisabled,
           "data-slash-command": highlight.input["data-slash-command"],
           "data-shell-command": highlight.input["data-shell-command"],
@@ -4633,7 +4767,7 @@ function ComposerImpl(
         }}
         slots={{
           inputPrefix:
-            draft.quotes.length > 0 ? (
+            draft.quotes.length > 0 && replyDocument === null ? (
               <ReplyDraftBlocks
                 quotes={draft.quotes}
                 activeTextId={activeTextId}
@@ -4835,7 +4969,7 @@ function ComposerImpl(
                 onOpen={savedWorkflows.refresh}
               />
               {!subAgentLabel && composerSessionId && (
-                <MobileHeaderControlPortal sessionId={composerSessionId}>
+                <MobileHeaderControlPortal sessionId={composerSessionId} popoverSlot="host">
                   <HostBadge
                     sessionId={composerSessionId}
                     appearance={isMobile ? "header" : "composer"}
@@ -4851,31 +4985,40 @@ function ComposerImpl(
                 </MobileHeaderControlPortal>
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
-                <ComposerPermissionPicker
-                  label="Permission mode"
-                  value={permissionLabel || "Permission mode"}
-                  harness={sessionHarness}
-                  selectedValue={selectedPermissionMode}
-                  options={permissionOptions}
-                  disabled={!permissionControlInteractive || configBusy}
-                  disabledReason={
-                    isOwnerLevel(permissionLevel)
-                      ? undefined
-                      : "Only the session owner can change the permission mode"
-                  }
-                  // The message box takes ⇧Tab, so not while it's disabled.
-                  shortcut={
-                    nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
-                  }
-                  onSelect={(mode) => void changePermission(mode)}
-                  openNonce={permissionPickerOpenNonce}
-                />
+                <SessionControlPortal
+                  sessionId={composerSessionId}
+                  slot="permission"
+                  offered={composerSessionId !== null}
+                >
+                  <ComposerPermissionPicker
+                    label="Permission mode"
+                    value={permissionLabel || "Permission mode"}
+                    harness={sessionHarness}
+                    selectedValue={selectedPermissionMode}
+                    options={permissionOptions}
+                    disabled={!permissionControlInteractive || configBusy}
+                    disabledReason={
+                      isOwnerLevel(permissionLevel)
+                        ? undefined
+                        : "Only the session owner can change the permission mode"
+                    }
+                    // The message box takes ⇧Tab, so not while it's disabled.
+                    shortcut={
+                      nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
+                    }
+                    onSelect={(mode) => void changePermission(mode)}
+                    openNonce={permissionPickerOpenNonce}
+                  />
+                </SessionControlPortal>
               )}
             </>
           ),
           trailing: (
             <>
-              <MobileHeaderControlPortal sessionId={composerSessionId}>
+              <MobileHeaderControlPortal
+                sessionId={composerSessionId}
+                popoverSlot={composerSessionId === null ? undefined : "harness"}
+              >
                 <div className="flex min-w-0 items-center rounded-lg">
                   <SessionHarnessPicker
                     appearance={isMobile ? "header" : "composer"}
@@ -4884,6 +5027,16 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    renderIcon={(icon) => (
+                      <SessionControlPortal
+                        sessionId={composerSessionId}
+                        slot="icon"
+                        inPlace={false}
+                        offered={composerSessionId !== null}
+                      >
+                        {icon}
+                      </SessionControlPortal>
+                    )}
                     paletteSettingsSource={
                       composerSessionId &&
                       isFeatureEnabled(composerServerInfo, "quick_pick_palette")
@@ -4899,14 +5052,43 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
+                  dictation.release();
                   voiceSnapshotRef.current = value;
+                  voiceTakeRef.current =
+                    replyDocument === null
+                      ? null
+                      : { before: replyDocument, last: replyDocument, clean: true };
                 }}
                 onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
+                  const take = voiceTakeRef.current;
+                  voiceTakeRef.current = null;
+                  // A take belongs to the engine it began on; after a switch the draft stays.
+                  if (replyDocument === null) {
+                    if (take === null) setValue(voiceSnapshotRef.current);
+                    return;
+                  }
+                  // Only a take nothing else edited goes back, so a quote or edit made in it stays.
+                  const untouched = take?.clean && textareaRef.current?.value === take.last;
+                  if (untouched && take.last !== take.before) setReplyDocument(take.before);
                 }}
-                onListeningChange={setDictating}
+                onListeningChange={(listening) => {
+                  setDictating(listening);
+                  // However a take ends, a partial it leaves is the user's text from now on.
+                  if (!listening) dictation.release();
+                  // A take leaves focus on the mic button, where the editor's undo and redo keys
+                  // don't reach; give it back to the editor once the take ends.
+                  const active = document.activeElement;
+                  const onOwnButton =
+                    active instanceof HTMLButtonElement &&
+                    composerFormRef.current?.contains(active);
+                  if (!listening && replyDocument !== null && onOwnButton && !isMobileRef.current) {
+                    textareaRef.current?.focus({ preventScroll: true });
+                  }
+                }}
                 inputRef={textareaRef}
                 onTranscript={(text) => {
+                  // In the editor the partial goes first, so the final is inserted as one step.
+                  if (replyDocument !== null) dictation.replaceInterim("");
                   dictation.appendFinal(text);
                   dirtyRef.current = true;
                   // Dictation is a user-driven edit — exit prompt-recall mode

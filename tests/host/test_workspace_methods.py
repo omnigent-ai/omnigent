@@ -7,6 +7,8 @@ from google.protobuf.descriptor_pb2 import MethodOptions
 from omnigent.api.workspace.v1alpha1 import workspace_pb2
 from omnigent.host.workspace_methods import (
     NON_PULL_REQUEST_METHODS,
+    PULL_REQUEST_FIELDS,
+    PULL_REQUEST_FINDERS,
     WORKSPACE_METHODS,
     WorkspaceMethod,
     unclassified_methods,
@@ -25,8 +27,9 @@ _PULL_REQUEST_READS = frozenset(
         "ListReviewThreadComments",
     }
 )
-# Reviewed by hand: each changes pull requests the session links, or reads what its
-# edit controls offer. Only the session's owner may call them. A new one is added here.
+# Reviewed by hand: each changes pull requests the session links, reads or searches what
+# its edit controls offer, or reads pull requests by URL or a branch's as the host's
+# account. Only the session's owner may call them. A new one is added here.
 _PULL_REQUEST_OWNER_METHODS = frozenset(
     {
         "ListLabels",
@@ -64,6 +67,11 @@ _PULL_REQUEST_OWNER_METHODS = frozenset(
         "EnqueuePullRequest",
         "DequeuePullRequest",
         "GetPullRequestStack",
+        "SearchReviewers",
+        "SearchCompletions",
+        "LookupPullRequest",
+        "GetPullRequestListStats",
+        "ListBranchPullRequests",
         "ReadPullRequestImage",
     }
 )
@@ -77,6 +85,11 @@ _PULL_REQUEST_WRITES = _PULL_REQUEST_OWNER_METHODS - {
     "GetPendingReview",
     "GetMergeQueue",
     "GetPullRequestStack",
+    "SearchReviewers",
+    "SearchCompletions",
+    "LookupPullRequest",
+    "GetPullRequestListStats",
+    "ListBranchPullRequests",
     "ReadPullRequestImage",
 }
 # Only the server's call frame carries these; a request message never does.
@@ -168,3 +181,22 @@ def test_a_batch_naming_its_pull_requests_in_a_list_is_a_pull_request_change() -
     assert "pr_url" not in batch.request_type.DESCRIPTOR.fields_by_name
     assert batch.pull_request
     assert not batch.no_side_effects
+
+
+def test_the_finders_are_pull_request_methods_whatever_their_fields() -> None:
+    """Neither ``pr_urls`` nor ``branch`` names a PR the server vouches for, so the methods
+    are marked by name.
+
+    That keeps them off the host's direct socket, which serves no pull request method.
+    """
+    assert {
+        "GetPullRequestListStats",
+        "ListBranchPullRequests",
+        "LookupPullRequest",
+    } == PULL_REQUEST_FINDERS
+    for name in ("GetPullRequestListStats", "ListBranchPullRequests"):
+        fields = WORKSPACE_METHODS[name].request_type.DESCRIPTOR.fields_by_name
+        assert not PULL_REQUEST_FIELDS & set(fields)
+    for name in PULL_REQUEST_FINDERS:
+        assert WORKSPACE_METHODS[name].pull_request
+        assert WORKSPACE_METHODS[name].no_side_effects

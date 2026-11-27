@@ -20,6 +20,7 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   revokePermission: vi.fn(),
   listAutomationPermissions: vi.fn(),
   listWorkflowPermissions: vi.fn(),
+  listGadgetPermissions: vi.fn(),
   grantSharePermission: vi.fn(),
   revokeSharePermission: vi.fn(),
 }));
@@ -66,6 +67,7 @@ const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
 const listAutomationMock = vi.mocked(api.listAutomationPermissions);
 const listWorkflowMock = vi.mocked(api.listWorkflowPermissions);
+const listGadgetMock = vi.mocked(api.listGadgetPermissions);
 const grantShareMock = vi.mocked(api.grantSharePermission);
 const revokeShareMock = vi.mocked(api.revokeSharePermission);
 
@@ -1031,7 +1033,7 @@ describe("PermissionsModal", () => {
             wrapper: createSharingWrapper("restricted_read_only"),
           },
         );
-        fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+        fireEvent.click(await screen.findByRole("button", { name: "Revoke access for bob" }));
         await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
         await chooseGeneralAccess("No access");
         await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
@@ -1544,7 +1546,7 @@ describe("PermissionsModal", () => {
         expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
         expect(screen.getByRole("combobox", { name: "Permission level for bob" })).toBeDisabled();
         if (sessionError) expect(screen.getByText(sessionError.message)).toBeInTheDocument();
-        fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+        fireEvent.click(screen.getByRole("button", { name: "Revoke access for bob" }));
         await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
         await chooseGeneralAccess("No access");
         await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
@@ -2060,6 +2062,173 @@ describe("PermissionsModal", () => {
         expect(revokeShareMock).toHaveBeenCalledWith(workflowTarget, "bob@example.com"),
       );
       expect(grantMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("sharing a gadget", () => {
+    const gadget = { id: "gadget-1", name: "Launch board" };
+    const gadgetTarget = { kind: "gadget", id: gadget.id };
+
+    function grantee(userId: string, level: number, displayName = userId) {
+      return { user_id: userId, gadget_id: gadget.id, level, display_name: displayName };
+    }
+
+    async function chooseLevel(trigger: HTMLElement, name: string) {
+      await waitFor(() => expect(trigger).toBeEnabled());
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    }
+
+    it("shares it at Can view, Can edit or Can manage, with no public access or link", async () => {
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));
+      grantShareMock.mockResolvedValue(grantee("carol@example.com", 3));
+      revokeShareMock.mockResolvedValue(undefined);
+
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true } }),
+      });
+
+      expect(await screen.findByText("Bob")).toHaveAttribute("title", "bob@example.com");
+      expect(screen.getByRole("heading", { name: "Share this gadget" })).toBeInTheDocument();
+      expect(listGadgetMock).toHaveBeenCalledWith(gadget.id);
+      expect(listMock).not.toHaveBeenCalled();
+      expect(screen.queryByText("General access")).toBeNull();
+      // Its link opens the gadget for the people it is shared with; there is no session link.
+      expect(screen.getByRole("button", { name: "Copy link" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Open in mobile app" })).toBeNull();
+      expect(
+        screen.getByRole("combobox", { name: "Permission level for bob@example.com" }),
+      ).toHaveTextContent("Can edit");
+
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol@example.com" },
+      });
+      await chooseLevel(
+        screen.getByRole("combobox", { name: "New user permission" }),
+        "Can manage",
+      );
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "carol@example.com", 3, true),
+      );
+
+      await chooseLevel(
+        screen.getByRole("combobox", { name: "Permission level for bob@example.com" }),
+        "Can view",
+      );
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com", 1),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Revoke access for Bob" }));
+      await waitFor(() =>
+        expect(revokeShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com"),
+      );
+      expect(grantMock).not.toHaveBeenCalled();
+    });
+
+    it("names the owner and asks before a manager gives up their own access", async () => {
+      const managed = { ...gadget, owner_id: "alice@example.com", viewer_id: "bob@example.com" };
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
+      revokeShareMock.mockResolvedValue(undefined);
+      const onOpenChange = vi.fn();
+      render(<PermissionsModal gadget={managed} open onOpenChange={onOpenChange} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true } }),
+      });
+
+      expect(await screen.findByText("alice@example.com")).toBeInTheDocument();
+      expect(screen.getByText("Owner")).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Revoke access for alice@example.com" }),
+      ).toBeNull();
+      // The full level fits its column.
+      expect(
+        screen.getByRole("combobox", { name: "Permission level for bob@example.com" }),
+      ).toHaveClass("w-32");
+
+      fireEvent.click(screen.getByRole("button", { name: "Revoke access for Bob" }));
+      expect(revokeShareMock).not.toHaveBeenCalled();
+      const confirm = screen.getByRole("alertdialog", { name: "Change your own access" });
+      fireEvent.click(within(confirm).getByRole("button", { name: "Remove my access" }));
+      await waitFor(() =>
+        expect(revokeShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com"),
+      );
+      await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    });
+
+    it.each(["bob@example.com"])(
+      "warns instead of lowering a grant from the add form (%s)",
+      async (typed) => {
+        listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
+        render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+          wrapper: createInfoWrapper({ features: { gadgets: true } }),
+        });
+        await screen.findByText("Bob");
+        fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+          target: { value: typed },
+        });
+        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+        expect(
+          await screen.findByText("Bob already has Can manage. Change it in the list above."),
+        ).toBeInTheDocument();
+        expect(grantShareMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ["while the list is still loading", "bob@example.com", "pending"],
+      ["over a stale list that lacks the grant", "bob@example.com", "stale"],
+      ["for the viewer themselves", "me@example.com", "self"],
+    ] as const)(
+      "adds without lowering access the server already holds, %s",
+      async (_case, typed, state) => {
+        const own = { ...gadget, owner_id: "alice@example.com", viewer_id: "me@example.com" };
+        if (state === "pending") listGadgetMock.mockReturnValue(new Promise(() => {}));
+        else listGadgetMock.mockResolvedValue(grantList([]));
+        grantShareMock.mockResolvedValue(
+          grantee(typed, 3, typed === "me@example.com" ? "You" : "Bob"),
+        );
+        render(<PermissionsModal gadget={own} open onOpenChange={() => {}} />, {
+          wrapper: createInfoWrapper({ features: { gadgets: true } }),
+        });
+        const box = await screen.findByPlaceholderText("alice@example.com");
+        fireEvent.change(box, { target: { value: typed } });
+        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+        // Can view is the default; the server keeps the Can manage it already holds.
+        await waitFor(() =>
+          expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, typed, 1, true),
+        );
+        expect(
+          await screen.findByText(/already has Can manage\. Change it in the list above\./),
+        ).toBeInTheDocument();
+      },
+    );
+
+    it("still lists and removes grants while sharing is off", async () => {
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));
+      revokeShareMock.mockResolvedValue(undefined);
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true }, sharing_mode: "off" }),
+      });
+      expect(await screen.findByText("Bob")).toBeInTheDocument();
+      expect(screen.queryByPlaceholderText("alice@example.com")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Revoke access for Bob" }));
+      await waitFor(() =>
+        expect(revokeShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com"),
+      );
+    });
+
+    it("offers only Can view where the server allows read-only sharing", async () => {
+      listGadgetMock.mockResolvedValue(grantList([]));
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true }, sharing_mode: "read_only" }),
+      });
+      const trigger = await screen.findByRole("combobox", { name: "New user permission" });
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      expect(await screen.findByRole("option", { name: "Can view" })).toBeInTheDocument();
+      expect(screen.queryByRole("option", { name: "Can edit" })).toBeNull();
+      expect(screen.queryByRole("option", { name: "Can manage" })).toBeNull();
     });
   });
 

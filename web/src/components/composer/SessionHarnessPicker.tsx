@@ -3,7 +3,7 @@ import {
   HarnessPickerConfigRow,
   HarnessPickerConfigPage,
 } from "@/components/composer/HarnessPicker";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { WandSparklesIcon } from "lucide-react";
 import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
 import { ComposerConfigTooltipRows } from "@/components/composer/ComposerControls";
@@ -87,6 +87,7 @@ export function SessionHarnessPicker({
   disabled,
   openNonce = 0,
   modelPickerShortcutEnabled = false,
+  renderIcon,
   paletteSettingsSource,
 }: {
   appearance?: "composer" | "header";
@@ -115,6 +116,8 @@ export function SessionHarnessPicker({
   modelPickerShortcutEnabled?: boolean;
   /** Read and change this session instead of the active conversation. */
   sessionId?: string;
+  /** Renders the session's harness glyph a second time, e.g. on another surface. */
+  renderIcon?: (icon: ReactNode) => ReactNode;
   /** Offer Model and Reasoning Effort in ⌘K under this; unset while quick_pick_palette is off. */
   paletteSettingsSource?: string;
 }) {
@@ -614,6 +617,7 @@ export function SessionHarnessPicker({
           routing={routing || undefined}
         />
       )}
+      {renderIcon?.(<ComposerAgentIcon agent={iconAgent} />)}
       {picker}
     </>
   );

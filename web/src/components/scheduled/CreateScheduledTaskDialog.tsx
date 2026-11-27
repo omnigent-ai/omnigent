@@ -237,6 +237,7 @@ export function CreateScheduledTaskDialog({
   initialPrompt,
   initialTrigger = null,
   initialTemplateId,
+  initialSchedule,
   sessionLink = "",
   editingTask = null,
   sourceSession = null,
@@ -251,6 +252,8 @@ export function CreateScheduledTaskDialog({
   /** Open on a Jira/Slack/GitHub/Linear trigger template instead of a plain prompt. */
   initialTrigger?: TriggerSource | null;
   initialTemplateId?: AutomationTemplateId;
+  /** RRULE a new automation starts from, for example from a gadget's link. */
+  initialSchedule?: string;
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
   sessionLink?: string;
   editingTask?: ScheduledTask | null;
@@ -706,10 +709,19 @@ export function CreateScheduledTaskDialog({
         setStartNewSession(false);
         setTrigger(sourceSession ? null : initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
+        const prefilled =
+          !(initialTrigger && !sourceSession) && initialSchedule
+            ? parseRRuleToScheduleModel(initialSchedule)
+            : null;
         setSchedule(
-          initialTrigger && !sourceSession ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL,
+          initialTrigger && !sourceSession
+            ? defaultTriggerSchedule
+            : (prefilled ?? DEFAULT_SCHEDULE_MODEL),
         );
-        setScheduleUnsupported(false);
+        // A prefilled schedule this form can't show says so instead of becoming the default.
+        setScheduleUnsupported(
+          !(initialTrigger && !sourceSession) && Boolean(initialSchedule) && prefilled === null,
+        );
         setHostId("");
         setWorkspace("");
         setBaseBranch(null);
@@ -726,6 +738,7 @@ export function CreateScheduledTaskDialog({
     initialName,
     initialPrompt,
     initialTrigger,
+    initialSchedule,
     defaultTriggerSchedule,
     editingTask,
     editingTriggerConfig,

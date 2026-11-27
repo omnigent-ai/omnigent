@@ -1625,7 +1625,9 @@ def _load_agent_spec_bundle(
     """Extract and load a fresh bundle while the runner's worker lock is held."""
     from omnigent.automations_availability import (
         AUTOMATIONS_HEADER,
+        GADGETS_HEADER,
         USER_INBOX_HEADER,
+        without_gadget_tools,
         without_scheduled_task_tools,
         without_user_inbox_tools,
     )
@@ -1671,6 +1673,9 @@ def _load_agent_spec_bundle(
         # tools need the server to turn them on.
         if resp.headers.get(USER_INBOX_HEADER) != "1":
             spec = without_user_inbox_tools(spec)
+        # Only a server with gadgets on sends "1"; older ones send nothing.
+        if resp.headers.get(GADGETS_HEADER) != "1":
+            spec = without_gadget_tools(spec)
         if resp.headers.get(MEMORY_HEADER) != "1":
             spec = without_memory_tools(spec)
         elif resp.headers.get(MEMORY_SEARCH_HEADER) != "1":
@@ -1708,6 +1713,10 @@ async def _resolve_agent_spec_from_server(
     :raises AgentSpecFetchError: For transport errors, 5xx responses or exhausted throttling.
     :raises RuntimeError: For other non-200 responses except 404.
     """
+    from omnigent.automations_availability import (
+        ACCEPTED_TOOL_GROUPS_HEADER,
+        NEGOTIATED_TOOL_GROUPS,
+    )
     from omnigent.mcp_selection import MCP_SELECTION_HEADER
     from omnigent.native.native_terminal import request_with_429_retry
 
@@ -1723,7 +1732,14 @@ async def _resolve_agent_spec_from_server(
     # resulting burst gets throttled; a failed fetch here fails the session's init.
     try:
         resp = await request_with_429_retry(
-            lambda: server_client.get(path, headers={MCP_SELECTION_HEADER: "1"}),
+            lambda: server_client.get(
+                path,
+                headers={
+                    MCP_SELECTION_HEADER: "1",
+                    # This runner parses every group, so the bundle comes as written.
+                    ACCEPTED_TOOL_GROUPS_HEADER: ",".join(sorted(NEGOTIATED_TOOL_GROUPS)),
+                },
+            ),
             delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
             max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
         )

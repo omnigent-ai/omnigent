@@ -347,6 +347,16 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
             pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png"),
             "The attachment is empty",
         ),
+        (
+            "SearchReviewers",
+            pb.SearchReviewersRequest(pr_url=_PR, page_size=21),
+            "Ask for at most 20 reviewers",
+        ),
+        (
+            "SearchCompletions",
+            pb.SearchCompletionsRequest(pr_url=_PR, text="al"),
+            "Choose what to complete: people or pull requests",
+        ),
     ],
     ids=[
         "account-without-pr",
@@ -357,6 +367,8 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         "upload-long-name",
         "upload-long-url",
         "upload-empty",
+        "reviewer-page-too-large",
+        "completion-of-no-kind",
     ],
 )
 async def test_a_request_the_api_doesnt_serve_is_refused_before_the_vouch(
@@ -1135,6 +1147,143 @@ async def test_a_github_call_to_an_unlinked_pr_is_refused_before_the_host(
     assert refused.value.code == Code.FAILED_PRECONDITION
     assert host_calls == []
     assert github_changes == []
+
+
+@pytest.mark.parametrize("method", sorted(host_tests._SEARCH_CALLS))
+async def test_a_search_of_a_pr_on_a_read_only_code_host_is_served(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    github_changes: list[tuple[str, str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    """A search changes nothing, so the read-only refusal never applies."""
+    request, function, _kwargs = host_tests._SEARCH_CALLS[method]
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=("github.com",)
+    )
+
+    await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
+
+    assert [(call.session_id, call.vouch) for call in host_calls] == [
+        (_SESSION, PullRequestVouch(server_tracked=True)),
+    ]
+    assert [(call[0], call[2]) for call in github_changes] == [(function, _PR)]
+
+
+@pytest.fixture
+def finder_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    """Each finder's runner call that reached the host."""
+    return host_tests.record_finder_calls(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "store",
+    [_Store(_linked(_PR)), _Store(_linked(_PR, synced=False)), None],
+    ids=["synced-with-a-default-pr", "not-imported", "no-store"],
+)
+@pytest.mark.parametrize("method", sorted(host_tests._FINDER_CALLS))
+async def test_a_finder_reaches_the_host_with_no_vouch_for_any_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+    store: _Store | None,
+    method: str,
+) -> None:
+    """A vouch would tell the host it may serve the session's PRs; a finder is given none.
+
+    The URLs it names need not be linked: the owner reads them to choose what to link.
+    """
+    request, function, kwargs = host_tests._FINDER_CALLS[method]
+    client = _client(tmp_path, monkeypatch, store)
+
+    response = await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
+
+    assert payload_dict(response.payload) == {"object": "test"}
+    assert [(call.session_id, call.vouch) for call in host_calls] == [(_SESSION, None)]
+    assert [(call[0], call[2]) for call in finder_calls] == [(function, kwargs)]
+    # The session's stored pull requests were never read for it.
+    assert store is None or store.reads == 0
+
+
+async def test_a_linked_only_read_still_refuses_the_url_a_finder_may_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """Reading an unlinked PR by URL opens nothing else about it."""
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    await client.lookup_pull_request(pb.LookupPullRequestRequest(pr_url=_OTHER_PR))
+    with pytest.raises(ConnectError) as refused:
+        await client.get_pull_request(pb.GetPullRequestRequest(pr_url=_OTHER_PR))
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert [call.method for call in host_calls] == ["LookupPullRequest"]
+
+
+@pytest.mark.parametrize("method", sorted(host_tests._FINDER_CALLS))
+async def test_a_finder_naming_a_pr_on_a_read_only_host_is_served_with_no_refusal_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    """A finder changes nothing, so the read-only refusal is never even checked."""
+    checked: list[Any] = []
+
+    def refuses_change(*args: Any) -> bool:
+        checked.append(args)
+        return True
+
+    monkeypatch.setattr(workspace_api, "refuses_change", refuses_change)
+    request, _function, _kwargs = host_tests._FINDER_CALLS[method]
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=("github.com",)
+    )
+
+    await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
+
+    assert len(host_calls) == 1
+    assert len(finder_calls) == 1
+    assert checked == []
+
+
+async def test_a_finder_naming_no_url_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.get_pull_request_list_stats(pb.GetPullRequestListStatsRequest())
+
+    assert refused.value.code == Code.INVALID_ARGUMENT
+    assert _failure_reasons(refused.value) == ["invalid_input"]
+    assert host_calls == []
+    assert finder_calls == []
+
+
+async def test_a_branch_list_naming_no_branch_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.list_branch_pull_requests(pb.ListBranchPullRequestsRequest(branch="a..b"))
+
+    assert refused.value.code == Code.INVALID_ARGUMENT
+    assert _failure_reasons(refused.value) == ["invalid_input"]
+    assert host_calls == []
+    assert finder_calls == []
 
 
 @pytest.fixture

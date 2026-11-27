@@ -119,7 +119,8 @@ vi.mock("./useTerminalStatuses", () => ({
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => false }));
 vi.mock("@/lib/capabilities", async (importOriginal) => ({
   ...(await importOriginal<typeof CapabilitiesModule>()),
-  isFeatureEnabled: () => true,
+  // Gadgets keep sessions on the classic sidebar, which this suite does not cover.
+  isFeatureEnabled: (_info: unknown, key: string) => key !== "gadgets",
 }));
 
 const TERMINALS: TerminalInfo[] = [

@@ -8,6 +8,7 @@ import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
 import { READLINE_BINDINGS } from "./codeMirrorReadline";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { insertComposerText } from "@/lib/composerText";
+import { quoteLine } from "@/lib/replyDraftDocument";
 import { useMentionBrowser, type MentionBrowser } from "@/hooks/useMentionBrowser";
 import type { MentionState } from "@/lib/composerMentions";
 import type { ComposerTextTarget } from "./composerInput";
@@ -18,13 +19,19 @@ vi.hoisted(() => {
   Object.defineProperty(navigator, "userAgent", { configurable: true, get: () => mac });
 });
 
-function mount(value: string, caret: number, mentionTokens?: readonly string[]) {
+function mount(
+  value: string,
+  caret: number,
+  mentionTokens?: readonly string[],
+  replyQuotes = false,
+) {
   const box: { target: ComposerTextTarget | null } = { target: null };
   const { container } = render(
     <CodeMirrorComposerInput
       aria-label="Message the agent"
       defaultValue={value}
       mentionTokens={mentionTokens}
+      replyQuotes={replyQuotes}
       ref={(target) => {
         box.target = target;
       }}
@@ -177,6 +184,42 @@ describe("CodeMirror composer keys on macOS", () => {
     press({ key: "y", code: "KeyY", ctrlKey: true });
 
     expect(target().value).toBe("git push ");
+  });
+});
+
+describe("readline kills beside a reply card", () => {
+  const value = `Intro\n${quoteLine("a", "Alpha")}\nReply`;
+  const afterCard = value.length - "Reply".length;
+
+  it.each([
+    ["⌃U at the start of the line after it", afterCard, "u"],
+    ["⌃W at the start of the line after it", afterCard, "w"],
+    ["⌃K at the end of the line before it", "Intro".length, "k"],
+  ])("stops %s", (_where, caret, key) => {
+    const { target, press } = mount(value, caret, undefined, true);
+    press({ key, code: `Key${key.toUpperCase()}`, ctrlKey: true });
+    expect(target().value).toBe(value);
+  });
+
+  it("kills a selection across a card whole, which ⌃Y yanks back as a quote and undo restores", () => {
+    const { target, press } = mount(value, 0, undefined, true);
+    act(() => target().setSelectionRange(2, value.length - 2));
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    expect(target().value).toBe("Inly");
+    press({ key: "y", code: "KeyY", ctrlKey: true });
+    expect(target().value).toBe("Intro\n> Alpha\nReply");
+    press({ key: "z", code: "KeyZ", metaKey: true });
+    expect(target().value).toBe("Inly");
+    press({ key: "z", code: "KeyZ", metaKey: true });
+    expect(target().value).toBe(value);
+  });
+
+  it("kills up to a card but not across it", () => {
+    const { target, press } = mount(value, value.length, undefined, true);
+    press({ key: "u", code: "KeyU", ctrlKey: true });
+    expect(target().value).toBe(value.slice(0, afterCard));
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    expect(target().value).toBe(value.slice(0, afterCard));
   });
 });
 

@@ -284,8 +284,10 @@ _FRAMEWORK_SKILL_GROUPS = {
     "workflow": "journal",
     "save-workflow": "journal",
     "import-memory": "memory",
+    "gadget": "gadgets",
 }
-# These also need the server's workflows feature; the others follow their tool group alone.
+# These also need the server's workflows feature; the others follow their tool group alone
+# (the runner turns ``gadgets`` off for a server without gadgets).
 WORKFLOW_FRAMEWORK_SKILLS = frozenset({"workflow", "save-workflow"})
 
 
@@ -369,7 +371,7 @@ def resolve_session_skills(
     merged.extend(
         skill
         for skill in framework_skills(spec, workflows_enabled=workflows_enabled)
-        if skill.name not in seen
+        if skill.user_invocable and skill.name not in seen
     )
     return merged
 

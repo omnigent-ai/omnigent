@@ -350,6 +350,7 @@ def _build_app_with_stub_stores() -> Any:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
     from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
@@ -386,6 +387,7 @@ def _build_app_with_stub_stores() -> Any:
         # The release feature is off by default; the spec documents the routes anyway.
         proactive_agent=True,
         memory_store=SqlAlchemyMemoryStore(db_uri),
+        gadget_store=LocalGadgetStore(str(workdir / "gadgets")),
     )
 
 
