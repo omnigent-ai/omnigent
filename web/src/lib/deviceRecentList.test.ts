@@ -9,6 +9,8 @@ import type * as HostModule from "@/lib/host";
 import type * as IdentityModule from "@/lib/identity";
 
 const identity = vi.hoisted(() => ({
+  server: "https://server.example.com",
+  base: "/api",
   user: "user-1" as string | null,
   listeners: new Set<() => void>(),
 }));
@@ -22,7 +24,11 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 vi.mock("@/lib/host", async (importOriginal) => ({
   ...(await importOriginal<typeof HostModule>()),
-  getOmnigentServerIdentity: () => "https://server.example.com",
+  getOmnigentServerIdentity: () => identity.server,
+}));
+vi.mock("@/lib/basePath", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getApiBasePath: () => identity.base,
 }));
 
 import { createDeviceRecentList } from "./deviceRecentList";
@@ -39,6 +45,8 @@ const SCOPE = ["github.com", "example-org/example-repo"];
 
 afterEach(() => {
   list.resetForTests();
+  identity.server = "https://server.example.com";
+  identity.base = "/api";
   identity.user = "user-1";
   identity.listeners.clear();
   window.localStorage.clear();
@@ -177,4 +185,30 @@ it("keeps each scope's items the same array while nothing changed, with two scop
   rerender();
   expect(result.current[0]).toBe(one);
   expect(result.current[1]).toBe(two);
+});
+
+it.each([
+  ["server", () => (identity.server = "https://other.example.com")],
+  ["API base path", () => (identity.base = "/other-api")],
+])("keeps one %s's lists apart from another's, for the same user", (_case, move) => {
+  list.record(SCOPE, ["a"], list.owner());
+  const first = list.owner();
+  move();
+  expect(list.owner()).not.toBe(first);
+  expect(list.read(SCOPE)).toEqual([]);
+  list.record(SCOPE, ["b"], list.owner());
+  expect(list.read(SCOPE)).toEqual(["b"]);
+});
+
+it("records nothing for an owner token taken before the server or user changed", () => {
+  const before = list.owner();
+  identity.server = "https://other.example.com";
+  list.record(SCOPE, ["late"], before);
+  expect(list.read(SCOPE)).toEqual([]);
+  identity.server = "https://server.example.com";
+  identity.user = "user-2";
+  list.record(SCOPE, ["late"], before);
+  expect(list.read(SCOPE)).toEqual([]);
+  identity.user = "user-1";
+  expect(list.read(SCOPE)).toEqual([]);
 });
