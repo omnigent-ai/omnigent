@@ -15312,7 +15312,9 @@ def test_model_command_refuses_queued_or_unrecognized_pickers_without_selecting(
     if surface == "queued-hint":
         assert caught.value.phase == "preflight" and not caught.value.command_submitted
         assert not caught.value.model_may_have_changed
-        assert "unrelated draft" in str(caught.value)
+        assert "could not be confirmed as your saved message" in str(caught.value)
+        assert "left untouched" in str(caught.value)
+        assert "will not be replayed automatically" in str(caught.value)
         assert composer.sends == composer.submitted == []
         assert composer.model == composer.options[0]
         assert composer.text == ""

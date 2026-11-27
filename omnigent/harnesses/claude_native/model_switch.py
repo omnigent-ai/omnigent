@@ -945,7 +945,9 @@ class SessionOnlyModelSwitch:
         if draft or (draft is None and self.owned_draft is not None):
             if self.owned_draft is None or not self.draft_matches(pane, self.owned_draft):
                 raise self.refuse(
-                    "An unrelated draft occupies Claude's input box. Finish it, then retry."
+                    "The input box contains text that could not be confirmed as your saved "
+                    "message; it was left untouched. Inspect the input and resubmit your "
+                    "message. It will not be replayed automatically."
                 )
             self.clear_owned_draft(self.owned_draft)
         before_selection: str | None = None
