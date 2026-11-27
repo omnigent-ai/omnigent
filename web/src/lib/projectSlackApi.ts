@@ -9,7 +9,7 @@ export interface ProjectSlackLink {
   linked: boolean;
   can_manage: boolean;
   id?: string;
-  slack_team_id?: string;
+  slack_team_id?: string | null;
   channel_id?: string;
   channel_name?: string | null;
   state?: ProjectSlackState;

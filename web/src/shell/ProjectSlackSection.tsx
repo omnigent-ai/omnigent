@@ -40,19 +40,16 @@ export function ProjectSlackSection({
   const queryKey = ["project-slack", projectId];
   const link = useQuery({ queryKey, queryFn: () => getProjectSlack(projectId) });
   const [channelLink, setChannelLink] = useState("");
-  const [teamId, setTeamId] = useState("");
   const [channelName, setChannelName] = useState("");
   const onDone = (next: ProjectSlackLink) => queryClient.setQueryData(queryKey, next);
   const save = useMutation({
     mutationFn: () =>
       linkProjectSlack(projectId, {
         channel_link: channelLink.trim(),
-        slack_team_id: teamId.trim() || undefined,
         channel_name: channelName.trim() || undefined,
       }),
     onSuccess: (next) => {
       setChannelLink("");
-      setTeamId("");
       setChannelName("");
       onDone(next);
     },
@@ -145,28 +142,17 @@ export function ProjectSlackSection({
           <Input
             value={channelLink}
             onChange={(event) => setChannelLink(event.target.value)}
-            placeholder="Channel link, e.g. https://app.slack.com/client/T0123/C0456"
+            placeholder="Channel link from Slack (Copy link), e.g. https://example.slack.com/archives/C0456"
             aria-label="Slack channel link"
             data-testid="project-slack-channel-link"
           />
-          <div className="flex gap-2">
-            <Input
-              value={teamId}
-              onChange={(event) => setTeamId(event.target.value)}
-              placeholder="Workspace ID (only for …/archives/… links)"
-              aria-label="Slack workspace ID"
-              data-testid="project-slack-team-id"
-              className="flex-1"
-            />
-            <Input
-              value={channelName}
-              onChange={(event) => setChannelName(event.target.value)}
-              placeholder="Channel name (optional)"
-              aria-label="Slack channel name"
-              data-testid="project-slack-channel-name"
-              className="flex-1"
-            />
-          </div>
+          <Input
+            value={channelName}
+            onChange={(event) => setChannelName(event.target.value)}
+            placeholder="Channel name (optional)"
+            aria-label="Slack channel name"
+            data-testid="project-slack-channel-name"
+          />
           <Button
             type="submit"
             size="sm"

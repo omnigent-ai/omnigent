@@ -127,3 +127,23 @@ def test_reply_formatting() -> None:
     assert len(delivery_id("b", "1.2")) == 32 and delivery_id("b", "1.2") != delivery_id(
         "b", "1.3"
     )
+
+
+def test_channel_links_parse_with_or_without_a_workspace_id() -> None:
+    import pytest
+
+    from omnigent.errors import OmnigentError
+    from omnigent.server.routes.project_slack import SlackLinkBody, parse_channel
+
+    archive = "https://example.enterprise.slack.com/archives/C0BUJ6MKKQF"
+    assert parse_channel(SlackLinkBody(channel_link=archive)) == (None, "C0BUJ6MKKQF")
+    assert parse_channel(
+        SlackLinkBody(channel_link=archive + "?thread=1", slack_team_id="t01x")
+    ) == (
+        "T01X",
+        "C0BUJ6MKKQF",
+    )
+    client = "https://app.slack.com/client/T0ZZ1/C0ZZ2"
+    assert parse_channel(SlackLinkBody(channel_link=client)) == ("T0ZZ1", "C0ZZ2")
+    with pytest.raises(OmnigentError):
+        parse_channel(SlackLinkBody(channel_link="https://example.com/C0ZZ2"))

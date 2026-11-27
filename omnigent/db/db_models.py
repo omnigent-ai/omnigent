@@ -1245,7 +1245,8 @@ class SqlProjectRoleKpiRevision(OmnigentBase):
 class SqlProjectSlackBinding(OmnigentBase):
     """A project's link to one Slack channel, watched by an automation the owner runs.
 
-    Unique on both ends: a channel belongs to at most one project and a project
+    Unique on both ends (Slack channel IDs are unique across workspaces, and a
+    shared channel keeps one ID): a channel belongs to at most one project and a project
     to at most one channel, so claiming is a single insert the database arbitrates.
     Disabling keeps the row (and the claim); unlinking deletes it.
     """
@@ -1255,7 +1256,8 @@ class SqlProjectSlackBinding(OmnigentBase):
     workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
-    slack_team_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Filled in by the watcher's first run when the link didn't carry it.
+    slack_team_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
     channel_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # claimed | active | disabled | error | needs_reconnect
@@ -1275,12 +1277,7 @@ class SqlProjectSlackBinding(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint(
-            "workspace_id",
-            "slack_team_id",
-            "channel_id",
-            name="uq_project_slack_bindings_channel",
-        ),
+        UniqueConstraint("workspace_id", "channel_id", name="uq_project_slack_bindings_channel"),
         UniqueConstraint("workspace_id", "project_id", name="uq_project_slack_bindings_project"),
     )
 

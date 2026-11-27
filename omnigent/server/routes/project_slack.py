@@ -47,9 +47,9 @@ class SlackLinkBody(BaseModel):
     channel_link: str | None = Field(
         default=None,
         max_length=512,
-        description="A Slack channel link: https://app.slack.com/client/<team>/<channel> "
-        "gives both IDs; a https://<workspace>.slack.com/archives/<channel> link needs "
-        "slack_team_id too.",
+        description="A Slack channel link, e.g. https://<workspace>.slack.com/archives/<channel> "
+        "(Copy link in Slack) or https://app.slack.com/client/<team>/<channel>. The "
+        "workspace ID is optional; the watcher records it on its first run.",
     )
     slack_team_id: str | None = Field(default=None, max_length=32)
     channel_id: str | None = Field(default=None, max_length=32)
@@ -62,8 +62,8 @@ class SlackLinkBody(BaseModel):
     )
 
 
-def parse_channel(body: SlackLinkBody) -> tuple[str, str]:
-    """The ``(slack_team_id, channel_id)`` a link body names.
+def parse_channel(body: SlackLinkBody) -> tuple[str | None, str]:
+    """The ``(slack_team_id, channel_id)`` a link body names; the team may be ``None``.
 
     :raises OmnigentError: ``INVALID_INPUT`` when the IDs are missing or malformed.
     """
@@ -82,10 +82,9 @@ def parse_channel(body: SlackLinkBody) -> tuple[str, str]:
             )
     if channel_id is None or not CHANNEL_ID.match(channel_id):
         raise OmnigentError("Give a Slack channel ID like C0123ABCD", code=ErrorCode.INVALID_INPUT)
-    if team_id is None or not TEAM_ID.match(team_id):
+    if team_id is not None and not TEAM_ID.match(team_id):
         raise OmnigentError(
-            "Give the Slack workspace (team) ID like T0123ABCD, or paste an "
-            "app.slack.com/client link, which carries it",
+            "A Slack workspace (team) ID looks like T0123ABCD; or leave it out",
             code=ErrorCode.INVALID_INPUT,
         )
     return team_id, channel_id

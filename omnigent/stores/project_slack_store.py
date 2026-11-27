@@ -1,9 +1,9 @@
 """Storage for project Slack channel links and their audit trail.
 
-A link (binding) ties one Slack channel, ``(slack_team_id, channel_id)``, to one
-project. Both ends are unique in the database, so two claims racing for the same
-channel or project can't both win. Callers check who may change a link; this
-store only arbitrates and records.
+A link (binding) ties one Slack channel, by its ``channel_id``, to one project;
+Slack channel IDs are unique across workspaces. Both ends are unique in the
+database, so two claims racing for the same channel or project can't both win.
+Callers check who may change a link; this store only arbitrates and records.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ class SlackBinding:
 
     id: str
     project_id: str
-    slack_team_id: str
+    slack_team_id: str | None
     channel_id: str
     channel_name: str | None
     state: str
@@ -173,13 +173,12 @@ class ProjectSlackStore:
                 return None
             return _binding(row)
 
-    def holder_of(self, slack_team_id: str, channel_id: str) -> str | None:
+    def holder_of(self, channel_id: str) -> str | None:
         """The project that holds a channel, if any."""
         with self._session("find_slack_channel_holder") as session:
             return session.scalar(
                 select(SqlProjectSlackBinding.project_id).where(
                     SqlProjectSlackBinding.workspace_id == current_workspace_id(),
-                    SqlProjectSlackBinding.slack_team_id == slack_team_id,
                     SqlProjectSlackBinding.channel_id == channel_id,
                 )
             )
@@ -188,7 +187,7 @@ class ProjectSlackStore:
         self,
         project_id: str,
         *,
-        slack_team_id: str,
+        slack_team_id: str | None,
         channel_id: str,
         channel_name: str | None,
         destination: dict[str, Any],
@@ -225,8 +224,9 @@ class ProjectSlackStore:
                 session.add(row)
                 action = "linked"
             else:
-                moved = (row.slack_team_id, row.channel_id) != (slack_team_id, channel_id)
-                row.slack_team_id = slack_team_id
+                moved = row.channel_id != channel_id
+                if moved or slack_team_id is not None:
+                    row.slack_team_id = slack_team_id
                 row.channel_id = channel_id
                 row.channel_name = channel_name
                 row.destination = destination
@@ -251,13 +251,23 @@ class ProjectSlackStore:
         try:
             return run_write_transaction(self._session_immediate, "claim_slack_channel", write)
         except IntegrityError as exc:
-            holder = self.holder_of(slack_team_id, channel_id)
+            holder = self.holder_of(channel_id)
             if holder is not None and holder != project_id:
                 raise ChannelTakenError(holder) from exc
             raise OmnigentError(
                 "Another change to this project's Slack link landed at the same time; retry.",
                 code=ErrorCode.CONFLICT,
             ) from exc
+
+    def learn_team_id(self, binding_id: str, slack_team_id: str) -> None:
+        """Record the Slack workspace a link's channel is in, once the watcher reports it."""
+
+        def write(session: Session) -> None:
+            row = session.get(SqlProjectSlackBinding, (current_workspace_id(), binding_id))
+            if row is not None and row.slack_team_id is None:
+                row.slack_team_id = slack_team_id
+
+        run_write_transaction(self._session_immediate, "learn_slack_team_id", write)
 
     def set_state(
         self,

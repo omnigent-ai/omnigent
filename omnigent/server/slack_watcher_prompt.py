@@ -23,11 +23,12 @@ def watcher_prompt(
 ) -> str:
     base = f"{relay_url.rstrip('/')}/v1/slack-relay/{binding.id}"
     channel = f"#{binding.channel_name}" if binding.channel_name else binding.channel_id
+    workspace = f", workspace `{binding.slack_team_id}`" if binding.slack_team_id else ""
     return f"""You are the Slack watcher for the "{project_name}" project. Each run, move new
-`@omni` requests from Slack channel {channel} (`{binding.channel_id}`, workspace
-`{binding.slack_team_id}`) to the project's Lead, and post the Lead's queued replies
-back into their threads. No human is watching; never ask questions. This automation
-is managed from the project's settings; don't change it by hand.
+`@omni` requests from Slack channel {channel} (`{binding.channel_id}`{workspace})
+to the project's Lead, and post the Lead's queued replies back into their threads.
+No human is watching; never ask questions. This automation is managed from the
+project's settings; don't change it by hand.
 
 ## Calling the project
 Every call goes to `{base}` with two headers:
@@ -49,7 +50,8 @@ A 403 or 404 means this link was paused or removed: stop the run without posting
    - It mentions `@omni`, **or** it is a reply in one of the listed threads. A
      follow-up in a known thread needs no mention.
 4. `POST {base}/events` with `{{"events": [...], "cursor": <newest channel ts you
-   fully read>}}`. Each event is `{{"ts", "thread_ts", "user", "user_name", "text",
+   fully read>, "team_id": <the channel's Slack workspace ID, e.g. from
+   conversations.info>}}`. Each event is `{{"ts", "thread_ts", "user", "user_name", "text",
    "permalink", "mentioned"}}`, the text unchanged. If the call fails, stop: the
    cursor stays where it was, and the next run re-reads the same messages (they're
    deduplicated by `ts`).

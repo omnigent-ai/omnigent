@@ -4,7 +4,7 @@ Revision ID: b8d4f2a6c1e3
 Revises: a7c3e9f1b5d2
 
 Additive: new tables that older binaries ignore. ``project_slack_bindings`` is
-unique on its Slack channel and on its project, so the database arbitrates
+unique on its Slack channel ID and on its project, so the database arbitrates
 concurrent claims; ``project_slack_audit`` records changes and relay events;
 ``project_slack_threads``, ``project_slack_messages`` and ``project_slack_outbox``
 hold the relay's durable state. Downgrade drops them all, unlinking every channel.
@@ -34,7 +34,7 @@ def upgrade() -> None:
             sa.Column("workspace_id", sa.BigInteger(), nullable=False),
             sa.Column("id", Uuid16(), nullable=False),
             sa.Column("project_id", Uuid16(), nullable=False),
-            sa.Column("slack_team_id", sa.String(32), nullable=False),
+            sa.Column("slack_team_id", sa.String(32), nullable=True),
             sa.Column("channel_id", sa.String(32), nullable=False),
             sa.Column("channel_name", sa.String(128), nullable=True),
             sa.Column("state", sa.String(24), nullable=False),
@@ -50,10 +50,7 @@ def upgrade() -> None:
             sa.Column("updated_at", sa.BigInteger(), nullable=False),
             sa.PrimaryKeyConstraint("workspace_id", "id"),
             sa.UniqueConstraint(
-                "workspace_id",
-                "slack_team_id",
-                "channel_id",
-                name="uq_project_slack_bindings_channel",
+                "workspace_id", "channel_id", name="uq_project_slack_bindings_channel"
             ),
             sa.UniqueConstraint(
                 "workspace_id", "project_id", name="uq_project_slack_bindings_project"

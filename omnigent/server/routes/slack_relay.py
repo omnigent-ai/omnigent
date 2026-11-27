@@ -64,6 +64,7 @@ class RelayEvents(BaseModel):
 
     events: list[RelayEvent] = Field(default_factory=list, max_length=200)
     cursor: str | None = Field(default=None, pattern=_TS)
+    team_id: str | None = Field(default=None, pattern=r"^[TE][A-Z0-9]{2,30}$")
 
 
 class RelayAck(BaseModel):
@@ -192,6 +193,8 @@ def create_slack_relay_router(
         from omnigent.server.project_router import router_session_id
 
         binding, project = await relay_link(request, binding_id)
+        if body.team_id and binding.slack_team_id is None:
+            await asyncio.to_thread(slack_store.learn_team_id, binding.id, body.team_id)
         people = [
             SlackEvent(
                 ts=event.ts,
