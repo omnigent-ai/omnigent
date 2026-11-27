@@ -138,6 +138,70 @@ def test_list_stats_read_every_pull_request_in_one_query(
     assert call[call.index("--hostname") + 1] == "github.com"
 
 
+def test_list_stats_keep_the_pull_requests_github_answered_when_others_failed(
+    tmp_path: Path, fake: FakeGraphQL
+) -> None:
+    """gh exits nonzero for a field error, but the data it read is still shown."""
+    fake.exit_code = 1
+    fake.answer = {
+        "data": {
+            "viewer": {"login": "octocat"},
+            "p0": {"pullRequest": _stats_node(7)},
+            "p1": None,
+        },
+        "errors": [{"message": f"Could not resolve to a Repository with the name '{LEAKED}'."}],
+    }
+
+    found = github_lookup.pull_request_list_stats(
+        str(tmp_path), pr_urls=[_url(7), _url(1, repository=LEAKED)]
+    )
+
+    assert [entry["url"] for entry in found["data"]] == [_url(7)]
+    assert found["reader"] == "octocat"
+    assert "Could not resolve" not in json.dumps(found)
+
+
+def _commits(state: str | None, *, oid: str = "c" * 40) -> dict[str, Any]:
+    rollup = {"state": state} if state else None
+    return {"nodes": [{"commit": {"oid": oid, "statusCheckRollup": rollup}}]}
+
+
+@pytest.mark.parametrize(
+    ("commits", "ci", "ci_head_sha"),
+    [
+        (_commits("SUCCESS"), "passing", "c" * 40),
+        (_commits("PENDING"), "pending", "c" * 40),
+        (_commits("EXPECTED"), "pending", "c" * 40),
+        (_commits("ERROR"), "failing", "c" * 40),
+        # Checks that never ran, an unknown state, no commit, and no commits at all.
+        (_commits(None), None, "c" * 40),
+        (_commits("NEW"), None, "c" * 40),
+        ({"nodes": [{"commit": None}]}, None, None),
+        ({"nodes": []}, None, None),
+        (None, None, None),
+    ],
+    ids=[
+        "success",
+        "pending",
+        "expected",
+        "error",
+        "no-rollup",
+        "unknown-state",
+        "no-commit",
+        "no-commits",
+        "null",
+    ],
+)
+def test_list_stats_read_each_check_state(
+    tmp_path: Path, fake: FakeGraphQL, commits: Any, ci: str | None, ci_head_sha: str | None
+) -> None:
+    fake.answer = {"data": {"p0": {"pullRequest": _stats_node(7, commits=commits)}}}
+
+    (entry,) = github_lookup.pull_request_list_stats(str(tmp_path), pr_urls=[_url(7)])["data"]
+
+    assert (entry["ci"], entry["ci_head_sha"]) == (ci, ci_head_sha)
+
+
 def test_a_url_named_twice_is_read_once(tmp_path: Path, fake: FakeGraphQL) -> None:
     github_lookup.pull_request_list_stats(str(tmp_path), pr_urls=[_url(7), _url(7) + "/files"])
 
@@ -345,6 +409,27 @@ def test_githubs_url_is_kept_only_when_it_names_the_pull_request_asked_about(
 
     assert found["url"] == _url(7)
     assert stats["url"] == _url(7)
+
+
+@pytest.mark.parametrize(
+    "answered",
+    ["https://GitHub.com/Example-Org/Example-Repo/pull/7", _url(7) + "/files", _url(7) + "/"],
+    ids=["case", "files-tab", "trailing-slash"],
+)
+def test_githubs_url_for_the_same_pull_request_is_accepted_in_its_canonical_form(
+    tmp_path: Path, fake: FakeGraphQL, answered: str
+) -> None:
+    fake.answer = {
+        "data": {
+            "repository": {"pullRequest": {"url": answered}},
+            "p0": {"pullRequest": _stats_node(7, url=answered)},
+        }
+    }
+
+    found = github_lookup.lookup_pull_request(str(tmp_path), pr_url=_url(7))
+    (stats,) = github_lookup.pull_request_list_stats(str(tmp_path), pr_urls=[_url(7)])["data"]
+
+    assert found["url"] == stats["url"] == _url(7)
 
 
 def test_a_title_that_isnt_text_is_shown_empty(tmp_path: Path, fake: FakeGraphQL) -> None:

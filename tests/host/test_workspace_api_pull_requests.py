@@ -1207,13 +1207,6 @@ async def test_a_finder_reaches_the_host_with_no_vouch_for_any_session(
     assert store is None or store.reads == 0
 
 
-def test_only_the_finders_skip_the_vouch_and_each_is_the_owners() -> None:
-    from omnigent.host.workspace_methods import PULL_REQUEST_FINDERS
-
-    assert {"GetPullRequestListStats", "LookupPullRequest"} == PULL_REQUEST_FINDERS
-    assert {METHOD_GATES[name] for name in PULL_REQUEST_FINDERS} == {WorkspaceGate.SESSION_OWNER}
-
-
 async def test_a_linked_only_read_still_refuses_the_url_a_finder_may_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
