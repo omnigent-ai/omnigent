@@ -40,6 +40,9 @@ vi.mock("@/shell/ProjectSharing", () => ({
   ProjectProductApproversSection: () => <div data-testid="approvers-section" />,
   ProjectBoardReadersSection: () => <div data-testid="board-readers-section" />,
 }));
+vi.mock("@/shell/ProjectSlackSection", () => ({
+  ProjectSlackSection: () => <div data-testid="slack-section" />,
+}));
 vi.mock("@/shell/ProjectSettingsDialog", () => ({
   ProjectSettingsDialog: (props: { open: boolean; defaultsOnly?: boolean }) => {
     mocks.settings(props);
@@ -98,9 +101,11 @@ describe("ProjectRules", () => {
       "Stages",
       "Who approves what",
       "People",
+      "Slack",
       "Advanced",
     ]);
     expect(screen.getByTestId("approvers-section")).toBeTruthy();
+    expect(screen.getByTestId("slack-section")).toBeTruthy();
     expect(screen.getByTestId("sharing-section")).toBeTruthy();
 
     fireEvent.click(screen.getByTestId("project-rules-session-defaults"));

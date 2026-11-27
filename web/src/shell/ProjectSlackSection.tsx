@@ -28,7 +28,14 @@ function channelLabel(link: ProjectSlackLink): string {
   return link.channel_name ? `#${link.channel_name}` : (link.channel_id ?? "");
 }
 
-export function ProjectSlackSection({ projectId }: { projectId: string }) {
+export function ProjectSlackSection({
+  projectId,
+  embedded = false,
+}: {
+  projectId: string;
+  /** Inside a page section that already has its own "Slack" heading. */
+  embedded?: boolean;
+}) {
   const queryClient = useQueryClient();
   const queryKey = ["project-slack", projectId];
   const link = useQuery({ queryKey, queryFn: () => getProjectSlack(projectId) });
@@ -66,8 +73,11 @@ export function ProjectSlackSection({ projectId }: { projectId: string }) {
     if (channelLink.trim()) save.mutate();
   };
   return (
-    <section className="flex flex-col gap-2 border-t pt-4" data-testid="project-slack">
-      <h3 className="font-medium text-ui">Slack</h3>
+    <section
+      className={embedded ? "flex flex-col gap-2" : "flex flex-col gap-2 border-t pt-4"}
+      data-testid="project-slack"
+    >
+      {!embedded && <h3 className="font-medium text-ui">Slack</h3>}
       <p className="text-muted-foreground text-sm">
         Link one Slack channel. Anyone in it can <code className="text-xs">@omni</code> the
         project&apos;s Lead, and replies come back in the thread marked{" "}
