@@ -27,6 +27,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.native.policy_allow_cache import ALLOW_CACHE_FIELD, MAX_ALLOW_CACHE_SECONDS
 from omnigent.pi_extension_ui import timeout_seconds, to_elicitation_params, to_ui_response
+from omnigent.policies.types import PolicyResult
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -107,6 +108,7 @@ from omnigent.server.schemas import (
     ElicitationRequestParams,
 )
 from omnigent.spec.types import (
+    AgentSpec,
     Phase,
     PolicyAction,
 )
@@ -118,6 +120,30 @@ from omnigent.stores.policy_store import PolicyStore
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+def _deny_reason(
+    result: PolicyResult, engine: PolicyEngine, spec: AgentSpec, caps: RuntimeCaps
+) -> str:
+    """Describe the deciding policy without guessing when its source is ambiguous."""
+    reason = result.reason or "Blocked by policy."
+    name = result.deciding_policy
+    if name is None:
+        return reason
+
+    source = ""
+    if result.deciding_policy_workspace_id is not None:
+        source = f" from workspace {result.deciding_policy_workspace_id}"
+    else:
+        matches = [policy.spec for policy in engine.policies if policy.spec.name == name]
+        if len(matches) == 1:
+            deciding_spec = matches[0]
+            agent_specs = spec.guardrails.policies if spec.guardrails else []
+            if any(deciding_spec is candidate for candidate in agent_specs or []):
+                source = " from agent spec"
+            elif any(deciding_spec is candidate for candidate in caps.default_policies or []):
+                source = " from server default"
+    return f"{reason} (policy {json.dumps(name)}{source})"
 
 
 # Serializes same-session policy-engine builds: each build seeds declared label initial
@@ -1193,7 +1219,9 @@ def register_hooks_routes(
         resp_body: dict[str, Any] = {
             "result": _PHASE_TO_PROTO_ACTION.get(result.action, "POLICY_ACTION_UNSPECIFIED"),
         }
-        if result.reason:
+        if result.action == PolicyAction.DENY:
+            resp_body["reason"] = _deny_reason(result, engine, loaded.spec, _caps)
+        elif result.reason:
             resp_body["reason"] = result.reason
         if result.data is not None:
             resp_body["data"] = result.data
@@ -1237,7 +1265,7 @@ def register_hooks_routes(
         # (claude/codex already show a clean UserPromptSubmit block). Best-effort.
         if result.action == PolicyAction.DENY and phase == Phase.REQUEST and not is_read_only:
             _spawn_native_blocked_notice_forward(
-                session_id, result.reason or "Blocked by policy.", result.deciding_policy
+                session_id, resp_body["reason"], result.deciding_policy
             )
         # A tool-call DENY is decided synchronously here, so nothing else on the
         # stream reflects that the native tool was blocked. Publish a positive
@@ -1245,7 +1273,7 @@ def register_hooks_routes(
         # than infer it from the blocked tool's absence. Observational, so it is
         # not gated on write access.
         if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL:
-            _publish_policy_denied(session_id, result.reason or "Blocked by policy.", phase.value)
+            _publish_policy_denied(session_id, resp_body["reason"], phase.value)
         # An LLM_RESPONSE DENY reaches the harness only after the assistant
         # text already streamed through the runner relay, whose terminal
         # flush would persist it as a normal assistant message. Mark the
@@ -1260,7 +1288,7 @@ def register_hooks_routes(
         if result.action == PolicyAction.DENY and phase == Phase.LLM_RESPONSE and not is_read_only:
             _relay = _runner_relay_tasks.get(session_id)
             if _relay is not None and not _relay.task.done():
-                _llm_response_denied_turns[session_id] = result.reason or "Denied by policy"
+                _llm_response_denied_turns[session_id] = resp_body["reason"]
         return Response(
             content=json.dumps(resp_body),
             media_type="application/json",
