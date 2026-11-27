@@ -1,7 +1,6 @@
-// After the open session is archived, open the session ⌃[ would: the most recent visit still live,
-// then sidebar order. While the session list is still loading, wait for it instead of guessing; if
-// the user opens something else meanwhile, the wait is dropped. With quick_pick_palette off, no
-// recent-session host is mounted, and archiving goes home as before.
+// After the open session is archived, open what ⌃[ would: the latest live visit, then sidebar order.
+// It waits for a loading list and stops waiting once the user moves on; without the recent-session
+// host, as with quick_pick_palette off, it goes home.
 
 import type { QueryClient } from "@tanstack/react-query";
 
@@ -66,7 +65,7 @@ export function newSessionPathFor(
 ): string {
   const projectId = conversation.project_id;
   const project =
-    (projectId != null
+    (projectId
       ? queryClient
           .getQueryData<ProjectSummary[]>(["projects"])
           ?.find((summary) => summary.id === projectId)?.name
@@ -105,8 +104,13 @@ function landingNow(
     sidebarEntryIds: useSidebarSessionOrderStore.getState().orderedSessionIds,
     isLive: (entryId) => live.has(entryId),
     parentOf: (entryId) => parentOf(queryClient, entryId),
-    listState: !sessionsKnown ? "loading" : sessionsFailed ? "failed" : "loaded",
+    listState: listStateOf(sessionsKnown, sessionsFailed),
   });
+}
+
+function listStateOf(known: boolean, failed: boolean): "loading" | "failed" | "loaded" {
+  if (!known) return "loading";
+  return failed ? "failed" : "loaded";
 }
 
 /** Go where `landing` says; false while there is nowhere to go yet. */

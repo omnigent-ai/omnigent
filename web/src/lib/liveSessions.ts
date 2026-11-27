@@ -1,7 +1,5 @@
-// The sessions the client knows are live: every non-archived row in the cached
-// session lists (sidebar scopes, project folders, pins), whether or not the
-// sidebar currently shows it. The cache patchers apply WS deltas, archives, and
-// deletes to all of these lists, so a removed session drops out here too.
+// Live (non-archived) sessions across all cached session lists (sidebar, folders, pins);
+// the cache patchers keep them current, so archived or deleted sessions drop out.
 
 import type { QueryClient } from "@tanstack/react-query";
 

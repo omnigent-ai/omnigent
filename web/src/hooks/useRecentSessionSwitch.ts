@@ -1,14 +1,6 @@
-// ⌃] / ⌃[ switch sessions by recency through a transient switcher, like macOS
-// ⌘Tab: the first press opens it one step from the open session, more presses
-// while Control is held cycle the selection, and releasing Control opens it.
-// Esc cancels; Enter or a click opens the selection.
-//
-// The order is frozen when the switcher opens: visited sessions still live, most
-// recent first, then the rest in sidebar order. Opened before the sessions have
-// loaded, the switcher remembers the presses, and a release, until they arrive.
-//
-// macOS only: there Control is free, while on Windows/Linux Ctrl is the command
-// key and Ctrl+[ / Ctrl+] are taken. ⌘K opens the switcher on every platform.
+// ⌃] / ⌃[ open a ⌘Tab-style recency switcher: presses while Control is held cycle it, releasing
+// Control opens the selection, Esc cancels. macOS only, as Ctrl+[ / Ctrl+] are taken elsewhere;
+// ⌘K opens it on every platform.
 
 import { useEffect, useRef } from "react";
 import { create } from "zustand";
@@ -96,7 +88,10 @@ export function recordRecentSessionVisit(sessionId: string): void {
   writeRecentSessionHistory(history);
 }
 
-/** The recency order to switch through, or null while the sessions aren't known yet. */
+/**
+ * The recency order to switch through, frozen as the switcher opens: visited sessions still
+ * live, most recent first, then the rest in sidebar order. Null while the sessions aren't known.
+ */
 function knownRecentOrder(): string[] | null {
   const { history, readLiveSessionIds, sessionsKnown } = useRecentSessionSwitchStore.getState();
   if (!readLiveSessionIds || !sessionsKnown) return null;
@@ -188,7 +183,10 @@ export function selectRecentSession(sessionId: string): void {
   if (switcher?.order?.includes(sessionId)) updateSwitcher({ selectedId: sessionId });
 }
 
-/** Freeze the order for a switcher opened before the sessions were known, and finish a release. */
+/**
+ * Freeze the order for a switcher opened before the sessions were known, replaying the presses
+ * and any release made while they loaded.
+ */
 function resolvePendingSwitcher(): void {
   const { switcher } = useRecentSessionSwitchStore.getState();
   if (!switcher || switcher.order) return;

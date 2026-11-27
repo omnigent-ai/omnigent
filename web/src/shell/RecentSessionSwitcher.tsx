@@ -78,7 +78,7 @@ export function RecentSessionSwitcher() {
   const holding = switcher?.holding ?? false;
   return (
     <QuickPickDialog<string>
-      // Opened from ⌘K, so it steps with Ctrl-N/Ctrl-P as ⌘K does.
+      // Steps with Ctrl-N/Ctrl-P, like ⌘K.
       stepsWithCtrlNP
       open={open}
       onOpenChange={(nextOpen) => {
