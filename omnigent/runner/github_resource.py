@@ -1007,8 +1007,17 @@ _CHANGED_CONVERSATIONS_LOCK = threading.Lock()
 
 def conversation_changed(pr_url: str) -> None:
     """Read ``pr_url``'s conversation past gh's cache until the copy it holds expires."""
+    now = time.monotonic()
     with _CHANGED_CONVERSATIONS_LOCK:
-        _CHANGED_CONVERSATIONS[pr_url] = time.monotonic()
+        # Drop expired marks here too, so the table stays bounded without later reads.
+        expired = [
+            url
+            for url, changed_at in _CHANGED_CONVERSATIONS.items()
+            if now - changed_at >= _CONVERSATION_CACHE_SECONDS
+        ]
+        for url in expired:
+            del _CHANGED_CONVERSATIONS[url]
+        _CHANGED_CONVERSATIONS[pr_url] = now
 
 
 def _conversation_changed_recently(pr_url: str) -> bool:

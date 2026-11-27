@@ -2303,6 +2303,24 @@ def test_a_changed_conversation_is_read_past_ghs_cache_until_its_copy_expires(
     assert list(github_resource._CHANGED_CONVERSATIONS) == ["https://github.com/o/r/pull/9"]
 
 
+def test_marking_a_changed_conversation_drops_the_expired_marks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The table stays bounded by what changed in the last 30s, even when nothing reads it."""
+    now = [1000.0]
+    monkeypatch.setattr(github_resource, "_CHANGED_CONVERSATIONS", {})
+    monkeypatch.setattr(github_resource.time, "monotonic", lambda: now[0])
+    github_resource.conversation_changed("https://github.com/o/r/pull/1")
+    now[0] += 10
+    github_resource.conversation_changed("https://github.com/o/r/pull/2")
+    now[0] += 25
+    github_resource.conversation_changed("https://github.com/o/r/pull/3")
+    assert list(github_resource._CHANGED_CONVERSATIONS) == [
+        "https://github.com/o/r/pull/2",
+        "https://github.com/o/r/pull/3",
+    ]
+
+
 _RIGHTS = {
     "viewerCanReact": True,
     "viewerCanUpdate": True,
