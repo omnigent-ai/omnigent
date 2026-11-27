@@ -45,13 +45,22 @@ describe("useOnboardingRunnerHost", () => {
 
   it("resolves 'local' to this machine's host once it's online", async () => {
     bridge.takeOnboardingRunner.mockResolvedValue("local");
+    // The shell names this machine after its host comes online, as it can on a slow start.
+    let nameMachine!: () => void;
+    bridge.getHostIdentity.mockReturnValue(
+      new Promise((resolve) => {
+        nameMachine = () => resolve({ cliInstalled: true, hostId: "laptop" });
+      }),
+    );
     const { result, rerender } = renderHook(({ hosts }) => useOnboardingRunnerHost(hosts), {
       initialProps: { hosts: [host("laptop", "offline"), host("box")] },
     });
     await waitFor(() => expect(bridge.takeOnboardingRunner).toHaveBeenCalled());
     expect(result.current).toMatchObject({ pending: true, hostId: null });
     rerender({ hosts: [host("laptop"), host("box")] });
-    expect(result.current).toEqual({ pending: false, hostId: "laptop" });
+    expect(result.current).toMatchObject({ pending: true, hostId: null });
+    nameMachine();
+    await waitFor(() => expect(result.current).toEqual({ pending: false, hostId: "laptop" }));
   });
 
   it("resolves 'remote' to the only other online host, and gives up with several", async () => {
