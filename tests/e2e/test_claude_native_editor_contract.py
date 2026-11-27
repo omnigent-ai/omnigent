@@ -28,6 +28,7 @@ from omnigent.harnesses.claude_native import (
     editor_transaction,
     model_switch,
 )
+from omnigent.harnesses.claude_native.main import build_native_claude_terminal_env
 from omnigent.runner.turn_routing import write_pending_replay, write_turn_routing_marker
 from tests._helpers.native_claude import _PINNED_CLAUDE_MODELS
 from tests._helpers.polling import poll_until
@@ -38,7 +39,14 @@ pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
 
 @pytest.mark.parametrize(
     "draft_mode",
-    ["editor", "picker", "controller-clear", "launch-picker", "launch-controller-clear"],
+    [
+        "editor",
+        "picker",
+        "controller-clear",
+        "launch-picker",
+        "launch-controller-clear",
+        "launch-paste-diagnostic",
+    ],
 )
 @pytest.mark.parametrize("editor_source", ["configured", "configured-code", "default"])
 def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
@@ -55,6 +63,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     launch_model = (
         "draft-initial-model" if draft_mode != "editor" else _PINNED_CLAUDE_MODELS["sonnet"]
     )
+    if draft_mode == "launch-paste-diagnostic":
+        launch_model = _PINNED_CLAUDE_MODELS["sonnet"]
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     config = tmp_path / "claude-config"
@@ -249,6 +259,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "EDITOR": editor_command + " --editor-program editor",
         "VISUAL": editor_command + " --editor-program visual",
     }
+    if draft_mode == "launch-paste-diagnostic":
+        env.update(build_native_claude_terminal_env(None, client_surface="cli"))
     if editor_source in {"default", "configured-code"}:
         if editor_source == "default":
             env.pop("EDITOR")
@@ -356,6 +368,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         + "0123456789 " * 24
         + "draft-end\n\nsecond line with spaces  \nthird line 😀\n"
     )
+    if draft_mode == "launch-paste-diagnostic":
+        typed_draft = "native-paste-draft-end\n" + "continued pasted line\n" * 12
 
     def observations() -> list[dict[str, object]]:
         if not observed.exists():
@@ -480,6 +494,45 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert owner["bridge_session_id"] == bridge.read_active_session_id(bridge_dir)
             assert owner["native_session_id"] == payload["session_id"]
             assert owner["process"] == payload["native_process"]
+            if draft_mode == "launch-paste-diagnostic":
+                picker_observations.append({"kind": "before-observation", "pane": pane()})
+                count = len(observations())
+                instruction.write_text(
+                    json.dumps(
+                        {
+                            "expected": draft,
+                            "replacement": "must-never-be-imported",
+                            "owner": owner,
+                            "cancelled": False,
+                            "observe_only": True,
+                        }
+                    )
+                )
+                command("send-keys", "-t", target, "C-g")
+                poll_until(lambda: len(observations()) == count + 1, timeout_s=15)
+                assert observations()[-1]["observe_only"] is True
+                session_id = bridge.read_active_session_id(bridge_dir)
+                assert session_id is not None
+                assert write_turn_routing_marker(bridge_dir, session_id=session_id)
+                assert write_pending_replay(
+                    bridge_dir,
+                    session_id=session_id,
+                    prompt=draft,
+                    blocked_turn_id=None,
+                    model="draft-test-model",
+                )
+                try:
+                    result = bridge.inject_model_command(
+                        bridge_dir, model="draft-test-model", owned_draft=draft, timeout_s=30
+                    )
+                    controller_observations.append({"kind": "selected", "receipt": asdict(result)})
+                except model_switch.ClaudeModelSwitchRefused as exc:
+                    controller_observations.append(
+                        {"kind": "refused", "phase": exc.phase, "message": str(exc)}
+                    )
+                assert saved_settings.read_bytes() == saved_contents
+                assert get_mock_message_requests(isolated_mock_llm_server_url) == []
+                return
             if draft_mode.endswith("controller-clear"):
                 session_id = bridge.read_active_session_id(bridge_dir)
                 assert session_id is not None
