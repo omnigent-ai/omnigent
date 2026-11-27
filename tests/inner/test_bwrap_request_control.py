@@ -368,7 +368,9 @@ def test_completion_waits_for_each_pinned_lifetime_and_output(
     assert case.owner.admitted and case.owner.done.is_set()
 
 
-@pytest.mark.parametrize("ending", ["complete", "timeout", "cancel", "read-error"])
+@pytest.mark.parametrize(
+    "ending", ["complete", "timeout", "cancel", "read-error", "drain-error", "wait-error"]
+)
 def test_encoded_requests_bound_capture_and_never_accumulate_output_through_communicate(
     monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase, ending: str
 ) -> None:
@@ -390,6 +392,10 @@ def test_encoded_requests_bound_capture_and_never_accumulate_output_through_comm
         return True
 
     capture.poll.side_effect = poll
+    if ending == "drain-error":
+        capture.drain.side_effect = OSError("capture drain failed")
+    elif ending == "wait-error":
+        case.process.wait.side_effect = OSError("process wait failed")
     construct = MagicMock(return_value=capture)
     monkeypatch.setattr(request_control, "BoundedPipeCapture", construct)
     if ending == "timeout":
@@ -398,8 +404,13 @@ def test_encoded_requests_bound_capture_and_never_accumulate_output_through_comm
     if ending == "cancel":
         with pytest.raises(request_control.RequestCancelled):
             case.owner.run(deadline=1.0, max_output=3)
-    elif ending == "read-error":
-        with pytest.raises(OSError, match="pipe read failed"):
+    elif ending in {"read-error", "drain-error", "wait-error"}:
+        message = {
+            "read-error": "pipe read failed",
+            "drain-error": "capture drain failed",
+            "wait-error": "process wait failed",
+        }[ending]
+        with pytest.raises(OSError, match=message):
             case.owner.run(deadline=1.0, max_output=3)
     else:
         result = case.owner.run(deadline=1.0, max_output=3)
@@ -413,6 +424,16 @@ def test_encoded_requests_bound_capture_and_never_accumulate_output_through_comm
     capture.close.assert_called_once()
     case.process.wait.assert_called_once()
     assert case.owner.done.is_set()
+    assert sorted(fd for action, fd in case.events if action == "close") == [
+        _INIT_FD,
+        _LAUNCHER_FD,
+    ]
+    case.control.close.assert_called_once()
+    for stream in (case.process.stdin, case.process.stdout, case.process.stderr):
+        stream.close.assert_called_once()
+    retired_events = list(case.events)
+    case.owner.cancel()
+    assert case.events == retired_events
 
 
 @pytest.mark.parametrize("refusal", ["cancelled", "deadline", "init-exited", "launcher-exited"])

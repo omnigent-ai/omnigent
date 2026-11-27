@@ -9,9 +9,11 @@ import os
 import subprocess
 import sys
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -619,6 +621,103 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
     finally:
         helper._egress_auth_token = None
         helper.close()
+
+
+@pytest.fixture
+def caller_environment(tmp_path: Path) -> Iterator[CallerProcessOSEnvironment]:
+    environment = CallerProcessOSEnvironment(
+        spec=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="linux_bwrap")
+        ),
+        cwd=tmp_path,
+        sandbox=_policy(tmp_path),
+        shell_path="/bin/sh",
+        _relaunch_when_stale=True,
+    )
+    try:
+        yield environment
+    finally:
+        environment.close()
+
+
+@pytest.mark.parametrize(
+    "arguments, mode, error",
+    [
+        pytest.param({"command": None}, None, "command", id="missing-command"),
+        pytest.param({"command": 17}, None, "command", id="non-string-command"),
+        pytest.param({"command": ""}, None, "command", id="empty-command"),
+        pytest.param({"command": " \n\t"}, None, "command", id="blank-command"),
+        pytest.param({"timeout": 0}, None, "timeout", id="zero-timeout"),
+        pytest.param({"timeout": -1}, None, "timeout", id="negative-timeout"),
+        pytest.param({"max_output": 0}, None, "max_output", id="zero-output-limit"),
+        pytest.param({"max_output": -1}, None, "max_output", id="negative-output-limit"),
+        pytest.param({"max_output": 1.5}, None, "max_output", id="fractional-output-limit"),
+        pytest.param({"max_output": "3"}, None, "max_output", id="non-integer-output-limit"),
+        pytest.param({}, "no-relaunch", "does not support", id="no-relaunch"),
+        pytest.param({}, "fork", "does not support", id="fork"),
+        pytest.param({}, "scratch", "does not support", id="scratch"),
+        pytest.param({}, "copy-on-write", "does not support", id="copy-on-write"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_isolated_shell_rejects_invalid_requests_before_starting_a_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    caller_environment: CallerProcessOSEnvironment,
+    arguments: dict[str, Any],
+    mode: str | None,
+    error: str,
+) -> None:
+    environment = caller_environment
+    if mode == "no-relaunch":
+        environment._relaunch_when_stale = False
+    elif mode == "fork":
+        environment.spec.fork = True
+    elif mode == "scratch":
+        environment._start_in_scratch = True
+    elif mode == "copy-on-write":
+        environment._copy_on_write_environment = MagicMock()
+    worker = MagicMock(side_effect=AssertionError("A rejected request started a worker"))
+    request = MagicMock(side_effect=AssertionError("A rejected request created an owner"))
+    monkeypatch.setattr(os_env_module, "threading", SimpleNamespace(Thread=worker))
+    monkeypatch.setattr(shell_request, "BwrapShellRequest", request)
+    result = await environment.isolated_shell(**({"command": "example-command"} | arguments))
+    assert error in result["error"]
+    worker.assert_not_called()
+    request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "timeout, max_output, expected_timeout, expected_limit",
+    [
+        (None, None, 120, os_env_module._MAX_TOOL_OUTPUT_CHARS),
+        (7, None, 7, os_env_module._MAX_TOOL_OUTPUT_CHARS),
+        (None, 3, 120, 3),
+        (7, 5_000_000, 7, 5_000_000),
+        (7, 5_000_001, 7, 5_000_000),
+    ],
+    ids=["defaults", "explicit-timeout", "explicit-limit", "maximum-limit", "capped-limit"],
+)
+@pytest.mark.asyncio
+async def test_isolated_shell_forwards_validated_limits_to_its_owned_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    caller_environment: CallerProcessOSEnvironment,
+    timeout: int | None,
+    max_output: int | None,
+    expected_timeout: int,
+    expected_limit: int,
+) -> None:
+    request = shell_request.BwrapShellRequest()
+    constructor = MagicMock(return_value=request)
+    monkeypatch.setattr(shell_request, "BwrapShellRequest", constructor)
+    expected = {"stdout": "result", "exit_code": 0}
+    run = MagicMock(return_value=expected)
+    monkeypatch.setattr(caller_environment._helper, "shell_request", run)
+    result = await caller_environment.isolated_shell(
+        "example-command", timeout, max_output, launcher="/selected/bwrap"
+    )
+    assert result == expected
+    constructor.assert_called_once_with(launcher="/selected/bwrap")
+    run.assert_called_once_with("example-command", expected_timeout, expected_limit, request)
 
 
 @pytest.mark.asyncio

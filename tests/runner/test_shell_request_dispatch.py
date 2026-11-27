@@ -434,6 +434,11 @@ print(json.dumps({
 async def test_real_runner_shell_reuse_records_latency_against_disposable_calls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Record opt-in timing evidence; lifecycle cases enforce correctness separately.
+
+    There is no performance threshold: shared-runner timings are diagnostic.
+    Enable with OMNIGENT_SHELL_LATENCY_EVIDENCE=1 when collecting measurements.
+    """
     spec = _spec(tmp_path)
     _require_request_launcher(spec, tmp_path)
     (tmp_path / "note.txt").write_text("ready\n")
