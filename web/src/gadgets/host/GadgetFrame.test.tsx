@@ -180,7 +180,7 @@ describe("GadgetFrame", () => {
           // Never the viewer's login: an older server's principal ID, and no name.
           viewer: { id: "42", displayName: null },
           capabilities: ["data.read"],
-          permissions: { writeData: true, publish: false },
+          permissions: { writeData: true, writeOwnData: true, publish: false },
         }),
       }),
     );

@@ -197,7 +197,9 @@ And:
 - Put `data-omnigent-ref` (for example `cards/c1`) and `data-omnigent-label`
   on each record's element, so a selection or comment names the exact record.
 - Others may see the gadget read-only. Put `data-omnigent-requires="write"` on
-  every control that changes records and `data-omnigent-requires="action"` on
+  every control that changes shared records, `data-omnigent-requires="own-write"`
+  on one that changes only the viewer's own records of a viewer collection
+  (anyone who can view the gadget may), and `data-omnigent-requires="action"` on
   every control that requests an action; the SDK disables them for people
   without that access and shows why.
 

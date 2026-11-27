@@ -423,6 +423,10 @@ export function GadgetFrame({
         capabilities: grantedCapabilities(latest.content),
         permissions: {
           writeData: latest.app.permissions.write_data,
+          // Anyone who can open the gadget keeps their own records of its viewer collections.
+          writeOwnData:
+            latest.app.permissions.write_data ||
+            Object.keys(latest.content.collection_scopes ?? {}).length > 0,
           publish: latest.app.permissions.publish,
         },
         colorScheme: latest.colorScheme === "dark" ? "dark" : "light",
