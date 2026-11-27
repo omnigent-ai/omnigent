@@ -34,6 +34,7 @@ import {
   createAutomaticFeaturePreference,
 } from "@/lib/automaticFeaturePreference";
 import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
+import { durableServerScope } from "@/lib/durableServerScope";
 import { resolveAutomaticGitHubReaderWith } from "@/lib/githubCooldown";
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import { acceptedWorkspaceDesign, subscribeAcceptedWorkspaceDesign } from "@/lib/workspaceSurfaces";
@@ -563,11 +564,12 @@ function githubReadsEnabledNow(): boolean {
   return githubMacReadsEnabled(githubMacReadsPreference.read(), automaticPolicy);
 }
 
-// Each PR's route as of the store's version: a long list asks for every row's route several
-// times a render, and working one out parses the URL each time.
+// Each PR's route as of the store's version and server: a long list asks for every row's route
+// several times a render, and a switch of server, which moves no version, changes its choices.
 let routeCache: {
   version: number;
   support: DesktopReadSupport | null;
+  serverScope: string | null;
   routes: Map<string, ReadRoute>;
 } | null = null;
 
@@ -575,8 +577,13 @@ let routeCache: {
 export function readRouteFor(rawUrl: string | null | undefined): ReadRoute {
   // Before the store listens, a change to the setting wouldn't move its version.
   if (!rawUrl || !started) return routeNow(rawUrl);
-  if (routeCache?.version !== version || routeCache.support !== support) {
-    routeCache = { version, support, routes: new Map() };
+  const serverScope = durableServerScope();
+  if (
+    routeCache?.version !== version ||
+    routeCache.support !== support ||
+    routeCache.serverScope !== serverScope
+  ) {
+    routeCache = { version, support, serverScope, routes: new Map() };
   }
   let route = routeCache.routes.get(rawUrl);
   if (!route) {
