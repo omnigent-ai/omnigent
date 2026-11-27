@@ -720,6 +720,34 @@ describe("ChatHeader — the switch in the chat pane's strip", () => {
   });
 });
 
+describe("ChatHeader — warm header workspace ownership", () => {
+  it.each(["sess-a", null])(
+    "keeps the toolbar in the URL-owned spot %s while the header is B",
+    (workspaceId) => {
+      const spotA = document.createElement("span");
+      const spotB = document.createElement("span");
+      document.body.append(spotA, spotB);
+      claimChatPaneViewToggleHost("sess-a", spotA);
+      claimChatPaneViewToggleHost("sess-b", spotB);
+      onTestFinished(() => {
+        releaseChatPaneViewToggleHost("sess-a", spotA);
+        releaseChatPaneViewToggleHost("sess-b", spotB);
+        spotA.remove();
+        spotB.remove();
+      });
+      const view = renderHeaderWithSession(makeTerminalFirstCtx(), {
+        conversationId: "sess-b",
+        workspaceConversationId: workspaceId,
+      });
+      const root = workspaceId ? spotA : view.container.querySelector("header")!;
+      expect(
+        root.querySelector('[role="group"][aria-label="Switch between chat and terminal"]'),
+      ).not.toBeNull();
+      expect(spotB).toBeEmptyDOMElement();
+    },
+  );
+});
+
 describe("ChatHeader — floating mobile controls", () => {
   it("adds glass to the mobile sidebar and shared action container", () => {
     isMobileMock.mockReturnValue(true);

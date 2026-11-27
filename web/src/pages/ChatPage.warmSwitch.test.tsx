@@ -1,10 +1,10 @@
 // Warm session switches with `warm_switch_keep_mounted_ui`: a sidebar-style
 // click switches the store with the navigation, so the commit landing
 // `/c/:id` skips the hydrating placeholder and the chat surface stays mounted.
-import { forwardRef, useLayoutEffect } from "react";
+import { forwardRef, Profiler, useLayoutEffect } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, MemoryRouter, Route, Routes, useParams } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, Outlet, Route, Routes, useParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getBasePath, withBasePath } from "@/lib/basePath";
 import {
@@ -17,6 +17,10 @@ import {
   type RoutingApi,
 } from "@/lib/routing";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type * as HeaderConversationMenuModule from "@/shell/HeaderConversationMenu";
+import { AppShell } from "@/shell/AppShell";
+import { useCommandContext } from "@/shell/commandContext";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { Sidebar } from "@/shell/Sidebar";
 import { conversation } from "@/test/sidebarMockHelpers";
 import { sessionRowsPage } from "@/lib/sidebarData";
@@ -34,9 +38,24 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import * as clipboard from "@/lib/clipboard";
+import * as serverOrigin from "@/lib/serverOrigin";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import { ChatPage } from "./ChatPage";
+
+// Observe the committed menu destination without replacing its real actions.
+vi.mock("@/shell/HeaderConversationMenu", async (importOriginal) => {
+  const original = await importOriginal<typeof HeaderConversationMenuModule>();
+  return {
+    ...original,
+    HeaderConversationMenu: (props: Parameters<typeof original.HeaderConversationMenu>[0]) => (
+      <span data-header-menu-target={props.conversation.id}>
+        <original.HeaderConversationMenu {...props} />
+      </span>
+    ),
+  };
+});
 
 const initialStoreState = useChatStore.getState();
 
@@ -67,6 +86,7 @@ interface CommitShape {
   urlConvId: string | undefined;
   activeConversationId: string | null;
   loadingConversation: boolean;
+  commandConversationId?: string;
 }
 const commitLog: CommitShape[] = [];
 
@@ -75,8 +95,14 @@ function RouteCommitLog() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
   const activeConversationId = useChatStore((s) => s.conversationId);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
+  const command = useCommandContext();
   useLayoutEffect(() => {
-    commitLog.push({ urlConvId, activeConversationId, loadingConversation });
+    commitLog.push({
+      urlConvId,
+      activeConversationId,
+      loadingConversation,
+      commandConversationId: command.session?.id,
+    });
   });
   return null;
 }
@@ -136,6 +162,8 @@ function renderPage(
     info?: Partial<capabilities.ServerInfo>;
     routing?: RoutingApi;
     sidebar?: boolean;
+    shell?: boolean;
+    onCommit?: () => void;
   } = {},
 ) {
   const info = { ...FALLBACK_SERVER_INFO, ...options.info, features };
@@ -154,38 +182,52 @@ function renderPage(
             <RoutingProvider value={routing}>
               <Routes>
                 <Route
-                  path={routing.rebasePath("/c/:conversationId")}
                   element={
-                    <>
-                      <RouteCommitLog />
-                      {options.sidebar && (
+                    options.shell ? (
+                      <Profiler id="shell" onRender={options.onCommit ?? (() => {})}>
                         <TooltipProvider>
-                          <Sidebar open onClose={() => {}} />
+                          <AppShell />
                         </TooltipProvider>
-                      )}
-                      <SessionLink
-                        id="conv_a"
-                        label="open alpha"
-                        deferNavigation={options.deferNavigation}
-                      />
-                      <SessionLink
-                        id="conv_b"
-                        label="open beta"
-                        cancelNavigation={options.cancelBetaNavigation}
-                        deferNavigation={options.deferNavigation}
-                      />
-                      <SessionLink
-                        id="conv_c"
-                        label="open gamma"
-                        deferNavigation={options.deferNavigation}
-                      />
-                      <Link to="/c/conv_a">finish alpha navigation</Link>
-                      <Link to="/c/conv_b">finish beta navigation</Link>
-                      <Link to="/c/conv_c">finish gamma navigation</Link>
-                      <ChatPage />
-                    </>
+                      </Profiler>
+                    ) : (
+                      <Outlet />
+                    )
                   }
-                />
+                >
+                  <Route
+                    path={routing.rebasePath("/c/:conversationId")}
+                    element={
+                      <>
+                        <RouteCommitLog />
+                        {options.sidebar && (
+                          <TooltipProvider>
+                            <Sidebar open onClose={() => {}} />
+                          </TooltipProvider>
+                        )}
+                        <SessionLink
+                          id="conv_a"
+                          label="open alpha"
+                          deferNavigation={options.deferNavigation}
+                        />
+                        <SessionLink
+                          id="conv_b"
+                          label="open beta"
+                          cancelNavigation={options.cancelBetaNavigation}
+                          deferNavigation={options.deferNavigation}
+                        />
+                        <SessionLink
+                          id="conv_c"
+                          label="open gamma"
+                          deferNavigation={options.deferNavigation}
+                        />
+                        <Link to="/c/conv_a">finish alpha navigation</Link>
+                        <Link to="/c/conv_b">finish beta navigation</Link>
+                        <Link to="/c/conv_c">finish gamma navigation</Link>
+                        <ChatPage />
+                      </>
+                    }
+                  />
+                </Route>
               </Routes>
             </RoutingProvider>
           </Router>
@@ -226,7 +268,97 @@ function renderWarmComposer(
   });
 }
 
+function headerSnapshot() {
+  const breadcrumb = document.querySelector(".conversation-breadcrumb");
+  const title = breadcrumb?.querySelector('[data-testid="header-title"], .breadcrumb-parent-link');
+  const project = breadcrumb?.querySelector('[aria-label^="Project: "]');
+  return {
+    ...commitLog.at(-1),
+    title: title?.textContent ?? null,
+    project: project?.getAttribute("aria-label") ?? null,
+    icon: project?.textContent ?? null,
+    parentLink: breadcrumb?.querySelector(".breadcrumb-parent-link")?.getAttribute("href") ?? null,
+    breadcrumb: breadcrumb?.textContent ?? null,
+    menuTarget:
+      breadcrumb
+        ?.querySelector("[data-header-menu-target]")
+        ?.getAttribute("data-header-menu-target") ?? null,
+    transcript: transcriptNode()?.textContent ?? "",
+  };
+}
+
+function renderHeaderPage(
+  enabled: boolean,
+  child: boolean,
+  frames: ReturnType<typeof headerSnapshot>[],
+  deferNavigation = true,
+) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  initChatStore(qc);
+  seedLiveEntry("conv_a", "alpha transcript");
+  seedLiveEntry("conv_b", "beta transcript");
+  const rows = sessionRowsPage([
+    conversation("conv_a", {
+      title: "Alpha session",
+      permission_level: 4,
+      project_id: "project_a",
+    }),
+    conversation(child ? "conv_parent" : "conv_b", {
+      title: child ? "Beta parent" : "Beta session",
+      permission_level: 4,
+      project_id: "project_b",
+    }),
+  ]);
+  const projects = [
+    { id: "project_a", name: "Alpha project", icon: "X" },
+    { id: "project_b", name: "Beta project", icon: "Y" },
+  ];
+  qc.setQueryData(["projects"], projects);
+  for (const id of ["conv_a", "conv_b", "conv_parent"]) {
+    qc.setQueryData(["session", id], {
+      id,
+      agentId: `agent_${id}`,
+      agentName: "Example agent",
+      permissionLevel: 4,
+      status: "idle",
+      title: id === "conv_a" ? "Alpha session" : "Beta session",
+      createdAt: 0,
+      labels: {},
+      items: [],
+      pendingElicitations: [],
+      parentSessionId: id === "conv_b" && child ? "conv_parent" : null,
+      subAgentName: id === "conv_b" && child ? "Worker B" : null,
+    });
+    qc.setQueryData(["session-agent", id], {
+      id: `agent_${id}`,
+      name: "Example agent",
+      mcp_servers: [],
+      policies: [],
+      terminals: [],
+    });
+  }
+  useChatStore.setState({ boundAgentId: "agent_conv_a" });
+  writeWorkspacePanelDefault("collapsed");
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((url: string) => {
+      if (String(url).includes("/projects"))
+        return Promise.resolve(new Response(JSON.stringify(projects)));
+      if (String(url).includes("/v1/sessions?"))
+        return Promise.resolve(new Response(JSON.stringify(rows)));
+      return new Promise<Response>(() => {});
+    }),
+  );
+  renderPage({ warm_switch_keep_mounted_ui: enabled }, qc, {
+    shell: true,
+    deferNavigation,
+    onCommit: () => frames.push(headerSnapshot()),
+  });
+}
+
 beforeEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
   window.history.replaceState({}, "", "/c/conv_a");
   useChatStore.setState({
     conversationId: "conv_a",
@@ -243,6 +375,8 @@ afterEach(() => {
   useChatStore.getState().abortController?.abort();
   conversationRegistry.clear();
   clearSessionDrafts();
+  localStorage.clear();
+  sessionStorage.clear();
   consumePendingInitialPrompt("conv_a");
   useChatStore.setState(initialStoreState);
   commitLog.length = 0;
@@ -327,6 +461,128 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
       }
     },
   );
+
+  it.each([false, true])(
+    "updates the header with the transcript in one pending commit (child: %s)",
+    async (child) => {
+      const frames: ReturnType<typeof headerSnapshot>[] = [];
+      renderHeaderPage(true, child, frames);
+      await screen.findByRole("button", { name: "Project: Alpha project" });
+      await screen.findByText("alpha transcript");
+      frames.length = 0;
+
+      fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+
+      const expected = child ? "Beta parent" : "Beta session";
+      const pending = frames.filter(
+        (frame) => frame.urlConvId === "conv_a" && frame.activeConversationId === "conv_b",
+      );
+      expect(pending.length).toBeGreaterThan(0);
+      for (const frame of pending) {
+        expect(frame.transcript).toContain("beta transcript");
+        expect(frame.title).toBe(expected);
+        expect(frame.project).toBe("Project: Beta project");
+        expect(frame.icon).toContain("Y");
+        expect(frame.menuTarget).toBe(child ? null : "conv_b");
+        expect(frame.parentLink).toBe(child ? "/c/conv_parent" : null);
+        expect(frame.commandConversationId).toBe("conv_a");
+        if (child) expect(frame.breadcrumb).toContain("Worker B");
+      }
+      fireEvent.click(screen.getByRole("link", { name: "finish beta navigation" }));
+      expect(headerSnapshot()).toMatchObject({
+        title: expected,
+        project: "Project: Beta project",
+        menuTarget: child ? null : "conv_b",
+        parentLink: child ? "/c/conv_parent" : null,
+        urlConvId: "conv_b",
+        activeConversationId: "conv_b",
+        commandConversationId: "conv_b",
+      });
+      expect(
+        frames.filter(
+          (frame) => frame.transcript.includes("beta transcript") && frame.title !== expected,
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it.each(["share", "fork"] as const)(
+    "pins the pending header's %s dialog to B",
+    async (action) => {
+      vi.spyOn(serverOrigin, "isCurrentServerLocal").mockReturnValue(false);
+      const copy = vi.spyOn(clipboard, "copyText").mockResolvedValue(undefined);
+      const frames: ReturnType<typeof headerSnapshot>[] = [];
+      renderHeaderPage(true, false, frames);
+      await screen.findByRole("button", { name: "Project: Alpha project" });
+      fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+
+      if (action === "share") {
+        fireEvent.click(screen.getByRole("button", { name: "Share session" }));
+        await screen.findByRole("dialog", { name: "Share this session" });
+        fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+        await waitFor(() =>
+          expect(copy).toHaveBeenCalledWith(expect.stringContaining("/c/conv_b")),
+        );
+      } else {
+        fireEvent.keyDown(screen.getByTestId("header-conversation-actions"), { key: "ArrowDown" });
+        fireEvent.click(screen.getByTestId("header-fork-conversation"));
+        await screen.findByTestId("fork-session-dialog");
+        fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+        expect(await screen.findByPlaceholderText("Fork of Beta session")).toBeInTheDocument();
+      }
+      fireEvent.click(screen.getByText("finish beta navigation"));
+      expect(headerSnapshot().urlConvId).toBe("conv_b");
+      if (action === "share")
+        expect(screen.getByRole("dialog", { name: "Share this session" })).toBeInTheDocument();
+      else expect(screen.getByPlaceholderText("Fork of Beta session")).toBeInTheDocument();
+    },
+  );
+
+  it("leaves the header URL-owned with the flag off", async () => {
+    const frames: ReturnType<typeof headerSnapshot>[] = [];
+    renderHeaderPage(false, false, frames);
+    await screen.findByRole("button", { name: "Project: Alpha project" });
+
+    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+
+    expect(headerSnapshot()).toMatchObject({
+      title: "Alpha session",
+      project: "Project: Alpha project",
+      menuTarget: "conv_a",
+      activeConversationId: "conv_a",
+      urlConvId: "conv_a",
+    });
+    fireEvent.click(screen.getByRole("link", { name: "finish beta navigation" }));
+    expect(headerSnapshot()).toMatchObject({
+      title: "Beta session",
+      menuTarget: "conv_b",
+      activeConversationId: "conv_b",
+      urlConvId: "conv_b",
+    });
+  });
+
+  it("keeps header navigation URL-owned on Back and Forward", async () => {
+    const frames: ReturnType<typeof headerSnapshot>[] = [];
+    renderHeaderPage(true, false, frames, false);
+    await screen.findByRole("button", { name: "Project: Alpha project" });
+    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+    expect(headerSnapshot().title).toBe("Beta session");
+
+    act(() => window.history.back());
+    await waitFor(() => expect(useChatStore.getState().conversationId).toBe("conv_a"));
+    expect(headerSnapshot()).toMatchObject({
+      title: "Alpha session",
+      menuTarget: "conv_a",
+      urlConvId: "conv_a",
+    });
+    act(() => window.history.forward());
+    await waitFor(() => expect(useChatStore.getState().conversationId).toBe("conv_b"));
+    expect(headerSnapshot()).toMatchObject({
+      title: "Beta session",
+      menuTarget: "conv_b",
+      urlConvId: "conv_b",
+    });
+  });
 
   it("flag off: the placeholder commits and the surface remounts as before", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });

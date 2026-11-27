@@ -1,3 +1,4 @@
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { basenamedRouting, reactRouterRouting } from "@/lib/routing";
 import * as capabilities from "@/lib/capabilities";
@@ -7,6 +8,7 @@ import {
   isWarmSwitchPending,
   switchSessionBeforeNavigate,
   warmSwitchKeepMountedEnabled,
+  useWarmSwitchConversationId,
 } from "./warmSessionSwitch";
 
 const initialStoreState = useChatStore.getState();
@@ -19,6 +21,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  cleanup();
   vi.clearAllTimers();
   useChatStore.setState(initialStoreState);
   conversationRegistry.clear();
@@ -94,6 +97,26 @@ describe("isWarmSwitchPending", () => {
   it("does not retain the mismatch when the flag is off", () => {
     window.history.replaceState({}, "", "/c/conv_b");
     expect(isWarmSwitchPending("conv_b", "conv_a", rebasePath)).toBe(false);
+  });
+});
+
+describe("useWarmSwitchConversationId", () => {
+  it("tracks the store only during an enabled browser-first navigation", () => {
+    const cached = spyFeatures({ warm_switch_keep_mounted_ui: true });
+    useChatStore.setState({ conversationId: "conv_a" });
+    const { result, rerender } = renderHook(({ id }) => useWarmSwitchConversationId(id), {
+      initialProps: { id: "conv_a" },
+    });
+    act(() => {
+      window.history.pushState({}, "", "/c/conv_b");
+      useChatStore.setState({ conversationId: "conv_b" });
+    });
+    expect(result.current).toBe("conv_b");
+    cached.mockReturnValue({ ...capabilities.FALLBACK_SERVER_INFO, features: {} });
+    rerender({ id: "conv_a" });
+    expect(result.current).toBe("conv_a");
+    rerender({ id: "conv_b" });
+    expect(result.current).toBe("conv_b");
   });
 });
 
