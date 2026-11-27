@@ -43,7 +43,7 @@ export interface DeviceRecentList<Item> {
   record: (scope: readonly string[], added: readonly Item[], owner: string | null) => void;
   /**
    * Drop the oldest past the scope limit and unreadable lists, and, keeping only the current
-   * owner's, other users' and servers' lists.
+   * owner's, other users' and servers' lists once that owner is known.
    */
   prune: () => void;
   /** A scope's items, re-read when they change or another user signs in. */
@@ -136,7 +136,9 @@ export function createDeviceRecentList<Item>({
     for (const key of savedKeys(storage)) {
       const usedAt = parse(storage, key)?.usedAt ?? null;
       const ownKey = !!prefix && key.startsWith(prefix);
-      if (usedAt === null || (retention === "current-owner" && !ownKey)) remove(storage, key);
+      // Only a known owner drops another's: an unresolved or failed identity keeps every list.
+      const anotherOwners = retention === "current-owner" && !!prefix && !ownKey;
+      if (usedAt === null || anotherOwners) remove(storage, key);
       else if (ownKey) mine.push({ key, usedAt });
     }
     // Only the current owner's are capped: another owner's wait, untouched, for them.

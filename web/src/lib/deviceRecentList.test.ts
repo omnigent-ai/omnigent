@@ -7,9 +7,17 @@ import { z } from "zod";
 import type * as HostModule from "@/lib/host";
 import type * as IdentityModule from "@/lib/identity";
 
+const identity = vi.hoisted(() => ({
+  user: "user-1" as string | null,
+  listeners: new Set<() => void>(),
+}));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
-  getCurrentUserId: () => "user-1",
+  getCurrentUserId: () => identity.user,
+  subscribeIdentity: (listener: () => void) => {
+    identity.listeners.add(listener);
+    return () => identity.listeners.delete(listener);
+  },
 }));
 vi.mock("@/lib/host", async (importOriginal) => ({
   ...(await importOriginal<typeof HostModule>()),
@@ -28,7 +36,18 @@ const list = createDeviceRecentList({
 });
 const SCOPE = ["github.com", "example-org/example-repo"];
 
-afterEach(() => window.localStorage.clear());
+afterEach(() => {
+  list.resetForTests();
+  identity.user = "user-1";
+  identity.listeners.clear();
+  window.localStorage.clear();
+});
+
+/** The workspace user becomes `user`, and identity tells its subscribers. */
+function identityBecomes(user: string | null) {
+  identity.user = user;
+  for (const listener of [...identity.listeners]) listener();
+}
 
 it("puts a batch first, its last item first, and keeps the list to its limit", () => {
   list.record(SCOPE, ["a"], list.owner());
@@ -39,4 +58,20 @@ it("puts a batch first, its last item first, and keeps the list to its limit", (
   // A batch naming an item twice keeps it once, where it was recorded last.
   list.record(SCOPE, ["b", "e", "b"], list.owner());
   expect(list.read(SCOPE)).toEqual(["b", "e", "d"]);
+});
+
+it("keeps the saved lists while the workspace user isn't known, and drops another user's once one is", () => {
+  list.record(SCOPE, ["a"], list.owner());
+  const stop = list.subscribe(() => {});
+  // A page loads before identity resolves, or its first request fails.
+  identityBecomes(null);
+  expect(list.hasSaved()).toBe(true);
+  identityBecomes("user-1");
+  expect(list.read(SCOPE)).toEqual(["a"]);
+  // A different user is a known owner: the first user's lists go.
+  identityBecomes("user-2");
+  expect(list.hasSaved()).toBe(false);
+  identityBecomes("user-1");
+  expect(list.read(SCOPE)).toEqual([]);
+  stop();
 });
