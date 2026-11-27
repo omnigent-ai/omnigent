@@ -33,6 +33,7 @@ it("does not read incoming layout while flushing the outgoing view on cleanup", 
           sessionIdle={false}
           conversationId="conv-cleanup"
           hasTasks={false}
+          loadingMoreHistory={false}
           disableVirtualization={false}
           onGeometryChange={vi.fn()}
         />
