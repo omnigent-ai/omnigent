@@ -44,6 +44,7 @@ describe("detectPullRequestShorthand", () => {
     ["a word in another script", "задача#12"],
     ["a word continuing in another script", "#12é"],
     ["a decomposed accent", "cafe\u0301#12"],
+    ["a letter outside the basic plane", "\u{1d49c}#12"],
     ["a mention", "@team#4"],
     ["a leading zero", "#012"],
     ["a number too large", "#99999999999"],

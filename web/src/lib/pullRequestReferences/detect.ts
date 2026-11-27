@@ -24,14 +24,26 @@ const NUMBER = "[1-9][0-9]{0,9}";
 // Hangul set no spaces between words, so they may border a reference (as `pullRequestRefs`).
 const UNSPACED_SCRIPT = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Hangul}";
 const WORD = `(?![${UNSPACED_SCRIPT}])[\\p{L}\\p{N}\\p{M}_]`;
-// Not inside a word, a path, a URL fragment, an entity or a mention.
-const BEFORE = `(?<!${WORD}|[./#&@-])`;
+// Not inside a word, a path, a URL fragment, an entity or a mention. Checked by hand, since
+// Safari before 16.4 can't parse a lookbehind.
+const BLOCKS_BEFORE = new RegExp(`^(?:${WORD}|[./#&@-])$`, "u");
 // Not followed by more of a word, `.md`, or `:12`.
 const AFTER = `(?!${WORD}|-|[.:][\\p{L}\\p{N}])`;
 const SHORTHAND = new RegExp(
-  `${BEFORE}(?:(${OWNER})\\/(${REPOSITORY})|(${BARE_REPOSITORY}))?#(${NUMBER})${AFTER}`,
+  `(?:(${OWNER})\\/(${REPOSITORY})|(${BARE_REPOSITORY}))?#(${NUMBER})${AFTER}`,
   "gu",
 );
+
+/** The whole character that ends just before `index`, astral ones included; "" at the start. */
+function characterBefore(text: string, index: number): string {
+  if (index === 0) return "";
+  const low = text.charCodeAt(index - 1);
+  const paired = index >= 2 && low >= 0xdc00 && low <= 0xdfff;
+  return text.slice(
+    paired && /[\ud800-\udbff]/.test(text[index - 2]!) ? index - 2 : index - 1,
+    index,
+  );
+}
 /** GitHub's largest PR number fits a signed 32-bit integer. */
 const MAX_NUMBER = 2 ** 31 - 1;
 
@@ -39,7 +51,13 @@ const MAX_NUMBER = 2 ** 31 - 1;
 export function detectPullRequestShorthand(text: string): PullRequestShorthand[] {
   if (!text.includes("#")) return [];
   const found: PullRequestShorthand[] = [];
-  for (const match of text.matchAll(SHORTHAND)) {
+  SHORTHAND.lastIndex = 0;
+  for (let match = SHORTHAND.exec(text); match; match = SHORTHAND.exec(text)) {
+    // A blocked start may still begin a reference one character on, as a lookbehind would try.
+    if (BLOCKS_BEFORE.test(characterBefore(text, match.index))) {
+      SHORTHAND.lastIndex = match.index + 1;
+      continue;
+    }
     const [whole, owner, ownedRepo, bareRepo, digits] = match;
     const number = Number(digits);
     if (number > MAX_NUMBER) continue;

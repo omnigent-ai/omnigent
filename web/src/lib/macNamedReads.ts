@@ -118,6 +118,8 @@ const floors = new Map<string, number>();
 const seen = new Set<string>();
 // Per host and login: how often what was read as it had to go, for copies kept outside queries.
 const epochs = new Map<string, number>();
+// Moves on every change of workspace user, so a switch away and back still moves each epoch.
+let identityChanges = 0;
 // Per host and login: the identity its last kept answer was read as, the one a change as it
 // names, until its status changes; and the logins main refused to read as since.
 const writers = new Map<string, { login: string; generation: number }>();
@@ -157,9 +159,9 @@ function bumpEpoch(host: string, login: string): void {
   epochs.set(id, (epochs.get(id) ?? 0) + 1);
 }
 
-/** Moves whenever what was read as `reader` must go, e.g. it signed out or the page left it. */
+/** Moves whenever what was read as `reader` must go: it signed out, the page left it, or the user changed. */
 export function namedReaderEpoch(reader: MacNamedReader): number {
-  return epochs.get(scopeId(reader.host, reader.login)) ?? 0;
+  return (epochs.get(scopeId(reader.host, reader.login)) ?? 0) + identityChanges;
 }
 
 /** Call `listener` whenever named reads become available or not, or a reader's answers go. */
@@ -215,6 +217,7 @@ function start(): void {
     const previous = user;
     user = getCurrentUserId();
     if (previous === user) return;
+    identityChanges += 1;
     writers.clear();
     refusedReaders.clear();
     answeredFor.clear();
