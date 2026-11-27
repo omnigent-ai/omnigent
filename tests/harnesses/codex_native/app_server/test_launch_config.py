@@ -678,18 +678,23 @@ def test_launch_argv_and_config_pin_name_the_same_model(
 
 
 @pytest.mark.parametrize(
-    ("source_model", "expected_model"),
-    [("system.ai.claude-opus-5-5", None), ("gpt-5.5", "gpt-5.5")],
-    ids=["claude-dropped", "gpt-kept"],
+    ("source_model", "pinned_model", "expected_model"),
+    [
+        ("system.ai.claude-opus-5-5", None, None),
+        ("gpt-5.5", None, "gpt-5.5"),
+        ("system.ai.claude-opus-5-5", "system.ai.claude-sonnet-5", "system.ai.claude-sonnet-5"),
+    ],
+    ids=["claude-dropped", "gpt-kept", "claude-pin-kept"],
 )
-async def test_unpinned_start_drops_claude_config_model(
+async def test_start_drops_claude_config_model_unless_pinned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     source_model: str,
+    pinned_model: str | None,
     expected_model: str | None,
 ) -> None:
-    """An unpinned launch never runs a copied Claude ``model`` Codex cannot serve."""
+    """An unpinned launch never runs a copied Claude ``model``; an explicit pin is kept."""
     real_codex_home = tmp_path / "real-codex-home"
     real_codex_home.mkdir()
     original = (
@@ -704,6 +709,7 @@ async def test_unpinned_start_drops_claude_config_model(
     _disable_codex_startup_rpc(monkeypatch)
 
     server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.pinned_model = pinned_model
     with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"):
         await server.start()
         await server.close()
