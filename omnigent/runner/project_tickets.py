@@ -233,6 +233,9 @@ async def execute_ticket_tool(
             return await _file_in_other_project(body, project_id, request)
         if name == "sys_project_lead_message":
             return await _message_other_lead(body, project_id, request)
+        if name == "sys_slack_reply":
+            sent = await request("POST", f"/v1/projects/{project_id}/slack/replies", json=body)
+            return json.dumps(sent, ensure_ascii=False)
         if name == "sys_project_board_read":
             return await _read_other_board(body, ticket_id, project_id, request)
         path = f"/v1/projects/{project_id}/tickets"

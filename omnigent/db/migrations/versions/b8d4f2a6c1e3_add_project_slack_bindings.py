@@ -1,11 +1,13 @@
-"""Add project Slack channel links, ``project_slack_bindings`` and ``project_slack_audit``.
+"""Add project Slack channel links and their relay state.
 
 Revision ID: b8d4f2a6c1e3
 Revises: a7c3e9f1b5d2
 
-Additive: two new tables that older binaries ignore. A binding is unique on
-its Slack channel and on its project, so the database arbitrates concurrent
-claims. Downgrade drops both tables, which unlinks every channel.
+Additive: new tables that older binaries ignore. ``project_slack_bindings`` is
+unique on its Slack channel and on its project, so the database arbitrates
+concurrent claims; ``project_slack_audit`` records changes and relay events;
+``project_slack_threads``, ``project_slack_messages`` and ``project_slack_outbox``
+hold the relay's durable state. Downgrade drops them all, unlinking every channel.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ def upgrade() -> None:
             sa.Column("destination", EnvelopedJSON(4096), nullable=True),
             sa.Column("automation_id", sa.String(128), nullable=True),
             sa.Column("relay_key_hash", sa.String(64), nullable=True),
+            sa.Column("channel_cursor", sa.String(32), nullable=True),
             sa.Column("last_error", sa.String(1024), nullable=True),
             sa.Column("owner_user_id", sa.String(128), nullable=False),
             sa.Column("created_by_user_id", sa.String(128), nullable=False),
@@ -74,9 +77,60 @@ def upgrade() -> None:
             "project_slack_audit",
             ["workspace_id", "project_id", "created_at"],
         )
+    if "project_slack_threads" not in tables:
+        op.create_table(
+            "project_slack_threads",
+            sa.Column("workspace_id", sa.BigInteger(), nullable=False),
+            sa.Column("binding_id", Uuid16(), nullable=False),
+            sa.Column("thread_ts", sa.String(32), nullable=False),
+            sa.Column("root_user", sa.String(32), nullable=False),
+            sa.Column("request_ts", sa.String(32), nullable=False),
+            sa.Column("mentioned_request_ts", sa.String(32), nullable=True),
+            sa.Column("last_seen_ts", sa.String(32), nullable=False),
+            sa.Column("ticket_id", Uuid16(), nullable=True),
+            sa.Column("created_at", sa.BigInteger(), nullable=False),
+            sa.Column("updated_at", sa.BigInteger(), nullable=False),
+            sa.PrimaryKeyConstraint("workspace_id", "binding_id", "thread_ts"),
+        )
+    if "project_slack_messages" not in tables:
+        op.create_table(
+            "project_slack_messages",
+            sa.Column("workspace_id", sa.BigInteger(), nullable=False),
+            sa.Column("binding_id", Uuid16(), nullable=False),
+            sa.Column("message_ts", sa.String(32), nullable=False),
+            sa.Column("outcome", sa.String(24), nullable=False),
+            sa.Column("created_at", sa.BigInteger(), nullable=False),
+            sa.PrimaryKeyConstraint("workspace_id", "binding_id", "message_ts"),
+        )
+    if "project_slack_outbox" not in tables:
+        op.create_table(
+            "project_slack_outbox",
+            sa.Column("workspace_id", sa.BigInteger(), nullable=False),
+            sa.Column("id", Uuid16(), nullable=False),
+            sa.Column("binding_id", Uuid16(), nullable=False),
+            sa.Column("thread_ts", sa.String(32), nullable=False),
+            sa.Column("text", sa.Text(), nullable=False),
+            sa.Column("state", sa.String(16), nullable=False),
+            sa.Column("attempts", sa.Integer(), nullable=False),
+            sa.Column("lease_until", sa.BigInteger(), nullable=True),
+            sa.Column("slack_ts", sa.String(32), nullable=True),
+            sa.Column("last_error", sa.String(512), nullable=True),
+            sa.Column("created_at", sa.BigInteger(), nullable=False),
+            sa.Column("updated_at", sa.BigInteger(), nullable=False),
+            sa.PrimaryKeyConstraint("workspace_id", "id"),
+        )
+        op.create_index(
+            "ix_project_slack_outbox_binding_state",
+            "project_slack_outbox",
+            ["workspace_id", "binding_id", "state"],
+        )
 
 
 def downgrade() -> None:
+    op.drop_index("ix_project_slack_outbox_binding_state", table_name="project_slack_outbox")
+    op.drop_table("project_slack_outbox")
+    op.drop_table("project_slack_messages")
+    op.drop_table("project_slack_threads")
     op.drop_index("ix_project_slack_audit_project", table_name="project_slack_audit")
     op.drop_table("project_slack_audit")
     op.drop_table("project_slack_bindings")

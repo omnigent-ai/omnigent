@@ -1265,6 +1265,8 @@ class SqlProjectSlackBinding(OmnigentBase):
     automation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # SHA-256 of the per-binding relay key; the key itself is never stored.
     relay_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Newest Slack ts the watcher has fully read; advanced only after acceptance.
+    channel_cursor: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     created_by_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -1280,6 +1282,61 @@ class SqlProjectSlackBinding(OmnigentBase):
             name="uq_project_slack_bindings_channel",
         ),
         UniqueConstraint("workspace_id", "project_id", name="uq_project_slack_bindings_project"),
+    )
+
+
+class SqlProjectSlackThread(OmnigentBase):
+    """A Slack thread a project is talking in, and the request it is answering."""
+
+    __tablename__ = "project_slack_threads"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    binding_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    thread_ts: Mapped[str] = mapped_column(String(32), primary_key=True)
+    root_user: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The newest human message the Lead was handed, and the one its root author
+    # was last mentioned for, so each new request pings them once.
+    request_ts: Mapped[str] = mapped_column(String(32), nullable=False)
+    mentioned_request_ts: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_seen_ts: Mapped[str] = mapped_column(String(32), nullable=False)
+    ticket_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class SqlProjectSlackMessage(OmnigentBase):
+    """A Slack message already handled for a link; replays are skipped."""
+
+    __tablename__ = "project_slack_messages"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    binding_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    message_ts: Mapped[str] = mapped_column(String(32), primary_key=True)
+    outcome: Mapped[str] = mapped_column(String(24), nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class SqlProjectSlackOutbox(OmnigentBase):
+    """A reply waiting for the watcher to post it in its Slack thread."""
+
+    __tablename__ = "project_slack_outbox"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    binding_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    thread_ts: Mapped[str] = mapped_column(String(32), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # pending | claimed | uncertain | posted | failed
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_until: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    slack_ts: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_project_slack_outbox_binding_state", "workspace_id", "binding_id", "state"),
     )
 
 

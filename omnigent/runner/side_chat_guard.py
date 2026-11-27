@@ -24,6 +24,7 @@ ROLE_SIDE_CHAT_BLOCKED_TOOLS = frozenset(
         "sys_ticket_create",
         "sys_project_ticket_file",
         "sys_project_lead_message",
+        "sys_slack_reply",
         "sys_ticket_import_pr",
         "sys_ticket_land",
         "sys_ticket_revert_draft",

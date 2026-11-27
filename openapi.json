@@ -9340,6 +9340,147 @@
         "title": "ReconnectLiveMCPServerRequest",
         "type": "object"
       },
+      "RelayAck": {
+        "additionalProperties": false,
+        "properties": {
+          "failed": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed"
+          },
+          "slack_ts": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{6,12}(?:\\.\\d{1,8})?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slack Ts"
+          },
+          "uncertain": {
+            "default": false,
+            "title": "Uncertain",
+            "type": "boolean"
+          }
+        },
+        "title": "RelayAck",
+        "type": "object"
+      },
+      "RelayEvent": {
+        "properties": {
+          "bot_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bot Id"
+          },
+          "mentioned": {
+            "default": false,
+            "title": "Mentioned",
+            "type": "boolean"
+          },
+          "permalink": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Permalink",
+            "type": "string"
+          },
+          "subtype": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtype"
+          },
+          "text": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Text",
+            "type": "string"
+          },
+          "thread_ts": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{6,12}(?:\\.\\d{1,8})?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Ts"
+          },
+          "ts": {
+            "pattern": "^\\d{6,12}(?:\\.\\d{1,8})?$",
+            "title": "Ts",
+            "type": "string"
+          },
+          "user": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "User",
+            "type": "string"
+          },
+          "user_name": {
+            "default": "",
+            "maxLength": 128,
+            "title": "User Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts",
+          "user"
+        ],
+        "title": "RelayEvent",
+        "type": "object"
+      },
+      "RelayEvents": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{6,12}(?:\\.\\d{1,8})?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RelayEvent"
+            },
+            "maxItems": 200,
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "title": "RelayEvents",
+        "type": "object"
+      },
       "ResetSessionModelOverrideRequest": {
         "additionalProperties": false,
         "description": "Reset a launch-time model selection only while that selection is current.",
@@ -17593,6 +17734,42 @@
           }
         },
         "title": "SlackLinkBody",
+        "type": "object"
+      },
+      "SlackReply": {
+        "additionalProperties": false,
+        "description": "The Lead's reply in a Slack thread it was asked in.",
+        "properties": {
+          "message": {
+            "maxLength": 3500,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "thread": {
+            "description": "The thread ts from the Slack message.",
+            "pattern": "^\\d{6,12}(?:\\.\\d{1,8})?$",
+            "title": "Thread",
+            "type": "string"
+          },
+          "ticket_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ticket Id"
+          }
+        },
+        "required": [
+          "thread",
+          "message"
+        ],
+        "title": "SlackReply",
         "type": "object"
       },
       "SlashCommandData": {
@@ -26689,6 +26866,61 @@
           }
         },
         "summary": "Enable Project Slack",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/slack/replies": {
+      "post": {
+        "description": "As the project's Lead, answer in a Slack thread the project was asked in.\n\nThe first answer to each new request mentions the thread's author once;\nevery reply ends with an italic \"via <project> \u00b7 Lead\" footer.",
+        "operationId": "reply_in_slack_v1_projects__project_id__slack_replies_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SlackReply"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reply In Slack V1 Projects  Project Id  Slack Replies Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reply In Slack",
         "tags": [
           "projects"
         ]
@@ -36666,6 +36898,215 @@
         "summary": "Get Skills",
         "tags": [
           "skills"
+        ]
+      }
+    },
+    "/v1/slack-relay/{binding_id}/events": {
+      "post": {
+        "description": "Hand new Slack messages to the project's Lead, then advance the cursor.\n\nBots, system messages and the project's own replies are dropped. Repeats\nare skipped. If the Lead can't be reached nothing is recorded, so the\nwatcher keeps its cursor and the next run sends them again.",
+        "operationId": "slack_relay_events_v1_slack_relay__binding_id__events_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayEvents"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Slack Relay Events V1 Slack Relay  Binding Id  Events Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Slack Relay Events",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/slack-relay/{binding_id}/replies": {
+      "get": {
+        "description": "Lease the replies waiting to be posted.",
+        "operationId": "slack_relay_replies_v1_slack_relay__binding_id__replies_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Slack Relay Replies V1 Slack Relay  Binding Id  Replies Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Slack Relay Replies",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/slack-relay/{binding_id}/replies/{reply_id}/ack": {
+      "post": {
+        "description": "Settle a leased reply: posted, failed (retried a few times), or uncertain.",
+        "operationId": "slack_relay_ack_v1_slack_relay__binding_id__replies__reply_id__ack_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "reply_id",
+            "required": true,
+            "schema": {
+              "title": "Reply Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayAck"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Slack Relay Ack V1 Slack Relay  Binding Id  Replies  Reply Id  Ack Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Slack Relay Ack",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/slack-relay/{binding_id}/state": {
+      "get": {
+        "description": "The watcher's cursor and the threads it must re-read this run.",
+        "operationId": "slack_relay_state_v1_slack_relay__binding_id__state_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Slack Relay State V1 Slack Relay  Binding Id  State Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Slack Relay State",
+        "tags": [
+          "projects"
         ]
       }
     },

@@ -885,6 +885,38 @@ class SysProjectBoardReadTool(_TicketTool):
         return cls.help_text
 
 
+class ReplyInSlack(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    thread: str = Field(
+        min_length=1,
+        max_length=32,
+        description="The thread ts shown in the Slack message you were handed.",
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=3500,
+        description="Your reply in Markdown; links stay clickable. Don't add a signature: "
+        "a 'via <project> · Lead' footer is added, and the thread's author is mentioned "
+        "once per new request.",
+    )
+    ticket_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="A ticket you filed for this thread, so later updates can find it.",
+    )
+
+
+class SysSlackReplyTool(_TicketTool):
+    tool_name = "sys_slack_reply"
+    help_text = (
+        "As the project's Lead, reply in a Slack thread this project was asked in through "
+        "its linked channel. The reply is queued and posted as @omni by the channel "
+        "watcher on its next run. Use it only for threads you were handed; it can't start "
+        "new threads or post anywhere else."
+    )
+    arguments = ReplyInSlack
+
+
 TICKET_TOOL_CLASSES = (
     SysTicketListTool,
     SysTicketGetTool,
@@ -914,6 +946,7 @@ TICKET_TOOL_CLASSES = (
     SysProjectTelemetryGetTool,
     SysProjectLeadMessageTool,
     SysProjectBoardReadTool,
+    SysSlackReplyTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}
 READ_ONLY_TICKET_TOOLS: tuple[str, ...] = tuple(

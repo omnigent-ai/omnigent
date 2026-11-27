@@ -4860,6 +4860,20 @@ def create_app(
                     if _slack_automation is not None
                     else None
                 )
+                from omnigent.server.routes.slack_relay import create_slack_relay_router
+                from omnigent.stores.project_slack_relay_store import SlackRelayStore
+
+                app.include_router(
+                    create_slack_relay_router(
+                        project_store,
+                        app.state.project_slack_store,
+                        SlackRelayStore(kpi_location),
+                        conversation_store,
+                        auth_provider=auth_provider,
+                    ),
+                    prefix="/v1",
+                    tags=["projects"],
+                )
                 app.include_router(
                     create_project_slack_router(
                         project_store,
