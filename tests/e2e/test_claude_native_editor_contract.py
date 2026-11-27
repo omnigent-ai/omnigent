@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ def test_claude_external_editor_preserves_exact_logical_drafts(
     tmp_path: Path,
     isolated_mock_llm_server_url: str,
     claude_managed_settings: None,
+    record_property: Callable[[str, object], None],
 ) -> None:
     claude, tmux_binary = shutil.which("claude"), shutil.which("tmux")
     assert claude is not None and tmux_binary is not None
@@ -55,7 +57,8 @@ def test_claude_external_editor_preserves_exact_logical_drafts(
         "CLAUDE_CONFIG_DIR": str(config),
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "ANTHROPIC_BASE_URL": isolated_mock_llm_server_url,
-        "ANTHROPIC_API_KEY": "mock-key",
+        "ANTHROPIC_AUTH_TOKEN": "mock-key",
+        "DISABLE_AUTOUPDATER": "1",
         "EDITOR": editor_command,
         "VISUAL": editor_command,
     }
@@ -82,10 +85,14 @@ def test_claude_external_editor_preserves_exact_logical_drafts(
         def command(*args: str, text: str | None = None) -> None:
             subprocess.run([*tmux, *args], input=text, text=True, check=True, timeout=10)
 
+        last_pane = ""
+
         def pane() -> str:
-            return subprocess.check_output(
+            nonlocal last_pane
+            last_pane = subprocess.check_output(
                 [*tmux, "capture-pane", "-p", "-t", target], text=True, timeout=5
             )
+            return last_pane
 
         try:
             subprocess.run(
@@ -114,7 +121,10 @@ def test_claude_external_editor_preserves_exact_logical_drafts(
                 check=True,
                 timeout=10,
             )
-            poll_until(lambda: bridge._composer_box(pane()) is not None, timeout_s=30)
+            try:
+                poll_until(lambda: bridge._composer_box(pane()) is not None, timeout_s=30)
+            except AssertionError as exc:
+                raise AssertionError({"phase": "initial-composer", "pane": pane()}) from exc
             command("load-buffer", "-b", "editor-draft", "-", text=drafts[0])
             command("paste-buffer", "-d", "-p", "-b", "editor-draft", "-t", target)
             poll_until(lambda: "draft-end" in pane(), timeout_s=10)
@@ -134,5 +144,18 @@ def test_claude_external_editor_preserves_exact_logical_drafts(
                 )
             assert get_mock_message_requests(isolated_mock_llm_server_url) == []
         finally:
-            print(json.dumps({"version": version.strip(), "editor_observations": observations()}))
-            subprocess.run([*tmux, "kill-server"], capture_output=True, check=False, timeout=10)
+            try:
+                diagnostics = {
+                    "version": version.strip(),
+                    "editor_observations": observations(),
+                    "last_pane": last_pane,
+                    "provider_messages": len(
+                        get_mock_message_requests(isolated_mock_llm_server_url)
+                    ),
+                }
+                record_property("editor_contract", json.dumps(diagnostics))
+                print(json.dumps(diagnostics))
+            finally:
+                subprocess.run(
+                    [*tmux, "kill-server"], capture_output=True, check=False, timeout=10
+                )
