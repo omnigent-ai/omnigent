@@ -97,15 +97,30 @@ export async function cancelSessionTimer(sessionId: string, timerId: string): Pr
   return true;
 }
 
-/** Stop the caller's loop in the session: the cancelled timer's id, or `null` when none ran. */
-export async function stopSessionLoop(sessionId: string): Promise<string | null> {
+async function deleteSessionLoop(
+  sessionId: string,
+): Promise<{ timer_id?: string | null; status?: string }> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/timers?origin=${LOOP_TIMER_ORIGIN}`,
     { method: "DELETE" },
   );
   if (!res.ok) throw await apiErrorFromResponse(res);
-  const body = (await res.json()) as { timer_id?: string | null };
+  return (await res.json()) as { timer_id?: string | null; status?: string };
+}
+
+/** Stop the caller's loop in the session: the cancelled timer's id, or `null` when none ran. */
+export async function stopSessionLoop(sessionId: string): Promise<string | null> {
+  const body = await deleteSessionLoop(sessionId);
   return typeof body.timer_id === "string" ? body.timer_id : null;
+}
+
+/**
+ * Stop the caller's loop in a session they were moved on from. Resolves whether the
+ * session had one: stopped by this call, or already retired there by the scheduler.
+ */
+export async function stopSupersededSessionLoop(sessionId: string): Promise<boolean> {
+  const body = await deleteSessionLoop(sessionId);
+  return typeof body.timer_id === "string" || body.status === "retired";
 }
 
 /**

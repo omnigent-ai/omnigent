@@ -1848,16 +1848,12 @@ describe("Composer slash-command menu", () => {
     expect(await screen.findByText("Loop stopped.")).toBeVisible();
   });
 
-  it.each([
-    // A lone "/loop" token completes from the menu on Enter; the completed form submits.
-    ["/loop ", "Usage: /loop <interval> <prompt>"],
-    ["/loop 90s check CI", "The shortest loop is 2m; 90s is too short."],
-  ])("%s shows the problem under the composer and arms nothing", async (typed, hint) => {
+  it("shows a /loop command's problem under the composer and arms nothing", async () => {
+    // What is wrong with a command is loopCommand.test.ts's; this is where it shows.
+    const typed = "/loop 90s check CI";
     const { setTimer, onSend } = renderLoopComposer("claude-sdk", savesTimers);
     submitLoop(typed);
-    expect(
-      await screen.findByText(new RegExp(hint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))),
-    ).toBeVisible();
+    expect(await screen.findByText(/The shortest loop is 2m; 90s is too short\./)).toBeVisible();
     expect(setTimer).not.toHaveBeenCalled();
     expect(onSend).not.toHaveBeenCalled();
     // The typed command stays for the user to fix.

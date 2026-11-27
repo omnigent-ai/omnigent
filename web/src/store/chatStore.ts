@@ -88,7 +88,7 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
-import { runSessionTimerMutation, stopSessionLoop } from "@/lib/sessionTimersApi";
+import { runSessionTimerMutation, stopSupersededSessionLoop } from "@/lib/sessionTimersApi";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
@@ -9040,9 +9040,9 @@ function committedUserBlock(
  */
 function reportLoopStoppedBySupersession(sessionId: string): void {
   // Queued behind a /loop this tab is still arming in that session.
-  runSessionTimerMutation(sessionId, () => stopSessionLoop(sessionId))
-    .then((stopped) => {
-      if (stopped === null) return;
+  runSessionTimerMutation(sessionId, () => stopSupersededSessionLoop(sessionId))
+    .then((hadLoop) => {
+      if (!hadLoop) return;
       toast.info(
         "Your loop stopped when this chat moved to a new session. Run /loop again to restart it.",
         { id: `loop-stopped-${sessionId}` },

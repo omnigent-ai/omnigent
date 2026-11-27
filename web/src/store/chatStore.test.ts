@@ -177,24 +177,17 @@ vi.mock("@/lib/identity", async (importOriginal) => {
   };
 });
 
-/** Stub the server's answer to stopping the viewer's loop in a session. */
-function stubLoopStop(answer: string | null | Error) {
-  const stop = vi.spyOn(sessionTimersApi, "stopSessionLoop");
-  if (answer instanceof Error) stop.mockRejectedValue(answer);
-  else stop.mockResolvedValue(answer);
+/** Stub whether the session a viewer was moved on from had a loop of theirs to stop. */
+function stubLoopStop(hadLoop: boolean | Error) {
+  const stop = vi.spyOn(sessionTimersApi, "stopSupersededSessionLoop");
+  if (hadLoop instanceof Error) stop.mockRejectedValue(hadLoop);
+  else stop.mockResolvedValue(hadLoop);
   const info = vi.spyOn(toast, "info").mockReturnValue("loop-stopped");
   onTestFinished(() => {
     stop.mockRestore();
     info.mockRestore();
   });
   return { stop, info };
-}
-
-/** Let promise chains started by the code under test run to their end. */
-function promiseChainsSettled(): Promise<void> {
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, 0);
-  });
 }
 
 function userMessage(responseId: string, text: string): ConversationItem {
@@ -9148,7 +9141,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     it.each(["clear", "rewind"] as const)(
       "stops the viewer's loop in a session a /%s moved them on from, and says so",
       async (reason) => {
-        const { stop, info } = stubLoopStop("st_loop");
+        const { stop, info } = stubLoopStop(true);
         useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
         handleSessionEvent({
           type: "session_superseded",
@@ -9165,7 +9158,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     );
 
     it.each([
-      ["the viewer had no loop there", null],
+      ["the viewer had no loop there", false],
       ["the server can't say, as an older one can't", new Error("Not Found")],
     ])("says nothing about a loop when %s", async (_, answer) => {
       const { stop, info } = stubLoopStop(answer);
@@ -9177,14 +9170,14 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         reason: "clear",
       });
       await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(1));
-      await promiseChainsSettled();
+      await tick();
       expect(info).not.toHaveBeenCalled();
       // The redirect never waits on it.
       expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
     });
 
     it("leaves a loop alone in a session the viewer is not being moved on from", async () => {
-      const { stop } = stubLoopStop("st_loop");
+      const { stop } = stubLoopStop(true);
       useChatStore.setState({ conversationId: "conv_current", redirectToConversationId: null });
       handleSessionEvent({
         type: "session_superseded",
@@ -9192,7 +9185,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         targetConversationId: "conv_new",
         reason: "clear",
       });
-      await promiseChainsSettled();
+      await tick();
       expect(stop).not.toHaveBeenCalled();
     });
   });
@@ -9280,9 +9273,9 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ["once, from the reply, when the live redirect was missed", false, 1],
       ["once more, to no effect, when the live redirect lands after the reply", true, 2],
     ])("reports the viewer's stopped loop %s", async (_, lateRedirect, asked) => {
-      const { stop, info } = stubLoopStop("st_loop");
+      const { stop, info } = stubLoopStop(true);
       // A second ask finds the loop already stopped.
-      stop.mockResolvedValueOnce("st_loop").mockResolvedValue(null);
+      stop.mockResolvedValueOnce(true).mockResolvedValue(false);
       useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
       answerClear({ queued: false, session_id: "conv_new" })();
 
@@ -9296,14 +9289,14 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         });
       }
       await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(asked));
-      await promiseChainsSettled();
+      await tick();
 
       expect(stop).toHaveBeenCalledWith("conv_old");
       expect(info).toHaveBeenCalledTimes(1);
     });
 
     it("says nothing about a loop for a clear the viewer switched away from", async () => {
-      const { stop } = stubLoopStop("st_loop");
+      const { stop } = stubLoopStop(true);
       useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
       const acknowledge = answerClear({ queued: false, session_id: "conv_new" });
 
@@ -9311,7 +9304,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       useChatStore.setState({ conversationId: "conv_other" });
       acknowledge();
       await clearing;
-      await promiseChainsSettled();
+      await tick();
 
       expect(stop).not.toHaveBeenCalled();
     });
@@ -9374,12 +9367,12 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         clearSessionDrafts();
         useChatStore.setState({ rewindPrefill: null });
       });
-      const { stop, info } = stubLoopStop("st_loop");
+      const { stop, info } = stubLoopStop(true);
       useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: pending });
       answerRewind(Response.json({ session_id: "conv_new", prompt: "Add parser tests" }));
 
       await useChatStore.getState().rewindToPrompt("msg_second");
-      await promiseChainsSettled();
+      await tick();
 
       expect(stop).toHaveBeenCalledTimes(asked);
       expect(info).toHaveBeenCalledTimes(asked);

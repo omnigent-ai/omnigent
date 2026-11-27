@@ -90,6 +90,8 @@ def timer_interval(rule: str) -> int:
 # A timer's name says which client set it: the web composer's /loop saves
 # ``Loop: <prompt>``; an agent's sys_timer_set saves ``Timer: <note>``.
 LOOP_TIMER_NAME = "Loop"
+# The longest interval a /loop repeats at: seven days, as the composer offers.
+LOOP_MAX_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 
 
 def timer_origin(name: str) -> str:

@@ -8,6 +8,7 @@ import {
   sendLoopPrompt,
   setSessionTimer,
   stopSessionLoop,
+  stopSupersededSessionLoop,
   TIMER_NOT_SAVED_CODE,
 } from "./sessionTimersApi";
 
@@ -163,6 +164,18 @@ describe("stopSessionLoop", () => {
   it("throws the server's error when the stop is refused", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Session not found" }, 404));
     await expect(stopSessionLoop("conv_a")).rejects.toMatchObject({ status: 404 });
+  });
+
+  it.each([
+    ["stopped by this call", { timer_id: "st_loop", status: "cancelled" }, true],
+    ["the scheduler had already retired", { timer_id: null, status: "retired" }, true],
+    ["that never ran", { timer_id: null, status: "none" }, false],
+  ])("tells a superseded session's loop %s apart", async (_, reply, hadLoop) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(reply));
+    await expect(stopSupersededSessionLoop("conv_a")).resolves.toBe(hadLoop);
+    // A retired loop is not one `/loop stop` stopped.
+    fetchMock.mockResolvedValueOnce(jsonResponse(reply));
+    await expect(stopSessionLoop("conv_a")).resolves.toBe(reply.timer_id);
   });
 });
 

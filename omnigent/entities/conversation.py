@@ -359,6 +359,18 @@ class StartupInputOptions(BaseModel):
 _MAX_MESSAGE_LABEL_LENGTH = 64
 
 
+def message_label(label: object) -> str | None:
+    """
+    Return a message phase or origin label, or ``None`` for a malformed one.
+
+    :param label: The candidate label, e.g. ``"loop"``.
+    :returns: *label* when it is a non-empty string within the length bound.
+    """
+    if isinstance(label, str) and 0 < len(label) <= _MAX_MESSAGE_LABEL_LENGTH:
+        return label
+    return None
+
+
 class MessageData(BaseModel):
     """
     Data for a message item (user or assistant).
@@ -419,9 +431,7 @@ class MessageData(BaseModel):
     @classmethod
     def drop_malformed_label(cls, label: object) -> str | None:
         """Read a malformed phase or origin as unset rather than rejecting the message."""
-        if isinstance(label, str) and 0 < len(label) <= _MAX_MESSAGE_LABEL_LENGTH:
-            return label
-        return None
+        return message_label(label)
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:

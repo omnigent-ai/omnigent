@@ -89,6 +89,7 @@ from omnigent.server.scheduled.rrule import (
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.schedule import (
+    LOOP_MAX_INTERVAL_SECONDS,
     LOOP_TIMER_NAME,
     continued_sandbox_host_id,
     is_trigger_automation,
@@ -2596,8 +2597,9 @@ def create_scheduled_tasks_router(
             like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``, plus an
             optional ``origin``: ``"loop"`` marks the web composer's ``/loop`` timer, whose
             ``note`` (required) is the prompt each firing sends visibly and which replaces
-            the caller's running loop in this session (``docs/AUTOMATIONS.md``); anything
-            else is refused.
+            the caller's running loop in this session (``docs/AUTOMATIONS.md``). A loop
+            must repeat, at most every ``LOOP_MAX_INTERVAL_SECONDS``; any other origin
+            is refused.
         :returns: ``durable`` true, ``timer_id``, ``status`` ``"scheduled"``, the UTC
             ``fire_at`` of the first firing, ``interval_seconds`` for a repeating timer
             (else ``None``), the ``seconds``, ``repeat``, ``note`` and ``origin`` it was
@@ -2628,6 +2630,15 @@ def create_scheduled_tasks_router(
         if origin is not None and not note:
             raise OmnigentError(
                 "a loop needs a note: the prompt it repeats", code=ErrorCode.INVALID_INPUT
+            )
+        if origin is not None and not repeat:
+            raise OmnigentError(
+                "a loop repeats: repeat must be true", code=ErrorCode.INVALID_INPUT
+            )
+        if origin is not None and seconds > LOOP_MAX_INTERVAL_SECONDS:
+            raise OmnigentError(
+                f"a loop repeats at most every {LOOP_MAX_INTERVAL_SECONDS} seconds (7 days)",
+                code=ErrorCode.INVALID_INPUT,
             )
         if seconds < DURABLE_TIMER_MIN_SECONDS:
             raise OmnigentError(
@@ -2755,8 +2766,10 @@ def create_scheduled_tasks_router(
         Only ``origin=loop`` is accepted: the loop is the timer the session remembers
         for the caller, so the agent's own timers are never touched. Repeating is safe.
 
-        :returns: ``{"timer_id": "...", "status": "cancelled"}``, or ``status``
-            ``"none"`` with a ``None`` ``timer_id`` when no loop was running.
+        :returns: ``{"timer_id": "...", "status": "cancelled"}``. With a ``None``
+            ``timer_id``: ``status`` ``"none"`` when the session remembered no loop,
+            or ``"retired"`` when the one it remembered had already ended, e.g. at a
+            firing after the session was superseded.
         :raises OmnigentError: 400 for any other ``origin``; 403/404 as for posting a
             message.
         """
@@ -2784,7 +2797,7 @@ def create_scheduled_tasks_router(
                 try:
                     running = await _running_loop(conv, user_id, timer_id)
                     if running is None:
-                        return {"timer_id": None, "status": "none"}
+                        return {"timer_id": None, "status": "retired"}
                     await asyncio.to_thread(store.delete, running.id)
                 except Exception:
                     _logger.warning(

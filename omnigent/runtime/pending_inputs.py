@@ -114,6 +114,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.entities.conversation import message_label
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
@@ -407,7 +408,8 @@ def record(
         idempotent across client retries. ``None`` for clients that do not
         send one.
     :param origin: What sent the message when no human typed it, e.g. ``"loop"``
-        for a ``/loop`` run, kept so the committed item carries it.
+        for a ``/loop`` run, kept so the committed item carries it. A malformed
+        one is dropped, as on a stored message.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -429,7 +431,8 @@ def record(
             pending_id=pending_id,
             content=copy.deepcopy(content),
             created_by=created_by,
-            origin=origin,
+            # The mirror copies this onto the stored message past its validator.
+            origin=message_label(origin),
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
         )

@@ -8093,6 +8093,11 @@ async def test_a_sub_agent_or_side_chat_timer_is_left_to_its_runner(
         ({"seconds": 300, "every": 5}, "unknown timer fields: every"),
         ({"seconds": 300, "origin": "cron"}, "origin must be 'loop'"),
         ({"seconds": 300, "origin": "loop"}, "a loop needs a note"),
+        ({"seconds": 300, "note": "check CI", "origin": "loop"}, "repeat must be true"),
+        (
+            {"seconds": 604801, "repeat": True, "note": "check CI", "origin": "loop"},
+            "at most every 604800 seconds",
+        ),
     ],
 )
 async def test_timer_requests_are_checked_like_the_tools_arguments(
@@ -8209,6 +8214,12 @@ async def test_a_loop_replaces_the_callers_loop_and_stops_on_request(
     stopped = await stop(origin="loop")
     assert stopped.status_code == 200, stopped.text
     assert stopped.json() == {"timer_id": second["timer_id"], "status": "cancelled"}
+    assert (await stop(origin="loop")).json() == {"timer_id": None, "status": "none"}
+    # A loop the scheduler retired first, as it does once the session is superseded,
+    # is still one the session remembered: the reply says so, once.
+    third = await saved({"seconds": 300, "repeat": True, "note": "third", "origin": "loop"})
+    assert store.delete(third["timer_id"])
+    assert (await stop(origin="loop")).json() == {"timer_id": None, "status": "retired"}
     assert (await stop(origin="loop")).json() == {"timer_id": None, "status": "none"}
     assert {task.id for task in store.list(kinds=("timer",))} == {
         agent_timer["timer_id"],

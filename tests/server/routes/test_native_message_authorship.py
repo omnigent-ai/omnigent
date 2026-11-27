@@ -98,12 +98,16 @@ async def test_native_authorship_survives_delivery_and_retries(
 async def test_native_delivery_keeps_a_loop_runs_origin(
     db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A /loop run typed into the terminal comes back labelled, as its author does."""
+    """A /loop run typed into the terminal comes back labelled, as its author does.
+
+    An origin too long for a stored message is dropped rather than copied onto one.
+    """
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Loop")
-    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
     transcript = tmp_path / "session.jsonl"
-    for text, origin in (("check CI", "loop"), ("thanks", None)):
+    for text, origin in (("check CI", "loop"), ("thanks", None), ("again", "x" * 65)):
         record = {"type": "user", "message": {"role": "user", "content": text}}
         transcript.write_text(json.dumps({"uuid": f"native-{text}", **record}) + "\n")
         [parsed] = read_transcript_items_since(transcript, 0, agent_name="Claude")[2]
@@ -119,4 +123,12 @@ async def test_native_delivery_keeps_a_loop_runs_origin(
     ] == [
         ("check CI", "loop", "alice@example.com"),
         ("thanks", None, "alice@example.com"),
+        ("again", None, "alice@example.com"),
     ]
+    # The live receipt carries the label the stored message does.
+    receipts = [call.args[1] for call in publish.call_args_list]
+    assert [
+        receipt["data"]["data"].get("origin")
+        for receipt in receipts
+        if receipt["type"] == "session.input.consumed"
+    ] == ["loop", None, None]
