@@ -594,6 +594,10 @@ run the relevant node IDs below with `uv run --no-sync pytest --reruns 0`:
   checks rejection before arguments or baseline settings change.
 - `tests/harnesses/claude_native/test_claude_native.py::test_cli_settings_probe_falls_back_without_creating_owned_request`
   checks legacy fallback for failed or unsupported ownership probes.
+  A successful probe selects the [Claude launch API](./terminals.md) route
+  `POST /v1/sessions/{session_id}/resources/claude-settings-v2/terminals` only
+  when both peers advertise support. Legacy fallback is chosen before dispatch;
+  a dispatched v2 launch is never retried through the older route.
 - `tests/runner/test_comment_relay.py::test_cli_settings_request_ownership_survives_admission_and_terminal_lifecycle`
   checks the explicit CLI launch route, composition after filesystem selection,
   typed startup refusals and ownership release without spawning a vendor CLI.

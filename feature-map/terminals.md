@@ -144,6 +144,13 @@ unsupported explanation.
 **Local terminal:** a native harness launched from the CLI runs in the user's
 own terminal; see [native harnesses](./native-harnesses.md).
 
+**Claude launch API:** clients that negotiate settings ownership with both
+server and runner use
+`POST /v1/sessions/{session_id}/resources/claude-settings-v2/terminals`.
+Older peers use `POST /v1/sessions/{session_id}/resources/terminals` after
+negotiation, before dispatching a launch. Once a v2 request has been dispatched,
+keep its identity and outcome; do not replay it through the legacy route.
+
 ## Driving it with the repro environment
 
 Preconditions: a running instance (`verify-env start`, then `verify-env
@@ -156,6 +163,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 ```
 
 - **`agent-terminal-view`:**
+  Claude launch API ownership and refusal envelopes are covered by
+  `tests/runner/test_comment_relay.py::test_cli_settings_request_ownership_survives_admission_and_terminal_lifecycle`.
+  `tests/harnesses/claude_native/test_settings_fenced_lifecycle.py::test_additive_capability_negotiation_keeps_legacy_fallback`
+  covers peer negotiation, and
+  `tests/harnesses/claude_native/test_settings_fenced_lifecycle.py::test_dispatched_v2_is_not_downgraded_if_runner_changes`
+  protects against replay through the older route after dispatch. These are
+  component checks; they do not establish completed-consumer reclamation.
   `tests/browser_ui/chat/test_terminal_auto_resume.py` covers automatic recovery
   through the desktop switch, keyboard shortcut, mobile menu and grid switch,
   plus failed attempts followed by manual Resume, including a cached closed

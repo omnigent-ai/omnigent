@@ -184,14 +184,20 @@ def prepare_claude_settings_lifecycle(
         # Fresh metadata fences admissions without removing any ownership files.
         lifecycle = None
     identity = _directory_identity(bridge_dir)
-    same_session = (
-        lifecycle is not None
-        and lifecycle.admission_epoch is not None
-        and session_id is not None
-        and lifecycle.session_id == session_id
-        and lifecycle.bridge_identity == identity
-        and _bridge_session_id(bridge_dir) == session_id
-    )
+    try:
+        same_session = (
+            lifecycle is not None
+            and lifecycle.admission_epoch is not None
+            and session_id is not None
+            and lifecycle.session_id == session_id
+            and lifecycle.bridge_identity == identity
+            and _bridge_session_id(bridge_dir) == session_id
+        )
+    except (OSError, ValueError):
+        if not reactivate:
+            raise
+        # Unverified bridge configuration fences admissions without removing old inputs.
+        same_session = False
     if lifecycle is None or (reactivate and not same_session):
         incarnation = secrets.token_hex(16)
         lifecycle = _ClaudeSettingsLifecycle(

@@ -5948,6 +5948,9 @@ def create_runner_app(
             post_tools_changed,
             start_tool_relay,
         )
+        from omnigent.harnesses.claude_native.settings_generation import (
+            ClaudeSettingsRequestExpired,
+        )
 
         workflows_enabled = await server_workflows_enabled(server_client)
 
@@ -6189,7 +6192,7 @@ def create_runner_app(
                         session_id=session_id,
                         file_change_observer=_observe_native_file_changes,
                     )
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ClaudeSettingsRequestExpired):
             _logger.warning(
                 "Failed to start comment relay for session=%s",
                 session_id,

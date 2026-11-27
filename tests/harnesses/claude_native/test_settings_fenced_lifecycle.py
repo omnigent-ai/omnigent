@@ -60,6 +60,40 @@ def _populate(request: ClaudeSettingsRequest) -> Path:
     return request.settings_path(request.bridge_dir)
 
 
+@pytest.mark.parametrize("removed_before_lock", [False, True])
+def test_deletion_rechecks_absence_without_creating_bridge_state(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, removed_before_lock: bool
+) -> None:
+    from omnigent.harnesses.claude_native import settings_generation
+
+    absent = bridge_dir.parent / "absent-bridge"
+    lock_file = absent.parent / ".locks" / f"{absent.name}.lock"
+    assert not absent.exists() and not lock_file.exists()
+    locked = []
+    if removed_before_lock:
+        absent.mkdir()
+        original_lock = settings_generation.bridge_dir_preparation_lock
+
+        @contextlib.contextmanager
+        def remove_before_deletion_check(path: Path):
+            with original_lock(path):
+                locked.append(path)
+                path.rmdir()
+                yield
+
+        monkeypatch.setattr(
+            settings_generation, "bridge_dir_preparation_lock", remove_before_deletion_check
+        )
+
+    request_claude_bridge_deletion(absent, "conv_absent")
+
+    assert not absent.exists()
+    if removed_before_lock:
+        assert locked == [absent]
+    else:
+        assert not lock_file.exists()
+
+
 @pytest.mark.parametrize(
     "protocol,owner,metadata,lifecycle_fault",
     [
@@ -202,6 +236,46 @@ def test_malformed_bridge_deletion_preserves_unverified_activation(
     assert {
         path.name: path.read_bytes() for path in bridge_dir.iterdir() if path.is_file()
     } == before
+
+
+@pytest.mark.parametrize("metadata", [b"{", b"[]", b"\xff"])
+def test_same_session_reactivation_repairs_config_without_releasing_old_owners(
+    bridge_dir: Path, metadata: bytes
+) -> None:
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=2)
+    baseline = _populate(request)
+    reader = acquire_claude_settings_request(bridge_dir, request.generation, protocol=2)
+    config_path = bridge_dir / "bridge.json"
+    original_config = config_path.read_bytes()
+    original_binding = bridge.read_bridge_credential_binding(bridge_dir)
+    assert original_binding is not None
+    unknown = baseline.with_suffix(".terminal-unknown.unconfirmed.owner")
+    unknown.write_bytes(b"unverified owner")
+    protected = {
+        path: (path.stat().st_ino, path.read_bytes())
+        for path in bridge_dir.glob(f"{baseline.stem}*")
+    }
+    config_path.write_bytes(metadata)
+    try:
+        bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+        current = bridge.read_bridge_credential_binding(bridge_dir)
+        assert current is not None and current != original_binding
+        assert current.directory_identity == original_binding.directory_identity
+        assert bridge.read_active_session_id(bridge_dir) == "conv_fenced"
+        assert {path: (path.stat().st_ino, path.read_bytes()) for path in protected} == protected
+        with pytest.raises(ValueError, match="expired"):
+            acquire_claude_settings_request(bridge_dir, request.generation, protocol=2)
+        assert not bridge.update_permission_hook_auth_headers(
+            bridge_dir,
+            {"Authorization": "Bearer synthetic-retired-activation"},
+            credential_binding=original_binding,
+        )
+        assert baseline.exists() and unknown.read_bytes() == b"unverified owner"
+    finally:
+        if bridge.read_bridge_credential_binding(bridge_dir) is None:
+            config_path.write_bytes(original_config)
+        reader.close()
+        request.close()
 
 
 def test_old_owners_cannot_remove_or_refresh_reactivated_credentials(bridge_dir: Path) -> None:

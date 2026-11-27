@@ -13018,7 +13018,7 @@ def _read_json_file(path: Path) -> _JsonObject:
     """
     try:
         raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, UnicodeDecodeError):
         return {}
     try:
         payload = json.loads(raw)
