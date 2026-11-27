@@ -492,6 +492,36 @@ def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _codex_cannot_serve_model(model: str | None) -> bool:
+    """Whether *model* is a Claude id, which Codex's Responses wire cannot serve."""
+    return model is not None and model_catalog.model_family_token(model) == "claude"
+
+
+def _drop_unservable_codex_config_model(codex_home: Path) -> None:
+    """
+    Remove a Claude top-level ``model`` from the session config.toml.
+
+    An unpinned launch runs the copied ``model``; with a Claude id Codex
+    sends it to the Responses API and every turn fails. Without the key,
+    Codex falls back to its own catalog default. The user's config is untouched.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    """
+    model = read_codex_home_config_model(codex_home)
+    if not _codex_cannot_serve_model(model):
+        return
+    config_path = codex_home / "config.toml"
+    _materialize_config_symlink(config_path)
+    document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    document.pop("model", None)
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    _logger.warning(
+        "Ignoring configured Codex model %r: Codex cannot serve Claude models; "
+        "using Codex's default instead",
+        model,
+    )
+
+
 def _materialize_config_symlink(config_path: Path) -> None:
     """
     Replace a symlinked session ``config.toml`` with a private copy.
@@ -1925,7 +1955,8 @@ def _codex_picker_config(source_home: Path) -> dict[str, str]:
 
     ``profile`` rides along because the minimal bridge copies profile
     definitions without the active selector, and an active profile's
-    ``model`` decides the CLI's effective default.
+    ``model`` decides the CLI's effective default. A Claude ``model`` is
+    dropped so the picker keeps Codex's own default.
     """
     try:
         config = tomlkit.parse((source_home / "config.toml").read_text(encoding="utf-8"))
@@ -1936,6 +1967,8 @@ def _codex_picker_config(source_home: Path) -> dict[str, str]:
         for key in ("model", "model_catalog_json", "profile")
         if isinstance(value := config.get(key), str) and value
     }
+    if _codex_cannot_serve_model(picker.get("model")):
+        del picker["model"]
     if catalog := picker.get("model_catalog_json"):
         path = Path(catalog).expanduser()
         picker["model_catalog_json"] = str(
@@ -2840,6 +2873,8 @@ class CodexNativeAppServer:
                     self.pinned_model,
                     model_migration_target,
                 )
+        else:
+            _drop_unservable_codex_config_model(self.codex_home)
         effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
         requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
         effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)

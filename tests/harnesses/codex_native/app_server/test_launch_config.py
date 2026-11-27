@@ -677,6 +677,41 @@ def test_launch_argv_and_config_pin_name_the_same_model(
         assert pinned == model
 
 
+@pytest.mark.parametrize(
+    ("source_model", "expected_model"),
+    [("system.ai.claude-opus-5-5", None), ("gpt-5.5", "gpt-5.5")],
+    ids=["claude-dropped", "gpt-kept"],
+)
+async def test_unpinned_start_drops_claude_config_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_model: str,
+    expected_model: str | None,
+) -> None:
+    """An unpinned launch never runs a copied Claude ``model`` Codex cannot serve."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    original = (
+        f'model = "{source_model}"\nmodel_provider = "gateway"\n'
+        '[model_providers.gateway]\nname = "Gateway"\nwire_api = "responses"\n'
+    )
+    (real_codex_home / "config.toml").write_text(original, encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+
+    config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert config.get("model") == expected_model
+    assert config["model_provider"] == "gateway"
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
 async def test_start_pins_reasoning_effort_in_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
