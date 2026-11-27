@@ -81,8 +81,12 @@ def test_hook_and_editor_share_only_the_current_physical_bridge_owner(
     assert recorded.pane_created_at == 120.0
     assert (context.root / "editor-owner.json").stat().st_mode & 0o777 == 0o600
     assert editor_handoff.read_editor_bridge_binding(context.root, context.binary) == recorded
+    context.observation.reset_mock()
+    assert editor_handoff.read_controller_editor_binding(context.root) == recorded
+    context.observation.assert_not_called()
 
 
+@pytest.mark.parametrize("reader", ["editor", "controller"])
 @pytest.mark.parametrize(
     "change",
     [
@@ -102,7 +106,10 @@ def test_hook_and_editor_share_only_the_current_physical_bridge_owner(
     ],
 )
 def test_changed_or_unverified_owners_cannot_use_a_recorded_binding(
-    monkeypatch: pytest.MonkeyPatch, binding_context: SimpleNamespace, change: str
+    monkeypatch: pytest.MonkeyPatch,
+    binding_context: SimpleNamespace,
+    change: str,
+    reader: str,
 ) -> None:
     context = binding_context
     assert editor_handoff.record_editor_bridge_binding(
@@ -131,6 +138,7 @@ def test_changed_or_unverified_owners_cannot_use_a_recorded_binding(
         )
     elif change == "native-gone":
         context.observation.return_value = None
+        context.native.is_running.return_value = False
     elif change == "tmux-unavailable":
         context.result.returncode = 1
     elif change == "malformed-record":
@@ -145,6 +153,56 @@ def test_changed_or_unverified_owners_cannot_use_a_recorded_binding(
             "read_active_session_id",
             MagicMock(side_effect=["conversation", "other-conversation"]),
         )
+    if reader == "editor":
+        assert editor_handoff.read_editor_bridge_binding(context.root, context.binary) is None
+    else:
+        assert editor_handoff.read_controller_editor_binding(context.root) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pid", True),
+        ("pid", 2**40),
+        ("created_at", True),
+        ("created_at", float("nan")),
+        ("created_at", float("inf")),
+        ("created_at", 10**400),
+        ("executable", "relative/claude"),
+        ("executable", "/invalid\x00claude"),
+        ("pane_id", "7"),
+    ],
+)
+def test_invalid_stored_process_cannot_authorize_controller_observation(
+    binding_context: SimpleNamespace, field: str, value: object
+) -> None:
+    context = binding_context
+    assert editor_handoff.record_editor_bridge_binding(
+        context.root, context.payload, context.binary
+    )
+    path = context.root / "editor-owner.json"
+    record = json.loads(path.read_text())
+    record["binding"]["owner"]["process"][field] = value
+    path.write_text(json.dumps(record))
+    context.query.reset_mock()
+    assert editor_handoff.read_controller_editor_binding(context.root) is None
+    context.query.assert_not_called()
+
+
+def test_unexpected_metadata_and_unavailable_observation_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, binding_context: SimpleNamespace
+) -> None:
+    context = binding_context
+    assert editor_handoff.record_editor_bridge_binding(
+        context.root, context.payload, context.binary
+    )
+    path = context.root / "editor-owner.json"
+    record = json.loads(path.read_text())
+    path.write_text(json.dumps({**record, "extra": "unverified"}))
+    assert editor_handoff.read_controller_editor_binding(context.root) is None
+    path.write_text(json.dumps(record))
+    monkeypatch.setattr(bridge, "read_active_session_id", MagicMock(side_effect=OSError))
+    assert editor_handoff.read_controller_editor_binding(context.root) is None
     assert editor_handoff.read_editor_bridge_binding(context.root, context.binary) is None
 
 

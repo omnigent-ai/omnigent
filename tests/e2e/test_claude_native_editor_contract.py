@@ -10,12 +10,22 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from omnigent.harnesses.claude_native import bridge, editor_delegate, editor_handoff, editor_owner
+from omnigent.harnesses.claude_native import (
+    bridge,
+    editor_control,
+    editor_delegate,
+    editor_handoff,
+    editor_owner,
+    editor_transaction,
+    model_switch,
+)
 from tests._helpers.native_claude import _PINNED_CLAUDE_MODELS
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_message_requests
@@ -23,7 +33,7 @@ from tests.e2e.conftest import get_mock_message_requests
 pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
 
 
-@pytest.mark.parametrize("editor_source", ["configured", "default"])
+@pytest.mark.parametrize("editor_source", ["configured", "configured-code", "default"])
 def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -49,10 +59,13 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     hook_record = tmp_path / "blocked-prompt.json"
     owner_source = hashlib.sha256(Path(editor_owner.__file__).read_bytes()).hexdigest()
     handoff_source = hashlib.sha256(Path(editor_handoff.__file__).read_bytes()).hexdigest()
+    control_source = hashlib.sha256(Path(editor_control.__file__).read_bytes()).hexdigest()
+    transaction_source = hashlib.sha256(Path(editor_transaction.__file__).read_bytes()).hexdigest()
     process_context = (
         "import hashlib, os, psutil, shutil\n"
         "from dataclasses import asdict\n"
-        "from omnigent.harnesses.claude_native import editor_handoff, editor_owner\n"
+        "from omnigent.harnesses.claude_native import "
+        "editor_control, editor_handoff, editor_owner, editor_transaction\n"
         f"native_executable = Path({str(Path(claude).resolve())!r})\n"
         "def native_process_record():\n"
         "    identity = editor_owner.observe_native_editor_process(native_executable)\n"
@@ -65,6 +78,10 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "Path(editor_owner.__file__).read_bytes()).hexdigest(), "
         "'handoff_source_sha256': hashlib.sha256("
         "Path(editor_handoff.__file__).read_bytes()).hexdigest(), "
+        "'control_source_sha256': hashlib.sha256("
+        "Path(editor_control.__file__).read_bytes()).hexdigest(), "
+        "'transaction_source_sha256': hashlib.sha256("
+        "Path(editor_transaction.__file__).read_bytes()).hexdigest(), "
         "'editor_environment_sha256': hashlib.sha256(json.dumps("
         "{key: os.environ.get(key) for key in ('VISUAL', 'EDITOR', 'PATH')}, "
         "sort_keys=True).encode()).hexdigest(), "
@@ -140,6 +157,15 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "    location = re.sub(r':\\d+(?::\\d+)?$', '', location)\n"
         "source = Path(location)\n"
         "content = source.read_bytes().decode('utf-8')\n"
+        "operation = editor_control.run_editor_operation(source, "
+        f"bridge_dir=Path({str(bridge_dir)!r}), "
+        "executable=native_executable)\n"
+        "if operation is not None:\n"
+        "    with observed.open('a', encoding='utf-8') as stream:\n"
+        "        stream.write(json.dumps({'kind': 'controller', 'content': content, "
+        "'after': source.read_bytes().decode('utf-8'), 'accepted': operation == 0, "
+        "'program': program, 'native_context': native_context()}) + '\\n')\n"
+        "    sys.exit(operation)\n"
         "request = json.loads(instruction.read_text())\n"
         "def current_owner():\n"
         f"    binding = editor_handoff.read_editor_bridge_binding(Path({str(bridge_dir)!r}), "
@@ -153,7 +179,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "expected_text=request['expected'], expected_owner=expected_owner, "
         "current_owner=current_owner, cancelled=lambda: request['cancelled'])\n"
         "with observed.open('a', encoding='utf-8') as stream:\n"
-        "    stream.write(json.dumps({'content': content, 'accepted': accepted, "
+        "    stream.write(json.dumps({'kind': 'manual', 'content': content, 'accepted': accepted, "
         "'program': program, 'native_context': native_context()}) + '\\n')\n"
         "if not accepted:\n"
         "    sys.exit(1)\n"
@@ -173,9 +199,10 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "EDITOR": editor_command + " --editor-program editor",
         "VISUAL": editor_command + " --editor-program visual",
     }
-    if editor_source == "default":
-        env.pop("EDITOR")
-        env.pop("VISUAL")
+    if editor_source in {"default", "configured-code"}:
+        if editor_source == "default":
+            env.pop("EDITOR")
+            env.pop("VISUAL")
         programs = tmp_path / "editors"
         programs.mkdir()
         for program in (
@@ -200,6 +227,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             )
             launcher.chmod(0o700)
         env["PATH"] = str(programs) + os.pathsep + env["PATH"]
+        if editor_source == "configured-code":
+            env["EDITOR"] = env["VISUAL"] = shlex.join([str(programs / "code"), "--reuse-window"])
     original_editor_environment = {key: env.get(key) for key in ("VISUAL", "EDITOR", "PATH")}
     editor_environment_digest = hashlib.sha256(
         json.dumps(original_editor_environment, sort_keys=True).encode()
@@ -219,6 +248,17 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     [sys.executable, str(editor), "--editor-program", program], program
                 )
             )
+    elif editor_source == "configured-code":
+        delegates = tmp_path / "configured-editor"
+        delegates.mkdir()
+        launcher = delegates / "code"
+        launcher.write_text(
+            "#!/bin/sh\nexec "
+            + shlex.join(delegate_command([str(programs / "code")], "code"))
+            + ' "$@"\n'
+        )
+        launcher.chmod(0o700)
+        env["EDITOR"] = env["VISUAL"] = shlex.join([str(launcher), "--reuse-window"])
     else:
         delegates = tmp_path / "delegated-editors"
         delegates.mkdir()
@@ -237,7 +277,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             )
             launcher.chmod(0o700)
         env["PATH"] = str(delegates) + os.pathsep + env["PATH"]
-    replaced_keys = ("VISUAL", "EDITOR") if editor_source == "configured" else ()
+    replaced_keys = ("VISUAL", "EDITOR") if editor_source != "default" else ()
     for manifest, command in delegate_manifests:
         manifest.write_text(
             json.dumps(
@@ -284,6 +324,45 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 [*tmux, "capture-pane", "-p", "-t", target], text=True, timeout=5
             )
             return last_pane
+
+        def wait_for_editor(count: int, expected: str) -> None:
+            poll_until(lambda: len(observations()) == count + 1, timeout_s=15)
+            poll_until(
+                lambda: (
+                    model_switch._draft(pane()) == ""
+                    if expected == ""
+                    else bridge._draft_in_input_box(pane(), expected.splitlines()[0].strip())
+                ),
+                timeout_s=10,
+            )
+
+        def controlled_edit(expected: str, replacement: str, *, cancel_after: str | None = None):
+            binding = editor_handoff.read_controller_editor_binding(bridge_dir)
+            assert binding is not None
+            cancelled = threading.Event()
+            control = editor_control.NativeEditorControl(
+                bridge_dir,
+                binding=binding,
+                expected_text=expected,
+                replacement_text=replacement,
+                cancelled=cancelled.is_set,
+                deadline=time.monotonic() + 15,
+            )
+            receive = editor_control._Channel.receive
+
+            def received(channel, phase):
+                result = receive(channel, phase)
+                if phase == cancel_after:
+                    cancelled.set()
+                return result
+
+            with (
+                monkeypatch.context() as changes,
+                bridge._bridge_injection_lock(bridge_dir),
+                bridge._bridge_injection_file_lock(bridge_dir),
+            ):
+                changes.setattr(editor_control._Channel, "receive", received)
+                return control.run(lambda: command("send-keys", "-t", target, "C-g"))
 
         try:
             subprocess.run(
@@ -345,6 +424,23 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert owner["bridge_session_id"] == bridge.read_active_session_id(bridge_dir)
             assert owner["native_session_id"] == payload["session_id"]
             assert owner["process"] == payload["native_process"]
+            for phase in ("prepared", "committed"):
+                count = len(observations())
+                with pytest.raises(editor_transaction.NativeDraftEditRefused):
+                    controlled_edit(draft, "", cancel_after=phase)
+                wait_for_editor(count, draft)
+                assert observations()[-1]["content"] == observations()[-1]["after"] == draft
+                assert observations()[-1]["accepted"] is False
+                assert not (bridge_dir / "editor-operation.json").exists()
+            count = len(observations())
+            receipt = controlled_edit(draft, "")
+            wait_for_editor(count, "")
+            assert receipt.original_text == draft and receipt.replacement_text == ""
+            assert observations()[-1]["content"] == draft and observations()[-1]["after"] == ""
+            count = len(observations())
+            controlled_edit(receipt.replacement_text, receipt.original_text)
+            wait_for_editor(count, draft)
+            assert observations()[-1]["content"] == "" and observations()[-1]["after"] == draft
             wrong_session = {**owner, "native_session_id": "other-native-session"}
             wrong_process = {
                 **owner,
@@ -371,6 +467,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             for index, (claimed, expected, accepted, expected_owner, cancelled) in enumerate(
                 steps
             ):
+                count = len(observations())
                 instruction.write_text(
                     json.dumps(
                         {
@@ -382,7 +479,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     )
                 )
                 command("send-keys", "-t", target, "C-g")
-                poll_until(lambda index=index: len(observations()) == index + 1, timeout_s=15)
+                poll_until(lambda count=count: len(observations()) == count + 1, timeout_s=15)
                 observation = observations()[-1]
                 actual = observation["content"]
                 assert actual == expected, {"step": index, "expected": expected, "actual": actual}
@@ -399,6 +496,30 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                         and bridge._draft_in_input_box(last_pane, expected.splitlines()[0].strip())
                     ),
                     timeout_s=10,
+                )
+            count = len(observations())
+            receipt = controlled_edit("/status", "")
+            wait_for_editor(count, "")
+            changed = "new-user-edit-preserved"
+            command("send-keys", "-l", "-t", target, changed)
+            poll_until(lambda: bridge._draft_in_input_box(pane(), changed), timeout_s=10)
+            count = len(observations())
+            with pytest.raises(editor_transaction.NativeDraftEditRefused):
+                controlled_edit(receipt.replacement_text, receipt.original_text)
+            wait_for_editor(count, changed)
+            assert observations()[-1]["content"] == observations()[-1]["after"] == changed
+            assert observations()[-1]["accepted"] is False
+            assert all(
+                item["native_context"]["control_source_sha256"] == control_source
+                and item["native_context"]["transaction_source_sha256"] == transaction_source
+                for item in observations()
+            )
+            if editor_source == "configured-code":
+                invocations = [json.loads(line) for line in invoked.read_text().splitlines()]
+                assert all("--reuse-window" in item["arguments"] for item in invocations)
+                assert all(
+                    "-g" in item["arguments"] or "--goto" in item["arguments"]
+                    for item in invocations
                 )
             assert get_mock_message_requests(isolated_mock_llm_server_url) == []
         finally:
