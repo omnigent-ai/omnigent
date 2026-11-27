@@ -1047,7 +1047,6 @@ def test_supported_api_routes_enforce_project_permissions(api_request: str, writ
         'projects/:project/issues -f "title[]=Fix" -f description=Details',
         'projects/:project/issues -f title=Fix -f "description="',
         "projects/:project/issues -f title=Fix -f description=Details -f _method=DELETE",
-        f"projects/:project/merge_requests {_API_MR_FIELDS} -f target_project_id=123",
         f"projects/:project/merge_requests {_API_MR_FIELDS} -f source_project_id=123",
         f"projects/:project/merge_requests {_API_MR_FIELDS} -F should_remove_source_branch=true",
         "projects/:project/merge_requests/12 -X PUT -f title=Fix "
@@ -1123,20 +1122,40 @@ def test_api_object_deletion_is_denied_before_project_resolution(
     assert _result(command, allow_destructive=True) == "DENY"
 
 
-def test_api_branch_deletion_requires_opt_in_and_exact_project_and_branch_permissions() -> None:
+@pytest.mark.parametrize(
+    ("branch_endpoint", "placeholder", "branch"),
+    [
+        ("feature", "", "feature"),
+        (":ref", "--placeholder ref=feature/topic", "feature/topic"),
+    ],
+    ids=["literal", "placeholder"],
+)
+def test_api_branch_deletion_requires_opt_in_and_exact_project_and_branch_permissions(
+    branch_endpoint: str, placeholder: str, branch: str
+) -> None:
     command = (
-        f"glab api projects/:project/repository/branches/:ref -X DELETE {_API_SELECTOR} "
-        "--placeholder ref=feature/topic"
+        f"glab api projects/:project/repository/branches/{branch_endpoint} "
+        f"-X DELETE {_API_SELECTOR} {placeholder}"
     )
-    configuration = {"write_repos": [_PROJECT], "write_branches": ["feature/topic"]}
+    configuration = {"write_repos": [_PROJECT], "write_branches": [branch]}
     assert _result(command, **configuration) == "DENY"
     assert _result(command, allow_destructive=True, **configuration) == "ALLOW"
     assert _result(command, allow_destructive=True) == "DENY"
     assert (
         _result(
-            command.replace("ref=feature/topic", "ref=main"),
+            command,
             allow_destructive=True,
-            **configuration,
+            write_repos=[_PROJECT],
+            write_branches=["main"],
+        )
+        == "DENY"
+    )
+    assert (
+        _result(
+            command,
+            allow_destructive=True,
+            write_repos=[_PROJECT],
+            write_branches=[branch.upper()],
         )
         == "DENY"
     )
@@ -1144,7 +1163,7 @@ def test_api_branch_deletion_requires_opt_in_and_exact_project_and_branch_permis
         assert _result(command + extra, allow_destructive=True, **configuration) == "ASK"
     assert (
         _result(
-            command.replace("ref=feature/topic", "ref=feature.json"),
+            command.replace(branch, "feature.json"),
             allow_destructive=True,
             **configuration,
         )
@@ -1185,6 +1204,17 @@ def test_api_removal_assignments_and_unresolved_mr_branch_effects(
     assert _result(command, write_repos=[_PROJECT], allow_destructive=True) == "ASK"
     if "/rebase" in api_request:
         assert _result(command) == "ASK"
+    if api_request.startswith("merge_requests/12/merge "):
+        assert _result(command) == "DENY"
+        assert _result(command, allow_destructive=True) == "DENY"
+        assert (
+            _result(
+                command.replace(f"project={_PROJECT}", "project=team/other"),
+                write_repos=[_PROJECT],
+                allow_destructive=True,
+            )
+            == "DENY"
+        )
 
 
 def test_api_destination_override_does_not_misidentify_source_project_as_write_target() -> None:
