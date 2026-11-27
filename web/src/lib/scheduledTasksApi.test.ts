@@ -137,15 +137,21 @@ describe("getScheduledTask", () => {
     expect((await getScheduledTask("st_1")).maxCostUsd).toBe(maxCostUsd ?? null);
   });
 
-  it("reads the retry settings, defaulting to none on older servers", async () => {
+  it("reads the retry and overlap settings, defaulting to none on older servers", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     fetchMock.mockResolvedValueOnce(
-      mockResponse({ ...TASK_WIRE, max_retries: 2, retry_delay_seconds: 60 }),
+      mockResponse({
+        ...TASK_WIRE,
+        max_retries: 2,
+        retry_delay_seconds: 60,
+        overlap_mode: "skip",
+      }),
     );
     const older = await getScheduledTask("st_1");
     const current = await getScheduledTask("st_1");
     expect([older.maxRetries, older.retryDelaySeconds]).toEqual([0, 300]);
     expect([current.maxRetries, current.retryDelaySeconds]).toEqual([2, 60]);
+    expect([older.overlapMode, current.overlapMode]).toEqual(["allow", "skip"]);
   });
 
   it("GETs /v1/scheduled-tasks/{id} and encodes the id", async () => {
@@ -303,6 +309,16 @@ describe("createScheduledTask", () => {
     expect(off).not.toHaveProperty("max_retries");
     expect(off).not.toHaveProperty("retry_delay_seconds");
     expect([on.max_retries, on.retry_delay_seconds]).toEqual([2, 60]);
+  });
+
+  it("sends an overlap mode only when it isn't the default", async () => {
+    const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    await createScheduledTask({ ...base, overlapMode: "allow" });
+    await createScheduledTask({ ...base, overlapMode: "skip" });
+    const [allow, skip] = fetchMock.mock.calls.map((call) => JSON.parse(call[1].body));
+    expect(allow).not.toHaveProperty("overlap_mode");
+    expect(skip.overlap_mode).toBe("skip");
   });
 
   it("POSTs required fields and omits unset optionals", async () => {
@@ -494,6 +510,11 @@ describe("updateScheduledTask", () => {
       "sends both retry settings",
       { maxRetries: 2, retryDelaySeconds: 60 },
       { max_retries: 2, retry_delay_seconds: 60 },
+    ],
+    [
+      "sends an explicit allow to stop skipping",
+      { overlapMode: "allow" as const },
+      { overlap_mode: "allow" },
     ],
   ])("%s", async (_, input, body) => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));

@@ -472,6 +472,7 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-cost-limit")).toHaveTextContent("No limit");
     // Retries are listed only when they are on.
     expect(screen.queryByTestId("task-detail-retries")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-overlap")).not.toBeInTheDocument();
   });
 
   it("shows saved launch settings and the continued session configuration", () => {
@@ -491,6 +492,7 @@ describe("header, prompt, configuration", () => {
         maxCostUsd: 2.5,
         maxRetries: 2,
         retryDelaySeconds: 300,
+        overlapMode: "skip",
       }),
     );
     renderPage();
@@ -508,6 +510,7 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-retries")).toHaveTextContent(
       "2 retries · 5 minutes apart",
     );
+    expect(screen.getByTestId("task-detail-overlap")).toHaveTextContent("Skip it");
     expect(screen.getByText(/saved launch settings/)).toBeInTheDocument();
   });
 

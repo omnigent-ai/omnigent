@@ -286,6 +286,7 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
     stage: "Retry",
     reason: "The automation's retries were turned off or reduced before this retry started.",
   },
+  previous_run_active: { stage: "Schedule", reason: "The previous run was still going." },
 };
 
 /**

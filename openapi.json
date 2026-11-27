@@ -2576,6 +2576,15 @@
             "title": "Name",
             "type": "string"
           },
+          "overlap_mode": {
+            "default": "allow",
+            "enum": [
+              "allow",
+              "skip"
+            ],
+            "title": "Overlap Mode",
+            "type": "string"
+          },
           "permission_mode": {
             "anyOf": [
               {
@@ -8272,6 +8281,13 @@
             "default": false,
             "title": "Scheduled Task One Time",
             "type": "boolean"
+          },
+          "scheduled_task_overlap_modes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scheduled Task Overlap Modes",
+            "type": "array"
           },
           "scheduled_task_projects": {
             "default": false,
@@ -16056,6 +16072,21 @@
               }
             ],
             "title": "Name"
+          },
+          "overlap_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "allow",
+                  "skip"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overlap Mode"
           },
           "permission_mode": {
             "anyOf": [

@@ -131,6 +131,14 @@ SCHEDULED_TASK_SESSION_MODE: dict[str, int] = {
     "continue": 2,
 }
 
+# What a due occurrence does while the task's previous run is still going. ``queue`` is in
+# the schema but not offered yet; a task a newer server saved with it starts every occurrence.
+SCHEDULED_TASK_OVERLAP_MODE: dict[str, int] = {
+    "allow": 1,
+    "skip": 2,
+    "queue": 3,
+}
+
 SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "scheduled": 1,
     "running": 2,
@@ -398,6 +406,16 @@ def encode_scheduled_task_session_mode(name: str) -> int:
 def decode_scheduled_task_session_mode(code: int) -> str:
     """Decode a ``scheduled_tasks.session_mode`` int code to its name."""
     return _decode(SCHEDULED_TASK_SESSION_MODE, code, field="scheduled_tasks.session_mode")
+
+
+def encode_scheduled_task_overlap_mode(name: str) -> int:
+    """Encode a ``scheduled_tasks.overlap_mode`` name to its int code."""
+    return _encode(SCHEDULED_TASK_OVERLAP_MODE, name, field="scheduled_tasks.overlap_mode")
+
+
+def decode_scheduled_task_overlap_mode(code: int) -> str:
+    """Decode a ``scheduled_tasks.overlap_mode`` int code to its name."""
+    return _decode(SCHEDULED_TASK_OVERLAP_MODE, code, field="scheduled_tasks.overlap_mode")
 
 
 def encode_scheduled_task_run_status(name: str) -> int:

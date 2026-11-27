@@ -152,6 +152,7 @@ class ScheduledTaskStore(ABC):
         max_cost_usd: float | None = None,
         max_retries: int = 0,
         retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
+        overlap_mode: str = "allow",
         session_mode: str = "new",
         session_id: str | None = None,
         source_session_id: str | None = None,
@@ -189,6 +190,8 @@ class ScheduledTaskStore(ABC):
         :param max_retries: How many times a run whose startup failed before
             its prompt reached the agent is started again; ``0`` never retries.
         :param retry_delay_seconds: How long to wait before each retry.
+        :param overlap_mode: What a due occurrence does while the previous run
+            is still going: ``"allow"`` starts it anyway, ``"skip"`` skips it.
         :param session_mode: ``"new"`` (default) starts a new session per
             firing; ``"continue"`` sends each firing's prompt into one session.
         :param session_id: The existing session a ``"continue"`` task sends
@@ -344,6 +347,7 @@ class ScheduledTaskStore(ABC):
         max_cost_usd: float | None = _UNSET,
         max_retries: int | None = None,
         retry_delay_seconds: int | None = None,
+        overlap_mode: str | None = None,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workflow_id: str | None = _UNSET,

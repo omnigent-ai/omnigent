@@ -78,6 +78,16 @@ _RETRY_PROPERTIES: dict[str, dict[str, Any]] = {
         ),
     },
 }
+# The overlap mode, the same in the create and update schemas.
+_OVERLAP_MODE_PROPERTY: dict[str, Any] = {
+    "type": "string",
+    "enum": ["allow", "skip"],
+    "description": (
+        "Optional. What a scheduled run does while the previous run is still going (its "
+        "session busy or waiting on an approval): 'allow' (default) starts it anyway, "
+        "'skip' records it as skipped. Run now always starts."
+    ),
+}
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
@@ -201,6 +211,7 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                         **_RETRY_PROPERTIES,
+                        "overlap_mode": _OVERLAP_MODE_PROPERTY,
                         "session_mode": {
                             "type": "string",
                             "enum": ["new", "continue"],
@@ -413,6 +424,7 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                         **_RETRY_PROPERTIES,
+                        "overlap_mode": _OVERLAP_MODE_PROPERTY,
                         "session_mode": {
                             "type": "string",
                             "enum": ["new", "continue"],

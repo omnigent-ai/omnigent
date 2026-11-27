@@ -61,6 +61,7 @@ from omnigent.server.scheduled.fire import (
     build_busy_until,
     build_on_fire,
     build_run_now,
+    build_session_busy,
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.scheduled.source_session import (
@@ -5638,6 +5639,43 @@ async def test_a_busy_session_is_checked_again_later(
         next_run_at=due,
     )
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "live_status", "pending", "busy"),
+    [
+        pytest.param("new", "running", None, False, id="new-session-each-run"),
+        pytest.param("continue", "running", None, True, id="turn-in-progress"),
+        pytest.param("continue", "idle", 1, True, id="waiting-on-approval"),
+        pytest.param("continue", "idle", 0, False, id="idle"),
+        pytest.param("continue", None, None, False, id="session-gone"),
+    ],
+)
+async def test_a_continued_session_is_busy_while_it_works_or_waits_on_its_owner(
+    session_mode, live_status, pending, busy
+) -> None:
+    now = 1_800_003_600
+    session_id = "sess_overlap_check"
+    activity = (
+        {}
+        if live_status is None
+        else {
+            session_id: SessionActivity(
+                now - 60,
+                live_status=live_status,
+                pending_elicitation_count=pending,
+                runner_id="runner_overlap_check",
+            )
+        }
+    )
+    conversation_store = Mock(get_session_activity=Mock(return_value=activity))
+    check = build_session_busy(_deps(Mock(), conversation_store=conversation_store))
+    task = _task(
+        session_mode=session_mode,
+        session_id=session_id if session_mode == "continue" else None,
+        next_run_at=now,
+    )
+    assert await check(task) is busy
 
 
 async def test_a_trigger_without_a_session_yet_polls_now() -> None:

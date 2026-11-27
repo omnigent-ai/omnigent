@@ -846,6 +846,7 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
                     "max_cost_usd": 2.5,
                     "max_retries": 3,
                     "retry_delay_seconds": 120,
+                    "overlap_mode": "skip",
                     # Unknown arguments, more than the room the prompt leaves for them.
                     **{f"extra_{index}": "e" * 70 for index in range(5)},
                 },
@@ -866,6 +867,7 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
         "max_cost_usd=2.5",
         "max_retries=3",
         "retry_delay_seconds=120",
+        "overlap_mode=skip",
     ):
         assert setting in reason, reason
     assert prompt in reason

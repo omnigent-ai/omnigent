@@ -610,6 +610,44 @@ BUSY_RECHECK_SECONDS = 2 * 60
 BUSY_SKIP_MAX_SECONDS = 10 * 60
 
 
+async def _continued_session_activity(deps: FireDeps, task: ScheduledTask) -> Any | None:
+    """The persisted activity of the session *task* continues, or ``None`` if it has none.
+
+    The scheduler polls without the owner's identity, which only a fire assumes, so it
+    reads session activity, which needs no caller access check. The fire itself still
+    checks the session before it sends anything.
+    """
+    session_id = task.session_id
+    if task.session_mode != "continue" or session_id is None:
+        return None
+    activity = await asyncio.to_thread(deps.conversation_store.get_session_activity, [session_id])
+    return activity.get(session_id)
+
+
+def _session_is_busy(session_id: str, session: Any) -> bool:
+    """Whether a session shows a turn in progress, or waits on an approval or a question."""
+    from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+
+    running = _session_status_from_cache(session_id, session.live_status) == "running"
+    # A native session can report idle while it waits on an approval or a question.
+    waiting = session.runner_id is not None and bool(session.pending_elicitation_count)
+    return running or waiting
+
+
+def build_session_busy(deps: FireDeps) -> Callable[[ScheduledTask], Awaitable[bool]]:
+    """Build the persistent scheduler's check of whether a task's continued session is busy.
+
+    A run that continues a session finishes once its prompt is delivered, so the session
+    itself shows whether that prompt is still being worked on.
+    """
+
+    async def session_busy(task: ScheduledTask) -> bool:
+        session = await _continued_session_activity(deps, task)
+        return session is not None and _session_is_busy(task.session_id or "", session)
+
+    return session_busy
+
+
 def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[int | None]]:
     """Build the persistent scheduler's check for when to poll a trigger automation.
 
@@ -623,28 +661,14 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
-        from omnigent.server.routes._sessions.helpers import _session_status_from_cache
-
-        session_id = task.session_id
-        if task.session_mode != "continue" or session_id is None:
-            return None
-        # The scheduler polls without the owner's identity, which only a fire assumes, so
-        # read the persisted status from session activity, which needs no caller access
-        # check. The fire itself still checks the session before it sends anything.
-        activity = await asyncio.to_thread(
-            deps.conversation_store.get_session_activity, [session_id]
-        )
-        session = activity.get(session_id)
+        session = await _continued_session_activity(deps, task)
         if session is None:
             return None
         runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
         latest = runs[0] if runs else None
-        running = _session_status_from_cache(session_id, session.live_status) == "running"
-        # A native session can report idle while it waits on an approval or a question.
-        waiting = session.runner_id is not None and bool(session.pending_elicitation_count)
         # The previous poll may still be on its way in, e.g. while a sandbox starts.
         delivering = latest is not None and latest.status in ("scheduled", "starting")
-        if running or waiting or delivering:
+        if _session_is_busy(task.session_id or "", session) or delivering:
             until = now + BUSY_RECHECK_SECONDS
         else:
             until = session.updated_at + BUSY_QUIET_SECONDS

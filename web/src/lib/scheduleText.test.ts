@@ -615,6 +615,13 @@ describe("describeRunFailure", () => {
     expect(describeRunFailure("retry_cancelled", "skipped").reason).toContain("turned off");
   });
 
+  it("says a skipped run waited on the previous one", () => {
+    expect(describeRunFailure("previous_run_active", "skipped")).toEqual({
+      stage: "Schedule",
+      reason: "The previous run was still going.",
+    });
+  });
+
   it("points settings failures at editing the automation", () => {
     const missing = describeRunFailure("missing_host_id", "failed");
     expect(missing.stage).toBe("Settings");

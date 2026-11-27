@@ -112,6 +112,7 @@ def _build_app(
     persistent: bool = False,
     one_time: bool = False,
     retries: bool = False,
+    overlap: bool = False,
     timers: bool = False,
     local_single_user: bool = False,
     projects: bool = True,
@@ -145,6 +146,7 @@ def _build_app(
                     + ("" if automations_feature else ",-automations")
                     + (",one_time_automations" if one_time else "")
                     + (",automation_retries" if retries else "")
+                    + (",automation_overlap_mode" if overlap else "")
                     + (",session_timers" if timers else "")
                     + (",workflows" if workflows else "")
                 )
@@ -166,14 +168,16 @@ def auth_app(
     # ``True`` turns on the database scheduler, with timers; ``"one_time"`` also
     # enables one-time automations on it; ``"one_time_without_dispatch"`` enables
     # only that release feature, which needs the database scheduler to take effect.
-    # ``"retries"`` and ``"retries_without_dispatch"`` do the same for retries.
+    # ``"retries"`` and ``"retries_without_dispatch"`` do the same for retries, and
+    # ``"overlap"`` and ``"overlap_without_dispatch"`` for overlap modes.
     param = getattr(request, "param", False)
     app = _build_app(
         db_uri,
         tmp_path,
-        persistent=param in (True, "one_time", "retries"),
+        persistent=param in (True, "one_time", "retries", "overlap", "retries_and_overlap"),
         one_time=param in ("one_time", "one_time_without_dispatch"),
-        retries=param in ("retries", "retries_without_dispatch"),
+        retries=param in ("retries", "retries_without_dispatch", "retries_and_overlap"),
+        overlap=param in ("overlap", "overlap_without_dispatch", "retries_and_overlap"),
         timers=param in (True, "one_time"),
     )
     _make_user(db_uri)
@@ -7583,7 +7587,7 @@ async def test_a_shared_run_session_lists_with_its_run_labels(
 _ON_DATABASE_SCHEDULER = pytest.mark.parametrize("auth_app", [True], indirect=True)
 
 
-@pytest.mark.parametrize("auth_app", ["retries"], indirect=True)
+@pytest.mark.parametrize("auth_app", ["retries_and_overlap"], indirect=True)
 @pytest.mark.parametrize("state", ["active", "paused"])
 async def test_clone_copies_an_automations_settings_under_a_new_id(
     auth_client: httpx.AsyncClient, db_uri: str, state: str
@@ -7595,6 +7599,7 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
             max_cost_usd=2.5,
             max_retries=2,
             retry_delay_seconds=120,
+            overlap_mode="skip",
             permission_mode="acceptEdits",
             model_override="databricks-claude-sonnet-4-6",
             reasoning_effort="high",
@@ -7630,6 +7635,7 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
         "max_cost_usd",
         "max_retries",
         "retry_delay_seconds",
+        "overlap_mode",
         "permission_mode",
         "model_override",
         "reasoning_effort",
@@ -7645,6 +7651,7 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
         "max_cost_usd": 2.5,
         "max_retries": 2,
         "retry_delay_seconds": 120,
+        "overlap_mode": "skip",
         "permission_mode": "acceptEdits",
         "model_override": "databricks-claude-sonnet-4-6",
         "reasoning_effort": "high",
@@ -7795,19 +7802,19 @@ async def test_retries_need_the_database_scheduler_and_the_release_feature(
 
 
 @_ON_DATABASE_SCHEDULER
-async def test_clone_copies_no_retries_while_the_release_feature_is_off(
+async def test_clone_copies_no_setting_whose_release_feature_is_off(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     created = (
         await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
     ).json()
-    # Saved while the feature was on.
-    SqlAlchemyScheduledTaskStore(db_uri).update(created["id"], max_retries=2)
+    # Saved while the features were on.
+    SqlAlchemyScheduledTaskStore(db_uri).update(created["id"], max_retries=2, overlap_mode="skip")
 
     resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/clone", headers=_headers())
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["max_retries"] == 0
+    assert (resp.json()["max_retries"], resp.json()["overlap_mode"]) == (0, "allow")
 
 
 @pytest.mark.parametrize("auth_app", ["retries"], indirect=True)
@@ -7856,6 +7863,55 @@ async def test_run_history_numbers_the_retries_of_an_occurrence(
         ("skipped", "retry_cancelled"),
         ("failed", "host_offline"),
     ]
+
+
+# A database scheduler from before overlap modes starts every occurrence, so
+# saving one waits for the release feature too.
+@pytest.mark.parametrize(
+    ("auth_app", "enabled"),
+    [(False, False), (True, False), ("overlap_without_dispatch", False), ("overlap", True)],
+    indirect=["auth_app"],
+    ids=["legacy_timer", "no_release_feature", "release_feature_without_dispatch", "enabled"],
+)
+async def test_an_overlap_mode_needs_the_database_scheduler_and_the_release_feature(
+    auth_client: httpx.AsyncClient, enabled: bool
+) -> None:
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_overlap_modes"] == (["allow", "skip"] if enabled else ["allow"])
+
+    defaults = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    assert defaults["overlap_mode"] == "allow"
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(overlap_mode="skip"), headers=_headers()
+    )
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{defaults['id']}",
+        json={"overlap_mode": "skip"},
+        headers=_headers(),
+    )
+    unknown = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(overlap_mode="cancel"), headers=_headers()
+    )
+
+    assert unknown.status_code == 422, unknown.text
+    if not enabled:
+        assert created.status_code == 400, created.text
+        assert patched.status_code == 400, patched.text
+        assert "overlap_mode needs automation overlap modes" in created.text
+        # The default is never refused.
+        default = await auth_client.patch(
+            f"/v1/scheduled-tasks/{defaults['id']}",
+            json={"overlap_mode": "allow"},
+            headers=_headers(),
+        )
+        assert default.status_code == 200, default.text
+        return
+    assert created.status_code == 200, created.text
+    assert created.json()["overlap_mode"] == "skip"
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["overlap_mode"] == "skip"
 
 
 @pytest.mark.parametrize("auth_app", [False, True], indirect=True, ids=["legacy", "database"])

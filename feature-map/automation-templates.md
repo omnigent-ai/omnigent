@@ -184,7 +184,7 @@ to customize.
   opens its searchable dropdown. Custom schedules use the same typed time input.
   Advanced starts collapsed and contains Workspace or
   Repository, Project, model/effort/permission settings, Ends and, for a
-  schedule on a server that supports it, Retries. Name remains
+  schedule on a server that supports them, Retries and Overlapping runs. Name remains
   required and editable without opening Advanced; changing instructions preserves
   it. Configured overrides are summarized beside Advanced, and invalid
   settings reveal their controls. Escape closes the active selector or folder browser
@@ -212,6 +212,15 @@ to customize.
   prompt reached the agent. A trigger has no Retries row, since it polls again
   within minutes. The detail page's Configuration lists Retries when they are
   on, and run history labels each retry **Retry N**.
+- **Overlapping runs:** when `/v1/info` lists more than `allow` in
+  `scheduled_task_overlap_modes`, which needs `automations_v2` and the
+  `automation_overlap_mode` release feature, Advanced has an Overlapping runs
+  row for a schedule. It sets what a scheduled run does while the previous run
+  is still going (its session busy or waiting on an approval): **Start it
+  anyway**, the default, or **Skip it**. A skipped run appears in run history
+  with "The previous run was still going." Run now always starts. A trigger has
+  no such row. The detail page's Configuration lists the setting when it isn't
+  the default.
 - **MCP services:** when the server's MCP registry is on and `/v1/info` reports
   `scheduled_task_mcp_services`, Advanced has an MCP services row that opens
   the new-chat service list and its sign-in. A new automation starts with none,

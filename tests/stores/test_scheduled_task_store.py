@@ -2599,6 +2599,224 @@ def test_retry_bookkeeping_seeks_the_runs_it_needs_and_no_others(
         assert "SCAN scheduled_task_runs" not in plan and "TEMP B-TREE" not in plan, plan
 
 
+def test_an_overlapping_occurrence_is_recorded_as_skipped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = store.update(_due_task(store).id, overlap_mode="skip")
+    now = task.next_run_at
+    # The run that kept the task busy has ended: nothing is skipped, and nothing advances.
+    assert (
+        store.skip_overlapping_occurrence(
+            task, now=now, next_run_at=now + 3600, host_id=task.host_id, running_since=0
+        )
+        is None
+    )
+    assert (store.get(task.id).next_run_at, store.list_runs(task.id)[0]) == (now, [])
+    # A busy session, which no run row shows, is not checked again.
+    skipped = store.skip_overlapping_occurrence(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, running_since=None
+    )
+    assert (skipped.status, skipped.error_code, skipped.error, skipped.trigger_key) == (
+        "skipped",
+        "previous_run_active",
+        None,
+        f"schedule:{now}",
+    )
+    assert (skipped.scheduled_at, skipped.finished_at, skipped.fired_at) == (now, now, None)
+    after = store.get(task.id)
+    assert (after.next_run_at, after.state) == (now + 3600, "active")
+    # The occurrence was decided; a stale snapshot can neither skip nor claim it again.
+    assert (
+        store.skip_overlapping_occurrence(
+            task, now=now, next_run_at=now + 3600, host_id=None, running_since=None
+        )
+        is None
+    )
+    assert (
+        store.claim_scheduled_run(
+            task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+        )
+        is None
+    )
+
+
+def test_a_skipped_occurrence_supersedes_a_waiting_retry(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = store.update(
+        _due_task(store).id, max_retries=1, retry_delay_seconds=60, overlap_mode="skip"
+    )
+    _failed_claim(store, task)
+    [retry] = _pending_retries(store, task.id)
+    due = store.get(task.id)
+    store.skip_overlapping_occurrence(
+        due,
+        now=due.next_run_at,
+        next_run_at=due.next_run_at + 3600,
+        host_id=due.host_id,
+        running_since=None,
+    )
+    # The next occurrence came due, so the retry is dropped as it is by a claim.
+    superseded = store.get_run(retry.id)
+    assert (superseded.status, superseded.error_code) == ("skipped", "retry_superseded")
+
+
+def test_a_late_failure_is_retried_when_the_next_occurrence_was_only_skipped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = store.update(
+        _due_task(store).id, max_retries=1, retry_delay_seconds=60, overlap_mode="skip"
+    )
+    first_at = task.next_run_at
+    first = store.claim_scheduled_run(
+        task, now=first_at, next_run_at=first_at + 3600, host_id=task.host_id, lease_seconds=7200
+    )
+    due = store.get(task.id)
+    # The first run is still starting, so the check under the lock agrees.
+    store.skip_overlapping_occurrence(
+        due, now=first_at + 3600, next_run_at=first_at + 7200, host_id=due.host_id, running_since=0
+    )
+    store.transition_starting_run(
+        first,
+        now=lambda: first_at + 3601,
+        status="failed",
+        error_code="sandbox_registration_timeout",
+        retryable=True,
+    )
+    # The skipped occurrence ran nothing, so the retry is this period's only run.
+    [retry] = _pending_retries(store, task.id)
+    assert retry.trigger_key == f"retry:1:schedule:{first_at}"
+
+
+def test_unfinished_runs_are_those_starting_running_or_requested(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTaskRun
+
+    task = store.update(_due_task(store).id, max_retries=1, retry_delay_seconds=60)
+    assert not store.has_unfinished_run(task.id, running_since=0)
+    _failed_claim(store, task)
+    # A retry waiting out its delay isn't going: the next occurrence supersedes it.
+    assert len(_pending_retries(store, task.id)) == 1
+    assert not store.has_unfinished_run(task.id, running_since=0)
+
+    due = store.get(task.id)
+    now = due.next_run_at
+    run = store.claim_scheduled_run(
+        due, now=now, next_run_at=now + 3600, host_id=due.host_id, lease_seconds=120
+    )
+    assert store.has_unfinished_run(task.id, running_since=0)
+    store.transition_starting_run(
+        run, now=lambda: now + 1, status="running", conversation_id=_uid("session")
+    )
+    assert store.has_unfinished_run(task.id, running_since=now - 1)
+    # From the stale-run backstop's age on, nothing reports the run's end.
+    assert not store.has_unfinished_run(task.id, running_since=now)
+    store.request_manual_run(due, now=now + 2, trigger_key="manual:a", host_id=due.host_id)
+    assert store.has_unfinished_run(task.id, running_since=now)
+
+    # A request saved before runs recorded what started them can still be waiting
+    # after the upgrade.
+    requested = _due_task(store, "requested-before-the-upgrade")
+    request = store.request_manual_run(
+        requested, now=now, trigger_key="manual:old", host_id=requested.host_id
+    )
+    with store._session_immediate("test_request_from_before_trigger_kind") as session:
+        session.execute(
+            update(SqlScheduledTaskRun)
+            .where(SqlScheduledTaskRun.id == request.id)
+            .values(trigger_kind=None)
+        )
+    assert store.get_run(request.id).status == "scheduled"
+    assert store.has_unfinished_run(requested.id, running_since=now)
+
+    # A running run with no fire time ages from when it was scheduled.
+    unfired = _due_task(store, "unfired")
+    store.create_run(_uid("unfired-run"), unfired.id, "running", 500)
+    assert store.has_unfinished_run(unfired.id, running_since=499)
+    assert not store.has_unfinished_run(unfired.id, running_since=500)
+
+
+@pytest.mark.parametrize("recent", [False, True], ids=["only_stale", "a_recent_run_too"])
+def test_the_unfinished_run_lookup_fails_stale_runs_it_cannot_read_past(
+    store: SqlAlchemyScheduledTaskStore, recent: bool
+) -> None:
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import _RUNNING_RUN_READ_LIMIT
+
+    task = _due_task(store)
+    for index in range(_RUNNING_RUN_READ_LIMIT - 1):
+        store.create_run(_uid(f"stale-{index}"), task.id, "running", 500 + index)
+    # Less than a page of stale runs is read through.
+    assert not store.has_unfinished_run(task.id, running_since=10_000)
+    for index in range(_RUNNING_RUN_READ_LIMIT + 2):
+        store.create_run(_uid(f"more-{index}"), task.id, "running", 600 + index)
+    if recent:
+        store.create_run(_uid("recent"), task.id, "running", 20_000)
+
+    # A full page could hide a newer run. Each check fails a page, as the stale-run
+    # backstop would, and reports a run unfinished until it can tell.
+    answers = [store.has_unfinished_run(task.id, running_since=10_000) for _ in range(4)]
+
+    assert (answers[0], answers[-1]) == (True, recent)
+    runs = store.list_runs(task.id, limit=100)[0]
+    failed = [run for run in runs if run.status == "failed"]
+    assert {run.error_code for run in failed} <= {"incomplete"}
+    assert [run.status for run in runs if run.scheduled_at == 20_000] == ["running"] * recent
+    if not recent:
+        # Every full page; the runs left are few enough to read through. With a recent
+        # run, which page an engine reads first decides how many it has to fail.
+        assert len(failed) == 2 * _RUNNING_RUN_READ_LIMIT
+
+
+def test_an_occurrence_is_not_skipped_while_only_stale_runs_are_in_the_way(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import _RUNNING_RUN_READ_LIMIT
+
+    task = store.update(_due_task(store).id, overlap_mode="skip")
+    for index in range(_RUNNING_RUN_READ_LIMIT):
+        store.create_run(_uid(f"stale-{index}"), task.id, "running", 500 + index)
+    now = task.next_run_at
+
+    skipped = store.skip_overlapping_occurrence(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, running_since=10_000
+    )
+
+    # The page is failed instead, and the occurrence stays due for the next poll.
+    assert skipped is None
+    assert store.get(task.id).next_run_at == now
+    assert not store.has_unfinished_run(task.id, running_since=10_000)
+
+
+def test_the_unfinished_run_lookup_seeks_one_status_at_a_time(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    reads = _bounded_run_reads(store, lambda: store.has_unfinished_run(task.id, running_since=0))
+    # Starting runs, Run now requests with and without a trigger kind, and running runs;
+    # never the finished history.
+    assert ["trigger_kind" in statement for statement, _ in reads] == [False, True, True, False]
+    for statement, plan in reads:
+        terms = ("status=?", "trigger_kind=?") if "trigger_kind" in statement else ("status=?",)
+        _assert_seeks(plan, "ix_scheduled_task_runs_task_status", *terms)
+
+
+def test_a_queue_mode_saved_by_a_later_release_runs_as_allow(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    task = _due_task(store)
+    with store._session_immediate("test_later_release") as session:
+        session.execute(update(SqlScheduledTask).values(overlap_mode=3))
+    # Reading it must not fail a list or a clone after a rollback to this release.
+    assert store.get(task.id).overlap_mode == "allow"
+
+
 def test_switching_to_legacy_timers_skips_pending_run_now_requests(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:

@@ -8354,11 +8354,14 @@ describe("CreateScheduledTaskDialog retries", () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialTrigger="github" />, {
       info: {
         scheduled_task_retries: true,
+        scheduled_task_overlap_modes: ["allow", "skip"],
         scheduled_task_session_modes: true,
         scheduled_task_subhour: true,
       },
     });
     expect(screen.queryByTestId("task-retries-trigger")).toBeNull();
+    // A trigger has its own check of a busy polling session.
+    expect(screen.queryByTestId("task-overlap-trigger")).toBeNull();
   });
 
   it("saves the picked retry count and delay", async () => {
@@ -8385,5 +8388,36 @@ describe("CreateScheduledTaskDialog retries", () => {
       maxRetries: 2,
       retryDelaySeconds: 60,
     });
+  });
+});
+
+describe("CreateScheduledTaskDialog overlap mode", () => {
+  // An older server lists none, and one with the release feature off only the default.
+  it.each([[[]], [["allow"]], [["allow", "skip"]]])(
+    "offers overlap modes the server accepts (%j)",
+    (modes) => {
+      render(
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />,
+        { info: { scheduled_task_overlap_modes: modes } },
+      );
+      expect(screen.queryByTestId("task-overlap-trigger") !== null).toBe(modes.length > 1);
+    },
+  );
+
+  it("saves the picked overlap mode", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />,
+      { info: { scheduled_task_overlap_modes: ["allow", "skip"] } },
+    );
+    closeTopLevelPopovers();
+    const trigger = screen.getByTestId("task-overlap-trigger");
+    expect(trigger).toHaveTextContent("Start it anyway");
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("task-overlap-skip"));
+    expect(trigger).toHaveTextContent("Skip it");
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ overlapMode: "skip" });
   });
 });

@@ -54,6 +54,7 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ComposerHarnessTrigger } from "@/components/composer/ComposerControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
+import { AutomationOverlapField } from "@/components/scheduled/AutomationOverlapField";
 import { AutomationRetryField } from "@/components/scheduled/AutomationRetryField";
 import {
   TriggerTemplateFields,
@@ -146,6 +147,7 @@ import {
   type ScheduledTask,
   type AutomationTemplateId,
   type ScheduledTaskExecutionTarget,
+  type ScheduledTaskOverlapMode,
   type ScheduledTaskSessionMode,
 } from "@/lib/scheduledTasksApi";
 import {
@@ -171,6 +173,9 @@ const AUTOMATION_COST_LIMIT_HELP =
 const AUTOMATION_CONTROL_TRIGGER_CLASS_NAME =
   "h-9! min-h-9! max-w-full justify-start gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-ui leading-5 font-normal md:min-h-9! [&_svg]:p-0! [&>svg:last-child]:ml-auto [&>svg:last-child]:text-muted-foreground [&>svg:last-child]:opacity-100 [&_[data-testid$='-agent-model-value']]:font-normal";
 const AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME = `${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} border-transparent`;
+
+// Offered in this order when the server accepts them.
+const OVERLAP_MODES: readonly ScheduledTaskOverlapMode[] = ["allow", "skip"];
 
 type AutomationTriggerType = "schedule" | TriggerSource;
 const AUTOMATION_TRIGGER_TYPES: readonly AutomationTriggerType[] = ["schedule", ...TRIGGER_SOURCES];
@@ -301,6 +306,9 @@ export function CreateScheduledTaskDialog({
   const worktreesSupported = info !== "loading" && info.scheduled_task_worktrees === true;
   const sessionModesSupported = info !== "loading" && info.scheduled_task_session_modes === true;
   const retriesSupported = info !== "loading" && info.scheduled_task_retries === true;
+  const overlapModes = OVERLAP_MODES.filter(
+    (mode) => info !== "loading" && info.scheduled_task_overlap_modes?.includes(mode),
+  );
   const triggersSupported =
     sessionModesSupported && isFeatureEnabled(info, "session_orchestration");
   // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
@@ -534,6 +542,7 @@ export function CreateScheduledTaskDialog({
   const [baseBranch, setBaseBranch] = useState<string | null>(null);
   const [maxRetries, setMaxRetries] = useState(0);
   const [retryDelaySeconds, setRetryDelaySeconds] = useState(DEFAULT_RETRY_DELAY_SECONDS);
+  const [overlapMode, setOverlapMode] = useState<ScheduledTaskOverlapMode>("allow");
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
   // "managed_sandbox") instead of a connected host. Catalog-backed providers
   // offer repository selection instead of browsing a connected host.
@@ -660,6 +669,7 @@ export function CreateScheduledTaskDialog({
       setCostLimit(editingTask?.maxCostUsd == null ? "" : String(editingTask.maxCostUsd));
       setMaxRetries(editingTask?.maxRetries ?? 0);
       setRetryDelaySeconds(editingTask?.retryDelaySeconds ?? DEFAULT_RETRY_DELAY_SECONDS);
+      setOverlapMode(editingTask?.overlapMode ?? "allow");
       if (editingTask) {
         const parsedSchedule = savedSchedule;
         setName(editingTask.name);
@@ -1272,6 +1282,8 @@ export function CreateScheduledTaskDialog({
     triggerMode || triggerType !== "schedule" || editedTriggerSource !== null;
   // A trigger polls again within minutes, which a retry would rarely beat.
   const retriesShown = retriesSupported && !usesTriggerSchedule;
+  // A trigger has its own check for a busy polling session.
+  const overlapShown = overlapModes.length > 1 && !usesTriggerSchedule;
   const compatibleTriggerSchedule =
     validateSchedule(defaultTriggerSchedule, {
       sessionMode,
@@ -1746,6 +1758,9 @@ export function CreateScheduledTaskDialog({
         ...(retriesShown &&
         retryDelaySeconds !== (editingTask?.retryDelaySeconds ?? DEFAULT_RETRY_DELAY_SECONDS)
           ? { retryDelaySeconds }
+          : {}),
+        ...(overlapShown && overlapMode !== (editingTask?.overlapMode ?? "allow")
+          ? { overlapMode }
           : {}),
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
@@ -2591,6 +2606,15 @@ export function CreateScheduledTaskDialog({
                               retryDelaySeconds={retryDelaySeconds}
                               onMaxRetriesChange={setMaxRetries}
                               onRetryDelayChange={setRetryDelaySeconds}
+                              triggerClassName={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                            />
+                          )}
+
+                          {overlapShown && (
+                            <AutomationOverlapField
+                              overlapMode={overlapMode}
+                              modes={overlapModes}
+                              onChange={setOverlapMode}
                               triggerClassName={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
                             />
                           )}

@@ -37,6 +37,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AutomationPaletteCommands } from "@/components/scheduled/AutomationPaletteCommands";
+import { OVERLAP_MODE_LABELS } from "@/components/scheduled/AutomationOverlapField";
 import { retrySummary } from "@/components/scheduled/AutomationRetryField";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { RunPullRequests } from "@/components/scheduled/RunPullRequests";
@@ -756,6 +757,13 @@ function TaskDetail({ taskId }: { taskId: string }) {
                 label="Retries"
                 value={retrySummary(task.maxRetries ?? 0, task.retryDelaySeconds ?? 0)}
                 testId="task-detail-retries"
+              />
+            )}
+            {(task.overlapMode ?? "allow") !== "allow" && (
+              <ConfigField
+                label="Overlapping runs"
+                value={OVERLAP_MODE_LABELS[task.overlapMode ?? "allow"]}
+                testId="task-detail-overlap"
               />
             )}
           </dl>

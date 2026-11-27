@@ -56,6 +56,11 @@ _CODECS = [
         ec.encode_scheduled_task_session_mode,
         ec.decode_scheduled_task_session_mode,
     ),
+    (
+        ec.SCHEDULED_TASK_OVERLAP_MODE,
+        ec.encode_scheduled_task_overlap_mode,
+        ec.decode_scheduled_task_overlap_mode,
+    ),
     (ec.JOURNAL_ENTRY_KIND, ec.encode_journal_entry_kind, ec.decode_journal_entry_kind),
     (ec.INBOX_ITEM_STATUS, ec.encode_inbox_item_status, ec.decode_inbox_item_status),
     (ec.MEMORY_ACTOR_TYPE, ec.encode_memory_actor_type, ec.decode_memory_actor_type),
@@ -141,6 +146,7 @@ def test_shipped_codes_are_stable() -> None:
         "managed_sandbox": 2,
     }
     assert ec.SCHEDULED_TASK_SESSION_MODE == {"new": 1, "continue": 2}
+    assert ec.SCHEDULED_TASK_OVERLAP_MODE == {"allow": 1, "skip": 2, "queue": 3}
     assert ec.INBOX_ITEM_STATUS == {"unread": 1, "read": 2, "done": 3, "dismissed": 4}
     assert ec.MEMORY_ACTOR_TYPE == {"user": 1}
     assert ec.SCHEDULED_TASK_RUN_STATUS == {

@@ -418,6 +418,7 @@ _SCHEDULED_TASK_SETTINGS = (
     "max_cost_usd",
     "max_retries",
     "retry_delay_seconds",
+    "overlap_mode",
     "model_override",
     "reasoning_effort",
     "workflow_id",

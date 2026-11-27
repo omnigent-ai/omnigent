@@ -19,6 +19,7 @@ from omnigent.debug_logging import current_session_id_scope, debug_event, log_at
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
     is_trigger_automation,
@@ -411,6 +412,9 @@ PollInterval = Callable[[], float]
 # Given the current time, when a trigger automation's busy session should next be checked,
 # skipping this poll unrecorded; ``None`` polls now. Asked only for trigger automations.
 BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
+# Whether the session an automation continues is still busy with an earlier prompt. Asked
+# only for automations whose ``overlap_mode`` is ``skip`` and that have no unfinished run.
+SessionBusy = Callable[[ScheduledTask], Awaitable[bool]]
 
 # With a busy check, the server tries to poll a trigger automation this often instead of
 # following the trigger's saved schedule.
@@ -477,6 +481,7 @@ class PersistentTaskScheduler:
         dispatch_enabled: DispatchEnabled = _always_enabled,
         poll_interval: PollInterval | None = None,
         busy_until: BusyUntil | None = None,
+        session_busy: SessionBusy | None = None,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -503,6 +508,7 @@ class PersistentTaskScheduler:
         self._dispatch_enabled = dispatch_enabled
         self._poll_interval = poll_interval
         self._busy_until = busy_until
+        self._session_busy = session_busy
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -769,6 +775,75 @@ class PersistentTaskScheduler:
         # A task that changed since it was listed is re-read on the next poll.
         return True
 
+    async def _skip_overlapping_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run: int, host_id: str | None
+    ) -> bool:
+        """Record a due occurrence as skipped while the automation's previous run is going.
+
+        Asked only for an automation whose ``overlap_mode`` is ``skip``; trigger
+        automations have their own busy check. Returns True when this occurrence must
+        not be claimed. A failed check returns False, so the occurrence starts.
+        """
+        if task.overlap_mode != "skip" or task.kind != "automation" or is_trigger_automation(task):
+            return False
+        assert task.next_run_at is not None
+        try:
+            going = await self._previous_run_going(task, now)
+        except Exception:
+            _logger.exception(
+                "Could not check whether task %s's previous run is still going; starting "
+                "this occurrence",
+                task.id,
+            )
+            return False
+        if going is None:
+            return False
+        with workspace_scope(task.workspace_id):
+            run = await asyncio.to_thread(
+                self._store.skip_overlapping_occurrence,
+                task,
+                now=now,
+                next_run_at=next_run,
+                host_id=host_id,
+                # A run can end before the skip is written, so the write checks it again.
+                running_since=now - STALE_RUN_MAX_AGE_SECONDS if going == "run" else None,
+            )
+        if run is None:
+            # The task changed, its run just ended or only stale runs were in the way; the
+            # next poll decides again.
+            return True
+        _log_event(
+            _logger.info,
+            "Skipped occurrence %s of task %s: its previous run is still going",
+            task.next_run_at,
+            task.id,
+            extra=debug_event(
+                "scheduled_run_skipped_overlap",
+                task_id=task.id,
+                task_workspace_id=task.workspace_id,
+                scheduled_at=task.next_run_at,
+                trigger_key=scheduled_trigger_key(task.next_run_at),
+                target=task.execution_target,
+                run_id=run.id,
+            ),
+        )
+        return True
+
+    async def _previous_run_going(
+        self, task: ScheduledTask, now: int
+    ) -> Literal["run", "session"] | None:
+        """What keeps the task's previous run going: a run of it, or the session it continues."""
+        with workspace_scope(task.workspace_id):
+            if await asyncio.to_thread(
+                self._store.has_unfinished_run,
+                task.id,
+                running_since=now - STALE_RUN_MAX_AGE_SECONDS,
+            ):
+                return "run"
+            if self._session_busy is not None and await self._session_busy(task):
+                return "session"
+        return None
+
     async def _validate_schedule(self, task: ScheduledTask) -> bool:
         try:
             if task.kind == "timer":
@@ -1001,6 +1076,11 @@ class PersistentTaskScheduler:
                     # is always sent.
                     if next_run is not None and await self._skip_busy_occurrence(
                         task, now=now, next_run=next_run
+                    ):
+                        continue
+                    # Skipping the last occurrence would complete the task without running it.
+                    if next_run is not None and await self._skip_overlapping_occurrence(
+                        task, now=now, next_run=next_run, host_id=host_id
                     ):
                         continue
                     with workspace_scope(task.workspace_id):

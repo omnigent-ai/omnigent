@@ -426,6 +426,12 @@ export interface ServerInfo {
    */
   scheduled_task_retries?: boolean;
   /**
+   * The `overlap_mode` values scheduled tasks accept. More than `allow` needs the database
+   * scheduler and the `automation_overlap_mode` release feature; absent or empty on older
+   * servers, which reject the field.
+   */
+  scheduled_task_overlap_modes?: string[];
+  /**
    * The deployment offers the proactive agent (Omni Advisor) to this caller;
    * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
    */
@@ -826,6 +832,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
           scheduled_task_clone: data.scheduled_task_clone === true,
           scheduled_task_retries: data.scheduled_task_retries === true,
+          scheduled_task_overlap_modes: Array.isArray(data.scheduled_task_overlap_modes)
+            ? data.scheduled_task_overlap_modes.filter(
+                (mode): mode is string => typeof mode === "string",
+              )
+            : [],
           proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:

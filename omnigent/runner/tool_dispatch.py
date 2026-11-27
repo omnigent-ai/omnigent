@@ -5412,6 +5412,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "max_cost_usd",
     "max_retries",
     "retry_delay_seconds",
+    "overlap_mode",
     "mcp_services",
     "session_mode",
     "session_id",
@@ -5436,6 +5437,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "max_cost_usd",
     "max_retries",
     "retry_delay_seconds",
+    "overlap_mode",
     "session_mode",
     "session_id",
     "workspace",
@@ -5479,6 +5481,11 @@ _SCHEDULED_TASK_GATED_FIELDS = (
 )
 
 
+# Optional fields whose values an older server may not accept, and the ``/v1/info`` list
+# of the values it does.
+_SCHEDULED_TASK_GATED_VALUES = (("overlap_mode", "scheduled_task_overlap_modes"),)
+
+
 async def _scheduled_task_session_fields_refusal(
     get_info: Callable[[], Awaitable[httpx.Response]],
     tool_name: str,
@@ -5495,13 +5502,31 @@ async def _scheduled_task_session_fields_refusal(
         for fields, capability, reason in _SCHEDULED_TASK_GATED_FIELDS
         if any(field in payload for field in fields)
     ]
-    if not gated:
+    gated_values = [
+        (field, capability)
+        for field, capability in _SCHEDULED_TASK_GATED_VALUES
+        if field in payload
+    ]
+    if not gated and not gated_values:
         return None
     info = await get_info()
     advertised = info.json() if info.status_code < 400 else {}
     for capability, reason in gated:
         if advertised.get(capability) is not True:
             return json.dumps({"error": f"{tool_name}: this Omnigent server {reason}"})
+    for field, capability in gated_values:
+        accepted = advertised.get(capability)
+        if not isinstance(accepted, list) or not accepted:
+            return json.dumps(
+                {"error": f"{tool_name}: this Omnigent server does not support {field}; omit it"}
+            )
+        if payload[field] not in accepted:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: this Omnigent server does not support {field} "
+                    f"{payload[field]!r}; it accepts {', '.join(map(repr, accepted))}"
+                }
+            )
     return None
 
 

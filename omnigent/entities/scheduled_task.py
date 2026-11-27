@@ -19,6 +19,7 @@ comments, and schema on "scheduled task"; only presentation strings say
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict
 
@@ -27,6 +28,10 @@ MAX_SCHEDULED_TASK_RETRIES = 5
 MIN_RETRY_DELAY_SECONDS = 60
 MAX_RETRY_DELAY_SECONDS = 60 * 60
 DEFAULT_RETRY_DELAY_SECONDS = 5 * 60
+
+# What a due occurrence can do while the task's previous run is still going.
+ScheduledTaskOverlapMode = Literal["allow", "skip"]
+SCHEDULED_TASK_OVERLAP_MODES: tuple[str, ...] = get_args(ScheduledTaskOverlapMode)
 
 
 class ScheduledRunLogContext(BaseModel):
@@ -84,6 +89,9 @@ class ScheduledTask:
         default) never retries.
     :param retry_delay_seconds: How long the scheduler waits after a failed
         startup before retrying it, e.g. ``300``.
+    :param overlap_mode: What a due occurrence does while the task's previous
+        run is still going: ``"allow"`` (default) starts it anyway, and
+        ``"skip"`` records it as a skipped run.
     :param session_mode: ``"new"`` (default) starts a new session per firing;
         ``"continue"`` sends each firing's prompt into ``session_id``.
     :param session_id: The session a ``"continue"`` task sends its prompt to.
@@ -136,6 +144,7 @@ class ScheduledTask:
     max_cost_usd: float | None = None
     max_retries: int = 0
     retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS
+    overlap_mode: str = "allow"
     session_mode: str = "new"
     kind: str = "automation"
     session_id: str | None = None

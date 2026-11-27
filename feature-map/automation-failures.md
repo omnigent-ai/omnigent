@@ -91,4 +91,7 @@ no connected host so Run now fails naturally without touching a real host.
   startup again by itself. While a retry waits it is the latest run, so the
   warning and Inbox item appear once the retries run out, or when a waiting
   retry is dropped because the automation was paused or its retries turned off.
+- An occurrence skipped because the previous run was still going is the latest
+  run. If that previous run fails afterwards, the list shows the skip, with no
+  warning or Inbox item; the failure is in the run history.
 - Older servers without the failure-feed capability retain the existing Inbox.

@@ -167,10 +167,11 @@ saved.
   or leave `max_retries` below the retry's attempt (`retry_cancelled`). A retry
   that is ruled out therefore never stays pending, and undoing the edit doesn't
   bring it back. `claim_pending_run` checks both again before it starts one.
-- **Superseding.** Claiming a scheduled occurrence records the task's waiting
-  retry as `skipped` (`retry_superseded`). A retry claimed once that occurrence
-  is due is superseded too: a sandbox occurrence and its retry have different
-  hosts, so another replica may claim the occurrence only afterwards.
+- **Superseding.** Recording a due occurrence, whether it is claimed or
+  [skipped](#overlap-mode), records the task's waiting retry as `skipped`
+  (`retry_superseded`). A retry claimed once that occurrence is due is
+  superseded too: a sandbox occurrence and its retry have different hosts, so
+  another replica may record the occurrence only afterwards.
 - **Latest run.** `list_latest_run_status_for_tasks` and `list_inbox_failures`
   pass over a `skipped` retry, so the failure it would have retried stays the
   task's latest run. A skipped retry keeps the date of its deadline, so any
@@ -187,6 +188,53 @@ every scheduler polling the database has this release. Before rolling back to
 one, turn the feature off and set `max_retries` to 0 on every task that has it:
 that drops its waiting retry in the same write, so no pending retry is left for
 the older scheduler.
+
+## Overlap mode
+
+A task's `overlap_mode` decides what a due occurrence does while the previous
+run is still going. The routes save a mode other than `allow` only with the
+`automation_overlap_mode` release feature; the scheduler follows whatever is
+saved.
+
+- **The check.** Before claiming a due occurrence of an automation whose mode
+  is `skip`, the scheduler asks the store's `has_unfinished_run`. The previous
+  run is still going when it finds a `starting` or `running` run (a `running`
+  one that began `STALE_RUN_MAX_AGE_SECONDS` ago or earlier is stale) or a
+  waiting Run now request. Failing that, for a task that continues a session,
+  the scheduler asks its `session_busy` callback (`build_session_busy`), which
+  says whether the session shows a turn in progress or waits on an approval or a
+  question. The session part has no age limit. A waiting retry doesn't count.
+  The check applies with a custom `on_fire` hook too.
+- **Skipping.** `skip_overlapping_occurrence` advances `next_run_at` and records
+  the occurrence as a `skipped` run with `previous_run_active`. It shares
+  `_record_due_occurrence` with `claim_scheduled_run`, so it makes the same
+  snapshot check and supersedes a waiting retry the same way. That retry is not
+  brought back, so the occurrence that failed is not run again.
+- **A run that ends during the check.** When a run was what kept the task busy,
+  the skip checks `has_unfinished_run` again under the task lock and records
+  nothing if the run has ended; the next poll then starts the occurrence. A
+  startup failure takes the same lock to decide its retry, so the two can't
+  interleave into a failed run with no retry and a skipped occurrence. The
+  session check is not repeated under the lock: a session that stops being busy
+  between the check and the write still skips the occurrence.
+- **What never checks.** Run now, retries, timers, reminders and trigger
+  automations. The last occurrence of a schedule that ends is claimed without
+  the check, since skipping it would complete the task without running it. A
+  failed check claims the occurrence.
+
+`has_unfinished_run` makes four seeks of `ix_scheduled_task_runs_task_status`,
+each stopping at its limit: a `starting` run, a waiting Run now request (status
+and `trigger_kind`), a request saved before `trigger_kind` (status, and no
+kind), and up to 20 `running` runs, whose age it checks in code.
+Twenty stale `running` runs could hide a newer one behind them, so the check
+can't tell. It fails that page under the task lock, as the stale-run backstop
+does on a read of the run history, and answers "unfinished" until a later poll
+can tell. The skip does the same and records nothing for such a page, so the
+occurrence stays due: stale runs delay it by a few polls, and never skip it.
+
+A database scheduler from before this release doesn't read the mode and
+starts every occurrence. Keep `automation_overlap_mode` off until every
+scheduler polling the database has this release.
 
 ## Startup leases
 
@@ -294,7 +342,8 @@ minutes ago, so a stale status cannot stall the trigger. A skip only moves
 status is read from session activity, which needs no caller access check, so the
 poll does not act as the owner. A failed check sends the prompt. Other continued
 tasks, legacy timers and a scheduler with a custom `on_fire` hook (it has no busy
-check) follow the saved schedule and never skip, and neither does Run now.
+check) follow the saved schedule, and so does Run now. Of these, only an
+automation whose [overlap mode](#overlap-mode) is `skip` skips an occurrence.
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run

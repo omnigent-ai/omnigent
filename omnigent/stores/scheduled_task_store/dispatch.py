@@ -93,6 +93,41 @@ class ScheduledTaskDispatchStore(Protocol):
         """
         ...
 
+    def has_unfinished_run(self, scheduled_task_id: str, *, running_since: int) -> bool:
+        """Whether a run of the task is ``starting``, ``running``, or a waiting Run now request.
+
+        Asked before a due occurrence of a task whose ``overlap_mode`` is ``skip``.
+        A ``running`` run that fired at or before *running_since* (or, with no fire
+        time, was scheduled then) is stale and doesn't count, and neither does a
+        retry waiting out its delay. The read is bounded, so a full page of stale
+        ``running`` runs could hide a newer one. This fails that page, as the
+        stale-run backstop would, and answers True until a later call can tell.
+        """
+        ...
+
+    def skip_overlapping_occurrence(
+        self,
+        task: ScheduledTask,
+        *,
+        now: int,
+        next_run_at: int,
+        host_id: str | None,
+        running_since: int | None,
+    ) -> ScheduledTaskRun | None:
+        """Advance an unchanged task past its due occurrence, recording it as ``skipped``.
+
+        For a task whose ``overlap_mode`` is ``skip`` while its previous run is still
+        going: the run gets ``error_code`` ``previous_run_active``, and a retry still
+        waiting is superseded as a claim would. With *running_since*, the write first
+        checks again, under the task lock, that :meth:`has_unfinished_run` still
+        holds. It records nothing if that run ended meanwhile, or if only stale
+        runs it cannot read past are in the way, which it fails. Pass ``None`` when
+        the session the task continues is what is busy. Returns None then, and if
+        the task changed since it was listed; an occurrence that already has a run
+        only advances.
+        """
+        ...
+
     def request_manual_run(
         self, task: ScheduledTask, *, now: int, trigger_key: str, host_id: str | None
     ) -> ScheduledTaskRun | None:

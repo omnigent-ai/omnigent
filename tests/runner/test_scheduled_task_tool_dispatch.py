@@ -536,6 +536,37 @@ async def test_retry_settings_reach_only_a_server_that_supports_them(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("advertised", "mode", "refusal"),
+    [
+        (["allow", "skip"], "skip", None),
+        (["allow"], "allow", None),
+        (["allow"], "skip", "does not support overlap_mode 'skip'; it accepts 'allow'"),
+        # An older server rejects the field itself, whatever its value.
+        (None, "allow", "does not support overlap_mode; omit it"),
+        (None, "skip", "does not support overlap_mode; omit it"),
+    ],
+    ids=["supported", "allow-only", "feature-off", "older-server-default", "older-server"],
+)
+async def test_an_overlap_mode_reaches_only_a_server_that_accepts_it(
+    advertised: list[str] | None, mode: str, refusal: str | None
+) -> None:
+    info = {} if advertised is None else {"scheduled_task_overlap_modes": advertised}
+    client = _RecordingClient(_Resp(body={"id": "t1"}), info=_Resp(body=info))
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps({**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "overlap_mode": mode}),
+        server_client=client,
+    )
+    if refusal is not None:
+        assert [url for _, url, _ in client.calls] == ["/v1/info"]
+        assert json.loads(out)["error"].endswith(refusal)
+        return
+    verb, _url, body = client.calls[-1]
+    assert (verb, body["overlap_mode"]) == ("PATCH", mode)
+
+
+@pytest.mark.asyncio
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
     out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)

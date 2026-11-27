@@ -6,7 +6,7 @@ import builtins
 import json
 import logging
 import uuid
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from functools import partial
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -47,12 +47,14 @@ from omnigent.db.enum_codecs import (
     SCHEDULED_TASK_STATE,
     decode_scheduled_task_execution_target,
     decode_scheduled_task_kind,
+    decode_scheduled_task_overlap_mode,
     decode_scheduled_task_run_prompt_dispatch,
     decode_scheduled_task_run_status,
     decode_scheduled_task_session_mode,
     decode_scheduled_task_state,
     encode_scheduled_task_execution_target,
     encode_scheduled_task_kind,
+    encode_scheduled_task_overlap_mode,
     encode_scheduled_task_run_prompt_dispatch,
     encode_scheduled_task_run_status,
     encode_scheduled_task_run_trigger_kind,
@@ -68,7 +70,10 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
-from omnigent.entities.scheduled_task import DEFAULT_RETRY_DELAY_SECONDS
+from omnigent.entities.scheduled_task import (
+    DEFAULT_RETRY_DELAY_SECONDS,
+    SCHEDULED_TASK_OVERLAP_MODES,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.scheduled.run_reconciler import (
@@ -128,20 +133,29 @@ _PENDING_RUN_FILTER = (
 # A retry only follows an automation that can still fire; a completed one-time task's
 # final occurrence still gets its retries.
 _RETRYABLE_TASK_STATES = {encode_scheduled_task_state(state) for state in ("active", "completed")}
-_PENDING, _SKIPPED = (
-    encode_scheduled_task_run_status(status) for status in ("scheduled", "skipped")
+_PENDING, _SKIPPED, _STARTING, _RUNNING = (
+    encode_scheduled_task_run_status(status)
+    for status in ("scheduled", "skipped", "starting", "running")
 )
 # A skipped run ran nothing; every other one started, or still can.
 _NOT_SKIPPED_STATUSES = tuple(
     encode_scheduled_task_run_status(status)
     for status in ("scheduled", "starting", "running", "succeeded", "failed")
 )
-_SCHEDULE_KIND, _RETRY_KIND = (
-    encode_scheduled_task_run_trigger_kind(kind) for kind in ("schedule", "retry")
+_SCHEDULE_KIND, _MANUAL_KIND, _RETRY_KIND = (
+    encode_scheduled_task_run_trigger_kind(kind) for kind in ("schedule", "manual", "retry")
 )
 _NOT_DISPATCHED, _DISPATCHED = (
     encode_scheduled_task_run_prompt_dispatch(state) for state in ("not_started", "started")
 )
+# How many of a task's ``running`` runs the overlap check reads for one that is not stale.
+_RUNNING_RUN_READ_LIMIT = 20
+
+
+def _overlap_mode(code: int) -> str:
+    """The stored mode; ``queue``, which only a later release saves, runs as ``allow``."""
+    mode = decode_scheduled_task_overlap_mode(code)
+    return mode if mode in SCHEDULED_TASK_OVERLAP_MODES else "allow"
 
 
 def _trigger_kind_code(trigger_key: str) -> int | None:
@@ -241,6 +255,79 @@ def _schedule_retry(
             host_id=occurrence_host_id(_to_entity(task), trigger_key),
         )
     )
+
+
+def _began(run: SqlScheduledTaskRun | Row[Any]) -> int:
+    """When a run started, which is what the stale-run backstop ages it from."""
+    return run.scheduled_at if run.fired_at is None else run.fired_at
+
+
+def _fail_stale_run(run: SqlScheduledTaskRun, now: int) -> None:
+    """Fail a ``running`` run past the stale-run age, as the read-time backstop does."""
+    run.status = encode_scheduled_task_run_status("failed")
+    run.finished_at = now
+    run.error_code = STALE_RUN_ERROR_CODE
+    run.error = f"scheduled run did not reach a terminal state within {STALE_RUN_MAX_AGE_SECONDS}s"
+
+
+def _fail_stale_runs(session: Session, task: SqlScheduledTask, running_since: int) -> None:
+    """Fail a page of the task's stale ``running`` runs, so the overlap check reads past them.
+
+    The caller holds the task lock.
+    """
+    page = session.scalars(
+        select(SqlScheduledTaskRun)
+        .where(
+            SqlScheduledTaskRun.workspace_id == task.workspace_id,
+            SqlScheduledTaskRun.scheduled_task_id == task.id,
+            SqlScheduledTaskRun.status == _RUNNING,
+        )
+        .limit(_RUNNING_RUN_READ_LIMIT)
+        .with_for_update()
+    )
+    timestamp = now_epoch()
+    for run in page:
+        if _began(run) <= running_since:
+            _fail_stale_run(run, timestamp)
+
+
+def _has_unfinished_run(
+    session: Session, workspace_id: int, task_id: str, running_since: int
+) -> bool | None:
+    """Whether a run of the task is starting, running, or a Run now request yet to start.
+
+    A ``running`` run that began at or before *running_since* is stale and doesn't
+    count. Every read is a seek that stops at its limit, so a full page of stale
+    ``running`` runs could hide a newer one: the answer is then ``None``, until
+    ``_fail_stale_runs`` has cleared the page.
+    """
+
+    def runs(*where: ColumnElement[bool], limit: int = 1) -> Sequence[Row[Any]]:
+        return session.execute(
+            select(SqlScheduledTaskRun.fired_at, SqlScheduledTaskRun.scheduled_at)
+            .where(
+                SqlScheduledTaskRun.workspace_id == workspace_id,
+                SqlScheduledTaskRun.scheduled_task_id == task_id,
+                *where,
+            )
+            .limit(limit)
+        ).all()
+
+    if (
+        runs(SqlScheduledTaskRun.status == _STARTING)
+        or runs(
+            SqlScheduledTaskRun.status == _PENDING,
+            SqlScheduledTaskRun.trigger_kind == _MANUAL_KIND,
+        )
+        # A request saved before ``trigger_kind``, or by a server from before it, has
+        # none. Every pending run was a Run now request then.
+        or runs(SqlScheduledTaskRun.status == _PENDING, SqlScheduledTaskRun.trigger_kind.is_(None))
+    ):
+        return True
+    running = runs(SqlScheduledTaskRun.status == _RUNNING, limit=_RUNNING_RUN_READ_LIMIT)
+    if any(_began(run) > running_since for run in running):
+        return True
+    return None if len(running) == _RUNNING_RUN_READ_LIMIT else False
 
 
 def _skip_run(run: SqlScheduledTaskRun, now: int, error_code: str) -> None:
@@ -442,6 +529,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         max_cost_usd=row.max_cost_usd,
         max_retries=row.max_retries,
         retry_delay_seconds=row.retry_delay_seconds,
+        overlap_mode=_overlap_mode(row.overlap_mode),
         session_mode=decode_scheduled_task_session_mode(row.session_mode),
         kind=decode_scheduled_task_kind(row.kind),
         session_id=row.session_id,
@@ -562,6 +650,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = None,
         max_retries: int = 0,
         retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
+        overlap_mode: str = "allow",
         session_mode: str = "new",
         session_id: str | None = None,
         source_session_id: str | None = None,
@@ -619,6 +708,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 max_cost_usd=max_cost_usd,
                 max_retries=max_retries,
                 retry_delay_seconds=retry_delay_seconds,
+                overlap_mode=encode_scheduled_task_overlap_mode(overlap_mode),
                 session_mode=encode_scheduled_task_session_mode(session_mode),
                 kind=encoded_kind,
                 session_id=session_id,
@@ -798,6 +888,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = _UNSET,
         max_retries: int | None = None,
         retry_delay_seconds: int | None = None,
+        overlap_mode: str | None = None,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workflow_id: str | None = _UNSET,
@@ -919,6 +1010,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if retry_delay_seconds is not None and row.retry_delay_seconds != retry_delay_seconds:
                 row.retry_delay_seconds = retry_delay_seconds
                 changed = True
+            if overlap_mode is not None:
+                encoded_overlap = encode_scheduled_task_overlap_mode(overlap_mode)
+                if row.overlap_mode != encoded_overlap:
+                    row.overlap_mode = encoded_overlap
+                    changed = True
             if session_mode is not None:
                 encoded_mode = encode_scheduled_task_session_mode(session_mode)
                 if row.session_mode != encoded_mode:
@@ -1147,13 +1243,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 if run.trigger_key is not None and stale_running:
                     # Apply the read-time backstop under the row lock; the next
                     # sweep removes the failed record like any other finished run.
-                    run.status = encode_scheduled_task_run_status("failed")
-                    run.finished_at = timestamp
-                    run.error_code = STALE_RUN_ERROR_CODE
-                    run.error = (
-                        "scheduled run did not reach a terminal state within "
-                        f"{STALE_RUN_MAX_AGE_SECONDS}s"
-                    )
+                    _fail_stale_run(run, timestamp)
                 elif run.trigger_key is None or run.status not in _UNFINISHED_CLAIM_STATUSES:
                     session.delete(run)
             return cursor
@@ -1463,6 +1553,30 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .limit(1)
             )
             return session.execute(stmt).first() is not None
+
+    def has_unfinished_run(self, scheduled_task_id: str, *, running_since: int) -> bool:
+        """Seek the task's ``starting``, ``running`` and requested runs; see the protocol."""
+        workspace_id = current_workspace_id()
+        with self._session("select_unfinished_task_run") as session:
+            unfinished = _has_unfinished_run(
+                session, workspace_id, scheduled_task_id, running_since
+            )
+        if unfinished is not None:
+            return unfinished
+
+        def write(session: Session) -> bool:
+            task = session.get(
+                SqlScheduledTask, (workspace_id, scheduled_task_id), with_for_update=True
+            )
+            if task is not None:
+                _fail_stale_runs(session, task, running_since)
+            # Still unknown past this page: unfinished for now, and the next check goes on.
+            return (
+                _has_unfinished_run(session, workspace_id, scheduled_task_id, running_since)
+                is not False
+            )
+
+        return run_write_transaction(self._session_immediate, "fail_stale_task_runs", write)
 
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """Return the ``running`` run for a conversation, or ``None``.
@@ -1828,28 +1942,30 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 stmt = stmt.where(self._cursor_after(columns, after))
             return [_to_entity(row) for row in session.scalars(stmt)]
 
-    def claim_scheduled_run(
+    def _record_due_occurrence(
         self,
         task: ScheduledTask,
         *,
         now: int,
         next_run_at: int | None,
         host_id: str | None,
-        lease_seconds: int,
+        operation: str,
+        run_values: Callable[[Session, SqlScheduledTask], dict[str, Any] | None],
     ) -> ScheduledTaskRun | None:
         """Lock/recheck the complete task snapshot, then advance and insert atomically.
 
         Comparing the full snapshot also catches same-second prompt/host edits;
         updated_at alone cannot serve as a revision. A uniqueness error rolls
-        back the advance, as does any other write failure. Claiming the final
-        occurrence (``next_run_at=None``) marks the task completed. A timer's claim
-        waits for its previous run to finish, then deletes it (see protocol).
+        back the advance, as does any other write failure. Recording the final
+        occurrence (``next_run_at=None``) marks the task completed. *run_values*
+        returns the status columns of the occurrence's run, or ``None`` to change
+        nothing.
         """
         self.check_dispatch_support()
-        if lease_seconds <= 0 or (next_run_at is not None and next_run_at <= now):
+        if next_run_at is not None and next_run_at <= now:
             raise ValueError(
-                "Cannot claim a scheduled run: lease_seconds must be greater than zero, "
-                "and next_run_at must be later than now or None when no future run remains."
+                "Cannot record a due occurrence: next_run_at must be later than now, "
+                "or None when no future run remains."
             )
         if (
             task.workspace_id != current_workspace_id()
@@ -1866,8 +1982,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.get(SqlScheduledTask, (task.workspace_id, task.id), with_for_update=True)
             if row is None or _to_entity(row) != task:
                 return None
-            if row.kind == _TIMER_KIND and not _clear_timer_history(session, row):
-                # The previous firing is still on its way; a later poll claims this one.
+            values = run_values(session, row)
+            if values is None:
                 return None
             existing = session.scalar(
                 select(SqlScheduledTaskRun.id).where(
@@ -1889,19 +2005,54 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 workspace_id=task.workspace_id,
                 id=run_id,
                 scheduled_task_id=task.id,
-                status=encode_scheduled_task_run_status("starting"),
                 scheduled_at=scheduled_at,
-                fired_at=now,
                 trigger_key=trigger_key,
                 trigger_kind=_SCHEDULE_KIND,
                 host_id=host_id,
-                lease_expires_at=now + lease_seconds,
-                prompt_dispatch=_NOT_DISPATCHED,
+                **values,
             )
             session.add(run)
             return _run_to_entity(run)
 
-        return run_write_transaction(self._session_immediate, "claim_occurrence", write)
+        return run_write_transaction(self._session_immediate, operation, write)
+
+    def claim_scheduled_run(
+        self,
+        task: ScheduledTask,
+        *,
+        now: int,
+        next_run_at: int | None,
+        host_id: str | None,
+        lease_seconds: int,
+    ) -> ScheduledTaskRun | None:
+        """Record the due occurrence as ``starting`` under a lease; see the protocol.
+
+        A timer's claim waits for its previous run to finish, then deletes it.
+        """
+        if lease_seconds <= 0:
+            raise ValueError(
+                "Cannot claim a scheduled run: lease_seconds must be greater than zero."
+            )
+
+        def starting(session: Session, row: SqlScheduledTask) -> dict[str, Any] | None:
+            if row.kind == _TIMER_KIND and not _clear_timer_history(session, row):
+                # The previous firing is still on its way; a later poll claims this one.
+                return None
+            return {
+                "status": _STARTING,
+                "fired_at": now,
+                "lease_expires_at": now + lease_seconds,
+                "prompt_dispatch": _NOT_DISPATCHED,
+            }
+
+        return self._record_due_occurrence(
+            task,
+            now=now,
+            next_run_at=next_run_at,
+            host_id=host_id,
+            operation="claim_occurrence",
+            run_values=starting,
+        )
 
     def skip_scheduled_occurrence(
         self, task: ScheduledTask, *, now: int, next_run_at: int
@@ -1930,6 +2081,37 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return True
 
         return run_write_transaction(self._session_immediate, "skip_occurrence", write)
+
+    def skip_overlapping_occurrence(
+        self,
+        task: ScheduledTask,
+        *,
+        now: int,
+        next_run_at: int,
+        host_id: str | None,
+        running_since: int | None,
+    ) -> ScheduledTaskRun | None:
+        """Record the due occurrence as ``skipped``, with no error text; see the protocol."""
+
+        def skipped(session: Session, row: SqlScheduledTask) -> dict[str, Any] | None:
+            if running_since is not None:
+                unfinished = _has_unfinished_run(session, row.workspace_id, row.id, running_since)
+                if unfinished is None:
+                    # Stale runs may hide a newer one: clear a page and decide on a later poll.
+                    _fail_stale_runs(session, row, running_since)
+                if not unfinished:
+                    # No run is known to be going; a later poll starts this occurrence.
+                    return None
+            return {"status": _SKIPPED, "finished_at": now, "error_code": "previous_run_active"}
+
+        return self._record_due_occurrence(
+            task,
+            now=now,
+            next_run_at=next_run_at,
+            host_id=host_id,
+            operation="skip_overlapping_run",
+            run_values=skipped,
+        )
 
     def request_manual_run(
         self, task: ScheduledTask, *, now: int, trigger_key: str, host_id: str | None

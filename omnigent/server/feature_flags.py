@@ -47,6 +47,7 @@ class Feature(StrEnum):
     AUTOMATIONS_V2 = "automations_v2"
     ONE_TIME_AUTOMATIONS = "one_time_automations"
     AUTOMATION_RETRIES = "automation_retries"
+    AUTOMATION_OVERLAP_MODE = "automation_overlap_mode"
     SESSION_TIMERS = "session_timers"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
@@ -176,6 +177,19 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
             "sharing the database runs a release with retries; an older one starts a waiting "
             "retry at once, without its delay. Turning it off stops new retry settings, "
             "not saved ones"
+        ),
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.AUTOMATION_OVERLAP_MODE,
+        description=(
+            "Save an overlap_mode other than allow on automations, so a scheduled run is "
+            "skipped while the previous one is still going. Enable it only once every "
+            "database scheduler sharing the database runs a release with overlap modes; "
+            "an older one starts every occurrence. Turning it off stops new settings, not "
+            "saved ones"
         ),
         owner="server",
         review_by_release="0.27.0",

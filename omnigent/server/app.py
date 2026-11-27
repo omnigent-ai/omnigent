@@ -25,7 +25,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -49,6 +49,7 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
+from omnigent.entities.scheduled_task import SCHEDULED_TASK_OVERLAP_MODES
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -455,6 +456,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``max_retries`` above 0. Needs the database scheduler and
     # the ``automation_retries`` release feature; absent on older servers.
     scheduled_task_retries: bool = False
+    # The ``overlap_mode`` values scheduled tasks accept; more than ``allow`` needs the
+    # ``automation_overlap_mode`` release feature. Empty on older servers.
+    scheduled_task_overlap_modes: list[str] = Field(default_factory=list)
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -2479,6 +2483,7 @@ def create_app(
                 build_busy_until,
                 build_on_fire,
                 build_run_now,
+                build_session_busy,
             )
 
             fire_deps = FireDeps(
@@ -2529,6 +2534,7 @@ def create_app(
                     busy_until=(
                         build_busy_until(fire_deps) if dispatch_hooks.on_fire is None else None
                     ),
+                    session_busy=build_session_busy(fire_deps),
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
@@ -2821,6 +2827,10 @@ def create_app(
     # Saving retries waits until every scheduler on the database delays and pauses them.
     app.state.automation_retries_enabled = automations_v2_enabled and (
         resolved_feature_flags.enabled(Feature.AUTOMATION_RETRIES)
+    )
+    # Saving an overlap mode waits until every scheduler on the database follows it.
+    app.state.automation_overlap_mode_enabled = automations_v2_enabled and (
+        resolved_feature_flags.enabled(Feature.AUTOMATION_OVERLAP_MODE)
     )
 
     app.state.scheduled_task_store = scheduled_task_store
@@ -4248,6 +4258,9 @@ def create_app(
                 and bool(app.state.scheduled_task_dispatch_enabled),
                 "scheduled_task_retries": automations_enabled
                 and bool(app.state.automation_retries_enabled),
+                "scheduled_task_overlap_modes": list(SCHEDULED_TASK_OVERLAP_MODES)
+                if automations_enabled and app.state.automation_overlap_mode_enabled
+                else ["allow"],
                 "session_timers": bool(app.state.session_timers_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,

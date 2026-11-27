@@ -22,6 +22,9 @@ export const RANDOM_WORKTREE_BASE_REF = "HEAD";
 export const MAX_SCHEDULED_TASK_RETRIES = 5;
 export const DEFAULT_RETRY_DELAY_SECONDS = 5 * 60;
 
+/** What a due run does while the previous run is still going. */
+export type ScheduledTaskOverlapMode = "allow" | "skip";
+
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
 
@@ -77,6 +80,8 @@ export interface ScheduledTask {
   maxRetries?: number;
   /** Seconds the server waits before each retry. */
   retryDelaySeconds?: number;
+  /** What a due run does while the previous run is still going; absent means `"allow"`. */
+  overlapMode?: ScheduledTaskOverlapMode;
   /** MCP services every session the automation creates starts with. */
   mcpServices: string[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
@@ -218,6 +223,8 @@ export interface CreateScheduledTaskInput {
   maxRetries?: number;
   /** Seconds before each retry; omit for the server default. */
   retryDelaySeconds?: number;
+  /** Omit to start every run (`"allow"`). */
+  overlapMode?: ScheduledTaskOverlapMode;
   /** MCP services every run starts with; omit for none. */
   mcpServices?: string[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
@@ -268,6 +275,7 @@ export interface UpdateScheduledTaskInput {
   maxCostUsd?: number | null;
   maxRetries?: number;
   retryDelaySeconds?: number;
+  overlapMode?: ScheduledTaskOverlapMode;
   /** Replaces the MCP services; `[]` clears them. */
   mcpServices?: string[];
   sessionMode?: ScheduledTaskSessionMode;
@@ -310,6 +318,7 @@ interface ScheduledTaskWire {
   // Absent on servers that predate retries.
   max_retries?: number;
   retry_delay_seconds?: number;
+  overlap_mode?: ScheduledTaskOverlapMode;
   mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
@@ -413,6 +422,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     maxCostUsd: wire.max_cost_usd ?? null,
     maxRetries: wire.max_retries ?? 0,
     retryDelaySeconds: wire.retry_delay_seconds ?? DEFAULT_RETRY_DELAY_SECONDS,
+    overlapMode: wire.overlap_mode ?? "allow",
     mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
@@ -645,6 +655,10 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
     body.max_retries = input.maxRetries;
     if (input.retryDelaySeconds !== undefined) body.retry_delay_seconds = input.retryDelaySeconds;
   }
+  // Only sent when not the default, so a server without the field still accepts the create.
+  if (input.overlapMode !== undefined && input.overlapMode !== "allow") {
+    body.overlap_mode = input.overlapMode;
+  }
   if (input.mcpServices?.length) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
@@ -716,6 +730,7 @@ export async function updateScheduledTask(
   if (input.maxCostUsd !== undefined) body.max_cost_usd = input.maxCostUsd;
   if (input.maxRetries !== undefined) body.max_retries = input.maxRetries;
   if (input.retryDelaySeconds !== undefined) body.retry_delay_seconds = input.retryDelaySeconds;
+  if (input.overlapMode !== undefined) body.overlap_mode = input.overlapMode;
   if (input.mcpServices !== undefined) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;

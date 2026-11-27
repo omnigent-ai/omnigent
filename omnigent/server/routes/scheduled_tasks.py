@@ -25,7 +25,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -40,6 +40,7 @@ from omnigent.entities.scheduled_task import (
     MAX_RETRY_DELAY_SECONDS,
     MAX_SCHEDULED_TASK_RETRIES,
     MIN_RETRY_DELAY_SECONDS,
+    ScheduledTaskOverlapMode,
 )
 from omnigent.entities.workflow import Workflow
 from omnigent.errors import ErrorCode, OmnigentError
@@ -222,6 +223,9 @@ class CreateScheduledTaskRequest(BaseModel):
         ge=MIN_RETRY_DELAY_SECONDS,
         le=MAX_RETRY_DELAY_SECONDS,
     )
+    # What a due occurrence does while the previous run is still going; a mode must
+    # be in ``scheduled_task_overlap_modes`` in ``/v1/info``.
+    overlap_mode: ScheduledTaskOverlapMode = "allow"
     # "continue" sends every run's prompt into one session: ``session_id`` when
     # given, else the session the first run creates. A prompt that runs a saved
     # workflow needs "new" (see ``workflow_session_reuse_error``).
@@ -310,6 +314,7 @@ class UpdateScheduledTaskRequest(BaseModel):
     retry_delay_seconds: int | None = Field(
         default=None, ge=MIN_RETRY_DELAY_SECONDS, le=MAX_RETRY_DELAY_SECONDS
     )
+    overlap_mode: ScheduledTaskOverlapMode | None = None
     session_mode: Literal["new", "continue"] | None = None
     # Null makes a continue-mode task's next run start a new session.
     session_id: str | None = Field(default=None, min_length=1)
@@ -356,6 +361,23 @@ def _require_retry_support(request: Request, max_retries: int) -> None:
     if max_retries > 0 and not retries_supported(request):
         raise OmnigentError(
             "max_retries needs automation retries, which this server does not enable",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def overlap_modes_supported(request: Request) -> bool:
+    """Whether tasks may save an ``overlap_mode`` other than ``allow``.
+
+    Gated by the ``automation_overlap_mode`` release feature, because an older
+    database scheduler polling the same database would start every occurrence.
+    """
+    return bool(getattr(request.app.state, "automation_overlap_mode_enabled", False))
+
+
+def _require_overlap_mode_support(request: Request, overlap_mode: str) -> None:
+    if overlap_mode != "allow" and not overlap_modes_supported(request):
+        raise OmnigentError(
+            "overlap_mode needs automation overlap modes, which this server does not enable",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -446,6 +468,7 @@ def _to_response(
         "max_cost_usd": task.max_cost_usd,
         "max_retries": task.max_retries,
         "retry_delay_seconds": task.retry_delay_seconds,
+        "overlap_mode": task.overlap_mode,
         "session_mode": task.session_mode,
         "session_id": task.session_id,
         "source_session_id": task.source_session_id,
@@ -698,6 +721,8 @@ def _clone_request(task: ScheduledTask) -> CreateScheduledTaskRequest:
         max_cost_usd=task.max_cost_usd,
         max_retries=task.max_retries,
         retry_delay_seconds=task.retry_delay_seconds,
+        # The request model rejects a mode this release doesn't accept.
+        overlap_mode=cast(ScheduledTaskOverlapMode, task.overlap_mode),
         session_mode="continue" if task.session_mode == "continue" else "new",
         workspace=task.workspace,
         base_branch=task.base_branch,
@@ -1480,9 +1505,11 @@ def create_scheduled_tasks_router(
         ):
             # A run files nothing into a deleted project, so the copy starts unfiled.
             create = create.model_copy(update={"project_id": None})
+        # Settings saved before their release feature was turned off are not copied.
         if not retries_supported(request):
-            # Retries saved before the release feature was turned off are not copied.
             create = create.model_copy(update={"max_retries": 0})
+        if not overlap_modes_supported(request):
+            create = create.model_copy(update={"overlap_mode": "allow"})
         return await _create_task(request, create, cloned_from=task)
 
     async def _create_task(
@@ -1526,6 +1553,7 @@ def create_scheduled_tasks_router(
                 code=ErrorCode.INVALID_INPUT,
             )
         _require_retry_support(request, body.max_retries)
+        _require_overlap_mode_support(request, body.overlap_mode)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         timezone = await asyncio.to_thread(_resolve_create_timezone, body, store, owner_id)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
@@ -1631,6 +1659,7 @@ def create_scheduled_tasks_router(
                     max_cost_usd=body.max_cost_usd,
                     max_retries=body.max_retries,
                     retry_delay_seconds=body.retry_delay_seconds,
+                    overlap_mode=body.overlap_mode,
                     session_mode=body.session_mode,
                     session_id=body.session_id,
                     source_session_id=source_copy.id if source_copy is not None else None,
@@ -2217,10 +2246,17 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
-        for name in ("session_mode", "mcp_services", "max_retries", "retry_delay_seconds"):
+        for name in (
+            "session_mode",
+            "mcp_services",
+            "max_retries",
+            "retry_delay_seconds",
+            "overlap_mode",
+        ):
             if fields.get(name) is None:
                 fields.pop(name, None)
         _require_retry_support(request, fields.get("max_retries", 0))
+        _require_overlap_mode_support(request, fields.get("overlap_mode", "allow"))
         derives_workflow_prompt = await _apply_workflow_update(request, existing, fields, owner)
         if await asyncio.to_thread(_align_stored_workflow, existing, fields):
             derives_workflow_prompt = True
