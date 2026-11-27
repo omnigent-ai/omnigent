@@ -317,11 +317,32 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
                         "response": response.text,
                         "model_control_failure": [
                             redact_log_text(line, include_whitespace_credentials=True)[:2048]
-                            for line in (tmp_path / "server" / "server.log")
-                            .read_text(errors="replace")
-                            .splitlines()
-                            if "Model change not applied to the terminal" in line
-                        ][-1:],
+                            for directory in (
+                                tmp_path
+                                / "server"
+                                / "server-home"
+                                / ".omnigent"
+                                / "logs"
+                                / "server",
+                                tmp_path / "host" / "home" / ".omnigent" / "logs" / "runner",
+                            )
+                            for path in directory.glob("*.log")
+                            for line in path.read_text(errors="replace").splitlines()
+                            if any(
+                                marker in line
+                                for marker in (
+                                    "Model change not applied to the terminal",
+                                    "claude-native model change failed:",
+                                    "ClaudeModelSwitchRefused:",
+                                    "ClaudeComposerNotCleared:",
+                                    "ClaudePromptTimeout:",
+                                    "ClaudeInputBoxOccupied:",
+                                    "ClaudeTerminalDialog:",
+                                    "ClaudeUserPromptPending:",
+                                    "RuntimeError:",
+                                )
+                            )
+                        ][-6:],
                     }
                     assert pending, "Model control must finish before the active turn is released"
                     assert claude_settings_snapshot(settings_path) == saved_settings
