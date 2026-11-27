@@ -312,13 +312,14 @@ def test_config_preserves_exact_command_and_environment(monkeypatch: pytest.Monk
 
 
 @pytest.mark.parametrize(
-    ("utf8_mode", "granted_override"), [(False, None), (True, None), (True, "0"), (False, "1")]
+    ("utf8_mode", "output_encoding"),
+    [(False, None), (True, None), (True, "ascii"), (False, "utf-8")],
 )
 def test_request_starts_its_own_relay_after_protection_and_reports_the_child_encoding(
     monkeypatch: pytest.MonkeyPatch,
     init_calls: tuple[MagicMock, MagicMock],
     utf8_mode: bool,
-    granted_override: str | None,
+    output_encoding: str | None,
 ) -> None:
     control = _control_socket()
     control.recv.return_value = b"admit:" + _TOKEN
@@ -343,10 +344,7 @@ def test_request_starts_its_own_relay_after_protection_and_reports_the_child_enc
         _CONFIG,
         relay=request_init._RelayConfig("/runtime/relay.py", 1234, "/private/broker.sock"),
         report_encoding=True,
-        env={"LC_ALL": "C", "PYTHONUTF8": granted_override} if granted_override else {},
-        output_encoding=(
-            "ascii" if granted_override == "0" else "utf-8" if granted_override == "1" else None
-        ),
+        output_encoding=output_encoding,
     )
     request_init._run_request(control, config)
     load.assert_called_once_with("/runtime/relay.py")

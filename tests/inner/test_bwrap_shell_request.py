@@ -12,7 +12,7 @@ import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -43,7 +43,7 @@ def _policy(cwd: Path) -> SandboxPolicy:
 
 @pytest.mark.parametrize(
     "unsupported",
-    ["platform", "inactive", "backend", "cow", "proxy", "missing", "flags", "kernel"],
+    ["platform", "inactive", "backend", "cow", "proxy", "missing", "flags", "kernel", "memfd"],
 )
 def test_unsupported_launchers_are_rejected_before_any_shell_spawn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unsupported: str
@@ -66,6 +66,15 @@ def test_unsupported_launchers_are_rejected_before_any_shell_spawn(
     probe = MagicMock(return_value=unsupported != "flags")
     monkeypatch.setattr(shell_request, "_has_request_options", probe)
     pidfds: list[int] = []
+    memory_fds: list[int] = []
+    create_memfd = shell_request.os.memfd_create
+
+    def memfd_create(name: str, flags: int) -> int:
+        if unsupported == "memfd":
+            raise PermissionError("memfd denied")
+        descriptor = create_memfd(name, flags)
+        memory_fds.append(descriptor)
+        return descriptor
 
     def pidfd_open(_pid: int) -> int:
         if unsupported == "kernel":
@@ -75,11 +84,17 @@ def test_unsupported_launchers_are_rejected_before_any_shell_spawn(
         return descriptor
 
     monkeypatch.setattr(shell_request.os, "pidfd_open", pidfd_open)
+    memory = MagicMock(side_effect=memfd_create)
+    monkeypatch.setattr(shell_request.os, "memfd_create", memory)
     monkeypatch.setattr(shell_request.signal, "pidfd_send_signal", MagicMock())
     assert shell_request.request_launcher(policy, {"PATH": "/selected/path"}) is None
-    if unsupported in {"flags", "kernel", "missing"}:
+    if unsupported in {"flags", "kernel", "missing", "memfd"}:
         which.assert_called_with("bwrap", path="/selected/path")
-    for descriptor in pidfds:
+    if unsupported == "memfd":
+        assert len(pidfds) == 1
+        memory.assert_called_once()
+        shell_request.signal.pidfd_send_signal.assert_called_once_with(pidfds[0], 0)
+    for descriptor in pidfds + memory_fds:
         with pytest.raises(OSError):
             os.fstat(descriptor)
 
@@ -160,6 +175,7 @@ def launch_case(monkeypatch: pytest.MonkeyPatch) -> _LaunchCase:
     monkeypatch.setattr(shell_request.os, "pidfd_open", pidfd_open)
 
     def spawn(argv: list[str], env: dict[str, str], fds: tuple[int, ...]) -> MagicMock:
+        descriptors.extend(fds)
         configuration.update(json.loads(os.pread(fds[1], 1_000_000, 0)))
         os.write(fds[2], b'{"child-pid": 23456}')
         assert argv[0] == "/selected/bwrap"
@@ -213,16 +229,26 @@ def _launch(case: _LaunchCase, cwd: Path) -> BwrapRequestResult:
     )
 
 
+@pytest.mark.parametrize("symlinked_import", [False, True])
 def test_launch_delivers_private_config_and_preserves_the_relay_until_owner_completion(
-    launch_case: _LaunchCase, tmp_path: Path
+    launch_case: _LaunchCase,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symlinked_import: bool,
 ) -> None:
     case = launch_case
+    if symlinked_import:
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        alias = tmp_path / "runtime-link"
+        alias.symlink_to(runtime, target_is_directory=True)
+        monkeypatch.setattr(shell_request, "__file__", str(alias / "_bwrap_shell_request.py"))
     assert _launch(case, tmp_path) == BwrapRequestResult(b"done\r\n", b"", 0, False, "utf-8")
     assert case.config["env"] == {"HTTP_PROXY": "http://omnigent:broker-secret@127.0.0.1:1234"}
     assert case.config["report_encoding"] is True
     assert case.config["output_encoding"] == "ascii"
     assert case.config["relay"] == {
-        "source": str(Path(shell_request.__file__).with_name("egress") / "relay.py"),
+        "source": str(Path(shell_request.__file__).resolve().with_name("egress") / "relay.py"),
         "port": 1234,
         "socket_path": "/private/broker.sock",
     }
@@ -246,12 +272,16 @@ def test_launch_delivers_private_config_and_preserves_the_relay_until_owner_comp
         "spawn",
         "unadmitted",
         "admission-lost",
+        "cleanup-timeout",
+        "launcher-pidfd",
     ],
 )
 def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
     launch_case: _LaunchCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     case = launch_case
+    signaling = MagicMock()
+    monkeypatch.setattr(shell_request.signal, "pidfd_send_signal", signaling)
     if failure == "unsupported":
         monkeypatch.setattr(shell_request, "request_launcher", lambda *_args: None)
     elif failure == "readiness-timeout":
@@ -270,6 +300,18 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
         case.spawn.side_effect = invalid_metadata
     elif failure == "receive":
         case.receive.side_effect = OSError("readiness rejected")
+    elif failure in {"cleanup-timeout", "launcher-pidfd"}:
+        case.poll.return_value = []
+        case.process.communicate.side_effect = [
+            subprocess.TimeoutExpired("fixture", 1),
+            (b"", b""),
+        ]
+        if failure == "launcher-pidfd":
+            monkeypatch.setattr(
+                shell_request.os,
+                "pidfd_open",
+                MagicMock(side_effect=OSError("launcher pidfd unavailable")),
+            )
     elif failure in {"unadmitted", "admission-lost"}:
         original_run = case.owner.run.side_effect
 
@@ -294,6 +336,19 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
         case.owner.run.assert_not_called()
     if failure in {"readiness-timeout", "invalid-metadata", "receive"}:
         case.process.communicate.assert_called_once_with(timeout=1)
+    if failure in {"cleanup-timeout", "launcher-pidfd"}:
+        assert case.process.communicate.call_args_list == [call(timeout=1), call()]
+        if failure == "launcher-pidfd":
+            case.process.kill.assert_called_once_with()
+            signaling.assert_not_called()
+        else:
+            descriptor = signaling.call_args.args[0]
+            assert descriptor in case.descriptors
+            signaling.assert_called_once_with(descriptor, shell_request.signal.SIGKILL)
+            case.process.kill.assert_not_called()
+    else:
+        signaling.assert_not_called()
+        case.process.kill.assert_not_called()
     if failure not in {"spawn", "unsupported"}:
         assert case.process.stdout.closed and case.process.stderr.closed
     for descriptor in case.descriptors:
@@ -319,6 +374,7 @@ def test_cancelled_request_never_reaches_spawn(launch_case: _LaunchCase, tmp_pat
         "lost",
         "decode",
         "timeout-invalid",
+        "invalid-locale",
     ],
 )
 def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semantics(
@@ -332,9 +388,11 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
             "PATH": os.defpath,
             "HTTP_PROXY": "http://127.0.0.1:1234",
             "PYTHONPATH": str(os_env_module._project_root()),
+            "LC_CTYPE": "C",
         },
     )
     monkeypatch.setenv("UNGRANTED_SECRET", "must-stay-in-the-parent")
+    monkeypatch.setenv("LC_CTYPE", "C.UTF-8")
     helper._prepared = prepared
     helper._egress_auth_token = "broker-secret"
     start = MagicMock()
@@ -351,6 +409,9 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
         )
     )
     monkeypatch.setattr(helper, "_request_locked", metadata)
+    if ending == "invalid-locale":
+        metadata.side_effect = None
+        metadata.return_value = {"encoding": encoding, "locale": {"UNGRANTED_SECRET": "fixture"}}
     limit = 16 if ending == "nonzero" else 4
 
     def capture(raw: bytes) -> CapturedOutput:
@@ -374,12 +435,18 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
     monkeypatch.setattr(request, "run", run)
     try:
         actual = helper.shell_request("printf result", 7, limit, request)
+        if ending == "invalid-locale":
+            assert actual == {"error": "Failed to read the OS helper's shell locale and encoding"}
+            run.assert_not_called()
+            return
         run.assert_called_once()
         options = run.call_args.kwargs
         assert options["policy"] is prepared.sandbox
         assert options["cwd"] == tmp_path
         assert options["max_output"] == limit
         assert options["output_encoding"] == encoding
+        assert options["command_env"]["LC_CTYPE"] == "C.UTF-8"
+        assert prepared.env["LC_CTYPE"] == "C"
         metadata.assert_called_once_with({"op": "shell_encoding"}, allow_retry=True)
         assert options["launch_env"] == prepared.env
         assert "UNGRANTED_SECRET" not in options["command_env"]
@@ -455,6 +522,7 @@ async def test_repeated_cancellation_waits_for_actual_worker_retirement(
         task.cancel()
         await poll_until_async(cancelled.is_set, timeout_s=2, interval_s=0.001)
         task.cancel()
+        await asyncio.sleep(0)
         assert not task.done()
         retirement.set()
         with pytest.raises(asyncio.CancelledError):
@@ -472,7 +540,7 @@ async def test_close_cancels_the_active_request_and_retains_brokers_until_retire
 ) -> None:
     helper = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=_policy(tmp_path))
     helper._prepared = _PreparedHelper(_policy(tmp_path), tmp_path, {"PATH": os.defpath})
-    helper._shell_encoding = "utf-8"
+    helper._shell_metadata = ("utf-8", {})
     monkeypatch.setattr(helper, "_ensure_started_locked", lambda: None)
     request = shell_request.BwrapShellRequest()
     started, cancelled, retire, stopped = (threading.Event() for _ in range(4))

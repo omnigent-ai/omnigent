@@ -69,6 +69,8 @@ def request_launcher(policy: SandboxPolicy, env: Mapping[str, str]) -> str | Non
             signal.pidfd_send_signal(descriptor, 0)
         finally:
             os.close(descriptor)
+        descriptor = os.memfd_create("shell-capability", os.MFD_CLOEXEC)
+        os.close(descriptor)
     except OSError:
         return None
     identity = (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
@@ -132,7 +134,7 @@ class BwrapShellRequest:
             if policy.egress_relay_port is None or policy.egress_socket_path is None:
                 raise ValueError("Shell request needs complete egress relay configuration")
             config["relay"] = {
-                "source": str(Path(__file__).with_name("egress") / "relay.py"),
+                "source": str(Path(__file__).resolve().with_name("egress") / "relay.py"),
                 "port": policy.egress_relay_port,
                 "socket_path": policy.egress_socket_path,
             }

@@ -72,7 +72,9 @@ def _fake_environments(monkeypatch: pytest.MonkeyPatch, cwd: Path) -> list[Mock]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["success", "nonzero", "timeout", "lost", "raised"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "nonzero", "timeout", "lost", "raised", "unsupported"]
+)
 async def test_supported_shells_lease_the_file_environment_and_retire_failures(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
 ) -> None:
@@ -95,20 +97,35 @@ async def test_supported_shells_lease_the_file_environment_and_retire_failures(
             "timeout": {"error": "timed out", "timed_out": True},
             "lost": {"error": "reply lost; command was not sent again"},
         }
-        if outcome == "raised":
+        if outcome == "unsupported":
+            monkeypatch.setattr(
+                "omnigent.inner._bwrap_shell_request.request_launcher", lambda *_: None
+            )
+        elif outcome == "raised":
             environment.isolated_shell.side_effect = OSError("request failed")
         else:
             environment.isolated_shell.return_value = results[outcome]
         result = json.loads(await execute("sys_os_shell", {"command": "example", "timeout": 7}))
-        assert result == ({"error": "request failed"} if outcome == "raised" else results[outcome])
-        environment.isolated_shell.assert_awaited_once_with(command="example", timeout=7)
-        environment.shell.assert_not_awaited()
-        assert len(environments) == 1
+        if outcome == "unsupported":
+            assert result == {"stdout": "disposable", "exit_code": 0}
+            environment.isolated_shell.assert_not_awaited()
+            environment.shell.assert_not_awaited()
+            assert len(environments) == 2
+            environments[1].shell.assert_awaited_once_with(command="example", timeout=7)
+            environments[1].isolated_shell.assert_not_awaited()
+            environments[1].close.assert_called_once_with()
+        else:
+            assert result == (
+                {"error": "request failed"} if outcome == "raised" else results[outcome]
+            )
+            environment.isolated_shell.assert_awaited_once_with(command="example", timeout=7)
+            environment.shell.assert_not_awaited()
+            assert len(environments) == 1
         assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
             "content": "file"
         }
-        if outcome == "success":
-            assert len(environments) == 1
+        if outcome in {"success", "unsupported"}:
+            assert len(environments) == (2 if outcome == "unsupported" else 1)
             assert environment.read.await_count == 2
             environment.close.assert_not_called()
         else:
@@ -330,6 +347,7 @@ signal.pause()
 async def test_real_claude_sdk_requests_have_private_relays_and_parent_owned_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    from omnigent.inner import _bwrap_shell_request as shell_request
     from omnigent.inner.claude_model_access import ClaudeModelAccess
 
     workspace = tmp_path / "workspace"
@@ -338,6 +356,13 @@ async def test_real_claude_sdk_requests_have_private_relays_and_parent_owned_cre
     source.write_text("synthetic-parent-only-secret")
     (workspace / "note.txt").write_text("ready\n")
     spec = _spec(workspace)
+    canonical_module = Path(shell_request.__file__).resolve()
+    alias = tmp_path / "runtime-link"
+    alias.symlink_to(canonical_module.parent, target_is_directory=True)
+    alias_module = alias / canonical_module.name
+    monkeypatch.setattr(shell_request, "__file__", str(alias_module))
+    assert spec.os_env is not None and spec.os_env.sandbox is not None
+    spec.os_env.sandbox.read_paths = [str(workspace), str(canonical_module.parents[2])]
     _require_request_launcher(spec, workspace)
     access = ClaudeModelAccess(
         "https://api.anthropic.com",
@@ -386,6 +411,7 @@ print(json.dumps({
     "placeholder": os.environ.get("ANTHROPIC_AUTH_TOKEN", "").startswith("oa_cred_"),
     "raw_key_absent": "ANTHROPIC_API_KEY" not in os.environ,
     "source_hidden": not Path(sys.argv[1]).exists(),
+    "runtime_alias_hidden": not Path(sys.argv[2]).exists(),
     "status": status,
 }))
 """
@@ -400,7 +426,15 @@ print(json.dumps({
                     "sys_os_shell",
                     {
                         "command": shlex.join(
-                            [sys.executable, "-I", "-S", "-c", command, str(source)]
+                            [
+                                sys.executable,
+                                "-I",
+                                "-S",
+                                "-c",
+                                command,
+                                str(source),
+                                str(alias_module),
+                            ]
                         ),
                         "timeout": 15,
                     },
@@ -411,6 +445,7 @@ print(json.dumps({
                 "placeholder": True,
                 "raw_key_absent": True,
                 "source_hidden": True,
+                "runtime_alias_hidden": True,
                 "status": "HTTP/1.1 403 Forbidden",
             }
         assert len(starts) == 1
@@ -482,7 +517,15 @@ async def test_real_runner_shell_reuse_records_latency_against_disposable_calls(
 
 @pytest.mark.skipif(not _LIVE_LINUX, reason="requires Linux and Bubblewrap")
 @pytest.mark.parametrize(
-    "mode", ["large-success", "large-error", "timeout-invalid", "utf8-disabled", "utf8-enabled"]
+    "mode",
+    [
+        "large-success",
+        "large-error",
+        "timeout-invalid",
+        "utf8-disabled",
+        "utf8-enabled",
+        "locale-coercion",
+    ],
 )
 @pytest.mark.asyncio
 @pytest.mark.timeout(45)
@@ -498,6 +541,11 @@ async def test_real_runner_shell_bounds_output_and_preserves_invalid_byte_timeou
         monkeypatch.setenv("PYTHONUTF8", "0" if mode == "utf8-disabled" else "1")
         assert spec.os_env is not None and spec.os_env.sandbox is not None
         spec.os_env.sandbox.env_passthrough = ["PYTHONUTF8"]
+    elif mode == "locale-coercion":
+        monkeypatch.delenv("LC_ALL", raising=False)
+        monkeypatch.setenv("LANG", "C")
+        monkeypatch.setenv("LC_CTYPE", "C")
+        monkeypatch.setenv("PYTHONCOERCECLOCALE", "0")
     _require_request_launcher(spec, tmp_path)
     observations: list[tuple[CapturedOutput, CapturedOutput]] = []
     original_result = BoundedPipeCapture.result
@@ -522,12 +570,17 @@ else:
     raise SystemExit(7 if sys.argv[1] == "large-error" else 0)
 """
     registry = SessionResourceRegistry()
+    command_text = (
+        r"""printf '\303\251' | wc -m; printf '|%s' "$LC_CTYPE" """
+        if mode == "locale-coercion"
+        else shlex.join([sys.executable, "-I", "-S", "-c", command, mode])
+    )
     try:
         result = json.loads(
             await _execute_os_env_tool(
                 "sys_os_shell",
                 {
-                    "command": shlex.join([sys.executable, "-I", "-S", "-c", command, mode]),
+                    "command": command_text,
                     "timeout": 3 if mode == "timeout-invalid" else 15,
                 },
                 agent_spec=spec,
@@ -537,19 +590,25 @@ else:
         )
         assert len(observations) == 1
         stdout, stderr = observations[0]
-        if mode.startswith("utf8-"):
+        if mode.startswith("utf8-") or mode == "locale-coercion":
             disposable = json.loads(
                 await _execute_os_env_tool(
                     "sys_os_shell",
                     {
-                        "command": shlex.join([sys.executable, "-I", "-S", "-c", command, mode]),
+                        "command": command_text,
                         "timeout": 15,
                     },
                     agent_spec=spec,
                     conversation_id="disposable-encoding",
                 )
             )
-            if mode == "utf8-disabled":
+            if mode == "locale-coercion":
+                assert stdout.decoding_error is None
+                assert result == disposable
+                count, effective_locale = result["stdout"].split("|")
+                assert int(count.strip()) == 1
+                assert effective_locale.strip() not in {"", "C", "POSIX"}
+            elif mode == "utf8-disabled":
                 assert stdout.decoding_error is not None
                 assert result == disposable
                 assert result["error"].startswith("os_env helper exception:")

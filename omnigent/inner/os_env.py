@@ -468,7 +468,7 @@ class _HelperProcessClient:
         self._launch: tuple[Callable[[], object], object] | None = None
         self._launch_env: dict[str, str] | None = None
         self._prepared: _PreparedHelper | None = None
-        self._shell_encoding: str | None = None
+        self._shell_metadata: tuple[str, dict[str, str]] | None = None
         # Parent-held containment handle from the sandbox backend's
         # post_spawn hook (e.g. a Windows Job Object). Closed in
         # ``_stop_locked`` to tear down the helper's process tree.
@@ -559,16 +559,29 @@ class _HelperProcessClient:
 
             raise RequestCancelled("Shell request was cancelled before preparation")
         self._ensure_started_locked()
-        encoding = self._shell_encoding
-        if encoding is None:
-            metadata = self._request_locked({"op": "shell_encoding"}, allow_retry=True)
-            encoding = metadata.get("encoding")
-            if not isinstance(encoding, str):
-                return {"error": "Failed to read the OS helper's shell-output encoding"}
-            self._shell_encoding = encoding
+        metadata = self._shell_metadata
+        if metadata is None:
+            response = self._request_locked({"op": "shell_encoding"}, allow_retry=True)
+            encoding, locale_env = response.get("encoding"), response.get("locale")
+            if (
+                not isinstance(encoding, str)
+                or not isinstance(locale_env, dict)
+                or not all(
+                    isinstance(name, str) and isinstance(value, str)
+                    for name, value in locale_env.items()
+                )
+                or _shell_locale_env(locale_env) != locale_env
+            ):
+                return {"error": "Failed to read the OS helper's shell locale and encoding"}
+            metadata = (encoding, locale_env)
+            self._shell_metadata = metadata
+        encoding, locale_env = metadata
         assert self._prepared is not None
         prepared = self._prepared
         env = _child_shell_env(prepared.env)
+        for name in _shell_locale_env(env):
+            env.pop(name)
+        env.update(locale_env)
         _authorize_proxy_env(env, self._egress_auth_token)
         try:
             completed = request.run(
@@ -979,7 +992,7 @@ class _HelperProcessClient:
         self._launch = None
         self._launch_env = None
         self._prepared = None
-        self._shell_encoding = None
+        self._shell_metadata = None
         try:
             if proc is None:
                 return
@@ -1494,7 +1507,10 @@ def _handle_helper_request(
 ) -> OpResult:
     op = request.get("op")
     if op == "shell_encoding":
-        return {"encoding": "utf-8" if sys.flags.utf8_mode else locale.getencoding()}
+        return {
+            "encoding": "utf-8" if sys.flags.utf8_mode else locale.getencoding(),
+            "locale": _shell_locale_env(os.environ),
+        }
     if op == "git":
         from omnigent.runtime.filesystem_registry import (
             _LOCK_FREE_GIT_READ_OPTIONS,
@@ -2392,6 +2408,14 @@ def _child_shell_env(helper_env: Mapping[str, str] | None = None) -> dict[str, s
     else:
         env.pop("PYTHONPATH", None)
     return env
+
+
+def _shell_locale_env(env: Mapping[str, str]) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in env.items()
+        if name in {"LANG", "LANGUAGE"} or name.startswith("LC_")
+    }
 
 
 def _authorize_proxy_env(env: MutableMapping[str, str], token: str | None) -> None:
