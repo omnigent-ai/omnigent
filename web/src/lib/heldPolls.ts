@@ -107,3 +107,20 @@ export function pollingObserver(poll: HeldPoll): PollingObserver | null {
   }
   return null;
 }
+
+/**
+ * Wake polls a pacer let go: each that `readsNow` allows and still polls reads once, without
+ * cancelling a read in flight; the rest work out their interval again.
+ */
+export function readOnceOrReschedule(
+  polls: Iterable<HeldPoll>,
+  readsNow: (poll: HeldPoll) => boolean,
+): void {
+  const rescheduled = createHeldPolls();
+  for (const poll of polls) {
+    const observer = readsNow(poll) ? pollingObserver(poll) : null;
+    if (observer?.refetch) void observer.refetch({ cancelRefetch: false }).catch(() => undefined);
+    else rescheduled.hold(poll);
+  }
+  rescheduled.reschedule();
+}

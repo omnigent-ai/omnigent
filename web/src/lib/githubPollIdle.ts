@@ -3,7 +3,7 @@
 // past its usual interval once, if its pacer would let it; the others go back to their pace.
 
 import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
-import { createHeldPolls, pollingObserver, type HeldPoll } from "@/lib/heldPolls";
+import { createHeldPolls, readOnceOrReschedule, type HeldPoll } from "@/lib/heldPolls";
 
 /** How long the window goes without pointer, key or wheel input before it counts as idle. */
 export const IDLE_POLL_AFTER_MS = 3 * 60_000;
@@ -98,13 +98,7 @@ export function createGitHubPollIdle({
   // The first input after idle reads each slowed poll that's due, once; the rest reschedule.
   function wake() {
     slowing = false;
-    const held = createHeldPolls();
-    for (const poll of slowed.drain()) {
-      const observer = due.get(poll)?.() ? pollingObserver(poll) : null;
-      if (observer?.refetch) void observer.refetch({ cancelRefetch: false }).catch(() => undefined);
-      else held.hold(poll);
-    }
-    held.reschedule();
+    readOnceOrReschedule(slowed.drain(), (poll) => due.get(poll)?.() ?? false);
     notify();
   }
 

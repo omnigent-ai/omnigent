@@ -3,7 +3,7 @@
 // behind others, and makes up the read a hidden window skipped.
 
 import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
-import { createHeldPolls, pollingObserver, type HeldPoll } from "@/lib/heldPolls";
+import { createHeldPolls, readOnceOrReschedule, type HeldPoll } from "@/lib/heldPolls";
 
 /** How long the window stays unfocused before its GitHub polls stop. */
 export const UNFOCUSED_POLL_PAUSE_MS = 2 * 60_000;
@@ -131,14 +131,11 @@ export function createGitHubPollFocus({
     cancelTimer();
     if (!wasPaused) return;
     notify();
-    const held = createHeldPolls();
     // A suspended renderer can pass the pause without its timer running: those polls recover too.
-    for (const poll of new Set([...stopped.drain(), ...polling.drain()])) {
-      const observer = readable.get(poll)?.() ? pollingObserver(poll) : null;
-      if (observer?.refetch) void observer.refetch({ cancelRefetch: false }).catch(() => undefined);
-      else held.hold(poll);
-    }
-    held.reschedule();
+    readOnceOrReschedule(
+      new Set([...stopped.drain(), ...polling.drain()]),
+      (poll) => readable.get(poll)?.() ?? false,
+    );
   }
 
   function setEnabled(next: boolean) {
