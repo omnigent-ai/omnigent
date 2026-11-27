@@ -4,6 +4,7 @@
 import { GitBranchIcon, MinusIcon } from "lucide-react";
 import { useState } from "react";
 
+import { Button } from "@/components/ui/button";
 import { QuickPickDialog, type QuickPickItem } from "@/components/ui/quick-pick";
 import { type Conversation, useSessionSearch } from "@/hooks/useConversations";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -70,9 +71,35 @@ export function MoveToNestPicker({
     rememberInHistory: false,
     value: { destination: row },
   }));
+  // As the row menu's nest search does: later pages on request, and a failure with Retry.
+  const searching = canJoin && trimmed !== "";
+  const searchFailed = searching && search.isError;
+  const status = searchFailed ? (
+    <div className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground">
+      <p role="status">Couldn't search for nests.</p>
+      <Button variant="ghost" size="xs" onClick={() => void search.refetch()}>
+        Retry
+      </Button>
+    </div>
+  ) : undefined;
+  const showMore = searching && !searchFailed && search.hasNextPage && (
+    <Button
+      variant="ghost"
+      className="w-full"
+      disabled={search.isFetching}
+      onClick={() => void search.fetchNextPage()}
+    >
+      Show more
+    </Button>
+  );
+  const emptyMessage = searchFailed
+    ? null
+    : searching && search.isFetching
+      ? "Searching…"
+      : "No other nests yet.";
   return (
     <QuickPickDialog<NestChoice>
-      // Opened from ⌘K, so it steps with Ctrl-N/Ctrl-P as ⌘K does.
+      // Steps with Ctrl-N/Ctrl-P, like ⌘K.
       stepsWithCtrlNP
       open
       onOpenChange={(open) => {
@@ -80,7 +107,9 @@ export function MoveToNestPicker({
       }}
       label={conversation.family ? "Move session to another nest" : "Move session to a nest"}
       placeholder="Find a nest…"
-      emptyMessage="No other nests yet."
+      emptyMessage={emptyMessage}
+      status={status}
+      listEnd={showMore}
       acceptLabel="Move"
       query={query}
       onQueryChange={setQuery}
