@@ -524,6 +524,14 @@ reads off the request path.
 Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
 
+`file://` URLs stay blocked, since agents can read the pages a Browser tab shows.
+To preview a local HTML file from a session on this machine, serve its folder
+on loopback only (for example, `python3 -m http.server 8000 --bind 127.0.0.1`)
+and open `http://127.0.0.1:8000/`. Without `--bind`, Python's server listens on
+every network interface.
+From any host, opening the file from **Files** shows a sandboxed preview, though
+it doesn't load the file's sibling CSS, scripts or images.
+
 Eligibility is per view: a public page in an eligible view can frame loopback
 documents too. A `*.localhost` request is sent only on a direct route and must
 connect to a loopback address. Chromium already sends these names around

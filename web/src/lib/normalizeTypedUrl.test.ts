@@ -20,6 +20,17 @@ describe("normalizeTypedUrl", () => {
     expect(normalizeTypedUrl("example.com/path?q=1")).toBe("https://example.com/path?q=1");
   });
 
+  it("leaves a file: URL as typed for the desktop policy to refuse", () => {
+    expect(normalizeTypedUrl("file:///Users/me/site/index.html")).toBe(
+      "file:///Users/me/site/index.html",
+    );
+    expect(normalizeTypedUrl(" FILE:///tmp/a.html ")).toBe("FILE:///tmp/a.html");
+  });
+
+  it("still treats a host named file with a port as a dotless host", () => {
+    expect(normalizeTypedUrl("file:8080/x")).toBe("http://file:8080/x");
+  });
+
   it("treats a host:port with no dot as dotless", () => {
     expect(normalizeTypedUrl("localhost:3000/x")).toBe("http://localhost:3000/x");
   });
