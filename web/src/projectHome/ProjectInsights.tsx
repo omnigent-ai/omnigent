@@ -104,7 +104,7 @@ function Stat({
         )}
       >
         {value}
-        {note && <About label={note}>{note}</About>}
+        {note && <About label={`About ${label}`}>{note}</About>}
       </dd>
     </div>
   );
@@ -190,10 +190,7 @@ export function InsightsPanels({ numbers }: { numbers: InsightsNumbers }) {
             title="Lead and roles"
             about="Do people talk to roles, or route everything through tickets? This decides whether roles get their own chat entry points."
           >
-            <Stat
-              value={formatTelemetryNumber(roles.messages_to_lead)}
-              label="Messages to Lead"
-            />
+            <Stat value={formatTelemetryNumber(roles.messages_to_lead)} label="Messages to Lead" />
             <Stat
               value={formatTelemetryNumber(roles.messages_to_roles)}
               label="Messages to roles"

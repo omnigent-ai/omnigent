@@ -104,6 +104,23 @@ describe("InsightsPanels", () => {
   });
 });
 
+describe("InsightsPanels caveats", () => {
+  it("names the PRs-merged info button briefly and keeps the caveat in its tooltip", async () => {
+    const base = project("Alpha");
+    const numbers = insightsNumbers({
+      ...base,
+      throughput: { ...base.throughput, merged_prs: 0, tickets_shipped: 3 },
+    });
+    render(<InsightsPanels numbers={numbers} />);
+    const shipping = screen.getByRole("region", { name: "Shipping" });
+    const info = within(shipping).getByRole("button", { name: "About PRs merged" });
+    await userEvent.hover(info);
+    expect(
+      (await screen.findAllByText("No finished ticket links a pull request")).length,
+    ).toBeGreaterThan(0);
+  });
+});
+
 describe("totalInsights", () => {
   it("adds counts across projects and leaves out medians and rates", () => {
     const totals = totalInsights([project("Alpha"), project("Beta")]);
