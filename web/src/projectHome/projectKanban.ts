@@ -95,13 +95,13 @@ export function kanbanColumns(
   return columns;
 }
 
-/** The card's note on nested sessions that put it in Needs attention, or null. */
+/** The card's note, beside "N nested", on nested sessions that put it in Needs attention. */
 export function nestedAttentionLabel(card: KanbanCard): string | null {
   const count = card.attentionMembers.length;
   if (count === 0) return null;
   return card.attentionMembers.every((member) => member.status === "failed")
-    ? `${count} nested failed`
-    : `${count} nested need${count === 1 ? "s" : ""} attention`;
+    ? `${count} failed`
+    : `${count} need${count === 1 ? "s" : ""} attention`;
 }
 
 /** Cards with any session matching the search, by the sidebar search's title-or-id rule. */

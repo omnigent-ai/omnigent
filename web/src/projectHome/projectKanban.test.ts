@@ -65,7 +65,7 @@ describe("project kanban", () => {
     const fresh = cardOf(parent, freshFailure);
     expect(fresh.column).toBe("Needs attention");
     expect(fresh.attentionMembers).toEqual([freshFailure]);
-    expect(nestedAttentionLabel(fresh)).toBe("1 nested failed");
+    expect(nestedAttentionLabel(fresh)).toBe("1 failed");
 
     // An outstanding approval rolls up however old it is.
     const asking = member("asking", {
@@ -75,7 +75,7 @@ describe("project kanban", () => {
     });
     const approval = cardOf(parent, asking);
     expect(approval.column).toBe("Needs attention");
-    expect(nestedAttentionLabel(approval)).toBe("1 nested needs attention");
+    expect(nestedAttentionLabel(approval)).toBe("1 needs attention");
   });
 
   it("keeps a failed head in Needs attention without a nested note", () => {
