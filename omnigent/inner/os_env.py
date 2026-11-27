@@ -375,9 +375,11 @@ class OSEnvironment(ABC):
         command: str,
         timeout: int | None = None,
         max_output: int | None = None,
+        *,
+        launcher: str | None = None,
     ) -> OpResult:
         """Retire a shell's complete lifetime before its environment can be reused."""
-        del command, timeout, max_output
+        del command, timeout, max_output, launcher
         return {"error": "This environment does not support reusable shell requests"}
 
     def run_git(
@@ -588,7 +590,6 @@ class _HelperProcessClient:
                 argv=_shell_argv(self.shell_path, command),
                 cwd=prepared.cwd,
                 policy=prepared.sandbox,
-                launch_env=prepared.env.copy(),
                 command_env=env,
                 timeout=timeout,
                 max_output=max_output,
@@ -1327,6 +1328,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
         command: str,
         timeout: int | None = None,
         max_output: int | None = None,
+        *,
+        launcher: str | None = None,
     ) -> OpResult:
         from ._bwrap_shell_request import BwrapShellRequest
 
@@ -1344,7 +1347,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
             or self._copy_on_write_environment is not None
         ):
             return {"error": "This environment does not support reusable shell requests"}
-        request = BwrapShellRequest()
+        request = BwrapShellRequest(launcher=launcher)
         result: Future[OpResult] = Future()
 
         def run() -> None:

@@ -101,7 +101,9 @@ async def test_supported_shells_lease_the_file_environment_and_retire_failures(
             environment.isolated_shell.return_value = results[outcome]
         result = json.loads(await execute("sys_os_shell", {"command": "example", "timeout": 7}))
         assert result == ({"error": "request failed"} if outcome == "raised" else results[outcome])
-        environment.isolated_shell.assert_awaited_once_with(command="example", timeout=7)
+        environment.isolated_shell.assert_awaited_once_with(
+            command="example", timeout=7, launcher="/supported/bwrap"
+        )
         environment.shell.assert_not_awaited()
         assert len(environments) == 1
         assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
@@ -205,11 +207,10 @@ async def _helper_process(
 
 def _require_request_launcher(spec: AgentSpec, cwd: Path) -> None:
     from omnigent.inner._bwrap_shell_request import request_launcher
-    from omnigent.inner.os_env import build_helper_env
 
     assert spec.os_env is not None
     policy = resolve_sandbox(spec.os_env, cwd)
-    if request_launcher(policy, build_helper_env(os.environ, policy)) is None:
+    if request_launcher(policy) is None:
         pytest.skip("Kernel or Bubblewrap requires the disposable shell compatibility path")
 
 

@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
 
 from . import _bwrap_request_init
@@ -27,13 +27,17 @@ _STARTUP_TIMEOUT_S = 10.0
 _REQUEST_OPTIONS = ("--as-pid-1", "--info-fd", "--add-seccomp-fd")
 
 
+def _launcher_env() -> dict[str, str]:
+    return {"PATH": os.defpath, "LANG": "C"}
+
+
 @functools.lru_cache(maxsize=16)
 def _has_request_options(executable: str, identity: tuple[int, ...]) -> bool:
     del identity  # An executable replacement must invalidate the cached probe.
     try:
         result = subprocess.run(
             [executable, "--help"],
-            env={"PATH": os.defpath, "LANG": "C"},
+            env=_launcher_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -45,8 +49,8 @@ def _has_request_options(executable: str, identity: tuple[int, ...]) -> bool:
     return result.returncode == 0 and all(option in result.stdout for option in _REQUEST_OPTIONS)
 
 
-def request_launcher(policy: SandboxPolicy, env: Mapping[str, str]) -> str | None:
-    """Return a supported launcher, or preserve the disposable path before launch."""
+def request_launcher(policy: SandboxPolicy, *, executable: str | None = None) -> str | None:
+    """Select a host launcher or revalidate the one retained by the lease."""
     if (
         not sys.platform.startswith("linux")
         or not policy.active
@@ -59,8 +63,9 @@ def request_launcher(policy: SandboxPolicy, env: Mapping[str, str]) -> str | Non
         or not hasattr(signal, "pidfd_send_signal")
     ):
         return None
-    executable = shutil.which("bwrap", path=env.get("PATH", os.defpath))
     if executable is None:
+        executable = shutil.which("bwrap", path=os.environ.get("PATH", os.defpath))
+    if executable is None or not Path(executable).is_absolute():
         return None
     try:
         status = os.stat(executable)
@@ -85,8 +90,9 @@ def _init_source() -> str:
 class BwrapShellRequest:
     """Keep cancellation separate from the helper lock that protects broker ownership."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, launcher: str | None = None) -> None:
         self.cancelled = threading.Event()
+        self._launcher = launcher
         self._lock = threading.Lock()
         self._owner: BwrapRequestControl | None = None
         self._admitted = False
@@ -109,14 +115,13 @@ class BwrapShellRequest:
         argv: list[str],
         cwd: Path,
         policy: SandboxPolicy,
-        launch_env: dict[str, str],
         command_env: dict[str, str],
         timeout: int,
         max_output: int,
         output_encoding: str,
         spawn: Callable[[list[str], dict[str, str], tuple[int, ...]], subprocess.Popen[bytes]],
     ) -> BwrapRequestResult:
-        launcher = request_launcher(policy, launch_env)
+        launcher = request_launcher(policy, executable=self._launcher)
         if launcher is None:
             raise OSError("Isolated shell request support changed before launch")
         if self.cancelled.is_set():
@@ -175,7 +180,7 @@ class BwrapShellRequest:
             try:
                 process = spawn(
                     wrapped,
-                    launch_env,
+                    _launcher_env(),
                     (
                         child.fileno(),
                         configuration.fileno(),

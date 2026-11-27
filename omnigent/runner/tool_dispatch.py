@@ -9288,11 +9288,18 @@ async def _execute_os_env_tool(
                     _path, "modified", conversation_id, lambda: _read_os_env_text(os_env, _path)
                 )
         elif tool_name == SysOsShellTool.name():
-            shell = os_env.isolated_shell if isolated_shell else os_env.shell
-            result = await shell(
-                command=cast("str", args.get("command", "")),
-                timeout=cast("int | None", args.get("timeout")),
-            )
+            if isolated_shell:
+                assert tool_lease is not None and tool_lease.shell_launcher is not None
+                result = await os_env.isolated_shell(
+                    command=cast("str", args.get("command", "")),
+                    timeout=cast("int | None", args.get("timeout")),
+                    launcher=tool_lease.shell_launcher,
+                )
+            else:
+                result = await os_env.shell(
+                    command=cast("str", args.get("command", "")),
+                    timeout=cast("int | None", args.get("timeout")),
+                )
         else:
             return f"Error: {tool_name} not implemented"
         # Only isolated shell requests retire every descendant before lease release.

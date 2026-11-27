@@ -256,6 +256,7 @@ class ToolEnvironmentLease:
     :param sandbox: Sandbox policy resolved from *spec* when it was built.
     :param environment: The live environment; its helper stays warm between calls.
     :param leased: Whether a call currently holds the environment.
+    :param shell_launcher: Trusted host executable selected for this shell lease.
     """
 
     registry: SessionResourceRegistry
@@ -264,6 +265,7 @@ class ToolEnvironmentLease:
     sandbox: SandboxPolicy
     environment: OSEnvironment
     leased: bool = False
+    shell_launcher: str | None = None
 
     async def release(self, *, reusable: bool) -> None:
         """End the call's hold; close the environment unless it stays reusable.
@@ -1314,20 +1316,19 @@ class SessionResourceRegistry:
         :returns: The lease, or ``None`` while another call holds it so
             concurrent calls fall back to their own environment.
         """
-        from omnigent.inner.os_env import build_helper_env, create_os_environment
+        from omnigent.inner.os_env import create_os_environment
 
         replaced: OSEnvironment | None = None
         # Resolution follows symlinks in the spec's paths, so compare a fresh one.
         cwd = Path(spec.cwd or ".").resolve(strict=False)
         sandbox = resolve_sandbox(spec, cwd)
+        launcher = None
         if for_shell:
             from omnigent.inner._bwrap_shell_request import request_launcher
 
             if spec.fork or spec.start_in_scratch:
                 return None
-            launcher = await asyncio.to_thread(
-                request_launcher, sandbox, build_helper_env(os.environ, sandbox)
-            )
+            launcher = await asyncio.to_thread(request_launcher, sandbox)
             if launcher is None:
                 return None
         with self._lock:
@@ -1357,6 +1358,7 @@ class SessionResourceRegistry:
                 lease = None
             if lease is not None:
                 lease.leased = True
+                lease.shell_launcher = launcher
         if replaced is not None:
             try:
                 await run_sync_cleanup(

@@ -20,6 +20,7 @@ from omnigent.inner import _bwrap_shell_request as shell_request
 from omnigent.inner import os_env as os_env_module
 from omnigent.inner._bounded_output import CapturedOutput, _TextPrefix
 from omnigent.inner._bwrap_request_control import BwrapRequestResult, RequestCancelled
+from omnigent.inner._bwrap_shell_request import request_launcher
 from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment, _HelperProcessClient, _PreparedHelper
 from omnigent.inner.sandbox import SandboxPolicy
@@ -43,7 +44,18 @@ def _policy(cwd: Path) -> SandboxPolicy:
 
 @pytest.mark.parametrize(
     "unsupported",
-    ["platform", "inactive", "backend", "cow", "proxy", "missing", "flags", "kernel", "memfd"],
+    [
+        "platform",
+        "inactive",
+        "backend",
+        "cow",
+        "proxy",
+        "missing",
+        "relative",
+        "flags",
+        "kernel",
+        "memfd",
+    ],
 )
 def test_unsupported_launchers_are_rejected_before_any_shell_spawn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unsupported: str
@@ -61,7 +73,9 @@ def test_unsupported_launchers_are_rejected_before_any_shell_spawn(
         policy = replace(policy, copy_on_write_roots=[tmp_path])
     elif unsupported == "proxy":
         policy = replace(policy, credential_proxy=CredentialProxySpec(entries=[]))
-    which = MagicMock(return_value=None if unsupported == "missing" else str(executable))
+    monkeypatch.setenv("PATH", "/selected/host-tools")
+    selected = "relative/bwrap" if unsupported == "relative" else str(executable)
+    which = MagicMock(return_value=None if unsupported == "missing" else selected)
     monkeypatch.setattr(shell_request.shutil, "which", which)
     probe = MagicMock(return_value=unsupported != "flags")
     monkeypatch.setattr(shell_request, "_has_request_options", probe)
@@ -87,9 +101,9 @@ def test_unsupported_launchers_are_rejected_before_any_shell_spawn(
     memory = MagicMock(side_effect=memfd_create)
     monkeypatch.setattr(shell_request.os, "memfd_create", memory)
     monkeypatch.setattr(shell_request.signal, "pidfd_send_signal", MagicMock())
-    assert shell_request.request_launcher(policy, {"PATH": "/selected/path"}) is None
-    if unsupported in {"flags", "kernel", "missing", "memfd"}:
-        which.assert_called_with("bwrap", path="/selected/path")
+    assert shell_request.request_launcher(policy) is None
+    if unsupported in {"flags", "kernel", "missing", "relative", "memfd"}:
+        which.assert_called_with("bwrap", path="/selected/host-tools")
     if unsupported == "memfd":
         assert len(pidfds) == 1
         memory.assert_called_once()
@@ -100,11 +114,15 @@ def test_unsupported_launchers_are_rejected_before_any_shell_spawn(
 
 
 def test_launcher_probe_uses_the_selected_executable_and_rechecks_replacements(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, launch_case: _LaunchCase
 ) -> None:
+    case = launch_case
     executable = tmp_path / "bwrap"
     executable.write_text("first")
-    monkeypatch.setattr(shell_request.shutil, "which", lambda *_a, **_k: str(executable))
+    monkeypatch.setenv("PATH", "/selected/host-tools")
+    which = MagicMock(return_value=str(executable))
+    monkeypatch.setattr(shell_request.shutil, "which", which)
+    monkeypatch.setattr(shell_request, "request_launcher", request_launcher)
     monkeypatch.setattr(
         shell_request.os, "pidfd_open", lambda _pid: os.open(os.devnull, os.O_RDONLY)
     )
@@ -118,13 +136,22 @@ def test_launcher_probe_uses_the_selected_executable_and_rechecks_replacements(
     shell_request._has_request_options.cache_clear()
     try:
         for _ in range(2):
-            assert shell_request.request_launcher(_policy(tmp_path), {}) == str(executable)
+            assert request_launcher(_policy(tmp_path)) == str(executable)
+        which.assert_called_with("bwrap", path="/selected/host-tools")
         run.assert_called_once()
         assert run.call_args.args[0] == [str(executable), "--help"]
         assert run.call_args.kwargs["env"] == {"PATH": os.defpath, "LANG": "C"}
+        case.launcher = str(executable)
+        case.request = shell_request.BwrapShellRequest(launcher=case.launcher)
+        which.return_value = str(tmp_path / "command-tools" / "bwrap")
+        _launch(case, tmp_path)
+        assert which.call_count == 2
+        assert case.spawn.call_args.args[0][0] == str(executable)
+        assert case.spawn.call_args.args[1] == {"PATH": os.defpath, "LANG": "C"}
+        run.assert_called_once()
         executable.write_text("replacement with no request flags")
         run.return_value = subprocess.CompletedProcess([], 0, stdout="--unshare-pid")
-        assert shell_request.request_launcher(_policy(tmp_path), {}) is None
+        assert request_launcher(_policy(tmp_path), executable=str(executable)) is None
         assert run.call_count == 2
     finally:
         shell_request._has_request_options.cache_clear()
@@ -140,6 +167,7 @@ class _LaunchCase:
     spawn: MagicMock
     config: dict[str, object]
     descriptors: list[int]
+    launcher: str = "/selected/bwrap"
 
 
 @pytest.fixture
@@ -160,7 +188,9 @@ def launch_case(monkeypatch: pytest.MonkeyPatch) -> _LaunchCase:
     monkeypatch.setattr(
         shell_request.select, "poll", lambda: SimpleNamespace(register=lambda *_: None, poll=poll)
     )
-    monkeypatch.setattr(shell_request, "request_launcher", lambda *_: "/selected/bwrap")
+    monkeypatch.setattr(
+        shell_request, "request_launcher", lambda *_args, **_kwargs: "/selected/bwrap"
+    )
     monkeypatch.setattr(
         shell_request.BwrapSandboxBackend,
         "wrap_launcher_argv",
@@ -178,7 +208,8 @@ def launch_case(monkeypatch: pytest.MonkeyPatch) -> _LaunchCase:
         descriptors.extend(fds)
         configuration.update(json.loads(os.pread(fds[1], 1_000_000, 0)))
         os.write(fds[2], b'{"child-pid": 23456}')
-        assert argv[0] == "/selected/bwrap"
+        assert argv[0] == case.launcher
+        assert env == {"PATH": os.defpath, "LANG": "C"}
         assert configuration["token"] not in " ".join(argv)
         assert "broker-secret" not in " ".join(argv)
         assert "broker-secret" not in json.dumps(env)
@@ -201,7 +232,7 @@ def launch_case(monkeypatch: pytest.MonkeyPatch) -> _LaunchCase:
     owner.run.side_effect = run
     receive_mock = MagicMock(side_effect=receive)
     monkeypatch.setattr(shell_request.BwrapRequestControl, "receive", receive_mock)
-    return _LaunchCase(
+    case = _LaunchCase(
         request,
         process,
         owner,
@@ -211,6 +242,7 @@ def launch_case(monkeypatch: pytest.MonkeyPatch) -> _LaunchCase:
         configuration,
         descriptors,
     )
+    return case
 
 
 def _launch(case: _LaunchCase, cwd: Path) -> BwrapRequestResult:
@@ -220,7 +252,6 @@ def _launch(case: _LaunchCase, cwd: Path) -> BwrapRequestResult:
         policy=replace(
             _policy(cwd), egress_relay_port=1234, egress_socket_path="/private/broker.sock"
         ),
-        launch_env={"PATH": os.defpath, "HTTP_PROXY": "http://127.0.0.1:1234"},
         command_env={"HTTP_PROXY": "http://omnigent:broker-secret@127.0.0.1:1234"},
         timeout=7,
         max_output=17,
@@ -285,7 +316,7 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
     signaling = MagicMock()
     monkeypatch.setattr(shell_request.signal, "pidfd_send_signal", signaling)
     if failure == "unsupported":
-        monkeypatch.setattr(shell_request, "request_launcher", lambda *_args: None)
+        monkeypatch.setattr(shell_request, "request_launcher", lambda *_args, **_kwargs: None)
     elif failure == "readiness-timeout":
         case.poll.return_value = []
     elif failure in {"invalid-metadata", "empty-metadata", "malformed-metadata"}:
@@ -375,11 +406,46 @@ def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
             os.fstat(descriptor)
 
 
-def test_cancelled_request_never_reaches_spawn(launch_case: _LaunchCase, tmp_path: Path) -> None:
-    launch_case.request.cancel()
+@pytest.mark.parametrize("phase", ["before-launch", "after-spawn", "during-receive"])
+def test_cancelled_request_never_reaches_spawn(
+    launch_case: _LaunchCase, tmp_path: Path, phase: str
+) -> None:
+    case = launch_case
+    if phase == "before-launch":
+        case.request.cancel()
+    else:
+        operation = case.spawn if phase == "after-spawn" else case.receive
+        original = operation.side_effect
+
+        def cancel_before_attachment(*args: object, **kwargs: object) -> MagicMock:
+            result = original(*args, **kwargs)
+            case.request.cancel()
+            case.owner.cancel.assert_not_called()
+            return result
+
+        operation.side_effect = cancel_before_attachment
+
+        def refuse_admission(*_args: object, **_kwargs: object) -> None:
+            case.owner.cancel.assert_called_once_with()
+            assert not case.owner.admitted
+            os.close(case.receive.call_args.kwargs["launcher_pidfd"])
+            raise RequestCancelled("cancelled before admission")
+
+        case.owner.run.side_effect = refuse_admission
     with pytest.raises(RequestCancelled):
-        _launch(launch_case, tmp_path)
-    launch_case.spawn.assert_not_called()
+        _launch(case, tmp_path)
+    assert not case.request.admitted
+    if phase == "before-launch":
+        case.spawn.assert_not_called()
+        case.receive.assert_not_called()
+    else:
+        case.spawn.assert_called_once()
+        case.receive.assert_called_once()
+        case.owner.run.assert_called_once()
+        assert case.process.stdout.closed and case.process.stderr.closed
+        for descriptor in case.descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
 
 
 @pytest.mark.parametrize(
@@ -400,15 +466,20 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
 ) -> None:
     helper = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=_policy(tmp_path))
+    prepared_env = {
+        "PATH": os.defpath,
+        "HTTP_PROXY": "http://127.0.0.1:1234",
+        "PYTHONPATH": str(os_env_module._project_root()),
+        "LC_CTYPE": "C",
+    }
+    tcp_broker = MagicMock()
+    tcp_broker.socket_path = tmp_path / "tcp-egress.sock"
+    tcp_broker.token = "fixture-token"
+    os_env_module.apply_tcp_egress_env(prepared_env, tcp_broker)
     prepared = _PreparedHelper(
         replace(_policy(tmp_path), egress_relay_port=1234, egress_socket_path="/broker.sock"),
         tmp_path,
-        {
-            "PATH": os.defpath,
-            "HTTP_PROXY": "http://127.0.0.1:1234",
-            "PYTHONPATH": str(os_env_module._project_root()),
-            "LC_CTYPE": "C",
-        },
+        prepared_env,
     )
     monkeypatch.setenv("UNGRANTED_SECRET", "must-stay-in-the-parent")
     monkeypatch.setenv("LC_CTYPE", "C.UTF-8")
@@ -467,7 +538,9 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
         assert options["command_env"]["LC_CTYPE"] == "C.UTF-8"
         assert prepared.env["LC_CTYPE"] == "C"
         metadata.assert_called_once_with({"op": "shell_encoding"}, allow_retry=True)
-        assert options["launch_env"] == prepared.env
+        assert "launch_env" not in options
+        assert options["command_env"]["PATH"] == prepared.env["PATH"]
+        assert prepared.env["PATH"].startswith(str(tmp_path) + os.pathsep)
         assert "UNGRANTED_SECRET" not in options["command_env"]
         assert "PYTHONPATH" not in options["command_env"]
         assert (
@@ -559,7 +632,8 @@ async def test_repeated_cancellation_waits_for_actual_worker_retirement(
     request = shell_request.BwrapShellRequest()
     cancel = MagicMock(side_effect=cancelled.set)
     monkeypatch.setattr(request, "cancel", cancel)
-    monkeypatch.setattr(shell_request, "BwrapShellRequest", lambda: request)
+    constructor = MagicMock(return_value=request)
+    monkeypatch.setattr(shell_request, "BwrapShellRequest", constructor)
 
     def run(*_args: object) -> dict[str, object]:
         started.set()
@@ -567,9 +641,12 @@ async def test_repeated_cancellation_waits_for_actual_worker_retirement(
         return {"stdout": "retired", "exit_code": 0}
 
     monkeypatch.setattr(environment._helper, "shell_request", run)
-    task = asyncio.create_task(environment.isolated_shell("example-command"))
+    task = asyncio.create_task(
+        environment.isolated_shell("example-command", launcher="/selected/bwrap")
+    )
     try:
         await poll_until_async(started.is_set, timeout_s=2, interval_s=0.001)
+        constructor.assert_called_once_with(launcher="/selected/bwrap")
         task.cancel()
         await poll_until_async(cancelled.is_set, timeout_s=2, interval_s=0.001)
         task.cancel()
