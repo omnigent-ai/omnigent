@@ -581,6 +581,38 @@ describe("WorkspacePanel surface presentation", () => {
     }
   });
 
+  it("closes gadgets with Close all tabs, and hides the rail when the last gadget closes", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const close = vi.fn();
+    const tabs = [{ key: "gadget:g1", label: "Board" }];
+    gadgetRailTabs.state = { tabs, canClose: true, close };
+    try {
+      const { rerender, onHide } = renderWorkspace({
+        selectedFilePath: "README.md",
+        openFiles: ["README.md"],
+      });
+      fireEvent.contextMenu(screen.getByTitle("README.md"));
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+      expect(close).toHaveBeenCalledWith("gadget:g1");
+      gadgetRailTabs.state = { tabs: [], canClose: true, close };
+      rerender({ openFiles: [], selectedFilePath: null });
+      expect(onHide).toHaveBeenCalledOnce();
+
+      // A lone gadget closed with its X hides the rail too.
+      onHide.mockClear();
+      close.mockClear();
+      gadgetRailTabs.state = { tabs, canClose: true, close, selected: "gadget:g1" };
+      rerender({ rightRailTab: "gadget" });
+      fireEvent.click(screen.getByRole("button", { name: "Close Board" }));
+      expect(close).toHaveBeenCalledWith("gadget:g1");
+      gadgetRailTabs.state = { tabs: [], canClose: true, close, selected: null };
+      rerender({});
+      expect(onHide).toHaveBeenCalledOnce();
+    } finally {
+      gadgetRailTabs.state = null;
+    }
+  });
+
   it("runs a gadget once: in the rail on a desktop, only in its drawer on a phone", () => {
     let mounted = 0;
     function CountedGadget() {

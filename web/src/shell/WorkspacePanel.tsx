@@ -1599,6 +1599,13 @@ function WorkspacePanelImpl({
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
+  // Records the user's close, like every other tab's, so closing the last one hides the rail.
+  const closeGadget = (key: string, hideWhenLast = true) => {
+    if (!gadgetRail.canClose) return;
+    closeIntentsRef.current.set(`gadget:${key}`, hideWhenLast);
+    gadgetRail.close(key);
+  };
+  const gadgetStripState = { ...gadgetRail, close: (key: string) => closeGadget(key) };
   const closeSideChat = (childId: string, hideWhenLast = true) =>
     stopSideChat(childId, () => {
       closeIntentsRef.current.set(`sidechat:${childId}`, hideWhenLast);
@@ -1924,7 +1931,7 @@ function WorkspacePanelImpl({
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
         void closeSideChat(sideChats.selected);
       } else if (scopeView === "gadget" && gadgetRail.selected !== null) {
-        if (gadgetRail.canClose) gadgetRail.close(gadgetRail.selected);
+        closeGadget(gadgetRail.selected);
       } else if (scopeView === "browser" && browsers.selected !== null) {
         void closeBrowserTab(browsers.selected);
       } else if (openPanel !== undefined) {
@@ -2022,6 +2029,10 @@ function WorkspacePanelImpl({
     ...sideChats.tabs.map((childId) => ({
       key: `sidechat:${childId}`,
       closeNow: (hide: boolean) => void closeSideChat(childId, hide),
+    })),
+    ...(gadgetRail.canClose ? gadgetRail.tabs : []).map((tab) => ({
+      key: `gadget:${tab.key}`,
+      closeNow: (hide: boolean) => closeGadget(tab.key, hide),
     })),
   ];
   // The tab a bulk close keeps, selected once the closed tabs (and any file viewer among
@@ -2337,7 +2348,7 @@ function WorkspacePanelImpl({
                     />
                   );
                 })}
-                <GadgetRailTabStrip state={gadgetRail} active={gadgetSelected} />
+                <GadgetRailTabStrip state={gadgetStripState} active={gadgetSelected} />
               </WorkspaceTabsScroller>
             </>
           )}

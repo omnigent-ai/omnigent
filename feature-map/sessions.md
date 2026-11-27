@@ -368,11 +368,11 @@ the header menu), and each place is a separate entry point.
   is made in one click. With gadgets on, sessions keep this side panel even when
   `workspace_sidebar_v2` is on, because gadget tabs and full screen live only in
   it. A gadget's toolbar renames it in place from its name, and has **Comments**
-  (where **Address all** sends the open comments to its session), **Share**, and a
-  **⋯** menu with **Gadget details** and **Delete gadget**. A gadget that asks to
+  (where **Address all** sends the open comments to its session), **Share** (only where
+  the server offers gadget sharing; the bundled SQL store doesn't), and a **⋯** menu with **Gadget details** and **Delete gadget**. A gadget that asks to
   read the viewer's sessions waits for **Allow** / **Don’t allow** first; a gadget
   that navigated itself stops with **Reload gadget**, after which it asks again.
-  The Gadget page lists the viewer's gadgets and a **Shared with you** section; each
+  The Gadget page lists the viewer's gadgets and, with sharing, a **Shared with you** section; each
   row's **⋯** menu has **Rename**, **Pin to sidebar** / **Unpin from sidebar** and
   **Delete gadget**, as the viewer's access allows. Closing a gadget's tab takes it out
   of that session's side panel for the viewer who closed it only; it stays linked for

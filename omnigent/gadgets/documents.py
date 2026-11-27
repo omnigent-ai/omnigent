@@ -204,6 +204,11 @@ _ENVELOPE_KEYS: Final = frozenset(
 # Public data types
 
 
+# A listing position no collection reaches, but whose order file name stays short: a cursor
+# naming a later one is refused before any file is read.
+_MAX_LISTING_ORDINAL = 10**18
+
+
 @dataclass(frozen=True)
 class StoreLimits:
     """Bounds enforced by the store. Defaults are the production limits."""
@@ -1872,7 +1877,11 @@ class ImmutableDocumentStore:
         ):
             raise invalid
         after = payload["after"]
-        if not isinstance(payload["s"], str) or type(after) is not int or after < 0:
+        if (
+            not isinstance(payload["s"], str)
+            or type(after) is not int
+            or not 0 <= after <= _MAX_LISTING_ORDINAL
+        ):
             raise invalid
         if self._encode_cursor(collection, after) != cursor:
             if payload["s"] != self._scope(collection):

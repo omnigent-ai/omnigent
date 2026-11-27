@@ -616,6 +616,51 @@ def test_a_unique_rule_added_over_duplicates_keeps_them_editable_and_the_value_t
     assert created["id"] == "c"
 
 
+def _nested(depth: int) -> dict:
+    """An object *depth* levels deep, counting itself."""
+    return {} if depth == 1 else {"n": _nested(depth - 1)}
+
+
+@pytest.mark.parametrize("depth", [13, 14, 15, 16])
+def test_a_ruled_collection_takes_any_record_the_public_limits_accept(
+    gadgets: Fixture, depth: int
+) -> None:
+    # The rules' bookkeeping wraps the record in a few containers of its own; it still has
+    # room for a record at the deepest the public limit accepts.
+    service = gadgets.service()
+    rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    app = publish_ruled_board(service, [rule])
+    value = {"title": "Ship", "column": "todo", "extra": _nested(depth - 1)}
+    created = rpc(service, app, "create", id="a", value=value, operation_id="c-a")
+    replaced = rpc(
+        service,
+        app,
+        "replace",
+        id="a",
+        value={**value, "column": "doing"},
+        if_version=created["version"],
+        operation_id="r-a",
+    )
+    assert replaced["value"]["column"] == "doing"
+
+
+def test_a_ruled_collection_still_refuses_a_record_past_the_public_depth(
+    gadgets: Fixture,
+) -> None:
+    service = gadgets.service()
+    rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    app = publish_ruled_board(service, [rule])
+    with pytest.raises(InvalidInput):
+        rpc(
+            service,
+            app,
+            "create",
+            id="a",
+            value={"title": "Ship", "column": "todo", "extra": _nested(16)},
+            operation_id="c-a",
+        )
+
+
 def test_a_unique_rule_refuses_duplicates_and_frees_a_deleted_value(gadgets: Fixture) -> None:
     service = gadgets.service()
     rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}

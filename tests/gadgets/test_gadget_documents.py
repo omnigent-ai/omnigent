@@ -17,6 +17,7 @@ from omnigent.stores.gadget_store import (
     Conflict,
     CorruptData,
     GadgetFiles,
+    InvalidInput,
     NotFound,
 )
 from omnigent.stores.gadget_store.local import LocalGadgetStore
@@ -216,6 +217,12 @@ def test_a_page_can_be_empty_and_still_continue(tmp_path: Path) -> None:
     assert page.items == () and page.next_cursor is not None
     rest = env.docs.list("cards", limit=2, cursor=page.next_cursor)
     assert [item.id for item in rest.items] == ["c"] and rest.next_cursor is None
+    # A well-formed cursor naming a position past any collection is refused before any
+    # file is read, instead of naming an order file too long for the file system.
+    far = env.docs._encode_cursor("cards", 10**300)
+    assert len(far) <= 512
+    with pytest.raises(InvalidInput):
+        env.docs.list("cards", limit=2, cursor=far)
 
 
 def test_records_deleted_past_retention_give_their_capacity_back(env: Env) -> None:

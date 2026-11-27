@@ -56,6 +56,7 @@ may be writing).
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -119,8 +120,16 @@ OVER_CAPACITY_MESSAGE = (
     "some records, or publish a version without the unique or count rule."
 )
 _INITIAL_STATE = {"rules": _STALE, "counts": {}, "unique": {}, "pending": None, "writes": 0}
-# The guard's own records; tests shrink it.
-GUARD_LIMITS: StoreLimits = DEFAULT_LIMITS
+# Containers the guard's state wraps around a record value (the state, its pending operations,
+# one operation, its fields), and room for the bookkeeping beside it.
+_GUARD_DEPTH_HEADROOM = 8
+# The guard's own records; tests shrink it. Deeper and larger than a record, since a pending
+# operation holds a record the public limits accept whole.
+GUARD_LIMITS: StoreLimits = dataclasses.replace(
+    DEFAULT_LIMITS,
+    max_json_depth=DEFAULT_LIMITS.max_json_depth + _GUARD_DEPTH_HEADROOM,
+    max_json_nodes=DEFAULT_LIMITS.max_json_nodes * 4,
+)
 # Records one rebuild step reads, and the steps one write may take before giving up as busy.
 REBUILD_PAGE = 200
 REBUILD_STEPS_PER_WRITE = 64
