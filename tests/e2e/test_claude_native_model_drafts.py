@@ -13,7 +13,6 @@ import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge, model_switch
-from omnigent.process_logging import redact_log_text
 from tests._helpers.mock_llm import advertised_tool_names
 from tests._helpers.native_claude import (
     _PINNED_CLAUDE_MODELS,
@@ -230,6 +229,16 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
         session_id = str(created["session_id"])
         try:
             _require_session_only_claude(base_url, session_id)
+            snapshot = _live_claude_snapshot(base_url, session_id)
+            bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
+            bridge_dir = bridge.bridge_dir_for_bridge_id(bridge_id)
+            advert = bridge.read_tmux_target(bridge_dir)
+            assert advert is not None, "The owned Claude terminal advertised no tmux pane"
+            target = advert["tmux_target"]
+            # Keep the full active-turn status panel visible during model selection.
+            bridge._run_tmux(
+                advert["socket_path"], "resize-window", "-t", target, "-x", "200", "-y", "50"
+            )
             saved_settings = claude_settings_snapshot(settings_path)
             selected = client.patch(
                 f"/v1/sessions/{session_id}",
@@ -259,12 +268,6 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
             assert tool_names, (
                 "A conversation tool must distinguish the held turn from title calls"
             )
-            snapshot = _live_claude_snapshot(base_url, session_id)
-            bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
-            bridge_dir = bridge.bridge_dir_for_bridge_id(bridge_id)
-            advert = bridge.read_tmux_target(bridge_dir)
-            assert advert is not None, "The owned Claude terminal advertised no tmux pane"
-            target = advert["tmux_target"]
             evidence = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
             evidence.mkdir(parents=True, exist_ok=True)
             busy_marker, busy_reply = f"busy-user-{nonce}", f"busy-reply-{nonce}"
@@ -313,37 +316,7 @@ def test_claude_model_control_during_an_active_turn_preserves_delivery(
                             indent=2,
                         )
                     )
-                    assert response.status_code == 200, {
-                        "response": response.text,
-                        "model_control_failure": [
-                            redact_log_text(line, include_whitespace_credentials=True)[:2048]
-                            for directory in (
-                                tmp_path
-                                / "server"
-                                / "server-home"
-                                / ".omnigent"
-                                / "logs"
-                                / "server",
-                                tmp_path / "host" / "home" / ".omnigent" / "logs" / "runner",
-                            )
-                            for path in directory.glob("*.log")
-                            for line in path.read_text(errors="replace").splitlines()
-                            if any(
-                                marker in line
-                                for marker in (
-                                    "Model change not applied to the terminal",
-                                    "claude-native model change failed:",
-                                    "ClaudeModelSwitchRefused:",
-                                    "ClaudeComposerNotCleared:",
-                                    "ClaudePromptTimeout:",
-                                    "ClaudeInputBoxOccupied:",
-                                    "ClaudeTerminalDialog:",
-                                    "ClaudeUserPromptPending:",
-                                    "RuntimeError:",
-                                )
-                            )
-                        ][-6:],
-                    }
+                    assert response.status_code == 200, response.text
                     assert pending, "Model control must finish before the active turn is released"
                     assert claude_settings_snapshot(settings_path) == saved_settings
                     poll_until(
