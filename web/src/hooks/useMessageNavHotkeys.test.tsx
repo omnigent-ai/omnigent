@@ -27,11 +27,38 @@ function press(init: KeyboardEventInit & { altGraph?: boolean }): KeyboardEvent 
 
 function mount() {
   const nav = { goPrev: vi.fn(), goNext: vi.fn() };
-  const hook = renderHook(() => useMessageNavHotkeys(nav));
+  const hook = renderHook(() => useMessageNavHotkeys(nav, true));
   return { nav, ...hook };
 }
 
 describe("useMessageNavHotkeys", () => {
+  it("binds nothing until enabled", () => {
+    const nav = { goPrev: vi.fn(), goNext: vi.fn() };
+    const { rerender } = renderHook(({ enabled }) => useMessageNavHotkeys(nav, enabled), {
+      initialProps: { enabled: false },
+    });
+    expect(press({ key: "ArrowUp", ctrlKey: true, altKey: true }).defaultPrevented).toBe(false);
+    rerender({ enabled: true });
+    expect(press({ key: "ArrowUp", ctrlKey: true, altKey: true }).defaultPrevented).toBe(true);
+    expect(nav.goPrev).toHaveBeenCalledTimes(1);
+  });
+
+  it("binds once for an inline target and steps with the latest one", () => {
+    const addListener = vi.spyOn(window, "addEventListener");
+    const first = { goPrev: vi.fn(), goNext: vi.fn() };
+    const latest = { goPrev: vi.fn(), goNext: vi.fn() };
+    const { rerender } = renderHook(
+      ({ nav }) => useMessageNavHotkeys({ goPrev: nav.goPrev, goNext: nav.goNext }, true),
+      { initialProps: { nav: first } },
+    );
+    rerender({ nav: latest });
+    expect(addListener.mock.calls.filter(([type]) => type === "keydown")).toHaveLength(1);
+    press({ key: "ArrowDown", ctrlKey: true, altKey: true });
+    expect(first.goNext).not.toHaveBeenCalled();
+    expect(latest.goNext).toHaveBeenCalledTimes(1);
+    addListener.mockRestore();
+  });
+
   it("steps with Ctrl+Alt and an arrow off macOS, leaving Shift held to Next and Previous session", () => {
     const { nav } = mount();
     expect(press({ key: "ArrowUp", ctrlKey: true, altKey: true }).defaultPrevented).toBe(true);
