@@ -54,11 +54,14 @@ class FakeGitHub:
         monkeypatch.setattr(github, "_in_sandbox", lambda: False)
         monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: None)
         self.active_tokens = [TOKEN]
+        # Each active-account token lookup, as binding the PR's account makes one.
+        self.token_lookups: list[str] = []
         # What a sandbox's gh answers from its hosts.yml.
         self.broker_token = ""
         monkeypatch.setattr(github, "_gh_active_token", self._active_token)
 
-    def _active_token(self, _root: str, _host: str = "github.com") -> str | None:
+    def _active_token(self, _root: str, host: str = "github.com") -> str | None:
+        self.token_lookups.append(host)
         return self.active_tokens.pop(0) if len(self.active_tokens) > 1 else self.active_tokens[0]
 
     def _gh(
@@ -72,9 +75,10 @@ class FakeGitHub:
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
-    """No stored gh hosts, no GH_HOST and every read slot free."""
+    """No stored or configured gh hosts, no GH_HOST and every read slot free."""
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
     monkeypatch.delenv("GH_HOST", raising=False)
+    monkeypatch.delenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", raising=False)
     monkeypatch.setattr(github_images, "_read_slots", threading.BoundedSemaphore(4))
     yield
 
@@ -181,12 +185,19 @@ def test_anything_but_an_attachment_on_the_pull_requests_host_is_refused(
         "https://user-images.githubusercontent.com/1/2-x.png",
     ],
 )
-def test_a_refused_url_reads_no_token_and_fetches_nothing(fake: FakeGitHub, url: str) -> None:
+def test_a_refused_url_reads_no_token_and_fetches_nothing(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    def no_token_read(_root: str, _reference: PullRequestRef) -> str | None:
+        raise AssertionError("The token was read before the URL was refused")
+
+    monkeypatch.setattr(github_images, "_image_token", no_token_read)
     transport = Transport()
 
     assert _refusal(lambda: _read(url, transport)) == "host_not_allowed"
 
     assert fake.calls == []
+    assert fake.token_lookups == []
     assert transport.seen == []
 
 
@@ -276,6 +287,18 @@ def test_a_redirect_off_the_signed_image_host_is_refused_with_no_request_to_it(
     assert _refusal(lambda: _read(ASSET, transport)) == "host_not_allowed"
 
     assert len(transport.seen) == 1
+
+
+def test_a_relative_redirect_on_the_signed_image_host_is_followed_without_the_token(
+    fake: FakeGitHub,
+) -> None:
+    transport = Transport(_redirect(SIGNED), _redirect("/1/3-x.png?jwt=b"), _image())
+
+    assert _read(ASSET, transport).data == PNG
+
+    followed = transport.seen[2]
+    assert str(followed.url) == "https://private-user-images.githubusercontent.com/1/3-x.png?jwt=b"
+    assert "authorization" not in followed.headers
 
 
 def test_an_enterprise_redirect_to_github_coms_signed_images_is_refused(
@@ -660,6 +683,28 @@ def test_a_proxy_httpx_cant_use_fails_the_fetch_without_its_diagnostic(
     assert refused.value.reason == "fetch_failed"
     assert str(refused.value) == "GitHub couldn't load that image. Try again."
     assert refused.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("no_proxy", "expected"),
+    [("", "http://proxy.example:3128"), ("githubusercontent.com", None)],
+    ids=["proxied", "no-proxy-match"],
+)
+def test_the_fetch_uses_https_proxy_unless_no_proxy_names_the_host(
+    monkeypatch: pytest.MonkeyPatch, no_proxy: str, expected: str | None
+) -> None:
+    for variable in ("https_proxy", "no_proxy"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("NO_PROXY", no_proxy)
+    built: list[dict[str, Any]] = []
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: built.append(kwargs))
+
+    github_images._transport_for(httpx.URL(SIGNED))
+
+    [kwargs] = built
+    assert kwargs["proxy"] == expected
+    assert kwargs["trust_env"] is False
 
 
 # Slots.
