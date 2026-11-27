@@ -411,6 +411,7 @@ import {
   SIDEBAR_ROW,
   SIDEBAR_ROW_MOBILE_INSET,
   SIDEBAR_HOVER_HIGHLIGHT,
+  SIDEBAR_PRESSED_HIGHLIGHT,
   SIDEBAR_ACTIVE_HIGHLIGHT,
   SIDEBAR_GRID_MEMBER_HIGHLIGHT,
   SIDEBAR_GRID_SELECTED_RING,
@@ -6853,6 +6854,7 @@ function ConversationRowImpl({
           // icon centered against the title and meta column.
           showHarness ? "items-center" : "flex-col justify-center",
           SIDEBAR_HOVER_HIGHLIGHT,
+          !selectionMode && SIDEBAR_PRESSED_HIGHLIGHT,
           // Full width (not 100%+1rem) so the highlight stays inset from the
           // right edge, aligning with the project/folder rows above.
           "w-full",
