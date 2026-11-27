@@ -3481,7 +3481,7 @@ function ConversationList({
     () => [...new Set(orderedConversationIds)].slice(0, SESSION_HOTKEY_DIGITS.length),
     [orderedConversationIds],
   );
-  useSessionNumberHotkeys(numberedSessionIds, activeId);
+  useSessionNumberHotkeys(numberedSessionIds);
   // With quick_pick_palette, ⌘K's Next and Previous session step through the same rows.
   const publishesSessionOrder = useQuickPickPaletteEnabled();
   const listedSessionIds = useMemo(
