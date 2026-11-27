@@ -1223,6 +1223,7 @@ async function runSwitchRace(seed: number) {
       }
       check();
     };
+    // Steps depend on the previous one, so chain them (no-await-in-loop forbids awaiting in the loop).
     let sequence = Promise.resolve();
     for (let step = 0; step < steps; step++) sequence = sequence.then(() => runAction(step));
     await sequence;
@@ -1375,7 +1376,8 @@ function raceEnvInteger(name: string, fallback: number, min: number): number {
   return value;
 }
 
-const raceSeed = raceEnvInteger("WARM_SWITCH_RACE_SEED", 1, 0);
+// xorshift never leaves state 0, so seeds start at 1.
+const raceSeed = raceEnvInteger("WARM_SWITCH_RACE_SEED", 1, 1);
 // At least 2 so both the browser and the pending-commit suites get a seed.
 const raceSeedCount = raceEnvInteger("WARM_SWITCH_RACE_SEEDS", 20, 2);
 const browserRaceSeedCount = Math.ceil(raceSeedCount / 5);
