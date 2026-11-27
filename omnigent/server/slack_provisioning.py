@@ -54,8 +54,13 @@ EXECUTION_TARGET = "managed_sandbox"
 # Every run continues one session, which the managed API allows every ten minutes.
 SESSION_MODE = "continue"
 DEFAULT_RRULE = "FREQ=MINUTELY;INTERVAL=10"
-# The MCP service that gives the watcher's sandbox Slack, unless a link names others.
-DEFAULT_MCP_SERVICES = ("slack",)
+# No MCP selection by default: the automation worker's own Slack configuration is used.
+DEFAULT_MCP_SERVICES: tuple[str, ...] = ()
+# Reasons in a 401/403 that mean the owner must sign in again, not a setup problem.
+_LOGIN_PROBLEM = re.compile(
+    r"expired|sign(?:ed)? ?in|log ?in|unauthenticated|invalid (?:token|credential)|token",
+    re.IGNORECASE,
+)
 _AGENT_ID = re.compile(r"^[0-9a-f]{32}$")
 _CRON_MINUTES = re.compile(r"^\*/([0-9]{1,2}) \* \* \* \*$")
 
@@ -109,6 +114,16 @@ class SlackAutomationConfig:
 
     def api_url_for(self, binding: SlackBinding) -> str:
         return ((binding.destination or {}).get("automation_url") or self.api_url).rstrip("/")
+
+    def automation_link(self, binding: SlackBinding) -> str | None:
+        """The watcher's page in the managed server's web UI, e.g. ``…/omnigent/tasks/<id>``."""
+        if not binding.automation_id:
+            return None
+        parts = urlsplit(self.api_url_for(binding))
+        if parts.scheme != "https" or not parts.path.startswith("/api/2.0/"):
+            return None
+        ui = parts.path.removeprefix("/api/2.0")
+        return f"https://{parts.netloc}{ui}/tasks/{_task_id(binding.automation_id)}"
 
     def relay_url_for(self, binding: SlackBinding) -> str:
         return (self.relay_url or (binding.destination or {}).get("relay_url") or "").rstrip("/")
@@ -242,10 +257,15 @@ class AutomationClient:
                 except httpx.HTTPError as exc:
                     raise AutomationError(f"The automation service is unreachable: {exc}") from exc
             status, text = response.status_code, response.text
-        if status in (401, 403):
+        if status == 401 or (status == 403 and _LOGIN_PROBLEM.search(_error_detail(text))):
             raise AutomationAuthError(
                 f"The automation service refused the owner's login ({status}): "
                 f"{_error_detail(text)}. Sign in again, then retry"
+            )
+        if status == 403:
+            raise AutomationError(
+                f"The automation service can't set up the watcher (403): {_error_detail(text)}. "
+                "This is a setup or permission problem on that service, not an expired login"
             )
         if status == 404:
             if method == "DELETE":
@@ -391,12 +411,14 @@ class SlackProvisioner:
             "timezone": "UTC",
             "execution_target": EXECUTION_TARGET,
             "session_mode": SESSION_MODE,
-            "mcp_services": (
-                [name.strip() for name in services.split(",") if name.strip()]
-                if services is not None
-                else list(self.config.mcp_services)
-            ),
         }
+        selected = (
+            [name.strip() for name in services.split(",") if name.strip()]
+            if services is not None
+            else list(self.config.mcp_services)
+        )
+        if selected:
+            task["mcp_services"] = selected
         model = destination.get("model") or self.config.model
         if model:
             task["model_override"] = model
@@ -464,7 +486,9 @@ class SlackProvisioner:
             result: dict[str, Any] | None = None
             if task_id:
                 try:
-                    result = await client.update(token, task_id, {**task, "state": _ACTIVE})
+                    # An empty selection clears services an earlier version chose.
+                    fields = {"mcp_services": [], **task, "state": _ACTIVE}
+                    result = await client.update(token, task_id, fields)
                 except AutomationNotFoundError:
                     task_id = None
             if not task_id:

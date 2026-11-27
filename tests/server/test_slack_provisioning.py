@@ -59,6 +59,7 @@ class _ManagedApi:
         self.tasks: dict[str, dict] = {}
         self.status = status
         self.drop_create_answer = False
+        self.detail = "nope"
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else {}
@@ -66,7 +67,7 @@ class _ManagedApi:
         self.calls.append((request.method, path, body))
         assert request.headers["Authorization"] == "Bearer owner-token"
         if self.status != 200:
-            return httpx.Response(self.status, json={"detail": "nope"})
+            return httpx.Response(self.status, json={"detail": self.detail})
         if path == TASKS and request.method == "GET":
             return httpx.Response(200, json={"scheduled_tasks": list(self.tasks.values())})
         if path == TASKS and request.method == "POST":
@@ -147,7 +148,8 @@ def test_create_sends_the_managed_contract(db_uri: str) -> None:
     assert body["rrule"] == "FREQ=MINUTELY;INTERVAL=10"
     assert body["agent_id"] == builtin_agent_id("claude-native-ui")
     assert (body["execution_target"], body["session_mode"]) == ("managed_sandbox", "continue")
-    assert body["mcp_services"] == ["slack"]
+    # No MCP selection: the automation worker's own Slack configuration is used.
+    assert "mcp_services" not in body
     assert active.automation_id == next(iter(service.tasks))
     assert "https://factory.example.com/v1/slack-relay/" in body["prompt"]
     # Only the hash is stored; the key is in the watcher's instructions.
@@ -381,3 +383,34 @@ def test_a_lead_host_owned_by_someone_else_is_not_used(db_uri: str) -> None:
     failed = _run(provisioner.provision(project, binding, actor_user_id=None))
     assert failed.state == "needs_reconnect"
     assert registry.frames == [] and service.calls == []
+
+
+def test_a_403_setup_problem_is_not_reported_as_an_expired_login(db_uri: str) -> None:
+    _, service, provisioner, project, binding = _setup(db_uri, status=403)
+    service.detail = "MCP registry is not configured"
+    failed = _run(provisioner.provision(project, binding, actor_user_id=None))
+    assert failed.state == "error"
+    assert "MCP registry is not configured" in (failed.last_error or "")
+    assert "not an expired login" in (failed.last_error or "")
+    _, service, provisioner, project, binding = _setup(db_uri, status=403, channel_id="C0403")
+    service.detail = "Token expired"
+    assert _run(provisioner.provision(project, binding, actor_user_id=None)).state == (
+        "needs_reconnect"
+    )
+
+
+def test_update_clears_services_an_earlier_version_chose(db_uri: str) -> None:
+    _, service, provisioner, project, binding = _setup(db_uri)
+    active = _run(provisioner.provision(project, binding, actor_user_id=None))
+    service.tasks[active.automation_id]["mcp_services"] = ["slack"]
+    _run(provisioner.provision(project, active, actor_user_id=None))
+    assert service.calls[-1][2]["mcp_services"] == []
+
+
+def test_the_watcher_link_opens_its_page_on_the_managed_server(db_uri: str) -> None:
+    _, _, provisioner, project, binding = _setup(db_uri)
+    assert provisioner.config.automation_link(binding) is None
+    active = _run(provisioner.provision(project, binding, actor_user_id=None))
+    assert provisioner.config.automation_link(active) == (
+        f"https://automation.example.com/omnigent/tasks/{active.automation_id}"
+    )

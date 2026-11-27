@@ -9,6 +9,13 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { MenuItem } from "@/components/ui/menu-item";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Spinner } from "@/components/ui/spinner";
@@ -31,6 +38,12 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { Link, useRebasePath } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import {
+  ProjectSlackSection,
+  SLACK_STATE_TEXT,
+  slackChannelLabel,
+  useProjectSlack,
+} from "@/shell/ProjectSlackSection";
 import { cn } from "@/lib/utils";
 
 const CreateScheduledTaskDialog = lazy(() =>
@@ -45,7 +58,11 @@ const SOURCES: { id: TriggerSource; label: string; description: string }[] = [
     label: "Jira board",
     description: "Filter a project or board with JQL",
   },
-  { id: "slack", label: "Slack channel", description: "Turn channel messages into tickets" },
+  {
+    id: "slack",
+    label: "Slack channel",
+    description: "@omni reaches the Lead, which answers, delegates or files a ticket",
+  },
   { id: "linear", label: "Linear team", description: "Bring in issues from a team" },
   { id: "github", label: "GitHub repository", description: "Capture issues from a repository" },
   {
@@ -122,14 +139,23 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
       }),
     [data, projectId],
   );
+  // The Slack bridge's watcher runs on the automation service, not in this list.
+  const slack = useProjectSlack(projectId);
+  const bridge = slack.data?.linked ? slack.data : null;
+  const bridgeFailed = bridge?.state === "error" || bridge?.state === "needs_reconnect";
+  const [bridgeOpen, setBridgeOpen] = useState(false);
+  const linkedCount = sources.length + (bridge ? 1 : 0);
   const loading = projectId !== null && data === undefined && !isError;
   const loadError = projectId !== null && isError;
-  const showPicker = view === "add" || (!sources.length && !loading && !loadError);
-  const showBack = view === "add" && (sources.length > 0 || loading || loadError);
-  const providers = [...new Set(sources.map((entry) => entry.source))];
-  const failedCount = sources.filter(({ task }) => task.lastRunStatus === "failed").length;
-  const triggerLabel = sources.length
-    ? `Sources: ${sources.length} linked${failedCount ? `, ${failedCount} with a failed last run` : ""}`
+  const showPicker = view === "add" || (!linkedCount && !loading && !loadError);
+  const showBack = view === "add" && (linkedCount > 0 || loading || loadError);
+  const providers = [
+    ...new Set([...(bridge ? (["slack"] as const) : []), ...sources.map((entry) => entry.source)]),
+  ];
+  const failedRuns = sources.filter(({ task }) => task.lastRunStatus === "failed").length;
+  const failedCount = failedRuns + (bridgeFailed ? 1 : 0);
+  const triggerLabel = linkedCount
+    ? `Sources: ${linkedCount} linked${failedRuns ? `, ${failedRuns} with a failed last run` : ""}${bridgeFailed ? ", Slack needs attention" : ""}`
     : loading || loadError
       ? "Sources"
       : "Connect source";
@@ -167,11 +193,11 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
               <PlugIcon aria-hidden className="size-4 text-muted-foreground" />
             )}
             <span className="@max-[60rem]/topbar:hidden">
-              {sources.length || loading || loadError ? "Sources" : "Connect source"}
+              {linkedCount || loading || loadError ? "Sources" : "Connect source"}
             </span>
-            {sources.length > 0 && (
+            {linkedCount > 0 && (
               <span className="rounded bg-muted px-1.5 text-xs leading-5 tabular-nums">
-                {sources.length}
+                {linkedCount}
               </span>
             )}
             {(loadError || failedCount > 0) && (
@@ -217,9 +243,9 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
               >
                 {showPicker ? "Connect a source" : "Ticket sources"}
               </h2>
-              {!showPicker && sources.length > 0 && (
+              {!showPicker && linkedCount > 0 && (
                 <span className="ml-auto text-xs text-muted-foreground">
-                  {sources.length} linked
+                  {linkedCount} linked
                 </span>
               )}
             </div>
@@ -230,6 +256,43 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
             </p>
           </div>
           <div className="min-h-0 overflow-y-auto overscroll-contain p-2">
+            {!showPicker && bridge && (
+              <MenuItem asChild className="w-full items-start gap-3 rounded-lg p-2.5 text-left">
+                <button
+                  type="button"
+                  aria-label={`Open Slack channel bridge: ${slackChannelLabel(bridge)}`}
+                  data-testid="project-source-slack-bridge"
+                  onClick={() => {
+                    setBridgeOpen(true);
+                    setOpen(false);
+                  }}
+                >
+                  <SourceIcon source="slack" />
+                  <span className="min-w-0 flex-1 space-y-1">
+                    <span className="block text-sm leading-5 font-medium wrap-anywhere">
+                      Slack · {slackChannelLabel(bridge)}
+                    </span>
+                    <span className="block text-xs leading-4 text-muted-foreground">
+                      @omni reaches the Lead
+                    </span>
+                    <span
+                      className={cn(
+                        "block text-xs leading-4",
+                        bridge.state === "active" && "text-session-active",
+                        bridgeFailed && "text-destructive",
+                        !bridgeFailed && bridge.state !== "active" && "text-muted-foreground",
+                      )}
+                    >
+                      {bridge.state ? SLACK_STATE_TEXT[bridge.state] : ""}
+                    </span>
+                  </span>
+                  <ChevronRightIcon
+                    aria-hidden
+                    className="mt-2 size-3.5 shrink-0 text-muted-foreground"
+                  />
+                </button>
+              </MenuItem>
+            )}
             {!showPicker && sources.length > 0 && (
               <ul aria-label="Source automations" className="space-y-1">
                 {sources.map(({ task, source: provider, scope, filter }) => (
@@ -300,7 +363,9 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
             ) : null}
             {showPicker &&
               SOURCES.map(({ id, label, description }) => {
-                const count = sources.filter((entry) => entry.source === id).length;
+                const count =
+                  sources.filter((entry) => entry.source === id).length +
+                  (id === "slack" && bridge ? 1 : 0);
                 return (
                   <MenuItem
                     key={id}
@@ -312,7 +377,9 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
                       aria-label={label}
                       aria-describedby={`${descriptionId}-${id}`}
                       onClick={() => {
-                        setSource(id);
+                        // A Slack channel connects to the Lead through the bridge, not intake.
+                        if (id === "slack") setBridgeOpen(true);
+                        else setSource(id);
                         setOpen(false);
                       }}
                     >
@@ -356,6 +423,19 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
           )}
         </PopoverContent>
       </Popover>
+      {projectId !== null && (
+        <Dialog open={bridgeOpen} onOpenChange={setBridgeOpen}>
+          <DialogContent data-testid="project-slack-dialog">
+            <DialogHeader>
+              <DialogTitle>Slack channel</DialogTitle>
+              <DialogDescription>
+                Link a channel so people can reach this project&apos;s Lead from Slack.
+              </DialogDescription>
+            </DialogHeader>
+            <ProjectSlackSection projectId={projectId} />
+          </DialogContent>
+        </Dialog>
+      )}
       {source && (
         <Suspense
           fallback={

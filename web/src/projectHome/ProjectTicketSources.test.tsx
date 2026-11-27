@@ -55,6 +55,10 @@ const SOURCES = [
   ["pagerduty", "PagerDuty service", "PagerDuty"],
 ] as const;
 
+// Slack connects through the Lead bridge, not a ticket-intake automation.
+const INTAKE_SOURCES = SOURCES.filter(([id]) => id !== "slack");
+const UNLINKED_SLACK = { object: "project.slack", linked: false, can_manage: true };
+
 const clients: QueryClient[] = [];
 function CurrentPage() {
   return <span data-testid="current-page">{useLocation().pathname}</span>;
@@ -121,10 +125,18 @@ function sourceRecord(
   };
 }
 
-function mockSources(records: object[]) {
-  vi.mocked(authenticatedFetch).mockImplementation(
-    async () => new Response(JSON.stringify({ scheduled_tasks: records })),
+function mockSources(records: object[], slack: object = UNLINKED_SLACK) {
+  vi.mocked(authenticatedFetch).mockImplementation(async (url) =>
+    String(url).endsWith("/slack")
+      ? new Response(JSON.stringify(slack))
+      : new Response(JSON.stringify({ scheduled_tasks: records })),
   );
+}
+
+function scheduledTaskCalls() {
+  return vi
+    .mocked(authenticatedFetch)
+    .mock.calls.filter(([url]) => !String(url).endsWith("/slack"));
 }
 
 beforeEach(() => {
@@ -137,7 +149,7 @@ afterEach(() => {
 });
 
 describe("project ticket sources", () => {
-  it.each(SOURCES)("opens the %s preset without creating anything", async (id, label, service) => {
+  it.each(INTAKE_SOURCES)("opens the %s preset without creating anything", async (id, label, service) => {
     renderSources();
     expect(CreateScheduledTaskDialog).not.toHaveBeenCalled();
     await openSources();
@@ -163,7 +175,7 @@ describe("project ticket sources", () => {
       "preserve its current stage, labels, and human decisions",
     );
     expect(props?.initialPrompt?.length).toBeLessThan(LEGACY_MAX_INSTRUCTIONS_CHARS);
-    expect(vi.mocked(authenticatedFetch).mock.calls).toEqual([["/v1/scheduled-tasks"]]);
+    expect(scheduledTaskCalls()).toEqual([["/v1/scheduled-tasks"]]);
   });
 
   it("discards a canceled source selection and opens the next preset", async () => {
@@ -174,11 +186,11 @@ describe("project ticket sources", () => {
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await openSources();
-    await userEvent.click(screen.getByRole("button", { name: "Slack channel" }));
+    await userEvent.click(screen.getByRole("button", { name: "Linear team" }));
     await screen.findByRole("dialog", { name: "New automation" });
     expect(vi.mocked(CreateScheduledTaskDialog).mock.lastCall?.[0]).toMatchObject({
-      initialTrigger: "slack",
-      initialName: "Slack → Shipping tickets",
+      initialTrigger: "linear",
+      initialName: "Linear → Shipping tickets",
     });
   });
 
@@ -322,8 +334,49 @@ describe("project ticket sources", () => {
     expect(screen.queryByText("No sources linked yet.")).not.toBeInTheDocument();
     expect(sourceButton()).toHaveAccessibleName("Sources");
     await userEvent.click(screen.getByRole("button", { name: "Add source" }));
-    await userEvent.click(screen.getByRole("button", { name: "Slack channel" }));
+    await userEvent.click(screen.getByRole("button", { name: "Jira board" }));
     await screen.findByRole("dialog", { name: "New automation" });
+  });
+
+  it("links a Slack channel through the Lead bridge, not an intake automation", async () => {
+    renderSources();
+    await openSources();
+    await userEvent.click(screen.getByRole("button", { name: "Slack channel" }));
+    const dialog = await screen.findByRole("dialog", { name: "Slack channel" });
+    expect(within(dialog).getByLabelText("Slack channel link")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Slack channel name")).toBeInTheDocument();
+    // People never see API URLs, repositories or automation instructions.
+    expect(within(dialog).queryByLabelText(/API URL/)).not.toBeInTheDocument();
+    expect(CreateScheduledTaskDialog).not.toHaveBeenCalled();
+  });
+
+  it("lists the Slack bridge from the project link with its status", async () => {
+    mockSources([sourceRecord("jira", "jira", "OPS")], {
+      object: "project.slack",
+      linked: true,
+      can_manage: true,
+      channel_id: "C0ZZ1",
+      channel_name: "eng",
+      state: "needs_reconnect",
+      last_error: "Sign in again",
+      automation_link: "https://automation.example.com/omnigent/tasks/t1",
+    });
+    renderSources();
+    await screen.findByRole("button", { name: "Sources: 2 linked, Slack needs attention" });
+    await openSources();
+    const bridge = await screen.findByRole("button", {
+      name: "Open Slack channel bridge: #eng",
+    });
+    expect(bridge).toHaveTextContent("Needs the owner to sign in");
+    await userEvent.click(bridge);
+    const dialog = await screen.findByRole("dialog", { name: "Slack channel" });
+    expect(within(dialog).getByRole("alert")).toHaveTextContent("Sign in again");
+    expect(within(dialog).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Unlink" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("link", { name: /Open the channel watcher/ })).toHaveAttribute(
+      "href",
+      "https://automation.example.com/omnigent/tasks/t1",
+    );
   });
 
   it("keeps long source names and board filters readable and can go back from adding", async () => {

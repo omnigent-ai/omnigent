@@ -1,9 +1,10 @@
 /**
- * Project settings → Slack: link the project to one Slack channel, where an
- * `@omni` mention reaches the project's Lead. Members see the link; the owner and
- * product approvers change it.
+ * The project's Slack channel bridge, opened from Sources → Slack channel: an
+ * `@omni` mention in the channel reaches the project's Lead. Members see the
+ * link; the owner and product approvers change it.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ExternalLinkIcon } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,16 +17,28 @@ import {
   unlinkProjectSlack,
 } from "@/lib/projectSlackApi";
 
-const STATE_TEXT: Record<ProjectSlackState, string> = {
-  claimed: "Linked; setting up the channel watcher",
+export const SLACK_STATE_TEXT: Record<ProjectSlackState, string> = {
+  claimed: "Setting up the channel watcher",
   active: "On: @omni in this channel reaches the Lead",
   disabled: "Paused: the channel is kept for this project but not watched",
   error: "Setup failed",
-  needs_reconnect: "Needs the owner to sign in; see below",
+  needs_reconnect: "Needs the owner to sign in",
 };
 
-// States where the watcher isn't running and saving again or retrying sets it up.
+// States where the watcher isn't running and retrying sets it up.
 const RETRY_STATES: ReadonlySet<ProjectSlackState> = new Set(["claimed", "error", "needs_reconnect"]);
+
+export function projectSlackQueryKey(projectId: string) {
+  return ["project-slack", projectId];
+}
+
+export function useProjectSlack(projectId: string | null) {
+  return useQuery({
+    queryKey: projectSlackQueryKey(projectId ?? ""),
+    queryFn: () => getProjectSlack(projectId ?? ""),
+    enabled: projectId !== null,
+  });
+}
 
 /** The link's saved settings to send again, minus what the server fills in. */
 function savedDestination(link: ProjectSlackLink | undefined): Record<string, string> {
@@ -33,46 +46,27 @@ function savedDestination(link: ProjectSlackLink | undefined): Record<string, st
   return rest;
 }
 
-function channelLabel(link: ProjectSlackLink): string {
+export function slackChannelLabel(link: ProjectSlackLink): string {
   return link.channel_name ? `#${link.channel_name}` : (link.channel_id ?? "");
 }
 
-export function ProjectSlackSection({
-  projectId,
-  embedded = false,
-}: {
-  projectId: string;
-  /** Inside a page section that already has its own "Slack" heading. */
-  embedded?: boolean;
-}) {
+export function ProjectSlackSection({ projectId }: { projectId: string }) {
   const queryClient = useQueryClient();
-  const queryKey = ["project-slack", projectId];
-  const link = useQuery({ queryKey, queryFn: () => getProjectSlack(projectId) });
+  const link = useProjectSlack(projectId);
   const [channelLink, setChannelLink] = useState("");
   const [channelName, setChannelName] = useState("");
-  const [automationUrl, setAutomationUrl] = useState("");
-  const onDone = (next: ProjectSlackLink) => queryClient.setQueryData(queryKey, next);
+  const onDone = (next: ProjectSlackLink) =>
+    queryClient.setQueryData(projectSlackQueryKey(projectId), next);
   const save = useMutation({
-    mutationFn: () => {
-      const current = link.data;
-      const destination = savedDestination(current);
-      if (automationUrl.trim()) destination.automation_url = automationUrl.trim();
-      const channel = channelLink.trim()
-        ? { channel_link: channelLink.trim() }
-        : {
-            channel_id: current?.channel_id,
-            slack_team_id: current?.slack_team_id ?? undefined,
-          };
-      return linkProjectSlack(projectId, {
-        ...channel,
-        channel_name: channelName.trim() || current?.channel_name || undefined,
-        destination,
-      });
-    },
+    mutationFn: () =>
+      linkProjectSlack(projectId, {
+        channel_link: channelLink.trim(),
+        channel_name: channelName.trim() || link.data?.channel_name || undefined,
+        destination: savedDestination(link.data),
+      }),
     onSuccess: (next) => {
       setChannelLink("");
       setChannelName("");
-      setAutomationUrl("");
       onDone(next);
     },
   });
@@ -87,23 +81,17 @@ export function ProjectSlackSection({
   const failure = [save, toggle, unlink].find((mutation) => mutation.isError)?.error as
     | Error
     | undefined;
-  const canSave =
-    channelLink.trim() !== "" || (data?.linked === true && automationUrl.trim() !== "");
-  const savedAutomationUrl = data?.destination?.automation_url;
+  const retry = data?.state !== undefined && RETRY_STATES.has(data.state);
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
-    if (canSave) save.mutate();
+    if (channelLink.trim()) save.mutate();
   };
   return (
-    <section
-      className={embedded ? "flex flex-col gap-2" : "flex flex-col gap-2 border-t pt-4"}
-      data-testid="project-slack"
-    >
-      {!embedded && <h3 className="font-medium text-ui">Slack</h3>}
+    <section className="flex flex-col gap-3" data-testid="project-slack">
       <p className="text-muted-foreground text-sm">
-        Link one Slack channel. Anyone in it can <code className="text-xs">@omni</code> the
-        project&apos;s Lead, and replies come back in the thread marked{" "}
-        <em>via this project · Lead</em>. Only this setting links a channel; nothing in Slack can.
+        Anyone in the channel can <code className="text-xs">@omni</code> the project&apos;s Lead,
+        which answers, delegates or files a ticket. Follow-ups in the thread need no mention, and
+        replies stay in the thread marked <em>via this project · Lead</em>.
       </p>
       {link.isError && (
         <p className="text-destructive text-sm" role="alert">
@@ -113,10 +101,10 @@ export function ProjectSlackSection({
       {data?.linked === true && (
         <div className="flex flex-col gap-1 text-sm" data-testid="project-slack-link">
           <div className="flex items-center justify-between gap-2">
-            <span className="truncate font-medium">{channelLabel(data)}</span>
+            <span className="truncate font-medium">{slackChannelLabel(data)}</span>
             {data.state !== undefined && (
               <span className="text-muted-foreground" data-testid="project-slack-state">
-                {STATE_TEXT[data.state]}
+                {SLACK_STATE_TEXT[data.state]}
               </span>
             )}
           </div>
@@ -131,6 +119,18 @@ export function ProjectSlackSection({
               it off so messages aren&apos;t answered twice.
             </p>
           )}
+          {data.automation_link && (
+            <a
+              href={data.automation_link}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 self-start text-xs underline underline-offset-2"
+              data-testid="project-slack-automation-link"
+            >
+              Open the channel watcher
+              <ExternalLinkIcon aria-hidden className="size-3" />
+            </a>
+          )}
           {canManage && (
             <div className="flex gap-2 pt-1">
               <Button
@@ -140,18 +140,9 @@ export function ProjectSlackSection({
                 loading={toggle.isPending}
                 disabled={busy}
                 data-testid="project-slack-toggle"
-                onClick={() =>
-                  toggle.mutate(
-                    data.state === "disabled" ||
-                      (data.state !== undefined && RETRY_STATES.has(data.state)),
-                  )
-                }
+                onClick={() => toggle.mutate(data.state === "disabled" || retry)}
               >
-                {data.state === "disabled"
-                  ? "Resume"
-                  : data.state !== undefined && RETRY_STATES.has(data.state)
-                    ? "Retry"
-                    : "Pause"}
+                {data.state === "disabled" ? "Resume" : retry ? "Retry" : "Pause"}
               </Button>
               <Button
                 type="button"
@@ -169,7 +160,9 @@ export function ProjectSlackSection({
         </div>
       )}
       {link.isSuccess && !data?.linked && !canManage && (
-        <p className="text-muted-foreground text-sm">Not linked to a Slack channel.</p>
+        <p className="text-muted-foreground text-sm">
+          Not linked to a Slack channel. The project owner or a product approver can link one.
+        </p>
       )}
       {canManage && (
         <form onSubmit={onSubmit} className="flex flex-col gap-2" data-testid="project-slack-form">
@@ -187,26 +180,15 @@ export function ProjectSlackSection({
             aria-label="Slack channel name"
             data-testid="project-slack-channel-name"
           />
-          <Input
-            value={automationUrl}
-            onChange={(event) => setAutomationUrl(event.target.value)}
-            placeholder={
-              savedAutomationUrl
-                ? `Automation API URL: ${savedAutomationUrl}`
-                : "Automation API URL, e.g. https://<workspace>/api/2.0/omnigent"
-            }
-            aria-label="Automation API URL"
-            data-testid="project-slack-automation-url"
-          />
           <Button
             type="submit"
             size="sm"
             className="self-start"
             loading={save.isPending}
-            disabled={busy || !canSave}
+            disabled={busy || channelLink.trim() === ""}
             data-testid="project-slack-save"
           >
-            {!data?.linked ? "Link channel" : channelLink.trim() ? "Change channel" : "Save"}
+            {data?.linked ? "Change channel" : "Link channel"}
           </Button>
         </form>
       )}

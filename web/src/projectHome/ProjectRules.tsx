@@ -10,7 +10,6 @@ import { useViewerId } from "@/hooks/useViewerId";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { ProjectSettingsDialog } from "@/shell/ProjectSettingsDialog";
-import { ProjectSlackSection } from "@/shell/ProjectSlackSection";
 import {
   ProjectBoardReadersSection,
   ProjectProductApproversSection,
@@ -56,13 +55,12 @@ const SIGN_OFFS: { label: string; name: string; when: string; who: string }[] = 
 ];
 
 /** Page sections, in reading order; ids double as in-page anchors. */
-type SectionKey = "mandate" | "stages" | "approvals" | "people" | "slack" | "advanced";
+type SectionKey = "mandate" | "stages" | "approvals" | "people" | "advanced";
 const SECTION_LABELS: Record<SectionKey, string> = {
   mandate: "Mandate",
   stages: "Stages",
   approvals: "Who approves what",
   people: "People",
-  slack: "Slack",
   advanced: "Advanced",
 };
 const sectionAnchor = (key: SectionKey) => `project-rules-section-${key}`;
@@ -370,7 +368,6 @@ export function ProjectRules({ projectName }: { projectName: string }) {
     ...(stagesEnabled ? (["stages"] as const) : []),
     "approvals",
     "people",
-    "slack",
     "advanced",
   ];
   return (
@@ -392,9 +389,6 @@ export function ProjectRules({ projectName }: { projectName: string }) {
           <RulesSection title="People" section="people" testId="project-rules-people">
             <ProjectSharingSection projectId={projectId} />
             <ProjectBoardReadersSection projectId={projectId} />
-          </RulesSection>
-          <RulesSection title="Slack" section="slack" testId="project-rules-slack">
-            <ProjectSlackSection projectId={projectId} embedded />
           </RulesSection>
           <AdvancedRules projectName={projectName} projectId={projectId} />
         </div>

@@ -150,7 +150,9 @@ def request_base_url(request: Request) -> str:
     return f"{proto or request.url.scheme}://{host}"
 
 
-def binding_json(binding: SlackBinding | None, *, can_manage: bool) -> dict[str, Any]:
+def binding_json(
+    binding: SlackBinding | None, *, can_manage: bool, automation_link: str | None = None
+) -> dict[str, Any]:
     """The link as Project settings shows it; never any credential."""
     if binding is None:
         return {"object": "project.slack", "linked": False, "can_manage": can_manage}
@@ -165,6 +167,7 @@ def binding_json(binding: SlackBinding | None, *, can_manage: bool) -> dict[str,
         "state": binding.state,
         "destination": binding.destination,
         "automation_id": binding.automation_id,
+        "automation_link": automation_link,
         "last_error": binding.last_error,
         "owner_user_id": binding.owner_user_id,
         "updated_by_user_id": binding.updated_by_user_id,
@@ -212,12 +215,17 @@ def create_project_slack_router(
     def provisioner(request: Request) -> Any:
         return getattr(request.app.state, "slack_provisioner", None)
 
+    def view(request: Request, binding: SlackBinding | None, *, can_manage: bool) -> dict:
+        active = provisioner(request)
+        link = active.config.automation_link(binding) if active and binding else None
+        return binding_json(binding, can_manage=can_manage, automation_link=link)
+
     @router.get("")
     async def get_project_slack(request: Request, project_id: str) -> dict[str, Any]:
         """The project's Slack channel link, its state, and whether the caller may change it."""
         _, project, can_manage = await load(request, project_id)
         binding = await asyncio.to_thread(slack_store.get, project.id)
-        body = binding_json(binding, can_manage=can_manage)
+        body = view(request, binding, can_manage=can_manage)
         active = provisioner(request)
         if binding is not None and can_manage and active is not None:
             body["overlaps"] = await active.overlaps(project, binding)
@@ -281,7 +289,7 @@ def create_project_slack_router(
             ) from None
         if active is not None:
             binding = await active.provision(project, binding, actor_user_id=actor)
-        return binding_json(binding, can_manage=True)
+        return view(request, binding, can_manage=True)
 
     @router.post("/disable")
     async def disable_project_slack(request: Request, project_id: str) -> dict[str, Any]:
@@ -297,7 +305,7 @@ def create_project_slack_router(
             binding = await asyncio.to_thread(
                 slack_store.set_state, project.id, "disabled", actor_user_id=actor
             )
-        return binding_json(binding, can_manage=True)
+        return view(request, binding, can_manage=True)
 
     @router.post("/enable")
     async def enable_project_slack(request: Request, project_id: str) -> dict[str, Any]:
@@ -313,7 +321,7 @@ def create_project_slack_router(
             binding = await asyncio.to_thread(
                 slack_store.set_state, project.id, "claimed", actor_user_id=actor, action="enabled"
             )
-        return binding_json(binding, can_manage=True)
+        return view(request, binding, can_manage=True)
 
     @router.delete("")
     async def unlink_project_slack(request: Request, project_id: str) -> dict[str, Any]:

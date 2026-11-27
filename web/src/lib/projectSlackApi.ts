@@ -15,6 +15,8 @@ export interface ProjectSlackLink {
   state?: ProjectSlackState;
   destination?: Record<string, string>;
   automation_id?: string | null;
+  /** The watcher's page on the automation service, once it exists. */
+  automation_link?: string | null;
   last_error?: string | null;
   owner_user_id?: string;
   updated_by_user_id?: string;
