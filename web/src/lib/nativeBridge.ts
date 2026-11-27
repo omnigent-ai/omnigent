@@ -495,6 +495,8 @@ export interface DesktopCommandState {
   commands: DesktopCommand[];
   sessionPinned: boolean;
   sessionArchived: boolean;
+  /** An open pick list has the keyboard and steps on Ctrl-N / Ctrl-P, which the menu then leaves. */
+  pickListFocused?: boolean;
 }
 
 /** One importable site tree and how many cookies a profile holds for it. */

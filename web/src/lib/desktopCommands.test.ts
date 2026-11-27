@@ -8,6 +8,7 @@ import {
   useAvailableDesktopCommands,
   useDesktopCommand,
 } from "./desktopCommands";
+import { PICK_LIST_INPUT_ATTRIBUTE } from "./listNavigationKeys";
 import type { DesktopCommandState } from "./nativeBridge";
 
 type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
@@ -166,6 +167,7 @@ describe("useDesktopCommand", () => {
       commands: ["archive-session", "close", "new-browser-tab", "toggle-pin-session"],
       sessionPinned: false,
       sessionArchived: false,
+      pickListFocused: false,
     });
 
     rerender({ pinned: true, browser: false });
@@ -174,6 +176,7 @@ describe("useDesktopCommand", () => {
       commands: ["archive-session", "close", "toggle-pin-session"],
       sessionPinned: true,
       sessionArchived: false,
+      pickListFocused: false,
     });
 
     unmount();
@@ -182,8 +185,34 @@ describe("useDesktopCommand", () => {
       commands: [],
       sessionPinned: false,
       sessionArchived: false,
+      pickListFocused: false,
     });
     expect(setDesktopCommandState).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports while an open pick list has the keyboard, so the menu leaves it Ctrl-N", async () => {
+    renderHook(() => useDesktopCommand("close", () => {}));
+    const field = document.createElement("input");
+    const other = document.createElement("input");
+    document.body.append(field, other);
+    const lastPickListFocused = async () => {
+      // A focus event or the list's attribute queues a report on the next microtask.
+      await flushReports();
+      await flushReports();
+      return setDesktopCommandState.mock.lastCall?.[0].pickListFocused;
+    };
+    expect(await lastPickListFocused()).toBe(false);
+
+    field.focus();
+    field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
+    expect(await lastPickListFocused()).toBe(true);
+    // The list closing drops its attribute, with the field still focused.
+    field.removeAttribute(PICK_LIST_INPUT_ATTRIBUTE);
+    expect(await lastPickListFocused()).toBe(false);
+    field.setAttribute(PICK_LIST_INPUT_ATTRIBUTE, "");
+    expect(await lastPickListFocused()).toBe(true);
+    other.focus();
+    expect(await lastPickListFocused()).toBe(false);
   });
 
   it("coalesces a burst of registrations into one report", async () => {

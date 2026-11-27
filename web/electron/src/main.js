@@ -168,6 +168,7 @@ const {
 } = require("./floating_composer_support");
 const {
   registerDesktopCommandStateReset,
+  registerPickListMenuYield,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
 const {
@@ -3322,6 +3323,10 @@ function createWindow(targetUrl, opts = {}) {
     state.desktopCommands = null;
     if (BrowserWindow.getFocusedWindow() === win) buildMenu();
   });
+  registerPickListMenuYield(
+    win.webContents,
+    () => windows.get(win)?.desktopCommands?.pickListFocused === true,
+  );
   // macOS trackpad swipes step back and forward, like a browser.
   win.on("swipe", (_event, direction) => {
     if (direction === "left") goInHistory(win, "go-back");

@@ -197,13 +197,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Report which menu commands this page can act on right now, plus the open
    * session's pin/archive state, so the native menu can enable and label them.
    * Fire-and-forget.
-   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean}} state
+   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean, pickListFocused?: boolean}} state
    */
   setDesktopCommandState: (state) => {
     ipcRenderer.send("omnigent:set-desktop-command-state", {
       commands: Array.isArray(state?.commands) ? state.commands.map(String) : [],
       sessionPinned: state?.sessionPinned === true,
       sessionArchived: state?.sessionArchived === true,
+      pickListFocused: state?.pickListFocused === true,
     });
   },
   /**
