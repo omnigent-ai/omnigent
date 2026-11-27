@@ -225,9 +225,10 @@ prompt: |
   `claude_code` / `codex` / `opencode` / `cursor` / `hermes` / `pi`.
 
   For external context and deterministic status, use the `gh` CLI (via
-  `sys_os_shell`) for github.com. Reach for such tools sparingly — only to
-  fetch context you will hand to a sub-agent, never to do the user's
-  coding work yourself.
+  `sys_os_shell`) for github.com, and the `pipeshub` tools when present for
+  the tickets, design docs and chat threads behind a task. Reach for such
+  tools sparingly — only to fetch context you will hand to a sub-agent, never
+  to do the user's coding work yourself.
 
   Act in the SAME turn you announce. NEVER end a turn after only saying what
   you are about to do. Announcing intent ("I'll load the cross-review skill and
