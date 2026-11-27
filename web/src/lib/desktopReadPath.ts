@@ -58,13 +58,15 @@ import {
 } from "@/lib/macReadScope";
 import type { MacNamedReader } from "@/lib/macNamedReads";
 import {
-  type CodeHostProvenance,
   desktopCodeHostQuery,
   desktopMacAccounts,
-  getDesktopFeatures,
   hasCodeHostAccountsBridge,
   hasCodeHostBridge,
   hasNamedCodeHostWriteBridge,
+} from "@/lib/macBridge";
+import {
+  type CodeHostProvenance,
+  getDesktopFeatures,
   onDesktopMacAccountsChanged,
   type DesktopCodeHost,
   type MacAccountChoice,

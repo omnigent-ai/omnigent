@@ -9,12 +9,10 @@ import {
 } from "@/lib/githubCooldown";
 import { githubReadBudgets } from "@/lib/githubReadBudget";
 import { randomUUID } from "@/lib/randomUUID";
+import { desktopCodeHostQuery, hasCodeHostBridge, hasCodeHostReadCancel } from "@/lib/macBridge";
 import {
   CODE_HOST_READ_CANCELLED,
-  desktopCodeHostQuery,
   getDesktopFeatures,
-  hasCodeHostBridge,
-  hasCodeHostReadCancel,
   type CodeHostQueryRequest,
   type CodeHostReadPriority,
   type GitHubFastTrackResult,
