@@ -774,9 +774,19 @@ class WorkspaceReader:
         )
 
     def github_review_threads(
-        self, session_id: str, pr_url: str, after: str, head_sha: str, base_sha: str
+        self,
+        session_id: str,
+        pr_url: str,
+        after: str,
+        head_sha: str,
+        base_sha: str,
+        *,
+        account_rights: bool = False,
     ) -> _WorkspacePayload:
-        """Published review conversations, optionally paginated at a requested revision."""
+        """Published review conversations, optionally paginated at a requested revision.
+
+        :param account_rights: Whether the server asked for the host account's rights.
+        """
         return cast(
             "_WorkspacePayload",
             pr_resource.pr_review_threads(
@@ -786,13 +796,20 @@ class WorkspaceReader:
                 after=after,
                 head_sha=head_sha,
                 base_sha=base_sha,
+                account_rights=account_rights,
             ),
         )
 
     def github_review_thread_comments(
-        self, session_id: str, pr_url: str, thread_id: str, after: str
+        self,
+        session_id: str,
+        pr_url: str,
+        thread_id: str,
+        after: str,
+        *,
+        account_rights: bool = False,
     ) -> _WorkspacePayload:
-        """Additional replies in a selected-PR review conversation."""
+        """Additional replies in a selected-PR review conversation; see above."""
         return cast(
             "_WorkspacePayload",
             pr_resource.pr_review_thread_comments(
@@ -801,6 +818,7 @@ class WorkspaceReader:
                 pr_url=pr_url,
                 thread_id=thread_id,
                 after=after,
+                account_rights=account_rights,
             ),
         )
 

@@ -18,6 +18,7 @@ from omnigent.server.feature_flags import (
     FeatureFlags,
     resolve_feature_flags,
 )
+from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE
 from omnigent.server.sharing_settings import write_peer_session_messaging_override
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
@@ -2225,6 +2226,82 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         await auth_app.state.startup_inputs.shutdown()
 
 
+@pytest.mark.parametrize("placement", ["managed", "child"])
+async def test_cancelled_request_still_finishes_an_independent_create(
+    auth_client, auth_app, peers, db_uri, monkeypatch, placement
+):
+    """A create cancelled once its session is stored still saves the first task and launches.
+
+    A runner reconciles and retries its own timed-out child create, so that one stops instead.
+    """
+    import asyncio
+
+    from omnigent.server.routes.sessions import routes_core
+    from tests._helpers.polling import poll_until_async
+
+    source, _, _ = peers
+    launched = asyncio.Event()
+    release_launch = asyncio.Event()
+
+    async def launch(**kwargs):
+        launched.set()
+        await release_launch.wait()
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    startup = auth_app.state.startup_inputs
+    save = startup.enqueue
+    saving, interrupted = [], []
+    release_save = asyncio.Event()
+
+    async def held_save(session_id, *args, **kwargs):
+        saving.append(session_id)
+        try:
+            await release_save.wait()
+        except asyncio.CancelledError:
+            interrupted.append(session_id)
+            raise
+        return await save(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(startup, "enqueue", held_save)
+    if placement == "managed":
+        create = _launch_worker(auth_client, source["agent_id"], source["id"], message="Go")
+    else:
+        first = {"role": "user", "content": [{"type": "input_text", "text": "Go"}]}
+        create = auth_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": source["agent_id"],
+                "parent_session_id": source["id"],
+                "host_type": "managed",
+                "initial_input": {"type": "message", "data": first},
+            },
+        )
+    request = asyncio.create_task(create)
+    try:
+        await poll_until_async(lambda: saving, timeout_s=5)
+        # The client gives up while the stored session's first task is being saved.
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        [session_id] = saving
+        store = SqlAlchemyConversationStore(db_uri)
+        if placement == "child":
+            assert interrupted == [session_id]
+            assert store.list_pending_inputs(session_id) == []
+            return
+        assert interrupted == []
+        release_save.set()
+        await asyncio.wait_for(launched.wait(), timeout=2)
+        pending = store.list_pending_inputs(session_id)
+        assert [item.data.content[0]["text"] for item in pending] == [
+            f"[Message from session {source['id']}]\nGo"
+        ]
+    finally:
+        release_save.set()
+        release_launch.set()
+        await auth_app.state.startup_inputs.shutdown()
+
+
 class _ListLabelSelection:
     """A deployment that records the whole selection in one JSON label."""
 
@@ -3015,13 +3092,16 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
             params={"limit": 2, "agent_id": sibling.agent_id, "expand_families": True},
         )
     ).json()
-    assert filtered["last_id"] == hidden.id
+    # Unbundled, the target shares the agent, so it takes the dropped side chat's slot;
+    # otherwise the side chat stays the cursor. Either way family context is appended.
+    last_listed = sibling if bundled else store.get_conversation(target["id"])
+    assert filtered["last_id"] == (hidden.id if bundled else last_listed.id)
     assert filtered["page_boundary"] == {
-        "id": sibling_id,
-        "created_at": sibling.created_at,
-        "updated_at": sibling.updated_at,
+        "id": last_listed.id,
+        "created_at": last_listed.created_at,
+        "updated_at": last_listed.updated_at,
     }
-    assert {row["id"] for row in filtered["data"]} == {source["id"], sibling_id}
+    assert {row["id"] for row in filtered["data"]} == {source["id"], sibling_id, last_listed.id}
     pinned = await auth_client.patch(
         f"/v1/sessions/{sibling_id}", json={"labels": {"omnigent.pinned": "1"}}
     )
@@ -3481,6 +3561,7 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
         "disabled",
         "shared_source",
         "read_only_target",
+        "edit_only_target",
         "missing_source",
         "legacy_disabled",
     ],
@@ -3505,9 +3586,10 @@ async def test_scripted_pr_link_checks_source_and_target(
     permissions.ensure_user("bob")
     if scenario == "shared_source":
         permissions.grant("bob", source["id"], LEVEL_EDIT)
-    if scenario == "read_only_target":
+    if scenario in ("read_only_target", "edit_only_target"):
         target = await _create_session_as(auth_client, "", "bob")
-        permissions.grant("alice", target["id"], LEVEL_READ)
+        level = LEVEL_READ if scenario == "read_only_target" else LEVEL_EDIT
+        permissions.grant("alice", target["id"], level)
     host = uuid4().hex
     _register_online_host(auth_app, host, "alice")
     SqlAlchemyConversationStore(db_uri).set_host_id(target["id"], host, workspace="/repo")
@@ -3537,6 +3619,9 @@ async def test_scripted_pr_link_checks_source_and_target(
     )
     if scenario != "allowed":
         assert response.status_code == 403, response.text
+        if scenario == "edit_only_target":
+            # A valid source the caller owns, so only the target's owner check refuses it.
+            assert response.json()["error"]["message"] == OWNER_ONLY_CHANGES_MESSAGE
         assert not captured
         return
     assert response.status_code == 200, response.text

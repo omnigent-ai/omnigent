@@ -43,7 +43,9 @@ def _consumed_receipts(published: list[tuple[str, dict[str, Any]]]) -> list[str 
 
 
 @pytest.mark.asyncio
-async def test_claude_native_mirrored_shell_command_drains_its_queued_entry() -> None:
+async def test_claude_native_mirrored_shell_command_drains_its_queued_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A web ``!cmd`` mirrored as terminal_command input clears its own queued entry.
 
     Claude Code runs the message as a shell command and records it as
@@ -60,18 +62,74 @@ async def test_claude_native_mirrored_shell_command_drains_its_queued_entry() ->
     conv = store.get_conversation(sid)
     assert conv is not None
     older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
-    pending_inputs.record(sid, [{"type": "input_text", "text": "!ls -la"}])
+    command = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "!ls -la"}], stable_id="a" * 32
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda sid, event: published.append((sid, event))
+    )
 
     try:
         await _persist_external_conversation_item(
             sid,
             conv,
-            _shell_mirror("input", "claude:ls:0", input="ls -la"),
+            _shell_mirror(
+                "input",
+                "claude:ls:0",
+                input="ls -la",
+                submission={"pending_id": "forged", "stable_id": "b" * 32},
+            ),
             store,  # type: ignore[arg-type]
         )
 
         assert [item.type for item in store.appended_items] == ["terminal_command"]
+        expected = {"pending_id": command, "stable_id": "a" * 32}
+        assert store.appended_items[0].to_api_dict()["submission"] == expected
+        assert published[0][1]["item"]["submission"] == expected
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_append", [False, True])
+async def test_forwarded_shell_retains_submission_after_pending_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_append: bool,
+) -> None:
+    """A shell queued in the CLI can outlive the pending bubble's cleanup timeout."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    now = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    store = _FailOnceStore() if retry_append else _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    original = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "!ls"}], stable_id="a" * 32
+    )
+    pending_inputs.mark_delivery_stage(sid, original, "forward_accepted")
+    try:
+        now[0] += pending_inputs._TTL_S + 1
+        # A reconnect can sweep stale entries before the delayed mirror arrives.
+        pending_inputs.snapshot_for(sid)
+        newer = pending_inputs.record(
+            sid, [{"type": "input_text", "text": "!ls"}], stable_id="b" * 32
+        )
+        event = _shell_mirror("input", "claude:delayed-ls:0", input="ls")
+        if retry_append:
+            with pytest.raises(RuntimeError, match="database unavailable"):
+                await _persist_external_conversation_item(sid, conv, event, store)  # type: ignore[arg-type]
+        await _persist_external_conversation_item(sid, conv, event, store)  # type: ignore[arg-type]
+        assert store.appended_items[0].to_api_dict()["submission"] == {
+            "pending_id": original,
+            "stable_id": "a" * 32,
+        }
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [newer]
     finally:
         pending_inputs.reset_for_tests()
 
@@ -153,11 +211,18 @@ async def test_claude_native_shell_command_output_drains_nothing() -> None:
         await _persist_external_conversation_item(
             sid,
             conv,
-            _shell_mirror("output", "claude:ls:1", stdout="a.txt", stderr=""),
+            _shell_mirror(
+                "output",
+                "claude:ls:1",
+                stdout="a.txt",
+                stderr="",
+                submission={"pending_id": command},
+            ),
             store,  # type: ignore[arg-type]
         )
 
         assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert "submission" not in store.appended_items[0].to_api_dict()
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [command]
     finally:
         pending_inputs.reset_for_tests()
@@ -180,11 +245,12 @@ async def test_claude_native_shell_command_typed_in_the_terminal_leaves_the_queu
         await _persist_external_conversation_item(
             sid,
             conv,
-            _shell_mirror("input", "claude:pwd:0", input="pwd"),
+            _shell_mirror("input", "claude:pwd:0", input="pwd", submission="untrusted"),
             store,  # type: ignore[arg-type]
         )
 
         assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert store.appended_items[0].to_api_dict()["submission"] == {}
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [queued]
     finally:
         pending_inputs.reset_for_tests()
@@ -306,7 +372,7 @@ async def test_claude_native_retried_shell_command_mirror_leaves_the_queue_alone
     sid = "64a784c3aa907d1774f44313546947c6"
     conv = store.get_conversation(sid)
     assert conv is not None
-    pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
+    original = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
     event = _shell_mirror("input", "claude:ls:0", input="ls")
 
     try:
@@ -327,6 +393,7 @@ async def test_claude_native_retried_shell_command_mirror_leaves_the_queue_alone
             store,  # type: ignore[arg-type]
         )
 
+        assert store.appended_items[0].to_api_dict()["submission"]["pending_id"] == original
         assert retried_id == first_id
         assert [item.type for item in store.appended_items] == ["terminal_command"]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [again]

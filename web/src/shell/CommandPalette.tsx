@@ -3,10 +3,13 @@
 // cmdk filtering is off and the static actions are filtered here.
 
 import type React from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { readlineStepAsArrow } from "@/lib/listNavigationKeys";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { closingDialogFocus } from "@/lib/automaticFocus";
+import { useDialogOpeningKey } from "@/lib/dialogOpenings";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
@@ -80,6 +83,9 @@ function groupByHeading(
   return [...groups];
 }
 
+/** The palette's dialog, which focus leaves for its opener as it closes. */
+const COMMAND_PALETTE_SELECTOR = "[data-command-palette]";
+
 /** Keys that move cmdk's selection; see `userMovedSelection`. */
 const SELECTION_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
 
@@ -127,6 +133,34 @@ export function CommandPalette({
     [actions, query, sessionsOnly],
   );
   const featureCommands = useFeaturePaletteCommands(open && !sessionsOnly);
+  // Opened from a shortcut, the palette has no trigger for Radix to return focus to.
+  const openerRef = useRef<HTMLElement | null>(null);
+  // Each opening mounts fresh content, so reopening during the exit animation focuses the
+  // search field again, even after a click on a row left focus on the list.
+  const openingKey = useDialogOpeningKey(open);
+  const contentRef = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!open) return;
+    const active = document.activeElement;
+    // Reopened before the last close finished, whose content the remount took focus from:
+    // keep that opening's opener.
+    if ((active === null || active === document.body) && openerRef.current !== null) return;
+    openerRef.current =
+      active instanceof HTMLElement && !active.closest(COMMAND_PALETTE_SELECTOR) ? active : null;
+  }, [open]);
+  const returnFocus = (event: Event) => {
+    // Removed by a reopening during its exit: focus belongs to the new content.
+    if (event.currentTarget !== contentRef.current) {
+      event.preventDefault();
+      return;
+    }
+    const { movedOn, restore } = closingDialogFocus(openerRef.current, COMMAND_PALETTE_SELECTOR);
+    openerRef.current = null;
+    event.preventDefault();
+    // A command that moved focus as the palette closed keeps it; one that moves it later runs next.
+    if (!movedOn) restore?.focus();
+    featureCommands.onCloseAutoFocus();
+  };
   const filteredFeatureGroups = useMemo(
     () => groupByHeading(filterAppCommands(featureCommands.rows, query)),
     [featureCommands.rows, query],
@@ -252,7 +286,12 @@ export function CommandPalette({
             : undefined
         }
         showCloseButton={false}
-        onCloseAutoFocus={featureCommands.onCloseAutoFocus}
+        key={openingKey}
+        onOpenAutoFocus={(event) => {
+          contentRef.current = event.currentTarget as HTMLElement;
+        }}
+        onCloseAutoFocus={returnFocus}
+        data-command-palette=""
       >
         <DialogTitle className="sr-only">{paletteLabel}</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions
@@ -266,6 +305,8 @@ export function CommandPalette({
           value={selectedValue}
           onValueChange={setSelectedValue}
           onKeyDown={(event) => {
+            // Ctrl-N/Ctrl-P step as the arrows do, which vimBindings would also give Ctrl+J/K.
+            if (readlineStepAsArrow(event)) return;
             if (SELECTION_KEYS.has(event.key)) userMovedSelection.current = true;
           }}
         >

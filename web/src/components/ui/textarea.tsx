@@ -3,17 +3,16 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 
-function Textarea({
-  className,
-  componentId,
-  onChange,
-  ...props
-}: React.ComponentProps<"textarea"> & {
-  // Opt-in analytics id. When set, a value-change is reported to the host sink
-  // (see `lib/analytics.ts`). The value itself is redacted by default (textarea
-  // text is treated as PII); only that the field changed is sent.
-  componentId?: string;
-}) {
+// Forwards its ref, so callers can place the caret or insert text, as Markdown editing does.
+const Textarea = React.forwardRef<
+  HTMLTextAreaElement,
+  React.ComponentPropsWithoutRef<"textarea"> & {
+    // Opt-in analytics id. When set, a value-change is reported to the host sink
+    // (see `lib/analytics.ts`). The value itself is redacted by default (textarea
+    // text is treated as PII); only that the field changed is sent.
+    componentId?: string;
+  }
+>(function Textarea({ className, componentId, onChange, ...props }, ref) {
   const { trackValueChange } = useOmnigentAnalytics();
   const handleChange = componentId
     ? (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -23,6 +22,7 @@ function Textarea({
     : onChange;
   return (
     <textarea
+      ref={ref}
       data-slot="textarea"
       data-component-id={componentId}
       onChange={handleChange}
@@ -33,6 +33,6 @@ function Textarea({
       {...props}
     />
   );
-}
+});
 
 export { Textarea };

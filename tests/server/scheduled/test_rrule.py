@@ -107,8 +107,7 @@ def test_default_timezone_is_utc_semantics() -> None:
 
 
 def test_validate_accepts_hourly_cadence() -> None:
-    # FREQ=HOURLY = exactly 3600s. The floor is a strict `<`, so a gap equal to
-    # the floor passes: `3600 < 3600` is False.
+    # FREQ=HOURLY = 3600s, above the 600s floor.
     trig = validate_rrule("FREQ=HOURLY")
     assert trig.rule == "FREQ=HOURLY"
     # The trigger can compute a next fire.
@@ -126,15 +125,9 @@ def test_validate_accepts_weekly_weekdays() -> None:
 
 
 def test_validate_rejects_every_minute() -> None:
-    # FREQ=MINUTELY = 60s < 3600s floor.
+    # FREQ=MINUTELY = 60s < 600s floor.
     with pytest.raises(RRuleValidationError):
         validate_rrule("FREQ=MINUTELY")
-
-
-def test_validate_rejects_half_hour_cadence() -> None:
-    # FREQ=MINUTELY;INTERVAL=30 = 1800s < 3600s floor.
-    with pytest.raises(RRuleValidationError):
-        validate_rrule("FREQ=MINUTELY;INTERVAL=30")
 
 
 def test_validate_rejects_secondly_cadence() -> None:
@@ -215,7 +208,7 @@ def test_validate_floor_is_deterministic() -> None:
 
 
 def test_min_interval_constant() -> None:
-    assert MIN_INTERVAL_SECONDS == 3600
+    assert MIN_INTERVAL_SECONDS == 600
 
 
 @pytest.mark.parametrize(
@@ -472,21 +465,14 @@ def test_legacy_search_horizon_remains_midnight_based() -> None:
     assert get_next_fire_time(rule, after, UTC, anchor=after) == _dt(2034, 1, 1, 1)
 
 
-@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox", None])
-@pytest.mark.parametrize("session_mode", ["new", "continue"])
 @pytest.mark.parametrize("minutes", [1, 5, 9, 10, 11, 15, 30, 59, 60])
-def test_minimum_interval_depends_on_execution(execution_target, session_mode, minutes):
-    minimum = 10 if execution_target == "connected_host" or session_mode == "continue" else 60
-    options = {
-        "execution_target": execution_target,
-        "session_mode": session_mode,
-    }
+def test_minimum_interval_is_ten_minutes(minutes):
     rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
-    if minutes < minimum:
-        with pytest.raises(RRuleValidationError, match=f"Minimum interval is {minimum} minutes"):
-            validate_rrule(rule, **options)
+    if minutes < 10:
+        with pytest.raises(RRuleValidationError, match="Minimum interval is 10 minutes"):
+            validate_rrule(rule)
     else:
-        assert validate_rrule(rule, **options).rule == rule
+        assert validate_rrule(rule).rule == rule
 
 
 @pytest.mark.parametrize(
@@ -498,9 +484,9 @@ def test_minimum_interval_depends_on_execution(execution_target, session_mode, m
         ("FREQ=SECONDLY;INTERVAL=599", False),
     ],
 )
-def test_continued_session_checks_actual_gaps(rule, allowed):
+def test_minimum_interval_checks_actual_gaps(rule, allowed):
     if allowed:
-        assert validate_rrule(rule, session_mode="continue").rule == rule
+        assert validate_rrule(rule).rule == rule
     else:
         with pytest.raises(RRuleValidationError, match="Minimum interval is 10 minutes"):
-            validate_rrule(rule, session_mode="continue")
+            validate_rrule(rule)

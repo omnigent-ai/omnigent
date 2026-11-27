@@ -38,6 +38,11 @@ import {
   holdsItsDividers,
 } from "./paneDividerCorners";
 import { PaneSplitDivider } from "./PaneSplitDivider";
+import {
+  type LayoutDragEnd,
+  type PointerDragEnd,
+  reportDividerDragEnd,
+} from "./paneDividerDragEnd";
 import { TerminalSplitCorner } from "./TerminalSplitCorner";
 import { TerminalZoomPill } from "./TerminalZoomPill";
 import { PANE_ROW_PX } from "./paneStrip/paneGeometry";
@@ -45,6 +50,7 @@ import { PaneTitleStrip } from "./paneStrip/PaneTitleStrip";
 import { usePaneMoveDrag } from "./paneStrip/usePaneMoveDrag";
 import { type PaneStripSource, usePaneStrips } from "./paneStrip/usePaneStrips";
 import { usePendingAppPaneDrop } from "./appPanes";
+import { PaneDropPreview } from "./PaneDropPreview";
 
 /** A row along the window's top, as tall as index.css makes it: the Mac title bar there. */
 export const WINDOW_TOP_ROW_HEIGHT = `var(--pane-window-top-row, ${PANE_ROW_PX}px)`;
@@ -97,11 +103,23 @@ export interface SplitPanesLayoutProps {
    * background; the focused card's edge brightens instead of its row carrying an accent line.
    */
   cards?: boolean;
+  /**
+   * Whether a workspace tab dragged over the session's panes lands here, so this view marks itself
+   * for that drop and shows where the tab would open. Floating panes leave it to the main split.
+   */
+  tabDropTarget?: boolean;
+  /**
+   * Whether this view draws the tab drop's preview itself; off while it waits hidden under a chat
+   * shown alone, which draws the preview over itself instead.
+   */
+  tabDropPreview?: boolean;
   className?: string;
 }
 
 const NO_PANES: readonly string[] = [];
 
+/** The handle a drag holds, as its log line names it. */
+const handleOf = (dragged: DividerDragSession) => (dragged.corner ? "corner" : "divider");
 // A pane's content is keyed in both its shown and hidden shapes, so the strip row and pill around
 // it in one shape never shift it to another position and remount it.
 const PANE_CONTENT_KEY = "pane-content";
@@ -129,6 +147,8 @@ export function SplitPanesLayout({
   refocusPane,
   paneDragOutside,
   cards = false,
+  tabDropTarget = false,
+  tabDropPreview = true,
   className,
 }: SplitPanesLayoutProps) {
   // The pointer drag on a divider or corner, from press to release: its sizes show over the latest
@@ -149,9 +169,24 @@ export function SplitPanesLayout({
     terminalLayoutKeys(split.layout).includes(zoomedKey);
   const liveSession =
     session && split && !maximized && holdsItsDividers(session, split.layout) ? session : null;
+  // Why the layout ended a drag it no longer shows, named in the log a snapped-back report holds.
+  const layoutEnded: LayoutDragEnd | null =
+    session && !liveSession ? layoutDragEnd(split !== undefined, maximized) : null;
   useEffect(() => {
-    if (session && !liveSession) setSession(null);
-  }, [session, liveSession]);
+    if (!session || layoutEnded === null) return;
+    reportDividerDragEnd(conversationId, handleOf(session), layoutEnded);
+    setSession(null);
+  }, [conversationId, session, layoutEnded]);
+  // The panes leaving the screen mid-drag, as when the list of terminals empties, end it too.
+  const liveOnUnmount = useRef({ conversationId, liveSession });
+  liveOnUnmount.current = { conversationId, liveSession };
+  useEffect(
+    () => () => {
+      const { conversationId: id, liveSession: live } = liveOnUnmount.current;
+      if (live) reportDividerDragEnd(id, handleOf(live), "panes-unmounted");
+    },
+    [],
+  );
   // A divider stops where a pane it shrinks would fall below the minimum.
   const keeps = (before: TerminalLayout, after: TerminalLayout) => {
     const rule = sizing ? sizing() : domCellSizing(panesRef.current);
@@ -176,7 +211,8 @@ export function SplitPanesLayout({
     setSession(null);
     if (resizes && liveSession) onResize(resizes);
   };
-  const abortDrag = () => {
+  const abortDrag = (reason: PointerDragEnd) => {
+    if (liveSession) reportDividerDragEnd(conversationId, handleOf(liveSession), reason);
     latestResizes.current = null;
     setSession(null);
   };
@@ -242,13 +278,13 @@ export function SplitPanesLayout({
   });
 
   // A sidebar tab dragged over the panes shows where it would open, as a dragged pane does.
-  const tabDrop = usePendingAppPaneDrop(conversationId);
+  const tabDrop = usePendingAppPaneDrop(tabDropTarget && tabDropPreview ? conversationId : null);
   const shownDrop = paneDrag.drop ?? tabDrop;
 
   return (
     <div
       ref={panesRef}
-      data-split-panes={conversationId}
+      data-split-panes={tabDropTarget ? conversationId : undefined}
       className={cn("relative min-h-0 flex-1", className)}
     >
       {paneKeys.map((key) => {
@@ -423,34 +459,10 @@ export function SplitPanesLayout({
             onAbort={abortDrag}
           />
         ))}
-      {shownDrop ? (
-        // The half the dragged pane or tab would take, edged in the accent on the side it meets.
-        <div
-          aria-hidden
-          data-pane-drop={`${shownDrop.targetKey}:${shownDrop.side}`}
-          className={cn(
-            "pointer-events-none absolute z-20 border-primary bg-primary/15",
-            DROP_EDGE[shownDrop.side],
-          )}
-          style={{
-            left: `${shownDrop.area.left}%`,
-            top: `${shownDrop.area.top}%`,
-            width: `${shownDrop.area.width}%`,
-            height: `${shownDrop.area.height}%`,
-          }}
-        />
-      ) : null}
+      {shownDrop ? <PaneDropPreview drop={shownDrop} /> : null}
     </div>
   );
 }
-
-/** The drop half's edge against the rest of its target, where the two panes will meet. */
-const DROP_EDGE: Record<TerminalPaneSide, string> = {
-  left: "border-r-2",
-  right: "border-l-2",
-  top: "border-b-2",
-  bottom: "border-t-2",
-};
 
 /**
  * When a pane may take keyboard focus on its own. A pane split off may take it once, as it
@@ -551,4 +563,11 @@ function ChatPaneBodyHost({
       style={{ top }}
     />
   );
+}
+
+/** Why the layout ends a held divider's drag: the split went, a pane is maximized, or the divider went. */
+function layoutDragEnd(splitShown: boolean, maximized: boolean): LayoutDragEnd {
+  if (!splitShown) return "split-hidden";
+  if (maximized) return "pane-maximized";
+  return "divider-gone";
 }

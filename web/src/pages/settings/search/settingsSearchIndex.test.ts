@@ -246,6 +246,14 @@ describe("availability", () => {
     expect(settingsSearchTargets([LINKS], SECTIONS, HIDDEN)).toEqual([]);
   });
 
+  it("offers the Shortcuts page's search field wherever the page shows", () => {
+    const shortcuts = [{ id: "shortcuts", label: "Keyboard shortcuts" }] as const;
+    const offered = (availability: SettingsAvailability) =>
+      settingsSearchTargets(SETTINGS_ENTRIES, shortcuts, availability).map((target) => target.key);
+    expect(offered(SHOWN)).toContain("shortcuts-search");
+    expect(offered(HIDDEN)).toContain("shortcuts-search");
+  });
+
   it("keeps a row without an availability rule, whatever is hidden", () => {
     expect(settingsSearchTargets([STEER], SECTIONS, HIDDEN).map((target) => target.key)).toEqual([
       "fixture.steer",

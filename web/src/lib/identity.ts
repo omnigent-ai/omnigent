@@ -354,6 +354,20 @@ function scheduledTaskHostId(url: string, init: RequestInit | undefined): string
 let currentIsAdmin = false;
 let identityResolved = false;
 let identityPromise: Promise<string | null> | null = null;
+
+/** Who the latest settled `/v1/me` probe says is signed in. */
+export type IdentityStatus =
+  | { kind: "unknown" }
+  | { kind: "signedIn"; userId: string | null }
+  | { kind: "signedOut" }
+  | { kind: "unreachable" };
+
+let identityStatus: IdentityStatus = { kind: "unknown" };
+
+/** The latest settled identity probe's answer, for state that belongs to one account. */
+export function getIdentityStatus(): IdentityStatus {
+  return identityStatus;
+}
 // A `/v1/me` that fails in transit says nothing about the viewer, so it is
 // retried rather than cached. Retries run only while `subscribeIdentity` has
 // listeners, so an unwatched probe never leaves a timer behind.
@@ -446,6 +460,7 @@ async function probeIdentity(): Promise<boolean> {
   try {
     const res = await hostFetch("/v1/me", undefined, { hostless: true });
     if (res.status === 401) {
+      identityStatus = { kind: "signedOut" };
       // OIDC / accounts mode: server requires authentication.
       // Redirect to the login URL provided in the response body —
       // unless we're already there (avoid an infinite reload loop
@@ -473,10 +488,18 @@ async function probeIdentity(): Promise<boolean> {
       };
       currentUserId = data.user_id;
       currentIsAdmin = data.is_admin ?? false;
+      identityStatus = { kind: "signedIn", userId: data.user_id };
       return true;
     }
-    return !isTransientIdentityStatus(res.status);
+    if (isTransientIdentityStatus(res.status)) {
+      identityStatus = { kind: "unreachable" };
+      return false;
+    }
+    // Another refusal, such as a server without this route: nobody is signed in.
+    identityStatus = { kind: "signedOut" };
+    return true;
   } catch {
+    identityStatus = { kind: "unreachable" };
     // Server unreachable, connection dropped, or the body was cut off.
     return false;
   }

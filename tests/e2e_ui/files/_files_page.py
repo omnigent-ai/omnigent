@@ -15,8 +15,9 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette
 from tests.e2e_ui.conftest import open_right_rail
-from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _set_flag
+from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _set_flag, _start_with_no_pinned_pages
 
 _DESKTOP = {"width": 1440, "height": 900}
 
@@ -75,9 +76,18 @@ def is_mac(page: Page) -> bool:
     return bool(page.evaluate("() => /Mac|iPhone|iPad/.test(navigator.platform)"))
 
 
-def open_workspace(page: Page, base_url: str, session_id: str) -> Locator:
-    """Open the session with ``workspace_sidebar_v2`` on; returns its Workspace sidebar."""
-    _set_flag(page, True)
+def open_workspace(
+    page: Page, base_url: str, session_id: str, *, quick_pick: bool = False
+) -> Locator:
+    """Open the session with ``workspace_sidebar_v2`` on; returns its Workspace sidebar.
+
+    ``quick_pick`` also turns on the QuickPick ⌘K palette, for journeys that run its settings.
+    """
+    if quick_pick:
+        enable_quick_pick_palette(page, "workspace_sidebar_v2")
+        _start_with_no_pinned_pages(page)
+    else:
+        _set_flag(page, True)
     page.set_viewport_size(_DESKTOP)
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
@@ -110,3 +120,21 @@ def run_palette(page: Page, label: str) -> None:
     expect(option).to_have_count(1)
     option.click()
     expect(palette).to_have_count(0)
+
+
+def set_rail_width(page: Page, rail: Locator, width: int) -> None:
+    """Drag the rail's resize handle until the rail is ``width`` pixels wide."""
+    handle = page.get_by_role("separator", name="Resize panel").first
+    handle_box, rail_box = handle.bounding_box(), rail.bounding_box()
+    assert handle_box is not None and rail_box is not None
+    y = handle_box["y"] + 200
+    page.mouse.move(handle_box["x"] + 2, y)
+    page.mouse.down()
+    page.mouse.move(rail_box["x"] + rail_box["width"] - width, y, steps=8)
+    page.mouse.up()
+    for _ in range(20):
+        box = rail.bounding_box()
+        if box is not None and abs(box["width"] - width) <= 2:
+            return
+        page.wait_for_timeout(100)
+    raise AssertionError(f"the rail didn't settle at {width}px")

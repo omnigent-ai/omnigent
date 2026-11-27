@@ -4,6 +4,7 @@ import { ChevronRightIcon, Loader2Icon, SquareTerminalIcon } from "lucide-react"
 import { useAgentTurnActive } from "@/components/chat/chatBubbleParts";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { throttleAnimations } from "@/lib/throttledAnimations";
 import type { BackgroundTaskInfo } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
@@ -144,6 +145,7 @@ export function BackgroundTaskIndicator({ className }: { className?: string }) {
           >
             {agentWorking ? (
               <Loader2Icon
+                ref={throttleAnimations}
                 data-testid="background-task-working"
                 className="size-3.5 animate-spin motion-reduce:animate-none"
                 aria-hidden="true"

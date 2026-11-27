@@ -441,6 +441,48 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     task.add_done_callback(_evict)
 
 
+# A parked permission hook re-reads this snapshot when its token lapses, and
+# runner bearers refresh minutes before expiry, so a minute keeps it current.
+_PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S = 60.0
+
+
+async def _refresh_claude_permission_hook_auth(
+    *,
+    bridge_dir: Path,
+    server_url: str,
+    auth_token_factory: Callable[[], str | None],
+    refresh_interval_s: float = _PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S,
+) -> None:
+    """Keep the Claude permission hook's header snapshot on a live bearer.
+
+    The hook subprocess cannot mint a token of its own, so without this a
+    prompt that waits past the launch token's lifetime can no longer reach
+    the server.
+
+    :param bridge_dir: Owner-only Claude bridge directory.
+    :param server_url: Omnigent server receiving permission requests.
+    :param auth_token_factory: Refresh-capable runner bearer factory.
+    :param refresh_interval_s: Delay between snapshot refreshes.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.harnesses.claude_native.bridge import update_permission_hook_auth_headers
+
+    last_token: str | None = None
+    while True:
+        await asyncio.sleep(refresh_interval_s)
+        try:
+            token = await asyncio.to_thread(auth_token_factory)
+            if token and token != last_token:
+                headers = databricks_request_headers(server_url, bearer_token=token)
+                if update_permission_hook_auth_headers(bridge_dir, headers):
+                    last_token = token
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Keep the last snapshot and retry on the next tick.
+            _logger.warning("Could not refresh Claude permission-hook auth", exc_info=True)
+
+
 # Background tasks that re-pop a still-pending cost-budget approval on a
 # terminal client that attaches after the ASK fired. Kept referenced so
 # they aren't garbage-collected before they run.
@@ -5998,14 +6040,7 @@ async def _auto_create_codex_terminal(
         codex_ws_port = s.getsockname()[1]
     codex_ws_url = f"ws://127.0.0.1:{codex_ws_port}"
 
-    # Write the minimal MCP bridge config so serve-mcp can boot, and
-    # start the tool relay so tool_relay.json is on disk before codex
-    # launches its MCP server. This mirrors the claude-native relay
-    # start in ``create_session_terminal``. The relay is started here
-    # (not in ``_ensure_comment_relay_started``) because that helper
-    # is scoped inside ``create_routes`` and not reachable at module
-    # level. The ``_run_turn_bg`` fallback path covers sessions whose
-    # terminal was created outside this function.
+    # Configure the shared MCP bridge before Codex can launch its MCP server.
     from omnigent.harnesses.codex_native.bridge import (
         codex_mcp_config_overrides,
         write_mcp_bridge_config,
@@ -6131,6 +6166,11 @@ async def _auto_create_codex_terminal(
         server_client=server_client,
         turn_routing=launch_config.turn_routing,
     )
+    # Codex can list tools during startup or resume, before the first turn.
+    # Keep notification asynchronous: its lazy MCP server may not exist yet.
+    if ensure_comment_relay is not None:
+        await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
+
     app_server.listen_url = codex_ws_url
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
@@ -6412,14 +6452,6 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         server_client=server_client,
     )
-
-    # Start the relay now (into codex's serve-mcp bridge dir) so tool_relay.json
-    # is on disk and the relay recorded before codex connects on its first turn:
-    # the first-turn `_ensure_comment_relay_started` then fast-paths, avoiding
-    # the ~30s stall (see its docstring for the lazy-bridge / await_notify=False
-    # rationale).
-    if ensure_comment_relay is not None:
-        await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
 
     _logger.info(
         "Auto-created codex terminal + forwarder for session %s",
@@ -7212,6 +7244,7 @@ async def _auto_create_antigravity_terminal(
     *,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the native Antigravity (agy) terminal for a session.
@@ -7266,6 +7299,8 @@ async def _auto_create_antigravity_terminal(
         relay is started against this session's bridge dir before launch so the
         wrapped agy sees the ``sys_*`` tools (#1194). ``None`` skips relay wiring
         (the ``_run_turn_bg`` first-turn fallback re-ensures it).
+    :param agent_spec: Resolved session agent whose authored instructions and
+        memory guidance should be delivered before the first agy turn.
     :returns: The created terminal resource view.
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
@@ -7279,6 +7314,7 @@ async def _auto_create_antigravity_terminal(
         ensure_agy_feedback_survey_disabled,
         prepare_bridge_dir,
         seed_isolated_agy_home,
+        write_agent_instructions,
         write_bridge_state,
         write_mcp_config,
         write_tmux_target,
@@ -7389,6 +7425,17 @@ async def _auto_create_antigravity_terminal(
             trusted_workspace=workspace,
         ),
     }
+    startup_instructions = await _native_startup_instructions(
+        agent_spec, server_client, session_id, workspace=workspace
+    )
+    try:
+        await asyncio.to_thread(write_agent_instructions, bridge_dir, startup_instructions)
+    except (OSError, ValueError) as error:
+        _logger.warning(
+            "Could not write Antigravity startup instructions (%s); terminal launch will continue",
+            type(error).__name__,
+            extra={"session_id": session_id},
+        )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
     # active turn and lost (#1494). Disable it before launch. agy now runs under
@@ -7412,11 +7459,17 @@ async def _auto_create_antigravity_terminal(
     # _run_turn_bg first-turn fallback re-ensures this for any session whose
     # terminal was launched outside this path.
     if ensure_comment_relay is not None:
+        relay_labels = (
+            {k: v for k, v in labels.items() if isinstance(k, str) and isinstance(v, str)}
+            if isinstance(labels, dict)
+            else None
+        )
         await ensure_comment_relay(
             session_id,
             bridge_id=bridge_id,
             explicit_bridge_dir=bridge_dir,
             await_notify=False,
+            session_labels=relay_labels,
         )
 
     _logger.info(
@@ -8085,6 +8138,25 @@ def _native_startup_instructions_from_spec(
     return build_native_startup_instructions(spec)
 
 
+async def _antigravity_startup_agent_spec(
+    session_id: str,
+    resolve: Callable[[str], Awaitable[AgentSpec | None]],
+) -> AgentSpec | None:
+    """Prepare framework guidance if optional Antigravity instruction retrieval fails."""
+    from omnigent.runner._entry import AgentSpecFetchError
+
+    try:
+        return await resolve(session_id)
+    except AgentSpecFetchError:
+        _logger.warning(
+            "Could not fetch Antigravity startup instructions; preparing framework "
+            "guidance: session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return None
+
+
 async def _native_startup_instructions(
     agent_spec: AgentSpec | ResolvedSpec | None,
     server_client: httpx.AsyncClient | None,
@@ -8726,7 +8798,9 @@ def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
     )
 
 
-def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
+def _claude_terminal_launch_env(
+    spec: TerminalEnvSpec, *, require_resolved: bool = False
+) -> dict[str, str]:
     """
     Return the environment the native Claude terminal process starts with.
 
@@ -8737,12 +8811,26 @@ def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
 
     :param spec: The Claude terminal launch spec, e.g. one with
         ``command="env"`` and ``args=["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]``.
+    :param require_resolved: Refuse unmodeled wrappers for strict MCP discovery.
     :returns: The effective environment, e.g.
         ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
     """
     env = _claude_terminal_pre_wrapper_env(spec)
     wrapper = env_wrapper_environment(spec.command or "", list(spec.args), env)
     if wrapper is None and Path(spec.command or "").name == "env":
+        if require_resolved:
+            from omnigent.config import global_config_path
+            from omnigent.mcp_disabled_servers import McpStrictModeError
+
+            raise McpStrictModeError(
+                "claude-native",
+                global_config_path(),
+                "unresolved env wrapper",
+                problem=(
+                    "the configured env wrapper cannot be resolved for strict MCP discovery; "
+                    "use a supported env wrapper or launch Claude directly"
+                ),
+            )
         _logger.info(
             "Claude terminal env wrapper form is not modeled; trust seeding uses the "
             "pre-wrapper environment"
@@ -10413,6 +10501,7 @@ async def _auto_create_claude_terminal(
             base_claude_args,
             settings_request=settings_request,
             active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+            defer_inherited_mcp_discovery=True,
             bridge_dir=bridge_dir,
             workspace=Path(workspace),
             ap_server_url=server_url,
@@ -10498,9 +10587,13 @@ async def _auto_create_claude_terminal(
                 await _run_claude_settings_step(lease.close)
 
         # Seed trust and onboarding in the config selected by the terminal's launch environment.
+        from omnigent.mcp_inheritance import resolve_mcp_inheritance
+
         ensure_claude_workspace_trusted(
             _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
+            env=_claude_terminal_launch_env(
+                env_spec, require_resolved=not resolve_mcp_inheritance("claude-native").inherit
+            ),
             added_dirs=trusted_added_dirs,
         )
     except BaseException as prepare_error:
@@ -11274,6 +11367,7 @@ async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
     )
 
 

@@ -148,6 +148,46 @@ describe("resolveIdentity", () => {
   });
 });
 
+describe("getIdentityStatus", () => {
+  it("is unknown until a probe settles", async () => {
+    const { getIdentityStatus } = await import("./identity");
+    expect(getIdentityStatus()).toEqual({ kind: "unknown" });
+  });
+
+  it.each<[string, () => void, unknown]>([
+    [
+      "a signed-in answer",
+      () => fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice" })),
+      { kind: "signedIn", userId: "alice" },
+    ],
+    [
+      "a 401",
+      () => fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 401 })),
+      { kind: "signedOut" },
+    ],
+    [
+      "another refusal, such as a server without the route",
+      () => fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 })),
+      { kind: "signedOut" },
+    ],
+    [
+      "a gateway 503",
+      () => fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 503 })),
+      { kind: "unreachable" },
+    ],
+    [
+      "a network error",
+      () => fetchMock.mockRejectedValueOnce(new Error("network")),
+      { kind: "unreachable" },
+    ],
+  ])("records %s", async (_label, answer, expected) => {
+    answer();
+    const { getIdentityStatus, resolveIdentity } = await import("./identity");
+    await resolveIdentity();
+    expect(getIdentityStatus()).toEqual(expected);
+  });
+});
+
 describe("resolveIdentity transient failures", () => {
   afterEach(() => {
     vi.useRealTimers();

@@ -41,6 +41,7 @@ from omnigent.util.tmux_compat import tmux_unavailable_reason
 
 if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
+    from omnigent.terminals.shell_inspection import ShellInspection
 
 from . import _proc, process_lifetime
 from ._subprocess_lifecycle import await_cleanup_task, terminate_direct_subprocess
@@ -381,6 +382,17 @@ class _TmuxProcessStartError(RuntimeError):
 def _is_transient_tmux_process_start_error(exc: OSError) -> bool:
     """Return whether a tmux process launch can reasonably be retried."""
     return exc.errno in _TRANSIENT_TMUX_PROCESS_START_ERRNOS
+
+
+async def _communicate_or_kill(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    """A tmux command's output; if its caller gives up, e.g. at a deadline, it's killed."""
+    try:
+        return await proc.communicate()
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
 
 
 def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
@@ -3157,6 +3169,22 @@ class TerminalInstance:
         except ValueError:
             return None
 
+    async def inspect_shell(self) -> ShellInspection:
+        """Whether this terminal's shell is idle, busy with a named job, or unknown.
+
+        Reads only this instance's own pane through its own tmux socket; see
+        :func:`omnigent.terminals.shell_inspection.read_pane_shell`.
+
+        :returns: The inspection, never a pid or another process's row.
+        """
+        from omnigent.terminals.shell_inspection import read_pane_shell, sandbox_launchers
+
+        policy = self.sandbox_policy
+        backend = policy.backend_type if policy is not None and policy.active else None
+        return await read_pane_shell(
+            self._tmux_base_cmd(), self.tmux_target, self.command, sandbox_launchers(backend)
+        )
+
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """
         Invoke a watcher edge callback, swallow + log on failure.
@@ -3245,7 +3273,7 @@ class TerminalInstance:
             return False
 
         try:
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await _communicate_or_kill(proc)
             if proc.returncode != 0:
                 detail = stderr.decode(errors="replace").strip() or "<no stderr>"
                 if not _tmux_reports_target_gone(detail):
@@ -3366,7 +3394,7 @@ class TerminalInstance:
             )
         except OSError as exc:
             raise _tmux_process_start_error(cmd, exc) from exc
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await _communicate_or_kill(proc)
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
         return stdout.decode()

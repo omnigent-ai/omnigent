@@ -267,6 +267,8 @@ export function CreateScheduledTaskDialog({
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const workflowsEnabled = isFeatureEnabled(info, "workflows");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
+  const newSandboxSubhourSupported =
+    info !== "loading" && info.scheduled_task_subhour_new_sandbox === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
   const triggerHeadersSupported =
     info !== "loading" && info.scheduled_task_trigger_headers === true;
@@ -437,8 +439,6 @@ export function CreateScheduledTaskDialog({
   // Radix reports as "interact outside" is absorbed. See `guardDialogDismiss`.
   const selectOpenCountRef = useRef(0);
   const selectClosedAtRef = useRef(0);
-  const nestedMenuOpenCountRef = useRef(0);
-  const nestedMenuClosedAtRef = useRef(0);
   const [workspaceBrowserOpen, setWorkspaceBrowserOpen] = useState(false);
   function handleSelectOpenChange(isOpen: boolean) {
     if (isOpen) {
@@ -447,14 +447,6 @@ export function CreateScheduledTaskDialog({
       selectOpenCountRef.current = Math.max(0, selectOpenCountRef.current - 1);
       selectClosedAtRef.current = Date.now();
     }
-  }
-  function handleNestedMenuOpenChange(isOpen: boolean) {
-    nestedMenuOpenCountRef.current = Math.max(
-      0,
-      nestedMenuOpenCountRef.current + (isOpen ? 1 : -1),
-    );
-    if (!isOpen) nestedMenuClosedAtRef.current = Date.now();
-    handleSelectOpenChange(isOpen);
   }
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   function changeAgentMenuOpen(next: boolean) {
@@ -494,20 +486,20 @@ export function CreateScheduledTaskDialog({
     setEndingMenuOpen(false);
     setMcpMenuOpen(false);
     selectOpenCountRef.current = 0;
-    nestedMenuOpenCountRef.current = 0;
-    nestedMenuClosedAtRef.current = 0;
     selectClosedAtRef.current = 0;
   }
-  /** preventDefault the Dialog's outside-dismiss ONLY for the narrow nested-Select
-   * cases — a click inside portalled dropdown content (path a) or while a dropdown
-   * is open (path b),
+  // Set by any typing since the dialog opened, so a stray click can't discard it.
+  const typedSinceOpenRef = useRef(false);
+  /** preventDefault the Dialog's outside-dismiss once the user has typed, and
+   * otherwise ONLY for the narrow nested-Select cases — a click inside portalled
+   * dropdown content (path a) or while a dropdown is open (path b),
    * plus a short grace window for the trailing focus-outside a dropdown emits as
-   * it unmounts. A genuine click on the backdrop OVERLAY always dismisses: its target
-   * is the overlay itself (never a popper), so we let it through even inside the
-   * grace window — this is the fix for backdrop-click-to-close being swallowed.
-   * Escape + Cancel are unaffected (they don't route through this guard). */
+   * it unmounts. Before any typing, a genuine click on the backdrop OVERLAY dismisses:
+   * its target is the overlay itself (never a popper), so we let it through even
+   * inside the grace window.
+   * X, Escape and Cancel are unaffected (they don't route through this guard). */
   function guardDialogDismiss(event: { target: EventTarget | null; preventDefault: () => void }) {
-    if (workspaceBrowserOpen) {
+    if (workspaceBrowserOpen || typedSinceOpenRef.current) {
       event.preventDefault();
       return;
     }
@@ -520,17 +512,15 @@ export function CreateScheduledTaskDialog({
       event.preventDefault();
     }
   }
+  /** Menus nested in a popover (time picker, Days, timezone, …) portal outside
+   * it, so picking one of their options reads as an outside click on the parent.
+   * Keep the parent open only for clicks that land inside such a popper; a click
+   * outside every popper closes the nested menu and the parent together. */
   function keepParentPopoverOpenForNestedMenu(event: {
     target: EventTarget | null;
     preventDefault: () => void;
   }) {
-    if (
-      nestedMenuOpenCountRef.current > 0 ||
-      Date.now() - nestedMenuClosedAtRef.current < 150 ||
-      isInsidePopper(event.target)
-    ) {
-      event.preventDefault();
-    }
+    if (isInsidePopper(event.target)) event.preventDefault();
   }
   function keepParentPopoverOpenOnFocus(event: { preventDefault: () => void }) {
     event.preventDefault();
@@ -624,6 +614,7 @@ export function CreateScheduledTaskDialog({
   const wasOpen = useRef(false);
   useEffect(() => {
     if (open && !wasOpen.current) {
+      typedSinceOpenRef.current = false;
       typeDrafts.current = {};
       setSourceSwitch(null);
       editSourceDrafts.current = {};
@@ -1203,6 +1194,7 @@ export function CreateScheduledTaskDialog({
       sessionMode,
       subhourSupported,
       executionTarget,
+      newSandboxSubhourSupported,
     });
   }
   const scheduleInvalid = scheduleError !== null;
@@ -1279,6 +1271,7 @@ export function CreateScheduledTaskDialog({
       sessionMode,
       subhourSupported,
       executionTarget,
+      newSandboxSubhourSupported,
     }) === null
       ? defaultTriggerSchedule
       : HOURLY_SCHEDULE_MODEL;
@@ -1297,7 +1290,7 @@ export function CreateScheduledTaskDialog({
   const recurrenceValid =
     validateSchedule(
       { ...schedule, end: undefined },
-      { sessionMode, subhourSupported, executionTarget },
+      { sessionMode, subhourSupported, executionTarget, newSandboxSubhourSupported },
     ) === null;
   const endingInvalid =
     validateSchedule({ ...DEFAULT_SCHEDULE_MODEL, end: schedule.end }, { allowPastEnd }) !== null ||
@@ -1883,10 +1876,14 @@ export function CreateScheduledTaskDialog({
         // Keep a nested Select's dismiss (pick an option, OR click empty modal
         // body / trigger while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss` — it covers both the popper-target path and the
-        // Select-open + focus-outside path, while leaving real backdrop clicks
-        // and Escape to close as normal.
+        // Select-open + focus-outside path, and keeps typed input open on a
+        // backdrop click. Escape still closes as normal.
         onPointerDownOutside={guardDialogDismiss}
         onInteractOutside={guardDialogDismiss}
+        // Bubbles from every text field, including portalled picker searches.
+        onInputCapture={() => {
+          typedSinceOpenRef.current = true;
+        }}
       >
         {/* The right padding keeps the bordered name field clear of the close button. */}
         <DialogHeader className="shrink-0 pt-5 pr-[4.5rem] pb-0 pl-6">
@@ -1942,11 +1939,12 @@ export function CreateScheduledTaskDialog({
               sessionMode={sessionMode}
               executionTarget={executionTarget}
               subhourSupported={subhourSupported}
+              newSandboxSubhourSupported={newSandboxSubhourSupported}
               recurrenceUnsupported={scheduleUnsupported}
               allowPastEnd={allowPastEnd}
               onChange={setSchedule}
               onRecurrenceSelect={() => setScheduleUnsupported(false)}
-              onSelectOpenChange={handleNestedMenuOpenChange}
+              onSelectOpenChange={handleSelectOpenChange}
               embedded
             >
               {({ recurrenceFields, endingFields }) => (
@@ -2078,7 +2076,7 @@ export function CreateScheduledTaskDialog({
                         source={trigger}
                         fields={triggerFields}
                         onChange={setTriggerFields}
-                        onSelectOpenChange={handleNestedMenuOpenChange}
+                        onSelectOpenChange={handleSelectOpenChange}
                         // Managed sandboxes provide their agents' integration tools.
                         toolsProvided={
                           sandboxMode &&

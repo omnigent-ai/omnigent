@@ -38,6 +38,7 @@ import {
   supportsArcaConnect,
   supportsBrowser,
   supportsWidenWindowForRightSidebar,
+  trustedRemoteHostsBridge,
   switchServer,
   takeOnboardingRunner,
 } from "./nativeBridge";
@@ -392,6 +393,35 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("trustedRemoteHostsBridge", () => {
+  it("is null in a plain browser and on a shell too old for the bridge", () => {
+    setElectron(false);
+    expect(trustedRemoteHostsBridge()).toBeNull();
+    setElectron(true);
+    expect(trustedRemoteHostsBridge()).toBeNull();
+  });
+
+  it("exposes list, add, and remove when the shell offers them", async () => {
+    const list = vi.fn().mockResolvedValue({ ok: true, hosts: [] });
+    const add = vi.fn();
+    const remove = vi.fn();
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      getTrustedRemoteHosts: list,
+      addTrustedRemoteHost: add,
+      removeTrustedRemoteHost: remove,
+    };
+    const bridge = trustedRemoteHostsBridge();
+    expect(bridge).not.toBeNull();
+    await bridge!.list();
+    expect(list).toHaveBeenCalledOnce();
+    await bridge!.add("https://server.example.com/", "example-host");
+    expect(add).toHaveBeenCalledWith("https://server.example.com/", "example-host");
+    await bridge!.remove("https://server.example.com/", "example-host");
+    expect(remove).toHaveBeenCalledWith("https://server.example.com/", "example-host");
   });
 });
 

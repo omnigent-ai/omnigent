@@ -12,7 +12,14 @@ import {
   recordPaneStartFailure,
   resetPaneStartFailuresForTests,
 } from "./paneStartFailures";
+import {
+  ENDED_SHELL_MEMORY_MS,
+  markPaneShellEnded,
+  resetEndedPaneShellsForTests,
+  usePaneShellExit,
+} from "./paneShellExit";
 import { PREFERRED_SHELL_KEY, readPreferredShell } from "./preferredShell";
+import type { ShellCloseCheck } from "./shellCloseCheck";
 import { PANE_CLOSED_MESSAGE } from "./splitTargetActions";
 import { resetPendingPaneClosesForTests, useTerminalPaneActions } from "./terminalPaneActions";
 import type { TerminalSplitTarget } from "./terminalSplitTarget";
@@ -27,6 +34,9 @@ const fixture = vi.hoisted(() => ({
   endShell: vi.fn<(terminalId: string) => void>(),
   toast: vi.fn<(message: string) => void>(),
   declaredShells: ["zsh", "bash"],
+  // The runner's close check; asks before closing unless a test says otherwise.
+  shellCheck: { close: "confirm", busy: null } as ShellCloseCheck,
+  checkedTerminals: [] as string[][],
 }));
 
 vi.mock("@/hooks/useAgents", () => ({
@@ -38,6 +48,13 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useDeleteTerminal: () => ({ mutate: fixture.endShell, isPending: false }),
 }));
 vi.mock("@/components/ui/toast", () => ({ showToast: fixture.toast }));
+vi.mock("./shellCloseCheck", () => ({
+  useShellCloseCheck:
+    () => (terminalIds: string[], _trigger: string, decide: (check: ShellCloseCheck) => void) => {
+      fixture.checkedTerminals.push(terminalIds);
+      decide(fixture.shellCheck);
+    },
+}));
 
 let session = 0;
 
@@ -69,10 +86,13 @@ beforeEach(() => {
   fixture.endShell.mockReset();
   fixture.toast.mockReset();
   fixture.declaredShells = ["zsh", "bash"];
+  fixture.shellCheck = { close: "confirm", busy: null };
+  fixture.checkedTerminals = [];
 });
 afterEach(() => {
   resetPaneStartFailuresForTests();
   resetPendingPaneClosesForTests();
+  resetEndedPaneShellsForTests();
   window.localStorage.clear();
 });
 
@@ -176,7 +196,7 @@ describe("useTerminalPaneActions", () => {
     const { target, read } = memoryTarget(SIDE_BY_SIDE);
     const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
     act(() => result.current.closePane(ZSH_KEY));
-    expect(result.current.pendingClose).toEqual({ key: ZSH_KEY, terminal: ZSH });
+    expect(result.current.pendingClose).toEqual({ key: ZSH_KEY, terminal: ZSH, busy: null });
     act(() => result.current.cancelClose());
     expect(result.current.pendingClose).toBeNull();
     expect(read()).toEqual(SIDE_BY_SIDE);
@@ -185,6 +205,59 @@ describe("useTerminalPaneActions", () => {
     act(() => result.current.confirmClose());
     expect(read()).toBeUndefined();
     expect(fixture.endShell).toHaveBeenCalledExactlyOnceWith(ZSH.id);
+  });
+
+  it("closes a pane whose shell is idle without asking, and asks naming a busy one's job", () => {
+    const { target, read } = memoryTarget(SIDE_BY_SIDE);
+    const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
+    fixture.shellCheck = { close: "confirm", busy: { foreground: "vim", backgroundJobs: 0 } };
+    act(() => result.current.closePane(ZSH_KEY));
+    expect(result.current.pendingClose?.busy).toEqual({ foreground: "vim", backgroundJobs: 0 });
+    act(() => result.current.cancelClose());
+
+    fixture.shellCheck = { close: "now" };
+    act(() => result.current.closePane(ZSH_KEY));
+    expect(result.current.pendingClose).toBeNull();
+    expect(read()).toBeUndefined();
+    expect(fixture.endShell).toHaveBeenCalledExactlyOnceWith(ZSH.id);
+    expect(fixture.checkedTerminals).toEqual([[ZSH.id], [ZSH.id]]);
+  });
+
+  it("closes a pane whose shell already exited without asking, while it's still listed", () => {
+    const { target, read } = memoryTarget(SIDE_BY_SIDE);
+    markPaneShellEnded(target.conversationId, ZSH_KEY);
+    const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
+    act(() => result.current.closePane(ZSH_KEY));
+    expect(result.current.pendingClose).toBeNull();
+    expect(read()).toBeUndefined();
+    expect(fixture.endShell).not.toHaveBeenCalled();
+  });
+
+  it("asks again about a shell relaunched under an ended one's key", () => {
+    vi.useFakeTimers();
+    const { target } = memoryTarget(SIDE_BY_SIDE);
+    markPaneShellEnded(target.conversationId, ZSH_KEY);
+    // The same name and session key relaunched, and its pane connects on a surface that
+    // doesn't remove ended panes.
+    const { result: observe } = renderHook(() => usePaneShellExit(target, false, () => null));
+    act(() => observe.current(ZSH_KEY, { kind: "connected" }));
+    const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
+    act(() => result.current.closePane(ZSH_KEY));
+    expect(result.current.pendingClose?.terminal).toEqual(ZSH);
+    act(() => result.current.confirmClose());
+    expect(fixture.endShell).toHaveBeenCalledWith(ZSH.id);
+
+    // Unconnected, the mark lasts only past the list's lag.
+    fixture.endShell.mockClear();
+    const later = memoryTarget(SIDE_BY_SIDE);
+    markPaneShellEnded(later.target.conversationId, ZSH_KEY);
+    vi.advanceTimersByTime(ENDED_SHELL_MEMORY_MS);
+    const { result: relaunched } = renderHook(() =>
+      useTerminalPaneActions(later.target, [AGENT, ZSH]),
+    );
+    act(() => relaunched.current.closePane(ZSH_KEY));
+    expect(relaunched.current.pendingClose?.terminal).toEqual(ZSH);
+    vi.useRealTimers();
   });
 
   it("closes a pane whose shell didn't start without asking, since it ends nothing", () => {

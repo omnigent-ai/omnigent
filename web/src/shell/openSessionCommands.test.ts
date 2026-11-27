@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 
+import { menuShortcutChords, type ShortcutId } from "@/lib/shortcuts/registry";
 import { AVAILABLE, unavailableBecause } from "@/store/paletteCommands";
 
-import { type OpenSessionFacts, openSessionCommands } from "./openSessionCommands";
+import {
+  type OpenSessionCommandId,
+  type OpenSessionFacts,
+  openSessionCommands,
+} from "./openSessionCommands";
 
 const OWNER_FACTS: OpenSessionFacts = {
   canAddAgent: true,
@@ -82,6 +87,34 @@ describe("openSessionCommands", () => {
         .map((command) => command.id);
     expect(chords(false)).toEqual([]);
     expect(chords(true)).toEqual(["pin", "fork", "archive"]);
+  });
+
+  it("shows the same chord as the desktop menu's registry binding for each command", () => {
+    const bindings: Partial<Record<OpenSessionCommandId, ShortcutId>> = {
+      pin: "session.pin",
+      unpin: "session.pin",
+      fork: "session.fork",
+      archive: "session.archive",
+      unarchive: "session.archive",
+    };
+    const desktopMenu = { mac: true, native: true, desktopMenu: true };
+    const commands = [false, true].flatMap((toggled) =>
+      openSessionCommands({
+        ...OWNER_FACTS,
+        pinned: toggled,
+        archived: toggled,
+        desktopShortcuts: true,
+      }),
+    );
+    const withChords = commands.filter((command) => command.nativeShortcut);
+    expect([...new Set(withChords.map((command) => command.id))].toSorted()).toEqual(
+      Object.keys(bindings).toSorted(),
+    );
+    for (const command of withChords) {
+      expect([command.nativeShortcut], command.id).toEqual(
+        menuShortcutChords(bindings[command.id]!, desktopMenu),
+      );
+    }
   });
 
   it("marks only Delete as destructive", () => {

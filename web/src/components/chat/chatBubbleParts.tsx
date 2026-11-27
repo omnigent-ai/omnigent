@@ -74,6 +74,7 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
+import { throttleAnimations } from "@/lib/throttledAnimations";
 import { cn } from "@/lib/utils";
 import {
   splitKnownSlashCommand,
@@ -751,7 +752,7 @@ export function WorkingIndicator() {
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
-          <div className="flex items-center gap-1.5 py-0.5">
+          <div ref={throttleAnimations} className="flex items-center gap-1.5 py-0.5">
             <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm" duration={1.5}>
               {label}

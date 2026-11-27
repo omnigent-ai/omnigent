@@ -8,6 +8,7 @@ import {
   type TerminalDivider,
 } from "@/lib/paneSplitLayout";
 
+import type { PointerDragEnd } from "./paneDividerDragEnd";
 import { usePaneDividerPointer } from "./usePaneDividerPointer";
 
 // Defaults for a divider used without a layout's drag session.
@@ -39,7 +40,7 @@ export function PaneSplitDivider({
   onResize: (path: number[], ratio: number, final: boolean) => void;
   onCommit: () => void;
   onStart?: (divider: TerminalDivider) => void;
-  onAbort?: () => void;
+  onAbort?: (reason: PointerDragEnd) => void;
   /** Whether the layout still has this divider's drag. */
   dragging?: boolean;
 }) {

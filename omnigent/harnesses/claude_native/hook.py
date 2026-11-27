@@ -144,7 +144,10 @@ def _env_float(name: str, default: float) -> float:
 # legitimately-parked approval behind a severing proxy is never capped, while a
 # down server can no longer re-POST for a day. Overridable for operators who
 # want more slack against a flaky upstream.
-_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 8))
+#
+# 40 failures ride out a brief outage, so the web card returns once the server
+# is back: about 17 minutes of 30s backoff, up to 40 when every connect times out.
+_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 40))
 
 
 def _never_connected_errors() -> tuple[type[Exception], ...]:
@@ -1056,6 +1059,50 @@ def _post_hook_with_reattach(
             backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
 
 
+def _permission_hook_reauth(
+    bridge_dir: Path, server_url: str, headers: dict[str, str], started_from: object
+) -> Callable[[], dict[str, str] | None]:
+    """
+    Renew the permission hook's auth from the runner's refreshed header snapshot.
+
+    The hook cannot mint a token itself (the runner keeps its credential from
+    child processes), so a prompt parked past its token's lifetime takes the
+    headers the runner last wrote to ``permission_hook.json``. It mints instead
+    when the hook did not start from that snapshot, the snapshot is for another
+    server, or it has not changed.
+
+    :param bridge_dir: Bridge directory holding ``permission_hook.json``.
+    :param server_url: Omnigent server URL the hook POSTs to.
+    :param headers: Headers the hook started with.
+    :param started_from: The snapshot those headers came from, or ``None`` when
+        they did not come from ``permission_hook.json``; ``None`` always mints.
+    :returns: A reauth callable for :func:`_post_hook_with_reattach`.
+    """
+    from omnigent.native.native_policy_hook import policy_hook_reauth
+
+    mint = policy_hook_reauth(server_url, headers)
+    seen = [started_from]
+
+    def reauth() -> dict[str, str] | None:
+        if started_from is None:
+            return mint()
+        config = read_permission_hook_config(bridge_dir)
+        snapshot = config.get("ap_auth_headers")
+        if (
+            config.get("ap_server_url") == server_url
+            and isinstance(snapshot, dict)
+            and snapshot
+            and snapshot != seen[0]
+        ):
+            seen[0] = snapshot
+            fresh = {str(key): str(value) for key, value in snapshot.items()}
+            _merge_identity_headers(fresh, server_url)
+            return fresh
+        return mint()
+
+    return reauth
+
+
 def _main_permission_request(argv: list[str]) -> int:
     """
     Forward one Claude ``PermissionRequest`` hook to the active Omnigent session.
@@ -1069,8 +1116,6 @@ def _main_permission_request(argv: list[str]) -> int:
         to its terminal prompt; an ``AskUserQuestion`` is denied instead so
         Claude asks it in chat text.
     """
-    from omnigent.native.native_policy_hook import policy_hook_reauth
-
     args = _parse_permission_args(argv)
     raw = sys.stdin.read()
     try:
@@ -1092,10 +1137,12 @@ def _main_permission_request(argv: list[str]) -> int:
         print("omnigent claude permission hook: Omnigent server URL missing", file=sys.stderr)
         return 0
     headers = _parse_headers(args.omnigent_auth_headers_json)
+    started_from: object = None
     if not headers:
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):
             headers = {str(key): str(value) for key, value in raw_headers.items()}
+            started_from = raw_headers
     # A permission request raises a web elicitation that parks in the pod-local
     # registry on the replica holding this session's runner tunnel; an unkeyed
     # POST lands elsewhere and the approval is silently lost. Key from the
@@ -1111,7 +1158,7 @@ def _main_permission_request(argv: list[str]) -> int:
         headers,
         payload,
         "claude permission",
-        reauth=policy_hook_reauth(ap_server_url, headers),
+        reauth=_permission_hook_reauth(bridge_dir, ap_server_url, headers, started_from),
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
         answer_window_s=(
             PRE_RESOLVED_ELICITATION_TTL_S - _QUESTION_ANSWER_WINDOW_MARGIN_S

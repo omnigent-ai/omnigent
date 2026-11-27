@@ -10,6 +10,8 @@ import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { registerFindSurface } from "@/lib/findRouting";
 import { readFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
 import { useThemePickerStore } from "@/store/themePicker";
+import { useFeatureFlagsPickerStore } from "@/store/featureFlagsPicker";
+import * as host from "@/lib/host";
 import { readTerminalThemeMode } from "@/lib/terminalThemePreferences";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
@@ -180,6 +182,25 @@ describe("QuickPick ⌘K app commands", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(useThemePickerStore.getState().open).toBe(false);
     await waitFor(() => expect(useThemePickerStore.getState().open).toBe(true));
+  });
+
+  it("opens UI feature overrides after closing the palette", async () => {
+    onTestFinished(() => useFeatureFlagsPickerStore.setState({ open: false, replaced: false }));
+    const input = renderPalette();
+    fireEvent.change(input, { target: { value: "feature flag" } });
+    expect(actionNames()[0]).toContain("Override UI feature flag…");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(useFeatureFlagsPickerStore.getState().open).toBe(false);
+    await waitFor(() => expect(useFeatureFlagsPickerStore.getState().open).toBe(true));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("hides UI feature overrides without a server identity", () => {
+    const identity = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue(null);
+    onTestFinished(() => identity.mockRestore());
+    const input = renderPalette();
+    fireEvent.change(input, { target: { value: "override ui feature" } });
+    expect(screen.queryByRole("option", { name: /Override UI feature flag/ })).toBeNull();
   });
 
   it("offers Find only while something on screen can find, and opens it there", async () => {

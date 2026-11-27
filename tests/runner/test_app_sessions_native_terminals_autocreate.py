@@ -5484,7 +5484,13 @@ class _AntigravitySnapshotServerClient:
             return _Response({"labels": labels})
         # The session snapshot: non-None so the host-spawn check reports the
         # session needs a terminal, and carries the same labels.
-        return _Response({"id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d", "labels": labels})
+        return _Response(
+            {
+                "id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                "labels": labels,
+            }
+        )
 
 
 _ANTIGRAVITY_AUTO_CREATE_SCENARIOS = [
@@ -5610,6 +5616,7 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
         :returns: None.
         """
         del resource_registry, publish_event
+        assert _kwargs.get("agent_spec") == native_spec
         created.append(session_id)
 
     monkeypatch.setattr(

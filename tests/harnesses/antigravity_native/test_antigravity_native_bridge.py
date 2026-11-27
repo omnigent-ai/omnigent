@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shlex
+import stat
 import subprocess
 import threading
 from collections.abc import Callable
@@ -33,6 +34,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     seed_isolated_agy_home,
     send_interaction_keys_via_tui,
     update_conversation_id,
+    write_agent_instructions,
     write_bridge_state,
     write_mcp_bridge_config,
     write_mcp_config,
@@ -1630,8 +1632,69 @@ def test_inject_user_message_via_tui_short_message_raises_when_not_submitted(
 # ---------------------------------------------------------------------------
 
 
+def test_write_agent_instructions_refreshes_only_the_owned_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Always-on startup text is private and coexists with the user's rules."""
+    bridge_dir = tmp_path / "bridge"
+    rules_dir = agy_gemini_dir(bridge_dir) / "config" / "rules"
+    rules_dir.mkdir(parents=True)
+    user_rule = rules_dir / "user-rule.md"
+    user_rule.write_text("Keep the user's rule.", encoding="utf-8")
+    instructions = "  Authored instructions.  \n\nFramework guidance."
+
+    path = write_agent_instructions(bridge_dir, instructions)
+
+    assert path == rules_dir / "omnigent_instructions.md"
+    assert path.read_text(encoding="utf-8") == (
+        "---\ntrigger: always_on\n---\n\n" + instructions + "\n"
+    )
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert write_agent_instructions(bridge_dir, "Updated on resume.") == path
+    assert "Updated on resume." in path.read_text(encoding="utf-8")
+    assert "Authored instructions." not in path.read_text(encoding="utf-8")
+    previous = path.read_bytes()
+
+    def fail_replace(*_args: object) -> None:
+        raise PermissionError("read-only startup rule")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.harnesses.antigravity_native.bridge.os.replace", fail_replace)
+        with pytest.raises(PermissionError, match="read-only startup rule"):
+            write_agent_instructions(bridge_dir, "Replacement must not be visible.")
+    assert path.read_bytes() == previous
+    assert {entry.name for entry in rules_dir.iterdir()} == {path.name, user_rule.name}
+    assert write_agent_instructions(bridge_dir, None) is None
+    assert not path.exists()
+    assert user_rule.read_text(encoding="utf-8") == "Keep the user's rule."
+
+
+@pytest.mark.parametrize("linked_dir", ["gemini", "rules", "cyclic-rules"])
+def test_write_agent_instructions_never_follows_rules_outside_the_bridge(
+    tmp_path: Path, linked_dir: str
+) -> None:
+    """A linked user configuration must not receive a generated startup rule."""
+    bridge_dir = tmp_path / "bridge"
+    gemini_dir = agy_gemini_dir(bridge_dir)
+    real_rules = tmp_path / "real-rules"
+    real_rules.mkdir()
+    link = gemini_dir if linked_dir == "gemini" else gemini_dir / "config" / "rules"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(
+        link.name if linked_dir == "cyclic-rules" else real_rules, target_is_directory=True
+    )
+
+    expected_errors = (ValueError, OSError) if linked_dir == "cyclic-rules" else (ValueError,)
+    with pytest.raises(expected_errors) as raised:
+        write_agent_instructions(bridge_dir, "Startup text.")
+    if isinstance(raised.value, ValueError):
+        assert "isolated Gemini dir" in str(raised.value)
+
+    assert list(real_rules.iterdir()) == []
+
+
 def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
-    """build_mcp_config emits the shared serve-mcp relay command + enabledTools."""
+    """build_mcp_config emits the shared serve-mcp relay command without enabledTools."""
     config = build_mcp_config(tmp_path, python_executable="python-test")
     server = config["mcpServers"]["omnigent"]
     assert server["command"] == "python-test"
@@ -1643,15 +1706,9 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
         "--bridge-dir",
         str(tmp_path),
     ]
-    # agy's auto-approve allowlist is the enabledTools key (not cursor's autoApprove).
-    assert "sys_session_send" in server["enabledTools"]
-    assert "sys_os_shell" in server["enabledTools"]
-    assert "sys_terminal_launch" in server["enabledTools"]
-    assert "sys_list_models" in server["enabledTools"]
-    assert "sys_project_list" in server["enabledTools"]
-    assert "sys_session_update" in server["enabledTools"]
-    assert "sys_project_update" in server["enabledTools"]
-    assert server["enabledTools"] == sorted(server["enabledTools"])
+    # enabledTools is a visibility allowlist in agy and must stay omitted so
+    # dynamically advertised relay tools (browser, memory, automations) stay visible.
+    assert "enabledTools" not in server
     assert server["env"]["TMPDIR"]
     # The relay's HOME and data dir are pinned to the runner's so its bridge-root
     # validation matches where the bridge dir lives, even if a future agy launch
@@ -1951,7 +2008,146 @@ def test_seed_isolated_agy_home_never_clobbers_existing_isolated_settings(
 
     seed_isolated_agy_home(bridge_dir)
 
-    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {"model": "session-pick"}
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["model"] == "session-pick"
+    assert "theme" not in isolated
+    assert isolated["permissions"]["allow"] == ["mcp(omnigent/*)"]
+
+
+def test_seed_isolated_agy_home_merges_omnigent_mcp_allow_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP allow-rule merges into permissions.allow idempotently without mutating real home."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_payload = {
+        "theme": "dark",
+        "permissions": {
+            "allow": ["mcp(other/*)"],
+            "ask": ["shell(git push *)", "mcp(omnigent/*)"],
+            "deny": ["shell(rm -rf *)", "mcp(omnigent/memory_search)"],
+        },
+    }
+    real_settings.write_text(json.dumps(real_payload), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["theme"] == "dark"
+    assert isolated["permissions"] == {
+        "allow": ["mcp(other/*)", "mcp(omnigent/*)"],
+        "ask": ["shell(git push *)", "mcp(omnigent/*)"],
+        "deny": ["shell(rm -rf *)", "mcp(omnigent/memory_search)"],
+    }
+    assert json.loads(real_settings.read_text(encoding="utf-8")) == real_payload
+
+
+@pytest.mark.parametrize("fault", ["read", "replace"])
+def test_relay_permissions_preserve_settings_and_remove_temporary_files_after_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    settings = agy_gemini_dir(bridge_dir) / "antigravity-cli/settings.json"
+    settings.parent.mkdir(parents=True)
+    original = b'{"theme":"dark","permissions":{"deny":["mcp(other/write)"]}}'
+    settings.write_bytes(original)
+    read_text = Path.read_text
+
+    def read(path: Path, *args: object, **kwargs: object) -> str:
+        if path == settings:
+            raise PermissionError("settings are unreadable")
+        return read_text(path, *args, **kwargs)
+
+    def replace(*_args: object) -> None:
+        raise OSError("replacement failed")
+
+    if fault == "read":
+        monkeypatch.setattr(Path, "read_text", read)
+    else:
+        monkeypatch.setattr(_mod.os, "replace", replace)
+
+    _mod._seed_isolated_agy_mcp_permissions(bridge_dir)
+
+    assert settings.read_bytes() == original
+    assert list(settings.parent.iterdir()) == [settings]
+
+
+@pytest.mark.parametrize("escaped_parent", ["gemini", "cli"])
+def test_relay_permissions_leave_settings_outside_the_bridge_unchanged(
+    tmp_path: Path, escaped_parent: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    gemini_dir = agy_gemini_dir(bridge_dir)
+    outside = tmp_path / "outside"
+    settings = outside / (
+        "antigravity-cli/settings.json" if escaped_parent == "gemini" else "settings.json"
+    )
+    settings.parent.mkdir(parents=True)
+    original = b'{"theme":"dark","permissions":{"allow":["mcp(other/read)"]}}'
+    settings.write_bytes(original)
+    linked = gemini_dir if escaped_parent == "gemini" else gemini_dir / "antigravity-cli"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside, target_is_directory=True)
+
+    _mod._seed_isolated_agy_mcp_permissions(bridge_dir)
+
+    assert settings.read_bytes() == original
+    assert list(settings.parent.iterdir()) == [settings]
+
+
+def test_seed_isolated_agy_home_populates_empty_settings_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty or whitespace-only settings.json still receives the Omnigent allow-rule."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text("  \n", encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["permissions"] == {"allow": ["mcp(omnigent/*)"]}
+
+
+@pytest.mark.parametrize(
+    "raw_content",
+    [
+        "{not valid json",
+        "[]",
+        json.dumps({"permissions": "not-an-object"}),
+        json.dumps({"permissions": {"allow": "not-a-list"}}),
+    ],
+    ids=["invalid-json", "non-object-root", "non-object-permissions", "non-list-allow"],
+)
+def test_seed_isolated_agy_home_leaves_malformed_settings_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw_content: str
+) -> None:
+    """Malformed or unexpected-shape isolated settings.json is left untouched."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text(raw_content, encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    assert iso_settings.read_text(encoding="utf-8") == raw_content
 
 
 def test_seed_isolated_agy_home_prefers_real_onboarding_marker(

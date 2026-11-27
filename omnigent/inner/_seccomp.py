@@ -557,6 +557,12 @@ BASELINE_DENYLIST_SYSCALLS: tuple[str, ...] = (
 )
 
 
+def baseline_denylist_rules() -> list[SeccompRule]:
+    """Build fresh EPERM rules shared by filter loading and export."""
+    deny = scmp_act_errno(errno.EPERM)
+    return [SeccompRule(syscall=name, action=deny) for name in BASELINE_DENYLIST_SYSCALLS]
+
+
 def apply_baseline_denylist() -> None:
     """
     Install :data:`BASELINE_DENYLIST_SYSCALLS` as ``EPERM`` rules on the
@@ -576,6 +582,4 @@ def apply_baseline_denylist() -> None:
         libseccomp can't load, the filter context can't be built, or
         the kernel rejects the load.
     """
-    deny = scmp_act_errno(errno.EPERM)
-    rules = [SeccompRule(syscall=name, action=deny) for name in BASELINE_DENYLIST_SYSCALLS]
-    apply_seccomp_filter(rules)
+    apply_seccomp_filter(baseline_denylist_rules())

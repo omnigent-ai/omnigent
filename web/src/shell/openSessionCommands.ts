@@ -19,6 +19,7 @@ import {
 import { useMemo, useRef } from "react";
 
 import type { Chord } from "@/lib/shortcuts/chord";
+import { OPEN_SESSION_CHORDS } from "@/lib/shortcuts/registry";
 import {
   AVAILABLE,
   type CommandAvailability,
@@ -75,9 +76,6 @@ export interface OpenSessionCommand {
   nativeShortcut?: Chord;
 }
 
-const PIN_CHORD: Chord = { mod: true, alt: true, code: "KeyP" };
-const FORK_CHORD: Chord = { mod: true, alt: true, code: "KeyF" };
-const ARCHIVE_CHORD: Chord = { mod: true, shift: true, key: "a" };
 const PIN_SAVING_REASON = "A pin change is still saving.";
 
 function offeredUnless(offered: boolean, disabledReason?: string): CommandAvailability {
@@ -102,7 +100,7 @@ export function openSessionCommands(facts: OpenSessionFacts): OpenSessionCommand
       keywords: ["pin", "session"],
       icon: facts.pinned ? PinOffIcon : PinIcon,
       availability: offeredUnless(facts.pinnable, facts.pinSaving ? PIN_SAVING_REASON : undefined),
-      nativeShortcut: shortcut(PIN_CHORD),
+      nativeShortcut: shortcut(OPEN_SESSION_CHORDS.pin),
     },
     {
       id: "share",
@@ -117,7 +115,7 @@ export function openSessionCommands(facts: OpenSessionFacts): OpenSessionCommand
       keywords: ["fork", "copy", "branch"],
       icon: GitForkIcon,
       availability: offeredUnless(facts.canFork, facts.forkDisabledReason),
-      nativeShortcut: shortcut(FORK_CHORD),
+      nativeShortcut: shortcut(OPEN_SESSION_CHORDS.fork),
     },
     {
       id: "export",
@@ -153,7 +151,7 @@ export function openSessionCommands(facts: OpenSessionFacts): OpenSessionCommand
       keywords: ["archive", "session"],
       icon: facts.archived ? ArchiveRestoreIcon : ArchiveIcon,
       availability: AVAILABLE,
-      nativeShortcut: shortcut(ARCHIVE_CHORD),
+      nativeShortcut: shortcut(OPEN_SESSION_CHORDS.archive),
     },
     {
       id: "delete",

@@ -194,6 +194,14 @@ def env_wrapper_launch(
     return None
 
 
+def env_wrapper_command(
+    command: str, args: list[str], environ: Mapping[str, str] | None = None
+) -> tuple[str, list[str]] | None:
+    """Return the final executable and arguments after supported env layers."""
+    parsed = env_wrapper_launch(command, args, environ)
+    return (parsed.command, parsed.args) if parsed is not None else None
+
+
 def _normalize_env_wrapper_args(
     args: list[str],
     chdirs: list[str] | None = None,

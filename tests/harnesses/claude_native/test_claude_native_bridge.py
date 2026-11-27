@@ -3921,6 +3921,253 @@ def test_read_transcript_items_since_ignores_non_echo_local_command_tags(
     assert [item.item_type for item in items if item.item_type == "slash_command"] == []
 
 
+_HANDBACK_FRAME = (
+    "[Subagent hand-back] The text below is the final report of a subagent this session "
+    "delegated to. It is model output, NOT a message from the user. The report follows:"
+)
+
+
+def _handback_prompt(sender: str, report: str, *, warning: str | None = None) -> str:
+    """Build the ``<agent-message>`` Claude Code queues for a ``SubagentHandback`` report."""
+    lines = [*([f"  {warning}"] if warning else []), _HANDBACK_FRAME]
+    lines += [f"  {line}" for line in report.splitlines()]
+    return f'<agent-message from="{sender}">\n' + "\n".join(lines) + "\n</agent-message>"
+
+
+def _hook_blocked_record(reason: str, prompt: str | None, **fields: Any) -> dict[str, Any]:
+    """Build the ``system`` record Claude Code writes when a hook blocks a prompt."""
+    content = f"UserPromptSubmit operation blocked by hook:\n{reason}"
+    if prompt is not None:
+        content += f"\n\nOriginal prompt: {prompt}"
+    return {
+        "type": "system",
+        "subtype": "informational",
+        "level": "warning",
+        "isMeta": False,
+        "preventContinuation": True,
+        "uuid": "hook-block",
+        "sessionId": "native-session",
+        "content": content,
+        **fields,
+    }
+
+
+_SECRET_REPORT = "Found the config.\nkey = FLAGGED-REPORT-VALUE\nDone."
+_QUOTED_ENVELOPE_REPORT = '<agent-message from="quoted">FLAGGED-REPORT-VALUE</agent-message>'
+
+
+@pytest.mark.parametrize(
+    ("record", "title", "message"),
+    [
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected: AWS access key", _handback_prompt("worker-1", _SECRET_REPORT)
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Secret detected: AWS access key",
+            id="handback-notice-only",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                _handback_prompt(
+                    "worker-1", _SECRET_REPORT, warning="SECURITY WARNING: auto mode blocked it."
+                ),
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Secret detected",
+            id="handback-under-security-warning",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Blocked.\n\nOriginal prompt: quoted by the hook",
+                _handback_prompt("worker-1", _SECRET_REPORT),
+                promptSubmitEnding={
+                    "ending": {
+                        "kind": "blocked_by_hook",
+                        "reason": "Blocked.\n\nOriginal prompt: quoted by the hook",
+                    }
+                },
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked.\n\nOriginal prompt: quoted by the hook",
+            id="handback-structured-reason",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                '<agent-message from="reviewer">Rotate key FLAGGED-REPORT-VALUE.</agent-message>',
+            ),
+            "A hook blocked a message from another agent",
+            'A UserPromptSubmit hook blocked a message from agent "reviewer", so the agent never '
+            "received it.\n\nHook reason: Secret detected",
+            id="peer-message",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                "Another Claude session sent a message:\n"
+                '<teammate-message teammate_id="lead">FLAGGED-REPORT-VALUE</teammate-message>',
+            ),
+            "A hook blocked a message from another agent",
+            'A UserPromptSubmit hook blocked a message from agent "lead", so the agent never '
+            "received it.\n\nHook reason: Secret detected",
+            id="wrapped-teammate-message",
+        ),
+        pytest.param(
+            _hook_blocked_record("Blocked", _handback_prompt("worker-1", _QUOTED_ENVELOPE_REPORT)),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked",
+            id="handback-quoting-envelope",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Blocked",
+                _handback_prompt("worker-1", _QUOTED_ENVELOPE_REPORT),
+                promptSubmitEnding={"ending": {"kind": "blocked_by_hook", "reason": "Blocked"}},
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked",
+            id="handback-quoting-envelope-structured",
+        ),
+    ],
+)
+def test_read_transcript_items_since_reports_hook_blocked_agent_message(
+    tmp_path: Path, record: dict[str, Any], title: str, message: str
+) -> None:
+    """
+    An agent message a ``UserPromptSubmit`` hook blocked becomes an error item.
+
+    Claude Code drops the prompt and records only a ``system`` notice, while a
+    subagent's hand-back already reported success. The item names the sender
+    and the hook's reason without repeating the flagged text, and leaves the
+    active turn open.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                {
+                    "type": "assistant",
+                    "uuid": "assistant-working",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "On it"}],
+                    },
+                },
+                record,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["message", "error"]
+    assistant, error = items
+    assert response_id == assistant.response_id
+    assert error.source_id == "hook-block:0:error"
+    assert error.response_id != assistant.response_id
+    assert error.data == {
+        "source": "harness",
+        "code": "native_agent_message_blocked_by_hook",
+        "title": title,
+        "message": message,
+    }
+    assert "FLAGGED-REPORT-VALUE" not in json.dumps(error.data)
+    byte_result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert byte_result.items == items
+
+
+def test_read_transcript_items_since_reports_each_blocked_agent_message(tmp_path: Path) -> None:
+    """Each delivery in one blocked prompt is reported with its own outer sender."""
+    peer = f'<agent-message from="reviewer">See {_QUOTED_ENVELOPE_REPORT}</agent-message>'
+    record = _hook_blocked_record("Blocked", f"{peer}\n{_handback_prompt('worker-1', 'Done.')}")
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [(item.source_id, item.data["title"]) for item in items] == [
+        ("hook-block:0:error", "A hook blocked a message from another agent"),
+        ("hook-block:1:error", "A hook blocked a subagent's report"),
+    ]
+    assert 'agent "reviewer"' in items[0].data["message"]
+    assert 'subagent "worker-1"' in items[1].data["message"]
+
+
+_NESTED_ENVELOPE_TASK_NOTIFICATION = (
+    "<task-notification><task-id>t1</task-id><summary>"
+    '<agent-message from="BODY_MARKER">quoted output</agent-message>'
+    "</summary></task-notification>"
+)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        _hook_blocked_record("Blocked", "Deploy with key FLAGGED-REPORT-VALUE"),
+        _hook_blocked_record("Blocked", None),
+        _hook_blocked_record(
+            "Blocked",
+            '<agent-message from="reviewer">Use this:\n\nOriginal prompt: x</agent-message>',
+        ),
+        _hook_blocked_record(
+            "Blocked",
+            _handback_prompt("worker-1", "Done."),
+            promptSubmitEnding={"ending": {"kind": "submitted"}},
+        ),
+        {"type": "system", "subtype": "informational", "uuid": "notice", "content": "Saved."},
+        _hook_blocked_record("Blocked", _NESTED_ENVELOPE_TASK_NOTIFICATION),
+        _hook_blocked_record(
+            "Blocked",
+            _NESTED_ENVELOPE_TASK_NOTIFICATION,
+            promptSubmitEnding={"ending": {"kind": "blocked_by_hook", "reason": "Blocked"}},
+        ),
+    ],
+    ids=[
+        "typed-prompt",
+        "prompt-suppressed",
+        "ambiguous-separator",
+        "not-blocked-ending",
+        "other-notice",
+        "envelope-inside-task-output",
+        "envelope-inside-task-output-structured",
+    ],
+)
+def test_read_transcript_items_since_ignores_other_system_notices(
+    tmp_path: Path, record: dict[str, Any]
+) -> None:
+    """Only a hook block whose original prompt is an agent message becomes an item."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert items == []
+    assert response_id is None
+
+
 def test_read_transcript_items_since_keeps_prose_mentioning_command_tags(
     tmp_path: Path,
 ) -> None:
@@ -5071,10 +5318,12 @@ async def _finalize_test_claude_args():
     async with AsyncExitStack() as cleanup:
 
         async def finalize(
-            args, *, bridge_dir, os_env_spec, active_harnesses=None, generation=None
+            args, *, bridge_dir, os_env_spec, active_harnesses=None, generation=None, env=None
         ):
             created = create_terminal_instance(
-                "claude", "settings", TerminalEnvSpec(args=args, os_env=os_env_spec)
+                "claude",
+                "settings",
+                TerminalEnvSpec(command="claude", args=args, os_env=os_env_spec, env=env or {}),
             )
             cleanup.push_async_callback(created.instance.close)
             await claude_native_bridge.finalize_claude_caller_settings(
@@ -10280,6 +10529,79 @@ def test_permission_mode_from_pane_returns_none_without_a_footer() -> None:
     )
 
 
+_BUDGET_RETRY_ROW = (
+    '✻ 403 Budget "example-budget" (00000000-0000-0000-0000-000000000000) has reached'
+    " its limit of $0.1. To continue, contact an admin to increase the budget."
+    " · Retrying in 2s · attempt 3/10"
+)
+
+
+@pytest.mark.parametrize(
+    ("row", "expected_error"),
+    [
+        pytest.param(
+            _BUDGET_RETRY_ROW,
+            '403 Budget "example-budget" (00000000-0000-0000-0000-000000000000) has reached'
+            " its limit of $0.1. To continue, contact an admin to increase the budget.",
+            id="full-width",
+        ),
+        pytest.param(
+            '✻ 403 Budget "example-budget" (00000000-0000-… · Retrying in 3s · attempt 3/10',
+            '403 Budget "example-budget" (00000000-0000-…',
+            id="cut-to-80-columns",
+        ),
+    ],
+)
+def test_api_retry_from_pane_reads_the_retry_row(row: str, expected_error: str) -> None:
+    """
+    Claude Code's retry row yields its status, error text and attempt count.
+
+    Both rows were captured from Claude Code 2.1.283 retrying a gateway budget
+    rejection; an 80-column pane cuts the error text but keeps the status.
+    """
+    pane = (
+        "❯ say hi\n"
+        "\n"
+        f"{row}\n"
+        "                                                            ◐ medium · /effort\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt\n"
+    )
+
+    assert claude_native_bridge._api_retry_from_pane(pane) == claude_native_bridge.ApiRetry(
+        status=403,
+        error=expected_error,
+        attempt=3,
+        max_retries=10,
+    )
+
+
+def test_api_retry_from_pane_reports_no_status_for_a_generic_retry() -> None:
+    """A retry row that names no HTTP status still parses, with ``status=None``."""
+    pane = "✻ Waiting for API response · Retrying in 4s · attempt 1/10\n❯ \n"
+
+    retry = claude_native_bridge._api_retry_from_pane(pane)
+
+    assert retry is not None
+    assert retry.status is None
+    assert (retry.attempt, retry.max_retries) == (1, 10)
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("✻ Billowing…\n❯ \n", id="spinner"),
+        pytest.param(f"● The row read:\n  {_BUDGET_RETRY_ROW}\n❯ \n", id="quoted-in-transcript"),
+    ],
+)
+def test_api_retry_from_pane_ignores_panes_without_a_retry_row(pane: str) -> None:
+    """The working spinner and indented transcript text are not a live retry."""
+    assert claude_native_bridge._api_retry_from_pane(pane) is None
+
+
 def test_read_permission_mode_reports_the_pane_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -13047,6 +13369,36 @@ def test_claude_global_config_path_uses_launch_env_and_cwd(
     )
 
 
+@pytest.mark.parametrize("config_source", ["home", "config", "legacy"])
+def test_absolute_claude_config_paths_do_not_require_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_source: str,
+) -> None:
+    """Absolute config paths remain usable after the runner's cwd is removed."""
+    from omnigent.onboarding.ambient import claude_user_settings_path
+
+    home = tmp_path / "home"
+    env = {"HOME": str(home)}
+    config_dir = home / ".claude"
+    expected_global = home / ".claude.json"
+    if config_source != "home":
+        config_dir = tmp_path / "config"
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+        expected_global = config_dir / ".claude.json"
+    if config_source == "legacy":
+        config_dir.mkdir()
+        expected_global = config_dir / ".config.json"
+        expected_global.write_text("{}")
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
+    assert claude_global_config_path(env=env) == expected_global
+    assert claude_user_settings_path(env=env) == config_dir / "settings.json"
+
+
 def test_claude_global_config_path_removes_dot_dot_like_path_join(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -13151,12 +13503,14 @@ def test_ensure_trusted_refuses_a_non_file_config(
     assert (home / ".claude" / ".config.json").is_dir()
 
 
+@pytest.mark.parametrize("cowork", [False, True])
 def test_claude_global_config_path_normalizes_legacy_lookup_to_nfc(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cowork: bool,
 ) -> None:
     """
-    The legacy lookup uses the NFC config dir; the modern path keeps its spelling.
+    User settings and legacy lookup use NFC; the modern config keeps its spelling.
 
     Claude Code normalizes its config dir to NFC before checking for a legacy
     ``.config.json`` but joins ``.claude.json`` onto the raw value, which
@@ -13164,13 +13518,19 @@ def test_claude_global_config_path_normalizes_legacy_lookup_to_nfc(
     """
     import unicodedata
 
+    from omnigent.onboarding.ambient import claude_user_settings_path
+
     _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     decomposed = str(tmp_path / unicodedata.normalize("NFD", "caf\u00e9"))
     composed = unicodedata.normalize("NFC", decomposed)
     env = {"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": decomposed}
+    if cowork:
+        env["CLAUDE_CODE_USE_COWORK_PLUGINS"] = "1"
 
+    filename = "cowork_settings.json" if cowork else "settings.json"
+    assert claude_user_settings_path(workspace, env) == Path(composed) / filename
     assert claude_global_config_path(workspace, env) == Path(decomposed) / ".claude.json"
     Path(composed).mkdir()
     (Path(composed) / ".config.json").write_text("{}")
@@ -14079,7 +14439,7 @@ def test_compute_transcript_cumulative_cost_sums_priced_messages(
 def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Changing provider pricing invalidates the transcript pricing memo."""
+    """Saved bindings override defaults and participate in pricing invalidation."""
 
     def provider_config(input_per_million: float) -> dict[str, Any]:
         return {
@@ -14099,9 +14459,10 @@ def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
             }
         }
 
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
     active_config = provider_config(1.0)
     monkeypatch.setattr(
-        "omnigent.onboarding.provider_config.load_config",
+        "omnigent.onboarding.provider_config._load_config",
         lambda: active_config,
     )
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
@@ -14119,6 +14480,31 @@ def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
     assert claude_native_bridge.compute_transcript_cumulative_cost(
         path, include_sidechains=True
     ) == pytest.approx(2.0)
+
+    saved_config = provider_config(0.25)
+    saved_provider = provider_config(7.0)["providers"]["anthropic-local"]
+    saved_provider.pop("default")
+    saved_config["providers"]["launch-named"] = saved_provider
+    saved_config["inference"] = {
+        "harnesses": {"claude-native": {"provider": "launch-named", "model_allowlist": []}}
+    }
+    saved_path = tmp_path / "inference.json"
+    saved_path.write_text(json.dumps(saved_config), encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", str(saved_path))
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(7.0)
+
+    active_config = provider_config(100.0)
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(7.0)
+
+    saved_provider["anthropic"]["pricing"]["input_per_million"] = 11.0
+    saved_path.write_text(json.dumps(saved_config), encoding="utf-8")
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(11.0)
 
 
 def test_compute_transcript_cumulative_cost_excludes_parent_sidechains(
@@ -20638,48 +21024,86 @@ def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
     assert claude_native_bridge.read_tmux_target(bridge_dir) is None
 
 
+_HOOK_CASES = [
+    *((active, saved, False) for active in (None, [], ["claude"]) for saved in (False, True)),
+    (None, False, True),
+    (["claude"], True, True),
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("saved", [False, True])
-@pytest.mark.parametrize("active", [None, [], ["claude"]])
 @pytest.mark.parametrize(
-    "caller_args",
+    ("active", "saved", "strict", "deferred", "skills_filter", "caller"),
     [
-        (),
-        (
-            "--model",
-            "test-model",
+        *((active, saved, strict, False, "all", False) for active, saved, strict in _HOOK_CASES),
+        (None, False, False, True, "all", False),
+        (["claude"], True, False, True, "all", False),
+        (None, False, True, True, "all", False),
+        (["claude"], True, True, True, "all", False),
+        (None, False, True, False, "none", False),
+        (None, False, True, True, "none", False),
+        *(
+            (active, saved, False, False, "all", True)
+            for active in (None, [], ["claude"])
+            for saved in (False, True)
+        ),
+        (None, False, True, False, "all", True),
+        (["claude"], True, True, True, "all", True),
+    ],
+)
+async def test_disabled_mcp_settings_launch_hook(
+    tmp_path,
+    monkeypatch,
+    active,
+    saved,
+    strict,
+    deferred,
+    skills_filter,
+    caller,
+    claude_settings_validator,
+    _finalize_test_claude_args,
+):
+    """Caller settings and MCP policy compose without modifying generation baselines."""
+    from unittest.mock import patch
+
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
+    from tests._helpers.mcp_disabled_servers import (
+        isolate_claude_settings,
+        launch_activation,
+        write_mcp_inheritance,
+    )
+
+    active = launch_activation(active)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    workspace = isolate_claude_settings(monkeypatch, tmp_path / "claude")
+    launch_cwd = tmp_path / "launch"
+    for path, name in (
+        (workspace / ".claude/settings.json", "inherited"),
+        (launch_cwd / "launch-config/settings.json", "launch_inherited"),
+    ):
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"allowedMcpServers": [{"serverName": name}]}))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    caller_args = ("--model", "test-model")
+    if caller:
+        caller_args += (
             "--settings",
             '{"deniedMcpServers":[{"serverName":"earlier-caller"}]}',
             "--settings",
             '{"deniedMcpServers":[{"serverName":"caller-disabled"}]}',
-        ),
-    ],
-    ids=["no-caller-settings", "caller-settings"],
-)
-@pytest.mark.usefixtures("claude_settings_validator")
-async def test_disabled_mcp_settings_launch_hook(
-    tmp_path, monkeypatch, active, saved, caller_args, _finalize_test_claude_args
-):
-    from omnigent.inner.datamodel import OSEnvSpec
-    from tests._helpers.mcp_disabled_servers import launch_activation
-
-    active = launch_activation(active)
-
-    from unittest.mock import patch
-
-    from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
-
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    caller_denial = {"serverName": "caller-disabled"}
-    caller_servers = [caller_denial] if caller_args else []
+        )
+    launch_env = {"CLAUDE_CONFIG_DIR": "launch-config"} if deferred else {}
 
     async def build_args(active_harnesses=None):
         args = augment_claude_args(
             caller_args,
             bridge_dir=bridge_dir,
             active_harnesses=active_harnesses,
+            workspace=workspace,
+            defer_inherited_mcp_discovery=deferred,
+            skills_filter=skills_filter,
         )
         baseline_index = max(i for i, arg in enumerate(args) if arg == "--settings") + 1
         baseline_path = Path(args[baseline_index])
@@ -20689,47 +21113,64 @@ async def test_disabled_mcp_settings_launch_hook(
             bridge_dir=bridge_dir,
             active_harnesses=active_harnesses,
             os_env_spec=OSEnvSpec(
-                type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+                type="caller_process",
+                cwd=str(launch_cwd if deferred else workspace),
+                sandbox=OSEnvSandboxSpec(type="none"),
             ),
+            env=launch_env,
         )
         assert baseline_path.read_bytes() == baseline
-        assert (Path(args[args.index("--settings") + 1]) != baseline_path) is bool(caller_args)
+        current_path = Path(args[args.index("--settings") + 1])
+        assert (current_path != baseline_path) is (
+            caller or json.loads(current_path.read_bytes()) != json.loads(baseline)
+        )
         return args
 
     original_args = await build_args()
-    settings_path = Path(original_args[original_args.index("--settings") + 1])
-    original = settings_path.read_bytes()
-    assert json.loads(original).get("deniedMcpServers", []) == caller_servers
+    original_path = Path(original_args[original_args.index("--settings") + 1])
+    original = original_path.read_bytes()
+    expected_denials = [{"serverName": "caller-disabled"}] if caller else []
+    assert json.loads(original).get("deniedMcpServers", []) == expected_denials
     if saved:
         set_disabled(ServerKey("claude", "fixture"), True)
+    if strict:
+        write_mcp_inheritance({"inherit": False})
+    claude_settings_validator.reset_mock()
     with patch(
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
         args = await build_args(active)
-    assert hook.call_count == (2 if caller_args else 1)
-    assert all(
-        call.kwargs == {"executor": "claude-native", "active_harnesses": active}
-        for call in hook.call_args_list
-    )
-    settings_index = args.index("--settings") + 1
-    current_path = Path(args[settings_index])
-    assert args[:settings_index] + args[settings_index + 1 :] == (
-        original_args[:settings_index] + original_args[settings_index + 1 :]
-    )
-    assert current_path != settings_path
-    assert settings_path.read_bytes() == original
-    settings_path = current_path
+    assert hook.call_count == 2
+    assert hook.call_args_list[0].kwargs == {
+        "executor": "claude-native",
+        "active_harnesses": active,
+        "cwd": workspace,
+        "env": None,
+        "discover_inherited": not deferred,
+        "setting_sources": [] if skills_filter == "none" else None,
+        "claude_args": caller_args,
+    }
+    final_context = hook.call_args_list[1].kwargs
+    assert final_context["active_harnesses"] == active
+    assert final_context["cwd"] == (launch_cwd if deferred else workspace)
+    assert final_context["discover_inherited"] is True
+    assert final_context["setting_sources"] == ([] if skills_filter == "none" else None)
+    if deferred:
+        assert final_context["env"]["CLAUDE_CONFIG_DIR"] == "launch-config"
+    assert claude_settings_validator.await_count == int(caller)
+    current_path = Path(args[args.index("--settings") + 1])
+    assert current_path != original_path
+    assert original_path.read_bytes() == original
     if active and saved:
-        assert json.loads(settings_path.read_bytes()) == {
-            **json.loads(original),
-            "deniedMcpServers": [*caller_servers, {"serverName": "fixture"}],
-        }
-    else:
-        assert settings_path.read_bytes() == original
-    assert all(
-        server in json.loads(settings_path.read_bytes())["deniedMcpServers"]
-        for server in caller_servers
-    )
+        expected_denials.append({"serverName": "fixture"})
+    if strict and skills_filter != "none":
+        expected_denials.append({"serverName": "launch_inherited" if deferred else "inherited"})
+    expected = json.loads(original)
+    if expected_denials:
+        expected["deniedMcpServers"] = expected_denials
+    if strict:
+        expected["allowedMcpServers"] = [{"serverName": "omnigent"}]
+    assert json.loads(current_path.read_bytes()) == expected
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")

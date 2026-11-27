@@ -5,10 +5,18 @@
 
 import { randomUUID } from "@/lib/randomUUID";
 import { newPendingSideChatId } from "@/lib/sideChat";
+import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 
 import { isPinnedTab, withPinnedFirst } from "./pinnedTabs";
 import { createShellWaits } from "./shellWaits";
 import { type HistoryMoveOptions, WorkspaceHistory } from "./workspaceHistory";
+import {
+  type AppliedTabSettings,
+  sameAppliedTabSettings,
+  settingsPagePlace,
+  tabSettingsChange,
+  type WorkspaceTabSettings,
+} from "./workspaceTabSettings";
 import {
   bindingForPlace,
   canShow,
@@ -157,6 +165,10 @@ export interface WorkspaceTabsStoreOptions {
   newDraftKey?: () => string;
   /** How many comparisons the person has chosen for the session, stamped on each landing. */
   choiceCount?: () => number;
+  /** Told the file's path each time an open or a navigation lands a tab on a file. */
+  onFileOpened?: (path: string) => void;
+  /** How many times the session's folder has moved, stamped on each landing. */
+  folderCount?: () => number;
 }
 
 /** A line, column or comment move inside the same file, which history records in place. */
@@ -197,6 +209,8 @@ export interface TabLanding {
   settled: boolean;
   /** The session's choice count as it landed; a pick since is newer than the visit. */
   choices: number;
+  /** The session's folder moves as it landed; a folder chosen since is newer than the visit. */
+  folders: number;
 }
 
 export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
@@ -213,14 +227,18 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     newViewKey = () => randomUUID(),
     newDraftKey = newPendingSideChatId,
     choiceCount = () => 0,
+    onFileOpened,
+    folderCount = () => 0,
   } = options;
 
   let tabs: WorkspaceTabRecord[] = withPinnedFirst([...options.initial.tabs]);
   // Each tab's latest landing on a visit by a step, a link or an open, which its view settles once.
   const landings = new Map<TabId, TabLanding>();
-  const land = (tabId: TabId) => landings.set(tabId, { settled: false, choices: choiceCount() });
+  const land = (tabId: TabId) =>
+    landings.set(tabId, { settled: false, choices: choiceCount(), folders: folderCount() });
   let selectedTabId: TabId | null = options.initial.selectedTabId;
   let closed: ClosedTab[] = [...options.initial.closed];
+  let tabSettings: AppliedTabSettings | undefined = options.initial.tabSettings;
   let revision = 0;
   // Dirty-state changes bump the revision too. One made by answering the very
   // question being asked (discarding the edits) is excused, so it isn't "newer".
@@ -272,7 +290,14 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
 
   function serialize(): WorkspaceTabsSessionState {
     const { visits, cursor } = history.serialize();
-    return { tabs, selectedTabId, timeline: visits, cursor, closed };
+    return {
+      tabs,
+      selectedTabId,
+      timeline: visits,
+      cursor,
+      closed,
+      ...(tabSettings ? { tabSettings } : {}),
+    };
   }
 
   function commit() {
@@ -517,6 +542,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         commit();
         return applied;
       });
+      noteFileOpened(result.tabId);
       // A tab opened into an empty sidebar is selected even when the plan didn't ask.
       return { ok: true as const, ...result, selected: selectedTabId === result.tabId };
     };
@@ -558,6 +584,12 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     return tab.id;
   }
 
+  /** Tell `onFileOpened` about the file `tabId` now shows, if it shows one. */
+  function noteFileOpened(tabId: TabId | null) {
+    const tab = tabId === null ? undefined : findTab(tabId);
+    if (tab?.place.kind === "files" && tab.place.path !== undefined) onFileOpened?.(tab.place.path);
+  }
+
   /** Show `place` in `tabId` in place: a step when the tab is selected (or a replacement). */
   async function navigate(
     tabId: TabId,
@@ -584,6 +616,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
           }
         }
         commit();
+        noteFileOpened(tabId);
         return { ok: true as const };
       }),
     );
@@ -1049,6 +1082,88 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     commit();
   }
 
+  /** The open tab that shows a settings page: the Files tab for Files, else the page itself. */
+  function settingsPageTab(page: DefaultWorkspaceTab): WorkspaceTab | undefined {
+    if (page === "files") return knownTabs().find((tab) => tab.role === "files");
+    const identity = placeIdentity(settingsPagePlace(page));
+    return knownTabs().find((tab) => !tab.binding && placeIdentity(tab.place) === identity);
+  }
+
+  function addSettingsPageTab(page: DefaultWorkspaceTab, pinned: boolean): WorkspaceTab {
+    const tab: WorkspaceTab = {
+      id: newTabId(),
+      place: settingsPagePlace(page),
+      openedBy: "restore",
+      ...(page === "files" ? { role: "files" as const } : {}),
+      ...(pinned ? { pinned: true as const } : {}),
+    };
+    tabs = [...tabs, tab];
+    return tab;
+  }
+
+  /**
+   * Follow the Workspace settings' pinned pages and first page, as far as this session can
+   * show them (`canShowPage`). A strip takes them all once, then only what a setting changed.
+   */
+  function applyTabSettings(
+    settings: WorkspaceTabSettings,
+    canShowPage: (page: DefaultWorkspaceTab) => boolean,
+  ): boolean {
+    // Only pages the strip will add take room under the cap, in Settings order: not ones
+    // already open, already taken (a closed pin stays closed), or the session can't show.
+    const empty = isOnlyEmptyNewTab(tabs);
+    // Only a strip opening on the settings gives its New tab's place to the pins. A pin that
+    // arrives later, as the session can show it or a setting changes, joins the strip as is.
+    const opening = tabSettings === undefined;
+    let room = MAX_WORKSPACE_TABS - (empty && opening ? 0 : tabs.length);
+    const taken = tabSettings?.pinned ?? [];
+    const openable = new Set<DefaultWorkspaceTab>();
+    for (const page of settings.pinned) {
+      if (settingsPageTab(page)) openable.add(page);
+      else if (!taken.includes(page) && canShowPage(page) && room > 0) {
+        openable.add(page);
+        room -= 1;
+      }
+    }
+    const change = tabSettingsChange(settings, tabSettings, {
+      canShow: canShowPage,
+      // The first page, unpinned, opens after the pins when there is room for it too.
+      canOpen: (page) => openable.has(page) || settingsPageTab(page) !== undefined || room > 0,
+      untouched: empty,
+    });
+    const nothingToDo =
+      change.pin.length === 0 && change.unpin.length === 0 && change.select === null;
+    if (nothingToDo && sameAppliedTabSettings(tabSettings, change.applied)) return false;
+    tabSettings = change.applied;
+    if ((opening && change.pin.length > 0) || change.select !== null) takeEmptyNewTabsPlace();
+    const unpinned = new Set(change.unpin.map(settingsPageTab).map((tab) => tab?.id));
+    const pinned = new Set<TabId>();
+    for (const page of change.pin) {
+      const tab = settingsPageTab(page);
+      if (tab) pinned.add(tab.id);
+      else addSettingsPageTab(page, true);
+    }
+    tabs = tabs.map((tab) => {
+      if (isUnknownTab(tab)) return tab;
+      if (pinned.has(tab.id)) return { ...tab, pinned: true as const };
+      if (!unpinned.has(tab.id) || !isPinnedTab(tab)) return tab;
+      const { pinned: _pinned, ...rest } = tab;
+      return rest;
+    });
+    if (change.select !== null) {
+      // A pinned page the user closed comes back pinned, as Settings still shows it.
+      const tab =
+        settingsPageTab(change.select) ??
+        addSettingsPageTab(change.select, settings.pinned.includes(change.select));
+      if (tab.id !== selectedTabId) {
+        markSelected(tab.id);
+        history.recordStep(visitOf(tab));
+      }
+    }
+    commit();
+    return true;
+  }
+
   /** Pin `tabIds` to the strip's start, after the pinned tabs, or unpin them to just after. */
   function setPinned(tabIds: readonly TabId[], pinned: boolean): boolean {
     const ids = new Set(tabIds);
@@ -1251,6 +1366,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     recentlySelected = recentlySelected.filter((id) => id !== tabId || next.id === tabId);
     history.replaceNewTab(tabId, { tabId: next.id, place });
     commit();
+    noteFileOpened(next.id);
     return next.id;
   }
 
@@ -1286,6 +1402,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     closeOthers,
     closeMany,
     setPinned,
+    applyTabSettings,
     invalidate,
     noteDirtyChange,
     askToLeave,

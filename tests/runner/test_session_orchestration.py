@@ -573,6 +573,8 @@ async def test_independent_creation_uncertain_result_is_not_retried(
         assert "host_id" not in result
     assert "conversation_id" not in result
     assert len(requests) == 1
+    # A managed create outwaits a slow server before calling the result uncertain.
+    assert requests[0].extensions["timeout"]["read"] == (120.0 if placement == "managed" else 30.0)
 
 
 @pytest.mark.asyncio

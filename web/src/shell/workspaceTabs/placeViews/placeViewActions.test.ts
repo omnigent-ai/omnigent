@@ -107,7 +107,41 @@ describe("Changes tab", () => {
       place: { kind: "changes", path: "a.go", comparison: shown },
       replace: false,
     });
-    expect(changesComparisonShown(current, shown, false)).toMatchObject({ replace: true });
+    expect(changesComparisonShown(current, shown, false)).toMatchObject({
+      replace: true,
+    });
+  });
+
+  it("keeps the folder whose review showed the comparison, and drops it for the workspace", () => {
+    const shown = { kind: "saved", intent: "head" } as const;
+    const worktree = "/repo/.worktrees/feature";
+    const inFolder = changesComparisonShown({ kind: "changes" }, shown, true, worktree);
+    expect(inFolder).toMatchObject({
+      place: { kind: "changes", comparison: shown, comparisonRoot: worktree },
+    });
+    const backHome = changesComparisonShown(
+      { kind: "changes", comparison: shown, comparisonRoot: worktree },
+      shown,
+      true,
+    );
+    expect(backHome).toEqual({
+      type: "navigate",
+      place: { kind: "changes", comparison: shown },
+      replace: false,
+    });
+    // A file's own tab and the overview keep the visit's folder with its comparison.
+    const visit = {
+      kind: "changes" as const,
+      path: "a.go",
+      comparison: shown,
+      comparisonRoot: worktree,
+    };
+    expect(changesOverview({ ...visit })).toMatchObject({
+      place: { comparison: shown, comparisonRoot: worktree },
+    });
+    expect(changesFileInNewTab({ ...visit }, "b.go", { background: false })).toMatchObject({
+      link: { place: { path: "b.go", comparison: shown, comparisonRoot: worktree } },
+    });
   });
 });
 

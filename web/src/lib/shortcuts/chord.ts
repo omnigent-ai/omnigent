@@ -20,6 +20,8 @@ export interface Chord {
   exactKey?: boolean;
   /** Also fires while AltGr is reported, as the chords that never checked for it always have. */
   matchesAltGraph?: boolean;
+  /** With `mod`: ⌘, Control, or both satisfy it on every platform, as on a list's Delete chord. */
+  eitherCommandKey?: boolean;
 }
 
 /** The fields a chord is matched against. */
@@ -65,14 +67,19 @@ export function chordMatches(
 ): boolean {
   const keys = "getModifierState" in input ? keyChordInput(input) : input;
   if (keys.altGraph && !chord.matchesAltGraph) return false;
-  const wanted = physicalModifiers(chord, mac);
-  if (keys.metaKey !== wanted.meta || keys.ctrlKey !== wanted.ctrl) return false;
-  if (keys.altKey !== wanted.alt || keys.shiftKey !== wanted.shift) return false;
+  if (!modifiersMatch(chord, keys, mac)) return false;
   if (chord.code !== undefined) return keys.code === chord.code;
   if (chord.key === undefined) return false;
   return chord.exactKey
     ? keys.key === chord.key
     : keys.key.toLowerCase() === chord.key.toLowerCase();
+}
+
+function modifiersMatch(chord: Chord, keys: KeyChordInput, mac: boolean): boolean {
+  const wanted = physicalModifiers(chord, mac);
+  if (keys.altKey !== wanted.alt || keys.shiftKey !== wanted.shift) return false;
+  if (chord.mod && chord.eitherCommandKey) return keys.metaKey || keys.ctrlKey;
+  return keys.metaKey === wanted.meta && keys.ctrlKey === wanted.ctrl;
 }
 
 /** Modifier key caps: symbols on macOS, words elsewhere; Shift is ⇧ everywhere. */

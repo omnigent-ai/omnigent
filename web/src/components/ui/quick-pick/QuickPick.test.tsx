@@ -920,3 +920,97 @@ describe("QuickPick rendering", () => {
     expect(summary.mock.calls.length - settled).toBe(1);
   });
 });
+
+describe("QuickPick preview", () => {
+  const preview = () => document.querySelector("[data-slot=quick-pick-preview]");
+
+  it("adds no preview pane unless the caller renders one", () => {
+    renderPicker();
+    expect(preview()).toBeNull();
+  });
+
+  it("previews the active row beside the list and follows it as it moves", () => {
+    const { input } = renderPicker({
+      renderPreview: (row) => <p>Preview of {row.label}</p>,
+    });
+    expect(preview()).toHaveTextContent("Preview of New session");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(preview()).toHaveTextContent("Preview of Open settings");
+  });
+
+  it("says there's no preview when no row is active", () => {
+    const { input } = renderPicker({ renderPreview: (row) => <p>Preview of {row.label}</p> });
+    fireEvent.change(input, { target: { value: "zzz-no-match" } });
+    expect(preview()).toHaveTextContent("No preview");
+  });
+
+  it("keeps the pane, saying there's no preview, for a row that renders none", () => {
+    const { input } = renderPicker({
+      renderPreview: (row) => (row.label === "New session" ? undefined : <p>Preview</p>),
+    });
+    expect(preview()).toHaveTextContent("No preview");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(preview()).toHaveTextContent("Preview");
+  });
+});
+
+describe("QuickPick content below the query field", () => {
+  it("shows between the field and the rows", () => {
+    renderPicker({ belowInput: <p>Filters</p> });
+    const below = screen.getByText("Filters");
+    const field = screen.getByRole("combobox", { name: "Command palette" });
+    const list = screen.getByRole("listbox", { name: "Command palette" });
+    expect(field.compareDocumentPosition(below) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(below.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe("QuickPick switcher presentation", () => {
+  it("hides its field but keeps the list's keys on it, and lists every row", () => {
+    const { input, onAccept } = renderPicker({ presentation: "switcher" });
+    expect(input).toHaveAttribute("readonly");
+    expect(input.closest(".sr-only")).not.toBeNull();
+    expect(input).toHaveFocus();
+    expect(optionNames()).toEqual(["New session⌘N", "Open settings"]);
+    expect(
+      screen.getByRole("listbox", { name: "Command palette" }).closest(".min-h-16"),
+    ).not.toBeNull();
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(activeOption(input)).toHaveTextContent("Open settings");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onAccept).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "open-settings" }),
+      expect.anything(),
+    );
+  });
+
+  it("leaves the default field visible and editable", () => {
+    const { input } = renderPicker();
+    expect(input).not.toHaveAttribute("readonly");
+    expect(input.closest(".sr-only")).toBeNull();
+  });
+});
+
+describe("QuickPick switcher header", () => {
+  it("shows no back button or end control, which would take focus where nothing shows", () => {
+    renderPicker({
+      presentation: "switcher",
+      onBack: vi.fn(),
+      backLabel: "Back",
+      inputEnd: <button type="button">Options</button>,
+    });
+    expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Options" })).toBeNull();
+  });
+
+  it("keeps both in the default presentation", () => {
+    renderPicker({
+      onBack: vi.fn(),
+      backLabel: "Back",
+      inputEnd: <button type="button">Options</button>,
+    });
+    expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Options" })).toBeTruthy();
+  });
+});
