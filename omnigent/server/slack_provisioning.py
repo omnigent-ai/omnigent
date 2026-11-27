@@ -58,7 +58,7 @@ DEFAULT_RRULE = "FREQ=MINUTELY;INTERVAL=10"
 DEFAULT_MCP_SERVICES: tuple[str, ...] = ()
 # Reasons in a 401/403 that mean the owner must sign in again, not a setup problem.
 _LOGIN_PROBLEM = re.compile(
-    r"expired|sign(?:ed)? ?in|log ?in|unauthenticated|invalid (?:token|credential)|token",
+    r"expired|sign(?:ed)? ?in|log ?in|unauthenticated|invalid (?:token|credential)",
     re.IGNORECASE,
 )
 _AGENT_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -462,7 +462,10 @@ class SlackProvisioner:
         """
         waiting = None
         if not self.config.api_url_for(binding):
-            waiting = "The project owner needs to add the automation API URL in Slack settings"
+            waiting = (
+                "This app has no automation service set up for Slack channels. Whoever deploys "
+                "it needs to set OMNIGENT_SLACK_AUTOMATION_API_URL; then Retry"
+            )
         elif not self.config.relay_url_for(binding):
             waiting = "The project owner needs to save this link once to set where it calls back"
         if waiting is not None:

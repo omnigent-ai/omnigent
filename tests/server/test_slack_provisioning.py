@@ -277,7 +277,9 @@ def test_a_link_without_an_automation_url_waits(db_uri: str) -> None:
         db_uri, config=SlackAutomationConfig(), destination={"relay_url": "https://f.example.com"}
     )
     waiting = _run(provisioner.provision(project, binding, actor_user_id=None))
-    assert waiting.state == "claimed" and "automation API URL" in (waiting.last_error or "")
+    assert waiting.state == "claimed" and "OMNIGENT_SLACK_AUTOMATION_API_URL" in (
+        waiting.last_error or ""
+    )
     assert service.calls == []
 
 
@@ -394,6 +396,14 @@ def test_a_403_setup_problem_is_not_reported_as_an_expired_login(db_uri: str) ->
     assert "not an expired login" in (failed.last_error or "")
     _, service, provisioner, project, binding = _setup(db_uri, status=403, channel_id="C0403")
     service.detail = "Token expired"
+    assert _run(provisioner.provision(project, binding, actor_user_id=None)).state == (
+        "needs_reconnect"
+    )
+    _, service, provisioner, project, binding = _setup(db_uri, status=403, channel_id="C0404")
+    service.detail = "MCP token missing for service slack"
+    assert _run(provisioner.provision(project, binding, actor_user_id=None)).state == "error"
+    _, service, provisioner, project, binding = _setup(db_uri, status=403, channel_id="C0405")
+    service.detail = "Invalid token"
     assert _run(provisioner.provision(project, binding, actor_user_id=None)).state == (
         "needs_reconnect"
     )
