@@ -207,6 +207,7 @@ import {
   resolveSessionHost,
   subscribeIdentity,
 } from "@/lib/identity";
+import { SESSION_READ_TIMEOUT_MS, withReadTimeout } from "@/lib/sessionReadTimeout";
 import { isDatabricksWorkspace, isHostRoutingEnabled } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
@@ -2188,9 +2189,6 @@ const FLASH_DURATION_MS = 1500;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
-// A session snapshot or items read still unanswered after this counts as failed,
-// so its caller retries instead of waiting on a request the server never answers.
-export const SESSION_READ_TIMEOUT_MS = 15_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = SESSION_READ_TIMEOUT_MS;
 // A send whose POST is still open after this says so on its bubble.
 export const SEND_STILL_SENDING_AFTER_MS = 10_000;
@@ -5659,28 +5657,6 @@ const SNAPSHOT_LOAD_RETRIES = 2;
  * finishes while a hung one stays bounded.
  */
 const snapshotLoadDeadlineMs = (attempt: number): number => SESSION_READ_TIMEOUT_MS * 2 ** attempt;
-
-/** Run a session read, rejecting with a retryable timeout if the server never answers. */
-async function withReadTimeout<T>(
-  read: (signal: AbortSignal) => Promise<T>,
-  timeoutMs = SESSION_READ_TIMEOUT_MS,
-): Promise<T> {
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      const error = new DOMException("session read timed out", "TimeoutError");
-      controller.abort(error);
-      reject(error);
-    }, timeoutMs);
-  });
-  try {
-    // The race also bounds a read that is stuck before it reaches the signal.
-    return await Promise.race([read(controller.signal), timedOut]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 /**
  * Run a conversation's snapshot load, repeating a failure a retry can fix (a

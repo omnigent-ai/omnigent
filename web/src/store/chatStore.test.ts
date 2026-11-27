@@ -81,7 +81,13 @@ import {
   promoteSessionDraft,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
-import { getCurrentAuthorId, getCurrentUserId, subscribeIdentity } from "@/lib/identity";
+import {
+  getCurrentAuthorId,
+  getCurrentUserId,
+  setSessionHostResolver,
+  subscribeIdentity,
+} from "@/lib/identity";
+import { SESSION_READ_TIMEOUT_MS } from "@/lib/sessionReadTimeout";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
@@ -126,7 +132,6 @@ import {
   pumpStreamEvents,
   retryConversationLoad,
   SEND_STILL_SENDING_AFTER_MS,
-  SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
   isListeningForInitialPrompt,
@@ -3779,6 +3784,44 @@ describe("chatStore — send (first-send ordering)", () => {
         conversationRegistry.peek("conv_hostless")!.getState().conversationLoadError,
       ).toBeNull();
       expect(slots.heldByTab()).toBe(1);
+    });
+
+    it("opens a session whose host resolver never answers its first lookup", async () => {
+      vi.useFakeTimers();
+      vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+      seedSession("conv_lost_resolve", []);
+      const lookups: (AbortSignal | undefined)[] = [];
+      // The first lookup is lost, like a request on a dead connection; a retry answers.
+      setSessionHostResolver((id, options) => {
+        lookups.push(options?.signal);
+        if (lookups.length === 1) return new Promise<void>(() => {});
+        setSessionHost(id, "host_found");
+        return Promise.resolve();
+      });
+      const streamOpened = () =>
+        fetchMock.mock.calls.some(
+          ([input]) => String(input).split("?")[0] === "/v1/sessions/conv_lost_resolve/stream",
+        );
+
+      try {
+        const switched = useChatStore.getState().switchTo("conv_lost_resolve");
+        await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS - 1_000);
+        const entry = conversationRegistry.peek("conv_lost_resolve")!;
+        expect(entry.getState().loadingConversation).toBe(true);
+        expect(streamOpened()).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(2_000);
+
+        expect(entry.getState()).toMatchObject({
+          loadingConversation: false,
+          conversationLoadError: null,
+        });
+        expect(streamOpened()).toBe(true);
+        expect(lookups[0]?.aborted).toBe(true);
+        await switched;
+      } finally {
+        setSessionHostResolver(null);
+      }
     });
 
     it("stops retrying once the session is closed", async () => {

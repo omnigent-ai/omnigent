@@ -1,6 +1,6 @@
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -207,6 +207,98 @@ describe("prefetchSessionHostChain", () => {
 
     expect(getSessionHost("inflight_managed")).toBe("host_after_provision");
     expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels the snapshot read it started when its lookup times out", async () => {
+    const { client } = harness();
+    const reads: (AbortSignal | undefined)[] = [];
+    getSessionSlimMock.mockImplementation((_id, options) => {
+      reads.push(options?.signal);
+      return new Promise<Session>(() => {});
+    });
+    const lookup = new AbortController();
+
+    const walk = prefetchSessionHostChain(client, "lost_read", { signal: lookup.signal });
+    await vi.waitFor(() => expect(reads).toHaveLength(1));
+    lookup.abort();
+
+    await expect(walk).rejects.toThrow();
+    expect(reads[0]?.aborted).toBe(true);
+    expect(client.isFetching({ queryKey: ["session", "lost_read"], exact: true })).toBe(0);
+  });
+
+  it.each(["fetching", "paused"] as const)(
+    "leaves another caller's %s snapshot read alone when its lookup times out",
+    async (fetchStatus) => {
+      const { client } = harness();
+      // An offline browser parks the other caller's read as paused.
+      onlineManager.setOnline(fetchStatus === "fetching");
+      try {
+        void client.fetchQuery({
+          queryKey: ["session", "shared_read"],
+          queryFn: () => new Promise<Session>(() => {}),
+        });
+        expect(client.getQueryState(["session", "shared_read"])?.fetchStatus).toBe(fetchStatus);
+        const lookup = new AbortController();
+
+        const walk = prefetchSessionHostChain(client, "shared_read", { signal: lookup.signal });
+        lookup.abort();
+
+        expect(client.getQueryState(["session", "shared_read"])?.fetchStatus).toBe(fetchStatus);
+        void walk.catch(() => undefined);
+      } finally {
+        onlineManager.setOnline(true);
+      }
+    },
+  );
+
+  it("keeps its snapshot read when a component that joined it unmounts", async () => {
+    const { client, Wrapper } = harness();
+    let finishRead!: (value: Session) => void;
+    getSessionSlimMock.mockImplementation(
+      () =>
+        new Promise<Session>((done) => {
+          finishRead = done;
+        }),
+    );
+    const lookup = new AbortController();
+
+    const walk = prefetchSessionHostChain(client, "watched", { signal: lookup.signal });
+    await flush();
+    const view = renderHook(() => useSession("watched"), { wrapper: Wrapper });
+    view.unmount();
+    finishRead(routed("watched", "host_watched", null));
+    await walk;
+
+    expect(getSessionHost("watched")).toBe("host_watched");
+    expect(getSessionSlimMock).toHaveBeenCalledOnce();
+  });
+
+  it("starts no fresh read when its lookup times out while waiting on another read", async () => {
+    const { client } = harness();
+    let finishOldSnapshot!: (value: Session) => void;
+    const oldSnapshot = client.fetchQuery({
+      queryKey: ["session", "inflight_timeout"],
+      queryFn: () =>
+        new Promise<Session>((done) => {
+          finishOldSnapshot = done;
+        }),
+      staleTime: Infinity,
+    });
+    serve([routed("inflight_timeout", "host_after_provision", null)]);
+    const lookup = new AbortController();
+
+    const refresh = prefetchSessionHostChain(client, "inflight_timeout", {
+      force: true,
+      signal: lookup.signal,
+    });
+    lookup.abort();
+    finishOldSnapshot(routed("inflight_timeout", null, null));
+    await oldSnapshot;
+    await refresh;
+
+    expect(getSessionSlimMock).not.toHaveBeenCalled();
+    expect(getSessionHost("inflight_timeout")).toBeNull();
   });
 
   it.each([false, true])("resolves nested side chats after reload (cached: %s)", async (cached) => {

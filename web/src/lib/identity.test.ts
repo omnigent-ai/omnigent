@@ -7,6 +7,7 @@
 // state into each other through the cached `currentUserId`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SESSION_READ_TIMEOUT_MS } from "./sessionReadTimeout";
 import type * as HostApi from "./host";
 
 function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
@@ -600,7 +601,9 @@ describe("authenticatedFetch", () => {
         const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
         expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(expected);
         if (mode === "resolve" || mode === "unknown") {
-          expect(resolve).toHaveBeenCalledExactlyOnceWith("session-a");
+          expect(resolve).toHaveBeenCalledExactlyOnceWith("session-a", {
+            signal: expect.any(AbortSignal),
+          });
         } else {
           expect(resolve).not.toHaveBeenCalled();
         }
@@ -961,6 +964,30 @@ describe("authenticatedFetch", () => {
 describe("OSS host routing", () => {
   beforeEach(() => {
     vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("sends a cold session's request once a host lookup that never answers times out", async () => {
+    vi.useFakeTimers();
+    const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+    const lookups: (AbortSignal | undefined)[] = [];
+    setSessionHostResolver((_id, options) => {
+      lookups.push(options?.signal);
+      return new Promise(() => {});
+    });
+    fetchMock.mockResolvedValue(Response.json({}));
+
+    const sent = authenticatedFetch("/v1/sessions/sess_oss/resources/terminals");
+    await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS - 1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect((await sent).status).toBe(200);
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]?.aborted).toBe(true);
   });
 
   it("resolves a cold session's host before sending a runner request", async () => {

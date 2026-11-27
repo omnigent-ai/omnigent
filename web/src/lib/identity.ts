@@ -26,6 +26,7 @@ import {
   type UploadProgressListener,
 } from "./host";
 import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
+import { withReadTimeout } from "./sessionReadTimeout";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -127,6 +128,8 @@ function hostScopeForUrl(url: string): UrlHostScope {
 export interface SessionHostResolveOptions {
   /** Refresh a hostless snapshot after a managed host has been assigned. */
   force?: boolean;
+  /** Aborted when the lookup times out, so the resolver can drop the read it started. */
+  signal?: AbortSignal;
 }
 
 type SessionHostResolver = (
@@ -213,12 +216,13 @@ export function resolveSessionHost(
   if (inFlight === undefined) {
     const resolver = _sessionHostResolver;
     // A pre-provisioning lookup may still be running; finish it before forcing
-    // a fresh read, while concurrent routing misses share this refresh.
+    // a fresh read, while concurrent routing misses share this refresh. Every
+    // session request waits on this, so a lookup that never answers times out.
     const lookup = options.force
       ? Promise.resolve(_hostResolveInFlight.get(sessionId)).then(() =>
-          resolver(sessionId, { force: true }),
+          withReadTimeout((signal) => resolver(sessionId, { force: true, signal })),
         )
-      : resolver(sessionId);
+      : withReadTimeout((signal) => resolver(sessionId, { signal }));
     inFlight = lookup
       .then(() => {
         _hostResolveAttempted.add(sessionId);

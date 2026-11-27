@@ -202,6 +202,8 @@ export function useActiveRootSessionId(
  *
  * @param queryClient - The app QueryClient holding the snapshot cache.
  * @param sessionId - Session whose routing host to resolve, e.g. ``"conv_child"``.
+ * @param options - ``force`` re-reads a cached snapshot; ``signal`` aborts when
+ *   the lookup times out, which cancels the read this call started.
  */
 export async function prefetchSessionHostChain(
   queryClient: QueryClient,
@@ -214,13 +216,16 @@ export async function prefetchSessionHostChain(
     id !== null &&
     visited.size < MAX_HOST_CHAIN_READS &&
     !visited.has(id) &&
+    !options.signal?.aborted &&
     getSessionHost(sessionId) === null
   ) {
     visited.add(id);
     const hopId: string = id;
     const queryOptions = {
       queryKey: ["session", hopId],
-      queryFn: () => getSessionSlim(hopId),
+      // The lookup's own signal, not the query's: a component that joins this
+      // read and unmounts mid-walk must not cancel it.
+      queryFn: () => getSessionSlim(hopId, { signal: options.signal }),
       staleTime: options.force ? 0 : Infinity,
       retry: false,
     };
@@ -232,10 +237,21 @@ export async function prefetchSessionHostChain(
       // starting the fresh read, without cancelling other snapshot consumers.
       // oxlint-disable-next-line no-await-in-loop
       await queryClient.fetchQuery(queryOptions).catch(() => undefined);
+      // Timed out during the wait: a fresh read now could no longer be cancelled.
+      if (options.signal?.aborted) return;
     }
+    // A lookup that times out drops the read it started, so later reads don't
+    // join a request that never answers. A read it joined (even paused) stays with its caller.
+    const startsRead =
+      (queryClient.getQueryState(queryOptions.queryKey)?.fetchStatus ?? "idle") === "idle";
+    const dropRead = () =>
+      void queryClient.cancelQueries({ queryKey: queryOptions.queryKey, exact: true });
+    if (startsRead) options.signal?.addEventListener("abort", dropRead, { once: true });
     // Each hop's id comes from the previous snapshot, so the chain is serial.
     // oxlint-disable-next-line no-await-in-loop
-    const session: Session = await queryClient.fetchQuery(queryOptions);
+    const session: Session = await queryClient
+      .fetchQuery(queryOptions)
+      .finally(() => options.signal?.removeEventListener("abort", dropRead));
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
     setSessionHost(session.id, sessionRoutingHostId(session.hostId, session.labels));

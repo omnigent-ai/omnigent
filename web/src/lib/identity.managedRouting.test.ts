@@ -66,8 +66,11 @@ describe("managed first-message routing", () => {
     const response = await authenticatedFetch(EVENTS_URL, init);
 
     expect(response).toBe(success);
-    expect(resolve).toHaveBeenNthCalledWith(1, SESSION_ID);
-    expect(resolve).toHaveBeenNthCalledWith(2, SESSION_ID, { force: true });
+    expect(resolve).toHaveBeenNthCalledWith(1, SESSION_ID, { signal: expect.any(AbortSignal) });
+    expect(resolve).toHaveBeenNthCalledWith(2, SESSION_ID, {
+      force: true,
+      signal: expect.any(AbortSignal),
+    });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(requestHeaders(0).get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
     expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
@@ -106,7 +109,10 @@ describe("managed first-message routing", () => {
 
     expect((await authenticatedFetch(EVENTS_URL)).ok).toBe(true);
 
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(SESSION_ID, { force: true });
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(SESSION_ID, {
+      force: true,
+      signal: expect.any(AbortSignal),
+    });
     expect(requestHeaders(0).get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
     expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
   });
@@ -131,7 +137,10 @@ describe("managed first-message routing", () => {
     await bootstrap;
     await refresh;
 
-    expect(resolve).toHaveBeenNthCalledWith(2, SESSION_ID, { force: true });
+    expect(resolve).toHaveBeenNthCalledWith(2, SESSION_ID, {
+      force: true,
+      signal: expect.any(AbortSignal),
+    });
     expect(getSessionHost(SESSION_ID)).toBe("new-host");
   });
 
@@ -343,7 +352,10 @@ describe("managed first-message routing", () => {
       expect(getSessionHost(SESSION_ID)).toBe("new-host");
       expect(resolve).toHaveBeenCalledTimes(sliceKey === undefined ? 2 : 1);
       if (sliceKey !== undefined) {
-        expect(resolve).not.toHaveBeenCalledWith(SESSION_ID, { force: true });
+        expect(resolve).not.toHaveBeenCalledWith(
+          SESSION_ID,
+          expect.objectContaining({ force: true }),
+        );
       }
     },
   );
@@ -376,7 +388,9 @@ describe("managed first-message routing", () => {
       body: JSON.stringify({ archived: true }),
     });
 
-    expect(lookup).toHaveBeenCalledExactlyOnceWith(SESSION_ID);
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(SESSION_ID, {
+      signal: expect.any(AbortSignal),
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(requestHeaders(0).get(SLICE_KEY)).toBe("host_known");
   });
