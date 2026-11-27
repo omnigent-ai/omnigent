@@ -29,6 +29,7 @@ import * as capabilities from "@/lib/capabilities";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { switchSessionBeforeNavigate, isWarmSwitchPending } from "@/lib/warmSessionSwitch";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { skillsQueryKey } from "@/hooks/useSkills";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   consumePendingInitialPrompt,
@@ -354,6 +355,7 @@ function renderHeaderPage(
     deferNavigation,
     onCommit: () => frames.push(headerSnapshot()),
   });
+  return qc;
 }
 
 beforeEach(() => {
@@ -387,6 +389,83 @@ afterEach(() => {
 });
 
 describe("ChatPage warm switch", () => {
+  it.each([
+    ["claude-native", "claude-code-native-ui", "/example-skill check"],
+    ["codex-native", "codex-native-ui", "$example-skill check"],
+  ])(
+    "dispatches skills for the visible %s or SDK session before the route commits",
+    async (harness, wrapper, command) => {
+      const qc = renderHeaderPage(false, []);
+      act(() => {
+        for (const id of ["conv_a", "conv_b"]) {
+          const session = {
+            ...qc.getQueryData<Session>(["session", id])!,
+            harness: id === "conv_b" ? harness : "claude-sdk",
+            labels: id === "conv_b" ? { "omnigent.wrapper": wrapper } : {},
+            hostId: "host_example",
+            workspace: "/workspace/example",
+          };
+          qc.setQueryData(["session", id], session);
+          qc.setQueryData(
+            skillsQueryKey({
+              sessionId: id,
+              scope: {
+                hostId: session.hostId,
+                harness: session.harness,
+                workspace: session.workspace,
+                agentId: session.agentId,
+                subAgentName: session.subAgentName,
+              },
+            }),
+            { skills: [{ name: "example-skill", description: "Example skill" }], warnings: [] },
+          );
+          conversationRegistry.peek(id)!.setState({ sessionHarness: session.harness });
+        }
+      });
+      const send = vi.fn().mockResolvedValue(undefined);
+      const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ send, sendSlashCommand });
+      await screen.findByText("alpha transcript");
+      const surface = transcriptNode();
+
+      fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+      expect(headerSnapshot()).toMatchObject({
+        urlConvId: "conv_a",
+        activeConversationId: "conv_b",
+      });
+      expect(transcriptNode()).toBe(surface);
+      const nativeInput = screen.getByRole("textbox");
+      fireEvent.change(nativeInput, { target: { value: command } });
+      fireEvent.keyDown(nativeInput, { key: "Enter" });
+      expect(send).toHaveBeenCalledWith(
+        command,
+        expect.any(String),
+        undefined,
+        expect.objectContaining({ pinnedConversationId: "conv_b" }),
+      );
+      expect(sendSlashCommand).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("link", { name: "finish beta navigation" }));
+      fireEvent.click(screen.getByRole("link", { name: "open alpha" }));
+      expect(headerSnapshot()).toMatchObject({
+        urlConvId: "conv_b",
+        activeConversationId: "conv_a",
+      });
+      expect(transcriptNode()).toBe(surface);
+      send.mockClear();
+      const sdkInput = screen.getByRole("textbox");
+      fireEvent.change(sdkInput, { target: { value: "/example-skill check" } });
+      fireEvent.keyDown(sdkInput, { key: "Enter" });
+      expect(sendSlashCommand).toHaveBeenCalledWith(
+        "example-skill",
+        "check",
+        expect.any(String),
+        expect.objectContaining({ pinnedConversationId: "conv_a" }),
+      );
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
+
   it("live target: the surface stays mounted and no placeholder renders", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     initChatStore(qc);
