@@ -10,6 +10,7 @@ repository is dropped, and a client shows titles as plain text.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -27,9 +28,8 @@ _SEARCH_OPERATORS = frozenset({"AND", "OR", "NOT"})
 _UNKNOWN_HOST = "Sign in to this GitHub host with gh before searching it"
 _UNREADABLE = "GitHub couldn't answer this search. Try again."
 MAX_BRANCH_PULL_REQUESTS = 20
-_BRANCH_FIELDS = (
-    "url,number,title,state,isDraft,updatedAt,headRefName,headRepository,headRepositoryOwner"
-)
+# GitHub's owner and repository names; anything else would change the REST path.
+_REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _UNKNOWN_WORKSPACE_HOST = "The workspace's repository isn't on a GitHub host set up here."
 _UNLISTED = "GitHub couldn't list this branch's pull requests. Try again."
 
@@ -240,13 +240,16 @@ def _config_value(root: str, key: str) -> str | None:
 def _remote_repository(root: str, remote: str) -> tuple[str, str] | None:
     """The host and ``owner/repo`` a remote names, by the provider's port-aware parser.
 
-    ``None`` for a missing remote, a path, or a host never set up for GitHub.
+    ``None`` for a missing remote, a path, a host never set up for GitHub, or a name
+    GitHub wouldn't give a repository.
     """
     rc, url, _ = github._git(["remote", "get-url", remote], cwd=root)
     if rc != 0:
         return None
     parsed = GitHubProvider().parse_remote_url(url.strip(), EnvInstances())
-    return (parsed.host, parsed.repository) if parsed is not None else None
+    if parsed is None or not _REPOSITORY_NAME.fullmatch(parsed.repository):
+        return None
+    return parsed.host, parsed.repository
 
 
 def _base_remote(root: str) -> str:
@@ -296,13 +299,23 @@ def workspace_repository(root: str) -> tuple[str, str] | None:
     return None
 
 
-def _head_repository(entry: dict[str, Any]) -> str | None:
-    """``owner/repo`` of the repository a pull request's head branch is in."""
-    owner = entry.get("headRepositoryOwner")
-    repository = entry.get("headRepository")
-    login = owner.get("login") if isinstance(owner, dict) else None
-    name = repository.get("name") if isinstance(repository, dict) else None
-    return f"{login}/{name}" if isinstance(login, str) and isinstance(name, str) else None
+def _head(entry: dict[str, Any]) -> tuple[Any, Any]:
+    """The branch a pull request's head is, and ``owner/repo`` of the repository it's in.
+
+    The repository is ``None`` once it's deleted.
+    """
+    head = entry.get("head")
+    head = head if isinstance(head, dict) else {}
+    repository = head.get("repo")
+    return head.get("ref"), repository.get("full_name") if isinstance(repository, dict) else None
+
+
+def _state(entry: dict[str, Any]) -> str | None:
+    """``OPEN``, ``CLOSED`` or ``MERGED``, as GitHub's GraphQL API names a pull request's."""
+    if entry.get("merged_at"):
+        return "MERGED"
+    state = entry.get("state")
+    return state.upper() if isinstance(state, str) else None
 
 
 def _repository_token(root: str, host: str, repository: str) -> str | None:
@@ -331,9 +344,8 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
 
     A pull request counts only when its head is ``branch`` in the repository the workspace
     pushes it to, so a same-named branch in someone else's fork isn't this branch. The most
-    recent :data:`MAX_BRANCH_PULL_REQUESTS` in any state, newest first as GitHub
-    orders them; ``has_more`` says older ones exist. A workspace without a repository
-    remote has none.
+    recently opened :data:`MAX_BRANCH_PULL_REQUESTS` in any state, newest first; ``has_more``
+    says older ones exist. A workspace without a repository remote has none.
 
     :param branch: A branch name, checked by the caller against git's ref rules.
     :raises PullRequestError: When the remote's host isn't set up for GitHub, which is
@@ -346,21 +358,25 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
     # A fork workflow pushes to its own remote and opens pull requests on the base.
     pushed_to = _remote_repository(root, _push_remote(root, branch))
     source = pushed_to[1] if pushed_to is not None and pushed_to[0] == host else repository
+    owner = source.split("/", 1)[0]
     with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+        # GitHub keeps only the owner's branch before it cuts the page, so other forks'
+        # same-named branches can't crowd this one out. Each field is sent URL-encoded.
         rc, output, _ = github._gh(
             [
-                "pr",
-                "list",
-                "-R",
-                f"{host}/{repository}",
-                f"--head={branch}",
-                "--state",
-                "all",
-                "--limit",
+                "api",
+                "--hostname",
+                host,
+                "--method",
+                "GET",
+                f"repos/{repository}/pulls",
+                "-f",
+                f"head={owner}:{branch}",
+                "-f",
+                "state=all",
+                "-F",
                 # One past the cap tells a full list from a cut one.
-                str(MAX_BRANCH_PULL_REQUESTS + 1),
-                "--json",
-                _BRANCH_FIELDS,
+                f"per_page={MAX_BRANCH_PULL_REQUESTS + 1}",
             ],
             cwd=root,
             token=_repository_token(root, host, repository),
@@ -375,23 +391,24 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
         entries = []
     rows = [
         {
-            "url": entry["url"],
+            "url": entry["html_url"],
             "number": entry.get("number"),
             "title": entry.get("title") if isinstance(entry.get("title"), str) else "",
-            "state": entry.get("state"),
-            "is_draft": entry.get("isDraft") is True,
-            "updated_at": entry.get("updatedAt"),
+            "state": _state(entry),
+            "is_draft": entry.get("draft") is True,
+            "updated_at": entry.get("updated_at"),
             "head_ref": branch,
         }
         for entry in entries
         if isinstance(entry, dict)
-        and isinstance(entry.get("url"), str)
-        and entry.get("headRefName") == branch
-        and (_head_repository(entry) or "").lower() == source.lower()
-        and _same_repository(entry["url"], host, repository)
+        and isinstance(entry.get("html_url"), str)
+        # What GitHub answers is untrusted, so the head filter is checked again here.
+        and _head(entry)[0] == branch
+        and str(_head(entry)[1] or "").lower() == source.lower()
+        and _same_repository(entry["html_url"], host, repository)
     ]
     return {
         "object": "list",
         "data": rows[:MAX_BRANCH_PULL_REQUESTS],
-        "has_more": len(entries) > MAX_BRANCH_PULL_REQUESTS,
+        "has_more": len(rows) > MAX_BRANCH_PULL_REQUESTS,
     }

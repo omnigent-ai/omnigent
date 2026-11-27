@@ -23,34 +23,56 @@ GHES = "code.example.com"
 TOKEN = "ghp_example_token_value"
 
 
-def _entry(number: int, head: str = "feature/login", **fields: Any) -> dict[str, Any]:
+def _entry(
+    number: int, head: str = "feature/login", owner: str = "example-org", **fields: Any
+) -> dict[str, Any]:
+    """A pull request as GitHub's REST pulls list gives it, from ``owner``'s ``head``."""
     return {
-        "url": f"https://github.com/{REPOSITORY}/pull/{number}",
+        "html_url": f"https://github.com/{REPOSITORY}/pull/{number}",
         "number": number,
         "title": f"PR {number}",
-        "state": "OPEN",
-        "isDraft": False,
-        "updatedAt": "2026-01-02T03:04:05Z",
-        "headRefName": head,
-        # Pushed from the repository itself unless a test says otherwise.
-        "headRepository": {"name": "example-repo"},
-        "headRepositoryOwner": {"login": "example-org"},
+        "state": "open",
+        "draft": False,
+        "updated_at": "2026-01-02T03:04:05Z",
+        "merged_at": None,
+        "head": {"ref": head, "repo": {"full_name": f"{owner}/example-repo"}},
         **fields,
     }
 
 
 def _from_fork(number: int, owner: str) -> dict[str, Any]:
     """A pull request into the repository from ``owner``'s fork's ``feature/login``."""
-    return _entry(number, headRepositoryOwner={"login": owner})
+    return _entry(number, owner=owner)
+
+
+def _list_request(argv: list[str]) -> tuple[str, str, dict[str, str]]:
+    """The host, endpoint and fields of a ``gh api --method GET`` call."""
+    fields = dict(
+        argv[index + 1].split("=", 1) for index, flag in enumerate(argv) if flag in {"-f", "-F"}
+    )
+    return argv[argv.index("--hostname") + 1], argv[argv.index("GET") + 1], fields
+
+
+def _github_keeps(entry: Any, fields: dict[str, str]) -> bool:
+    """Whether GitHub's ``head=<owner>:<branch>`` filter keeps ``entry``."""
+    owner, branch = fields["head"].split(":", 1)
+    head = (entry.get("head") or {}) if isinstance(entry, dict) else {}
+    full_name = (head.get("repo") or {}).get("full_name", "")
+    return head.get("ref") == branch and full_name.split("/")[0].lower() == owner.lower()
 
 
 class FakeGh:
-    """Answers each ``gh`` process with ``listed``; git runs for real."""
+    """Answers the pulls list from ``listed``, newest first, as GitHub does; git runs for real.
+
+    Like GitHub, it keeps only the requested head's pull requests, then cuts the page at
+    ``per_page``. With ``filtered`` off, it answers ``listed`` as it is, as GitHub never would.
+    """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.calls: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
         self.listed: Any = []
+        self.filtered = True
         self.list_exit_code = 0
         self.raw_output: str | None = None
         real_run = github._run
@@ -65,18 +87,22 @@ class FakeGh:
             self.envs.append(env)
             if argv[1:3] == ["auth", "token"]:
                 return 0, TOKEN + "\n", ""
-            assert argv[1:3] == ["pr", "list"], argv
+            assert argv[1] == "api", argv
             if self.list_exit_code:
                 return self.list_exit_code, "", "HTTP 502: example-org/secret-repo is unreachable"
             if self.raw_output is not None:
                 return 0, self.raw_output, ""
-            return 0, json.dumps(self.listed), ""
+            if not self.filtered:
+                return 0, json.dumps(self.listed), ""
+            _host, _endpoint, fields = _list_request(argv)
+            kept = [entry for entry in self.listed if _github_keeps(entry, fields)]
+            return 0, json.dumps(kept[: int(fields["per_page"])]), ""
 
         monkeypatch.setattr(github, "_run", run)
 
-    def list_arguments(self) -> list[str]:
-        (argv,) = [call for call in self.calls if call[:2] == ["pr", "list"]]
-        return argv
+    def list_request(self) -> tuple[str, str, dict[str, str]]:
+        (argv,) = [call for call in self.calls if call[0] == "api"]
+        return _list_request(argv)
 
 
 @pytest.fixture(autouse=True)
@@ -119,7 +145,11 @@ def test_a_branch_lists_its_pull_requests_in_the_workspaces_repository(
     tmp_path: Path, fake: FakeGh
 ) -> None:
     root = _checkout(tmp_path, origin=f"git@github.com:{REPOSITORY}.git")
-    fake.listed = [_entry(7), _entry(5, state="MERGED", isDraft=True)]
+    fake.listed = [
+        _entry(7),
+        _entry(5, state="closed", merged_at="2026-01-03T04:05:06Z", draft=True),
+        _entry(4, state="closed"),
+    ]
 
     found = github_search.branch_pull_requests(root, branch="feature/login")
 
@@ -144,17 +174,37 @@ def test_a_branch_lists_its_pull_requests_in_the_workspaces_repository(
                 "updated_at": "2026-01-02T03:04:05Z",
                 "head_ref": "feature/login",
             },
+            {
+                "url": f"https://github.com/{REPOSITORY}/pull/4",
+                "number": 4,
+                "title": "PR 4",
+                "state": "CLOSED",
+                "is_draft": False,
+                "updated_at": "2026-01-02T03:04:05Z",
+                "head_ref": "feature/login",
+            },
         ],
         "has_more": False,
     }
-    argv = fake.list_arguments()
-    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
-    # One argument, so a branch can never be read as another flag.
-    assert "--head=feature/login" in argv
-    assert argv[argv.index("--state") + 1] == "all"
-    # One past the cap, to tell a full list from a cut one.
-    assert argv[argv.index("--limit") + 1] == str(github_search.MAX_BRANCH_PULL_REQUESTS + 1)
-    assert fake.calls == [argv]
+    # GitHub keeps only this owner's branch before the page is cut, one past the cap.
+    assert fake.list_request() == (
+        "github.com",
+        f"repos/{REPOSITORY}/pulls",
+        {"head": "example-org:feature/login", "state": "all", "per_page": "21"},
+    )
+    assert len(fake.calls) == 1
+
+
+def test_a_branch_name_is_one_field_never_part_of_the_path(tmp_path: Path, fake: FakeGh) -> None:
+    """gh sends each field URL-encoded, so ``&`` or ``#`` can't add a query parameter."""
+    root = _checkout(tmp_path, origin=f"https://github.com/{REPOSITORY}")
+
+    github_search.branch_pull_requests(root, branch="feature/a&state=open#x")
+
+    (argv,) = fake.calls
+    assert argv[argv.index("GET") + 1] == f"repos/{REPOSITORY}/pulls"
+    assert argv[argv.index("head=example-org:feature/a&state=open#x") - 1] == "-f"
+    assert fake.list_request()[2]["state"] == "all"
 
 
 @pytest.mark.parametrize(
@@ -175,8 +225,7 @@ def test_every_remote_form_lists_the_same_repository(
     rows = github_search.branch_pull_requests(root, branch="feature/login")["data"]
 
     assert [row["url"] for row in rows] == [f"https://github.com/{REPOSITORY}/pull/7"]
-    argv = fake.list_arguments()
-    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
+    assert fake.list_request()[:2] == ("github.com", f"repos/{REPOSITORY}/pulls")
 
 
 def test_the_base_remote_gh_resolved_is_listed_before_tracking_and_origin(
@@ -195,8 +244,7 @@ def test_the_base_remote_gh_resolved_is_listed_before_tracking_and_origin(
 
     github_search.branch_pull_requests(root, branch="feature/login")
 
-    argv = fake.list_arguments()
-    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
+    assert fake.list_request()[:2] == ("github.com", f"repos/{REPOSITORY}/pulls")
 
 
 @pytest.mark.parametrize(
@@ -219,8 +267,7 @@ def test_without_a_base_remote_the_branchs_tracking_remote_is_listed(
 
     github_search.branch_pull_requests(root, branch="feature/login")
 
-    argv = fake.list_arguments()
-    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
+    assert fake.list_request()[:2] == ("github.com", f"repos/{REPOSITORY}/pulls")
 
 
 def _fork_checkout(tmp_path: Path, **settings: str) -> str:
@@ -253,15 +300,21 @@ def _fork_checkout(tmp_path: Path, **settings: str) -> str:
 def test_a_fork_lists_its_own_branchs_pull_request_but_not_another_forks(
     tmp_path: Path, fake: FakeGh, settings: dict[str, str], pushed_from: str
 ) -> None:
-    """Another fork's ``feature/login`` is a different branch, though GitHub lists both."""
+    """Another fork's ``feature/login`` is a different branch, though it has the same name.
+
+    More than a page of newer pull requests from other forks' branches comes first. They
+    can't crowd this branch's out, because GitHub keeps only its owner's before the cut.
+    """
     root = _fork_checkout(tmp_path, **settings)
+    newer = [_from_fork(number, "another") for number in range(100, 79, -1)]
     owners = ["someone", "mirror-owner", "another", "example-org"]
-    fake.listed = [_from_fork(number, owner) for number, owner in enumerate(owners, 1)]
+    fake.listed = newer + [_from_fork(number, owner) for number, owner in enumerate(owners, 1)]
 
-    rows = github_search.branch_pull_requests(root, branch="feature/login")["data"]
+    found = github_search.branch_pull_requests(root, branch="feature/login")
 
-    expected = owners.index(pushed_from) + 1
-    assert [row["number"] for row in rows] == [expected]
+    assert fake.list_request()[2]["head"] == f"{pushed_from}:feature/login"
+    assert [row["number"] for row in found["data"]] == [owners.index(pushed_from) + 1]
+    assert found["has_more"] is False
 
 
 def test_a_same_repository_branch_lists_no_forks_pull_request(
@@ -279,17 +332,17 @@ def test_a_same_repository_branch_lists_no_forks_pull_request(
     "listed",
     [
         # Another repository's, another host's, and one that's no pull request URL.
-        [_entry(1, url="https://github.com/example-org/other-repo/pull/1")],
-        [_entry(2, url=f"https://{GHES}/{REPOSITORY}/pull/2")],
-        [_entry(3, url="javascript:alert(1)")],
+        [_entry(1, html_url="https://github.com/example-org/other-repo/pull/1")],
+        [_entry(2, html_url=f"https://{GHES}/{REPOSITORY}/pull/2")],
+        [_entry(3, html_url="javascript:alert(1)")],
         # Another branch's, and entries GitHub never sends.
         [_entry(4, head="main")],
         # Another fork's same-named branch, and a head repository since deleted.
         [_from_fork(7, "another")],
-        [_entry(8, headRepository=None, headRepositoryOwner=None)],
-        [_entry(5, url=None)],
+        [_entry(8, head={"ref": "feature/login", "repo": None})],
+        [_entry(5, html_url=None)],
         ["not an entry"],
-        {"url": f"https://github.com/{REPOSITORY}/pull/6"},
+        {"html_url": f"https://github.com/{REPOSITORY}/pull/6"},
     ],
     ids=[
         "other-repository",
@@ -308,6 +361,7 @@ def test_an_answer_not_for_this_repository_and_branch_is_dropped(
 ) -> None:
     """What GitHub answers is untrusted: a row is shown only for the repository asked about."""
     root = _checkout(tmp_path, origin=f"https://github.com/{REPOSITORY}")
+    fake.filtered = False
     fake.listed = listed
 
     assert github_search.branch_pull_requests(root, branch="feature/login")["data"] == []
@@ -339,8 +393,12 @@ def test_the_list_is_capped_and_says_when_github_has_more(
 
 @pytest.mark.parametrize(
     "remotes",
-    [{}, {"origin": "/srv/mirror/example-repo"}],
-    ids=["no-remote", "path-remote"],
+    [
+        {},
+        {"origin": "/srv/mirror/example-repo"},
+        {"origin": f"https://github.com/{REPOSITORY}?per_page=100"},
+    ],
+    ids=["no-remote", "path-remote", "not-a-repository-name"],
 )
 def test_a_workspace_without_a_repository_remote_has_none(
     tmp_path: Path, fake: FakeGh, remotes: dict[str, str]
@@ -378,15 +436,14 @@ def test_a_remote_on_the_gh_host_set_up_is_listed(
 ) -> None:
     monkeypatch.setenv("GH_HOST", GHES)
     root = _checkout(tmp_path, origin=f"https://{GHES}/{REPOSITORY}.git")
-    fake.listed = [_entry(7, url=f"https://{GHES}/{REPOSITORY}/pull/7")]
+    fake.listed = [_entry(7, html_url=f"https://{GHES}/{REPOSITORY}/pull/7")]
 
     rows = github_search.branch_pull_requests(root, branch="feature/login")["data"]
 
     assert [row["url"] for row in rows] == [f"https://{GHES}/{REPOSITORY}/pull/7"]
-    argv = fake.list_arguments()
-    assert argv[argv.index("-R") + 1] == f"{GHES}/{REPOSITORY}"
+    assert fake.list_request()[:2] == (GHES, f"repos/{REPOSITORY}/pulls")
     # No sign-in probe: the host was checked without running gh.
-    assert [call[:2] for call in fake.calls] == [["pr", "list"]]
+    assert [call[0] for call in fake.calls] == ["api"]
 
 
 @pytest.mark.parametrize(
@@ -419,7 +476,7 @@ def test_with_no_saved_account_the_list_runs_as_ghs_active_one(
 
     github_search.branch_pull_requests(root, branch="feature/login")
 
-    assert [call[:2] for call in fake.calls] == [["pr", "list"]]
+    assert [call[0] for call in fake.calls] == ["api"]
     assert fake.envs == [None]
 
 
