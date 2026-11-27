@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.harnesses.claude_native import bridge
+from omnigent.harnesses.claude_native import bridge, editor_owner
 from tests._helpers.native_claude import _PINNED_CLAUDE_MODELS
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_message_requests
@@ -40,12 +41,21 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     observed = tmp_path / "editor-observed.jsonl"
     invoked = tmp_path / "editor-invoked.jsonl"
     hook_record = tmp_path / "blocked-prompt.json"
+    owner_source = hashlib.sha256(Path(editor_owner.__file__).read_bytes()).hexdigest()
     process_context = (
-        "import os, psutil, shutil\n"
+        "import hashlib, os, psutil, shutil\n"
+        "from dataclasses import asdict\n"
+        "from omnigent.harnesses.claude_native import editor_owner\n"
+        f"native_executable = Path({str(Path(claude).resolve())!r})\n"
+        "def native_process_record():\n"
+        "    identity = editor_owner.observe_native_editor_process(native_executable)\n"
+        "    return asdict(identity) if identity is not None else None\n"
         "def native_context():\n"
         "    parents = psutil.Process().parents()[:3]\n"
         "    return {'parents': [{'pid': p.pid, 'created': p.create_time(), "
         "'name': p.name(), 'exe': p.exe()} for p in parents], "
+        "'owner_source_sha256': hashlib.sha256("
+        "Path(editor_owner.__file__).read_bytes()).hexdigest(), "
         "'tty': os.ttyname(0) if os.isatty(0) else None, "
         "'session_env': {key: os.environ.get(key) for key in "
         "('CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', "
@@ -66,6 +76,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "record = {key: payload.get(key) for key in "
         "('prompt', 'session_id', 'hook_event_name')}\n"
         "record['native_context'] = native_context()\n"
+        "record['native_process'] = native_process_record()\n"
+        "record['bridge_session_id'] = 'editor-contract-conversation'\n"
         "temporary.write_text(json.dumps(record))\n"
         "temporary.replace(destination)\n"
         "print(json.dumps({'decision': 'block', "
@@ -111,7 +123,20 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "source = Path(location)\n"
         "content = source.read_bytes().decode('utf-8')\n"
         "request = json.loads(instruction.read_text())\n"
-        "accepted = content == request['expected']\n"
+        "def current_owner():\n"
+        f"    producer = json.loads(Path({str(hook_record)!r}).read_text())\n"
+        "    process = editor_owner.observe_native_editor_process(native_executable)\n"
+        "    if process is None or asdict(process) != producer['native_process']:\n"
+        "        return None\n"
+        "    return editor_owner.NativeDraftOwner(producer['bridge_session_id'], "
+        "producer['session_id'], process)\n"
+        "claimed = request['owner']\n"
+        "expected_owner = editor_owner.NativeDraftOwner("
+        "claimed['bridge_session_id'], claimed['native_session_id'], "
+        "editor_owner.NativeEditorProcess(**claimed['process']))\n"
+        "accepted = editor_owner.exported_draft_matches_owner(source, "
+        "expected_text=request['expected'], expected_owner=expected_owner, "
+        "current_owner=current_owner, cancelled=lambda: request['cancelled'])\n"
         "with observed.open('a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps({'content': content, 'accepted': accepted, "
         "'program': program, 'native_context': native_context()}) + '\\n')\n"
@@ -240,20 +265,56 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             draft = payload["prompt"]
             assert payload["hook_event_name"] == "UserPromptSubmit"
             assert isinstance(draft, str) and "\n" in draft and payload["session_id"]
+            assert payload["native_process"] is not None, payload["native_context"]
+            assert payload["native_context"]["owner_source_sha256"] == owner_source
+            owner = {
+                "bridge_session_id": payload["bridge_session_id"],
+                "native_session_id": payload["session_id"],
+                "process": payload["native_process"],
+            }
+            wrong_session = {**owner, "native_session_id": "other-native-session"}
+            wrong_process = {
+                **owner,
+                "process": {
+                    **payload["native_process"],
+                    "created_at": payload["native_process"]["created_at"] + 1,
+                },
+            }
             steps = [
-                (draft[:-1] if draft.endswith("\n") else draft + "\n", draft, False),
-                (draft.replace("\n", " "), draft, False),
-                (draft, draft, True),
-                ("unrelated claim", "/status", False),
+                (
+                    draft[:-1] if draft.endswith("\n") else draft + "\n",
+                    draft,
+                    False,
+                    owner,
+                    False,
+                ),
+                (draft.replace("\n", " "), draft, False, owner, False),
+                (draft, draft, False, wrong_session, False),
+                (draft, draft, False, wrong_process, False),
+                (draft, draft, False, owner, True),
+                (draft, draft, True, owner, False),
+                ("unrelated claim", "/status", False, owner, False),
             ]
-            for index, (claimed, expected, accepted) in enumerate(steps):
-                instruction.write_text(json.dumps({"expected": claimed, "replacement": "/status"}))
+            for index, (claimed, expected, accepted, expected_owner, cancelled) in enumerate(
+                steps
+            ):
+                instruction.write_text(
+                    json.dumps(
+                        {
+                            "expected": claimed,
+                            "replacement": "/status",
+                            "owner": expected_owner,
+                            "cancelled": cancelled,
+                        }
+                    )
+                )
                 command("send-keys", "-t", target, "C-g")
                 poll_until(lambda index=index: len(observations()) == index + 1, timeout_s=15)
                 observation = observations()[-1]
                 actual = observation["content"]
                 assert actual == expected, {"step": index, "expected": expected, "actual": actual}
                 assert observation["accepted"] is accepted
+                assert observation["native_context"]["owner_source_sha256"] == owner_source
                 poll_until(
                     lambda expected=("/status" if accepted else expected): (
                         bridge._composer_box(pane()) is not None
