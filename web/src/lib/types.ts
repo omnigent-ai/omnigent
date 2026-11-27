@@ -72,6 +72,10 @@ export interface PendingInput {
   content: MessageContentBlock[];
   /** Authenticated identity of the posting actor, e.g. ``"alice@example.com"``. Absent when unknown. */
   createdBy?: string;
+  /** Ids of the transcript items saved just before an undelivered input, newest first. */
+  precedingItemIds?: string[];
+  /** Ids of the transcript items saved just after an undelivered input, oldest first. */
+  followingItemIds?: string[];
 }
 
 /** Token usage statistics for a completed response. */

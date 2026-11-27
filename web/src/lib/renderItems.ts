@@ -220,6 +220,8 @@ export type Bubble =
       responseId: string;
       // Stable, sibling-unique identifier for React keying
       stableId: string;
+      /** Ids of the transcript items this bubble shows; `stableId` need not be one of them. */
+      itemIds?: string[];
       /** Response id of the streamed block that opened this bubble; it keys the bubble. */
       liveOpener?: string;
       lifecycle: ActiveResponse["state"];
@@ -1180,6 +1182,10 @@ function walkBubbles(
       kind: "assistant",
       responseId: groupResponseId,
       stableId,
+      itemIds: groupBlocks.flatMap((block) => [
+        ...(block.ctx.itemId === null ? [] : [block.ctx.itemId]),
+        ...(block.type === "reasoning_start" && block.streamedItemId ? [block.streamedItemId] : []),
+      ]),
       ...(liveOpener !== undefined ? { liveOpener } : {}),
       lifecycle,
       error,

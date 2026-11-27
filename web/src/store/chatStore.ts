@@ -49,6 +49,7 @@ import type {
   ElicitationBlock,
   ErrorBlock,
   MessageContentBlock,
+  ReasoningStartBlock,
   TextDone,
   ToolGroup,
   UserMessageBlock,
@@ -8432,8 +8433,49 @@ export async function pumpStreamEvents(
     });
   };
 
+  // Delta-streamed reasoning renders before its persisted item exists, and that item only
+  // closes the section. Record the item on the section's opening block so undelivered
+  // placement can find the thought, without rendering it twice.
+  const stampStreamedReasoning = (itemId: string, responseId: string): void => {
+    const unstamped = (block: AnyBlock | undefined): block is ReasoningStartBlock =>
+      block?.type === "reasoning_start" &&
+      !block.ctx.itemId &&
+      !block.streamedItemId &&
+      block.ctx.responseId === responseId;
+    const names = (block: AnyBlock) =>
+      block.ctx.itemId === itemId ||
+      (block.type === "reasoning_start" && block.streamedItemId === itemId);
+    if (buffer.some(names) || get().blocks.some(names)) return;
+    const buffered = buffer.findLastIndex(unstamped);
+    const opener = buffer[buffered];
+    if (unstamped(opener)) {
+      buffer[buffered] = { ...opener, streamedItemId: itemId };
+      return;
+    }
+    // A mirrored thought has no streamed section to record; skip the store write.
+    if (!get().blocks.some(unstamped)) return;
+    set((s) => {
+      const at = s.blocks.findLastIndex(unstamped);
+      const committed = s.blocks[at];
+      if (!unstamped(committed)) return {};
+      const next = s.blocks.slice();
+      next[at] = { ...committed, streamedItemId: itemId };
+      return { blocks: next };
+    });
+  };
+  async function* withStreamedReasoningIds(
+    source: AsyncIterable<StreamEvent>,
+  ): AsyncIterable<StreamEvent> {
+    for await (const event of source) {
+      if (event.type === "reasoning_done" && event.itemId && event.responseId) {
+        stampStreamedReasoning(event.itemId, event.responseId);
+      }
+      yield event;
+    }
+  }
+
   try {
-    for await (const block of stream.reduce(events)) {
+    for await (const block of stream.reduce(withStreamedReasoningIds(events))) {
       if (controller.signal.aborted) return "aborted";
       if (isConversationDisposed(id)) return "switched";
 

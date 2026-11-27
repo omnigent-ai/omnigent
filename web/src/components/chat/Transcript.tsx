@@ -204,8 +204,8 @@ function TranscriptImpl({
   // cache so a streaming append rebuilds only the active bubble, reusing the
   // finalized prefix by reference. Pending user messages (POSTed but not yet
   // acked) render as trailing user bubbles so the input is visible immediately.
-  // Undelivered startup messages replace their pending bubbles, above the
-  // failure notice that explains them.
+  // Undelivered startup messages replace their pending bubbles, where they
+  // were sent.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(
@@ -487,6 +487,7 @@ function TranscriptImpl({
                   sessionIdle={sessionStatus === "idle"}
                   conversationId={display.conversationId}
                   hasTasks={display.hasTasks}
+                  loadingMoreHistory={display.loadingMoreHistory}
                   disableVirtualization={disableVirtualization}
                   messageId={messageId}
                   onGeometryChange={onGeometryChange}
@@ -729,6 +730,7 @@ export function VirtualBubbleList({
   sessionIdle,
   conversationId,
   hasTasks,
+  loadingMoreHistory,
   disableVirtualization,
   messageId,
   onGeometryChange,
@@ -740,6 +742,7 @@ export function VirtualBubbleList({
   sessionIdle: boolean;
   conversationId: string | null | undefined;
   hasTasks: boolean;
+  loadingMoreHistory: boolean;
   disableVirtualization: boolean;
   messageId?: string | null;
   /** Publishes virtualizer-derived geometry up to the rail/spacer. */
@@ -891,6 +894,8 @@ export function VirtualBubbleList({
   const renderedBubblesRef = useRef<readonly Bubble[]>([]);
   const renderedFirstKeyRef = useRef<string | undefined>(undefined);
   const prevFirstKeyRef = useRef<string | undefined>(undefined);
+  const previousLoadingMoreHistoryRef = useRef(false);
+  const undeliveredRowSnapshotRef = useRef<{ key: string; start: number; end: number }[]>([]);
   // Mounted rows with the offsets they hold, refreshed every render that is not
   // a prepend (react-virtual re-renders after each measurement, so this tracks
   // measured offsets) and after a prepend's own measurements below. The prepend
@@ -908,8 +913,13 @@ export function VirtualBubbleList({
     renderedBubblesRef.current = [];
     renderedFirstKeyRef.current = undefined;
     rowSnapshotRef.current = [];
+    undeliveredRowSnapshotRef.current = [];
     prevFirstKeyRef.current = undefined;
+    previousLoadingMoreHistoryRef.current = false;
   }
+  useLayoutEffect(() => {
+    previousLoadingMoreHistoryRef.current = loadingMoreHistory;
+  }, [conversationId, loadingMoreHistory]);
 
   const virtualizer = useVirtualizer({
     enabled: !disableVirtualization,
@@ -961,13 +971,29 @@ export function VirtualBubbleList({
   // continues the top turn renames it. Keep rendering it under the key its row
   // already has: React keeps the node (a remount replays the action row's hover
   // fade on every page) and react-virtual keeps the measured height.
-  // Only a prepend can rename a bubble, and a prepend always changes the first
-  // bubble's key, so the alias map is only rebuilt then.
-  const firstBubbleKey = bubbles.length > 0 ? bubbleKey(bubbles[0]!) : undefined;
+  // Undelivered copies can stay at the top across history prepends, so they
+  // cannot identify the first historical row.
+  const firstHistoricalIndex = bubbles.findIndex(
+    (bubble) => bubble.kind !== "user" || !bubble.undelivered,
+  );
+  const firstBubbleKey =
+    firstHistoricalIndex < 0 ? undefined : bubbleKey(bubbles[firstHistoricalIndex]!);
+  // A copy anchors a page only when it survives below a newly loaded historical row.
+  const fallbackRows =
+    previousLoadingMoreHistoryRef.current &&
+    !loadingMoreHistory &&
+    renderedFirstKeyRef.current === undefined &&
+    firstHistoricalIndex >= 0
+      ? undeliveredRowSnapshotRef.current.filter(
+          (row) =>
+            bubbles.findIndex((bubble) => bubbleKey(bubble) === row.key) > firstHistoricalIndex,
+        )
+      : [];
+  const previousRenderedKey = renderedFirstKeyRef.current ?? fallbackRows[0]?.key;
   if (
-    renderedFirstKeyRef.current !== undefined &&
+    previousRenderedKey !== undefined &&
     firstBubbleKey !== undefined &&
-    firstBubbleKey !== renderedFirstKeyRef.current
+    firstBubbleKey !== previousRenderedKey
   ) {
     // Flagged in render so the mount-time measurements of this commit's rows
     // (which run before the layout effect below) already see it.
@@ -1150,13 +1176,17 @@ export function VirtualBubbleList({
   // edge: the page grew it at its top (the turn's earlier items), and what the
   // reader sees below it aligns to that edge, not to its start. Measured purely
   // from the virtualizer, so content above the list is irrelevant.
-  const snapshotRows = () =>
-    virtualizer
-      .getVirtualItems()
-      .flatMap((item) =>
-        typeof item.key === "string" ? [{ key: item.key, start: item.start, end: item.end }] : [],
-      );
-  if (!prependCommitRef.current) rowSnapshotRef.current = snapshotRows();
+  const snapshotRows = (undelivered: boolean) =>
+    virtualizer.getVirtualItems().flatMap((item) => {
+      const bubble = bubbles[item.index];
+      const isUndelivered = bubble?.kind === "user" && bubble.undelivered === true;
+      if (isUndelivered !== undelivered || typeof item.key !== "string") return [];
+      return [{ key: item.key, start: item.start, end: item.end }];
+    });
+  if (!prependCommitRef.current) {
+    rowSnapshotRef.current = snapshotRows(false);
+    undeliveredRowSnapshotRef.current = snapshotRows(true);
+  }
   useLayoutEffect(() => {
     // react-virtual skips its mount-time measurement while the pane counts as
     // scrolling and leaves it to a ResizeObserver that fires after paint — so
@@ -1176,16 +1206,16 @@ export function VirtualBubbleList({
     }
     prependCommitRef.current = false;
     virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
-    const firstKey = bubbles.length > 0 ? bubbleKey(bubbles[0]!) : undefined;
-    const prevFirstKey = prevFirstKeyRef.current;
-    const prevSnapshot = rowSnapshotRef.current;
-    prevFirstKeyRef.current = firstKey;
+    const prevFirstKey = prevFirstKeyRef.current ?? fallbackRows[0]?.key;
+    const prevSnapshot = fallbackRows.length > 0 ? fallbackRows : rowSnapshotRef.current;
+    prevFirstKeyRef.current = firstBubbleKey;
     // The rows as measured in this commit, for the next prepend.
-    rowSnapshotRef.current = snapshotRows();
+    rowSnapshotRef.current = snapshotRows(false);
+    undeliveredRowSnapshotRef.current = snapshotRows(true);
     // Only a prepend (grew or was renamed at the top, some earlier row still
     // present). A switch replaces the list (no row survives) — handled by the
     // mount scroll-to-bottom. Streaming appends leave the first key unchanged.
-    if (!scrollEl || prevFirstKey === undefined || firstKey === prevFirstKey) return;
+    if (!scrollEl || prevFirstKey === undefined || firstBubbleKey === prevFirstKey) return;
     const indexByKey = new Map(bubbles.map((bubble, index) => [rowKey(bubble), index]));
     const survivors = prevSnapshot.filter((row) => indexByKey.has(row.key));
     const unrenamed = survivors.find((row) => !renamedRowKeysRef.current.has(row.key));

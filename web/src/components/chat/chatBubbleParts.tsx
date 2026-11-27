@@ -86,6 +86,7 @@ import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
+  answeredElicitationItemId,
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
@@ -94,6 +95,7 @@ import {
   isTextBlock,
   keyedAttachments,
   PENDING_FILE_PREFIX,
+  slashCommandEchoItemId,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { isCommandListed } from "@/store/paletteCommands";
@@ -351,15 +353,84 @@ function isStartupFailureBubble(bubble: Bubble): boolean {
   );
 }
 
-/**
- * Place undelivered messages above the startup failure notice that explains
- * them, or at the end of the transcript when that notice isn't loaded.
- */
-export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble[]): Bubble[] {
-  if (undelivered.length === 0) return committed;
+interface BubbleSpan {
+  first: number;
+  last: number;
+}
+
+/** The first and last committed bubble showing each transcript item. */
+function bubbleSpansByItemId(committed: Bubble[]): Map<string, BubbleSpan> {
+  const spans = new Map<string, BubbleSpan>();
+  committed.forEach((bubble, index) => {
+    for (const id of bubble.kind === "assistant" ? (bubble.itemIds ?? []) : [bubble.itemId]) {
+      const span = spans.get(id);
+      if (span === undefined) spans.set(id, { first: index, last: index });
+      else span.last = index;
+    }
+  });
+  return spans;
+}
+
+// A skill receipt also shows the user's typed command, and an answered question or plan call
+// shows its rebuilt card, each under an id derived from the item's.
+function itemSpan(spans: Map<string, BubbleSpan>, id: string): BubbleSpan | undefined {
+  let combined: BubbleSpan | undefined;
+  for (const key of [id, slashCommandEchoItemId(id), answeredElicitationItemId(id)]) {
+    const span = spans.get(key);
+    if (span === undefined) continue;
+    combined =
+      combined === undefined
+        ? span
+        : { first: Math.min(combined.first, span.first), last: Math.max(combined.last, span.last) };
+  }
+  return combined;
+}
+
+// After the newest rendered item saved before the message, else before the oldest rendered one
+// saved after it. Otherwise last when nothing followed it, else first (older than what's loaded).
+// An older server names neither: above the startup failure notice, or last.
+function undeliveredIndex(
+  input: PendingInput,
+  spans: Map<string, BubbleSpan>,
+  notice: number,
+  end: number,
+): number {
+  if (input.precedingItemIds === undefined) return notice === -1 ? end : notice;
+  for (const id of input.precedingItemIds) {
+    const span = itemSpan(spans, id);
+    if (span !== undefined) return span.last + 1;
+  }
+  const following = input.followingItemIds ?? [];
+  for (const id of following) {
+    const span = itemSpan(spans, id);
+    if (span !== undefined) return span.first;
+  }
+  return following.length === 0 ? end : 0;
+}
+
+/** Place undelivered messages where they were sent, in submission order. */
+export function placeUndeliveredBubbles(
+  committed: Bubble[],
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  if (failedInputs.length === 0) return committed;
+  const bubbles = buildUndeliveredBubbles(failedInputs, selfAuthor);
+  const spans = bubbleSpansByItemId(committed);
   const notice = committed.findIndex(isStartupFailureBubble);
-  if (notice === -1) return [...committed, ...undelivered];
-  return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
+  const placed = new Map<number, Bubble[]>();
+  let previous = 0;
+  for (const [index, input] of failedInputs.entries()) {
+    const at = Math.max(previous, undeliveredIndex(input, spans, notice, committed.length));
+    previous = at;
+    placed.set(at, [...(placed.get(at) ?? []), bubbles[index]!]);
+  }
+  const result: Bubble[] = [];
+  for (let index = 0; index <= committed.length; index += 1) {
+    result.push(...(placed.get(index) ?? []));
+    if (index < committed.length) result.push(committed[index]!);
+  }
+  return result;
 }
 
 /** Submission order within one second: the optimistic bubble's sequence number from its temp id. */
@@ -391,10 +462,7 @@ export function withUncommittedUserBubbles(
   selfAuthor: string | null,
   failedUploads: PendingUserMessage[] = [],
 ): Bubble[] {
-  const withUndelivered = placeUndeliveredBubbles(
-    committed,
-    buildUndeliveredBubbles(failedInputs, selfAuthor),
-  );
+  const withUndelivered = placeUndeliveredBubbles(committed, failedInputs, selfAuthor);
   // Pending sends keep their own order; each parked upload goes where its send time falls.
   const uncommitted = [...withoutFailedInputs(pendingUserMessages, failedInputs)];
   for (const failed of failedUploads) {

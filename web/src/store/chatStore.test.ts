@@ -45,6 +45,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
 import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles } from "@/lib/renderItems";
+import { withUncommittedUserBubbles } from "@/components/chat/chatBubbleParts";
 import {
   getSessionSlim,
   INITIAL_WINDOW_ITEMS,
@@ -15362,6 +15363,81 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
   const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
   const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];
 
+  it.each([
+    { section: "still open", speakFirst: false, closeWithText: false, onScreen: false },
+    { section: "closed by text", speakFirst: false, closeWithText: true, onScreen: false },
+    { section: "already on screen", speakFirst: false, closeWithText: false, onScreen: true },
+    { section: "after text in the reply", speakFirst: true, closeWithText: false, onScreen: false },
+  ])(
+    "tags a streamed thought with its item when the item arrives (section $section)",
+    async ({ speakFirst, closeWithText, onScreen }) => {
+      const question = userMessage("resp_question", "Question");
+      useChatStore.setState({ conversationId: "conv_thought", blocks: itemsToBlocks([question]) });
+      const sink = pushableStream();
+      const manual = manualScheduler();
+      const pump = pumpStreamEvents(
+        "conv_thought",
+        sink.stream,
+        new AbortController(),
+        setState,
+        getState,
+        manual.scheduler,
+      );
+      sink.push(sse("response.created", { id: "resp_thought", status: "in_progress", output: [] }));
+      if (speakFirst) sink.push(sse("response.output_text.delta", { delta: "Let me check. " }));
+      sink.push(sse("response.reasoning.started", {}));
+      sink.push(sse("response.reasoning_text.delta", { delta: "plan the answer\n" }));
+      if (closeWithText) sink.push(sse("response.output_text.delta", { delta: "Answer" }));
+      if (onScreen) {
+        await vi.waitFor(() => expect(manual.pending()).toBe(true));
+        manual.fire();
+        expect(useChatStore.getState().blocks.map((block) => block.type)).toContain(
+          "reasoning_start",
+        );
+      }
+      sink.push(
+        sse("response.output_item.done", {
+          item: {
+            id: "rs_thought",
+            type: "reasoning",
+            status: "completed",
+            response_id: "resp_thought",
+            content: [{ type: "reasoning_text", text: "plan the answer\n" }],
+            summary: [],
+          },
+        }),
+      );
+      sink.push("data: [DONE]\n\n");
+      sink.close();
+      await pump;
+
+      // The thought still renders once, from its deltas, now tagged with the persisted item,
+      // while its block identity stays in flight for reconnect and dedupe.
+      const blocks = useChatStore.getState().blocks;
+      expect(blocks.filter((block) => block.type === "reasoning_block")).toEqual([]);
+      expect(blocks.find((block) => block.type === "reasoning_start")).toMatchObject({
+        ctx: { itemId: null },
+        streamedItemId: "rs_thought",
+      });
+      const placed = withUncommittedUserBubbles(
+        buildBubbles(blocks, null),
+        [],
+        [
+          {
+            pendingId: "pending_first",
+            content: [],
+            precedingItemIds: ["rs_thought", question.id],
+            followingItemIds: [],
+          },
+        ],
+        null,
+      );
+      expect(
+        placed.map((bubble) => (bubble.kind === "assistant" ? "reply" : bubble.itemId)),
+      ).toEqual([question.id, "reply", "pending_first"]);
+    },
+  );
+
   it("coalesces multiple buffered blocks into one in-order append per frame", async () => {
     useChatStore.setState({ conversationId: "conv_batch", blocks: [] });
     const sink = pushableStream();
@@ -19132,6 +19208,56 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   function gapUser(prefix: string, idx: number): ConversationItem {
     return userMessage(`${prefix}_${idx.toString().padStart(4, "0")}`, `${prefix} ${idx}`);
   }
+
+  it("keeps a streamed thought exactly once when its answer is still streaming across a reconnect", async () => {
+    const question = gapUser("question", 0);
+    const thought = {
+      id: "rs_gap",
+      type: "reasoning",
+      status: "completed",
+      response_id: "resp_gap",
+      content: [{ type: "reasoning_text", text: "plan the answer\n" }],
+      summary: [],
+    } as ConversationItem;
+    seedSession("conv_thought_gap", [question]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_thought_gap",
+      abortController: controller,
+      blocks: itemsToBlocks([question]),
+    });
+    const loop = startStreamPump("conv_thought_gap", controller, setState, getState);
+    await drainAsync();
+    const first = sinks[0]!;
+    first.push(sse("response.created", { id: "resp_gap", status: "in_progress", output: [] }));
+    first.push(sse("response.reasoning.started", {}));
+    first.push(sse("response.reasoning_text.delta", { delta: "plan the answer\n" }));
+    first.push(sse("response.output_item.done", { item: thought }));
+    first.push(sse("response.output_text.delta", { delta: "Answer so far" }));
+    await drainAsync();
+    expect(useChatStore.getState().activeResponse?.state).toBe("streaming");
+
+    // The answer is still streaming when the connection drops; history now holds the thought.
+    seedSessionItems("conv_thought_gap", [question, thought]);
+    first.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    const thoughts = useChatStore
+      .getState()
+      .blocks.filter(
+        (block) =>
+          (block.type === "reasoning_chunk" && block.text.includes("plan the answer")) ||
+          (block.type === "reasoning_block" && block.reasoningText.includes("plan the answer")),
+      );
+    expect(thoughts).toHaveLength(1);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
 
   it("backfills a multi-page disconnect gap until it reaches the rendered transcript", async () => {
     // 30 committed items; the rendered window is the newest 20.

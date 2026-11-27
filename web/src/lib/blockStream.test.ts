@@ -533,6 +533,12 @@ describe("BlockStream — reasoning", () => {
     const types = blockTypes(blocks);
     expect(types).toContain("reasoning_chunk");
     expect(types).not.toContain("reasoning_block");
+    // The store tags this section's opener with the persisted item, matching on its
+    // response, so the opener must name that response and carry no item id yet.
+    expect(blocks.find((b) => b.type === "reasoning_start")?.ctx).toMatchObject({
+      responseId: "resp_1",
+      itemId: null,
+    });
   });
 
   it("reasoning_done while a streamed section is open closes it without re-rendering", () => {
@@ -559,6 +565,12 @@ describe("BlockStream — reasoning", () => {
     expect(types).not.toContain("reasoning_block");
     const chunks = blocks.filter((b): b is ReasoningChunk => b.type === "reasoning_chunk");
     expect(chunks.map((c) => c.text).join("")).toContain("thinking hard");
+    // The store tags this section's opener with the persisted item, matching on its
+    // response, so the opener must name that response and carry no item id yet.
+    expect(blocks.find((b) => b.type === "reasoning_start")?.ctx).toMatchObject({
+      responseId: "resp_1",
+      itemId: null,
+    });
   });
 
   it("interleaved text→reasoning→text closes each text section (no orphan, no concatenation)", () => {

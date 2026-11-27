@@ -525,8 +525,11 @@ Fields:
     delivered, e.g. because the managed sandbox host did not come online.
     Same `{pending_id, content, created_by?}` shape as `pending_inputs`, in
     submission order. File blocks keep their `file_id`, so attachments stay
-    downloadable from this session. Clients show these as undelivered
-    messages; a `retry_session` that redelivers them removes them.
+    downloadable from this session. Each also carries `preceding_item_ids`
+    and `following_item_ids`: up to 20 ids each of the transcript items
+    saved just before it (newest first) and just after it (oldest first).
+    Clients show these as undelivered messages next to the nearest of those
+    items they render; a `retry_session` that redelivers them removes them.
 
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.

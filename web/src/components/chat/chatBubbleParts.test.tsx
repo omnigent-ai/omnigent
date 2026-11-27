@@ -4,7 +4,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElicitationBlock } from "@/lib/blocks";
-import type { Bubble, RenderItem } from "@/lib/renderItems";
+import { buildBubbles, type Bubble, type RenderItem } from "@/lib/renderItems";
+import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import type { ConversationItem } from "@/lib/conversationItems";
+import type { PendingInput } from "@/lib/types";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import { PEER_SESSION_MESSAGES_STORAGE_KEY } from "@/lib/peerSessionMessagePreferences";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
@@ -1137,17 +1140,198 @@ describe("undelivered startup messages", () => {
     ],
   };
 
-  it("sit above the startup failure notice, or last when it isn't loaded", () => {
+  it("sit above the startup failure notice, or last, when the server names no earlier items", () => {
     const user: Bubble = { kind: "user", itemId: "user_1", content: [] };
     const notice = errorBubble("startup_input_failed");
     const [undelivered] = buildUndeliveredBubbles([lost], "alice@example.com");
     expect(undelivered).toMatchObject({ undelivered: true, createdBy: "alice@example.com" });
-    expect(placeUndeliveredBubbles([user, notice], [undelivered!])).toEqual([
+    expect(placeUndeliveredBubbles([user, notice], [lost], "alice@example.com")).toEqual([
       user,
       undelivered,
       notice,
     ]);
-    expect(placeUndeliveredBubbles([user], [undelivered!])).toEqual([user, undelivered]);
+    expect(placeUndeliveredBubbles([user], [lost], "alice@example.com")).toEqual([
+      user,
+      undelivered,
+    ]);
+  });
+
+  it("stay where they were sent, above later activity", () => {
+    const first: Bubble = { kind: "user", itemId: "user_1", content: [] };
+    const reply: Bubble = {
+      ...errorBubble(),
+      lifecycle: "completed",
+      itemIds: ["reply_text", "reply_tail"],
+      items: [
+        { kind: "text", itemId: "reply_text", text: "Read it.", final: true },
+        { kind: "text", itemId: "reply_tail", text: "Done.", final: true },
+      ],
+    };
+    const later: Bubble = { kind: "user", itemId: "user_2", content: [] };
+    const committed = [first, reply, later];
+    const place = (...neighbors: Pick<PendingInput, "precedingItemIds" | "followingItemIds">[]) =>
+      withUncommittedUserBubbles(
+        committed,
+        [],
+        neighbors.map((ids, index) => ({ ...lost, pendingId: `pending_${index}`, ...ids })),
+        null,
+      ).map((bubble) => (bubble.kind === "assistant" ? bubble.stableId : bubble.itemId));
+
+    // An item that renders no bubble (a resource event) is passed over.
+    expect(place({ precedingItemIds: ["resource_event", "user_1"] })).toEqual([
+      "user_1",
+      "pending_0",
+      "error_failed",
+      "user_2",
+    ]);
+    expect(place({ precedingItemIds: ["reply_text", "user_1"] })).toEqual([
+      "user_1",
+      "error_failed",
+      "pending_0",
+      "user_2",
+    ]);
+    // Nothing rendered before it: above the oldest rendered later item.
+    expect(
+      place({ precedingItemIds: ["resource_event"], followingItemIds: ["meta_note", "user_2"] }),
+    ).toEqual(["user_1", "error_failed", "pending_0", "user_2"]);
+    // Sent before anything loaded, or before anything at all.
+    expect(place({ precedingItemIds: ["older_item"], followingItemIds: ["older_reply"] })).toEqual([
+      "pending_0",
+      "user_1",
+      "error_failed",
+      "user_2",
+    ]);
+    expect(place({ precedingItemIds: [], followingItemIds: ["user_1"] })).toEqual([
+      "pending_0",
+      "user_1",
+      "error_failed",
+      "user_2",
+    ]);
+    // Nothing rendered before it and nothing saved after it: the newest message.
+    expect(place({ precedingItemIds: ["resource_event"], followingItemIds: [] })).toEqual([
+      "user_1",
+      "error_failed",
+      "user_2",
+      "pending_0",
+    ]);
+    // A later message whose neighbors don't render stays below the one sent first.
+    expect(
+      place(
+        { precedingItemIds: ["user_1"] },
+        { precedingItemIds: ["resource_event"], followingItemIds: ["older_reply"] },
+      ),
+    ).toEqual(["user_1", "pending_0", "pending_1", "error_failed", "user_2"]);
+  });
+
+  it("stay below a reply that only reasoned, from history or streamed live", () => {
+    const steps = Array.from({ length: 21 }, (_, index) => `rs_${index}`);
+    const history = itemsToBlocks([
+      {
+        id: "user_1",
+        response_id: "resp_user",
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [{ type: "input_text", text: "Plan it" }],
+      },
+      ...steps.map((id) => ({
+        id,
+        response_id: "resp_1",
+        type: "reasoning" as const,
+        status: "completed",
+        summary: [],
+        content: [{ type: "reasoning_text" as const, text: `Check ${id}.` }],
+      })),
+    ]);
+    const live = history.map((block) =>
+      block.ctx.responseId === "resp_1"
+        ? { ...block, ctx: { ...block.ctx, clientCreatedAtS: 1 } }
+        : block,
+    );
+    // The 20 items nearest the message leave out the first step, which keys a history bubble.
+    const anchors = {
+      ...lost,
+      precedingItemIds: steps.slice(1).reverse(),
+      followingItemIds: ["resource_event"],
+    };
+    for (const [blocks, key] of [
+      [history, "rs_0"],
+      [live, "resp_1:live:0"],
+    ] as const) {
+      const committed = buildBubbles(blocks, null);
+      expect(committed[1]).toMatchObject({ kind: "assistant", stableId: key });
+      const placed = withUncommittedUserBubbles(committed, [], [anchors], null);
+      expect(placed.map((bubble) => bubble.kind)).toEqual(["user", "assistant", "user"]);
+      expect(placed[2]).toMatchObject({ undelivered: true, itemId: "pending_first" });
+    }
+  });
+
+  it.each<{ derived: string; itemId: string; items: ConversationItem[]; bubbles: string[] }>([
+    {
+      derived: "a skill command's typed echo and its indicator",
+      itemId: "skill_1",
+      bubbles: ["skill_1:user", "assistant:skill_1"],
+      items: [
+        {
+          id: "skill_1",
+          response_id: "resp_skill",
+          type: "slash_command",
+          status: "completed",
+          kind: "skill",
+          name: "review",
+          arguments: "the plan",
+        },
+      ],
+    },
+    {
+      derived: "an answered question's card and its tool row",
+      itemId: "fc_ask",
+      bubbles: ["assistant:fc_ask:answer", "assistant:fc_ask"],
+      items: [
+        {
+          id: "fc_ask",
+          response_id: "resp_ask",
+          type: "function_call",
+          status: "completed",
+          name: "AskUserQuestion",
+          call_id: "call_ask",
+          arguments: JSON.stringify({
+            questions: [
+              {
+                question: "Which library?",
+                header: "Library",
+                multiSelect: false,
+                options: [{ label: "date-fns", description: "Small" }],
+              },
+            ],
+          }),
+        },
+        {
+          id: "fco_ask",
+          response_id: "resp_ask",
+          type: "function_call_output",
+          status: "completed",
+          call_id: "call_ask",
+          output: 'Your questions have been answered: "Which library?"="date-fns".',
+        },
+      ],
+    },
+  ])("stay outside $derived", ({ itemId, items, bubbles }) => {
+    const committed = buildBubbles(itemsToBlocks(items), null);
+    const label = (bubble: Bubble) =>
+      bubble.kind === "assistant" ? `assistant:${bubble.stableId}` : bubble.itemId;
+    const place = (neighbors: Pick<PendingInput, "precedingItemIds" | "followingItemIds">) =>
+      withUncommittedUserBubbles(committed, [], [{ ...lost, ...neighbors }], null).map(label);
+    expect(committed.map(label)).toEqual(bubbles);
+    // An earlier item that isn't loaded leaves the copy to anchor on the item's first bubble.
+    expect(place({ precedingItemIds: ["older"], followingItemIds: [itemId] })).toEqual([
+      "pending_first",
+      ...committed.map(label),
+    ]);
+    expect(place({ precedingItemIds: [itemId], followingItemIds: ["resource_event"] })).toEqual([
+      ...committed.map(label),
+      "pending_first",
+    ]);
   });
 
   it("start a new session carrying the text and the attachments that download", async () => {

@@ -19,7 +19,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from starlette.datastructures import Headers
 
-from omnigent.entities.conversation import ErrorData
+from omnigent.entities.conversation import ErrorData, MessageData, NewConversationItem
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import HostHelloFrame
@@ -1257,6 +1257,74 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert (
         await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
     )
+
+
+async def test_undelivered_inputs_name_the_transcript_items_around_them(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clients place each undelivered message next to the items saved around it, not last."""
+    env = startup_env
+    session_id = await _create(env)
+    startup = env.app.state.startup_inputs
+
+    def append_replies(response_id: str) -> list[str]:
+        saved = env.conv_store.append(
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=response_id,
+                    data=MessageData(
+                        role="assistant",
+                        agent="startup-probe",
+                        content=[{"type": "output_text", "text": f"Reply {index}"}],
+                    ),
+                )
+                for index in range(21)
+            ],
+        )
+        return [item.id for item in saved]
+
+    earlier = append_replies("resp_earlier")
+    follow_up = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "Second input"}]},
+    }
+    await startup.enqueue(
+        session_id,
+        SessionEventInput.model_validate(follow_up),
+        user_id=None,
+        headers=Headers(),
+        first=False,
+    )
+    later = append_replies("resp_later")
+    await startup.record_launch_failure(session_id, "spend limit reached")
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    first, second = snapshot["failed_inputs"]
+    # Each side names the nearest 20 items, skipping the other undelivered input.
+    assert first["preceding_item_ids"] == []
+    assert first["following_item_ids"] == earlier[:20]
+    assert second["preceding_item_ids"] == earlier[::-1][:20]
+    assert second["following_item_ids"] == later[:20]
+
+    # An input resolved while its neighbors are read drops out; the read still succeeds.
+    first_input, _ = env.conv_store.list_pending_inputs(session_id)
+    list_items = env.conv_store.list_items
+    resolved: list[str] = []
+
+    def resolve_before_neighbor_lookup(conversation_id: str, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("after") == first_input.id and not resolved:
+            assert env.conv_store.transition_pending_input(
+                conversation_id, first_input.id, expected="failed", status=None
+            )
+            resolved.append(first_input.id)
+        return list_items(conversation_id, *args, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "list_items", resolve_before_neighbor_lookup)
+    response = await env.client.get(f"/v1/sessions/{session_id}")
+    assert response.status_code == 200, response.text
+    assert resolved == [first_input.id]
+    assert response.json()["failed_inputs"] == [second]
 
 
 async def test_registration_timeout_fences_prompt_before_provider_hint(
