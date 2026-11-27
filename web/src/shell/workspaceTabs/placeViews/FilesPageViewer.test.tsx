@@ -143,10 +143,10 @@ describe("FilesPageViewer", () => {
     expect(useFileContent).toHaveBeenCalledWith("conv_1", "a.ts", { visible: false });
   });
 
-  it("edits text in CodeMirror at the cited position, with Show changes and Close in its toolbar", async () => {
+  it("edits text in CodeMirror at the cited position, with Show changes and no Close in its toolbar", async () => {
     const onShowChanges = vi.fn();
     const position = { line: 3 };
-    const { onClose } = renderViewer(
+    renderViewer(
       "src/a.ts",
       { data: file("src/a.ts", "const a = 1;", { truncated: true }) },
       { onShowChanges, position },
@@ -155,8 +155,8 @@ describe("FilesPageViewer", () => {
     expect(captured.editor).toMatchObject({ path: "src/a.ts", truncated: true, position });
     await userEvent.click(screen.getByRole("button", { name: "Show changes" }));
     expect(onShowChanges).toHaveBeenCalledTimes(1);
-    await userEvent.click(screen.getByRole("button", { name: "Close file" }));
-    expect(onClose).toHaveBeenCalledTimes(1);
+    // The tab's own close button closes the file, so the toolbar has no Close.
+    expect(screen.queryByRole("button", { name: "Close file" })).toBeNull();
   });
 
   it("ends a text file's toolbar with the tree's toggle, after the file's actions", () => {
@@ -350,24 +350,24 @@ describe("FilesPageViewer", () => {
     expect(captured.viewer!.permissionLevel).toBe(1);
   });
 
-  it("keeps the tree toggle, Show changes and Close above a rich file, without repeating its path", async () => {
+  it("hands a rich file's one toolbar row to the app's viewer, with the tree's toggle and Show changes", () => {
     const onShowChanges = vi.fn();
-    const { onClose } = renderViewer(
+    const toggle = <button type="button">Show tree</button>;
+    renderViewer(
       "docs/guide.md",
       { data: file("docs/guide.md", "# Guide") },
-      { toolbarTrailing: <button type="button">Show tree</button>, onShowChanges },
+      { toolbarTrailing: toggle, onShowChanges },
     );
-    // The toggle ends the toolbar, over the tree docked at the right.
-    const toggle = screen.getByRole("button", { name: "Show tree" });
-    expect(toggle.parentElement?.lastElementChild).toBe(toggle);
-    // The app's viewer has its own actions, so the toolbar adds no File actions.
+    // The viewer draws the row beside the tree, so the page draws none of its own.
+    expect(captured.viewer).toMatchObject({
+      besideSidebar: true,
+      frameless: true,
+      toolbarTrailing: toggle,
+      onShowChanges,
+    });
+    expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
     expect(screen.queryByRole("button", { name: "File actions" })).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Show changes" }));
-    expect(onShowChanges).toHaveBeenCalledTimes(1);
-    await userEvent.click(screen.getByRole("button", { name: "Close file" }));
-    expect(onClose).toHaveBeenCalledTimes(1);
-    // The viewer's own header names the file.
-    expect(screen.getAllByText("docs/guide.md")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Close file" })).toBeNull();
   });
 
   it("shows a spinner while loading, and why a file couldn't open", () => {
