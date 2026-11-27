@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import subprocess
 import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from importlib.metadata import version
 from pathlib import Path
 
@@ -20,6 +23,47 @@ from tests._helpers.polling import poll_until_async
 from tests.server.integration.mock_llm_server import app as mock_gateway
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="native Windows SDK launcher")
+
+
+def _isolate_claude_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config = home / ".claude"
+    config.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    for name in (
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@asynccontextmanager
+async def _serve_gateway(app, reply: str) -> AsyncIterator[str]:
+    with reserve_port() as socket:
+        base_url = f"http://127.0.0.1:{socket.getsockname()[1]}"
+        server = uvicorn.Server(
+            uvicorn.Config(app, log_level="warning", lifespan="off", interface="asgi3")
+        )
+        worker = threading.Thread(target=server.run, kwargs={"sockets": [socket]}, daemon=True)
+        worker.start()
+        try:
+            await poll_until_async(lambda: server.started, timeout_s=15)
+            async with httpx.AsyncClient(base_url=base_url) as control:
+                response = await control.post(
+                    "/mock/configure", json={"responses": [{"text": reply}] * 128}
+                )
+                response.raise_for_status()
+            yield base_url
+        finally:
+            server.should_exit = True
+            await asyncio.to_thread(worker.join, 5)
+            assert not worker.is_alive()
 
 
 @pytest.mark.asyncio
@@ -56,42 +100,13 @@ async def test_windows_static_key_gateway_completes_real_sdk_turns(
                 return
         await mock_gateway(scope, receive, send)
 
-    home = tmp_path / "home"
-    home.mkdir()
-    config = home / ".claude"
-    config.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
-    monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-    for name in (
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
+    _isolate_claude_home(tmp_path, monkeypatch)
     executor = None
     process = None
     messages = []
     key_file = None
-    with reserve_port() as socket:
-        base_url = f"http://127.0.0.1:{socket.getsockname()[1]}"
-        server = uvicorn.Server(
-            uvicorn.Config(
-                credential_checked_gateway, log_level="warning", lifespan="off", interface="asgi3"
-            )
-        )
-        worker = threading.Thread(target=server.run, kwargs={"sockets": [socket]}, daemon=True)
-        worker.start()
+    async with _serve_gateway(credential_checked_gateway, marker) as base_url:
         try:
-            await poll_until_async(lambda: server.started, timeout_s=15)
-            async with httpx.AsyncClient(base_url=base_url) as control:
-                response = await control.post(
-                    "/mock/configure", json={"responses": [{"text": marker}] * 128}
-                )
-                response.raise_for_status()
             executor = ClaudeSDKExecutor(
                 cwd=str(tmp_path),
                 model=model,
@@ -159,16 +174,59 @@ async def test_windows_static_key_gateway_completes_real_sdk_turns(
             assert len(authenticated) >= 3 and all(authenticated)
             assert refresh_observed
         finally:
-            try:
-                if executor is not None:
-                    await executor.close()
-            finally:
-                server.should_exit = True
-                await asyncio.to_thread(worker.join, 5)
-                assert not worker.is_alive()
+            if executor is not None:
+                await executor.close()
     assert process is not None and process.returncode is not None
     assert key_file is not None and not key_file.directory.exists()
     print(
         f"{turn + 1} real SDK turns authenticated; background helper refresh verified within 30s."
     )
     print("CLI exited and private key file was removed.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(150)
+@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions"])
+async def test_windows_preapproved_many_tool_turn_launches_real_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, permission_mode: str
+) -> None:
+    marker = "WINDOWS_MANY_TOOLS_OK"
+    tools = [
+        {
+            "name": f"server{index % 4}__list_project_items_{index:03d}",
+            "description": "List project items.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        for index in range(740)
+    ]
+    _isolate_claude_home(tmp_path, monkeypatch)
+    async with _serve_gateway(mock_gateway, marker) as base_url:
+        executor = ClaudeSDKExecutor(
+            cwd=str(tmp_path),
+            model="sonnet",
+            permission_mode=permission_mode,
+            gateway=True,
+            base_url_override=base_url,
+            gateway_auth_command="printf %s dummy-native-many-tools-key",
+            skills_filter="none",
+        )
+        try:
+            messages = [{"role": "user", "content": "hello", "session_id": "windows-many-tools"}]
+            events = [event async for event in executor.run_turn(messages, tools, "")]
+            assert not [event for event in events if isinstance(event, ExecutorError)]
+            completed = [event for event in events if isinstance(event, TurnComplete)]
+            assert completed and completed[-1].response == marker
+            cli_path = executor._clients["windows-many-tools"].client._transport._cli_path
+        finally:
+            await executor.close()
+    print(f"OS: {platform.platform()}; {len(tools)}-tool {permission_mode} turn replied {marker}")
+
+    # A per-tool allowlist for this session is too long for CreateProcess.
+    per_tool_rules = ",".join(f"mcp__omnigent__{tool['name']}" for tool in tools)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        subprocess.run(
+            [cli_path, "--allowedTools", per_tool_rules, "--version"],
+            capture_output=True,
+            timeout=60,
+        )
+    assert getattr(excinfo.value, "winerror", None) == 206

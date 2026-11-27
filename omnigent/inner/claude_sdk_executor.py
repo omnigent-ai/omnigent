@@ -4160,18 +4160,10 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode in _OMNIGENT_TOOLS_PREAPPROVED_MODES:
-            # Allow all Omnigent MCP tools (no per-call human gate needed)
-            for schema in tools:
-                raw_tname = schema.get("name")
-                # Claude SDK's ``allowed_tools`` requires concrete strings;
-                # Omnigent tool schemas always carry a name (see
-                # ``Tool.tool_schema``), but defend against malformed specs
-                # by skipping unnamed entries rather than producing a
-                # bogus ``mcp__omnigent__`` allow-entry.
-                if not isinstance(raw_tname, str) or not raw_tname:
-                    continue
-                allowed_tools.append(f"mcp__omnigent__{raw_tname}")
+        if self._permission_mode in _OMNIGENT_TOOLS_PREAPPROVED_MODES and omnigent_tools_reachable:
+            # One server-level rule: a per-tool list grows the CLI command line with the
+            # tool count and overflows Windows' 32,767-character limit for large tool sets.
+            allowed_tools.append(f"mcp__{_OMNIGENT_MCP_SERVER_NAME}")
 
         # cfg.model > spec model > Databricks default (only on the
         # Databricks-profile gateway path) > None (lets the SDK pick its own

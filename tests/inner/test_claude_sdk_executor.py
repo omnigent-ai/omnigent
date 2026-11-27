@@ -3140,7 +3140,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                     for message in _FakeSDK.messages:
                         yield message
 
-        async def _t(preset):
+        async def _t(preset, permission_mode="auto"):
             # Explicit ``sandbox=none`` so the test runs on any
             # platform. The default ``OSEnvSandboxSpec.type`` is
             # ``"linux_bwrap"``; without this override,
@@ -3149,6 +3149,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             # sandbox behavior.
             executor = ClaudeSDKExecutor(
                 system_prompt_preset=preset,
+                permission_mode=permission_mode,
                 os_env=OSEnvSpec(
                     type="caller_process",
                     sandbox=OSEnvSandboxSpec(type="none"),
@@ -3172,8 +3173,6 @@ class TestStreamEventStreaming(unittest.TestCase):
             # OS operations route through sys_os_* MCP tools, not SDK
             # built-ins. Skill and ToolSearch do not widen OS access.
             self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
-            self.assertIn("mcp__omnigent__sleep", captured_options["allowed_tools"])
-            self.assertNotIn("Bash", captured_options["allowed_tools"])
             self.assertIsInstance(events[-1], TurnComplete)
             prompt = captured_options["system_prompt"]
             if preset:
@@ -3186,6 +3185,13 @@ class TestStreamEventStreaming(unittest.TestCase):
         for preset in (None, "claude_code"):
             with self.subTest(preset=preset):
                 _run(_t(preset))
+                self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent"])
+
+        # Other permission modes pre-approve nothing, even with Omnigent tools present.
+        for permission_mode in ("default", "acceptEdits", "plan", "dontAsk"):
+            with self.subTest(permission_mode=permission_mode):
+                _run(_t(None, permission_mode))
+                self.assertEqual(captured_options["allowed_tools"], [])
 
         with self.assertRaisesRegex(ValueError, "system_prompt_preset"):
             ClaudeSDKExecutor(system_prompt_preset="unknown")
@@ -3240,7 +3246,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             # what this test pins. Neither base tool widens the FS attack
             # surface.
             self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
-            self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent__sleep"])
+            self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent"])
             self.assertIsInstance(events[-1], TurnComplete)
 
         _run(_t())
@@ -3295,7 +3301,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                         "Delegate through `sys_session_send`.",
                     )
                 ]
-            self.assertIn("mcp__omnigent__sys_session_send", captured_options["allowed_tools"])
+            self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent"])
             self.assertIn(
                 "use `mcp__omnigent__sys_session_send` when instructions say `sys_session_send`",
                 captured_options["system_prompt"],
@@ -3351,10 +3357,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                         "Call `sys_session_rename` before replying.",
                     )
                 ]
-            self.assertIn(
-                "mcp__omnigent__sys_session_rename",
-                captured_options["allowed_tools"],
-            )
+            self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent"])
             self.assertIn(
                 "use `mcp__omnigent__sys_session_rename` when instructions say "
                 "`sys_session_rename`",
@@ -4755,6 +4758,7 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
         first = await turn("q0")
         assert first.options.mcp_servers == {}
+        assert first.options.allowed_tools == ["mcp__omnigent"]
         relay_env = {
             key: value for key, value in first.options.env.items() if key.startswith("OMNIGENT_")
         }
@@ -4808,6 +4812,7 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
         messages.clear()
         bare = await turn("q2")
         assert bare.options.mcp_servers == {}
+        assert bare.options.allowed_tools == []
         assert bare.options.env[bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV] == ""
         assert "mcp__omnigent__" not in (bare.options.system_prompt or "")
         assert warnings == [bridge.MANAGED_MCP_RELAY_MISSING_WARNING]
@@ -5826,6 +5831,57 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_error() -> No
         f"Stderr not included in connect error.\nExpected 'unknown option' in: {msg!r}"
     )
     assert "Command failed" in msg, msg
+
+
+_WINDOWS_COMMAND_LINE_LIMIT = 32767
+
+
+@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions"])
+async def test_preapproved_many_tool_session_spawns_cli_within_windows_command_line_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, permission_mode: str
+) -> None:
+    from claude_agent_sdk._internal.transport import subprocess_cli
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    cli = tmp_path / "claude"
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", str(cli))
+    monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+    command_line_lengths: list[int] = []
+
+    class _SpawnAccepted(Exception):
+        pass
+
+    async def windows_open_process(command, **kwargs):
+        command_line = subprocess.list2cmdline([os.fsdecode(part) for part in command])
+        command_line_lengths.append(len(command_line))
+        # Windows CPython reports an over-long CreateProcess command line (WinError 206) this way.
+        if len(command_line) >= _WINDOWS_COMMAND_LINE_LIMIT:
+            raise FileNotFoundError(2, "[WinError 206] The filename or extension is too long")
+        raise _SpawnAccepted
+
+    monkeypatch.setattr(subprocess_cli.anyio, "open_process", windows_open_process)
+    tools = [
+        {
+            "name": f"server{index % 4}__list_project_items_{index:03d}",
+            "description": "List project items.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        for index in range(740)
+    ]
+    executor = ClaudeSDKExecutor(permission_mode=permission_mode)
+
+    with pytest.raises(RuntimeError, match="Claude SDK connect failed") as excinfo:
+        async for _ in executor.run_turn([{"role": "user", "content": "hello"}], tools, ""):
+            pass
+
+    assert command_line_lengths, "the Claude CLI was never spawned"
+    assert command_line_lengths[0] < _WINDOWS_COMMAND_LINE_LIMIT, (
+        f"{command_line_lengths[0]}-char CLI command line; turn failed with: {excinfo.value}"
+    )
+    assert "Claude Code not found" not in str(excinfo.value)
 
 
 if __name__ == "__main__":
