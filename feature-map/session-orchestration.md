@@ -336,7 +336,7 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   side-chat destinations with the production runner client/auth and a simulated
   ingress. Same-host creation covers root/child managers, inherited host routing,
   legacy keyless routing and refusal before writes on the wrong replica. A tunnel
-  loss after workspace validation leaves one discoverable worker and reports
+  loss after workspace validation removes the saved worker and reports
   uncertainty without retrying creation. Queue tests check refusal before saving
   and replay after sharing. Scheduled-origin tests cover sends and
   creates from a scheduled run, its full fork after schedule-history deletion,
@@ -390,9 +390,11 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   not a session ID; these hints do not prove creation or uniquely identify a worker.
   Same-host `wrong_replica`/409 responses can occur before persistence or during
   launch afterward, so the runner treats them as uncertain and never auto-retries.
-  An early wrong-replica refusal creates no row; a late launch failure may leave
-  one that the owner can inspect. Keyless legacy routing must be configured on
-  the runner; independent creation has no automatic routing fallback.
+  An early wrong-replica refusal creates no row; a host launch refused before a
+  runner is bound deletes the saved row and any worktree it created, since its
+  first task would never be sent. Other unconfirmed results, such as a lost
+  response, may still leave a row to inspect. Keyless legacy routing must be
+  configured on the runner; independent creation has no automatic routing fallback.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
 - A fresh managed sandbox is distinct from reusing an existing managed host.

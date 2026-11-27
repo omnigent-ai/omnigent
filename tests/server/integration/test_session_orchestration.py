@@ -2770,6 +2770,7 @@ async def test_same_host_creation_across_replicas(
         assert stack.conv_store.get_conversation(manager["id"]).host_id is None
     before = {s.id for s in stack.conv_store.list_conversations().data}
     launches = []
+    uncertain_create = routing in {"wrong_replica", "disconnect", "offline"}
 
     def answer_host(connection, payload):
         frame = decode_host_frame(payload)
@@ -2820,6 +2821,7 @@ async def test_same_host_creation_across_replicas(
                         "agent_id": source["agent_id"],
                         "placement": "same_host",
                         "title": "Review worker",
+                        **({"message": "First task"} if uncertain_create else {}),
                     }
                 ),
                 server_client=client,
@@ -2835,25 +2837,26 @@ async def test_same_host_creation_across_replicas(
                     conversation_id=manager["id"],
                 )
             )
-            workers = [s for s in listing["sessions"] if s["title"] == result["title"]]
-            assert len(workers) == 1
-            recovered = json.loads(
-                await execute_tool(
-                    tool_name="sys_session_get_info",
-                    arguments=json.dumps({"session_id": workers[0]["session_id"]}),
-                    server_client=client,
-                    conversation_id=manager["id"],
-                )
-            )
-            assert recovered["agent_id"] == result["agent_id"]
-            assert recovered["host_id"] == host_id
+            assert [s for s in listing["sessions"] if s["title"] == result["title"]] == []
     created = {s.id for s in stack.conv_store.list_conversations().data} - before
     assert len(posts) == 1
-    if routing in {"wrong_replica", "disconnect", "offline"}:
+    if uncertain_create:
         assert "do not automatically retry" in result["error"], result
         assert posts == [(host_id, 409 if routing == "offline" else 400)]
-        assert len(created) == (0 if routing == "wrong_replica" else 1)
+        assert not created
         assert launches == []
+        # The caller must not resend, so a session left behind has to keep its first task.
+        for worker_id in created:
+            saved_texts = [
+                part.get("text", "")
+                for item in (
+                    *stack.conv_store.list_pending_inputs(worker_id),
+                    *stack.conv_store.list_items(worker_id).data,
+                )
+                for part in getattr(item.data, "content", None) or []
+                if isinstance(part, dict)
+            ]
+            assert any("First task" in text for text in saved_texts), saved_texts
     else:
         assert "error" not in result, result
         assert posts == [(None if routing == "keyless" else host_id, 201)]
@@ -3466,14 +3469,19 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     assert not snapshot["family"]["pinned"]
 
 
-@pytest.mark.parametrize("scenario", ["allowed", "foreign_host", "restricted", "shared_source"])
+@pytest.mark.parametrize(
+    "scenario", ["allowed", "foreign_host", "restricted", "shared_source", "launch_refused"]
+)
 @pytest.mark.parametrize("nested", [False, True])
 async def test_scripted_host_worktree_respects_ownership_and_policy(
     auth_client, auth_app, peers, db_uri, monkeypatch, scenario, nested
 ):
+    from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.host.frames import (
         HostCreateWorktreeFrame,
         HostLaunchRunnerFrame,
+        HostListWorktreesFrame,
+        HostRemoveWorktreeFrame,
         HostStatFrame,
         decode_host_frame,
     )
@@ -3517,10 +3525,25 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
             )
         elif isinstance(frame, HostLaunchRunnerFrame):
             connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        elif isinstance(frame, HostListWorktreesFrame):
+            connection.pending_list_worktrees[frame.request_id].set_result(
+                {
+                    "status": "ok",
+                    "worktrees": [{"path": "/repos/review", "branch": "review", "is_main": False}],
+                }
+            )
+        elif isinstance(frame, HostRemoveWorktreeFrame):
+            connection.pending_remove_worktrees[frame.request_id].set_result({"status": "ok"})
         else:
             pytest.fail(f"Unexpected host frame: {frame}")
 
     monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    if scenario == "launch_refused":
+
+        async def refuse_launch(*_args, **_kwargs):
+            raise OmnigentError("Host runtime is too old", code=ErrorCode.CONFLICT)
+
+        monkeypatch.setattr(auth_app.state.host_registry, "admit_launch", refuse_launch)
     before = {s.id for s in store.list_conversations().data}
     result = json.loads(
         await execute_tool(
@@ -3541,7 +3564,13 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
     if scenario != "allowed":
         assert "error" in result, result
         assert {s.id for s in store.list_conversations().data} == before
-        assert not frames
+        if scenario == "launch_refused":
+            removed = next(f for f in frames if isinstance(f, HostRemoveWorktreeFrame))
+            assert (removed.worktree_path, removed.branch) == ("/repos/review", "review")
+            assert removed.delete_branch
+            assert not any(isinstance(f, HostLaunchRunnerFrame) for f in frames)
+        else:
+            assert not frames
         return
     assert "error" not in result, result
     created = store.get_conversation(result["conversation_id"])
