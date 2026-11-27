@@ -1,7 +1,7 @@
 """Project permissions for bounded Git transfers and glab activities.
 
 Only explicitly supported command/option combinations can run automatically.
-Unresolved destinations, MR merges/rebases, and custom API requests require approval.
+Unresolved destinations, MR merges/rebases, and unmodelled API requests require approval.
 The policy examines shell text; existing CLI configuration must be trusted.
 GitLab MCP tools and direct HTTP clients are outside this policy's scope.
 """
@@ -123,6 +123,23 @@ _COMMAND_OPTIONS = {
     ),
     ("mr", "rebase"): _option_spec(switches="skip-ci"),
 }
+_API_OPTIONS = _option_spec(
+    "hostname method:X placeholder raw-field:f field:F input header:H form output",
+    "help:h include:i silent paginate",
+)
+_API_READ_FIELDS = frozenset(
+    {
+        "page",
+        "per_page",
+        "state",
+        "search",
+        "labels",
+        "source_branch",
+        "target_branch",
+        "order_by",
+        "sort",
+    }
+)
 
 _GIT_OPTIONS = {
     "clone": _option_spec(
@@ -328,6 +345,29 @@ def _parse_glab_arguments(
     return _GlabArguments(tuple(parsed), tuple(operands))
 
 
+def _api_fields(args: _GlabArguments) -> dict[str, str | bool] | None:
+    """Model literal string fields and typed booleans without files or expansion."""
+    fields: dict[str, str | bool] = {}
+    for name, spec in args.options:
+        if name not in {"field", "raw-field"}:
+            continue
+        key, equal, value = spec.partition("=")
+        if not equal or not re.fullmatch(r"[a-z_]+", key) or key in fields:
+            return None
+        if name == "field":
+            if value not in {"true", "false"}:
+                return None
+            fields[key] = value == "true"
+        else:
+            fields[key] = value
+    return fields
+
+
+def _has_quick_actions(value: str) -> bool:
+    """Conservatively recognize slash-led text without interpreting Markdown."""
+    return any(line.lstrip().startswith("/") for line in value.splitlines())
+
+
 def _project_ref(value: str, hosts: frozenset[str]) -> _Project | None:
     """Keep project paths separate from optional, explicitly configured HTTPS hosts."""
     if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
@@ -461,10 +501,10 @@ def gitlab_policy(
     :param hosts: Trusted GitLab HTTPS authorities; defaults to gitlab.com.
     :param read_all: Allow supported reads across projects on the configured hosts.
     :param read_repos: Readable project paths or host-pinned HTTPS project URLs.
-    :param write_repos: Projects permitting supported issue/MR writes and Git pushes.
-    :param write_branches: Exact, case-sensitive push destination branch names;
+    :param write_repos: Projects permitting supported issue/MR/API writes and Git pushes.
+    :param write_branches: Exact, case-sensitive push and API branch-deletion names;
         None or empty means unrestricted. Does not apply to issues, tags, or MR metadata.
-    :param allow_destructive: Permit explicit Git ref deletions through write checks;
+    :param allow_destructive: Permit Git ref and API branch deletions through write checks;
         explicit MR source-removal requests still require approval.
     :param deny_tag_push: Deny tag pushes, including bulk tag flags, by default.
     :param deny_force_push: Deny force flags and force-prefixed refspecs by default.
@@ -529,7 +569,7 @@ def gitlab_policy(
             if value is not None and (not value or value == "-"):
                 return _ask("Provide explicit MR text; editor or empty input requires approval.")
         description = args.last("description")
-        if description and any(line.lstrip().startswith("/") for line in description.splitlines()):
+        if description and _has_quick_actions(description):
             return _ask("Potential GitLab quick actions in MR descriptions require approval.")
         if action == "create":
             if any(args.last(name) is None for name in ("title", "description")):
@@ -573,6 +613,183 @@ def gitlab_policy(
                 for name, _ in args.options
             ):
                 return _ask("Choose an explicit supported MR metadata change.")
+        return None
+
+    def check_api(tokens: list[str]) -> PolicyResponse | None:
+        args = _parse_glab_arguments(tokens, _API_OPTIONS)
+        if args is None:
+            return _ask("Unsupported or incomplete glab API options require approval.")
+        if args.enabled("help"):
+            return None
+        hosts = args.values("hostname")
+        if not hosts or len(set(hosts)) != 1 or len(args.operands) != 1:
+            return _ask("Select one explicit API hostname and endpoint.")
+        host = instance_authority(hosts[0])
+        if host not in owned_hosts or any(char in hosts[0] for char in "/@?#:"):
+            return _ask("Use one configured API hostname supported by glab.")
+        endpoint = args.operands[0].removeprefix("/")
+        parts = endpoint.split("/")
+        if (
+            len(parts) < 2
+            or parts[0] != "projects"
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(char in endpoint for char in "?#%")
+        ):
+            return _ask("Use a supported project API route without a query string.")
+        route = parts[2:]
+        path = "/".join(route)
+        member = re.fullmatch(r"(?:issues|merge_requests)/[1-9][0-9]*", path)
+        notes = re.fullmatch(r"(?:issues|merge_requests)/[1-9][0-9]*/notes", path)
+        merge = re.fullmatch(r"merge_requests/[1-9][0-9]*/merge", path)
+        rebase = re.fullmatch(r"merge_requests/[1-9][0-9]*/rebase", path)
+        branch_member = len(route) == 3 and route[:2] == ["repository", "branches"]
+        bulk_delete = path == "repository/merged_branches"
+        if len(set(args.values("method"))) > 1:
+            return _ask("Conflicting API method selectors require approval.")
+        method = args.last("method")
+        if method is None:
+            method = (
+                "POST"
+                if any(args.values(name) for name in ("field", "raw-field", "input", "form"))
+                else "GET"
+            )
+        if method == "DELETE":
+            deletion_parts = (
+                endpoint.replace(":group/:namespace/:repo", ":fullpath")
+                .replace(":namespace/:repo", ":fullpath")
+                .split("/")
+            )
+            deletion_route = deletion_parts[2:]
+            if not deletion_route or re.fullmatch(
+                r"(?:issues|merge_requests)/[1-9][0-9]*", "/".join(deletion_route)
+            ):
+                return _deny(f"{deny_reason} GitLab object deletion is not permitted.")
+            if not allow_destructive and (
+                (len(deletion_route) == 3 and deletion_route[:2] == ["repository", "branches"])
+                or deletion_route == ["repository", "merged_branches"]
+            ):
+                return _deny(f"{deny_reason} API branch deletion is not permitted.")
+        placeholders: dict[str, str] = {}
+        for spec in args.values("placeholder"):
+            name, equal, value = spec.partition("=")
+            if not equal or name not in {"project", "ref"} or name in placeholders:
+                return _ask("Use unique literal project/ref API placeholders.")
+            placeholders[name] = value
+        project_path = placeholders.get("project", "")
+        project = _project_ref(f"https://{host}/{project_path}", owned_hosts)
+        if project is None or project[1] != project_path.lower():
+            return _ask("Pin the API project with --placeholder project=group/project.")
+        if parts[1] != ":project":
+            return _ask(
+                "Use an explicit projects/:project API placeholder instead of inferred IDs."
+            )
+        uses_ref = branch_member and route[2] == ":ref"
+        if set(placeholders) != ({"project", "ref"} if uses_ref else {"project"}):
+            return _ask("API placeholders must identify only project and branch route segments.")
+        branch = placeholders.get("ref", "") if uses_ref else route[-1] if branch_member else ""
+        if (
+            any(args.values(name) for name in ("input", "form", "header"))
+            or args.enabled("paginate")
+            or args.last("output") not in {None, "json", "ndjson"}
+        ):
+            return _ask("API bodies, headers, pagination, or output options require approval.")
+        fields = _api_fields(args)
+        if fields is None:
+            return _ask("Use unique raw string fields and typed true/false API fields.")
+        if method == "GET":
+            readable = (
+                not route
+                or path in {"issues", "merge_requests", "repository/branches"}
+                or member
+                or notes
+                or re.fullmatch(r"(?:issues|merge_requests)/[1-9][0-9]*/notes/[1-9][0-9]*", path)
+                or re.fullmatch(r"merge_requests/[1-9][0-9]*/(?:changes|diffs|raw_diffs)", path)
+                or (branch_member and _valid_branch(branch))
+            )
+            if not readable or fields.keys() - _API_READ_FIELDS:
+                return _ask("This API read route or query field requires approval.")
+            return gate_project(project, write=False)
+        if method == "PUT" and rebase:
+            return _ask("API rebasing changes an unresolved source project and branch.")
+        if method == "DELETE" and (branch_member or bulk_delete):
+            decision = gate_project(project, write=True)
+            if decision is not None:
+                return decision
+            if bulk_delete or not _valid_branch(branch) or "." in branch or fields:
+                return _ask("The full set of API branch-deletion effects requires approval.")
+            if allowed_branches and branch not in allowed_branches:
+                return _deny(f"{deny_reason} API branch destination is not permitted.")
+            return None
+        mr_create = method == "POST" and path == "merge_requests"
+        mr_update = method == "PUT" and path.startswith("merge_requests/") and bool(member)
+        if not (
+            mr_create
+            or mr_update
+            or (method == "PUT" and merge)
+            or (method == "POST" and (path == "issues" or notes))
+        ):
+            return _ask("This API method or write route requires approval.")
+        if fields.keys() & {"id", "project_id", "source_project_id", "target_project_id"}:
+            return _ask(
+                "API destination overrides require approval; the route alone is insufficient."
+            )
+        decision = gate_project(project, write=True)
+        if decision is not None:
+            return decision
+        if mr_create or mr_update or merge:
+            removal_field = "should_remove_source_branch" if merge else "remove_source_branch"
+            if removal_field in fields and fields[removal_field] is not False:
+                if fields[removal_field] is True or fields[removal_field] == "true":
+                    if not allow_destructive:
+                        return _deny(f"{deny_reason} MR source-branch removal is not permitted.")
+                return _ask("API MR source-removal settings require approval.")
+        if merge:
+            return _ask("API merging requires its target branch and source-removal settings.")
+        required: set[str]
+        if mr_create:
+            strings = {"title", "description", "source_branch", "target_branch", "labels"}
+            booleans = {"remove_source_branch", "allow_collaboration"}
+            required = {"title", "description", "source_branch", "target_branch"}
+        elif mr_update:
+            strings = {
+                "title",
+                "description",
+                "labels",
+                "add_labels",
+                "remove_labels",
+                "target_branch",
+            }
+            booleans = {"remove_source_branch"}
+            required = set()
+        elif notes:
+            strings, booleans, required = {"body"}, set(), {"body"}
+        else:
+            strings = {"title", "description", "labels"}
+            booleans, required = {"confidential"}, {"title", "description"}
+        if (
+            not fields
+            or fields.keys() - (strings | booleans)
+            or any(not isinstance(value, str) for name, value in fields.items() if name in strings)
+            or any(
+                not isinstance(value, bool) for name, value in fields.items() if name in booleans
+            )
+            or any(not fields.get(name) for name in required)
+            or (mr_update and not fields.keys() & strings)
+        ):
+            return _ask("Provide supported API metadata fields without destination overrides.")
+        for name, value in fields.items():
+            if name in {"title", "description", "body"} and not value:
+                return _ask("Empty API text requires approval.")
+            if isinstance(value, str):
+                if name in {"description", "body"} and _has_quick_actions(value):
+                    return _ask("Potential GitLab quick actions in API text require approval.")
+                if name in {"source_branch", "target_branch"} and not _valid_branch(value):
+                    return _ask("API MR metadata must name literal branches.")
+        if mr_create and any(
+            fields.get(name) is not False
+            for name in ("remove_source_branch", "allow_collaboration")
+        ):
+            return _ask("Disable API MR source removal and collaboration with typed false fields.")
         return None
 
     def check(tokens: list[str]) -> PolicyResponse | None:
@@ -621,6 +838,8 @@ def gitlab_policy(
             if _GATED_COMMAND.search(" ".join(tokens)):
                 return _ask("This command form mentions git/glab but cannot be resolved. Approve?")
             return None
+        if tokens[1:2] == ["api"]:
+            return check_api(tokens[2:])
         if len(tokens) < 3:
             return _ask("Choose a supported glab action and an explicit project. Approve?")
         group, action = tokens[1:3]
@@ -691,7 +910,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
         "name": "GitLab Project Access",
         "description": (
             "Project permissions for explicit Git downloads and pushes, glab issue and MR "
-            "reads, issue writes, and explicit MR creation/metadata updates. "
+            "reads, issue writes, MR creation/metadata updates, and bounded API requests. "
             "Unresolved operations require approval."
         ),
         "params_schema": {
@@ -716,13 +935,13 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                 "write_repos": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Projects permitting supported issue/MR writes and Git pushes.",
+                    "description": "Projects permitting supported glab writes and Git pushes.",
                 },
                 "write_branches": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Exact push destination branch names; empty permits all. "
+                        "Exact push and API branch-deletion names; empty permits all. "
                         "Does not restrict tags, issues, or MR metadata."
                     ),
                 },
@@ -730,7 +949,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "boolean",
                     "default": False,
                     "description": (
-                        "Permit explicit Git ref deletions through write checks; "
+                        "Permit explicit Git ref and API branch deletions through write checks; "
                         "MR source-removal requests still need approval."
                     ),
                 },
