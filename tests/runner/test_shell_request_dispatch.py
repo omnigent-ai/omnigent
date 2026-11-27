@@ -474,3 +474,80 @@ async def test_real_runner_shell_reuse_records_latency_against_disposable_calls(
         )
     finally:
         await registry.cleanup_session("live-shell")
+
+
+@pytest.mark.skipif(not _LIVE_LINUX, reason="requires Linux and Bubblewrap")
+@pytest.mark.parametrize("mode", ["large-success", "large-error", "timeout-invalid"])
+@pytest.mark.asyncio
+@pytest.mark.timeout(45)
+async def test_real_runner_shell_bounds_output_and_preserves_invalid_byte_timeouts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    from omnigent.inner._bounded_output import BoundedPipeCapture, CapturedOutput
+
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    spec = _spec(tmp_path)
+    _require_request_launcher(spec, tmp_path)
+    observations: list[tuple[CapturedOutput, CapturedOutput]] = []
+    original_result = BoundedPipeCapture.result
+
+    def observe(capture: BoundedPipeCapture) -> tuple[CapturedOutput, CapturedOutput]:
+        output = original_result(capture)
+        observations.append(output)
+        return output
+
+    monkeypatch.setattr(BoundedPipeCapture, "result", observe)
+    command = """
+import os, sys, time
+if sys.argv[1] == "timeout-invalid":
+    os.write(1, b"\\xff")
+    time.sleep(30)
+else:
+    for _ in range(32):
+        os.write(1, b"x" * 8192)
+        os.write(2, b"e" * 8192)
+    raise SystemExit(7 if sys.argv[1] == "large-error" else 0)
+"""
+    registry = SessionResourceRegistry()
+    try:
+        result = json.loads(
+            await _execute_os_env_tool(
+                "sys_os_shell",
+                {
+                    "command": shlex.join([sys.executable, "-I", "-S", "-c", command, mode]),
+                    "timeout": 3 if mode == "timeout-invalid" else 15,
+                },
+                agent_spec=spec,
+                conversation_id="live-shell",
+                resource_registry=registry,
+            )
+        )
+        assert len(observations) == 1
+        stdout, stderr = observations[0]
+        if mode == "timeout-invalid":
+            assert stdout.decoding_error is not None
+            assert result == {
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+                "timed_out": True,
+                "error": "Command timed out after 3 seconds",
+                "shell": shutil.which("bash") or shutil.which("sh") or "/bin/sh",
+                "cwd": str(tmp_path),
+            }
+        else:
+            assert len(stdout.text) == len(stderr.text) == 100_000
+            assert stdout.omitted == stderr.omitted == 162_144
+            assert result["stdout"].startswith(
+                "x" * 100_000 + "\n[stdout truncated: 162,144 characters omitted."
+            )
+            assert result["stderr"].startswith(
+                "e" * 100_000 + "\n[stderr truncated: 162,144 characters omitted."
+            )
+            assert result["exit_code"] == (7 if mode == "large-error" else 0)
+            assert result["timed_out"] is False
+            if mode == "large-error":
+                assert len(result["error"]) < 100_500
+                assert result["error"].startswith("Command exited with status 7: e")
+    finally:
+        await registry.cleanup_session("live-shell")

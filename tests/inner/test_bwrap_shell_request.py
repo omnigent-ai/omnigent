@@ -18,6 +18,7 @@ import pytest
 
 from omnigent.inner import _bwrap_shell_request as shell_request
 from omnigent.inner import os_env as os_env_module
+from omnigent.inner._bounded_output import CapturedOutput, _TextPrefix
 from omnigent.inner._bwrap_request_control import BwrapRequestResult, RequestCancelled
 from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment, _HelperProcessClient, _PreparedHelper
@@ -204,6 +205,7 @@ def _launch(case: _LaunchCase, cwd: Path) -> BwrapRequestResult:
         launch_env={"PATH": os.defpath, "HTTP_PROXY": "http://127.0.0.1:1234"},
         command_env={"HTTP_PROXY": "http://omnigent:broker-secret@127.0.0.1:1234"},
         timeout=7,
+        max_output=17,
         spawn=case.spawn,
     )
 
@@ -221,6 +223,7 @@ def test_launch_delivers_private_config_and_preserves_the_relay_until_owner_comp
         "socket_path": "/private/broker.sock",
     }
     case.owner.run.assert_called_once()
+    assert case.owner.run.call_args.kwargs["max_output"] == 17
     case.process.communicate.assert_not_called()
     assert case.process.stdout.closed and case.process.stderr.closed
     for descriptor in case.descriptors:
@@ -270,7 +273,10 @@ def test_cancelled_request_never_reaches_spawn(launch_case: _LaunchCase, tmp_pat
     launch_case.spawn.assert_not_called()
 
 
-@pytest.mark.parametrize("ending", ["success", "nonzero", "timeout", "lost", "decode"])
+@pytest.mark.parametrize(
+    "ending",
+    ["success", "nonzero", "nonzero-truncated", "timeout", "lost", "decode", "timeout-invalid"],
+)
 def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semantics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
 ) -> None:
@@ -290,25 +296,32 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
     start = MagicMock()
     monkeypatch.setattr(helper, "_ensure_started_locked", start)
     request = shell_request.BwrapShellRequest()
+    encoding = "utf-8" if ending in {"decode", "timeout-invalid"} else "iso8859-1"
+    limit = 16 if ending == "nonzero" else 4
+
+    def capture(raw: bytes) -> CapturedOutput:
+        output = _TextPrefix(encoding, limit)
+        output.feed(raw, final=True)
+        return output.result()
+
     result = BwrapRequestResult(
-        b"caf\xe9\r\n",
-        b"problem\r",
-        None if ending == "timeout" else 7 if ending == "nonzero" else 0,
-        ending == "timeout",
-        "iso8859-1",
+        capture(b"caf\xe9\r\n"),
+        capture(b"problem\r"),
+        None if ending.startswith("timeout") else 7 if ending.startswith("nonzero") else 0,
+        ending.startswith("timeout"),
+        encoding,
     )
-    if ending == "decode":
-        result = replace(result, encoding="utf-8")
     run = MagicMock(return_value=result)
     if ending == "lost":
         run.side_effect = OSError("result lost after admission")
     monkeypatch.setattr(request, "run", run)
     try:
-        actual = helper.shell_request("printf result", 7, 4, request)
+        actual = helper.shell_request("printf result", 7, limit, request)
         run.assert_called_once()
         options = run.call_args.kwargs
         assert options["policy"] is prepared.sandbox
         assert options["cwd"] == tmp_path
+        assert options["max_output"] == limit
         assert options["launch_env"] == prepared.env
         assert "UNGRANTED_SECRET" not in options["command_env"]
         assert "PYTHONPATH" not in options["command_env"]
@@ -320,12 +333,26 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
             assert "not sent again" in actual["error"]
         elif ending == "decode":
             assert actual["error"].startswith("os_env helper exception:")
+        elif ending == "timeout-invalid":
+            assert actual == {
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+                "timed_out": True,
+                "error": "Command timed out after 7 seconds",
+                "shell": "/bin/sh",
+                "cwd": str(tmp_path),
+            }
         else:
             assert isinstance(actual["stdout"], str) and actual["stdout"].startswith("café")
-            assert actual["stderr"].startswith("prob") and "truncated" in actual["stderr"]
+            assert actual["stderr"].startswith("prob")
+            assert ("truncated" in actual["stderr"]) == (limit == 4)
             assert actual["timed_out"] == (ending == "timeout")
             if ending == "nonzero":
                 assert actual["error"] == "Command exited with status 7: problem"
+            if ending == "nonzero-truncated":
+                assert actual["error"].startswith("Command exited with status 7: prob\n")
+                assert "stderr truncated: 4 characters omitted" in actual["error"]
             if ending == "timeout":
                 assert actual["exit_code"] is None
                 assert actual["error"] == "Command timed out after 7 seconds"
@@ -389,7 +416,7 @@ async def test_close_cancels_the_active_request_and_retains_brokers_until_retire
     def run(**_kwargs: object) -> BwrapRequestResult:
         started.set()
         assert retire.wait(timeout=5)
-        return BwrapRequestResult(b"", b"", 0, False, "utf-8")
+        return BwrapRequestResult(CapturedOutput(""), CapturedOutput(""), 0, False, "utf-8")
 
     monkeypatch.setattr(request, "run", run)
     monkeypatch.setattr(request, "cancel", cancelled.set)

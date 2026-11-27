@@ -266,7 +266,18 @@ def test_invalid_command_handle_is_closed_without_inventing_a_command_result(
 
 @pytest.mark.parametrize(
     "change",
-    [{"token": "z" * 64}, {"argv": []}, {"cwd": "relative"}, {"env": {"BAD=KEY": "x"}}],
+    [
+        {"token": "z" * 64},
+        {"argv": []},
+        {"cwd": "relative"},
+        {"env": {"BAD=KEY": "x"}},
+        {"relay": []},
+        {"relay": {"source": "relative", "port": 1234, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": True, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": 65536, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": 1234, "socket_path": "relative"}},
+        {"report_encoding": "yes"},
+    ],
 )
 def test_config_is_validated_before_readiness(
     monkeypatch: pytest.MonkeyPatch, change: dict[str, object]
@@ -293,29 +304,6 @@ def test_config_preserves_exact_command_and_environment(monkeypatch: pytest.Monk
     result = request_init._read_request_config(41)
     assert result.argv == tuple(config["argv"])
     assert result.cwd == config["cwd"] and result.env == config["env"]
-
-
-@pytest.mark.parametrize(
-    "change",
-    [
-        {"relay": []},
-        {"relay": {"source": "relative", "port": 1234, "socket_path": "/broker"}},
-        {"relay": {"source": "/relay.py", "port": True, "socket_path": "/broker"}},
-        {"relay": {"source": "/relay.py", "port": 65536, "socket_path": "/broker"}},
-        {"relay": {"source": "/relay.py", "port": 1234, "socket_path": "relative"}},
-        {"report_encoding": "yes"},
-    ],
-)
-def test_invalid_relay_and_encoding_options_are_rejected_before_activation(
-    monkeypatch: pytest.MonkeyPatch, change: dict[str, object]
-) -> None:
-    config = {"token": _TOKEN.decode(), "argv": ["/bin/sh"], "cwd": "/workspace", "env": {}}
-    config.update(change)
-    monkeypatch.setattr(
-        request_init.os, "fdopen", lambda *_a, **_k: io.StringIO(json.dumps(config))
-    )
-    with pytest.raises(ValueError):
-        request_init._read_request_config(41)
 
 
 @pytest.mark.parametrize("utf8_mode", [False, True])

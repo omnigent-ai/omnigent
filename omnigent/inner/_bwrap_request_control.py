@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
+from ._bounded_output import DEFAULT_OUTPUT_CHARS, BoundedPipeCapture, CapturedOutput
 from ._bwrap_request_init import _ADMIT, _EXIT, _READY, _validate_control_socket
 
 _POLL_S = 0.05
@@ -25,10 +26,10 @@ _CREDENTIALS = struct.Struct("iII")
 
 @dataclass(frozen=True)
 class BwrapRequestResult:
-    """Command result, with empty bytes for output streams that were not captured."""
+    """Bounded text output, or legacy bytes when readiness has no encoding metadata."""
 
-    stdout: bytes
-    stderr: bytes
+    stdout: bytes | CapturedOutput
+    stderr: bytes | CapturedOutput
     exit_code: int | None
     timed_out: bool
     encoding: str | None = None
@@ -92,6 +93,7 @@ class BwrapRequestControl:
         self._init_pidfd = init_pidfd
         self._launcher_pidfd = launcher_pidfd
         self._encoding = encoding
+        self._output_capture: BoundedPipeCapture | None = None
         self._owned_pidfds: tuple[int, int] | None = (init_pidfd, launcher_pidfd)
         self._lock = threading.Lock()
         self._stop_reason: str | None = None
@@ -245,7 +247,7 @@ class BwrapRequestControl:
                     raise
             return None
 
-    def run(self, *, deadline: float) -> BwrapRequestResult:
+    def run(self, *, deadline: float, max_output: int | None = None) -> BwrapRequestResult:
         """Admit once, then require namespace exit and launcher/output cleanup.
 
         The deadline is observed between 50 ms polls; completion during the
@@ -255,9 +257,18 @@ class BwrapRequestControl:
             if self._started:
                 raise RuntimeError("A shell request can only run once")
             self._started = True
-        outputs: tuple[bytes, bytes] | None = None
+        outputs: tuple[bytes | CapturedOutput, bytes | CapturedOutput] | None = None
         exit_code: int | None = None
         try:
+            if self._encoding is not None:
+                self._output_capture = BoundedPipeCapture(
+                    self._process.stdout,
+                    self._process.stderr,
+                    encoding=self._encoding,
+                    max_chars=DEFAULT_OUTPUT_CHARS if max_output is None else max_output,
+                )
+            elif max_output is not None:
+                raise ValueError("Bounded output requires the command's encoding metadata")
             self._admit(deadline)
             while True:
                 if monotonic() >= deadline:
@@ -265,9 +276,13 @@ class BwrapRequestControl:
                 if exit_code is None and self._stop_reason is None:
                     exit_code = self._read_pending_result()
                 if outputs is None:
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        stdout, stderr = self._process.communicate(timeout=_POLL_S)
-                        outputs = (stdout or b"", stderr or b"")
+                    if self._output_capture is not None:
+                        if self._output_capture.poll(_POLL_S):
+                            outputs = self._output_capture.result()
+                    else:
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            stdout, stderr = self._process.communicate(timeout=_POLL_S)
+                            outputs = (stdout or b"", stderr or b"")
                 init_exited = _pidfd_exited(self._init_pidfd)
                 launcher_exited = _pidfd_exited(self._launcher_pidfd)
                 if init_exited and launcher_exited and outputs is not None:
@@ -298,13 +313,21 @@ class BwrapRequestControl:
         while not _pidfd_exited(self._launcher_pidfd, round(_POLL_S * 1000)):
             pass
         try:
-            self._process.communicate()
+            if self._output_capture is not None:
+                try:
+                    self._output_capture.drain()
+                finally:
+                    self._process.wait()
+            else:
+                self._process.communicate()
         finally:
             # Serialize descriptor retirement with cancellation to prevent fd reuse races.
             with self._lock:
                 self._owned_pidfds = None
                 try:
                     with contextlib.ExitStack() as cleanup:
+                        if self._output_capture is not None:
+                            cleanup.callback(self._output_capture.close)
                         cleanup.callback(self._control.close)
                         cleanup.callback(os.close, self._launcher_pidfd)
                         cleanup.callback(os.close, self._init_pidfd)

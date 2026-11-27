@@ -103,6 +103,7 @@ class BwrapShellRequest:
         launch_env: dict[str, str],
         command_env: dict[str, str],
         timeout: int,
+        max_output: int,
         spawn: Callable[[list[str], dict[str, str], tuple[int, ...]], subprocess.Popen[bytes]],
     ) -> BwrapRequestResult:
         launcher = request_launcher(policy, launch_env)
@@ -201,7 +202,7 @@ class BwrapShellRequest:
                     self._owner = owner
                     if self.cancelled.is_set():
                         owner.cancel()
-                return owner.run(deadline=time.monotonic() + timeout)
+                return owner.run(deadline=time.monotonic() + timeout, max_output=max_output)
             finally:
                 with self._lock:
                     self._owner = None

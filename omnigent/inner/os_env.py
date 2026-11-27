@@ -35,6 +35,7 @@ from omnigent.runner.identity import (
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
+from ._bounded_output import DEFAULT_OUTPUT_CHARS, CapturedOutput
 from ._proc import run_isolated
 from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_cleanup, run_sync_on_thread
@@ -180,7 +181,7 @@ _DEFAULT_ENV_PASSTHROUGH_PREFIXES: tuple[str, ...] = ("LC_",)
 # (e.g. ``cat`` on a multi-MB log file) saturate the context window and cause
 # the LLM to fail with a context-length-exceeded error. The limit applies
 # independently to stdout and stderr — each may be up to this size.
-_MAX_TOOL_OUTPUT_CHARS = 100_000
+_MAX_TOOL_OUTPUT_CHARS = DEFAULT_OUTPUT_CHARS
 
 # Default line limit for sys_os_read when the caller does not specify one.
 # Without a cap an agent can ask to read an unbounded file and saturate the
@@ -568,14 +569,15 @@ class _HelperProcessClient:
                 launch_env=prepared.env.copy(),
                 command_env=env,
                 timeout=timeout,
+                max_output=max_output,
                 spawn=self._spawn_shell_request,
             )
             if completed.encoding is None:
                 raise OSError("Shell request did not identify its output encoding")
-            stdout, stderr = (
-                value.decode(completed.encoding).replace("\r\n", "\n").replace("\r", "\n")
-                for value in (completed.stdout, completed.stderr)
-            )
+            if not isinstance(completed.stdout, CapturedOutput) or not isinstance(
+                completed.stderr, CapturedOutput
+            ):
+                raise OSError("Shell request did not bound its output")
         except OSError as exc:
             return {
                 "error": (
@@ -583,11 +585,29 @@ class _HelperProcessClient:
                     f"so it was not sent again: {exc}"
                 )
             }
-        except UnicodeError as exc:
-            return {"error": f"os_env helper exception: {exc}"}
+        stdout, stderr = completed.stdout, completed.stderr
+        decoding_error = stdout.decoding_error or stderr.decoding_error
+        if decoding_error is not None:
+            if not completed.timed_out:
+                return {"error": f"os_env helper exception: {decoding_error}"}
+            # Timeout cleanup cannot decode either complete stream after a decoding failure.
+            stdout = stderr = CapturedOutput("")
+        detail = ""
+        if not completed.timed_out and completed.exit_code != 0:
+            detail = next(
+                (
+                    _truncate_output(value.text, label, max_output, omitted=value.omitted).strip()
+                    for label, value in (("stderr", stderr), ("stdout", stdout))
+                    if value.nonblank or value.text.strip()
+                ),
+                "",
+            )
         return _shell_result(
-            stdout=stdout,
-            stderr=stderr,
+            stdout=stdout.text,
+            stderr=stderr.text,
+            stdout_omitted=stdout.omitted,
+            stderr_omitted=stderr.omitted,
+            error_detail=detail,
             exit_code=completed.exit_code,
             timed_out=completed.timed_out,
             timeout=timeout,
@@ -1320,10 +1340,9 @@ class CallerProcessOSEnvironment(OSEnvironment):
         # Start before awaiting so loop-wide cancellation cannot discard the worker's owner.
         worker = threading.Thread(target=run, name="os-env-shell-request", daemon=True)
         worker.start()
+        wrapped = asyncio.wrap_future(result)
         try:
-            while not result.done():
-                await asyncio.sleep(0.001)
-            return result.result()
+            return await asyncio.shield(wrapped)
         except BaseException:
             try:
                 request.cancel()
@@ -1331,6 +1350,10 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 # Repeated cancellation cannot return a lease while its worker owns resources.
                 with contextlib.suppress(BaseException):
                     await run_sync_cleanup(worker.join, component="os_env_shell_request")
+                # The caller may leave before the loop delivers the worker's exception.
+                wrapped.cancel()
+                if not wrapped.cancelled():
+                    wrapped.exception()
             raise
 
     def run_git(
@@ -2145,7 +2168,9 @@ def _edit_impl(
     }
 
 
-def _truncate_output(text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS) -> str:
+def _truncate_output(
+    text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS, *, omitted: int = 0
+) -> str:
     """
     Truncate a tool output field to ``limit`` characters.
 
@@ -2157,14 +2182,15 @@ def _truncate_output(text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS)
         e.g. ``"stdout"``.
     :param limit: Maximum number of characters to return. Defaults to
         :data:`_MAX_TOOL_OUTPUT_CHARS`.
+    :param omitted: Characters already discarded while draining the process pipes.
     :returns: The original string if within the limit, otherwise the
         first ``limit`` characters followed by a ``"[truncated: ...]"``
         sentinel.
     """
-    if len(text) <= limit:
+    if len(text) <= limit and not omitted:
         return text
     truncated = text[:limit]
-    dropped = len(text) - limit
+    dropped = max(0, len(text) - limit) + omitted
     return (
         truncated + f"\n[{label} truncated: {dropped:,} characters omitted."
         " Use a more targeted command to see the full output.]"
@@ -2246,10 +2272,13 @@ def _shell_result(
     shell_path: str,
     cwd: Path,
     max_output: int,
+    stdout_omitted: int = 0,
+    stderr_omitted: int = 0,
+    error_detail: str | None = None,
 ) -> OpResult:
     result: OpResult = {
-        "stdout": _truncate_output(stdout, "stdout", max_output),
-        "stderr": _truncate_output(stderr, "stderr", max_output),
+        "stdout": _truncate_output(stdout, "stdout", max_output, omitted=stdout_omitted),
+        "stderr": _truncate_output(stderr, "stderr", max_output, omitted=stderr_omitted),
         "exit_code": exit_code,
         "timed_out": timed_out,
         "shell": shell_path,
@@ -2258,7 +2287,7 @@ def _shell_result(
     if timed_out:
         result["error"] = f"Command timed out after {timeout} seconds"
     elif exit_code != 0:
-        detail = stderr.strip() or stdout.strip()
+        detail = error_detail if error_detail is not None else stderr.strip() or stdout.strip()
         if detail:
             result["error"] = f"Command exited with status {exit_code}: {detail}"
         else:

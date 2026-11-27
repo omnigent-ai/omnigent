@@ -28,6 +28,7 @@ import pytest
 
 from omnigent.inner import _bwrap_request_control as request_control
 from omnigent.inner import _bwrap_request_init as request_init
+from omnigent.inner._bounded_output import CapturedOutput
 from omnigent.inner.bwrap_sandbox import BwrapRequestFds, BwrapSandboxBackend
 from omnigent.inner.sandbox import SandboxPolicy
 from tests._helpers.polling import poll_until
@@ -350,6 +351,53 @@ def test_completion_waits_for_each_pinned_lifetime_and_output(
     assert set(kills) == ({_INIT_FD, _LAUNCHER_FD} if timed_out else set())
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
     assert case.owner.admitted and case.owner.done.is_set()
+
+
+@pytest.mark.parametrize("ending", ["complete", "timeout", "cancel", "read-error"])
+def test_encoded_requests_bound_capture_and_never_accumulate_output_through_communicate(
+    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase, ending: str
+) -> None:
+    case = request_case
+    case.owner._encoding = "utf-8"
+    capture = MagicMock()
+    capture.result.return_value = (
+        CapturedOutput("out", 1000, nonblank=True),
+        CapturedOutput("err", 2000, nonblank=True),
+    )
+
+    def poll(_timeout: float) -> bool:
+        assert not case.owner.done.is_set()
+        case.exited.update({_INIT_FD: True, _LAUNCHER_FD: True})
+        if ending == "cancel":
+            case.owner.cancel()
+        if ending == "read-error":
+            raise OSError("pipe read failed")
+        return True
+
+    capture.poll.side_effect = poll
+    construct = MagicMock(return_value=capture)
+    monkeypatch.setattr(request_control, "BoundedPipeCapture", construct)
+    if ending == "timeout":
+        clock = iter([0.0])
+        monkeypatch.setattr(request_control, "monotonic", lambda: next(clock, 2.0))
+    if ending == "cancel":
+        with pytest.raises(request_control.RequestCancelled):
+            case.owner.run(deadline=1.0, max_output=3)
+    elif ending == "read-error":
+        with pytest.raises(OSError, match="pipe read failed"):
+            case.owner.run(deadline=1.0, max_output=3)
+    else:
+        result = case.owner.run(deadline=1.0, max_output=3)
+        assert result.stdout == CapturedOutput("out", 1000, nonblank=True)
+        assert result.timed_out == (ending == "timeout")
+    construct.assert_called_once_with(
+        case.process.stdout, case.process.stderr, encoding="utf-8", max_chars=3
+    )
+    case.process.communicate.assert_not_called()
+    capture.drain.assert_called_once()
+    capture.close.assert_called_once()
+    case.process.wait.assert_called_once()
+    assert case.owner.done.is_set()
 
 
 @pytest.mark.parametrize("refusal", ["cancelled", "deadline", "init-exited", "launcher-exited"])
