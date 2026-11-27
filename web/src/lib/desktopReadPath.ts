@@ -35,10 +35,10 @@ import {
 } from "@/lib/automaticFeaturePreference";
 import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
 import {
-  onReadPathOwnerMoved,
-  readPathOwnerMoved,
-  resetReadPathOwnerForTests,
-} from "@/lib/readPathOwner";
+  onReadPathServerMoved,
+  readPathServerMoved,
+  resetReadPathServerForTests,
+} from "@/lib/readPathServer";
 import { resolveAutomaticGitHubReaderWith } from "@/lib/githubCooldown";
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import { acceptedWorkspaceDesign, subscribeAcceptedWorkspaceDesign } from "@/lib/workspaceSurfaces";
@@ -427,7 +427,7 @@ function start(): void {
     readChoices.clear();
     changed();
   });
-  const stopMoved = onReadPathOwnerMoved(changed);
+  const stopMoved = onReadPathServerMoved(changed);
   stopWatching = () => {
     stopReadsFlag();
     stopPreference();
@@ -480,8 +480,8 @@ export function repoReaderPolicyChanged(): void {
 /** Who `url`'s repository is read as on this Mac; see {@link RepoReaderState}. */
 export function repoReaderFor(rawUrl: string | null | undefined): RepoReaderState {
   const url = pullRequestPageUrl(rawUrl);
-  // Another owner's saved login reads nothing: the session's host reads it instead.
-  if (!url || readPathOwnerMoved()) return NO_REPO_READER;
+  // After a server switch no saved login applies: the session's host reads it instead.
+  if (!url || readPathServerMoved()) return NO_REPO_READER;
   if (repoPolicy) return repoPolicy.readerFor(url);
   const repository = pullRequestRepository(url);
   if (!repository) return NO_REPO_READER;
@@ -504,7 +504,7 @@ function repoNamedReader(url: string | null | undefined): MacNamedReader | null 
 
 function loadSupport(): Promise<DesktopReadSupport> {
   start();
-  if (readPathOwnerMoved()) return Promise.resolve(NO_DESKTOP_READS);
+  if (readPathServerMoved()) return Promise.resolve(NO_DESKTOP_READS);
   if (shellSupport) return Promise.resolve(shellSupport);
   if (!hasCodeHostBridge()) {
     shellSupport = NO_DESKTOP_READS;
@@ -526,11 +526,11 @@ function loadSupport(): Promise<DesktopReadSupport> {
 }
 
 /**
- * What the shell reads as seen by this page's owner: nothing once the owner moved, so every
+ * What the shell reads as seen by this page: nothing once its server moved, so every
  * pull request reads through the session's host until a reload.
  */
 function supportNow(): DesktopReadSupport | null {
-  return readPathOwnerMoved() ? NO_DESKTOP_READS : shellSupport;
+  return readPathServerMoved() ? NO_DESKTOP_READS : shellSupport;
 }
 
 const supportNowOr = (known: DesktopReadSupport) => supportNow() ?? known;
@@ -585,7 +585,7 @@ function githubReadsEnabledNow(): boolean {
   return githubMacReadsEnabled(githubMacReadsPreference.read(), automaticPolicy);
 }
 
-// Each PR's route as of the store's version and the shell's support as this owner sees it: a long
+// Each PR's route as of the store's version and the shell's support as this page sees it: a long
 // list asks for every row's route several times a render, and working one out parses the URL.
 let routeCache: {
   version: number;
@@ -668,8 +668,8 @@ export function automaticReadRoute(url: string | null | undefined): "mac" | "hos
 
 /** The user's choice for `url`; Automatic when there is none. */
 export function readChoiceFor(url: string | null | undefined): ReadChoice {
-  // Choices were the page's first owner's; after a move every PR reads through the host.
-  if (readPathOwnerMoved()) return "automatic";
+  // Choices were the page's first server's; after a switch every PR reads through the host.
+  if (readPathServerMoved()) return "automatic";
   const key = readChoiceKey(url);
   return (key ? readChoices.get(key) : undefined) ?? "automatic";
 }
@@ -687,7 +687,7 @@ function appliedReadChoiceFor(url: string | null | undefined): ReadChoice {
 export function chooseReadSource(url: string, choice: ReadChoice): void {
   start();
   const key = readChoiceKey(url);
-  if (!key || readPathOwnerMoved() || readChoiceFor(key) === choice) return;
+  if (!key || readPathServerMoved() || readChoiceFor(key) === choice) return;
   if (choice === "automatic") readChoices.delete(key);
   else readChoices.set(key, choice);
   repoPolicy?.readChoiceChanged(key);
@@ -1217,7 +1217,7 @@ export function macOffers(provider: CodeHostPullRequest["provider"], operation: 
   return !!host?.operations.includes(operation);
 }
 
-/** The shell's read support as this page's owner sees it, once known. */
+/** The shell's read support as this page's server sees it, once known. */
 export function desktopReadSupport(): DesktopReadSupport | null {
   const support = supportNow();
   return support;
@@ -1269,7 +1269,7 @@ export function resetDesktopReadPathForTests(): void {
   identityCheckUsers.clear();
   shellSupport = null;
   supportRequest = null;
-  resetReadPathOwnerForTests();
+  resetReadPathServerForTests();
   automaticPolicy = false;
   githubHosts.clear();
   probedHosts.clear();

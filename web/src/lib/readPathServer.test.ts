@@ -1,5 +1,5 @@
-// The page's read-path owner is its first known user with the server identity and API base path;
-// any later change of the three latches until a reload. A user not known yet is no owner.
+// The page's read-path server is its server identity and API base path once a user is known; a
+// later change of either latches until a reload. A user switch on the same server never does.
 
 import type * as BasePathModule from "@/lib/basePath";
 import type * as HostModule from "@/lib/host";
@@ -25,13 +25,13 @@ vi.mock("@/lib/basePath", async (importOriginal) => ({
 }));
 
 import {
-  onReadPathOwnerMoved,
-  readPathOwnerMoved,
-  resetReadPathOwnerForTests,
-} from "./readPathOwner";
+  onReadPathServerMoved,
+  readPathServerMoved,
+  resetReadPathServerForTests,
+} from "./readPathServer";
 
 afterEach(() => {
-  resetReadPathOwnerForTests();
+  resetReadPathServerForTests();
   state.user = "user-1";
   state.server = "https://server-a.example.com";
   state.base = "/api";
@@ -53,13 +53,6 @@ const CHANGES: [string, string | null, () => void][] = [
     },
   ],
   [
-    "the user",
-    "https://server-a.example.com",
-    () => {
-      state.user = "user-2";
-    },
-  ],
-  [
     "the base path with no server identity",
     null,
     () => {
@@ -69,37 +62,50 @@ const CHANGES: [string, string | null, () => void][] = [
 ];
 
 it.each(CHANGES)(
-  "moves when %s changes, and stays moved back on the first owner",
+  "moves when %s changes, and stays moved back on the first server",
   (_case, server, change) => {
     state.server = server;
-    expect(readPathOwnerMoved()).toBe(false);
+    expect(readPathServerMoved()).toBe(false);
     change();
-    expect(readPathOwnerMoved()).toBe(true);
-    state.user = "user-1";
+    expect(readPathServerMoved()).toBe(true);
     state.server = server;
     state.base = "/api";
-    expect(readPathOwnerMoved()).toBe(true);
+    expect(readPathServerMoved()).toBe(true);
   },
 );
 
-it("takes the first known user as the owner, and never moves on a user not known yet", () => {
+it("takes the first server once a user is known, and never moves on a user not known yet", () => {
   state.user = null;
-  expect(readPathOwnerMoved()).toBe(false);
+  state.server = "https://server-b.example.com";
+  expect(readPathServerMoved()).toBe(false);
   state.user = "user-1";
-  expect(readPathOwnerMoved()).toBe(false);
+  state.server = "https://server-a.example.com";
+  expect(readPathServerMoved()).toBe(false);
   state.user = null;
-  expect(readPathOwnerMoved()).toBe(false);
+  expect(readPathServerMoved()).toBe(false);
   state.user = "user-1";
-  expect(readPathOwnerMoved()).toBe(false);
+  expect(readPathServerMoved()).toBe(false);
+});
+
+it("stays open when the user switches on the same server", () => {
+  const moved = vi.fn();
+  const stop = onReadPathServerMoved(moved);
+  expect(readPathServerMoved()).toBe(false);
+  state.user = "user-2";
+  expect(readPathServerMoved()).toBe(false);
+  state.user = "user-1";
+  expect(readPathServerMoved()).toBe(false);
+  expect(moved).not.toHaveBeenCalled();
+  stop();
 });
 
 it("tells listeners once, after the read that found the move", async () => {
   const moved = vi.fn();
-  const stop = onReadPathOwnerMoved(moved);
-  readPathOwnerMoved();
+  const stop = onReadPathServerMoved(moved);
+  readPathServerMoved();
   state.server = "https://server-b.example.com";
-  readPathOwnerMoved();
-  readPathOwnerMoved();
+  readPathServerMoved();
+  readPathServerMoved();
   expect(moved).not.toHaveBeenCalled();
   await Promise.resolve();
   expect(moved).toHaveBeenCalledTimes(1);

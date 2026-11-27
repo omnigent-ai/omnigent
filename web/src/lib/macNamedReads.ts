@@ -12,7 +12,7 @@ import {
   useDesktopReadPathVersion,
 } from "@/lib/desktopReadPath";
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
-import { onReadPathOwnerMoved, readPathOwnerMoved } from "@/lib/readPathOwner";
+import { onReadPathServerMoved, readPathServerMoved } from "@/lib/readPathServer";
 import {
   acceptMacRead,
   acceptedMacReader,
@@ -224,7 +224,7 @@ function start(): void {
     answeredFor.clear();
     changed();
   });
-  const stopMoved = onReadPathOwnerMoved(changed);
+  const stopMoved = onReadPathServerMoved(changed);
   stopWatching = () => {
     stopFlag();
     stopAccounts();
@@ -392,8 +392,8 @@ export function acceptNamedReaderFor(
 export function namedWriterIdentity(
   reader: MacNamedReader,
 ): { login: string; generation: number } | "checking" | "refused" {
-  // Named reads end with the page's owner, and so does who a change acts as.
-  if (readPathOwnerMoved()) return "checking";
+  // Named reads end with the page's server, and so does who a change acts as.
+  if (readPathServerMoved()) return "checking";
   const id = scopeId(reader.host, reader.login);
   const known = writers.get(id);
   if (known) return known;

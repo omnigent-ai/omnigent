@@ -8,7 +8,7 @@ import {
   repoReaderPolicyChanged,
 } from "@/lib/desktopReadPath";
 import { readChoiceKey } from "@/lib/pullRequestReadRoute";
-import { readPathOwnerMoved } from "@/lib/readPathOwner";
+import { readPathServerMoved } from "@/lib/readPathServer";
 import {
   leaveNamedReader,
   namedReadsAvailable,
@@ -30,8 +30,8 @@ import {
 /** The repository's reader from its saved choice and what the shell can do now. */
 export function repoReaderState(url: string): RepoReaderState {
   const repository = pullRequestRepository(url);
-  // Choices are applied only for the page's first owner; after a move the host reads the PR.
-  if (!repository || readPathOwnerMoved()) return NO_REPO_READER;
+  // Choices apply only on the page's first server; after a switch the host reads the PR.
+  if (!repository || readPathServerMoved()) return NO_REPO_READER;
   // "Session's machine", chosen for this PR, reads it there on purpose, with no Mac account.
   if (readChoiceFor(url) === "session") return NO_REPO_READER;
   return stateFor(repository);

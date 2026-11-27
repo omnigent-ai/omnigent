@@ -6,10 +6,10 @@ import { useSyncExternalStore } from "react";
 
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import {
-  onReadPathOwnerMoved,
-  readPathOwnerMoved,
-  resetReadPathOwnerForTests,
-} from "@/lib/readPathOwner";
+  onReadPathServerMoved,
+  readPathServerMoved,
+  resetReadPathServerForTests,
+} from "@/lib/readPathServer";
 
 import type { CodeHostProviderId } from "@/lib/codeHosts";
 
@@ -127,8 +127,8 @@ export function acceptMacRead(
   reader: string,
   { restored = false }: { restored?: boolean } = {},
 ): MacReadVerdict {
-  // Nothing read on this Mac is kept once the page's owner changed.
-  if (readPathOwnerMoved()) return "rejected";
+  // Nothing read on this Mac is kept once the page's server changed.
+  if (readPathServerMoved()) return "rejected";
   const state = stateOf(ticket.scope);
   const sequence = ticket.sequence;
   // Sent before the latest change of reader: older than it, whoever read it.
@@ -165,7 +165,7 @@ export function acceptMacRead(
  * answers that name none (older shells): kept only within the same order.
  */
 export function macReadCurrent(ticket: MacReadTicket): boolean {
-  if (readPathOwnerMoved()) return false;
+  if (readPathServerMoved()) return false;
   return ticket.sequence >= stateOf(ticket.scope).floor;
 }
 
@@ -247,7 +247,7 @@ export function onMacReadScopeAdvanced(
 
 /** The reader whose answers `key` shows, or null before any answer was kept. */
 export function acceptedMacReader(key: MacReadScopeKey): string | null {
-  if (readPathOwnerMoved()) return null;
+  if (readPathServerMoved()) return null;
   return scopes.get(scopeId(key))?.reader ?? null;
 }
 
@@ -278,7 +278,7 @@ export function macReadPublishable(
   viewer: string | null,
   owner: MacRecordOwner,
 ): boolean {
-  if (readPathOwnerMoved()) return false;
+  if (readPathServerMoved()) return false;
   if (!owner.scope[1] || owner.scope[1] !== getCurrentUserId()) return false;
   if (ticket.scope !== scopeId(owner.scope)) return false;
   const state = scopes.get(ticket.scope);
@@ -300,8 +300,8 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-// Every scope's answers stop showing when the page's owner changes: readers re-render then.
-onReadPathOwnerMoved(() => {
+// Every scope's answers stop showing when the page's server changes: readers re-render then.
+onReadPathServerMoved(() => {
   version += 1;
   for (const listener of listeners) listener();
 });
@@ -325,7 +325,7 @@ export class StaleMacReadError extends Error {
 
 /** Forget every scope, so a test starts clean. */
 export function resetMacReadScopesForTests(): void {
-  resetReadPathOwnerForTests();
+  resetReadPathServerForTests();
   scopes.clear();
   listeners.clear();
   // Advance listeners stay: a query client bound to the scopes outlives a reset.

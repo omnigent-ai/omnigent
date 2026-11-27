@@ -1,6 +1,6 @@
-// The read path serves only the owner its page started with: server identity, API base path and
-// workspace user. After any change of owner, every PR reads through the session's host until a
-// reload, with no Mac read kept and no per-owner choice applied, even back on the first owner.
+// The read path serves only the server and API base path its page started with. After either
+// changes, every PR reads through the session's host until a reload, with no Mac read kept and no
+// per-server choice applied, even back on the first server.
 
 import type * as BasePathModule from "@/lib/basePath";
 import type * as HostModule from "@/lib/host";

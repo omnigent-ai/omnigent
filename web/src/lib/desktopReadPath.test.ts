@@ -399,13 +399,12 @@ describe("binding Mac answers to their account and workspace user", () => {
     expect(advances).toBe(1);
   });
 
-  it("drops an answer that lands after the workspace user changed, and reads through the host", async () => {
+  it("drops an answer that lands after the workspace user changed", async () => {
     await readyStore();
     const sent = ticket();
     currentUser.id = "user-2";
     expect(acceptMacAnswer(sent, answer("alice", 1))).toBe("moved");
-    // Another user on the same page reads every PR through the session's host until a reload.
-    expect(readScope(GITHUB_PR)).toEqual([]);
+    expect(readScope(GITHUB_PR)).toEqual(["mac-read", "user-2", "github", "github.com"]);
   });
 
   it("keeps answers when a saved choice leaves the same account in use, and advances otherwise", async () => {
@@ -676,8 +675,8 @@ describe("checking who read a Mac answer", () => {
     for (const listener of identityListeners) listener();
     // The previous user's reads are the ones dropped.
     expect(advanced).toContainEqual(["mac-read", "user-1", "named-host", DEVICE_HOST]);
-    // Nothing read on this Mac is kept for the new user until the page reloads.
-    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("carol"))).toBe("moved");
+    // The new user's first deviceHost read establishes its own viewer.
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("carol"))).toBe("accepted");
   });
 
   it.each([
