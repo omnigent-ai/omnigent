@@ -1843,6 +1843,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session("list_side_chat_ids") as session:
             return list(session.scalars(stmt.order_by(meta.id).limit(limit)))
 
+    def list_side_chat_ids_by_parent(self, parent_ids: list[str]) -> dict[str, list[str]]:
+        unique_ids = list(dict.fromkeys(parent_ids))
+        result: dict[str, list[str]] = {parent_id: [] for parent_id in unique_ids}
+        if not unique_ids:
+            return result
+        meta = SqlConversationMetadata
+        stmt = (
+            select(meta.side_chat_parent_id, meta.id)
+            .where(
+                meta.workspace_id == current_workspace_id(),
+                meta.side_chat_parent_id.in_(unique_ids),
+            )
+            .order_by(meta.side_chat_parent_id, meta.id)
+        )
+        with self._session("list_side_chat_ids_by_parent") as session:
+            for parent_id, side_chat_id in session.execute(stmt):
+                result.setdefault(parent_id, []).append(side_chat_id)
+        return result
+
     def set_labels(
         self,
         conversation_id: str,

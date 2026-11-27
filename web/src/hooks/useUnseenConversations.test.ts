@@ -124,6 +124,27 @@ describe("isConversationUnseen", () => {
   });
 });
 
+describe("isSideChatReplyUnseen", () => {
+  it("flags a side-chat reply newer than the parent's baseline until the parent is seen", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000, updated_at: 900 }]);
+    expect(mod.isSideChatReplyUnseen("conv-1", undefined)).toBe(false);
+    expect(mod.isSideChatReplyUnseen("conv-1", 1_000)).toBe(false); // equal, not greater
+    expect(mod.isSideChatReplyUnseen("conv-1", 2_000)).toBe(true);
+    expect(mod.isSideChatReplyUnseen("missing", 2_000)).toBe(false);
+
+    mod.markConversationSeen("conv-1", 2_000);
+    expect(mod.isSideChatReplyUnseen("conv-1", 2_000)).toBe(false);
+  });
+
+  it("reads side-chat replies from before the first load as seen", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", updated_at: 1_000, side_chat_activity_at: 2_000 }]);
+    expect(mod.isSideChatReplyUnseen("conv-1", 2_000)).toBe(false);
+    expect(mod.isSideChatReplyUnseen("conv-1", 2_001)).toBe(true);
+  });
+});
+
 describe("markConversationSeen", () => {
   it("does nothing before the first seed (reload-clobber guard)", async () => {
     const mod = await loadFresh();

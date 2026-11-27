@@ -647,6 +647,7 @@ class _SessionBatchReads:
     perms_by_conv: dict[str, list[SessionPermission]]
     agents_by_id: dict[str, Agent]
     child_ids_by_parent: dict[str, list[str]]
+    side_chat_activity: dict[str, int]
     comments_fingerprints: dict[str, CommentsFingerprint]
     pull_request_summaries: dict[str, SessionSummary]
 
@@ -1513,6 +1514,46 @@ def register_core_routes(
             conversation_store.get_conversation, session_id
         )
         return conv is not None and await asyncio.to_thread(_side_chat_allowed_sync, user_id, conv)
+
+    def _side_chat_activity_sync(
+        conversations: list[Conversation],
+        user_id: str | None,
+        perms_by_conv: dict[str, list[SessionPermission]],
+    ) -> dict[str, int]:
+        """Latest ``updated_at`` of each session's side chats that are not running.
+
+        Side chats have no sidebar row, so their parent's row carries this for the
+        unread marker. Only a session's owner sees its side chats; other rows get none.
+        """
+        owned = [
+            conv.id
+            for conv in conversations
+            if auth_provider is None
+            or permission_store is None
+            or any(
+                grant.user_id == user_id and grant.level >= LEVEL_OWNER
+                for grant in perms_by_conv.get(conv.id, [])
+            )
+        ]
+        side_chat_ids = conversation_store.list_side_chat_ids_by_parent(owned)
+        all_side_chat_ids = [
+            side_chat_id for ids in side_chat_ids.values() for side_chat_id in ids
+        ]
+        if not all_side_chat_ids:
+            return {}
+        side_chats = conversation_store.get_conversations(all_side_chat_ids)
+        activity: dict[str, int] = {}
+        for parent_id, ids in side_chat_ids.items():
+            finished = [
+                side_chats[side_chat_id].updated_at
+                for side_chat_id in ids
+                if side_chat_id in side_chats
+                and _session_status_from_cache(side_chat_id, side_chats[side_chat_id].live_status)
+                != "running"
+            ]
+            if finished:
+                activity[parent_id] = max(finished)
+        return activity
 
     @router.post(
         "/sessions/orchestrated/host",
@@ -2968,18 +3009,24 @@ def register_core_routes(
                     conv_ids = [conv.id for conv in list_batch if conv.agent_id is not None]
                     if not conv_ids:
                         continue
+                    batch_perms = (
+                        permission_store.list_for_sessions(conv_ids)
+                        if permission_store is not None
+                        else {}
+                    )
                     batches.append(
                         _SessionBatchReads(
                             conversations=list(list_batch),
                             conv_ids=conv_ids,
-                            perms_by_conv=(
-                                permission_store.list_for_sessions(conv_ids)
-                                if permission_store is not None
-                                else {}
-                            ),
+                            perms_by_conv=batch_perms,
                             agents_by_id=_session_agents(list_batch),
                             child_ids_by_parent=(
                                 conversation_store.list_child_conversation_ids_by_parent(conv_ids)
+                            ),
+                            side_chat_activity=_side_chat_activity_sync(
+                                [conv for conv in list_batch if conv.agent_id is not None],
+                                user_id,
+                                batch_perms,
                             ),
                             comments_fingerprints=_comments_fingerprints_sync(conv_ids),
                             pull_request_summaries=_pull_request_summaries_sync(conv_ids),
@@ -3046,6 +3093,7 @@ def register_core_routes(
                         comments_fingerprint=comments_fingerprints.get(conv.id),
                         pull_request=pull_requests.get(conv.id, (None, None))[0],
                         pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                        side_chat_activity_at=batch.side_chat_activity.get(conv.id),
                     )
                     for conv in list_batch
                     if conv.agent_id is not None
@@ -3241,6 +3289,7 @@ def register_core_routes(
         (
             agent_metadata,
             child_ids_by_parent,
+            side_chat_activity,
             comments_fingerprints,
             pull_requests,
         ) = await asyncio.gather(
@@ -3249,6 +3298,7 @@ def register_core_routes(
                 conversation_store.list_child_conversation_ids_by_parent,
                 conv_ids,
             ),
+            asyncio.to_thread(_side_chat_activity_sync, convs, user_id, perms_by_conv),
             _comments_fingerprints_for(conv_ids),
             _pull_requests_for(conv_ids),
         )
@@ -3268,6 +3318,7 @@ def register_core_routes(
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 pull_request=pull_requests.get(conv.id, (None, None))[0],
                 pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                side_chat_activity_at=side_chat_activity.get(conv.id),
             )
             for conv in convs
         ]

@@ -1375,6 +1375,7 @@ def _build_session_list_item(
     harness: str | None = None,
     pull_request: SessionPullRequestSummary | None = None,
     pull_requests_synced: bool | None = None,
+    side_chat_activity_at: int | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1421,6 +1422,8 @@ def _build_session_list_item(
         from the server's PR store; ``None`` when it has none.
     :param pull_requests_synced: Whether the server has imported the
         conversation's PRs, or ``None`` without PR storage.
+    :param side_chat_activity_at: Latest ``updated_at`` of the viewer's finished
+        side chats on this session, or ``None``.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -1487,6 +1490,7 @@ def _build_session_list_item(
         ),
         viewer_last_seen=viewer_last_seen,
         viewer_unread=viewer_unread,
+        side_chat_activity_at=side_chat_activity_at,
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,

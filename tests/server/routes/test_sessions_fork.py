@@ -748,6 +748,29 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
     assert plain_fork["id"] in sidebar_ids
     assert not sidebar_ids & {side_chat["id"], another_side_chat["id"], other_side_chat["id"]}
 
+    # Their parents' rows carry the latest finished side chat for the unread marker.
+    async def side_chat_activity() -> dict[str, int | None]:
+        response = await client.get("/v1/sessions")
+        assert response.status_code == 200, response.text
+        return {row["id"]: row.get("side_chat_activity_at") for row in response.json()["data"]}
+
+    side_chats = store.get_conversations([*expected, other_side_chat["id"]])
+    activity = await side_chat_activity()
+    assert activity[parent.id] == max(side_chats[side_id].updated_at for side_id in expected)
+    assert activity[other_parent.id] == side_chats[other_side_chat["id"]].updated_at
+    assert activity[plain_fork["id"]] is None
+    # A side chat that is still answering has no reply to flag yet.
+    for status, expected_activity in (
+        ("running", None),
+        ("idle", side_chats[other_side_chat["id"]].updated_at),
+    ):
+        response = await client.post(
+            f"/v1/sessions/{other_side_chat['id']}/events",
+            json={"type": "external_session_status", "data": {"status": status}},
+        )
+        assert response.status_code == 202, response.text
+        assert (await side_chat_activity())[other_parent.id] == expected_activity
+
 
 @pytest.mark.asyncio
 async def test_only_the_owner_starts_and_lists_side_chats(
@@ -951,6 +974,17 @@ async def test_only_the_owner_starts_and_lists_side_chats(
         assert await _side_chat_ids(auth_client, parent.id, headers=headers[user]) == set()
     # A signed-out viewer of the public parent gets none either.
     assert await _side_chat_ids(auth_client, parent.id) == set()
+
+    # Only the owner's sidebar row flags their side chats' replies.
+    async def parent_row(user: str) -> dict[str, Any] | None:
+        response = await auth_client.get("/v1/sessions", headers=headers[user])
+        assert response.status_code == 200, response.text
+        return next((row for row in response.json()["data"] if row["id"] == parent.id), None)
+
+    assert isinstance((await parent_row(owner) or {}).get("side_chat_activity_at"), int)
+    for user in (editor, reader):
+        shared_row = await parent_row(user)
+        assert shared_row is not None and "side_chat_activity_at" not in shared_row
 
     # A Codex sub-agent the editor started, with its own owner grant, still
     # belongs to the parent's owner, and so does a side chat opened from it.
