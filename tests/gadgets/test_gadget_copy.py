@@ -1,0 +1,166 @@
+"""Make a copy: a gadget the copier owns, with the source's published code and, optionally,
+its records; nothing else of the source's, and no link back to it."""
+
+from __future__ import annotations
+
+import pytest
+
+from omnigent.gadgets import service as service_module
+from omnigent.gadgets.constraints import ConstraintViolation
+from omnigent.stores.gadget_store import CapacityExceeded, InvalidInput, NotFound
+from tests.gadgets.conftest import READ, Fixture, person
+from tests.gadgets.test_gadget_service import (
+    WIP_LIMIT,
+    card,
+    publish_board,
+    publish_ruled_board,
+    rpc,
+)
+
+
+def _records(service, app: dict) -> list[tuple[str, dict]]:
+    page = rpc(service, app, "list", limit=100)
+    return [(item["id"], item["value"]) for item in page["items"]]
+
+
+def test_a_reader_copies_the_published_code_without_the_data(gadgets: Fixture) -> None:
+    owner = gadgets.service(1)
+    source = publish_board(owner)
+    rpc(owner, source, "create", id="t1", value={"title": "Owner's task"}, operation_id="o1")
+    owner.create_comment(
+        source["id"],
+        {"body": "Synthetic comment", "anchor": {"text": "Synthetic"}, "operation_id": "c1"},
+    )
+    gadgets.access.share(source, 2, READ)
+    reader = gadgets.service(2)
+
+    copied = reader.copy(source["id"], {})
+
+    assert copied["id"] != source["id"]
+    assert copied["owner_id"] == person(2)
+    assert copied["name"] == "Copy of Synthetic team board"
+    assert copied["permissions"]["manage"] is True
+    assert copied["published_revision"] is not None
+    assert copied["published_revision"] != source["published_revision"]
+    source_code = owner.get_revision(source["id"])
+    copy_code = reader.get_revision(copied["id"])
+    for field in ("html", "capabilities", "collections"):
+        assert copy_code[field] == source_code[field]
+    assert _records(reader, copied) == []
+    assert reader.list_comments(copied["id"])["items"] == []
+    # The source is untouched, and its owner can't reach the copy.
+    assert _records(owner, source) == [("t1", {"title": "Owner's task"})]
+    with pytest.raises(NotFound):
+        owner.get(copied["id"])
+    assert [item["id"] for item in reader.list_owned()["items"]] == [copied["id"]]
+
+
+def test_a_copy_with_data_keeps_the_records_and_then_goes_its_own_way(gadgets: Fixture) -> None:
+    owner = gadgets.service(1)
+    source = publish_board(owner)
+    for number in range(3):
+        rpc(
+            owner,
+            source,
+            "create",
+            id=f"t{number}",
+            value={"title": f"Task {number}"},
+            operation_id=f"o{number}",
+        )
+    gadgets.access.share(source, 2, READ)
+    reader = gadgets.service(2)
+
+    copied = reader.copy(source["id"], {"name": "My board", "include_data": True})
+
+    assert copied["name"] == "My board"
+    assert _records(reader, copied) == [(f"t{n}", {"title": f"Task {n}"}) for n in range(3)]
+    # Later writes on either side stay on that side.
+    first = rpc(reader, copied, "get", id="t0")
+    rpc(
+        reader,
+        copied,
+        "replace",
+        id="t0",
+        value={"title": "Changed in the copy"},
+        if_version=first["version"],
+        operation_id="c1",
+    )
+    rpc(owner, source, "create", id="t9", value={"title": "Added later"}, operation_id="o9")
+    assert dict(_records(owner, source))["t0"] == {"title": "Task 0"}
+    assert "t9" not in dict(_records(reader, copied))
+
+
+def test_copied_records_count_under_the_copys_rules(gadgets: Fixture) -> None:
+    owner = gadgets.service(1)
+    source = publish_ruled_board(owner, [WIP_LIMIT])
+    card(owner, source, "a", "doing")
+    card(owner, source, "b", "doing")
+    gadgets.access.share(source, 2, READ)
+    reader = gadgets.service(2)
+
+    copied = reader.copy(source["id"], {"include_data": True})
+
+    with pytest.raises(ConstraintViolation):
+        card(reader, copied, "c", "doing")
+
+
+def test_a_gadget_the_viewer_cant_read_or_that_was_never_published_is_not_copied(
+    gadgets: Fixture,
+) -> None:
+    owner = gadgets.service(1)
+    published = publish_board(owner)
+    unbuilt = owner.create("Synthetic draft")
+    gadgets.access.share(unbuilt, 2, READ)
+    other = gadgets.service(2)
+
+    with pytest.raises(NotFound):
+        gadgets.service(3).copy(published["id"], {})
+    with pytest.raises(NotFound):
+        other.copy(unbuilt["id"], {})
+    with pytest.raises(InvalidInput):
+        owner.copy(published["id"], {"include_data": "yes"})
+
+    assert other.list_owned()["items"] == []
+    assert gadgets.service(3).list_owned()["items"] == []
+
+
+def test_data_over_the_copy_limit_is_refused_before_anything_is_created(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service_module, "MAX_COPIED_RECORDS", 2)
+    owner = gadgets.service(1)
+    source = publish_board(owner)
+    for number in range(3):
+        rpc(
+            owner,
+            source,
+            "create",
+            id=f"t{number}",
+            value={"title": "x"},
+            operation_id=f"o{number}",
+        )
+
+    with pytest.raises(CapacityExceeded):
+        owner.copy(source["id"], {"include_data": True})
+
+    assert [item["id"] for item in owner.list_owned()["items"]] == [source["id"]]
+    # Without the data the same gadget copies.
+    assert owner.copy(source["id"], {})["published_revision"] is not None
+
+
+def test_a_copy_that_fails_half_way_is_removed(gadgets: Fixture) -> None:
+    owner = gadgets.service(1)
+    source = publish_board(owner)
+    rpc(owner, source, "create", id="t1", value={"title": "x"}, operation_id="o1")
+
+    def fail_copied_data(path: str) -> None:
+        # The copy only reads the source, so the data written now is the copy's.
+        if path.startswith("data/"):
+            raise OSError("synthetic storage failure")
+
+    gadgets.store.before_create = fail_copied_data
+    with pytest.raises(OSError):
+        owner.copy(source["id"], {"include_data": True})
+    gadgets.store.before_create = None
+
+    assert [item["id"] for item in owner.list_owned()["items"]] == [source["id"]]

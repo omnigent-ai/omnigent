@@ -345,6 +345,25 @@ export async function createGadget(name: string): Promise<Gadget> {
   );
 }
 
+/**
+ * Makes a copy the viewer owns of a published gadget they can read: its published code and,
+ * with `includeData`, its records. The copy keeps no link to the source. Resolves the copy.
+ */
+export async function copyGadget(
+  appId: string,
+  options: { name?: string; includeData: boolean },
+): Promise<Gadget> {
+  return parseGadget(
+    await gadgetRequest(`${appPath(appId)}/copy`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...(options.name !== undefined ? { name: options.name } : {}),
+        include_data: options.includeData,
+      }),
+    }),
+  );
+}
+
 /** Deletes the gadget, with its data and versions, for everyone. Needs manage access. */
 export async function deleteGadget(appId: string): Promise<void> {
   await gadgetRequest(appPath(appId), { method: "DELETE" });

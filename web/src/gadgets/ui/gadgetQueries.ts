@@ -10,6 +10,7 @@ import { ApiError } from "@/lib/sessionsApi";
 import {
   type Gadget,
   type GadgetShelf,
+  copyGadget,
   deleteGadget,
   getSessionGadgets,
   getGadget,
@@ -201,6 +202,26 @@ export function useRenameGadget() {
     mutationFn: ({ gadgetId, name }: { gadgetId: string; name: string }) =>
       renameGadget(gadgetId, name),
     onSuccess: (gadget) => updateCachedGadget(queryClient, gadget),
+  });
+}
+
+/** Makes a copy the viewer owns, and lists it with their gadgets. */
+export function useCopyGadget() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      gadgetId,
+      name,
+      includeData,
+    }: {
+      gadgetId: string;
+      name?: string;
+      includeData: boolean;
+    }) => copyGadget(gadgetId, { name, includeData }),
+    onSuccess: (gadget) => {
+      updateCachedGadget(queryClient, gadget);
+      invalidateGadgets(queryClient);
+    },
   });
 }
 

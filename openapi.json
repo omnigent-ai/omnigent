@@ -19283,6 +19283,66 @@
         ]
       }
     },
+    "/v1/gadgets/{app_id}/copy": {
+      "post": {
+        "description": "Make a copy the caller owns of a published gadget they can read, from\n`{\"name\"?, \"include_data\"?}`: its published code and, with `include_data`, its\nrecords. Answers the copy with 201.",
+        "operationId": "copy_gadget_v1_gadgets__app_id__copy_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "include_data": {
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Copy Gadget",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
     "/v1/gadgets/{app_id}/describe": {
       "get": {
         "description": "What an agent reads before working with the records: the published revision's\nguide, collection schemas, constraints and actions, without its HTML.",

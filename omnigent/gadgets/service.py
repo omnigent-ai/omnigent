@@ -96,6 +96,8 @@ _REVISION = re.compile(r"^[0-9a-f]{32}$")
 # The viewer's pins and session links, in their own files.
 SHELF_ROOT = "shelf"
 MAX_PINNED_GADGETS = 50
+# The most records "Make a copy" copies in one request, over all collections.
+MAX_COPIED_RECORDS = 2000
 MAX_SESSION_GADGETS = 20
 COMMENT_STATUSES = frozenset({"draft", "addressed"})
 MAX_COMMENT_CHARS = 4000
@@ -625,6 +627,74 @@ class GadgetService:
         self.access.forget(gadget.id)
         self.store.delete(gadget.id)
         return {"id": app_id, "deleted": True}
+
+    def copy(self, app_id: str, body: dict) -> dict:
+        """Make a copy the viewer owns: the published revision, published again in the copy,
+        and with ``include_data`` the records of its collections. Comments, grants, the
+        action ledger and gadget sessions stay with the source, and the copy keeps no link
+        to it. Needs read access to a published gadget.
+
+        :param body: ``{"name"?, "include_data"?}``; the name defaults to ``Copy of <name>``.
+        :returns: The copy, as :meth:`get` answers it.
+        :raises CapacityExceeded: When the data to copy exceeds :data:`MAX_COPIED_RECORDS`
+            records; nothing is created.
+        """
+        gadget, _, revision, _ = self._active(app_id)
+        include_data = body.get("include_data", False)
+        if not isinstance(include_data, bool):
+            raise InvalidInput("include_data must be a boolean")
+        name = body.get("name")
+        name = (
+            _gadget_name(name)
+            if name is not None
+            else ("Copy of " + gadget.name)[:MAX_GADGET_NAME_CHARS]
+        )
+        # Read before creating anything, so a refused copy leaves no gadget behind.
+        records: list[tuple[str, str, Any]] = []
+        if include_data:
+            source = ImmutableDocumentStore(self._files(gadget), "data", limits=_DATA_STORE_LIMITS)
+            for collection in sorted(revision["collections"]):
+                cursor = None
+                while True:
+                    page = source.list(collection, _DATA_STORE_LIMITS.max_list_limit, cursor)
+                    records.extend((collection, item.id, item.value) for item in page.items)
+                    if len(records) > MAX_COPIED_RECORDS:
+                        raise CapacityExceeded(
+                            f"A copy with data can hold at most {MAX_COPIED_RECORDS} records; "
+                            "copy the gadget without its data",
+                            details={"max_records": MAX_COPIED_RECORDS},
+                        )
+                    cursor = page.next_cursor
+                    if cursor is None:
+                        break
+        copied = self.store.create(
+            self.viewer.user_id, name, owner_registration=self.viewer.registration
+        )
+        self._after_owned_write()
+        permissions = self.access.permissions(self.viewer.user_id, copied)
+        try:
+            files = self._files(copied)
+            value = {**revision, "id": uuid.uuid4().hex}
+            files.mkdirs("code/revisions")
+            files.create_json(f"code/revisions/{value['id']}.json", value)
+            # Before publishing, so the copy's rules count these records as existing data.
+            target = ImmutableDocumentStore(files, "data", limits=_DATA_STORE_LIMITS)
+            for collection, record_id, record in records:
+                target.create(
+                    collection,
+                    record_id,
+                    record,
+                    "copy-" + _digest([collection, record_id]),
+                    self.viewer.user_id,
+                )
+            with self._lifecycle(copied):
+                return self._publish(copied, permissions, {"revision_id": value["id"]})
+        except BaseException:
+            # Best effort: a copy that failed half-way is not left for the viewer to find.
+            with contextlib.suppress(Exception):
+                self.access.forget(copied.id)
+                self.store.delete(copied.id)
+            raise
 
     def gadget_session_status(self, app_id: str) -> dict:
         """Whether the viewer's gadget session, with the sessions it started, is working."""
