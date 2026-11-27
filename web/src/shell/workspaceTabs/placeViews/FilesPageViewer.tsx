@@ -58,8 +58,8 @@ export interface FilesPageViewerProps {
   position?: FilePosition;
   /** The tab is selected and the sidebar is open, so the file stays current. */
   active: boolean;
-  /** Shown first in the toolbar, such as the tree's toggle. */
-  toolbarLeading?: ReactNode;
+  /** Shown last in the toolbar, over the tree it toggles. */
+  toolbarTrailing?: ReactNode;
   onClose: () => void;
   /** Shows the file's changes, in the Changes review. */
   onShowChanges?: () => void;
@@ -89,7 +89,7 @@ export function FilesPageViewer({
   path,
   position,
   active,
-  toolbarLeading,
+  toolbarTrailing,
   onClose,
   onShowChanges,
   onOpenFile,
@@ -137,7 +137,6 @@ export function FilesPageViewer({
   return (
     <div className={cn("flex min-h-0 flex-col bg-background", WORKSPACE_SIDEBAR_LAYOUT.page)}>
       <div className={cn(WORKSPACE_TOOLBAR_CLASS, WORKSPACE_SIDEBAR_LAYOUT.toolbar)}>
-        {toolbarLeading}
         {/* The app's viewer shows the breadcrumbs in its own header. */}
         <div className="flex min-w-0 flex-1">{rich ? null : breadcrumbs}</div>
         {text !== null ? <SaveStatusChip status={saveStatus} /> : null}
@@ -181,6 +180,7 @@ export function FilesPageViewer({
         >
           <XIcon aria-hidden="true" />
         </Button>
+        {toolbarTrailing}
       </div>
       <div className={cn("flex min-h-0 flex-1 flex-col", WORKSPACE_SIDEBAR_LAYOUT.content)}>
         {/* A failed refresh keeps the last content, so an open editor and its edits stay. */}

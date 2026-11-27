@@ -159,6 +159,19 @@ describe("FilesPageViewer", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("ends a text file's toolbar with the tree's toggle, after the file's actions", () => {
+    renderViewer(
+      "src/a.ts",
+      { data: file("src/a.ts", "const a = 1;") },
+      { toolbarTrailing: <button type="button">Hide tree</button>, onShowChanges: vi.fn() },
+    );
+    const toggle = screen.getByRole("button", { name: "Hide tree" });
+    const toolbar = toggle.parentElement!;
+    expect(toolbar.lastElementChild).toBe(toggle);
+    const actions = within(toolbar).getByRole("button", { name: "File actions" });
+    expect(actions.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("offers no Show changes button where the file has no changes view", () => {
     renderViewer("a.ts", { data: file("a.ts", "x") });
     expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
@@ -342,9 +355,11 @@ describe("FilesPageViewer", () => {
     const { onClose } = renderViewer(
       "docs/guide.md",
       { data: file("docs/guide.md", "# Guide") },
-      { toolbarLeading: <button type="button">Show tree</button>, onShowChanges },
+      { toolbarTrailing: <button type="button">Show tree</button>, onShowChanges },
     );
-    expect(screen.getByRole("button", { name: "Show tree" })).toBeInTheDocument();
+    // The toggle ends the toolbar, over the tree docked at the right.
+    const toggle = screen.getByRole("button", { name: "Show tree" });
+    expect(toggle.parentElement?.lastElementChild).toBe(toggle);
     // The app's viewer has its own actions, so the toolbar adds no File actions.
     expect(screen.queryByRole("button", { name: "File actions" })).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "Show changes" }));

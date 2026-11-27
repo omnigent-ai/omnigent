@@ -1,7 +1,7 @@
-// A workspace page whose toolbar spans its full width, with an optional sidebar
-// (a file tree) below the toolbar and beside the content. Showing or hiding the
-// sidebar never moves or narrows the toolbar. A narrow page opens the sidebar
-// as a popover under its toggle instead, as the Changes review does.
+// A workspace page whose toolbar spans its full width, with an optional sidebar (a file
+// tree) below the toolbar at the content's right, so showing or hiding it moves neither the
+// toolbar nor the content's left edge. A narrow page opens the sidebar as a popover under
+// its toggle instead, as the Changes review does.
 
 import { ListTreeIcon } from "lucide-react";
 import { useCallback, useRef, useState, type ReactNode } from "react";
@@ -27,7 +27,7 @@ import { cn } from "@/lib/utils";
 export const WORKSPACE_SIDEBAR_LAYOUT = {
   page: "col-span-full row-span-full grid min-h-0 min-w-0 grid-cols-subgrid grid-rows-subgrid overflow-hidden",
   toolbar: "col-span-full row-start-1",
-  content: "col-start-2 row-start-2 min-w-0",
+  content: "col-start-1 row-start-2 min-w-0",
 } as const;
 
 /** Marks a control inside a sidebar that handles Escape itself, so the popover stays open. */
@@ -149,29 +149,33 @@ export function WorkspaceSidebarLayout({
       <div
         ref={state?.setElement}
         data-testid={testId}
-        className="@container/workspace-page grid min-h-0 flex-1 grid-cols-[auto_minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)]"
+        className="@container/workspace-page grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_auto] grid-rows-[auto_minmax(0,1fr)]"
       >
         {children}
-        {/* After the page, so it paints over the page's empty first column. */}
+        {/* After the page, so it paints over the page's empty last column. */}
         {docked && (
           <div
             className={cn(
               "row-start-2 flex min-h-0 flex-col",
-              state.fills ? "col-span-full" : "relative col-start-1 border-r border-border",
+              state.fills ? "col-span-full" : "relative col-start-2 border-l border-border",
               !state.fills && !resize && "w-[min(16rem,40cqw)]",
             )}
             style={!state.fills && resize ? { width: resize.width } : undefined}
           >
             {sidebar}
             {!state.fills && resize && (
-              <PaneResizeHandle resize={resize} testId="workspace-sidebar-resize-handle" />
+              <PaneResizeHandle
+                resize={resize}
+                side="left"
+                testId="workspace-sidebar-resize-handle"
+              />
             )}
           </div>
         )}
       </div>
       {state && !state.wide && sidebar && (
         <PopoverContent
-          align="start"
+          align="end"
           collisionPadding={8}
           className="flex h-96 w-72 flex-col overflow-hidden p-0"
           aria-label={sidebarLabel}

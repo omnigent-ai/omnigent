@@ -26,6 +26,8 @@ export const FILES_TREE_WIDTH: PaneWidthSpec = {
   roomIn: (pageWidth) => Math.floor(pageWidth * FILES_TREE_MAX_SHARE),
   // A tab gone full size widens the tree in proportion, rather than stopping at a fixed width.
   growsWithRoom: true,
+  // The tree docks at the page's right, so its handle is its left edge.
+  anchor: "right",
   label: "Resize the file tree",
   keyboardStep: 16,
 };

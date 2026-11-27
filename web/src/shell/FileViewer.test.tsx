@@ -577,7 +577,7 @@ describe("FileViewer mobile keyboard inset", () => {
     const root = screen.getByTestId("file-viewer");
     expect(root).toHaveClass("flex", "flex-col", "bg-card");
     expect(root.firstElementChild).toHaveClass("border-b", "px-4", "py-3");
-    expect(root.querySelector(".col-start-2")).toBeNull();
+    expect(root.querySelector(".col-start-1, .col-start-2")).toBeNull();
   });
 
   it("beside a sidebar, spans the toolbar over the page with its leading control first", () => {
@@ -594,8 +594,8 @@ describe("FileViewer mobile keyboard inset", () => {
     expect(toolbar).toHaveClass("col-span-full", "row-start-1");
     const leading = within(toolbar).getByRole("button", { name: "Show tree" });
     expect(toolbar.querySelector("button")).toBe(leading);
-    // The banner and content sit in the cell beside the sidebar.
-    expect(root.children[1]).toHaveClass("col-start-2", "row-start-2");
+    // The banner and content sit in the cell beside the sidebar, which docks at the right.
+    expect(root.children[1]).toHaveClass("col-start-1", "row-start-2");
   });
 
   it("ends the toolbar with a trailing control, after the file's actions", () => {
