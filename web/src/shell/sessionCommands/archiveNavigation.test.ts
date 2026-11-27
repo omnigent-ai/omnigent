@@ -144,6 +144,25 @@ describe("navigateAfterArchiving", () => {
     expect(landed()).toEqual(["pending", "user_left"]);
   });
 
+  it("keeps waiting while the archived row drops out of the list, which still shows it open", () => {
+    registerSessions({ history: ["a"], known: false });
+    archive();
+    // The archive patches the row out of the sidebar's list; the route still shows the session.
+    useSidebarSessionOrderStore.setState({ orderedSessionIds: ["c", "b"] });
+    useRecentSessionSwitchStore.setState({ sessionsKnown: true });
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/c/c", { replace: true });
+    expect(landed()).toEqual(["pending", "sidebar_order"]);
+  });
+
+  it("keeps waiting while the sidebar stops publishing, as when it unmounts", () => {
+    registerSessions({ history: ["a"], known: false });
+    archive();
+    useSidebarSessionOrderStore.setState({ orderedSessionIds: [], activeSessionId: null });
+    useRecentSessionSwitchStore.setState({ sessionsKnown: true });
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/?project=Payments", { replace: true });
+    expect(landed()).toEqual(["pending", "new_session"]);
+  });
+
   it("records a list that fails while it waits, once, then opens the survivor on retry", () => {
     registerSessions({ history: ["a"], known: false });
     archive();
