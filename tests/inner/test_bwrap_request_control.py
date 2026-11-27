@@ -32,6 +32,7 @@ from omnigent.inner._bounded_output import CapturedOutput
 from omnigent.inner.bwrap_sandbox import BwrapRequestFds, BwrapSandboxBackend
 from omnigent.inner.sandbox import SandboxPolicy
 from tests._helpers.polling import poll_until
+from tests._helpers.shell_lifecycle import detached_output_command
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="Linux pidfd and credential metadata"
@@ -771,32 +772,6 @@ class _LiveBwrapRequest:
 @pytest.fixture
 def live_bwrap_request(tmp_path: Path, ending: str) -> Iterator[_LiveBwrapRequest]:
     descendant_ready = tmp_path / "descendant-ready"
-    descendant = """
-import signal, sys
-from pathlib import Path
-print("descendant-ready", flush=True)
-print("descendant-stderr", file=sys.stderr, flush=True)
-Path(sys.argv[1]).write_text("ready")
-signal.pause()
-"""
-    command = """
-import signal, subprocess, sys, time
-from pathlib import Path
-subprocess.Popen(
-    [sys.executable, "-I", "-S", "-c", sys.argv[3], sys.argv[1]],
-    start_new_session=True,
-)
-ready = Path(sys.argv[1])
-deadline = time.monotonic() + 5
-while not ready.exists():
-    if time.monotonic() >= deadline:
-        raise RuntimeError("Descendant did not start")
-    time.sleep(0.01)
-if sys.argv[2] == "complete":
-    print("command-complete", flush=True)
-    raise SystemExit(7)
-signal.pause()
-"""
     policy = SandboxPolicy(
         backend_type="linux_bwrap",
         active=True,
@@ -823,16 +798,9 @@ signal.pause()
             json.dumps(
                 {
                     "token": _TOKEN.decode("ascii"),
-                    "argv": [
-                        sys.executable,
-                        "-I",
-                        "-S",
-                        "-c",
-                        command,
-                        str(descendant_ready),
-                        ending,
-                        descendant,
-                    ],
+                    "argv": detached_output_command(
+                        descendant_ready, ending, exit_code=7, ready_timeout=5
+                    ),
                     "cwd": str(tmp_path),
                     "env": {"PATH": os.defpath, "LANG": "C.UTF-8"},
                 }

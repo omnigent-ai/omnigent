@@ -9302,9 +9302,16 @@ async def _execute_os_env_tool(
                 )
         else:
             return f"Error: {tool_name} not implemented"
-        # Only isolated shell requests retire every descendant before lease release.
+        # Isolated requests publish an exit status only after their owned lifetimes retire.
+        command_exited = (
+            isolated_shell
+            and isinstance(result, dict)
+            and type(result.get("exit_code")) is int
+            and result.get("exit_code") != 0
+        )
         completed = (tool_name != SysOsShellTool.name() or isolated_shell) and not (
-            isinstance(result, dict) and ("error" in result or result.get("timed_out"))
+            isinstance(result, dict)
+            and (("error" in result and not command_exited) or result.get("timed_out"))
         )
     except Exception as exc:
         _logger.exception(

@@ -24,6 +24,7 @@ from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.tool_dispatch import _execute_os_env_tool
 from omnigent.spec.types import AgentSpec
 from tests._helpers.polling import poll_until_async
+from tests._helpers.shell_lifecycle import detached_output_command
 
 _LIVE_LINUX = (
     sys.platform.startswith("linux") and shutil.which("bwrap", path=os.defpath) is not None
@@ -109,7 +110,7 @@ async def test_supported_shells_lease_the_file_environment_and_retire_failures(
         assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
             "content": "file"
         }
-        if outcome == "success":
+        if outcome in {"success", "nonzero"}:
             assert len(environments) == 1
             assert environment.read.await_count == 2
             environment.close.assert_not_called()
@@ -215,7 +216,7 @@ def _require_request_launcher(spec: AgentSpec, cwd: Path) -> None:
 
 
 @pytest.mark.skipif(not _LIVE_LINUX, reason="requires Linux and Bubblewrap")
-@pytest.mark.parametrize("ending", ["complete", "timeout", "cancel"])
+@pytest.mark.parametrize("ending", ["complete", "nonzero", "timeout", "cancel"])
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 async def test_real_runner_shell_requests_retire_descendants_and_keep_only_clean_helpers(
@@ -243,30 +244,6 @@ async def test_real_runner_shell_requests_retire_descendants_and_keep_only_clean
 
     monkeypatch.setattr(request_control.BwrapRequestControl, "receive", observe)
     ready = tmp_path / "descendant-ready"
-    descendant = """
-import signal, sys
-from pathlib import Path
-print("descendant-ready", flush=True)
-print("descendant-stderr", file=sys.stderr, flush=True)
-Path(sys.argv[1]).write_text("ready")
-signal.pause()
-"""
-    command = """
-import signal, subprocess, sys, time
-from pathlib import Path
-subprocess.Popen(
-    [sys.executable, "-I", "-S", "-c", sys.argv[3], sys.argv[1]], start_new_session=True
-)
-deadline = time.monotonic() + 8
-while not Path(sys.argv[1]).exists():
-    if time.monotonic() >= deadline:
-        raise RuntimeError("Descendant did not start")
-    time.sleep(0.01)
-if sys.argv[2] == "complete":
-    print("command-complete", flush=True)
-    raise SystemExit(0)
-signal.pause()
-"""
     task = None
     try:
         assert (
@@ -278,7 +255,12 @@ signal.pause()
                 "sys_os_shell",
                 {
                     "command": shlex.join(
-                        [sys.executable, "-I", "-S", "-c", command, str(ready), ending, descendant]
+                        detached_output_command(
+                            ready,
+                            "complete" if ending == "nonzero" else ending,
+                            exit_code=7 if ending == "nonzero" else 0,
+                            ready_timeout=8,
+                        )
                     ),
                     "timeout": 3 if ending == "timeout" else 15,
                 },
@@ -296,7 +278,9 @@ signal.pause()
         else:
             result = json.loads(await task)
             assert result["timed_out"] == (ending == "timeout")
-            assert result["exit_code"] == (0 if ending == "complete" else None)
+            assert result["exit_code"] == (
+                0 if ending == "complete" else 7 if ending == "nonzero" else None
+            )
             assert "descendant-ready\n" in result["stdout"]
             assert "descendant-stderr\n" in result["stderr"]
         assert len(lifetimes) == 1
@@ -308,7 +292,7 @@ signal.pause()
             json.loads(await execute("sys_os_read", {"path": "note.txt"}))["content"] == "ready\n"
         )
         current = await _helper_process(registry, spec)
-        if ending == "complete":
+        if ending in {"complete", "nonzero"}:
             assert current is original and original.poll() is None
         else:
             assert current is not original

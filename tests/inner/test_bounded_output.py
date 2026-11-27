@@ -46,6 +46,23 @@ def test_decode_errors_are_retained_as_small_metadata_while_remaining_data_is_di
     assert result.decoding_error is not None and "decode" in result.decoding_error
 
 
+def test_unfinished_stateful_output_discards_pending_bytes_at_the_bound() -> None:
+    capture = _TextPrefix("utf-7", 4)
+    capture.feed(b"safe+")
+    for _ in range(3):
+        capture.feed(b"A" * 32_768)
+        assert capture.result() == CapturedOutput("safe", nonblank=True)
+    capture.feed(b"A" * 32_768)
+    failed = capture.result()
+    assert failed.text == "" and failed.omitted == 0
+    assert failed.decoding_error == "Output decoder retained an oversized incomplete sequence"
+    assert capture._decoder.getstate()[0] == b""
+    capture.feed(b"A" * 131_072)
+    capture.feed(b"-", final=True)
+    assert capture.result() == failed
+    assert capture._decoder.getstate()[0] == b""
+
+
 @pytest.mark.posix_only
 @pytest.mark.timeout(20)
 def test_both_pipes_are_fully_drained_with_bounded_heap_retention() -> None:
