@@ -75,7 +75,7 @@ def test_other_pull_requests_are_writable(pr_url: object) -> None:
         ("git?.example.org", "git1.example.org", False),
         ("git[12].example.org", "git1.example.org", False),
         ("*.example.org", "a.b.example.org", True),
-        ("git.example.org", "gitXexample.org", False),
+        ("a.b.example", "aXb.example", False),
     ],
 )
 def test_only_a_star_is_a_wildcard(pattern: str, host: str, matches: bool) -> None:

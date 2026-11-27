@@ -1425,6 +1425,45 @@ _CHANGE_REQUESTS = {**host_tests._OWNER_CALLS, **host_tests._REVIEW_CALLS}
 _READ_ONLY_GITHUB = ("github.com",)
 
 
+@pytest.mark.parametrize(
+    ("read_only_code_hosts", "capabilities", "marked"),
+    [
+        pytest.param(
+            _READ_ONLY_GITHUB,
+            {"merging": True, "line_counts": True},
+            {"read_only": True, "capabilities": {"merging": False, "line_counts": True}},
+            id="read-only",
+        ),
+        pytest.param(_READ_ONLY_GITHUB, None, {"read_only": True}, id="older-host"),
+        pytest.param(("git.example.com",), {"merging": True}, {}, id="writable"),
+    ],
+)
+async def test_the_overview_of_a_pr_on_a_read_only_host_offers_no_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_only_code_hosts: tuple[str, ...],
+    capabilities: dict[str, bool] | None,
+    marked: dict[str, Any],
+) -> None:
+    """The workspace API shapes the host's overview as the REST route does."""
+    overview: dict[str, Any] = {"selected_pr_url": _PR, "pr": {"url": _PR}}
+    if capabilities is not None:
+        overview["capabilities"] = capabilities
+    stored = _linked(_PR)
+    monkeypatch.setattr(server_prs, "ingest_info", lambda *_args, **_kwargs: stored)
+    monkeypatch.setattr(server_prs, "answer", lambda info, _stored: dict(info))
+    monkeypatch.setattr(
+        WorkspaceReader, "github_info", lambda _self, _session, _url: dict(overview)
+    )
+    client = _client(
+        tmp_path, monkeypatch, _Store(stored), read_only_code_hosts=read_only_code_hosts
+    )
+
+    response = await client.get_pull_request(pb.GetPullRequestRequest(pr_url=_PR))
+
+    assert payload_dict(response.payload) == {**overview, **marked}
+
+
 async def _tracked(_pr_url: str) -> PullRequestVouch:
     """The vouch once the server stores the session's PRs: their first is the default."""
     return PullRequestVouch(server_tracked=True, default_pr_url=_PR)
@@ -1488,6 +1527,27 @@ async def test_a_change_naming_no_pr_is_refused_when_the_first_is_read_only(
     assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
     assert _failure_reasons(refused.value) == ["read_only_code_host"]
     assert host_calls == []
+
+
+async def test_a_change_naming_no_pr_reaches_the_host_when_the_first_is_writable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """Another host being read-only doesn't hold back a change to the session's first PR."""
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=("git.example.com",)
+    )
+
+    await client.create_comment(pb.CreateCommentRequest(body="Looks good"))
+
+    assert [call.method for call in host_calls] == ["CreateComment"]
+    [(function, _root, arguments)] = owner_calls
+    assert function == "create_pr_comment"
+    # Forwarded as sent: the host picks the session's PR, as it does with no policy.
+    assert arguments["pr_url"] is None
+    assert arguments["body"] == "Looks good"
 
 
 @pytest.mark.parametrize("method", ["SetPullRequestAccount", "GetMergeOptions"])
