@@ -30,7 +30,7 @@ _UNREADABLE = "GitHub couldn't read this pull request's stack. Try again."
 
 # A user's login, or a GitHub App's, which ends in ``[bot]``.
 _LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?:\[bot\])?")
-# GraphQL's Int is 32-bit and signed.
+# GraphQL's Int is 32-bit and signed; the answer's Struct keeps such numbers exactly.
 _INT_MIN, _INT_MAX = -(2**31), 2**31 - 1
 _NODE_ID = re.compile(r"[A-Za-z0-9_=-]{1,256}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -183,7 +183,7 @@ def _member(node: Any, reference: PullRequestRef, hidden: set[tuple[str, ...]]) 
         return {"pullRequest": None}
     if found.host != reference.host or found.repository.lower() != reference.repository.lower():
         return {"pullRequest": None, "outside_repository": True}
-    number = _count(node.get("number"), least=1, most=2**63 - 1)
+    number = _count(node.get("number"), least=1, most=_INT_MAX)
     head_ref = _ref_name(node.get("headRefName"))
     state = _one_of(node.get("state"), _STATES)
     if number != found.number or head_ref is None or state is None:
@@ -237,7 +237,7 @@ def _stack(stack: Any, reference: PullRequestRef, errors: list[Any]) -> dict[str
     has_next_page = page.get("hasNextPage") if isinstance(page, dict) else None
     shaped = {
         "id": _matching(_NODE_ID, stack.get("id")),
-        "number": _count(stack.get("number"), least=1, most=2**63 - 1),
+        "number": _count(stack.get("number"), least=1, most=_INT_MAX),
         "size": _count(stack.get("size"), least=0, most=MAX_STACK_SIZE),
         "baseRefName": _ref_name(stack.get("baseRefName")),
     }
@@ -307,7 +307,7 @@ def pull_request_native_stack(root: str, reference: PullRequestRef) -> dict[str,
     pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
     if login is None or not isinstance(pull_request, dict):
         raise _unreadable()
-    if _count(pull_request.get("number"), least=1, most=2**63 - 1) != reference.number:
+    if _count(pull_request.get("number"), least=1, most=_INT_MAX) != reference.number:
         raise _unreadable()
     # Both are asked for, so an answer without either isn't GitHub's; each may be null.
     if "stackEntry" not in pull_request or "stack" not in pull_request:

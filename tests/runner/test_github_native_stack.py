@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.host.workspace_payloads import payload_dict, payload_struct
 from omnigent.runner import github_native_stack
 from omnigent.runner import github_resource as github
 from omnigent.runner.pull_request_errors import PullRequestError
@@ -195,6 +196,24 @@ def test_an_answer_with_null_errors_reads_as_one_with_none(fake: FakeGraphQL) ->
     assert _entries(_read())[1] == {"position": 2, "pullRequest": _shaped(2)}
 
 
+def test_the_largest_numbers_accepted_survive_the_payload_unchanged(fake: FakeGraphQL) -> None:
+    """The answer travels as a Struct, whose numbers are doubles."""
+    largest = 2**31 - 1
+    url = f"https://github.com/{REPOSITORY}/pull/{largest}"
+    fake.answer = _answer(
+        [{"position": largest, "pullRequest": {**_member(3), "number": largest, "url": url}}],
+        number=largest,
+        size=10_000,
+    )
+
+    found = _read()
+
+    assert payload_dict(payload_struct(found)) == found
+    (entry,) = _entries(found)
+    assert (entry["pullRequest"]["number"], entry["pullRequest"]["url"]) == (largest, url)
+    assert found["native_stack"]["stack"]["number"] == largest
+
+
 def test_a_pull_request_in_no_stack_says_so(fake: FakeGraphQL) -> None:
     pull_request = fake.answer["data"]["repository"]["pullRequest"]
     pull_request.update(stackEntry=None, stack=None)
@@ -264,6 +283,8 @@ def test_a_member_outside_the_repository_is_blanked(fake: FakeGraphQL, url: str)
         {"url": None},
         {"number": 4},
         {"number": "3"},
+        # Past GraphQL's Int, so the payload's doubles could change it; its URL agrees.
+        {"number": 2**31, "url": f"https://github.com/{REPOSITORY}/pull/{2**31}"},
         {"state": "DELETED"},
         {"state": []},
         {"state": {}},
@@ -278,6 +299,7 @@ def test_a_member_outside_the_repository_is_blanked(fake: FakeGraphQL, url: str)
         "no-url",
         "other-number",
         "number-as-text",
+        "number-past-int",
         "unknown-state",
         "state-as-list",
         "state-as-object",
@@ -603,6 +625,7 @@ def _with(path: list[str], value: Any) -> dict[str, Any]:
         _with(["repository", "pullRequest", "stack", "id"], "PRS_<script>"),
         _with(["repository", "pullRequest", "stack", "id"], "x" * 257),
         _with(["repository", "pullRequest", "stack", "number"], 0),
+        _with(["repository", "pullRequest", "stack", "number"], 2**31),
         _with(["repository", "pullRequest", "stack", "size"], -1),
         _with(["repository", "pullRequest", "stack", "size"], 10_001),
         _with(["repository", "pullRequest", "stack", "baseRefName"], "é" * 128),
@@ -627,6 +650,7 @@ def _with(path: list[str], value: Any) -> dict[str, Any]:
         "stack-id-form",
         "stack-id-too-long",
         "stack-number-zero",
+        "stack-number-past-int",
         "stack-size-negative",
         "stack-size-too-large",
         "stack-base-256-bytes",
