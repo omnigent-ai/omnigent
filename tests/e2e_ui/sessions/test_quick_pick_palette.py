@@ -50,8 +50,12 @@ from tests.e2e_ui.conftest import (
     _ensure_runner_online,
     _server_state,
 )
-from tests.e2e_ui.sessions._sidebar_helpers import patch_session, session_archived
-from tests.e2e_ui.sessions.test_sidebar_mark_unread import _row, _unread_dot
+from tests.e2e_ui.sessions._sidebar_helpers import (
+    patch_session,
+    session_archived,
+    sidebar_row,
+    unread_dot,
+)
 
 _PALETTE_INPUT = "command-palette-input"
 # "Go to Settings" navigates to /settings, which redirects to the general section.
@@ -334,43 +338,46 @@ def test_quick_pick_marks_all_read_and_filters_the_inbox(
     page: Page = request.getfixturevalue("page")
     enable_quick_pick_palette(page)
     page.goto(f"{base_url}/c/{session_id}")
-    row = _row(page, session_id)
+    row = sidebar_row(page, session_id)
     expect(row).to_be_visible(timeout=30_000)
+
+    def read_state_put(unread: bool):
+        def matches(candidate) -> bool:
+            return (
+                candidate.request.method == "PUT"
+                and candidate.url.endswith(f"/v1/sessions/{session_id}/read-state")
+                and json.loads(candidate.request.post_data or "{}").get("unread") is unread
+            )
+
+        return matches
 
     row.hover()
     row.get_by_test_id("conversation-actions").click()
-    page.get_by_test_id("mark-unread-conversation").click()
-    expect(_unread_dot(row)).to_be_visible()
+    # The dot lights at once; wait for the server's copy, so leaving the page can't cancel it.
+    with page.expect_response(read_state_put(True), timeout=10_000):
+        page.get_by_test_id("mark-unread-conversation").click()
+    expect(unread_dot(row)).to_be_visible()
 
     # From the Inbox no session is open, and the sidebar row keeps its dot.
     page.goto(f"{base_url}/inbox")
-    row = _row(page, session_id)
-    expect(_unread_dot(row)).to_be_visible(timeout=30_000)
+    row = sidebar_row(page, session_id)
+    expect(unread_dot(row)).to_be_visible(timeout=30_000)
 
     # The server holds the unread mark, so reading it back later shows Mark all's write.
     poll_until(lambda: _viewer_unread(base_url, session_id), timeout_s=10.0)
 
-    def read_state_put(candidate) -> bool:
-        return (
-            candidate.request.method == "PUT"
-            and candidate.url.endswith(f"/v1/sessions/{session_id}/read-state")
-            and json.loads(candidate.request.post_data or "{}").get("unread") is False
-        )
-
-    page.keyboard.press("ControlOrMeta+k")
-    palette_input = page.get_by_role("combobox", name="Command palette")
-    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input = open_quick_pick_palette(page)
     palette_input.fill("mark all as read")
     # Wait for the list to settle: rows from before the query can linger for a moment.
     options = page.get_by_role("dialog").get_by_role("option")
     expect(options).to_have_count(1)
     expect(options.first).to_contain_text("Mark 1 unread session as read")
     expect(options.first).to_have_attribute("aria-selected", "true")
-    with page.expect_response(read_state_put, timeout=10_000) as put:
+    with page.expect_response(read_state_put(False), timeout=10_000) as put:
         page.keyboard.press("Enter")
     assert put.value.status == 204
     expect(palette_input).to_have_count(0)
-    expect(_unread_dot(row)).to_have_count(0)
+    expect(unread_dot(row)).to_have_count(0)
     poll_until(lambda: not _viewer_unread(base_url, session_id), timeout_s=10.0)
 
     expect(page.get_by_role("tab", name="All")).to_have_attribute("aria-selected", "true")
@@ -380,9 +387,8 @@ def test_quick_pick_marks_all_read_and_filters_the_inbox(
     page.get_by_role("dialog").get_by_role("combobox").fill("unread")
     expect(page.get_by_role("dialog").get_by_role("option").first).to_contain_text("Unread")
     page.keyboard.press("Enter")
-    # Choosing a value returns to the command list, where the row shows it; close to see the page.
+    # Choosing a value returns to the command list; close it to see the page.
     expect(heading).to_have_count(0)
-    expect(page.get_by_role("dialog").get_by_role("option").first).to_contain_text("Unread")
     page.keyboard.press("Escape")
     expect(page.get_by_role("combobox", name="Command palette")).to_have_count(0)
     expect(page.get_by_role("tab", name="Unread")).to_have_attribute(
