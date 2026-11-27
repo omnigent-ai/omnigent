@@ -29,8 +29,8 @@ import {
   hasCodeHostAccountsBridge,
   hasCodeHostBridge,
   hasNamedAccountEvents,
+  onDesktopNamedAccountsChanged,
 } from "@/lib/macBridge";
-import { onDesktopNamedAccountsChanged } from "@/lib/nativeBridge";
 
 /** The release flag for reading as a named login; main checks it on every read too. */
 export const PULL_REQUESTS_PAGE_ACCOUNTS_FLAG = "pull-requests-page-accounts";

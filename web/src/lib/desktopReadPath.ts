@@ -63,11 +63,11 @@ import {
   hasCodeHostAccountsBridge,
   hasCodeHostBridge,
   hasNamedCodeHostWriteBridge,
+  onDesktopMacAccountsChanged,
 } from "@/lib/macBridge";
 import {
   type CodeHostProvenance,
   getDesktopFeatures,
-  onDesktopMacAccountsChanged,
   type DesktopCodeHost,
   type MacAccountChoice,
   type MacAccountIdentity,
