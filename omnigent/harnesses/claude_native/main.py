@@ -6115,6 +6115,11 @@ def _claude_transcript_records_from_session_items(
     """
     Convert Omnigent session items into Claude Code transcript records.
 
+    As in Claude Code's own transcripts, a run of tool calls (one model response's
+    parallel calls) shares one ``message.id``. Each result hangs off its own call, so
+    without the shared id ``--resume`` drops every call and result of the batch but
+    the last.
+
     :param items: Flat Omnigent item dicts in chronological order, e.g.
         ``{"type": "message", "role": "user", "content": [...]}``.
     :param session_id: Omnigent conversation id, e.g.
@@ -6130,6 +6135,7 @@ def _claude_transcript_records_from_session_items(
     records: list[_JsonObject] = []
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
+    batch_message_id: str | None = None
     snapshot_item_ids: set[str] = set()
     previous_item: _JsonObject | None = None
     for index, item in enumerate(items):
@@ -6155,6 +6161,7 @@ def _claude_transcript_records_from_session_items(
                 records.clear()
                 parent_uuid = None
                 tool_parent_by_call_id.clear()
+                batch_message_id = None
                 snapshot_item_ids.clear()
                 # Emit a compact_boundary system record so Claude
                 # Code recognizes the compaction on resume.
@@ -6230,10 +6237,15 @@ def _claude_transcript_records_from_session_items(
         if record is None:
             continue
         records.append(record)
-        if item.get("type") == "function_call":
+        message = record.get("message")
+        if item.get("type") == "function_call" and isinstance(message, dict):
+            batch_message_id = batch_message_id or f"msg_{record_uuid}"
+            message["id"] = batch_message_id
             call_id = item.get("call_id")
             if isinstance(call_id, str) and call_id:
                 tool_parent_by_call_id[call_id] = record_uuid
+        else:
+            batch_message_id = None
         parent_uuid = record_uuid
     return records
 

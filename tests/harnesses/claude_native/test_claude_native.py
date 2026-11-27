@@ -10456,6 +10456,65 @@ def test_transcript_records_keep_genuine_repeats_across_turns() -> None:
     assert len(records) == 2, f"Genuine repeats must both survive: {records}"
 
 
+def test_transcript_records_give_each_run_of_tool_calls_one_message_id() -> None:
+    """Parallel tool calls share a ``message.id``, so ``--resume`` keeps every call.
+
+    Each result hangs off its own call, as Claude Code writes them. Claude Code finds
+    a batch's earlier calls through the shared id; without it, a resume keeps only the
+    batch's last call. A call after the batch's results is a new model response.
+    """
+
+    def call(name: str) -> dict[str, Any]:
+        return {
+            "type": "function_call",
+            "name": "Read",
+            "call_id": f"toolu_{name}",
+            "arguments": json.dumps({"file_path": f"{name}.txt"}),
+            "response_id": "resp_1",
+        }
+
+    def output(name: str) -> dict[str, Any]:
+        return {
+            "type": "function_call_output",
+            "call_id": f"toolu_{name}",
+            "output": f"contents of {name}.txt",
+            "response_id": "resp_1",
+        }
+
+    items: list[dict[str, Any]] = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Read a, b and c."}],
+            "response_id": "resp_1",
+        },
+        call("a"),
+        call("b"),
+        output("a"),
+        output("b"),
+        call("c"),
+        output("c"),
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    blocks = [(record, record["message"]["content"][0]) for record in records[1:]]
+    calls = {block["id"]: record for record, block in blocks if block["type"] == "tool_use"}
+    results = {
+        block["tool_use_id"]: record for record, block in blocks if block["type"] == "tool_result"
+    }
+    batch_id = calls["toolu_a"]["message"]["id"]
+    assert batch_id
+    assert calls["toolu_b"]["message"]["id"] == batch_id
+    assert calls["toolu_c"]["message"]["id"] not in (None, batch_id)
+    assert results["toolu_a"]["parentUuid"] == calls["toolu_a"]["uuid"]
+    assert results["toolu_b"]["parentUuid"] == calls["toolu_b"]["uuid"]
+
+
 def test_claude_transcript_records_handles_native_compaction_messages() -> None:
     """Claude-native compacted messages survive cold-resume reconstruction."""
     items: list[dict[str, Any]] = [
