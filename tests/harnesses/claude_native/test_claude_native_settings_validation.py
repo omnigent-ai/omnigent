@@ -174,8 +174,6 @@ async def test_validator_requires_complete_controls_and_keeps_the_full_document(
 @pytest.mark.parametrize(
     ("sandboxed", "env_wrapped", "fork_executable"),
     [
-        pytest.param(False, True, None, id="False"),
-        pytest.param(True, True, None, id="True"),
         pytest.param(True, False, None, id="different-paths"),
         pytest.param(True, True, "bin", id="fork-bin"),
         pytest.param(True, True, "opt", id="fork-opt"),

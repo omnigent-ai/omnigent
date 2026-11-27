@@ -1898,6 +1898,22 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
         "settings_request_ack,expected_ack"
     ),
     [
+        (
+            200,
+            {
+                "id": "terminal_claude_main",
+                "object": "session.resource",
+                "type": "terminal",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+                "name": "claude:main",
+                "metadata": {"terminal_name": "claude", "session_key": "main", "running": True},
+            },
+            200,
+            None,
+            None,
+            "1" * 32,
+            "1" * 32,
+        ),
         # Runner returns its own error body (the common case: tunnel
         # dropped mid-launch, runner reports offline). The runner's code
         # drives the HTTP status, and its message is surfaced verbatim.
@@ -1984,12 +2000,12 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     runner_status: int,
     runner_payload: dict[str, Any],
     expected_status: int,
-    expected_code: str,
-    expected_message: str,
+    expected_code: str | None,
+    expected_message: str | None,
     settings_request_ack: str | int | None,
     expected_ack: str | None,
 ) -> None:
-    """A runner ``>=400`` on terminal launch yields a clean error, not a 500 crash.
+    """Runner statuses, successful resources and typed acknowledgements survive proxying.
 
     Regression for the masking bug at ``create_session_terminal``: it built
     ``OmnigentError(..., http_status=status)``, but ``OmnigentError``
@@ -2016,6 +2032,13 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     session_id = "79b22ebd2309e48fdeb450c65611d51b"
     path = f"/v1/sessions/{session_id}/resources/{terminal_path}"
     request_body: dict[str, Any] = {"terminal": "bash", "session_key": "s1"}
+    if runner_status < 400:
+        request_body = {"terminal": "claude", "session_key": "main", "bridge_inject_dir": True}
+        if terminal_path == "claude-settings-v2/terminals":
+            request_body.update(
+                claude_settings_request="1" * 32,
+                claude_settings_request_protocol=2,
+            )
     if settings_request_ack is not None:
         runner_payload = {**runner_payload, "claude_settings_request_ack": settings_request_ack}
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
@@ -2024,9 +2047,9 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     with capture_debug_rows("server") as rows:
         resp = await client.post(path, json=request_body)
 
-    # A failed launch still records its timing, with the runner's status.
+    # Every launch records its timing, with the runner's status.
     (finished,) = [row for row in rows if row["event_name"] == "terminal_create_finished"]
-    assert int(cast(dict[str, str], finished["attributes"])["status_code"]) >= 400
+    assert int(cast(dict[str, str], finished["attributes"])["status_code"]) == runner_status
     # http_status is derived from the surfaced code; 503 here proves the
     # runner's ``runner_unavailable`` propagated (a 500 would mean it was
     # masked by the old TypeError path or a generic internal error).
@@ -2034,14 +2057,16 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     body = resp.json()
     # The runner's own code/message reach the client unchanged — proves the
     # error was surfaced, not swallowed or replaced by a generic 500.
-    assert body["error"]["code"] == expected_code
-    assert body["error"]["message"] == expected_message
+    if expected_status >= 400:
+        assert body["error"]["code"] == expected_code
+        assert body["error"]["message"] == expected_message
+        assert "id" not in body
+    else:
+        assert body == runner_payload
     if expected_ack is None:
         assert "claude_settings_request_ack" not in body
     else:
         assert body["claude_settings_request_ack"] == expected_ack
-    # The launch failed, so no resource-created event/resource is returned.
-    assert "id" not in body
     # The proxy POST was actually attempted before the error was raised.
     assert fake_runner.calls == [("POST", path)]
 

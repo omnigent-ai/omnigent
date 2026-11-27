@@ -38,6 +38,12 @@ from omnigent.inner import process_lifetime
 from omnigent.inner.terminal import TerminalInstance
 from tests._helpers.live_server import terminate_process
 from tests._helpers.stdio_jsonrpc import read_json_line
+from tests.harnesses.claude_native._launch_failure_helpers import (
+    POST_ERRORS,
+    POST_RESPONSE_FAILURES,
+    UNCERTAIN_POST_ERRORS,
+    UNDELIVERED_POST_ERRORS,
+)
 
 pytestmark = pytest.mark.timeout(20)
 
@@ -293,16 +299,11 @@ def test_sender_close_fences_new_admission_and_preserves_admitted_readers(
     ("admitted", "failure"),
     [
         (admitted, failure)
-        for failure in ["read", "write", "timeout", "cancel", "400", "503", "no-ack", "mismatched"]
+        for failure in [*UNCERTAIN_POST_ERRORS, "400", *POST_RESPONSE_FAILURES]
         for admitted in [False, True]
     ]
-    + [
-        (False, "connect"),
-        (False, "connect-timeout"),
-        (False, "pool-timeout"),
-        (False, "cleanup-failure"),
-        (True, "reactivated-ack"),
-    ],
+    + [(False, failure) for failure in UNDELIVERED_POST_ERRORS]
+    + [(True, "reactivated-ack")],
 )
 async def test_uncertain_http_completion_releases_only_sender_ownership(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, admitted: bool, failure: str
@@ -311,16 +312,6 @@ async def test_uncertain_http_completion_releases_only_sender_ownership(
     received = []
     receiver = None
     generation = None
-    errors = {
-        "read": httpx.ReadError,
-        "write": httpx.WriteError,
-        "timeout": httpx.ReadTimeout,
-        "cancel": asyncio.CancelledError,
-        "connect": httpx.ConnectError,
-        "connect-timeout": httpx.ConnectTimeout,
-        "pool-timeout": httpx.PoolTimeout,
-        "cleanup-failure": httpx.ConnectError,
-    }
     if failure == "cleanup-failure":
         monkeypatch.setattr(
             ClaudeSettingsRequest,
@@ -345,8 +336,8 @@ async def test_uncertain_http_completion_releases_only_sender_ownership(
         if admitted:
             receiver = acquire_claude_settings_request(bridge_dir, generation, protocol=2)
             received.append(settings_generation_path(bridge_dir, generation).read_bytes())
-        if failure in errors:
-            raise errors[failure]("inert uncertain delivery")
+        if failure in POST_ERRORS:
+            raise POST_ERRORS[failure]("inert uncertain delivery")
         if failure == "reactivated-ack":
             request_claude_bridge_deletion(bridge_dir, "conv_fenced")
             bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
@@ -369,7 +360,7 @@ async def test_uncertain_http_completion_releases_only_sender_ownership(
         async with httpx.AsyncClient(
             base_url="http://unused.invalid", transport=httpx.MockTransport(respond)
         ) as client:
-            expected = errors.get(failure, ClickException)
+            expected = POST_ERRORS.get(failure, ClickException)
             with pytest.raises(expected):
                 await main._launch_claude_terminal(
                     client, "conv_fenced", (), command="claude", bridge_dir=bridge_dir

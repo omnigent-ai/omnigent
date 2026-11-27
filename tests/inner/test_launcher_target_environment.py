@@ -56,6 +56,7 @@ def _payload(tmp_path: Path, *, inherit: bool = True) -> Path:
 @pytest.fixture
 def inert_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     events = []
+    activation_environments = []
     environment: dict[str, str] = {}
     launcher_os = SimpleNamespace(**{**vars(os), "environ": environment})
     scratch = tmp_path / "launcher-scratch"
@@ -67,11 +68,10 @@ def inert_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     def activate(_policy):
         events.append("activate")
-        assert _SENTINEL not in environment.values()
+        activation_environments.append(dict(environment))
 
     def read(path, *args, **kwargs):
         events.append("payload-read")
-        assert "activate" in events
         return builtins.open(path, *args, **kwargs)
 
     def spawn(*args, **kwargs):
@@ -96,6 +96,7 @@ def inert_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return SimpleNamespace(
         environment=environment,
         events=events,
+        activation_environments=activation_environments,
         scratch=scratch,
         backend=backend,
         run=run,
@@ -136,6 +137,8 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
         )
         assert "EXAMPLE_TARGET_ONLY" not in inert_launcher.environment
     assert inert_launcher.events == ["activate", "payload-read", "target-spawn", "cleanup"]
+    assert len(inert_launcher.activation_environments) == 1
+    assert _SENTINEL not in inert_launcher.activation_environments[0].values()
     call = inert_launcher.run.call_args
     assert call.args == ([_TARGET, "doctor"],)
     assert call.kwargs["cwd"] == "/fixture/workspace"
@@ -228,23 +231,27 @@ def test_default_launcher_keeps_inherited_environment_call(inert_launcher, activ
 
 
 @pytest.mark.parametrize(
-    "fault",
+    ("fault", "active"),
     [
-        "missing",
-        "malformed",
-        "shape",
-        "inherit",
-        "unset",
-        "unset-member",
-        "variables",
-        "variables-value",
-        "overrides",
-        "overrides-value",
-        "oversize",
-    ],
+        pytest.param(fault, False, id=fault)
+        for fault in (
+            "missing",
+            "malformed",
+            "shape",
+            "inherit",
+            "unset",
+            "unset-member",
+            "variables",
+            "variables-value",
+            "overrides",
+            "overrides-value",
+            "oversize",
+        )
+    ]
+    + [pytest.param("missing", True, id="missing-active")],
 )
 def test_invalid_target_payload_never_starts_target(
-    tmp_path: Path, inert_launcher, fault: str, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, inert_launcher, fault: str, active: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = _payload(tmp_path)
     if fault == "missing":
@@ -267,11 +274,20 @@ def test_invalid_target_payload_never_starts_target(
     with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         with pytest.raises((ValueError, FileNotFoundError)) as error:
             sb.run_launcher(
-                _encoded(_policy(False)), _TARGET, ["doctor"], target_environment_path=str(path)
+                _encoded(_policy(active)),
+                _TARGET,
+                ["doctor"],
+                target_environment_path=str(path),
+                _spawn_wrapped=active,
             )
     inert_launcher.run.assert_not_called()
     inert_launcher.execute.assert_not_called()
-    inert_launcher.cleanup.assert_called_once_with(None)
+    inert_launcher.cleanup.assert_called_once_with(inert_launcher.scratch if active else None)
+    if "payload-read" in inert_launcher.events:
+        assert inert_launcher.events.index("activate") < inert_launcher.events.index(
+            "payload-read"
+        )
+    assert _SENTINEL not in inert_launcher.activation_environments[0].values()
     assert _SENTINEL not in str(error.value)
     assert _SENTINEL not in caplog.text
 
@@ -286,15 +302,9 @@ def test_relative_target_payload_path_is_refused_before_launcher_creation(
     create.assert_not_called()
 
 
-@pytest.mark.parametrize("fault", ["payload", "spawn"])
-def test_target_failure_cleans_owned_launcher_scratch(
-    tmp_path: Path, inert_launcher, fault: str
-) -> None:
+def test_target_failure_cleans_owned_launcher_scratch(tmp_path: Path, inert_launcher) -> None:
     path = _payload(tmp_path)
-    if fault == "payload":
-        path.unlink()
-    else:
-        inert_launcher.run.side_effect = OSError("inert target failure")
+    inert_launcher.run.side_effect = OSError("inert target failure")
     with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         with pytest.raises(OSError):
             sb.run_launcher(
@@ -305,6 +315,7 @@ def test_target_failure_cleans_owned_launcher_scratch(
                 _spawn_wrapped=True,
             )
     inert_launcher.cleanup.assert_called_once_with(inert_launcher.scratch)
+    assert _SENTINEL not in inert_launcher.activation_environments[0].values()
 
 
 @pytest.mark.parametrize("active", [False, True])
@@ -327,6 +338,7 @@ def test_target_payload_cannot_restore_runner_secrets(
         )
     environment = inert_launcher.run.call_args.kwargs["env"]
     assert not set(RUNNER_AUTH_SECRET_ENV_VARS).intersection(environment)
+    assert _SENTINEL not in inert_launcher.activation_environments[0].values()
     assert SHARED_ENVIRONMENT_VAR not in environment
     assert (sb.HOST_SANDBOX_BACKEND_ENV in environment) is not active
 
@@ -380,6 +392,7 @@ def test_process_lifetime_is_acquired_only_after_containment_and_inherited_by_ta
             )
             == 0
         )
+    assert _SENTINEL not in inert_launcher.activation_environments[0].values()
     for descriptor in inherited:
         with pytest.raises(OSError):
             os.fstat(descriptor)

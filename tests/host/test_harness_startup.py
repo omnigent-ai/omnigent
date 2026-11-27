@@ -207,21 +207,21 @@ def test_env_split_string_keeps_a_word_only_for_set_variables():
 
 
 @pytest.mark.parametrize(
-    "args",
+    ("args", "expected_cwd"),
     [
-        ["-C", "sub", "/bin/pwd"],
-        ["-Csub", "/bin/pwd"],
-        ["--chdir=link", "/bin/pwd"],
-        ["-iC", "sub", "/bin/pwd"],
-        ["-S", "-C sub /bin/pwd"],
+        (["-C", "sub", "/bin/pwd"], "sub"),
+        (["-Csub", "/bin/pwd"], "sub"),
+        (["--chdir=link", "/bin/pwd"], "sub"),
+        (["-iC", "sub", "/bin/pwd"], "sub"),
+        (["-S", "-C sub /bin/pwd"], "sub"),
         # env applies only the last -C, relative to the starting directory.
-        ["-C", "link", "-C", "sub", "/bin/pwd"],
-        ["-C", "sub", "env", "-C", "nested", "/bin/pwd"],
-        ["-C", "nested-link", "env", "-C", "..", "/bin/pwd"],
-        ["-C", "sub", "env", "-C", "/", "/bin/pwd"],
+        (["-C", "link", "-C", "sub", "/bin/pwd"], "sub"),
+        (["-C", "sub", "env", "-C", "nested", "/bin/pwd"], "sub/nested"),
+        (["-C", "nested-link", "env", "-C", "..", "/bin/pwd"], "sub"),
+        (["-C", "sub", "env", "-C", "/", "/bin/pwd"], "/"),
     ],
 )
-def test_env_wrapper_chdir_matches_real_env(tmp_path, args):
+def test_env_wrapper_chdir_matches_real_env(tmp_path, args, expected_cwd):
     """The modeled ``--chdir`` directory is where the real ``env`` runs the command."""
     if not _real_env_supports_chdir():
         pytest.skip("/usr/bin/env lacks -C/--chdir")
@@ -235,20 +235,7 @@ def test_env_wrapper_chdir_matches_real_env(tmp_path, args):
         ["/usr/bin/env", *args], cwd=tmp_path, env={}, capture_output=True, text=True, check=True
     )
     assert process.stdout.strip() == str((tmp_path / chdir).resolve())
-
-
-def test_nested_env_chdir_preserves_symlink_parent(tmp_path):
-    """Nested ``env`` resolves a symlink before applying the parent-directory change."""
-    sub = tmp_path / "sub"
-    (sub / "nested").mkdir(parents=True)
-    (tmp_path / "nested-link").symlink_to(sub / "nested")
-
-    chdir = startup.env_wrapper_chdir(
-        "/usr/bin/env", ["-C", "nested-link", "env", "-C", "..", "/bin/pwd"]
-    )
-
-    assert chdir is not None
-    assert (tmp_path / chdir).resolve() == sub
+    assert (tmp_path / chdir).resolve() == (tmp_path / expected_cwd).resolve()
 
 
 @pytest.mark.parametrize(

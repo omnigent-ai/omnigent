@@ -22,6 +22,12 @@ from click import ClickException
 from omnigent.harnesses.claude_native import bridge, forwarder
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+from tests.harnesses.claude_native._launch_failure_helpers import (
+    POST_ERRORS,
+    UNCERTAIN_POST_ERRORS,
+    UNDELIVERED_POST_ERRORS,
+    V2_POST_FAILURES,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -226,23 +232,8 @@ async def test_server_client_start_failure_drains_diagnostics_before_first_poll(
 
 @pytest.mark.parametrize(
     "owned_request,failure_mode",
-    [
-        (False, "rejected"),
-        (False, "transport"),
-        (False, "cancelled"),
-        (True, "rejected"),
-        (True, "reactivated-ack"),
-        (True, "transport"),
-        (True, "connect-timeout"),
-        (True, "pool-timeout"),
-        (True, "cleanup-failure"),
-        (True, "read"),
-        (True, "write"),
-        (True, "timeout"),
-        (True, "cancelled"),
-        (True, "unacknowledged"),
-        (True, "mismatched"),
-    ],
+    [(False, failure) for failure in ("503", "connect", "cancel")]
+    + [(True, failure) for failure in V2_POST_FAILURES],
 )
 async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_error(
     monkeypatch: pytest.MonkeyPatch,
@@ -272,15 +263,6 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
     posted: list[dict[str, object]] = []
     original_error: BaseException | None = None
     receiver: ClaudeSettingsLease | None = None
-    uncertain_errors = {
-        "read": httpx.ReadError,
-        "write": httpx.WriteError,
-        "timeout": httpx.ReadTimeout,
-    }
-    undelivered_errors = {
-        "connect-timeout": httpx.ConnectTimeout,
-        "pool-timeout": httpx.PoolTimeout,
-    }
     if failure_mode == "cleanup-failure":
         monkeypatch.setattr(
             ClaudeSettingsRequest,
@@ -301,20 +283,18 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
                 else {},
             )
         posted.append(json.loads(request.content))
-        if failure_mode == "cancelled":
+        if failure_mode == "cancel":
             original_error = asyncio.CancelledError("launch cancelled")
             raise original_error
-        if failure_mode in {"transport", "cleanup-failure"}:
-            original_error = httpx.ConnectError(
-                "simulated launch transport failure", request=request
+        if failure_mode in UNDELIVERED_POST_ERRORS:
+            message = (
+                "simulated launch transport failure"
+                if failure_mode in {"connect", "cleanup-failure"}
+                else "simulated failure before dispatch"
             )
+            original_error = POST_ERRORS[failure_mode](message, request=request)
             raise original_error
-        if failure_mode in undelivered_errors:
-            original_error = undelivered_errors[failure_mode](
-                "simulated failure before dispatch", request=request
-            )
-            raise original_error
-        if failure_mode in {"unacknowledged", "mismatched"}:
+        if failure_mode in {"no-ack", "mismatched"}:
             return httpx.Response(
                 200,
                 json={
@@ -327,11 +307,11 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
                 },
             )
         if owned_request:
-            if failure_mode in uncertain_errors:
+            if failure_mode in UNCERTAIN_POST_ERRORS:
                 receiver = acquire_claude_settings_request(
                     bridge_dir, posted[-1]["claude_settings_request"], protocol=2
                 )
-                original_error = uncertain_errors[failure_mode](
+                original_error = POST_ERRORS[failure_mode](
                     "simulated failure after admission", request=request
                 )
                 raise original_error
@@ -349,19 +329,20 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
                     )
         return httpx.Response(503, json={"detail": "simulated launch rejection"})
 
-    expected_error, expected_message = {
-        "rejected": (ClickException, "503"),
-        "reactivated-ack": (ClickException, r"\(409\): simulated launch rejection"),
-        "transport": (httpx.ConnectError, "simulated launch transport failure"),
-        "connect-timeout": (httpx.ConnectTimeout, "simulated failure before dispatch"),
-        "pool-timeout": (httpx.PoolTimeout, "simulated failure before dispatch"),
-        "cleanup-failure": (httpx.ConnectError, "simulated launch transport failure"),
-        "read": (httpx.ReadError, "simulated failure after admission"),
-        "write": (httpx.WriteError, "simulated failure after admission"),
-        "timeout": (httpx.ReadTimeout, "simulated failure after admission"),
-        "cancelled": (asyncio.CancelledError, "launch cancelled"),
-        "unacknowledged": (ClickException, "did not acknowledge"),
-        "mismatched": (ClickException, "did not acknowledge"),
+    expected_error = POST_ERRORS.get(failure_mode, ClickException)
+    expected_message = {
+        "503": "503",
+        "reactivated-ack": r"\(409\): simulated launch rejection",
+        "connect": "simulated launch transport failure",
+        "connect-timeout": "simulated failure before dispatch",
+        "pool-timeout": "simulated failure before dispatch",
+        "cleanup-failure": "simulated launch transport failure",
+        "read": "simulated failure after admission",
+        "write": "simulated failure after admission",
+        "timeout": "simulated failure after admission",
+        "cancel": "launch cancelled",
+        "no-ack": "did not acknowledge",
+        "mismatched": "did not acknowledge",
     }[failure_mode]
     try:
         async with httpx.AsyncClient(
