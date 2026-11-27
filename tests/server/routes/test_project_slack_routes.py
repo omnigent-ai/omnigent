@@ -63,7 +63,9 @@ async def test_agents_cannot_change_the_link_and_only_the_lead_replies(
     assert sent.status_code == 201, sent.text
 
 
-async def test_only_the_owner_chooses_where_the_watcher_runs_and_calls_back(multi_user_client):
+async def test_only_the_owner_chooses_where_the_watcher_runs_and_calls_back(
+    multi_user_client, db_uri
+):
     client = multi_user_client
     project = await _project(client, ALICE, "zz-slack-owner (throwaway)")
     path = f"/v1/projects/{project['id']}"
@@ -72,7 +74,10 @@ async def test_only_the_owner_chooses_where_the_watcher_runs_and_calls_back(mult
         path, json={"config": {"product_approvers": [BOB]}}, headers=_as_user(ALICE)
     )
     assert made.status_code == 200, made.text
-    ours = {"automation_url": "https://automation.example.com/api/2.0/agent"}
+    ours = {
+        "automation_url": "https://automation.example.com/api/2.0/omnigent",
+        "agent": "claude-native-ui",
+    }
     owner = await client.put(
         f"{path}/slack",
         json={**LINK, "destination": ours},
@@ -81,15 +86,34 @@ async def test_only_the_owner_chooses_where_the_watcher_runs_and_calls_back(mult
     assert owner.status_code == 200, owner.text
     saved = owner.json()["destination"]
 
-    elsewhere = {"automation_url": "https://other.example.com/api/2.0/agent"}
+    # A product approver who isn't the owner can't add or change what the
+    # owner's watcher runs as, where, or with which connections.
     bob = {**_as_user(BOB), "X-Forwarded-Host": "attacker.example.com"}
-    refused = await client.put(
-        f"{path}/slack", json={**LINK, "destination": elsewhere}, headers=bob
-    )
-    assert refused.status_code == 403, refused.text
-    # An approver may still save other settings; the owner's URLs are kept.
-    kept = await client.put(
-        f"{path}/slack", json={**LINK, "destination": {"model": "m1"}}, headers=bob
-    )
-    assert kept.status_code == 200, kept.text
-    assert kept.json()["destination"] == {**saved, "model": "m1"}
+    for change in (
+        {"automation_url": "https://other.example.com/api/2.0/omnigent"},
+        {"agent": "polly"},
+        {"agent": "0123456789abcdef0123456789abcdef"},
+        {"mcp_services": "slack,github"},
+        {"mcp_services": ""},
+    ):
+        refused = await client.put(
+            f"{path}/slack", json={**LINK, "destination": {**ours, **change}}, headers=bob
+        )
+        assert refused.status_code == 403, (change, refused.text)
+    # Resending the owner's values, or leaving them out, passes and keeps them.
+    for destination in ({**ours, "model": "m1"}, {"model": "m1"}):
+        kept = await client.put(
+            f"{path}/slack", json={**LINK, "destination": destination}, headers=bob
+        )
+        assert kept.status_code == 200, kept.text
+        assert kept.json()["destination"] == {**saved, "model": "m1"}
+
+    # An agent, even the owner's own Lead, can't change them either.
+    lead = _lead_headers(db_uri, project, ALICE)
+    for change in ({"agent": "polly"}, {"mcp_services": "github"}):
+        refused = await client.put(
+            f"{path}/slack", json={**LINK, "destination": {**ours, **change}}, headers=lead
+        )
+        assert refused.status_code == 403, (change, refused.text)
+    after = await client.get(f"{path}/slack", headers=_as_user(ALICE))
+    assert after.json()["destination"] == {**saved, "model": "m1"}
