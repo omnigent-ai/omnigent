@@ -43,6 +43,7 @@ from omnigent.server import session_pull_requests as server_prs
 from omnigent.server import workspace_access, workspace_api
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
 from omnigent.server.pull_request_viewers import PullRequestViewer
+from omnigent.server.read_only_code_hosts import READ_ONLY_CODE_HOST_MESSAGE
 from omnigent.server.workspace_access import METHOD_GATES, WorkspaceGate, callable_methods
 from omnigent.stores.session_pull_request_store import SessionPullRequests
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
@@ -116,9 +117,17 @@ def provider_reads(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
     return reached
 
 
-def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: _Store | None) -> Any:
+def _client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    store: _Store | None,
+    *,
+    read_only_code_hosts: tuple[str, ...] = (),
+) -> Any:
     monkeypatch.setattr(server_prs, "open_store", lambda _conversations: store)
-    app = service_tests._server_app(tmp_path, monkeypatch)
+    app = service_tests._server_app(
+        tmp_path, monkeypatch, read_only_code_hosts=read_only_code_hosts
+    )
     return service_tests._connect(app, service_tests._SERVER_BASE, ProtocolType.CONNECT)
 
 
@@ -639,6 +648,8 @@ def _tunnel(
     *,
     refuse_send: bool = False,
     viewer: PullRequestViewer = PullRequestViewer.VIEWER,
+    vouch: Callable[[str], Any] = _no_vouch,
+    read_only_code_hosts: tuple[str, ...] = (),
 ) -> _Tunnel:
     registry = HostRegistry()
     hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
@@ -657,7 +668,11 @@ def _tunnel(
         workspace_api.HostTarget(registry, host, str(tmp_path)),
         content_search=False,
         pull_requests=workspace_api.PullRequestRoute(
-            _SESSION, vouch=_no_vouch, overview=_as_reported, viewer=viewer
+            _SESSION,
+            vouch=vouch,
+            overview=_as_reported,
+            viewer=viewer,
+            read_only_code_hosts=read_only_code_hosts,
         ),
     )
     return _Tunnel(registry, host, service, sent)
@@ -1144,12 +1159,13 @@ async def test_a_hosts_refusal_reason_reaches_the_client(
         ("comment_changed", ["comment_changed"]),
         ("pull_request_changed", ["pull_request_changed"]),
         ("invalid_input", ["invalid_input"]),
-        ("read_only_code_host", []),
+        ("read_only_code_host", ["read_only_code_host"]),
+        ("merge_queue_full", []),
         ("<b>Click here</b>", []),
         ("", []),
         (None, []),
     ],
-    ids=["comment", "head", "input", "other-known", "arbitrary", "empty", "none"],
+    ids=["comment", "head", "input", "read-only", "other-known", "arbitrary", "empty", "none"],
 )
 async def test_only_an_allowed_reason_from_the_host_is_attached(
     tmp_path: Path, reason: str | None, attached: list[str]
@@ -1184,6 +1200,7 @@ def test_a_pull_request_failure_carries_only_its_reason() -> None:
         "comment_changed",
         "pull_request_changed",
         "invalid_input",
+        "read_only_code_host",
     } == workspace_api.PULL_REQUEST_FAILURE_REASONS
 
 
@@ -1400,3 +1417,166 @@ async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
     [thread] = payload_dict(response.payload)["data"]
     assert thread["can_reply"] is owner
     assert thread["comments"]["data"][0]["can_update"] is owner
+
+
+# Every change to the pull request on its code host, with a valid request for it.
+_CODE_HOST_CHANGES = sorted(_PULL_REQUEST_WRITES - {"SetPullRequestAccount"})
+_CHANGE_REQUESTS = {
+    **host_tests._OWNER_CALLS,
+    **host_tests._REVIEW_CALLS,
+    **host_tests._QUEUE_CALLS,
+}
+_READ_ONLY_GITHUB = ("github.com",)
+
+
+@pytest.mark.parametrize(
+    ("read_only_code_hosts", "capabilities", "marked"),
+    [
+        pytest.param(
+            _READ_ONLY_GITHUB,
+            {"merging": True, "line_counts": True},
+            {"read_only": True, "capabilities": {"merging": False, "line_counts": True}},
+            id="read-only",
+        ),
+        pytest.param(_READ_ONLY_GITHUB, None, {"read_only": True}, id="older-host"),
+        pytest.param(("git.example.com",), {"merging": True}, {}, id="writable"),
+    ],
+)
+# The overview is shaped as well when the server has no PR store or can't store the PRs.
+@pytest.mark.parametrize(
+    "fault", [None, "no-store", "ingest-fails"], ids=["stored", "no-store", "ingest-fails"]
+)
+async def test_the_overview_of_a_pr_on_a_read_only_host_offers_no_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_only_code_hosts: tuple[str, ...],
+    capabilities: dict[str, bool] | None,
+    marked: dict[str, Any],
+    fault: str | None,
+) -> None:
+    """The workspace API shapes the host's overview as the REST route does."""
+    overview: dict[str, Any] = {"selected_pr_url": _PR, "pr": {"url": _PR}}
+    if capabilities is not None:
+        overview["capabilities"] = capabilities
+    stored = _linked(_PR)
+
+    def ingest(*_args: Any, **_kwargs: Any) -> Any:
+        if fault == "ingest-fails":
+            raise OSError("disk full")
+        return stored
+
+    monkeypatch.setattr(server_prs, "ingest_info", ingest)
+    monkeypatch.setattr(server_prs, "answer", lambda info, _stored: dict(info))
+    monkeypatch.setattr(
+        WorkspaceReader, "github_info", lambda _self, _session, _url: dict(overview)
+    )
+    store = None if fault == "no-store" else _Store(stored)
+    client = _client(tmp_path, monkeypatch, store, read_only_code_hosts=read_only_code_hosts)
+
+    response = await client.get_pull_request(pb.GetPullRequestRequest(pr_url=_PR))
+
+    assert payload_dict(response.payload) == {**overview, **marked}
+
+
+async def _tracked(_pr_url: str) -> PullRequestVouch:
+    """The vouch once the server stores the session's PRs: their first is the default."""
+    return PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+
+
+async def _refused_before_the_host(tunnel: _Tunnel, method: str, request: Any) -> ConnectError:
+    """The read-only refusal a change gets, checking that no frame went to the host."""
+    with pytest.raises(ConnectError) as refused:
+        # A change that isn't refused waits for the host; this one has no answer.
+        await asyncio.wait_for(tunnel.call(method, request), timeout=5)
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
+    assert _failure_reasons(refused.value) == ["read_only_code_host"]
+    assert tunnel.sent == []
+    return refused.value
+
+
+@pytest.mark.parametrize("method", _CODE_HOST_CHANGES)
+async def test_a_change_to_a_pr_on_a_read_only_host_is_refused_before_the_host(
+    tmp_path: Path, method: str
+) -> None:
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=_READ_ONLY_GITHUB)
+
+    await _refused_before_the_host(tunnel, method, _CHANGE_REQUESTS[method][0])
+
+
+@pytest.mark.parametrize(
+    "request_message",
+    [
+        pb.CreateCommentRequest(body="Looks good"),
+        pb.CreateCommentRequest(pr_url="\u00a0" + _PR, body="Looks good"),
+        pb.CreateCommentRequest(
+            pr_url="https://example.visualstudio.com/project/_git/repo/pullrequest/7",
+            body="Looks good",
+        ),
+    ],
+    ids=["no-pr", "padded-url", "legacy-alias"],
+)
+async def test_a_change_the_server_cant_place_off_a_read_only_host_is_refused(
+    tmp_path: Path, request_message: Any
+) -> None:
+    """Before the server stores the session's PRs, the host picks or normalizes the PR."""
+    hosts = (*_READ_ONLY_GITHUB, "dev.azure.com")
+    tunnel = _tunnel(tmp_path, vouch=_no_vouch, read_only_code_hosts=hosts)
+
+    await _refused_before_the_host(tunnel, "CreateComment", request_message)
+
+
+async def test_a_change_naming_no_pr_is_refused_when_the_first_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    """Through the route, so the server's configured hosts reach the workspace API."""
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=_READ_ONLY_GITHUB
+    )
+
+    with pytest.raises(ConnectError) as refused:
+        await client.create_comment(pb.CreateCommentRequest(body="Looks good"))
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
+    assert _failure_reasons(refused.value) == ["read_only_code_host"]
+    assert host_calls == []
+
+
+async def test_a_change_naming_no_pr_reaches_the_host_when_the_first_is_writable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """Another host being read-only doesn't hold back a change to the session's first PR."""
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=("git.example.com",)
+    )
+
+    await client.create_comment(pb.CreateCommentRequest(body="Looks good"))
+
+    assert [call.method for call in host_calls] == ["CreateComment"]
+    [(function, _root, arguments)] = owner_calls
+    assert function == "create_pr_comment"
+    # Forwarded as sent; the real host then refuses a comment that names no PR.
+    assert arguments["pr_url"] is None
+    assert arguments["body"] == "Looks good"
+
+
+@pytest.mark.parametrize("method", ["SetPullRequestAccount", "GetMergeOptions"])
+async def test_reads_and_the_account_choice_on_a_read_only_host_reach_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=_READ_ONLY_GITHUB
+    )
+
+    await getattr(client, WORKSPACE_METHODS[method].python_name)(_CHANGE_REQUESTS[method][0])
+
+    assert [call.method for call in host_calls] == [method]
+    assert len(owner_calls) == 1

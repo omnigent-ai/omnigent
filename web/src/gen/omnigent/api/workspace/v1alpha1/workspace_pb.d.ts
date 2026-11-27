@@ -3861,7 +3861,7 @@ export declare const ReadPullRequestImageResponseSchema: GenMessage<ReadPullRequ
  */
 export declare type PullRequestFailure = Message<"omnigent.api.workspace.v1alpha1.PullRequestFailure"> & {
   /**
-   * One of "comment_changed", "pull_request_changed" or "invalid_input".
+   * One of "comment_changed", "pull_request_changed", "invalid_input" or "read_only_code_host".
    *
    * @generated from field: string reason = 1;
    */

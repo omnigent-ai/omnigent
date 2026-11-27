@@ -1576,6 +1576,6 @@ message ReadPullRequestImageResponse {
 
 // Attached to a refused pull request call's error: why it was refused, for a client to act on.
 message PullRequestFailure {
-  // One of "comment_changed", "pull_request_changed" or "invalid_input".
+  // One of "comment_changed", "pull_request_changed", "invalid_input" or "read_only_code_host".
   string reason = 1;
 }

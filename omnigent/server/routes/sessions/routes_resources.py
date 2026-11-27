@@ -13,7 +13,7 @@ import re
 import time
 import urllib.parse
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
@@ -71,6 +71,14 @@ from omnigent.server.pull_request_viewers import (
     review_comments_for_viewer,
     review_read_params,
     review_threads_for_viewer,
+)
+from omnigent.server.read_only_code_hosts import (
+    READ_ONLY_CODE_HOST_MESSAGE,
+    is_read_only_pull_request,
+    mark_read_only,
+    parse_patterns,
+    refuses_change,
+    selected_pull_request,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -289,9 +297,30 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+    read_only_code_hosts: Sequence[str] = (),
 ) -> None:
-    """Register the resources routes on router."""
+    """Register the resources routes on router.
+
+    :param read_only_code_hosts: Host patterns whose pull requests are served read-only,
+        from the server config's ``read_only_code_hosts``.
+    """
     pull_request_store = server_prs.open_store(conversation_store)
+    read_only_patterns = parse_patterns(list(read_only_code_hosts))
+
+    def _refuse_read_only_write(params: dict[str, Any]) -> None:
+        """Refuse a write to a pull request on a read-only host before it reaches the host.
+
+        :param params: The write's parameters: the PR it names, else the server's first.
+        """
+        target = params.get("pr_url") or params.get("default_pr_url")
+        if refuses_change(target, read_only_patterns):
+            raise OmnigentError(READ_ONLY_CODE_HOST_MESSAGE, code=ErrorCode.FORBIDDEN)
+
+    def _marked_read_only(info: dict[str, Any]) -> dict[str, Any]:
+        """An overview whose selected PR is on a read-only host, with its writes turned off."""
+        if is_read_only_pull_request(selected_pull_request(info), read_only_patterns):
+            return mark_read_only(info)
+        return info
 
     async def _require_filesystem_attachment_support(
         request: Request, conv: Conversation, filename: str, capability: str
@@ -1261,6 +1290,7 @@ def register_resources_routes(
         :raises HTTPException: With the runner's status and ``detail`` when it refuses.
         """
         params = await _github_params(session_id, params)
+        _refuse_read_only_write(params)
         try:
             status, result = await _proxy_post_to_runner(
                 session_id, runner_path, params, conv, timeout=_PR_EDIT_PROXY_TIMEOUT_S
@@ -3057,6 +3087,7 @@ def register_resources_routes(
                     session_id, payload, sent_at
                 ),
                 viewer=PullRequestViewer.OWNER if session_owner else PullRequestViewer.VIEWER,
+                read_only_code_hosts=read_only_patterns,
             ),
             # Only GetCapabilities lists methods, and it needs the browse gate.
             callable_methods=callable_methods(
@@ -3777,7 +3808,7 @@ def register_resources_routes(
         :param requested_at: Epoch seconds the server sent the request ``info`` answers.
         """
         if pull_request_store is None:
-            return info
+            return _marked_read_only(info)
         try:
             stored = await asyncio.to_thread(
                 server_prs.ingest_info,
@@ -3792,10 +3823,10 @@ def register_resources_routes(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-            return info
+            return _marked_read_only(info)
         if pull_request_refresher is not None:
             pull_request_refresher.note_read(session_id, requested_at)
-        return server_prs.answer(info, stored)
+        return _marked_read_only(server_prs.answer(info, stored))
 
     async def _record_attached(session_id: str, info: dict[str, Any]) -> None:
         """Link the PR a successful attach selected, clearing an earlier unlink.
@@ -4771,6 +4802,7 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         await _require_pull_request_owner(conv, request)
+        _refuse_read_only_write({"pr_url": pr_url})
         content = await _read_upload_capped(file, _MAX_PR_ATTACHMENT_BYTES)
         name = file.filename or ""
         tracking = await _github_params(session_id, {"pr_url": pr_url})

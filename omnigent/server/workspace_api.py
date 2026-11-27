@@ -51,6 +51,11 @@ from omnigent.server.pull_request_viewers import (
     review_comments_for_viewer,
     review_threads_for_viewer,
 )
+from omnigent.server.read_only_code_hosts import (
+    READ_ONLY_CODE_HOST_MESSAGE,
+    READ_ONLY_CODE_HOST_REASON,
+    refuses_change,
+)
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 # Each reply must arrive within this; a whole ReadFile can take longer.
@@ -84,9 +89,11 @@ _REVIEW_WRITES = frozenset(
         "RemoveReaction",
     }
 )
+# Changes that stay on the session's host, such as which account it uses.
+_HOST_ONLY_CHANGES = frozenset({"SetPullRequestAccount"})
 # The refusal reasons a client may read; any other reason a host sends is dropped.
 PULL_REQUEST_FAILURE_REASONS = frozenset(
-    {"comment_changed", "pull_request_changed", "invalid_input"}
+    {"comment_changed", "pull_request_changed", "invalid_input", READ_ONLY_CODE_HOST_REASON}
 )
 # The reads whose answer the server shapes for who reads it: the host account's rights.
 _VIEWER_SHAPES: dict[str, Callable[[dict[str, Any], PullRequestViewer], dict[str, Any]]] = {
@@ -125,12 +132,15 @@ class PullRequestRoute:
         call was sent.
     :param viewer: Who reads; anyone but the owner gets the thread reads without the
         host account's rights. The least trusted by default.
+    :param read_only_code_hosts: Host patterns whose pull requests the server serves
+        read-only; a change to one is refused before the host.
     """
 
     session_id: str
     vouch: Callable[[str], Awaitable[PullRequestVouch | None]]
     overview: Callable[[dict[str, Any], float], Awaitable[dict[str, Any]]]
     viewer: PullRequestViewer = PullRequestViewer.VIEWER
+    read_only_code_hosts: tuple[str, ...] = ()
 
 
 class HostWorkspaceService(WorkspaceServiceMethods):
@@ -204,6 +214,15 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         vouch = await route.vouch(getattr(request, "pr_url", ""))
         sent_at = time.time()
         changes = not method.no_side_effects
+        # The PR the call names, else the server's first, which the host would change.
+        target = getattr(request, "pr_url", "") or (vouch.default_pr_url if vouch else None)
+        writes = changes and method.name not in _HOST_ONLY_CHANGES
+        if writes and refuses_change(target, route.read_only_code_hosts):
+            raise ConnectError(
+                Code.FAILED_PRECONDITION,
+                READ_ONLY_CODE_HOST_MESSAGE,
+                details=failure_details(READ_ONLY_CODE_HOST_REASON),
+            )
         shape = _VIEWER_SHAPES.get(method.name)
         owner = route.viewer is PullRequestViewer.OWNER
         message = await self._unary(
