@@ -1003,15 +1003,15 @@ def _label_names(value: object, field: str) -> list[str]:
 
 
 def pr_labels(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str, *, session_id: str | None = None, pr_url: str | None = None, text: str = ""
 ) -> dict[str, Any]:
-    """List the labels the selected PR's repository offers.
+    """List the labels the selected PR's repository offers, or those matching ``text``.
 
     :raises ValueError: Without a selected tracked PR, or when its provider
         cannot edit labels.
     """
     facet, reference = _label_target(session_id, pr_url)
-    return facet.repo_labels(root, reference)
+    return facet.repo_labels(root, reference, text=text.strip())
 
 
 @_invalidates_panel_reads

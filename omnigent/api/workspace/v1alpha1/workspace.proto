@@ -1071,8 +1071,9 @@ message ListReviewThreadCommentsResponse {
 
 message ListLabelsRequest {
   string pr_url = 1;
-  // Labels whose name matches; unset lists the repository's labels.
-  // Not supported yet: setting this field returns INVALID_ARGUMENT.
+  // Labels whose name or description matches, best match first, at most 50;
+  // unset lists the repository's labels by name. Longer than 256 characters
+  // returns INVALID_ARGUMENT.
   string text = 2;
 }
 

@@ -283,7 +283,7 @@ def _pr_target(**fields: Any) -> dict[str, Any]:
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
 # Each owner method: a valid request, the pr_resource function it runs, and its arguments.
 _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
-    "ListLabels": (pb.ListLabelsRequest(pr_url=_PR), "pr_labels", _pr_target()),
+    "ListLabels": (pb.ListLabelsRequest(pr_url=_PR), "pr_labels", _pr_target(text="")),
     "ListReviewerCandidates": (
         pb.ListReviewerCandidatesRequest(pr_url=_PR),
         "pr_review_candidates",
@@ -672,7 +672,7 @@ async def test_an_owner_method_naming_no_pr_changes_none_the_server_offers_by_de
     assert providers == []
 
 
-async def test_list_labels_refuses_a_search_it_cant_do(
+async def test_list_labels_searches_the_selected_prs_repository_by_text(
     tmp_path: Path, owner_calls: list[tuple[str, str, dict[str, Any]]]
 ) -> None:
     request = pb.ListLabelsRequest(pr_url=_PR, text="bug")
@@ -680,8 +680,20 @@ async def test_list_labels_refuses_a_search_it_cant_do(
         _frame(tmp_path, "ListLabels", request.SerializeToString())
     )
 
+    assert (code, message) == (None, None)
+    assert owner_calls == [("pr_labels", str(tmp_path.resolve()), _pr_target(text="bug"))]
+
+
+async def test_list_labels_refuses_a_search_longer_than_the_cap(
+    tmp_path: Path, owner_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    request = pb.ListLabelsRequest(pr_url=_PR, text="a" * 257)
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "ListLabels", request.SerializeToString())
+    )
+
     assert code == Code.INVALID_ARGUMENT.value
-    assert message == "Label search isn't available on this host"
+    assert message == "The label search is longer than 256 characters"
     assert owner_calls == []
 
 

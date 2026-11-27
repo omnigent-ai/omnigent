@@ -1903,8 +1903,9 @@ export declare type ListLabelsRequest = Message<"omnigent.api.workspace.v1alpha1
   prUrl: string;
 
   /**
-   * Labels whose name matches; unset lists the repository's labels.
-   * Not supported yet: setting this field returns INVALID_ARGUMENT.
+   * Labels whose name or description matches, best match first, at most 50;
+   * unset lists the repository's labels by name. Longer than 256 characters
+   * returns INVALID_ARGUMENT.
    *
    * @generated from field: string text = 2;
    */
