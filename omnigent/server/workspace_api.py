@@ -40,7 +40,11 @@ from omnigent.host.frames import (
     PullRequestVouch,
     encode_host_frame,
 )
-from omnigent.host.workspace_methods import WORKSPACE_METHODS, WorkspaceMethod
+from omnigent.host.workspace_methods import (
+    PULL_REQUEST_FINDERS,
+    WORKSPACE_METHODS,
+    WorkspaceMethod,
+)
 from omnigent.host.workspace_payloads import payload_dict, payload_struct
 from omnigent.host.workspace_pull_request_input import (
     PullRequestRefused,
@@ -229,6 +233,9 @@ class HostWorkspaceService(WorkspaceServiceMethods):
             refuse_unserved_request(method.name, request)
         except PullRequestRefused as exc:
             raise ConnectError(exc.code, exc.message, details=failure_details(exc.reason)) from exc
+        if method.name in PULL_REQUEST_FINDERS:
+            # It reads no PR of the session's, so the host is told to serve none.
+            return route, None
         # The vouch comes from the PRs the server stores, never from the request message.
         return route, await _vouch(route, request)
 

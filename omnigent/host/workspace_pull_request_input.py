@@ -13,6 +13,7 @@ from connectrpc.errors import ConnectError
 
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.runner import pr_resource
+from omnigent.runner.github_lookup import MAX_PULL_REQUEST_URLS
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
     COMMENT_REVIEW_EVENT,
@@ -108,6 +109,10 @@ def refuse_unserved_request(method: str, request: Any) -> None:
         reason = f"The label search is longer than {MAX_LABEL_SEARCH_CHARACTERS} characters"
     elif method in {"SearchReviewers", "SearchCompletions"}:
         reason = _search_refusal(method, request)
+    elif method == "LookupPullRequest":
+        reason = _named_url_refusal(request.pr_url)
+    elif method == "GetPullRequestListStats":
+        reason = _list_stats_refusal(request.pr_urls)
     elif method == "EnableAutoMerge":
         reason = _auto_merge_refusal(request)
     elif method == "ReadPullRequestImage":
@@ -145,6 +150,21 @@ def _search_refusal(method: str, request: Any) -> str | None:
     if method == "SearchCompletions" and request.kind not in _COMPLETION_KINDS:
         return "Choose what to complete: people or pull requests"
     return None
+
+
+def _named_url_refusal(pr_url: str) -> str | None:
+    if not pr_url:
+        return "Expected a pull request URL"
+    if len(pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+        return _LONG_PULL_REQUEST_URL
+    return None
+
+
+def _list_stats_refusal(pr_urls: Any) -> str | None:
+    """Why a list-stats read can't be sent: no URLs, too many, or one empty or too long."""
+    if not 1 <= len(pr_urls) <= MAX_PULL_REQUEST_URLS:
+        return f"Ask for 1 to {MAX_PULL_REQUEST_URLS} pull requests"
+    return next(filter(None, (_named_url_refusal(url) for url in pr_urls)), None)
 
 
 def _review_refusal(method: str, request: Any) -> str | None:
