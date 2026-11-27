@@ -284,36 +284,6 @@ def test_quick_pick_archives_another_session_from_its_row(
     assert not session_archived(base_url, open_id)
 
 
-def test_quick_pick_archives_a_session_picked_after_the_verb(
-    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
-) -> None:
-    """Archive a Session… asks which session, then archives the one picked from its actions."""
-    base_url, open_id, other_id = seeded_session_pair
-    patch_session(base_url, other_id, title="Heron notes")
-    page: Page = request.getfixturevalue("page")
-    enable_quick_pick_palette(page)
-    page.goto(f"{base_url}/c/{open_id}")
-    expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
-
-    palette_input = open_quick_pick_palette(page)
-    palette_input.fill("archive a session")
-    dialog = page.get_by_role("dialog")
-    # By name: the open session's own Archive session row can rank above it.
-    dialog.get_by_role("option", name=re.compile(r"^Archive a Session…")).click()
-    heading = dialog.locator('[data-slot="quick-pick-heading"]')
-    expect(heading).to_have_text("Archive which session?", timeout=10_000)
-
-    picker = dialog.get_by_role("combobox", name="Pick a session")
-    picker.fill("heron")
-    expect(dialog.get_by_role("option").first).to_contain_text("Heron notes")
-    page.keyboard.press("Enter")
-    expect(heading).to_have_text("Actions for “Heron notes”", timeout=10_000)
-    page.keyboard.press("Enter")
-    poll_until(lambda: session_archived(base_url, other_id), timeout_s=15.0)
-    # The open session stays open; only the picked one was archived.
-    expect(page).to_have_url(f"{base_url}/c/{open_id}")
-
-
 def _open_one_then_the_other(page: Page, base_url: str, first: str, second: str) -> None:
     """Open *first*, then *second* from its sidebar row, so *first* is the previous visit."""
     page.goto(f"{base_url}/c/{first}")

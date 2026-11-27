@@ -6,6 +6,11 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import type * as ConversationsModule from "@/hooks/useConversations";
+import {
+  useRecentSessionHotkey,
+  useRecentSessionSwitchStore,
+} from "@/hooks/useRecentSessionSwitch";
+import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
 import type { Conversation } from "@/hooks/useConversations";
 
 import { LEVEL_READ } from "@/lib/permissionsApi";
@@ -467,5 +472,56 @@ describe("QuickPick ⌘K verb-first session actions", () => {
     fireEvent.keyDown(input, { key: "Escape" });
     await waitFor(() => expect(heading()).toBeNull());
     expect(input).toHaveValue("archive a session");
+  });
+});
+
+describe("QuickPick ⌘K and the held recent-session switcher", () => {
+  function RecentSessionChord() {
+    useRecentSessionHotkey(true);
+    return null;
+  }
+
+  afterEach(() => {
+    useRecentSessionSwitchStore.setState({ history: [], switcher: null, chordOwner: null });
+    useSidebarSessionOrderStore.setState({ orderedSessionIds: [], activeSessionId: null });
+  });
+
+  it("closes on ⌃] and opens the switcher in its place, which opens its pick on release", async () => {
+    const live = new Set(["c1", "c2"]);
+    useSidebarSessionOrderStore.setState({
+      orderedSessionIds: ["c1", "c2"],
+      activeSessionId: "c1",
+    });
+    useRecentSessionSwitchStore.setState({
+      history: ["c2", "c1"],
+      switcher: null,
+      chordOwner: null,
+      readLiveSessionIds: () => live,
+      sessionsKnown: true,
+    });
+    render(<RecentSessionChord />);
+    const { onOpenChange, input } = renderPalette(new QueryClient(), { closes: true });
+    input.focus();
+
+    const chord = new KeyboardEvent("keydown", {
+      key: "]",
+      code: "BracketRight",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      input.dispatchEvent(chord);
+    });
+    expect(chord.defaultPrevented).toBe(true);
+    expect(onOpenChange).toHaveBeenLastCalledWith(false);
+    await waitFor(() => expect(openPaletteDialog()).toBeNull());
+    expect(useRecentSessionSwitchStore.getState().switcher).toMatchObject({ selectedId: "c2" });
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keyup", { key: "Control", bubbles: true }));
+    });
+    expect(useRecentSessionSwitchStore.getState().switcher).toBeNull();
+    expect(navigate).toHaveBeenCalledWith("/c/c2");
   });
 });
