@@ -190,7 +190,7 @@ def _refuse_owner_config_write(
     changed = [
         key for key in OWNER_ONLY_CONFIG_KEYS if requested.get(key) != (current or {}).get(key)
     ]
-    if changed and (_is_agent_call(request) or not is_owner):
+    if changed and (is_agent_call(request) or not is_owner):
         raise OmnigentError(
             "Only the project owner can change " + ", ".join(f"`{key}`" for key in changed),
             code=ErrorCode.FORBIDDEN,
@@ -231,7 +231,7 @@ def _refuse_member_agent_choice(project: Project, user_id: str | None, changed: 
         )
 
 
-def _is_agent_call(request: Request) -> bool:
+def is_agent_call(request: Request) -> bool:
     """Whether an agent's runner made the call: it carries a source or a runner token header."""
     return (
         ORCHESTRATION_SOURCE_HEADER in request.headers
@@ -247,7 +247,7 @@ def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
     :param mandate: The requested mandate, or ``None`` when unchanged.
     :raises OmnigentError: 403 for an agent-originated mandate write.
     """
-    if mandate is not None and _is_agent_call(request):
+    if mandate is not None and is_agent_call(request):
         raise OmnigentError(
             "Agents can't change a project's mandate; propose an addition "
             "with sys_project_mandate_propose instead",
@@ -719,7 +719,7 @@ def create_projects_router(
         request: Request, project_id: str, proposal_id: str, *, accept: bool
     ) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
-        if _is_agent_call(request):
+        if is_agent_call(request):
             raise OmnigentError(
                 "Agents can't accept or dismiss a mandate proposal; a person must",
                 code=ErrorCode.FORBIDDEN,

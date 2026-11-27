@@ -22,7 +22,6 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.persona_mentions import MentionRateLimiter
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.slack_provisioning import relay_key_hash
@@ -33,7 +32,7 @@ from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 if TYPE_CHECKING:
     from omnigent.entities import Project
     from omnigent.server.auth import AuthProvider
-    from omnigent.stores import ConversationStore, ProjectStore
+    from omnigent.stores import ConversationStore, PermissionStore, ProjectStore
     from omnigent.stores.project_slack_relay_store import SlackRelayStore
     from omnigent.stores.project_slack_store import ProjectSlackStore, SlackBinding
 
@@ -137,9 +136,10 @@ def create_slack_relay_router(
     project_store: ProjectStore,
     slack_store: ProjectSlackStore,
     relay_store: SlackRelayStore,
-    conversations: ConversationStore | None,
+    conversations: ConversationStore,
     *,
     auth_provider: AuthProvider | None = None,
+    permissions: PermissionStore | None = None,
 ) -> APIRouter:
     router = APIRouter()
     limiter = MentionRateLimiter(limit=SLACK_MESSAGES_PER_PERSON_HOUR, window_seconds=3600)
@@ -316,33 +316,25 @@ def create_slack_relay_router(
         The first answer to each new request mentions the thread's author once;
         every reply ends with an italic "via <project> · Lead" footer.
         """
-        from omnigent.server.project_router import router_session_ids
+        from omnigent.server.routes.project_lead_messages import calling_lead
 
-        user_id = require_user(request, auth_provider)
-        raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        refusal = "Only the project's Lead can reply in Slack"
+        _, _, project = await calling_lead(
+            request,
+            "Replying in Slack",
+            refusal=refusal,
+            people_hint="Slack replies come from the project's Lead; people reply in Slack",
+            auth_provider=auth_provider,
+            conversations=conversations,
+            projects=project_store,
+            permissions=permissions,
+        )
         try:
-            source_id = uuid_to_bytes(raw_source or "").hex()
             path_project = uuid_to_bytes(project_id).hex()
         except InvalidUuidError:
-            raise OmnigentError(
-                "Slack replies come from the project's Lead", code=ErrorCode.FORBIDDEN
-            ) from None
-        project = await asyncio.to_thread(project_store.get, path_project, user_id=user_id)
-        if project is None:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        source = (
-            await asyncio.to_thread(conversations.get_conversation, source_id)
-            if conversations is not None
-            else None
-        )
-        if (
-            source is None
-            or source.project_id != project.id
-            or source.id not in await router_session_ids(request.app, project)
-        ):
-            raise OmnigentError(
-                "Only the project's Lead can reply in Slack", code=ErrorCode.FORBIDDEN
-            )
+            raise OmnigentError(refusal, code=ErrorCode.FORBIDDEN) from None
+        if path_project != project.id:
+            raise OmnigentError(refusal, code=ErrorCode.FORBIDDEN)
         binding = await asyncio.to_thread(slack_store.get, project.id)
         if binding is None or binding.state != "active":
             raise OmnigentError(

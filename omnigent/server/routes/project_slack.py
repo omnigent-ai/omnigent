@@ -144,6 +144,18 @@ def create_project_slack_router(
         return user_id, project, can_manage
 
     async def load_manager(request: Request, project_id: str) -> tuple[str, Project]:
+        """A person who may change the link; never an agent, even one running as them.
+
+        Linking provisions a watcher with the owner's connection, so only people,
+        in the UI or over the API without an agent's headers, may do it.
+        """
+        from omnigent.server.routes.projects import is_agent_call
+
+        if is_agent_call(request):
+            raise OmnigentError(
+                "Agents can't change a project's Slack link; a person does it in Project settings",
+                code=ErrorCode.FORBIDDEN,
+            )
         user_id, project, can_manage = await load(request, project_id)
         if not can_manage:
             raise OmnigentError(

@@ -4863,17 +4863,19 @@ def create_app(
                 from omnigent.server.routes.slack_relay import create_slack_relay_router
                 from omnigent.stores.project_slack_relay_store import SlackRelayStore
 
-                app.include_router(
-                    create_slack_relay_router(
-                        project_store,
-                        app.state.project_slack_store,
-                        SlackRelayStore(kpi_location),
-                        conversation_store,
-                        auth_provider=auth_provider,
-                    ),
-                    prefix="/v1",
-                    tags=["projects"],
-                )
+                if conversation_store is not None:
+                    app.include_router(
+                        create_slack_relay_router(
+                            project_store,
+                            app.state.project_slack_store,
+                            SlackRelayStore(kpi_location),
+                            conversation_store,
+                            auth_provider=auth_provider,
+                            permissions=permission_store,
+                        ),
+                        prefix="/v1",
+                        tags=["projects"],
+                    )
                 app.include_router(
                     create_project_slack_router(
                         project_store,
