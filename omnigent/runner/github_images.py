@@ -58,6 +58,15 @@ _PAGE_SIZE = 100
 # A listing stops after this many pages, so a very long thread links only its first items.
 _MAX_LISTING_PAGES = 20
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+# A destination its text delimits, taken whole: an angle-bracketed Markdown destination or
+# autolink, a Markdown destination with balanced parentheses, or a quoted HTML attribute.
+_DELIMITED_URL = re.compile(
+    r"<(https://[^<>\s]+)>"
+    r"|\]\((https://[^\s()]*(?:\([^\s()]*\)[^\s()]*)*)(?=[\s)])"
+    r"|=\s*\"(https://[^\"\s]+)\""
+    r"|=\s*'(https://[^'\s]+)'"
+)
+# A bare link, which ends before trailing punctuation, as GitHub's autolinks do.
 _URL = re.compile(r"https://[^\s<>\"'()\]\[]+")
 # The asset path an upload answers with, as ``github_resource._is_attachment_url`` matches it.
 _ATTACHMENT_PATH = re.compile(r"/user-attachments/assets/[0-9a-f-]+")
@@ -210,9 +219,25 @@ def _linked_urls(
     urls: set[str] = set()
     for text in bodies:
         if isinstance(text, str):
-            for match in _URL.finditer(html.unescape(text)):
-                urls.add(match.group(0).rstrip(".,;:!?"))
+            urls |= _urls_in(html.unescape(text))
     return frozenset(urls)
+
+
+def _urls_in(text: str) -> set[str]:
+    """Each link in ``text``, exactly as it delimits it, then each bare link.
+
+    A delimited destination is blanked once taken, so the bare pass can't also record its
+    prefix, such as the part before a parenthesis.
+    """
+    urls: set[str] = set()
+
+    def take(match: re.Match[str]) -> str:
+        urls.add(next(group for group in match.groups() if group is not None))
+        return " " * len(match.group(0))
+
+    rest = _DELIMITED_URL.sub(take, text)
+    urls.update(match.group(0).rstrip(".,;:!?") for match in _URL.finditer(rest))
+    return urls
 
 
 def _revision(pull_request: dict[str, Any]) -> tuple[str, str] | None:

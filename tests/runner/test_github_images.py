@@ -204,6 +204,7 @@ def test_lookalikes_and_other_hosts_and_paths_are_refused(url: str, pr_host: str
         "https://user-images.githubusercontent.com/1/a b.png",
         "https://user-images.githubusercontent.com/1/a\tb.png",
         "https://user-images.githubusercontent.com/1/a\x00.png",
+        "https://user-images.githubusercontent.com/1%2F..%2Fa.png?x=1",
     ],
 )
 def test_encoded_and_dot_segment_paths_are_refused_before_github_is_asked(
@@ -228,13 +229,6 @@ def test_a_signed_url_whose_query_carries_encoded_slashes_is_followed(
     assert str(transport.seen[1].url) == signed
 
 
-def test_an_encoded_slash_in_the_path_is_refused_even_with_a_clean_query() -> None:
-    with pytest.raises(ImageRefused):
-        checked_image_url(
-            "https://user-images.githubusercontent.com/1%2F..%2Fa.png?x=1", "github.com"
-        )
-
-
 def test_a_fragment_is_dropped_before_the_check_and_never_fetched(fake: FakeGitHub) -> None:
     linked = f"{ASSET}#preview"
     fake.pull["body"] = linked
@@ -256,6 +250,47 @@ def test_an_image_the_pull_request_doesnt_link_is_refused_with_nothing_fetched(
     assert _refusal(lambda: _read(NEWER_ASSET, transport)) == "not_in_pr"
 
     assert transport.seen == []
+
+
+_PARENTHESES = "https://user-images.githubusercontent.com/1/screenshot(1).png"
+_PUNCTUATED = "https://user-images.githubusercontent.com/1/before-and-after!"
+
+
+@pytest.mark.parametrize(
+    "body, linked, prefix",
+    [
+        (f"![shot](<{_PARENTHESES}>)", _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
+        (f"![shot]({_PARENTHESES})", _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
+        (f'![shot]({_PARENTHESES} "Screenshot")', _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
+        (f'<img src="{_PARENTHESES}">', _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
+        (f"<img src='{_PARENTHESES}'>", _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
+        (f"![shot](<{_PUNCTUATED}>)", _PUNCTUATED, _PUNCTUATED[:-1]),
+        (f'<img src="{_PUNCTUATED}">', _PUNCTUATED, _PUNCTUATED[:-1]),
+    ],
+    ids=[
+        "angle-parentheses",
+        "balanced-parentheses",
+        "titled",
+        "html-double",
+        "html-single",
+        "angle-punctuation",
+        "html-punctuation",
+    ],
+)
+def test_a_delimited_destination_is_linked_whole_and_its_prefix_isnt(
+    fake: FakeGitHub, body: str, linked: str, prefix: str
+) -> None:
+    fake.pull["body"] = body
+
+    assert _read(linked, Transport(_image())).data == PNG
+    assert _refusal(lambda: _read(prefix, Transport())) == "not_in_pr"
+
+
+def test_a_bare_link_still_drops_the_punctuation_after_it(fake: FakeGitHub) -> None:
+    fake.pull["body"] = f"Before and after: {_PUNCTUATED[:-1]}!"
+
+    assert _read(_PUNCTUATED[:-1], Transport(_image())).data == PNG
+    assert _refusal(lambda: _read(_PUNCTUATED, Transport())) == "not_in_pr"
 
 
 @pytest.mark.parametrize("listing", LISTINGS)
