@@ -86,6 +86,21 @@ the header menu), and each place is a separate entry point.
   stays listed with the reason, and a dialog such as Rename opens with focus in
   it. With `quick_pick_palette`, **Go to Session…** turns the open palette into
   the session switcher; Escape returns focus to where ⌘K was opened.
+- `palette-session-actions`: with `quick_pick_palette` on, ⌘↵ (Ctrl+Enter) on
+  any session's ⌘K row lists that session's row-menu actions, such as Open in
+  new window, Pin, Rename, Add to project, Mute, Archive and Delete; Back
+  returns to the row. Verb-first rows such as **Archive a Session…** ask which
+  session first, searching as ⌘K does (a pasted `#123` or pull request link
+  finds the loaded session linked to it), then list the picked session's
+  actions on that verb, or say why it doesn't apply. Each action is checked
+  against the session's current state as it runs and uses the row menu's
+  dialogs. Archiving or deleting the open session leaves its view; an archive
+  opens the session visited before it. In the desktop app the flag also
+  replaces Ctrl+Tab's recent sessions switcher with Next and Previous session.
+  On macOS, ⌃] / ⌃[ open the held recent-session switcher, from ⌘K too
+  (`web/src/shell/QuickPickCommandPalette.sessionActions.test.tsx`,
+  `web/src/shell/sessionCommands/SessionActionHost.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py`).
 - `palette-screen-commands`: with `quick_pick_palette` on (off by default), ⌘K
   also lists the open screen's own actions, each run by its button's handler.
   Under **Conversation**: Copy latest response, Copy link to latest response,
@@ -105,6 +120,15 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+  On the Inbox, ⌘K lists under **Inbox** the **Inbox filter** setting (the tabs)
+  and, for each card, what the card itself offers: Open, Open to respond, Mark
+  as read, Reply…, which expands the card and focuses its reply field where the
+  viewer can reply, and an automation's Open or Mark failed as read. Under
+  **Sessions**, Mark all as read clears every loaded unread session, and the
+  open session's **Conversation** group adds Resume sandbox while its sandbox
+  sleeps or failed to wake (`web/src/pages/InboxPage.test.tsx`,
+  `web/src/shell/markAllReadPaletteCommand.test.tsx`,
+  `web/src/shell/resumeSandboxCommand.test.tsx`).
 - `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
   `floating_panes` on, and not a touch device), the QuickPick palette lists the
   **Pane corners** setting. **Automatic** follows the server's `floating_panes`

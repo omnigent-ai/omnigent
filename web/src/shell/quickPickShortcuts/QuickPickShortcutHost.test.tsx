@@ -76,6 +76,7 @@ function headerRow(id: string, availability: PaletteCommand["availability"] = AV
 
 const PIN = { key: "π", code: "KeyP", metaKey: true, altKey: true };
 const ARCHIVE = { key: "A", code: "KeyA", metaKey: true, shiftKey: true };
+const FORK = { key: "ƒ", code: "KeyF", metaKey: true, altKey: true };
 
 const press = (init: KeyboardEventInit) => fireEvent.keyDown(window, init);
 const CTRL_TAB = { key: "Tab", code: "Tab", ctrlKey: true };
@@ -228,6 +229,9 @@ describe("QuickPickShortcutHost", () => {
     const archive = headerRow("archive");
     press(ARCHIVE);
     expect(archive).toHaveBeenCalledTimes(1);
+    const fork = headerRow("fork");
+    expect(press(FORK)).toBe(false);
+    expect(fork).toHaveBeenCalledTimes(1);
     const greyed = headerRow("pin", { available: false, reason: "A pin change is still saving." });
     expect(press(PIN)).toBe(true);
     expect(greyed).not.toHaveBeenCalled();

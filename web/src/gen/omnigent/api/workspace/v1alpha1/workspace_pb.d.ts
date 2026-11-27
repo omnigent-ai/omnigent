@@ -1903,8 +1903,9 @@ export declare type ListLabelsRequest = Message<"omnigent.api.workspace.v1alpha1
   prUrl: string;
 
   /**
-   * Labels whose name matches; unset lists the repository's labels.
-   * Not supported yet: setting this field returns INVALID_ARGUMENT.
+   * Labels whose name or description matches, best match first, at most 50;
+   * unset lists the repository's labels by name. Longer than 256 characters
+   * returns INVALID_ARGUMENT.
    *
    * @generated from field: string text = 2;
    */
@@ -3860,7 +3861,7 @@ export declare const ReadPullRequestImageResponseSchema: GenMessage<ReadPullRequ
  */
 export declare type PullRequestFailure = Message<"omnigent.api.workspace.v1alpha1.PullRequestFailure"> & {
   /**
-   * One of "comment_changed", "pull_request_changed" or "invalid_input".
+   * One of "comment_changed", "pull_request_changed", "invalid_input" or "read_only_code_host".
    *
    * @generated from field: string reason = 1;
    */

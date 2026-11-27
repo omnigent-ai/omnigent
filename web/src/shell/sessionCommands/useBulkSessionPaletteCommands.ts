@@ -14,8 +14,7 @@ import {
 } from "lucide-react";
 import { useMemo, useRef } from "react";
 
-import { isFeatureEnabled } from "@/lib/capabilities";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useQuickPickPaletteEnabled } from "@/shell/screenCommands/useQuickPickPaletteCommands";
 import {
   AVAILABLE,
   HIDDEN,
@@ -48,10 +47,6 @@ const OPENS_DIALOG = new Set<BulkSessionCommandId>(["archive", "delete"]);
 
 const NO_COMMANDS: PaletteCommand[] = [];
 
-function useQuickPickPalette(): boolean {
-  return isFeatureEnabled(useServerInfo(), "quick_pick_palette");
-}
-
 // Each selection Set gets its own key, so a row accepted after the selection changed
 // names a selection that no longer exists, and the palette does nothing.
 const selectionKeys = new WeakMap<ReadonlySet<string>, number>();
@@ -77,7 +72,7 @@ export interface BulkSessionActions {
 
 /** Offers the selection bar's actions in ⌘K while the bar is mounted. */
 export function useBulkSessionPaletteCommands(actions: BulkSessionActions): void {
-  const enabled = useQuickPickPalette();
+  const enabled = useQuickPickPaletteEnabled();
   const latest = useRef(actions);
   latest.current = actions;
   const { facts, selection, projects } = actions;
@@ -125,7 +120,7 @@ export interface SessionSelection {
 
 /** Offers Select all and Deselect all in ⌘K while the sidebar is selecting sessions. */
 export function useSessionSelectionPaletteCommands(selection: SessionSelection): void {
-  const enabled = useQuickPickPalette();
+  const enabled = useQuickPickPaletteEnabled();
   const latest = useRef(selection);
   latest.current = selection;
   const { selecting, selected } = selection;

@@ -195,6 +195,8 @@ import {
 import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
+import { MarkAllReadPaletteCommand } from "./markAllReadPaletteCommand";
+import { ResumeSandboxPaletteCommand } from "./resumeSandboxCommand";
 import { AppShellRootProviders } from "./AppShellRootProviders";
 import { replaceThemePicker } from "@/store/themePicker";
 import { replaceFeatureFlagsPicker } from "@/store/featureFlagsPicker";
@@ -3982,6 +3984,14 @@ function AppShellImpl() {
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
           />
+          {/* ⌘K's Mark all as read and Resume sandbox, with the label and action their own
+              surfaces use. */}
+          {isFeatureEnabled(serverInfo, "quick_pick_palette") && (
+            <>
+              <MarkAllReadPaletteCommand />
+              <ResumeSandboxPaletteCommand />
+            </>
+          )}
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </AppShellRootProviders>

@@ -14,7 +14,9 @@ describe("sidebarNavCommands", () => {
     );
     expect(all.map((command) => command.label)).toEqual(["Go to Canvas", "Go to Usage"]);
     all[0]!.run();
-    expect(navigate).toHaveBeenCalledWith("/canvas?c=main");
+    expect(navigate).toHaveBeenLastCalledWith("/canvas?c=main");
+    all[1]!.run();
+    expect(navigate).toHaveBeenLastCalledWith("/usage");
 
     expect(
       sidebarNavCommands(

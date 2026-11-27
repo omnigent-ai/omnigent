@@ -563,10 +563,14 @@ class PullRequestFacet(Protocol):
         """
         ...
 
-    def repo_labels(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+    def repo_labels(
+        self, root: str, reference: PullRequestRef, *, text: str = ""
+    ) -> dict[str, Any]:
         """Return the labels the PR's repository offers, as a ``list`` with ``has_more``.
 
         The orchestrator calls it only with ``label_editing``.
+
+        :param text: Words to match in a label's name or description; empty lists them all.
         """
         ...
 

@@ -57,6 +57,10 @@ _PULL_REQUEST_OWNER_METHODS = frozenset(
         "AddReaction",
         "RemoveReaction",
         "UploadAttachment",
+        "GetMergeQueue",
+        "EnqueuePullRequest",
+        "DequeuePullRequest",
+        "GetPullRequestStack",
     }
 )
 # The owner methods that change the pull request; a lost answer may hide a change.
@@ -65,6 +69,8 @@ _PULL_REQUEST_WRITES = _PULL_REQUEST_OWNER_METHODS - {
     "ListReviewerCandidates",
     "GetMergeOptions",
     "GetPendingReview",
+    "GetMergeQueue",
+    "GetPullRequestStack",
 }
 # Only the server's call frame carries these; a request message never does.
 _SERVER_ONLY_FIELDS = frozenset(
