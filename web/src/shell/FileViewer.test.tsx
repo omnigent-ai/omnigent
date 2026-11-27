@@ -612,6 +612,30 @@ describe("FileViewer mobile keyboard inset", () => {
     expect(within(toolbar).getAllByRole("button", { name: "Hide tree" })).toHaveLength(1);
   });
 
+  it("counts the trailing control's width before deciding the file's actions fit", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    installCollapsedToolbar();
+    // Room for the path's reserve and the actions, but not for a wide trailing control as well.
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(100);
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this.tagName === "DIV" && this.textContent === "Hide tree" ? 200 : 0;
+    });
+    renderViewer({ open: true, frameless: true, besideSidebar: true });
+    expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
+    cleanup();
+
+    renderViewer({
+      open: true,
+      frameless: true,
+      besideSidebar: true,
+      toolbarTrailing: <button type="button">Hide tree</button>,
+    });
+    expect(screen.getByRole("button", { name: "More actions" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide tree" })).toBeVisible();
+  });
+
   it("draws no trailing slot when none is given, as every classic viewer is", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     renderViewer({ open: true, frameless: true });
