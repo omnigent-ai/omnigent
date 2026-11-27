@@ -19,6 +19,12 @@ interface NestChoice {
   destination: Conversation | null;
 }
 
+/** A failed search shows its own status instead, so an empty list never reads as "no nests". */
+function emptyMessageFor(searchFailed: boolean, fetching: boolean): string | null {
+  if (searchFailed) return null;
+  return fetching ? "Searching…" : "No other nests yet.";
+}
+
 export function MoveToNestPicker({
   conversation,
   onPick,
@@ -92,11 +98,6 @@ export function MoveToNestPicker({
       Show more
     </Button>
   );
-  const emptyMessage = searchFailed
-    ? null
-    : searching && search.isFetching
-      ? "Searching…"
-      : "No other nests yet.";
   return (
     <QuickPickDialog<NestChoice>
       // Steps with Ctrl-N/Ctrl-P, like ⌘K.
@@ -107,7 +108,7 @@ export function MoveToNestPicker({
       }}
       label={conversation.family ? "Move session to another nest" : "Move session to a nest"}
       placeholder="Find a nest…"
-      emptyMessage={emptyMessage}
+      emptyMessage={emptyMessageFor(searchFailed, searching && search.isFetching)}
       status={status}
       listEnd={showMore}
       acceptLabel="Move"
