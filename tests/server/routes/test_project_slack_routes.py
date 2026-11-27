@@ -61,3 +61,35 @@ async def test_agents_cannot_change_the_link_and_only_the_lead_replies(
     ).status_code == 403
     sent = await client.post(base + "/replies", json=reply, headers=lead)
     assert sent.status_code == 201, sent.text
+
+
+async def test_only_the_owner_chooses_where_the_watcher_runs_and_calls_back(multi_user_client):
+    client = multi_user_client
+    project = await _project(client, ALICE, "zz-slack-owner (throwaway)")
+    path = f"/v1/projects/{project['id']}"
+    await client.post(f"{path}/shares", json={"user_id": BOB}, headers=_as_user(ALICE))
+    made = await client.patch(
+        path, json={"config": {"product_approvers": [BOB]}}, headers=_as_user(ALICE)
+    )
+    assert made.status_code == 200, made.text
+    ours = {"automation_url": "https://automation.example.com/api/2.0/agent"}
+    owner = await client.put(
+        f"{path}/slack",
+        json={**LINK, "destination": ours},
+        headers={**_as_user(ALICE), "X-Forwarded-Host": "factory.example.com"},
+    )
+    assert owner.status_code == 200, owner.text
+    saved = owner.json()["destination"]
+
+    elsewhere = {"automation_url": "https://other.example.com/api/2.0/agent"}
+    bob = {**_as_user(BOB), "X-Forwarded-Host": "attacker.example.com"}
+    refused = await client.put(
+        f"{path}/slack", json={**LINK, "destination": elsewhere}, headers=bob
+    )
+    assert refused.status_code == 403, refused.text
+    # An approver may still save other settings; the owner's URLs are kept.
+    kept = await client.put(
+        f"{path}/slack", json={**LINK, "destination": {"model": "m1"}}, headers=bob
+    )
+    assert kept.status_code == 200, kept.text
+    assert kept.json()["destination"] == {**saved, "model": "m1"}

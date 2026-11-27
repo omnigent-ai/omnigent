@@ -229,10 +229,25 @@ def create_project_slack_router(
         actor, project = await load_manager(request, project_id)
         team_id, channel_id = parse_channel(body)
         destination = clean_destination(body.destination)
-        # The watcher calls back on the address the link was saved from.
-        destination["relay_url"] = request_base_url(request)
-        active = provisioner(request)
         existing = await asyncio.to_thread(slack_store.get, project.id)
+        previous = existing.destination if existing is not None else {}
+        if actor == (project.user_id or actor):
+            # The watcher calls back on the address the owner saved the link from.
+            destination["relay_url"] = request_base_url(request)
+        else:
+            # The owner's login signs calls to the automation URL and the owner's
+            # watcher sends channel messages to the relay URL, so only they choose them.
+            requested = destination.get("automation_url", previous.get("automation_url"))
+            if requested != previous.get("automation_url"):
+                raise OmnigentError(
+                    "Only the project owner can set the automation API URL",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            for key in ("automation_url", "relay_url"):
+                destination.pop(key, None)
+                if previous.get(key):
+                    destination[key] = previous[key]
+        active = provisioner(request)
         if active is not None and existing is not None and existing.automation_id:
             moved_to = destination.get("automation_url") or active.config.api_url
             if moved_to.rstrip("/") != active.config.api_url_for(existing):

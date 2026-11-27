@@ -396,21 +396,18 @@ class SlackProvisioner:
         Retrying is safe: creation is keyed on the link's id, so a lost response
         can't leave two watchers.
         """
-        missing = [
-            name
-            for name, value in (
-                ("automation API URL", self.config.api_url_for(binding)),
-                ("relay URL", self.config.relay_url_for(binding)),
-            )
-            if not value
-        ]
-        if missing:
+        waiting = None
+        if not self.config.api_url_for(binding):
+            waiting = "The project owner needs to add the automation API URL in Slack settings"
+        elif not self.config.relay_url_for(binding):
+            waiting = "The project owner needs to save this link once to set where it calls back"
+        if waiting is not None:
             return await asyncio.to_thread(
                 self._store.set_state,
                 project.id,
                 "claimed",
                 actor_user_id=actor_user_id,
-                last_error=f"Add the {' and '.join(missing)} in Slack settings, then save",
+                last_error=waiting,
                 action="provision_waiting",
             )
         relay_key = secrets.token_urlsafe(32)
