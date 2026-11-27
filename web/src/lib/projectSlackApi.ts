@@ -27,7 +27,7 @@ export interface ProjectSlackLinkInput {
   slack_team_id?: string;
   channel_id?: string;
   channel_name?: string;
-  /** automation_url, org, repo, model, username; omitted ones use the defaults. */
+  /** automation_url, agent, model, mcp_services; omitted ones use the defaults. */
   destination?: Record<string, string>;
 }
 

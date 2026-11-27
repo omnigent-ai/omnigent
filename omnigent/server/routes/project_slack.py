@@ -37,7 +37,11 @@ _CLIENT_LINK = re.compile(r"^https://app\.slack\.com/client/([A-Z0-9]+)/([A-Z0-9
 _ARCHIVE_LINK = re.compile(
     r"^https://[a-z0-9-]+\.(?:enterprise\.)?slack\.com/archives/([A-Z0-9]+)/?(?:[?#].*)?$"
 )
-_DESTINATION_KEYS = ("org", "repo", "model", "username", "automation_url")
+_DESTINATION_KEYS = ("automation_url", "agent", "model", "mcp_services")
+# Settings earlier versions accepted; the managed API needs none of them.
+_RETIRED_DESTINATION_KEYS = frozenset({"org", "repo", "username"})
+# These run the owner's automation with the owner's login and connections.
+_OWNER_ONLY_KEYS = ("automation_url", "agent", "mcp_services", "relay_url")
 
 
 class SlackLinkBody(BaseModel):
@@ -57,10 +61,10 @@ class SlackLinkBody(BaseModel):
     channel_name: str | None = Field(default=None, max_length=128)
     destination: dict[str, str] | None = Field(
         default=None,
-        description="Where the watcher automation runs: automation_url (the automation "
-        "service's scheduled-task API, e.g. https://<workspace>/api/2.0/<service>), org, "
-        "repo, model, and the owner's username on the automation service. "
-        "Omit a setting to use the default.",
+        description="Where the watcher automation runs: automation_url (a managed Omnigent "
+        "API, e.g. https://<workspace>/api/2.0/omnigent), agent (a packaged agent's name or "
+        "an agent id), model, and mcp_services (comma-separated). Omit a setting to use the "
+        "app's default. Only the project owner may set automation_url, agent or mcp_services.",
     )
 
 
@@ -98,7 +102,7 @@ def clean_automation_url(value: str) -> str:
     :raises OmnigentError: ``INVALID_INPUT`` for anything but a plain HTTPS API URL.
     """
     parts = urlsplit(value.strip())
-    path = parts.path.rstrip("/").removesuffix("/scheduled-tasks")
+    path = parts.path.rstrip("/").removesuffix("/scheduled-tasks").removesuffix("/v1")
     if (
         parts.scheme != "https"
         or not parts.hostname
@@ -109,7 +113,7 @@ def clean_automation_url(value: str) -> str:
         or not path.startswith("/api/")
     ):
         raise OmnigentError(
-            "Give the automation service's API URL, like https://<workspace>/api/2.0/<service>, "
+            "Give the managed API's URL, like https://<workspace>/api/2.0/omnigent, "
             "not the Tasks page in the browser",
             code=ErrorCode.INVALID_INPUT,
         )
@@ -119,14 +123,16 @@ def clean_automation_url(value: str) -> str:
 def clean_destination(destination: dict[str, str] | None) -> dict[str, str]:
     cleaned: dict[str, str] = {}
     for key, value in (destination or {}).items():
+        if key in _RETIRED_DESTINATION_KEYS:
+            continue
         if key not in _DESTINATION_KEYS:
             raise OmnigentError(
-                f"Unknown destination setting {key!r}; use automation_url, org, repo, model "
-                "or username",
+                f"Unknown destination setting {key!r}; use automation_url, agent, model or "
+                "mcp_services",
                 code=ErrorCode.INVALID_INPUT,
             )
         value = str(value).strip()
-        if not value:
+        if not value and key != "mcp_services":
             continue
         if key == "automation_url":
             cleaned[key] = clean_automation_url(value[:512])
@@ -235,17 +241,17 @@ def create_project_slack_router(
             # The watcher calls back on the address the owner saved the link from.
             destination["relay_url"] = request_base_url(request)
         else:
-            # The owner's login signs calls to the automation URL and the owner's
-            # watcher sends channel messages to the relay URL, so only they choose them.
-            requested = destination.get("automation_url", previous.get("automation_url"))
-            if requested != previous.get("automation_url"):
-                raise OmnigentError(
-                    "Only the project owner can set the automation API URL",
-                    code=ErrorCode.FORBIDDEN,
-                )
-            for key in ("automation_url", "relay_url"):
+            # The watcher runs with the owner's login and connections and sends
+            # channel messages to the relay URL, so only the owner chooses these.
+            for key in _OWNER_ONLY_KEYS:
+                if key != "relay_url" and destination.get(key, previous.get(key)) != previous.get(
+                    key
+                ):
+                    raise OmnigentError(
+                        f"Only the project owner can set {key}", code=ErrorCode.FORBIDDEN
+                    )
                 destination.pop(key, None)
-                if previous.get(key):
+                if key in previous:
                     destination[key] = previous[key]
         active = provisioner(request)
         if active is not None and existing is not None and existing.automation_id:

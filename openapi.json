@@ -17729,7 +17729,7 @@
                 "type": "null"
               }
             ],
-            "description": "Where the watcher automation runs: automation_url (the automation service's scheduled-task API, e.g. https://<workspace>/api/2.0/<service>), org, repo, model, and the owner's username on the automation service. Omit a setting to use the default.",
+            "description": "Where the watcher automation runs: automation_url (a managed Omnigent API, e.g. https://<workspace>/api/2.0/omnigent), agent (a packaged agent's name or an agent id), model, and mcp_services (comma-separated). Omit a setting to use the app's default. Only the project owner may set automation_url, agent or mcp_services.",
             "title": "Destination"
           },
           "slack_team_id": {

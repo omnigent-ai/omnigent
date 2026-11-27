@@ -193,7 +193,7 @@ export function ProjectSlackSection({
             placeholder={
               savedAutomationUrl
                 ? `Automation API URL: ${savedAutomationUrl}`
-                : "Automation API URL, e.g. https://<workspace>/api/2.0/<service>"
+                : "Automation API URL, e.g. https://<workspace>/api/2.0/omnigent"
             }
             aria-label="Automation API URL"
             data-testid="project-slack-automation-url"
