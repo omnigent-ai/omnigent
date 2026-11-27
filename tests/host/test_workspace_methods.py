@@ -25,7 +25,7 @@ _PULL_REQUEST_READS = frozenset(
         "ListReviewThreadComments",
     }
 )
-# Reviewed by hand: each changes one pull request the session links, or reads what its
+# Reviewed by hand: each changes pull requests the session links, or reads what its
 # edit controls offer. Only the session's owner may call them. A new one is added here.
 _PULL_REQUEST_OWNER_METHODS = frozenset(
     {
@@ -42,6 +42,9 @@ _PULL_REQUEST_OWNER_METHODS = frozenset(
         "MergePullRequest",
         "MergePullRequestAsAccount",
         "DisableAutoMerge",
+        "EnableAutoMerge",
+        "SetPullRequestState",
+        "SetPullRequestDraft",
         "GetPendingReview",
         "StartPendingReview",
         "AddPendingReviewComment",
@@ -127,6 +130,8 @@ def test_the_review_changes_have_side_effects_and_the_pending_review_read_has_no
         "RemoveReaction",
     }
     assert not any(WORKSPACE_METHODS[name].no_side_effects for name in review_changes)
+    lifecycle_changes = {"SetPullRequestState", "SetPullRequestDraft", "EnableAutoMerge"}
+    assert not any(WORKSPACE_METHODS[name].no_side_effects for name in lifecycle_changes)
     assert WORKSPACE_METHODS["GetPendingReview"].no_side_effects
 
 
@@ -140,13 +145,21 @@ def test_a_served_method_without_a_pull_request_must_be_classified() -> None:
     """A method that names no PR would be scoped to no session; serving it fails the import."""
     template = WORKSPACE_METHODS["EditComment"]
     unnamed = WorkspaceMethod(
-        name="EnableAutoMerge",
-        python_name="enable_auto_merge",
+        name="ExampleUnscopedChange",
+        python_name="example_unscoped_change",
         request_type=template.request_type,
         response_type=template.response_type,
         streaming=False,
         pull_request=False,
     )
-    assert unclassified_methods({**WORKSPACE_METHODS, "EnableAutoMerge": unnamed}) == [
-        "EnableAutoMerge"
+    assert unclassified_methods({**WORKSPACE_METHODS, "ExampleUnscopedChange": unnamed}) == [
+        "ExampleUnscopedChange"
     ]
+
+
+def test_a_batch_naming_its_pull_requests_in_a_list_is_a_pull_request_change() -> None:
+    """The server vouches for each pull request a batch names, as for one in ``pr_url``."""
+    batch = WORKSPACE_METHODS["EnableAutoMerge"]
+    assert "pr_url" not in batch.request_type.DESCRIPTOR.fields_by_name
+    assert batch.pull_request
+    assert not batch.no_side_effects

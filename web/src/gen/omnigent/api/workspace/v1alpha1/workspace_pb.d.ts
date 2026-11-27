@@ -3270,6 +3270,8 @@ export declare const PullRequestAutoMergeSchema: GenMessage<PullRequestAutoMerge
  */
 export declare type EnableAutoMergeRequest = Message<"omnigent.api.workspace.v1alpha1.EnableAutoMergeRequest"> & {
   /**
+   * 1 to 20 pull requests the session links, each named once.
+   *
    * @generated from field: repeated omnigent.api.workspace.v1alpha1.PullRequestAutoMerge pull_requests = 1;
    */
   pullRequests: PullRequestAutoMerge[];
@@ -3286,7 +3288,9 @@ export declare const EnableAutoMergeRequestSchema: GenMessage<EnableAutoMergeReq
  */
 export declare type EnableAutoMergeResponse = Message<"omnigent.api.workspace.v1alpha1.EnableAutoMergeResponse"> & {
   /**
-   * Each pull request's result, in request order.
+   * Each pull request's result, in request order: `enabled_at`, or an `error` with its
+   * `reason`, and `unconfirmed: true` when GitHub may have turned auto-merge on. The
+   * results stop at the first pull request whose head moved; the rest weren't sent.
    *
    * @generated from field: google.protobuf.Struct payload = 1;
    */

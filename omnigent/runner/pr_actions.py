@@ -11,7 +11,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.runner import github_merge_queue, github_reviews, github_stack, pr_resource
+from omnigent.runner import (
+    github_lifecycle,
+    github_merge_queue,
+    github_reviews,
+    github_stack,
+    pr_resource,
+)
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
     COMMENT_REVIEW_EVENT,
@@ -25,6 +31,7 @@ from omnigent.runner.pull_request_errors import InvalidPullRequestInput
 from omnigent.runner.session_prs import PullRequestRef
 
 _UNSELECTED = "Select a pull request to change it"
+AUTO_MERGE_BATCH_LIMIT = 20
 
 
 def _target(session_id: str | None, pr_url: str | None) -> PullRequestRef:
@@ -375,3 +382,50 @@ def get_pull_request_stack(
 ) -> dict[str, Any]:
     """The stack around the pull request, found through its branches."""
     return github_stack.pull_request_stack(root, _target(session_id, pr_url))
+
+
+def set_pull_request_state(
+    root: str, *, session_id: str | None, pr_url: str | None, state: object
+) -> dict[str, Any]:
+    """Close or reopen the pull request."""
+    if state not in ("closed", "open"):
+        raise InvalidPullRequestInput("Expected state to be closed or open")
+    return github_lifecycle.set_state(root, _target(session_id, pr_url), state=str(state))
+
+
+def set_pull_request_draft(
+    root: str, *, session_id: str | None, pr_url: str | None, draft: object
+) -> dict[str, Any]:
+    """Make the pull request a draft, or mark it ready for review."""
+    if not isinstance(draft, bool):
+        raise InvalidPullRequestInput("Expected draft to be true or false")
+    return github_lifecycle.set_draft(root, _target(session_id, pr_url), draft=draft)
+
+
+def enable_auto_merge(
+    root: str, *, session_id: str | None, items: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Turn on auto-merge for each pull request, in one batch.
+
+    Every pull request is checked against the session before any is sent.
+    """
+    if not 1 <= len(items) <= AUTO_MERGE_BATCH_LIMIT:
+        raise InvalidPullRequestInput(
+            f"Enable auto-merge for 1 to {AUTO_MERGE_BATCH_LIMIT} pull requests at once"
+        )
+    batch: list[github_lifecycle.AutoMergeItem] = []
+    for item in items:
+        method = item.get("merge_method")
+        if method not in github_lifecycle.MERGE_METHODS:
+            raise InvalidPullRequestInput("Expected merge_method to be merge, squash, or rebase")
+        reference = _target(session_id, item.get("pr_url"))
+        if any(queued.reference.url == reference.url for queued in batch):
+            raise InvalidPullRequestInput("Name each pull request once")
+        batch.append(
+            github_lifecycle.AutoMergeItem(
+                reference=reference,
+                merge_method=str(method),
+                expected_head_oid=_commit(item.get("expected_head_oid"), "expected_head_oid"),
+            )
+        )
+    return github_lifecycle.enable_auto_merge(root, batch)

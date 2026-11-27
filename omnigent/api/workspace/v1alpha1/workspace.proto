@@ -1428,11 +1428,14 @@ message PullRequestAutoMerge {
 }
 
 message EnableAutoMergeRequest {
+  // 1 to 20 pull requests the session links, each named once.
   repeated PullRequestAutoMerge pull_requests = 1;
 }
 
 message EnableAutoMergeResponse {
-  // Each pull request's result, in request order.
+  // Each pull request's result, in request order: `enabled_at`, or an `error` with its
+  // `reason`, and `unconfirmed: true` when GitHub may have turned auto-merge on. The
+  // results stop at the first pull request whose head moved; the rest weren't sent.
   google.protobuf.Struct payload = 1;
 }
 

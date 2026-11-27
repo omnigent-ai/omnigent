@@ -737,10 +737,19 @@ async def test_an_unavailable_answer_after_the_frame_leaves_the_change_unconfirm
     assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _CHANGE_UNCONFIRMED)
 
 
-# The pull request changes; the review changes have their own cases below.
-_WRITES = sorted(_PULL_REQUEST_WRITES - set(host_tests._REVIEW_CALLS))
+# The lifecycle changes of one pull request, which answer as any pull request change does.
+_LIFECYCLE_WRITES = frozenset({"SetPullRequestState", "SetPullRequestDraft"})
+_REVIEW_WRITES = sorted(
+    set(host_tests._GITHUB_CHANGE_CALLS) - {"GetPendingReview"} - _LIFECYCLE_WRITES
+)
+# The pull request changes; the review changes and the auto-merge batch have their own cases.
+_WRITES = sorted(_PULL_REQUEST_WRITES - set(_REVIEW_WRITES) - {"EnableAutoMerge"})
 # A valid request for each of those changes.
-_WRITE_REQUESTS = {**host_tests._OWNER_CALLS, **host_tests._QUEUE_CALLS}
+_WRITE_REQUESTS = {
+    **host_tests._OWNER_CALLS,
+    **host_tests._QUEUE_CALLS,
+    **{method: host_tests._GITHUB_CHANGE_CALLS[method] for method in _LIFECYCLE_WRITES},
+}
 
 
 async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str) -> ConnectError:
@@ -763,7 +772,7 @@ async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str
 
 def test_every_write_has_a_request_case() -> None:
     assert set(_WRITES) <= set(_WRITE_REQUESTS)
-    assert len(_WRITES) == 13
+    assert len(_WRITES) == 15
 
 
 @pytest.mark.parametrize("method", _WRITES)
@@ -1073,9 +1082,9 @@ def _failure_reasons(error: ConnectError) -> list[str]:
 
 
 @pytest.fixture
-def review_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
-    """Each GitHub review, merge queue or stack call a method made on the host."""
-    return host_tests.record_review_calls(monkeypatch)
+def github_changes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
+    """Each GitHub review, lifecycle, merge queue or stack call a method made on the host."""
+    return host_tests.record_github_changes(monkeypatch)
 
 
 @pytest.mark.parametrize("method", sorted(host_tests._SELECTED_PR_CALLS))
@@ -1083,7 +1092,7 @@ async def test_a_github_call_to_a_linked_pr_runs_on_the_servers_word(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],
-    review_calls: list[tuple[str, str, str, dict[str, Any]]],
+    github_changes: list[tuple[str, str, str, dict[str, Any]]],
     method: str,
 ) -> None:
     request, function, _kwargs = host_tests._SELECTED_PR_CALLS[method]
@@ -1095,7 +1104,7 @@ async def test_a_github_call_to_a_linked_pr_runs_on_the_servers_word(
     assert [(call.session_id, call.vouch) for call in host_calls] == [
         (_SESSION, PullRequestVouch(server_tracked=True)),
     ]
-    assert [(call[0], call[2]) for call in review_calls] == [(function, _PR)]
+    assert [(call[0], call[2]) for call in github_changes] == [(function, _PR)]
 
 
 @pytest.mark.parametrize("method", sorted(host_tests._SELECTED_PR_CALLS))
@@ -1103,7 +1112,7 @@ async def test_a_github_call_to_an_unlinked_pr_is_refused_before_the_host(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],
-    review_calls: list[tuple[str, str, str, dict[str, Any]]],
+    github_changes: list[tuple[str, str, str, dict[str, Any]]],
     method: str,
 ) -> None:
     request, _function, _kwargs = host_tests._SELECTED_PR_CALLS[method]
@@ -1114,7 +1123,122 @@ async def test_a_github_call_to_an_unlinked_pr_is_refused_before_the_host(
 
     assert refused.value.code == Code.FAILED_PRECONDITION
     assert host_calls == []
-    assert review_calls == []
+    assert github_changes == []
+
+
+@pytest.fixture
+def auto_merges(monkeypatch: pytest.MonkeyPatch) -> list[list[tuple[str, str, str]]]:
+    """Each auto-merge batch the host sent: its pull requests, methods and heads."""
+    return host_tests.record_auto_merges(monkeypatch)
+
+
+async def test_auto_merge_of_linked_prs_runs_on_the_servers_word_for_each(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    auto_merges: list[list[tuple[str, str, str]]],
+) -> None:
+    store = _Store(_linked(_PR, _OTHER_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    response = await client.enable_auto_merge(host_tests._AUTO_MERGE)
+
+    assert payload_dict(response.payload) == {"object": "test"}
+    assert [(call.session_id, call.vouch) for call in host_calls] == [
+        (_SESSION, PullRequestVouch(server_tracked=True)),
+    ]
+    assert store.reads == 2
+    assert [[url for url, _method, _head in batch] for batch in auto_merges] == [[_PR, _OTHER_PR]]
+
+
+async def test_auto_merge_naming_an_unlinked_pr_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    auto_merges: list[list[tuple[str, str, str]]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.enable_auto_merge(host_tests._AUTO_MERGE)
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert host_calls == []
+    assert auto_merges == []
+
+
+async def test_auto_merge_before_the_server_stores_the_prs_leaves_each_to_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    auto_merges: list[list[tuple[str, str, str]]],
+) -> None:
+    """Without the server's word for every PR, the host checks each against its record."""
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR, _OTHER_PR, synced=False)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.enable_auto_merge(host_tests._AUTO_MERGE)
+
+    assert [call.vouch for call in host_calls] == [None]
+    assert (refused.value.code, refused.value.message) == (
+        Code.FAILED_PRECONDITION,
+        "This pull request is not associated with the session",
+    )
+    assert auto_merges == []
+
+
+@pytest.mark.parametrize(
+    "items, refusal",
+    [
+        ([], "Enable auto-merge for 1 to 20 pull requests at once"),
+        (
+            [pb.PullRequestAutoMerge(merge_method="squash", expected_head_oid=host_tests._HEAD)],
+            "Name each pull request to merge automatically",
+        ),
+    ],
+    ids=["none", "unnamed"],
+)
+async def test_an_auto_merge_batch_the_server_cant_vouch_for_is_refused_before_the_vouch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    items: list[pb.PullRequestAutoMerge],
+    refusal: str,
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    with pytest.raises(ConnectError) as refused:
+        await client.enable_auto_merge(pb.EnableAutoMergeRequest(pull_requests=items))
+
+    assert (refused.value.code, refused.value.message) == (Code.INVALID_ARGUMENT, refusal)
+    assert store.reads == 0
+    assert host_calls == []
+
+
+_AUTO_MERGE_UNCONFIRMED = (
+    "Could not confirm which pull requests will merge automatically. Check GitHub before retrying."
+)
+
+
+async def test_an_auto_merge_batch_waits_longer_and_its_lost_answer_is_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch reads and changes up to 20 pull requests, past a single change's 20 s."""
+    assert workspace_api._reply_timeout("EnableAutoMerge", changes=True) == 120.0
+    assert workspace_api._reply_timeout("SetPullRequestState", changes=True) == 20.0
+    monkeypatch.setattr(workspace_api, "_WRITE_REPLY_TIMEOUT_S", 60.0)
+    monkeypatch.setattr(workspace_api, "_AUTO_MERGE_REPLY_TIMEOUT_S", 0.05)
+    tunnel = _tunnel(tmp_path)
+
+    with pytest.raises(ConnectError) as lost:
+        await tunnel.call("EnableAutoMerge", host_tests._AUTO_MERGE)
+
+    assert (lost.value.code, lost.value.message) == (
+        Code.DEADLINE_EXCEEDED,
+        _AUTO_MERGE_UNCONFIRMED,
+    )
+    assert len(tunnel.sent) == 1
 
 
 async def test_a_malformed_review_change_is_refused_before_the_vouch_as_invalid_input(
@@ -1147,7 +1271,7 @@ async def test_a_hosts_refusal_reason_reaches_the_client(
     client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
 
     with pytest.raises(ConnectError) as refused:
-        await client.edit_comment(host_tests._REVIEW_CALLS["EditComment"][0])
+        await client.edit_comment(host_tests._GITHUB_CHANGE_CALLS["EditComment"][0])
 
     assert refused.value.code == Code.FAILED_PRECONDITION
     assert _failure_reasons(refused.value) == ["comment_changed"]
@@ -1172,7 +1296,7 @@ async def test_only_an_allowed_reason_from_the_host_is_attached(
 ) -> None:
     """A host can't push its own text into the structured field a client acts on."""
     tunnel = _tunnel(tmp_path)
-    request = host_tests._REVIEW_CALLS["EditComment"][0]
+    request = host_tests._GITHUB_CHANGE_CALLS["EditComment"][0]
     call = asyncio.create_task(tunnel.call("EditComment", request))
     await tunnel.frame_sent()
     deliver_workspace_reply(
@@ -1205,7 +1329,6 @@ def test_a_pull_request_failure_carries_only_its_reason() -> None:
 
 
 _REVIEW_UNCONFIRMED = "Could not confirm the review change. Check GitHub before retrying."
-_REVIEW_WRITES = sorted(set(host_tests._REVIEW_CALLS) - {"GetPendingReview"})
 
 
 @pytest.mark.parametrize("method", _REVIEW_WRITES)
@@ -1213,7 +1336,7 @@ async def test_a_review_change_whose_host_drops_after_the_frame_is_unconfirmed(
     tmp_path: Path, method: str
 ) -> None:
     tunnel = _tunnel(tmp_path)
-    request = host_tests._REVIEW_CALLS[method][0]
+    request = host_tests._GITHUB_CHANGE_CALLS[method][0]
     call = asyncio.create_task(tunnel.call(method, request))
     await tunnel.frame_sent()
     tunnel.registry.deregister("host_ws", conn=tunnel.host)
@@ -1230,7 +1353,9 @@ async def test_a_host_failure_after_a_review_change_was_sent_is_unconfirmed(
 ) -> None:
     """A host error shaping GitHub's answer may follow a change GitHub made."""
     tunnel = _tunnel(tmp_path)
-    error = await _end_after_frame(tunnel, method, host_tests._REVIEW_CALLS[method][0], "internal")
+    error = await _end_after_frame(
+        tunnel, method, host_tests._GITHUB_CHANGE_CALLS[method][0], "internal"
+    )
 
     assert (error.code, error.message) == (Code.UNKNOWN, _REVIEW_UNCONFIRMED)
 
@@ -1238,7 +1363,10 @@ async def test_a_host_failure_after_a_review_change_was_sent_is_unconfirmed(
 async def test_a_host_failure_on_the_pending_review_read_stays_internal(tmp_path: Path) -> None:
     tunnel = _tunnel(tmp_path)
     error = await _end_after_frame(
-        tunnel, "GetPendingReview", host_tests._REVIEW_CALLS["GetPendingReview"][0], "internal"
+        tunnel,
+        "GetPendingReview",
+        host_tests._GITHUB_CHANGE_CALLS["GetPendingReview"][0],
+        "internal",
     )
 
     assert (error.code, error.message) == (Code.INTERNAL, "Workspace call failed")
@@ -1252,7 +1380,7 @@ async def test_a_review_change_whose_answer_times_out_is_unconfirmed(
 
     with pytest.raises(ConnectError) as lost:
         await tunnel.call(
-            "SubmitPendingReview", host_tests._REVIEW_CALLS["SubmitPendingReview"][0]
+            "SubmitPendingReview", host_tests._GITHUB_CHANGE_CALLS["SubmitPendingReview"][0]
         )
 
     assert (lost.value.code, lost.value.message) == (Code.DEADLINE_EXCEEDED, _REVIEW_UNCONFIRMED)
@@ -1263,7 +1391,7 @@ async def test_the_pending_review_read_cut_off_by_the_host_stays_safe_to_retry(
 ) -> None:
     tunnel = _tunnel(tmp_path)
     call = asyncio.create_task(
-        tunnel.call("GetPendingReview", host_tests._REVIEW_CALLS["GetPendingReview"][0])
+        tunnel.call("GetPendingReview", host_tests._GITHUB_CHANGE_CALLS["GetPendingReview"][0])
     )
     await tunnel.frame_sent()
     tunnel.registry.deregister("host_ws", conn=tunnel.host)
@@ -1423,8 +1551,9 @@ async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
 _CODE_HOST_CHANGES = sorted(_PULL_REQUEST_WRITES - {"SetPullRequestAccount"})
 _CHANGE_REQUESTS = {
     **host_tests._OWNER_CALLS,
-    **host_tests._REVIEW_CALLS,
+    **host_tests._GITHUB_CHANGE_CALLS,
     **host_tests._QUEUE_CALLS,
+    "EnableAutoMerge": (host_tests._AUTO_MERGE, "enable_auto_merge", {}),
 }
 _READ_ONLY_GITHUB = ("github.com",)
 
@@ -1502,6 +1631,34 @@ async def test_a_change_to_a_pr_on_a_read_only_host_is_refused_before_the_host(
     tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=_READ_ONLY_GITHUB)
 
     await _refused_before_the_host(tunnel, method, _CHANGE_REQUESTS[method][0])
+
+
+async def test_an_auto_merge_batch_naming_a_read_only_hosts_pr_is_refused_before_the_host(
+    tmp_path: Path,
+) -> None:
+    """The session's first pull request is writable; a later one in the batch isn't."""
+    batch = pb.EnableAutoMergeRequest(
+        pull_requests=[
+            pb.PullRequestAutoMerge(pr_url=_PR, merge_method="squash", expected_head_oid="a" * 40),
+            pb.PullRequestAutoMerge(
+                pr_url="https://git.example.com/example-org/example-repo/pull/9",
+                merge_method="squash",
+                expected_head_oid="b" * 40,
+            ),
+        ]
+    )
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=("git.example.com",))
+
+    await _refused_before_the_host(tunnel, "EnableAutoMerge", batch)
+
+
+async def test_an_auto_merge_batch_on_writable_hosts_reaches_the_host(tmp_path: Path) -> None:
+    """A batch names no single pull request, so each one it names is checked instead."""
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=("git.example.com",))
+
+    await _end_after_frame(tunnel, "EnableAutoMerge", host_tests._AUTO_MERGE, "internal")
+
+    assert [frame.method for frame in tunnel.sent] == ["EnableAutoMerge"]
 
 
 @pytest.mark.parametrize(

@@ -153,6 +153,23 @@ def _named(action: Callable[..., dict[str, Any]], *fields: str) -> PullRequestOp
     return run
 
 
+def _enable_auto_merge(
+    reader: WorkspaceReader, call: PullRequestCall, request: pb.EnableAutoMergeRequest
+) -> dict[str, Any]:
+    return pr_actions.enable_auto_merge(
+        _root(reader),
+        session_id=call.session_id,
+        items=[
+            {
+                "pr_url": item.pr_url,
+                "merge_method": item.merge_method,
+                "expected_head_oid": item.expected_head_oid,
+            }
+            for item in request.pull_requests
+        ],
+    )
+
+
 # The session owner's review and comment changes, and the pending review they work on.
 _REVIEW_OPS: dict[str, PullRequestOp] = {
     "GetPendingReview": _named(pr_actions.get_pending_review),
@@ -294,6 +311,9 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "DisableAutoMerge": lambda reader, call, request: pr_resource.disable_pr_auto_merge(
         _root(reader), session_id=call.session_id, pr_url=_url(request)
     ),
+    "SetPullRequestState": _named(pr_actions.set_pull_request_state, "state"),
+    "SetPullRequestDraft": _named(pr_actions.set_pull_request_draft, "draft"),
+    "EnableAutoMerge": _enable_auto_merge,
     **_REVIEW_OPS,
     **_MERGE_QUEUE_OPS,
     # The stack read lists the repository's other pull requests as the host's account.
