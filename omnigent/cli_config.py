@@ -1595,6 +1595,76 @@ def _manage_harness_providers(family: str) -> None:
             status = _manage_credential(row.provider, family)
 
 
+_GENIE_PROVIDER_NAME = "genie-databricks"
+
+
+def _genie_bound_provider(config: collections.abc.Mapping[str, Any]) -> str | None:  # type: ignore[explicit-any]
+    """Return the provider name bound to Genie under ``inference.harnesses``, if any."""
+    inference = config.get("inference")
+    harnesses = inference.get("harnesses") if isinstance(inference, dict) else None
+    binding = harnesses.get("genie") if isinstance(harnesses, dict) else None
+    provider = binding.get("provider") if isinstance(binding, dict) else None
+    return provider if isinstance(provider, str) else None
+
+
+def _manage_genie_harness() -> None:
+    """Install Genie if needed, then sign it in to one Databricks workspace.
+
+    Genie authenticates with the workspace's Databricks CLI login, as it does on its
+    own, so this runs only ``databricks auth login`` (no gateway setup step) and binds
+    the saved provider to Genie alone, leaving the Codex provider untouched.
+
+    :returns: None. Side effect: writes ``~/.omnigent/config.yaml`` and, through the
+        Databricks CLI, ``~/.databrickscfg``.
+    """
+    from omnigent.onboarding.configure_models import build_databricks_provider_entry
+    from omnigent.onboarding.databricks_config import normalize_workspace_url
+    from omnigent.onboarding.harness_install import GENIE_KEY, harness_cli_installed
+    from omnigent.onboarding.interactive import clear_screen, console, prompt_text, select
+    from omnigent.onboarding.provider_config import provider_entry_settings
+    from omnigent.onboarding.setup import login_databricks_workspace
+
+    if not harness_cli_installed(GENIE_KEY) and not _prompt_install_harness(GENIE_KEY):
+        return
+    config = _load_global_config()
+    current = _genie_bound_provider(config)
+    if current is not None:
+        choice = select(
+            f"Genie signs in through provider {current!r}",
+            ["Keep it", "Sign Genie in to a different workspace"],
+            clear_on_exit=True,
+        )
+        if choice != 1:
+            return
+    console.print(
+        "  [dim]Genie signs in to a Databricks workspace with your Databricks CLI login "
+        "and is billed as Genie Code there.[/dim]"
+    )
+    workspace_url = prompt_text("Databricks workspace URL for Genie").strip()
+    if not workspace_url:
+        return
+    if not workspace_url.startswith(("http://", "https://")):
+        workspace_url = f"https://{workspace_url}"
+    workspace_url = normalize_workspace_url(workspace_url)
+    profile = login_databricks_workspace(workspace_url, console=console)
+    clear_screen()
+    _save_global_config(
+        provider_entry_settings(
+            _GENIE_PROVIDER_NAME, build_databricks_provider_entry(profile), make_default=False
+        ),
+        deep_merge_keys=("providers",),
+    )
+    config = _load_global_config()
+    inference = config.get("inference")
+    inference = dict(inference) if isinstance(inference, dict) else {}
+    harnesses = inference.get("harnesses")
+    harnesses = dict(harnesses) if isinstance(harnesses, dict) else {}
+    harnesses["genie"] = {"provider": _GENIE_PROVIDER_NAME}
+    inference["harnesses"] = harnesses
+    _save_global_config({"inference": inference})
+    console.print(f"  [green]✓ Genie signs in to {workspace_url} (profile `{profile}`)[/green]")
+
+
 def _prompt_install_cursor() -> str | None:
     """Offer to install the missing ``cursor`` extra; return a status line.
 
@@ -3924,15 +3994,18 @@ def _run_configure_harnesses_interactive() -> None:
                 )
             )
         else:
+            genie_bound = _genie_bound_provider(config)
             genie_default = surface_default_provider(config, OPENAI_FAMILY)
-            if genie_default is None:
+            if genie_bound is not None:
+                rows.append((_GENIE, "Genie", f"Signs in via {genie_bound}", "ready", ""))
+            elif genie_default is None:
                 rows.append(
                     (
                         _GENIE,
                         "Genie",
                         "Not configured",
                         "warn",
-                        "Open to add a Databricks/OpenAI credential (shared with Codex).",
+                        "Open to sign Genie in to a Databricks workspace.",
                     )
                 )
             else:
@@ -4414,8 +4487,7 @@ def _run_configure_harnesses_interactive() -> None:
         elif isinstance(selected_target, str) and selected_target in families:
             _manage_harness_providers(selected_target)
         elif selected_target == _GENIE:
-            # Genie shares the OpenAI-family provider with Codex — manage it there.
-            _manage_harness_providers(OPENAI_FAMILY)
+            _manage_genie_harness()
         elif selected_target == _ANTIGRAVITY:
             _manage_antigravity_harness()
         elif selected_target == _QWEN:

@@ -84,6 +84,7 @@ _ENV_AGENT_NAME = "HARNESS_GENIE_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_GENIE_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_GENIE_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_GENIE_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+_ENV_WORKSPACE_ID = "HARNESS_GENIE_WORKSPACE_ID"
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -200,6 +201,7 @@ def _build_genie_executor() -> Executor:
         if (raw_skills_dir := os.environ.get(_ENV_SKILLS_DIR))
         else None,
         signer_launch_config=signer_launch_config,
+        workspace_id=None if brokered else os.environ.get(_ENV_WORKSPACE_ID) or None,
     )
 
 

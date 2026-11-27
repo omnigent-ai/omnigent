@@ -63,6 +63,16 @@ def test_native_and_sdk_bindings_do_not_share_provider_defaults() -> None:
     assert binding_for_harness(config, "claude-native") is None
 
 
+def test_genie_binding_does_not_share_codex_provider() -> None:
+    config = _config(genie={"provider": "unity"}, codex={"provider": "bifrost"})
+    genie = binding_for_harness(config, "genie")
+    assert genie is not None
+    assert genie.provider == "unity"
+    codex = binding_for_harness(config, "codex")
+    assert codex is not None
+    assert codex.provider == "bifrost"
+
+
 def test_native_alias_resolves_without_collapsing_to_sdk() -> None:
     config = _config(**{"native-codex": {"provider": "unity"}})
     assert binding_for_harness(config, "codex-native") == binding_for_harness(

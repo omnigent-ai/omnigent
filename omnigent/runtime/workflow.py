@@ -1600,6 +1600,25 @@ def _build_codex_spawn_env(
     return env
 
 
+def _databricks_profile_workspace_id(profile: str | None) -> str | None:
+    """Return the ``workspace_id`` of *profile* in the Databricks config file, if set.
+
+    Shared hosts route AI Gateway calls by the ``x-databricks-workspace-id`` header.
+    """
+    import configparser
+
+    from omnigent.inner.databricks_executor import _databrickscfg_path
+
+    cfg_path = _databrickscfg_path()
+    if not profile or not cfg_path.exists():
+        return None
+    config = configparser.ConfigParser()
+    config.read(cfg_path)
+    if profile not in config:
+        return None
+    return config[profile].get("workspace_id") or None
+
+
 def _build_genie_spawn_env(
     spec: AgentSpec,
     *,
@@ -1637,9 +1656,13 @@ def _build_genie_spawn_env(
             code=ErrorCode.INVALID_INPUT,
         )
     if provider.kind == DATABRICKS_KIND:
-        _configure_brokered_codex_with_ucode(env, spec, provider, harness_type="genie")
-    else:
-        configure_agent_harness_with_provider(env, provider, harness_type="genie")
+        # Genie signs in with the profile's Databricks CLI login, as it does standalone,
+        # and its workspace route serves only Genie's model aliases.
+        env["HARNESS_GENIE_MODEL"] = "genie-code-cli-primary"
+        workspace_id = _databricks_profile_workspace_id(provider.profile)
+        if workspace_id:
+            env["HARNESS_GENIE_WORKSPACE_ID"] = workspace_id
+    configure_agent_harness_with_provider(env, provider, harness_type="genie")
     env["HARNESS_GENIE_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
     if spec.name:
         env["HARNESS_GENIE_AGENT_NAME"] = spec.name
