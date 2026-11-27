@@ -13,6 +13,7 @@ import {
   resetGadgetRailRequests,
   setFullScreenGadget,
   useGadgetRailRequest,
+  gadgetCoversConversation,
 } from "@/lib/gadgetRailTabs";
 import {
   type Gadget,
@@ -871,6 +872,9 @@ describe("the gadget beside New session", () => {
       );
       act(() => navigate!("/c/conv_9", true));
       expect(within(panel).getByText("shows Board")).toBe(gadget);
+      // On the session's own page before it links the gadget: neither the URL nor the full
+      // screen state names it, yet its replies are hidden, so they stay unread.
+      expect(gadgetCoversConversation(useGadgetRailRequest.getState(), "conv_9", null)).toBe(true);
 
       // The session shows the gadget full screen, but its frame isn't connected yet.
       act(() => setFullScreenGadget("1"));
@@ -881,6 +885,7 @@ describe("the gadget beside New session", () => {
 
       act(() => noteGadgetFrameConnected("1"));
       await waitFor(() => expect(screen.queryByTestId("gadget-new-session-panel")).toBeNull());
+      expect(useGadgetRailRequest.getState().handoffCover).toBeNull();
       // The session's full screen keeps the sidebar as it is.
       expect(onSidebarOpenChange).not.toHaveBeenCalledWith(true);
     });

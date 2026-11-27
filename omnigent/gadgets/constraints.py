@@ -119,6 +119,26 @@ class _Absent:
 _ABSENT: Any = _Absent()
 
 
+def _json_key(value: Any) -> Any:
+    """*value* with equal JSON numbers spelled alike: ``1`` and ``1.0`` and ``-0.0`` and
+    ``0`` are one number to JSON, so to rules. Booleans stay booleans."""
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return int(number) if number.is_integer() else number
+    if isinstance(value, list):
+        return [_json_key(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_key(item) for key, item in value.items()}
+    return value
+
+
+def _json_equal(left: Any, right: Any) -> bool:
+    """Whether two JSON values are equal as JSON: numbers by value, never a boolean as one."""
+    return _canonical(_json_key(left)) == _canonical(_json_key(right))
+
+
 def _epoch_name(number: int) -> str:
     return f"e{number:06d}"
 
@@ -145,8 +165,9 @@ GUARD_LIMITS: StoreLimits = dataclasses.replace(
 REBUILD_PAGE = 200
 REBUILD_STEPS_PER_WRITE = 64
 # Bumped when the derived state gains something a rebuild must fill in (the reference index,
-# its generations, every holder of a repeated unique value).
-_STATE_FORMAT = 4
+# its generations, every holder of a repeated unique value), or its keys change spelling
+# (equal JSON numbers keyed alike).
+_STATE_FORMAT = 5
 # Entries per directory of a target's reference index.
 _INDEX_PER_SEGMENT = 1000
 _INDEX_APPEND_ATTEMPTS = 16
@@ -571,6 +592,16 @@ class ConstraintGuard:
                 operation: dict[str, Any] | None
                 operation, current = planned.get(key, (None, dependent.value))
                 if operation is None:
+                    if (
+                        self.data.revision_count(key[0], dependent.id)
+                        >= self.data.limits.max_revisions_per_record
+                    ):
+                        # Its update could never be written, and the change would wait on it
+                        # for good: refused before anything is written.
+                        raise CapacityExceeded(
+                            f"{key[0]} record {dependent.id} has no room for the update this "
+                            "change makes to it"
+                        )
                     operation = {
                         "collection": key[0],
                         "id": dependent.id,
@@ -768,7 +799,7 @@ class ConstraintGuard:
         if not rule["where"]:
             return True  # Every live record counts, whatever its value, null included.
         return isinstance(value, dict) and all(
-            key in value and value[key] == expected and type(value[key]) is type(expected)
+            key in value and _json_equal(value[key], expected)
             for key, expected in rule["where"].items()
         )
 
@@ -776,7 +807,7 @@ class ConstraintGuard:
     def _unique_key(rule: dict, value: Any) -> str | None:
         if not isinstance(value, dict) or any(value.get(name) is None for name in rule["fields"]):
             return None
-        return _digest([value[name] for name in rule["fields"]], 24)
+        return _digest([_json_key(value[name]) for name in rule["fields"]], 24)
 
     def _dependents(self, rule: dict, target_id: str, generation: int) -> list[Document]:
         """The live records whose *rule* field names *target_id*, read from the rule's index.

@@ -21,6 +21,7 @@ import {
   setFullScreenGadget,
   setGadgetNewSessionTabMaximized,
   useGadgetRailRequest,
+  noteGadgetHandoffCover,
 } from "@/lib/gadgetRailTabs";
 import { cn } from "@/lib/utils";
 import { MobilePanelDrawer, useMobilePanelHeaderTarget } from "@/shell/MobilePanelDrawer";
@@ -953,6 +954,12 @@ export function GadgetNewSessionPanel({
     );
     return () => clearTimeout(timer);
   }, [handoffGadgetId, handoffReady, handoffFailed]);
+  // While the cover hides the session, its new messages stay unread.
+  const coveredSessionId = covering ? (handoff?.sessionId ?? null) : null;
+  useEffect(() => {
+    noteGadgetHandoffCover(coveredSessionId);
+    return () => noteGadgetHandoffCover(null);
+  }, [coveredSessionId]);
   // The gadget over the session is only a picture of it: the session's own gadget takes clicks.
   const asideRef = useRef<HTMLElement | null>(null);
   useEffect(() => {

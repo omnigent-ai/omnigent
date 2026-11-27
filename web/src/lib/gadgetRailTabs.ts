@@ -45,6 +45,11 @@ interface GadgetRailState {
    * isn't linked there, or gadgets are off): the session shows instead.
    */
   fullScreenUnavailable: { conversationId: string; gadgetId: string } | null;
+  /**
+   * The session a full screen gadget still covers while the session it started takes over:
+   * after the move to the new session's page and before the session shows the gadget itself.
+   */
+  handoffCover: string | null;
 }
 
 /** A message gadget code wrote for a new session, and the gadget it came from. */
@@ -65,6 +70,7 @@ export const useGadgetRailRequest = create<GadgetRailState>(() => ({
   frameConnections: {},
   failedStarts: {},
   fullScreenUnavailable: null,
+  handoffCover: null,
 }));
 
 /**
@@ -210,9 +216,16 @@ export function gadgetCoversConversation(
   urlGadget: string | null,
 ): boolean {
   if (state.fullScreenGadgetId !== null) return true;
+  if (conversationId !== undefined && state.handoffCover === conversationId) return true;
   if (conversationId === undefined || urlGadget === null) return false;
   const unavailable = state.fullScreenUnavailable;
   return !(unavailable?.conversationId === conversationId && unavailable.gadgetId === urlGadget);
+}
+
+/** Notes the session a handoff's cover still hides (see `handoffCover`), or `null`. */
+export function noteGadgetHandoffCover(conversationId: string | null): void {
+  if (useGadgetRailRequest.getState().handoffCover === conversationId) return;
+  useGadgetRailRequest.setState({ handoffCover: conversationId });
 }
 
 export function clearGadgetRailRequest(): void {
@@ -232,5 +245,6 @@ export function resetGadgetRailRequests(): void {
     frameConnections: {},
     failedStarts: {},
     fullScreenUnavailable: null,
+    handoffCover: null,
   });
 }

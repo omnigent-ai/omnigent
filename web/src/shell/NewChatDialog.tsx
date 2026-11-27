@@ -3,6 +3,7 @@ import {
   updateNestedSessionDraft,
   removeNestedSessionDraft,
 } from "@/lib/nestedSessionDrafts";
+import { GADGET_START_PARAM } from "@/gadgets/host/gadgetPages";
 import { useSiblingSessionDestinations } from "@/hooks/useSharing";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
@@ -6343,8 +6344,10 @@ function NewChatLandingContent({
       const wasViewing = removeLocalConversation(localConv.tempConvId);
       // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
       if (wasViewing && stillOnTempRoute) {
+        // Back where the create started, keeping a gadget's New session (and full screen):
+        // a failed create is not the viewer leaving the gadget behind.
         navigate(
-          returnToCanvas || siblingSourceId
+          returnToCanvas || siblingSourceId || searchParams.has(GADGET_START_PARAM)
             ? { pathname: "/", search: `?${searchParams.toString()}` }
             : "/",
         );

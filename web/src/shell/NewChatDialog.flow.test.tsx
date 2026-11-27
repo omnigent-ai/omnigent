@@ -1428,6 +1428,35 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
+  it("returns a failed page create to the gadget's New session, gadget and full screen kept", async () => {
+    // Build opened New session for a gadget; the temporary create then fails. Going back
+    // to a plain New session would read as leaving the gadget and delete it.
+    const query = "gadget_start=0123456789abcdef0123456789abcdef&gadget_full=1";
+    searchParams = new URLSearchParams(query);
+    const previousUrl = window.location.href;
+    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+    });
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_gadget",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    removeLocalConversationMock.mockReturnValue(true);
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new Error("offline"));
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("Build the gadget");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
+      );
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
   it.each([
     { query: "canvas=proj_alpha&project=Alpha", sourceDeleted: false },
     { query: "sibling=source", sourceDeleted: false },

@@ -891,6 +891,44 @@ def test_a_reference_to_a_record_whose_value_is_null_follows_its_delete_rule(
         assert left["value"] == {"n": 1}
 
 
+_NUMBERED = {"type": "object", "properties": {"n": {}}}
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "same"),
+    [(1, 1.0, True), (0.0, -0.0, True), (0, -0.0, True), (1, True, False), (0, False, False)],
+)
+def test_rules_take_equal_json_numbers_as_one_value(
+    gadgets: Fixture, first, second, same: bool
+) -> None:
+    service = gadgets.service()
+    unique = {"name": "one_n", "kind": "unique", "collection": "items", "fields": ["n"]}
+    app = _publish_any_board(service, [unique], _NUMBERED)
+    _put(service, app, "items", "a", {"n": first}, "a")
+    if same:
+        with pytest.raises(ConstraintViolation):
+            _put(service, app, "items", "b", {"n": second}, "b")
+    else:
+        assert _put(service, app, "items", "b", {"n": second}, "b")["id"] == "b"
+
+
+def test_a_record_limit_filter_matches_equal_json_numbers(gadgets: Fixture) -> None:
+    service = gadgets.service()
+    limit = {
+        "name": "one",
+        "kind": "max_records",
+        "collection": "items",
+        "max": 1,
+        "where": {"n": 1},
+    }
+    app = _publish_any_board(service, [limit], _NUMBERED)
+    _put(service, app, "items", "a", {"n": 1}, "a")
+    with pytest.raises(ConstraintViolation):
+        _put(service, app, "items", "b", {"n": 1.0}, "b")
+    # A boolean is not the number one.
+    assert _put(service, app, "items", "c", {"n": True}, "c")["id"] == "c"
+
+
 def test_an_unfiltered_record_limit_counts_every_value(gadgets: Fixture) -> None:
     service = gadgets.service()
     limit = {"name": "two", "kind": "max_records", "collection": "items", "max": 2}
@@ -1426,6 +1464,52 @@ def test_a_late_rule_update_leaves_a_dependent_created_again_alone(
     assert after is not None
     assert after["value"]["cardId"] == "x"
     assert after["value"]["state"] == "done-17"
+
+
+@pytest.mark.parametrize("on_delete", ["unset", "cascade"])
+def test_deleting_a_record_whose_dependent_is_full_is_refused_before_anything_changes(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch, on_delete: str
+) -> None:
+    # The run naming the card has used every revision it may have: its rule update could
+    # never land, so the delete is refused up front instead of waiting on it for good.
+    limits = service_module._DATA_STORE_LIMITS
+    monkeypatch.setattr(
+        service_module,
+        "_DATA_STORE_LIMITS",
+        StoreLimits(**{**vars(limits), "max_revisions_per_record": 6, "revisions_per_segment": 3}),
+    )
+    service = gadgets.service()
+    app = publish_ruled_board(service, [{**_UNSET_RUN_CARD, "on_delete": on_delete}])
+    target = card(service, app, "x", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="d",
+        value={"cardId": "x", "state": "s0"},
+        operation_id="d",
+    )
+    for edit in range(5):
+        current = _run(service, app, "d")
+        rpc(
+            service,
+            app,
+            "replace",
+            collection="runs",
+            id="d",
+            value={"cardId": "x", "state": f"s{edit + 1}"},
+            if_version=current["version"],
+            operation_id=f"d-{edit}",
+        )
+
+    with pytest.raises(CapacityExceeded):
+        rpc(service, app, "delete", id="x", if_version=target["version"], operation_id="x-del")
+
+    assert rpc(service, app, "get", id="x") is not None
+    assert _run(service, app, "d")["value"]["cardId"] == "x"
+    # Nothing is left pending: other ruled writes go on.
+    assert card(service, app, "y", "todo")["id"] == "y"
 
 
 def test_a_late_unset_checks_the_collection_its_deleted_record_was_in(

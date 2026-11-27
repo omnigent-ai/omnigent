@@ -166,8 +166,9 @@ def _holds_gadget_data(user: SqlUser, gadget_store: GadgetStore | None) -> bool:
     """Whether *user* has gadget data a remap would strand.
 
     Their own gadgets and shelf are in *gadget_store*, owned under their username's
-    registration. The shelf counts only while it holds something: unpinning and hiding
-    leave its documents behind, empty, and those strand nothing. Each check reads at most
+    registration. The shelf counts only while it pins or shows a gadget that still exists:
+    unpinning, hiding and deleting a gadget leave its documents and IDs behind, and those
+    strand nothing. Each check reads at most
     a few pages; more empty session documents than that count as holding data.
     """
     if gadget_store is None:
@@ -186,15 +187,31 @@ def _holds_gadget_data(user: SqlUser, gadget_store: GadgetStore | None) -> bool:
         limits=_STATE_STORE_LIMITS,
     )
     try:
+
+        def any_live(ids: list) -> bool:
+            # Pins and session lists keep the IDs of gadgets deleted since; only a gadget
+            # still there would be stranded.
+            wanted = [i for i in ids if isinstance(i, str)]
+            return bool(wanted) and bool(gadget_store.get_many(wanted))
+
         pins = shelf.get("pins", "all")
-        if pins is not None and pins.value.get("items"):
+        items = pins.value.get("items") if pins is not None else None
+        if isinstance(items, list) and any_live(
+            [item.get("id") for item in items if isinstance(item, dict)]
+        ):
             return True
         # Emptying a session's list removes its document, so a live one with gadgets is
         # data; empty ones left by older builds are passed over, a bounded number of pages.
         cursor = None
         for _ in range(_SHELF_PAGES_CHECKED):
             page = shelf.list("sessions", limit=_SHELF_SESSIONS_PER_PAGE, cursor=cursor)
-            if any(document.value.get("gadgets") for document in page.items):
+            shown = [
+                gadget_id
+                for document in page.items
+                if isinstance(document.value.get("gadgets"), list)
+                for gadget_id in document.value["gadgets"]
+            ]
+            if any_live(shown):
                 return True
             cursor = page.next_cursor
             if cursor is None:

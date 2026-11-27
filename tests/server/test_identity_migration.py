@@ -154,6 +154,34 @@ def test_remap_refuses_a_user_with_gadgets_and_leaves_them_reachable(
     ]
 
 
+@pytest.mark.parametrize("left", ["pinned", "shown_beside_a_session"])
+def test_remap_goes_ahead_once_a_user_deleted_a_gadget_still_on_their_shelf(
+    db_uri: str, tmp_path, left: str
+) -> None:
+    """Deleting the gadget is enough: the shelf keeping its ID strands nothing."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", hash_password("password123"))
+    alice = _gadget_service(db_uri, store, "alice")
+    board = alice.create("Synthetic board")
+    if left == "pinned":
+        alice.pin(board["id"], {"pinned": True})
+    else:
+        alice.link_session(board["id"], "a" * 32, {"linked": True})
+    alice.delete(board["id"])
+
+    report = remap_identities(
+        get_or_create_engine(db_uri),
+        {"alice": "alice@example.com"},
+        dry_run=False,
+        gadget_store=store,
+    )
+
+    assert report.refused_gadgets == []
+
+
 def test_remap_goes_ahead_once_a_user_deleted_their_gadgets_and_cleared_the_shelf(
     db_uri: str, tmp_path
 ) -> None:
