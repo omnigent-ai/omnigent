@@ -58,6 +58,12 @@ describe("remarkGitHubEmoji", () => {
     expect(leaves("Text\n\n    :tada: indented\n")).toContainEqual(["code", ":tada: indented"]);
   });
 
+  it("leaves the text in inline HTML code as typed, and turns the text around it", () => {
+    expect(text("<code>:tada:</code> then <kbd>:+1:</kbd> :tada:")).toBe(
+      "<code>:tada:</code> then <kbd>:+1:</kbd> 🎉",
+    );
+  });
+
   it("renders link text, but never a bare URL or address GitHub linked by itself", () => {
     expect(text("[ship :rocket:](https://example.com/:rocket:)")).toBe("ship 🚀");
     expect(leaves("See https://example.com/a/:tada:/b now")).toContainEqual([
@@ -115,12 +121,15 @@ describe("rehypeGitHubEmoji", () => {
   it("leaves code, keyboard input and autolinked URLs as typed", () => {
     expect(html("`:tada:` <kbd>:tada:</kbd> <pre>:tada:</pre>")).not.toContain("🎉");
     expect(html("See https://example.com/:tada:/b")).toContain("https://example.com/:tada:/b</a>");
+    expect(html("See https://example.com/é/:shipit:/b")).toContain(
+      ">https://example.com/é/:shipit:/b</a>",
+    );
     expect(html("[ship :rocket:](https://example.com/:rocket:)")).toContain(">ship 🚀</a>");
   });
 
-  it("draws GitHub's picture emoji from GitHub, labelled with their shortcode", () => {
+  it("draws GitHub's picture emoji as sized images from GitHub, with their shortcode as the text", () => {
     expect(html("ship :shipit:")).toBe(
-      `<p>ship <span class="github-emoji-image" role="img" aria-label=":shipit:" title=":shipit:" style="background-image: url(&#x22;${githubImageEmojiUrl("shipit")}&#x22;)"></span></p>`,
+      `<p>ship <img class="github-emoji-image" src="${githubImageEmojiUrl("shipit")}" alt=":shipit:" title=":shipit:" style="width: 1.25em; height: 1.25em; vertical-align: -0.2em"></p>`,
     );
   });
 });

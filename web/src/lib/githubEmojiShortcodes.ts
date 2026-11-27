@@ -88,7 +88,32 @@ function isAutolink(href: unknown, children: TreeNode[] | undefined): boolean {
   const [child, ...rest] = children ?? [];
   if (!child || rest.length > 0 || child.type !== "text" || typeof href !== "string") return false;
   const text = child.value ?? "";
-  return href === text || href === `mailto:${text}` || href === `http://${text}`;
+  // Rendering percent-encodes a URL's `href` but not its text, as for `https://example.com/é`.
+  const decoded = decodedUrl(href);
+  return [text, `mailto:${text}`, `http://${text}`].some(
+    (address) => href === address || decoded === address,
+  );
+}
+
+/** `href` with its percent escapes decoded, or null when they don't decode. */
+function decodedUrl(href: string): string | null {
+  try {
+    return decodeURI(href);
+  } catch {
+    return null;
+  }
+}
+
+/** HTML whose text GitHub shows as typed. */
+const VERBATIM_TAGS = new Set(["code", "pre", "kbd", "samp", "script", "style", "textarea"]);
+const HTML_TAG = /^<(\/?)([a-z][a-z0-9]*)\b[^>]*?(\/?)>$/i;
+
+/** How an inline HTML node such as `<code>` or `</code>` changes the verbatim depth. */
+function verbatimDepthChange(node: TreeNode): number {
+  if (node.type !== "html") return 0;
+  const tag = HTML_TAG.exec((node.value ?? "").trim());
+  if (!tag || !VERBATIM_TAGS.has(tag[2]!.toLowerCase()) || tag[3]) return 0;
+  return tag[1] ? -1 : 1;
 }
 
 /** The remark plugin, for plain-text excerpts: glyphs in place, picture emoji left as typed. */
@@ -101,25 +126,28 @@ export function remarkGitHubEmoji() {
       return;
     }
     if (node.type === "link" && isAutolink(node.url, node.children)) return;
-    for (const child of node.children ?? []) visit(child);
+    // Text between inline HTML such as `<code>` and `</code>` stays as typed.
+    let verbatimDepth = 0;
+    for (const child of node.children ?? []) {
+      verbatimDepth = Math.max(0, verbatimDepth + verbatimDepthChange(child));
+      if (verbatimDepth === 0) visit(child);
+    }
   };
   return (tree: TreeNode) => visit(tree);
 }
 
-/** HTML whose text GitHub shows as typed. */
-const VERBATIM_TAGS = new Set(["code", "pre", "kbd", "samp", "script", "style", "textarea"]);
-
+// An image sized like the text around it, which shows its shortcode if it can't load.
 function pictureEmoji(name: string): Element {
   const label = `:${name}:`;
   return {
     type: "element",
-    tagName: "span",
+    tagName: "img",
     properties: {
       className: ["github-emoji-image"],
-      role: "img",
-      ariaLabel: label,
+      src: githubImageEmojiUrl(name),
+      alt: label,
       title: label,
-      style: `background-image: url("${githubImageEmojiUrl(name)}")`,
+      style: "width: 1.25em; height: 1.25em; vertical-align: -0.2em",
     },
     children: [],
   };
