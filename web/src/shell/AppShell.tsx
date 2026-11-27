@@ -357,6 +357,37 @@ function sessionShareDisabledReason(
   return info !== "loading" && info.sharing_mode === "off" ? SHARING_OFF_REASON : undefined;
 }
 
+function sessionActionGates({
+  conversationId,
+  isKnownTopLevel,
+  isChildSession,
+  permissionLevel,
+  serverInfo,
+}: {
+  conversationId: string | undefined;
+  isKnownTopLevel: boolean;
+  isChildSession: boolean;
+  permissionLevel: number | null;
+  serverInfo: ReturnType<typeof useServerInfo>;
+}) {
+  const canShare =
+    !!conversationId &&
+    isKnownTopLevel &&
+    isOwnerLevel(permissionLevel) &&
+    !isSingleUserMode(serverInfo);
+  // Any viewer can fork, sub-agents included (that promotes a child to top level),
+  // once the session kind is known so the action doesn't flicker in.
+  const canFork =
+    !!conversationId &&
+    (isKnownTopLevel || isChildSession) &&
+    (permissionLevel === null || permissionLevel >= 1);
+  return {
+    canShare,
+    canFork,
+    shareDisabledReason: sessionShareDisabledReason(canShare, serverInfo),
+  };
+}
+
 function useHeaderConversation(
   conversationId: string | undefined,
   allConversations: Conversation[] | undefined,
@@ -462,16 +493,13 @@ function useHeaderConversation(
     permissionLevel,
   ]);
   const serverInfo = useServerInfo();
-  const canShare =
-    !!conversationId &&
-    isKnownTopLevel &&
-    isOwnerLevel(permissionLevel) &&
-    !isSingleUserMode(serverInfo);
-  const canFork =
-    !!conversationId &&
-    (isKnownTopLevel || isChildSession) &&
-    (permissionLevel === null || permissionLevel >= 1);
-  const shareDisabledReason = sessionShareDisabledReason(canShare, serverInfo);
+  const { canShare, canFork, shareDisabledReason } = sessionActionGates({
+    conversationId,
+    isKnownTopLevel,
+    isChildSession,
+    permissionLevel,
+    serverInfo,
+  });
   const hasAgentInfo =
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
   const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
@@ -1097,21 +1125,17 @@ function AppShellImpl() {
   const isKnownTopLevel = isKnownTopLevelConversation(conversationId, activeConv, activeSession);
   useToggleUnreadHotkey(activeConv);
   // File sharing and descendant fork actions remain scoped to the URL session.
-  const canShare =
-    !!conversationId &&
-    isKnownTopLevel &&
-    isOwnerLevel(permissionLevel) &&
-    !isSingleUserMode(serverInfo);
-  const shareDisabledReason = sessionShareDisabledReason(canShare, serverInfo);
-  // Any viewer can fork a shared session, sub-agents included — forking a
-  // child is how it gets promoted to a top-level session of its own. Gated on
-  // knowing which the session is (sidebar row or loaded snapshot) so the
-  // affordance doesn't flicker in before that resolves. Shared by the header
-  // menus and ForkDialogContext's per-message "Fork from here" action.
-  const canClone =
-    !!conversationId &&
-    (isKnownTopLevel || isChildSession) &&
-    (permissionLevel === null || permissionLevel >= 1);
+  const {
+    canShare,
+    canFork: canClone,
+    shareDisabledReason,
+  } = sessionActionGates({
+    conversationId,
+    isKnownTopLevel,
+    isChildSession,
+    permissionLevel,
+    serverInfo,
+  });
   const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
   // The live snapshot is authoritative; the sidebar row is only a fallback
   // (it is absent entirely for sub-agent children, which the list omits).
