@@ -204,7 +204,8 @@ describe("omnigent SDK runtime", () => {
         app: { id: "app-1", name: "Team board" },
         revisionId: "rev-1",
         viewer: { id: "1001", displayName: "viewer@example.com" },
-        permissions: { writeData: true, publish: false },
+        // Changing shared records includes one's own.
+        permissions: { writeData: true, writeOwnData: true, publish: false },
         preview: false,
       });
       expect(client.capabilities).toEqual(["data.read", "data.write"]);
@@ -912,6 +913,36 @@ describe("omnigent SDK permission guards", () => {
     expect(byId<HTMLButtonElement>("add").disabled).toBe(true);
     expect(added.disabled).toBe(true);
     expect(added.title).toBe(ACTION_REASON);
+  });
+
+  it("lets a read-only viewer keep their own records while shared writes stay blocked", async () => {
+    const { runtime, byId } = page(
+      '<button id="save" data-omnigent-requires="own-write">Save my progress</button>' +
+        '<button id="add" data-omnigent-requires="write">Add lesson</button>',
+    );
+    const { client } = await connected(runtime, {
+      ...CONTEXT,
+      permissions: { writeData: false, writeOwnData: true, publish: false },
+    });
+
+    expect(client.can("own-write")).toBe(true);
+    expect(client.can("write")).toBe(false);
+    expect(byId<HTMLButtonElement>("save").disabled).toBe(false);
+    expect(byId<HTMLButtonElement>("add").disabled).toBe(true);
+    expect(client.context.permissions.writeOwnData).toBe(true);
+  });
+
+  it("blocks own-write too for a viewer of a gadget without per-viewer collections", async () => {
+    const { runtime, byId } = page(
+      '<button id="save" data-omnigent-requires="own-write">Save</button>',
+    );
+    const { client } = await connected(runtime, {
+      ...CONTEXT,
+      permissions: { writeData: false, publish: false },
+    });
+
+    expect(client.can("own-write")).toBe(false);
+    expect(byId<HTMLButtonElement>("save").disabled).toBe(true);
   });
 
   it("blocks only what the viewer lacks", async () => {

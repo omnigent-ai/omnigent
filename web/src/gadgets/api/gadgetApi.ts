@@ -45,6 +45,8 @@ export interface GadgetContent {
    * (never a login or email). Older servers omit it.
    */
   viewer?: { id: string; display_name: string | null };
+  /** Collections where each viewer keeps their own records; older servers omit it. */
+  collection_scopes?: Record<string, "viewer">;
 }
 
 /** A rule across records that the server checks on every write (see `gadgets_constraints.py`). */
@@ -255,6 +257,15 @@ function parseContent(value: unknown): GadgetContent {
           },
         }
       : {}),
+    ...(isRecord(value.collection_scopes)
+      ? {
+          collection_scopes: Object.fromEntries(
+            Object.entries(value.collection_scopes)
+              .filter(([, scope]) => scope === "viewer")
+              .map(([name]) => [name, "viewer" as const]),
+          ),
+        }
+      : {}),
   };
 }
 
@@ -391,6 +402,22 @@ export async function createGadgetRevision(
   });
   if (!isRecord(body) || typeof body.id !== "string") {
     throw malformed("revision");
+  }
+  // A server from before per-viewer collections drops the scopes and keeps every collection
+  // shared; it answers without naming them, and such a revision must not be published.
+  const wanted = Object.entries(revision.collection_scopes ?? {}).filter(
+    ([, scope]) => scope === "viewer",
+  );
+  if (wanted.length > 0) {
+    const kept = isRecord(body.collection_scopes) ? body.collection_scopes : {};
+    const keptAll =
+      Object.keys(kept).length === wanted.length &&
+      wanted.every(([name]) => kept[name] === "viewer");
+    if (!keptAll) {
+      throw new Error(
+        "This server doesn’t support per-viewer collections, so this version keeps every collection shared.",
+      );
+    }
   }
   return { id: body.id };
 }

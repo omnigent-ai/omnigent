@@ -6,7 +6,7 @@ import pytest
 
 from omnigent.gadgets.constraints import ConstraintViolation
 from omnigent.gadgets.service import GadgetError, GadgetService
-from omnigent.stores.gadget_store import InvalidInput
+from omnigent.stores.gadget_store import InvalidInput, NotFound
 from tests.gadgets.conftest import READ, Fixture, person
 
 COLLECTIONS = {
@@ -176,3 +176,41 @@ def test_a_copy_never_takes_viewer_records(gadgets: Fixture) -> None:
     assert owner.describe(copied["id"])["collection_scopes"] == {"progress": "viewer"}
     assert listed(owner, app, "progress") == [("c1", {"state": "done"})]
     assert person(1) == copied["owner_id"]
+
+
+def test_a_viewers_first_viewer_record_marks_their_files(gadgets: Fixture) -> None:
+    from omnigent.gadgets.service import VIEWER_DATA_MARKER
+
+    owner = gadgets.service(1)
+    app = publish(owner)
+    files = gadgets.store.user_files(person(1))
+    with pytest.raises(NotFound):
+        files.read_json(VIEWER_DATA_MARKER)
+    call(owner, app, "create", "catalog", value={"title": "x"}, operation_id="o1")
+    with pytest.raises(NotFound):
+        files.read_json(VIEWER_DATA_MARKER)
+    call(owner, app, "create", "progress", value={}, operation_id="p1")
+    call(owner, app, "create", "progress", value={}, operation_id="p2")
+    assert files.read_json(VIEWER_DATA_MARKER) == {"viewer_data": True}
+
+
+@pytest.mark.parametrize("collection", [[], {}, ["progress"], {"name": "progress"}, 7, None])
+@pytest.mark.parametrize("method", ["create", "replace", "delete"])
+def test_a_malformed_collection_is_invalid_input(
+    gadgets: Fixture, method: str, collection: object
+) -> None:
+    owner = gadgets.service(1)
+    app = publish(owner)
+    with pytest.raises(InvalidInput):
+        owner.rpc(
+            app["id"],
+            app["published_revision"],
+            "data.v1." + method,
+            {
+                "collection": collection,
+                "value": {},
+                "id": "r1",
+                "if_version": "v",
+                "operation_id": "o",
+            },
+        )

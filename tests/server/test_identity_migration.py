@@ -849,16 +849,27 @@ def test_cli_rejects_malformed_map(db_uri: str, bad: str) -> None:
     assert result.exit_code != 0
 
 
-def test_remap_refuses_a_user_with_records_in_another_users_gadget(db_uri: str, tmp_path) -> None:
-    """Their viewer-collection records are in their own files, under the old name."""
-    from omnigent.stores.gadget_store.local import LocalGadgetStore
+def test_remap_refuses_a_user_with_records_in_another_users_gadget(
+    db_uri: str, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Their viewer-collection records are in their own files, under the old name; a marker
+    their first one wrote says so in one read, without listing every gadget they wrote in."""
+    from omnigent.gadgets.service import _mark_viewer_data
+    from omnigent.stores.gadget_store.local import LocalGadgetFiles, LocalGadgetStore
 
     store = LocalGadgetStore(str(tmp_path / "gadgets"))
     accounts = SqlAlchemyAccountStore(db_uri)
     accounts.create_user_with_password("alice", hash_password("password123"))
-    registration = SqlAlchemyPermissionStore(db_uri).account_registrations(["alice"])["alice"]
-    files = store.user_files("alice", owner_registration=registration)
-    files.mkdirs("viewer-data/0123456789abcdef0123456789abcdef")
+    registration = _gadget_service(db_uri, store, "alice").viewer.registration
+    _mark_viewer_data(store.user_files("alice", owner_registration=registration))
+    listed: list[str] = []
+    real = LocalGadgetFiles.list_page
+
+    def list_page(self, path, **kwargs):  # type: ignore[no-untyped-def]
+        listed.append(path)
+        return real(self, path, **kwargs)
+
+    monkeypatch.setattr(LocalGadgetFiles, "list_page", list_page)
 
     report = remap_identities(
         get_or_create_engine(db_uri),
@@ -868,3 +879,4 @@ def test_remap_refuses_a_user_with_records_in_another_users_gadget(db_uri: str, 
     )
 
     assert report.refused_gadgets == ["alice -> alice@example.com"]
+    assert not [path for path in listed if path.startswith("viewer-data")]

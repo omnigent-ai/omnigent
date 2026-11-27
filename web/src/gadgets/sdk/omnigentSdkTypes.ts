@@ -126,7 +126,11 @@ export interface OmnigentClientContext {
    * login or email.
    */
   viewer: { id: string; displayName: string | null };
-  permissions: { writeData: boolean; publish: boolean };
+  /**
+   * `writeData` changes shared records; `writeOwnData` changes the viewer's own records of
+   * per-viewer collections, which Can view is enough for. Older hosts omit `writeOwnData`.
+   */
+  permissions: { writeData: boolean; writeOwnData?: boolean; publish: boolean };
   /**
    * True in a template preview, where data lives in memory, nothing is saved and actions are off.
    * Show sample content and skip sign-in, saving and access notices there.
@@ -317,7 +321,7 @@ export interface OmnigentWatch {
  * their text stays selectable), sets `aria-disabled` and `data-omnigent-blocked`, shows the reason
  * as their tooltip, and keeps them that way even if the page re-enables them.
  */
-export type OmnigentRequirement = "write" | "action";
+export type OmnigentRequirement = "write" | "own-write" | "action";
 
 export interface OmnigentClient {
   readonly context: OmnigentClientContext;
