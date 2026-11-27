@@ -780,9 +780,11 @@ async def test_auto_forwarder_registry_isolates_sessions_and_evicts_completed() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("renewable_auth", [False, True], ids=["no-auth", "renewable-auth"])
 async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    renewable_auth: bool,
 ) -> None:
     """
     Re-running claude terminal auto-create leaves exactly one live forwarder.
@@ -802,24 +804,48 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setattr("omnigent.config.load_effective_config", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        claude_native_bridge, "ensure_claude_workspace_trusted", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr("omnigent.runner.native.orchestration.resolve_cli_binary", lambda _: None)
 
     session_id = "f3e241b72bac7d5e33d7a9819e0fa865"
     runs: list[_ForwarderRun] = []
+    auth_runs: list[_ForwarderRun] = []
+    auth_started = asyncio.Event()
+    auth_factory = (lambda: "fixture-bearer") if renewable_auth else None
 
-    async def _parking_forwarder(**kwargs: Any) -> None:
-        """Park forever like the real restart-forever supervisor."""
-        del kwargs
+    async def _park(records: list[_ForwarderRun]) -> None:
         run = _ForwarderRun(task=asyncio.current_task())
-        runs.append(run)
+        records.append(run)
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             run.cancelled = True
             raise
 
+    async def _parking_forwarder(**_kwargs: Any) -> None:
+        """Park forever like the real restart-forever supervisor."""
+        await _park(runs)
+
+    async def _refresh_hook_auth(**kwargs: Any) -> None:
+        assert kwargs["auth_token_factory"] is auth_factory
+        assert kwargs["server_url"] == "http://127.0.0.1:8000"
+        assert kwargs["bridge_dir"].is_dir()
+        auth_started.set()
+        await _park(auth_runs)
+
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _parking_forwarder,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._refresh_claude_permission_hook_auth",
+        _refresh_hook_auth,
     )
 
     class _FakeResourceRegistry(SessionResourceRegistry):
@@ -854,10 +880,14 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
             server_client=NullServerClient(),  # type: ignore[arg-type]
+            auth_token_factory=auth_factory,
         )
         # Let forwarder A start and park — in production the recovery
         # re-create fires long after the original create's task is running.
         await asyncio.sleep(0)
+        if renewable_auth:
+            await asyncio.wait_for(auth_started.wait(), timeout=1)
+            auth_started.clear()
 
         # The recovery path: terminal resource gone, ensure re-creates.
         await runner_app_mod._auto_create_claude_terminal(
@@ -865,8 +895,11 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
             server_client=NullServerClient(),  # type: ignore[arg-type]
+            auth_token_factory=auth_factory,
         )
         await asyncio.sleep(0)
+        if renewable_auth:
+            await asyncio.wait_for(auth_started.wait(), timeout=1)
 
         # Both creates spawned a forwarder; the recovery one is the survivor.
         assert len(runs) == 2, (
@@ -891,9 +924,15 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         assert registered is live_runs[0].task
         # Still running: a done survivor would leave the session unmirrored.
         assert not registered.done()
+        assert len(auth_runs) == (2 if renewable_auth else 0)
+        if renewable_auth:
+            assert auth_runs[0].cancelled
+            assert not auth_runs[1].cancelled
     finally:
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+        await _drain_forwarder_runs(auth_runs)
+    assert all(run.cancelled for run in auth_runs)
 
 
 @pytest.mark.parametrize(

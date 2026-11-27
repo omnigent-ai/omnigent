@@ -10738,6 +10738,18 @@ async def _auto_create_claude_terminal(
         from omnigent.harnesses.claude_native.forwarder import supervise_forwarder
 
         async def _supervise_bridge() -> None:
+            hook_auth_task = (
+                asyncio.create_task(
+                    _refresh_claude_permission_hook_auth(
+                        bridge_dir=bridge_dir,
+                        server_url=server_url,
+                        auth_token_factory=_auth_factory,
+                    ),
+                    name=f"claude-hook-auth-{session_id}",
+                )
+                if _auth_factory is not None
+                else None
+            )
             try:
                 await supervise_forwarder(
                     base_url=server_url,
@@ -10751,6 +10763,9 @@ async def _auto_create_claude_terminal(
                     event_dispatcher=event_dispatcher,
                 )
             finally:
+                if hook_auth_task is not None:
+                    hook_auth_task.cancel()
+                    await asyncio.gather(hook_auth_task, return_exceptions=True)
                 await _shutdown_session_router_async(session_id, _subagent_router)
                 await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
 
