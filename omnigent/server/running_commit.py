@@ -79,7 +79,7 @@ def _reset_for_tests() -> None:
         _ancestry.clear()
 
 
-def _is_ancestor(checkout: str, ancestor: str, descendant: str) -> bool | None:
+def is_ancestor(checkout: str, ancestor: str, descendant: str) -> bool | None:
     """Whether *ancestor* is in *descendant*'s history; None when git can't tell."""
     key = (checkout, ancestor, descendant)
     if key in _ancestry:
@@ -125,7 +125,7 @@ def _landing_tip(checkout: Path, branch: str) -> str | None:
     return tip
 
 
-def _ticket_sha(ticket: dict[str, Any]) -> str | None:
+def ticket_sha(ticket: dict[str, Any]) -> str | None:
     values = {
         label.get("key"): (label.get("value") or "").strip().lower()
         for label in ticket.get("labels") or []
@@ -139,7 +139,7 @@ def _ticket_sha(ticket: dict[str, Any]) -> str | None:
 
 def ship_status(config: dict[str, Any], ticket: dict[str, Any]) -> dict[str, str] | None:
     """``{state, sha, running_commit}`` for a ticket's landed commit, or None."""
-    sha = _ticket_sha(ticket)
+    sha = ticket_sha(ticket)
     running = running_commit()
     if sha is None or running is None:
         return None
@@ -147,12 +147,12 @@ def ship_status(config: dict[str, Any], ticket: dict[str, Any]) -> dict[str, str
     if target is None:
         return None
     checkout = str(target.checkout)
-    live = _is_ancestor(checkout, sha, running)
+    live = is_ancestor(checkout, sha, running)
     if live is None:
         return None
     if live:
         return {"state": "live", "sha": sha, "running_commit": running}
     tip = _landing_tip(target.checkout, target.branch)
-    if tip is None or not _is_ancestor(checkout, sha, tip):
+    if tip is None or not is_ancestor(checkout, sha, tip):
         return None
     return {"state": "waiting_restart", "sha": sha, "running_commit": running}

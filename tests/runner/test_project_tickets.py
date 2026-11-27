@@ -381,6 +381,8 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
         ),
         ("sys_project_kpis_get", {"window": "30d"}),
         ("sys_project_telemetry_get", {"window": "7d"}),
+        ("sys_project_deploy_status", {}),
+        ("sys_project_artifact_list", {"kind": "demo", "ticket_id": TICKET}),
     ],
 )
 async def test_read_only_tools_only_send_gets(name, args):
@@ -389,7 +391,9 @@ async def test_read_only_tools_only_send_gets(name, args):
         "sys_ticket_list",
         "sys_ticket_get",
         "sys_ticket_push_prefix",
+        "sys_project_deploy_status",
         "sys_project_identity_list",
+        "sys_project_artifact_list",
         "sys_project_file_view",
         "sys_project_kpis_get",
         "sys_project_telemetry_get",
@@ -411,7 +415,7 @@ async def test_read_only_tools_only_send_gets(name, args):
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 26
+    assert len(TICKET_TOOLS) == 28
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (

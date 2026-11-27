@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Form, Request, Response, UploadFile
 from pydantic import BaseModel, Field
@@ -89,6 +89,7 @@ def _describe(project_id: str, stored: StoredFile) -> dict[str, Any]:
         "kind": metadata.get("kind", "ticket_attachment"),
         "ticket_id": metadata.get("ticket_id"),
         "source_session_id": metadata.get("source_session_id"),
+        "demo": bool(metadata.get("demo")),
         "url": project_file_content_path(project_id, stored.id),
     }
 
@@ -128,6 +129,7 @@ def create_project_files_router(
         file: UploadFile,
         title: str | None = Form(default=None),
         ticket_id: str | None = Form(default=None),
+        demo: bool | None = Form(default=None),
     ) -> dict[str, Any]:
         project = await require_project(request, project_id)
         content = await file.read(MAX_PROJECT_FILE_BYTES + 1)
@@ -143,6 +145,9 @@ def create_project_files_router(
             metadata["title"] = title.strip()[:200]
         if ticket_id:
             metadata["ticket_id"] = _hex(ticket_id, "Ticket")
+        # A saved video is a demo unless the saver says otherwise.
+        if demo if demo is not None else _content_type(file).startswith("video/"):
+            metadata["demo"] = True
         source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
         if source:
             metadata["source_session_id"] = _hex(source, "Session")
@@ -162,10 +167,29 @@ def create_project_files_router(
         return _describe(project, stored)
 
     @router.get("")
-    async def list_project_files(request: Request, project_id: str) -> dict[str, Any]:
+    async def list_project_files(
+        request: Request,
+        project_id: str,
+        since: float | None = None,
+        ticket_id: str | None = None,
+        kind: Literal["artifact", "demo", "ticket_attachment"] | None = None,
+    ) -> dict[str, Any]:
+        """The project's files, newest first, optionally filtered by time, ticket or kind."""
         project = await require_project(request, project_id)
         rows = await asyncio.to_thread(file_store.list_by_metadata, PROJECT_METADATA_KEY, project)
-        return {"data": [_describe(project, row) for row in rows]}
+        files = [_describe(project, row) for row in rows]
+        wanted_ticket = _hex(ticket_id, "Ticket") if ticket_id else None
+        files = [
+            item
+            for item in files
+            if (since is None or item["created_at"] >= since)
+            and (wanted_ticket is None or item["ticket_id"] == wanted_ticket)
+            and (
+                kind is None
+                or (item["demo"] if kind == "demo" else item["kind"] == kind)
+            )
+        ]
+        return {"data": files}
 
     @router.get("/{file_id}")
     async def get_project_file(request: Request, project_id: str, file_id: str) -> dict[str, Any]:

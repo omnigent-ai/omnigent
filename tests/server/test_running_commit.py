@@ -85,3 +85,56 @@ def test_no_status_without_git(repo, monkeypatch) -> None:
     running.capture(repo)
     monkeypatch.setenv("OMNIGENT_LANDING_CHECKOUT", str(repo.parent))  # not a checkout
     assert running.ship_status({}, ticket(sha)) is None
+
+
+class _Board:
+    """A ticket store with just what the deploy status reads."""
+
+    def __init__(self, tickets: list[dict]) -> None:
+        self.tickets = tickets
+
+    def stages(self, project_id, *, user_id):
+        return {
+            "stages": [
+                {"id": "code_review", "is_complete": False},
+                {"id": "implemented", "is_complete": False},
+                {"id": "merged", "is_complete": True},
+            ]
+        }
+
+    def list(self, project_id, *, user_id, after, limit):
+        return {"data": self.tickets, "has_more": False}
+
+
+def test_deploy_status_counts_what_waits_for_a_restart_and_landing_drift(repo) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.server.project_deploy_status import deploy_status
+
+    live = git(repo, "rev-parse", "HEAD")
+    running.capture(repo)
+    merged_later = commit(repo, "merged after the server started")
+    drifted = commit(repo, "on the branch but its ticket is still in review")
+    git(repo, "checkout", "-q", "-b", "side")
+    in_review = commit(repo, "still in review")
+    git(repo, "checkout", "-q", BRANCH)
+
+    def row(ticket_id: str, stage: str, sha: str) -> dict:
+        return {"id": ticket_id, "title": ticket_id, "stage_id": stage, **ticket(sha)}
+
+    board = _Board(
+        [
+            row("live", "merged", live),
+            row("merged-later", "merged", merged_later),
+            row("landed", "implemented", merged_later),
+            row("drift", "code_review", drifted),
+            row("review", "code_review", in_review),
+        ]
+    )
+    status = deploy_status(SimpleNamespace(id="p", config={}), board, None)
+    assert status["running_commit"] == live
+    assert status["tip"] == drifted
+    assert status["restart_needed"] is True
+    assert status["merged_not_deployed"] == 1
+    assert [item["ticket_id"] for item in status["not_deployed"]] == ["merged-later", "landed"]
+    assert [item["ticket_id"] for item in status["landing_drift"]] == ["drift"]

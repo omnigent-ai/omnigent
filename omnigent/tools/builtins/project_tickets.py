@@ -403,6 +403,48 @@ class SysTicketPushPrefixTool(_TicketTool):
     arguments = PushPrefix
 
 
+class DeployStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class SysProjectDeployStatusTool(_TicketTool):
+    tool_name = "sys_project_deploy_status"
+    read_only = True
+    help_text = (
+        "Report which commit this project's server is running and what isn't live yet: "
+        "running_commit, the landing branch tip and restart_needed; merged_not_deployed, "
+        "the count of Merged tickets whose commit is on the branch but not running (and "
+        "not_deployed, those tickets plus Landed ones); and landing_drift, tickets in an "
+        "earlier stage whose commit is already on the landing branch. A ticket's commit is "
+        "its approved, else verified, SHA. Read-only."
+    )
+    arguments = DeployStatus
+
+
+class ListProjectArtifacts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    since: float | None = Field(
+        default=None, description="Only files saved at or after this Unix time."
+    )
+    ticket_id: str | None = Field(default=None, description="Only files attached to this ticket.")
+    kind: Literal["artifact", "demo", "ticket_attachment"] | None = Field(
+        default=None,
+        description="artifact: saved files; demo: demo videos; ticket_attachment: images "
+        "pasted into tickets.",
+    )
+
+
+class SysProjectArtifactListTool(_TicketTool):
+    tool_name = "sys_project_artifact_list"
+    read_only = True
+    help_text = (
+        "List this project's files, newest first, optionally only those saved since a time, "
+        "attached to one ticket, or of one kind (demo for demo videos). Each row has its id, "
+        "title, kind, whether it's a demo, ticket_id, size, created_at and url."
+    )
+    arguments = ListProjectArtifacts
+
+
 class RevertDraft(RevertDraftRequest):
     ticket_id: str
 
@@ -546,6 +588,11 @@ class SaveProjectArtifact(BaseModel):
         default=None,
         max_length=2000,
         description="Comment posted with the attachment when ticket_id is set.",
+    )
+    demo: bool | None = Field(
+        default=None,
+        description="Whether this is a demo of the ticket's change. Videos count as demos "
+        "unless this is false; set true for a demo in another format.",
     )
 
 
@@ -836,6 +883,7 @@ TICKET_TOOL_CLASSES = (
     SysTicketCommentTool,
     SysTicketLandTool,
     SysTicketPushPrefixTool,
+    SysProjectDeployStatusTool,
     SysTicketRevertDraftTool,
     SysTicketImportPrTool,
     SysSessionLinkTicketTool,
@@ -846,6 +894,7 @@ TICKET_TOOL_CLASSES = (
     SysProjectIdentityUpdateTool,
     SysProjectIdentitySessionTool,
     SysProjectArtifactSaveTool,
+    SysProjectArtifactListTool,
     SysProjectFileViewTool,
     SysProjectFileCommentsTool,
     SysProjectKpisGetTool,

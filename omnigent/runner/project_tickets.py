@@ -189,6 +189,10 @@ async def execute_ticket_tool(
                 },
                 ensure_ascii=False,
             )
+        if name == "sys_project_artifact_list":
+            params = dict(body, **({"ticket_id": ticket_id} if ticket_id else {}))
+            result = await request("GET", f"/v1/projects/{project_id}/files", params=params)
+            return json.dumps(result, ensure_ascii=False)
         if name == "sys_project_telemetry_get":
             role = body.pop("role", None)
             if role is not None:
@@ -297,6 +301,7 @@ async def execute_ticket_tool(
                 "sys_ticket_comment": ("POST", "/comments"),
                 "sys_ticket_land": ("POST", "/land"),
                 "sys_ticket_push_prefix": ("GET", "/push-prefix"),
+                "sys_project_deploy_status": ("GET", "/deploy-status"),
                 "sys_ticket_revert_draft": ("POST", "/revert-draft"),
                 "sys_ticket_import_pr": ("POST", "/import-pr"),
                 "sys_session_link_ticket": ("POST", "/sessions"),
@@ -532,6 +537,8 @@ async def _save_artifact(
     form = {key: body[key] for key in ("title",) if body.get(key)}
     if ticket_id is not None:
         form["ticket_id"] = ticket_id
+    if body.get("demo") is not None:
+        form["demo"] = "true" if body["demo"] else "false"
     headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     response = await client.post(
         f"/v1/projects/{project_id}/files",

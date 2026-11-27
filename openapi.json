@@ -981,6 +981,17 @@
       },
       "Body_upload_project_file_v1_projects__project_id__files_post": {
         "properties": {
+          "demo": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Demo"
+          },
           "file": {
             "contentMediaType": "application/octet-stream",
             "title": "File",
@@ -24532,6 +24543,7 @@
     },
     "/v1/projects/{project_id}/files": {
       "get": {
+        "description": "The project's files, newest first, optionally filtered by time, ticket or kind.",
         "operationId": "list_project_files_v1_projects__project_id__files_get",
         "parameters": [
           {
@@ -24541,6 +24553,59 @@
             "schema": {
               "title": "Project Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ticket_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ticket Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "artifact",
+                    "demo",
+                    "ticket_attachment"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
             }
           }
         ],
@@ -26929,6 +26994,51 @@
           }
         },
         "summary": "Project Cost",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/deploy-status": {
+      "get": {
+        "description": "The commit this server runs, tickets landed but not running yet, and drift.",
+        "operationId": "deploy_status_v1_projects__project_id__tickets_deploy_status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Deploy Status V1 Projects  Project Id  Tickets Deploy Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Deploy Status",
         "tags": [
           "project tickets"
         ]

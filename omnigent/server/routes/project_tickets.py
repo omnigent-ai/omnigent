@@ -46,6 +46,7 @@ from omnigent.server import (
     github_pr_intake,
     github_pr_status,
     product_approval,
+    project_deploy_status,
     project_release,
     running_commit,
 )
@@ -1161,6 +1162,16 @@ def create_project_tickets_router(
         project = await load_project(request, project_id, who)
         with _storage_errors():
             return await project_release.project_push_prefix(project, store, who.user_id)
+
+    @router.get("/deploy-status")
+    async def deploy_status(request: Request, project_id: str) -> dict[str, Any]:
+        """The commit this server runs, tickets landed but not running yet, and drift."""
+        who = await actor(request, project_id)
+        project = await load_project(request, project_id, who)
+        with _storage_errors():
+            return await project_deploy_status.project_deploy_status(
+                project, store, who.user_id
+            )
 
     @router.get("/{ticket_id}")
     async def get_ticket(
