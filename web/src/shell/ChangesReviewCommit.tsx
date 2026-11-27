@@ -36,35 +36,37 @@ export interface CommitStepFocus {
 }
 
 /**
- * The owner that reads `spec`, made once a commit is first opened and kept for the
- * review's life, so stepping only changes what it compares.
+ * The owner that reads `spec`, made once a commit is first opened and kept while the review
+ * shows the same folder, so stepping only changes what it compares.
  */
 export function useCommitComparisons(
   spec: RevisionSpec | null,
   repository = "",
   workspaceKey = "",
 ): WorkingCopyComparisonOwner | null {
-  const instance = useRef<CommitComparisons | null>(null);
+  const instance = useRef<{ comparisons: CommitComparisons; folder: string } | null>(null);
   const [owner, setOwner] = useState<WorkingCopyComparisonOwner | null>(null);
   const base = spec?.base;
   const head = spec?.head;
   useEffect(() => {
     if (base === undefined || head === undefined) return;
     const next = { base, head };
-    if (instance.current) {
-      instance.current.show(next);
+    // Stepping keeps the owner; a review of another folder lists from a new one.
+    const folder = `${workspaceKey}\u0000${repository}`;
+    if (instance.current?.folder === folder) {
+      instance.current.comparisons.show(next);
       return;
     }
+    instance.current?.comparisons.dispose();
     const created = createCommitComparisons(next, (customComparisons) =>
       createComparisonOwner({ customComparisons, onlyTyped: true, repository, workspaceKey }),
     );
-    instance.current = created;
+    instance.current = { comparisons: created, folder };
     setOwner(created.owner);
-    // A review keys itself by its folder, so one owner keeps the folder it was made with.
   }, [base, head, repository, workspaceKey]);
   useEffect(
     () => () => {
-      instance.current?.dispose();
+      instance.current?.comparisons.dispose();
       instance.current = null;
     },
     [],
