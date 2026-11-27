@@ -6622,11 +6622,14 @@ def _bundle(source: Path) -> bytes:
 
     # Pre-resolve env vars in YAML files that contain secrets.
     resolved = _resolve_bundle_env_vars(source)
+    omitted = _unfilled_optional_mcp_files(source)
 
     buf = io.BytesIO()
     # dereference: linked paths can share an inode, and the server refuses hardlink members.
     with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as tf:
         for file_path, arcname in _bundle_files(source):
+            if arcname in omitted:
+                continue
             if arcname in resolved:
                 # Write the resolved YAML instead of the
                 # original file (which has ${VAR} refs).
@@ -6733,7 +6736,9 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
       ``tools.builtins[*]`` dict-entry values (except ``name``), and
       inline ``tools.<name>`` MCP servers' ``url``, ``headers.*`` and
       ``env.*`` values
-    - ``tools/mcp/*.yaml``: ``url``, ``headers.*`` and ``env.*`` values
+    - ``tools/mcp/*.yaml``: ``url``, ``headers.*`` and ``env.*`` values,
+      except ``optional: true`` servers whose variables are unset here,
+      which :func:`_bundle` leaves out of the bundle instead
 
     These mirror the server-side parser's ``${VAR}`` expansion
     sites. Resolving here, against the client's own environment,
@@ -6767,7 +6772,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
             raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
+            if not isinstance(raw, dict) or _is_unfilled_optional_mcp(raw):
                 continue
             if _expand_mcp_server_env_vars(raw, expand_env_vars):
                 arcname = str(yaml_file.relative_to(source))
@@ -6777,6 +6782,43 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
                 )
 
     return resolved
+
+
+def _is_unfilled_optional_mcp(raw: dict[str, object]) -> bool:
+    """
+    Whether one ``tools/mcp/*.yaml`` mapping is an ``optional: true``
+    server with a ``${VAR}`` this shell leaves unset.
+
+    :param raw: The parsed MCP file, e.g.
+        ``{"optional": True, "url": "${PIPESHUB_MCP_URL}"}``.
+    :returns: ``True`` when the file should stay out of the bundle.
+    """
+    from omnigent.spec.parser import unfilled_mcp_env_refs
+
+    return raw.get("optional") is True and bool(unfilled_mcp_env_refs(raw, expand=True))
+
+
+def _unfilled_optional_mcp_files(source: Path) -> set[str]:
+    """
+    Arcnames of optional MCP server files to leave out of a bundle.
+
+    The server re-parses uploads without expanding ``${VAR}``, so an
+    optional server whose variables are unset here is dropped before
+    upload rather than shipped with a literal ``${VAR}`` url.
+
+    :param source: The agent image directory.
+    :returns: e.g. ``{"tools/mcp/pipeshub.yaml"}``; empty when every
+        optional server is fully configured.
+    """
+    mcp_dir = source / "tools" / "mcp"
+    if not mcp_dir.is_dir():
+        return set()
+    omitted: set[str] = set()
+    for yaml_file in sorted(mcp_dir.glob("*.yaml")):
+        raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and _is_unfilled_optional_mcp(raw):
+            omitted.add(str(yaml_file.relative_to(source)))
+    return omitted
 
 
 class _LLMDeploy(BaseModel):  # type: ignore[explicit-any]  # Pydantic extra="allow" stubs use Any

@@ -3001,6 +3001,48 @@ def check_unresolved_env_vars(key: str, value: str) -> None:
         )
 
 
+def unfilled_mcp_env_refs(raw: dict[str, object], *, expand: bool) -> list[str]:
+    """
+    List the ``$VAR`` / ``${VAR}`` references in one MCP server
+    declaration's ``url``, ``headers`` and ``env`` that stay unfilled.
+
+    :param raw: One parsed ``tools/mcp/*.yaml`` mapping, e.g.
+        ``{"url": "${PIPESHUB_MCP_URL}", "headers": {...}}``.
+    :param expand: Expand against the process environment first. With
+        ``False`` every reference counts as unfilled, which is how the
+        server sees a bundle it re-parses without expansion.
+    :returns: The references left over, e.g. ``["${PIPESHUB_MCP_URL}"]``;
+        empty when the declaration is complete.
+    """
+    values: list[str] = []
+    if raw.get("url") is not None:
+        values.append(str(raw["url"]))
+    for field in ("headers", "env"):
+        mapping = raw.get(field)
+        if isinstance(mapping, dict):
+            values.extend(str(v) for v in mapping.values())
+    refs: list[str] = []
+    for value in values:
+        text = os.path.expandvars(value) if expand else value
+        refs.extend(_UNRESOLVED_VAR_RE.findall(text))
+    return refs
+
+
+def _parse_mcp_optional_flag(name: object, raw: dict[str, object], source: Path) -> bool:
+    """
+    Read an MCP server file's ``optional`` flag (default ``False``).
+
+    :raises OmnigentError: If ``optional`` is present but not a boolean.
+    """
+    optional = raw.get("optional", False)
+    if not isinstance(optional, bool):
+        raise OmnigentError(
+            f"MCP server {name!r} 'optional' must be true or false: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return optional
+
+
 _TOOLS_CONFIG_KEYS = frozenset({"agents", "builtins", "timeout", "retry", "sandbox"})
 
 
@@ -3166,7 +3208,10 @@ def _discover_mcp_servers(
     ``tools/mcp/``.
 
     Each ``.yaml`` file in the directory is parsed into an
-    :class:`MCPServerConfig`.
+    :class:`MCPServerConfig`. A file marked ``optional: true`` is
+    skipped when a ``${VAR}`` in its ``url``, ``headers`` or ``env``
+    is unfilled (unset in the environment, or not expanded at all),
+    instead of failing the whole agent.
 
     :param mcp_dir: Path to the ``tools/mcp/`` directory, e.g.
         ``root / "tools" / "mcp"``.
@@ -3208,15 +3253,28 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         if transport_str == "http":
-            servers.append(_parse_http_mcp_server(name, raw, yaml_file, expand_env=expand_env))
+            parse_server = _parse_http_mcp_server
         elif transport_str == "stdio":
-            servers.append(_parse_stdio_mcp_server(name, raw, yaml_file, expand_env=expand_env))
+            parse_server = _parse_stdio_mcp_server
         else:
             raise OmnigentError(
                 f"MCP server {name!r} uses unsupported transport "
                 f"{transport!r} — must be 'http' or 'stdio': {yaml_file}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if _parse_mcp_optional_flag(name, raw, yaml_file):
+            unfilled = unfilled_mcp_env_refs(raw, expand=expand_env)
+            if unfilled:
+                # Still check the file's shape, so a typo surfaces even when skipped.
+                parse_server(name, raw, yaml_file, expand_env=False)
+                _log.info(
+                    "Skipping optional MCP server %r: %s not set (%s)",
+                    name,
+                    ", ".join(unfilled),
+                    yaml_file,
+                )
+                continue
+        servers.append(parse_server(name, raw, yaml_file, expand_env=expand_env))
     return servers
 
 
