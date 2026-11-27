@@ -6032,6 +6032,7 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", [1, 2])
 @pytest.mark.parametrize(
     ("last_owner", "reactivation", "delete_again", "malformed_lifecycle"),
     [
@@ -6046,6 +6047,8 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
         pytest.param("terminal", "new-session", True, False, id="terminal-rotated"),
         pytest.param("request", "new-session", False, False, id="request-rotated-active"),
         pytest.param("terminal", "new-session", False, False, id="terminal-rotated-active"),
+        pytest.param("request", "rotation", False, False, id="request-direct-rotation"),
+        pytest.param("terminal", "rotation", False, False, id="terminal-direct-rotation"),
     ],
 )
 async def test_claude_bridge_deletion_waits_for_every_settings_owner(
@@ -6054,6 +6057,7 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
     reactivation: str | None,
     delete_again: bool,
     malformed_lifecycle: bool,
+    protocol: int,
 ) -> None:
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
@@ -6069,57 +6073,68 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
     assert lifecycle_path.stat().st_mode & 0o777 == 0o600
     prepare_bridge_dir("conv_owned", workspace=tmp_path)
     assert lifecycle_path.read_bytes() == initial_lifecycle
-    first = ClaudeSettingsRequest.create(bridge_dir)
-    second = ClaudeSettingsRequest.create(bridge_dir)
+    first = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
+    second = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
     for request in (first, second):
         augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
     baselines = [request.settings_path(bridge_dir) for request in (first, second)]
     baseline_bytes = [path.read_bytes() for path in baselines]
-    private_dir = tmp_path / "terminal"
-    private_dir.mkdir()
-    instance = TerminalInstance(
-        name="claude",
-        session_key="main",
-        private_dir=private_dir,
-        socket_path=private_dir / "tmux.sock",
-    )
-    lease = acquire_claude_settings_request(bridge_dir, first.generation)
-    lease.attach(instance)
-    claim = next(bridge_dir.glob(f"claude-settings-{first.generation}.terminal-*.owner"))
+    instances = []
+    lease = acquire_claude_settings_request(bridge_dir, first.generation, protocol=protocol)
+    for index in range(2):
+        private_dir = tmp_path / f"terminal-{index}"
+        private_dir.mkdir()
+        instance = TerminalInstance(
+            name="claude",
+            session_key=str(index),
+            private_dir=private_dir,
+            socket_path=private_dir / "tmux.sock",
+        )
+        lease.attach(instance)
+        instances.append(instance)
+    claims = list(bridge_dir.glob(f"claude-settings-{first.generation}.terminal-*.owner"))
+    assert len(claims) == 2
     bridge_inode = bridge_dir.stat().st_ino
-    claim_inode = claim.stat().st_ino
+    claim_inodes = [claim.stat().st_ino for claim in claims]
     lease_path = baselines[0].with_suffix(".lease.lock")
     lease_inode = lease_path.stat().st_ino
     original_lifecycle = json.loads(lifecycle_path.read_text())
     config_bytes = (bridge_dir / "bridge.json").read_bytes()
     original_token = json.loads(config_bytes)["token"]
-    current_session = "conv_rotated" if reactivation == "new-session" else "conv_owned"
+    current_session = (
+        "conv_rotated" if reactivation in {"new-session", "rotation"} else "conv_owned"
+    )
+    current = None
     try:
-        request_claude_bridge_deletion(bridge_dir, "conv_owned")
-        config_bytes = (bridge_dir / "bridge.json").read_bytes()
-        assert "token" not in json.loads(config_bytes)
-        pending = json.loads(lifecycle_path.read_text())
-        assert pending["incarnation"] == original_lifecycle["incarnation"]
-        assert pending["delete_for_session"] == "conv_owned"
+        if reactivation != "rotation":
+            request_claude_bridge_deletion(bridge_dir, "conv_owned")
+            config_bytes = (bridge_dir / "bridge.json").read_bytes()
+            assert "token" not in json.loads(config_bytes)
+            pending = json.loads(lifecycle_path.read_text())
+            assert pending["incarnation"] == original_lifecycle["incarnation"]
+            assert pending["delete_for_session"] == "conv_owned"
         if reactivation:
             assert first._request_fd is not None
-            binding = os.pread(first._request_fd, 33, 0)
-            assert len(binding) == 32
-            assert binding.decode() == original_lifecycle.get(
-                "admission_epoch", original_lifecycle["incarnation"]
+            binding = os.pread(first._request_fd, 4096, 0)
+            binding_epoch = (
+                json.loads(binding)["admission_epoch"] if protocol == 2 else binding.decode()
             )
+            assert binding_epoch == original_lifecycle["admission_epoch"]
             if malformed_lifecycle:
                 lifecycle_path.write_text("{")
             prepare_bridge_dir(current_session, bridge_id="conv_owned", workspace=tmp_path)
             reactivated = json.loads(lifecycle_path.read_text())
             assert "delete_for_session" not in reactivated
-            assert json.loads((bridge_dir / "bridge.json").read_text())["token"] != original_token
+            if reactivation != "rotation":
+                assert (
+                    json.loads((bridge_dir / "bridge.json").read_text())["token"] != original_token
+                )
             assert bridge_dir.stat().st_ino == bridge_inode
-            assert claim.stat().st_ino == claim_inode
+            assert [claim.stat().st_ino for claim in claims] == claim_inodes
             assert lease_path.stat().st_ino == lease_inode
-            assert os.pread(first._request_fd, 33, 0) == binding
+            assert os.pread(first._request_fd, 4096, 0) == binding
             with pytest.raises(ValueError, match="expired"):
-                acquire_claude_settings_request(bridge_dir, first.generation)
+                acquire_claude_settings_request(bridge_dir, first.generation, protocol=protocol)
             with pytest.raises(ValueError, match="expired"):
                 first.mark_dispatched()
             before_ack = {
@@ -6132,39 +6147,53 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
                 path.name: path.read_bytes() for path in bridge_dir.iterdir() if path.is_file()
             } == before_ack
             with pytest.raises(ValueError, match="expired"):
-                lease.attach(instance)
-            with ClaudeSettingsRequest.create(bridge_dir) as current:
-                augment_claude_args((), bridge_dir=bridge_dir, settings_request=current)
-                assert current._request_fd is not None
-                assert (
-                    os.pread(current._request_fd, 33, 0).decode() == reactivated["admission_epoch"]
-                )
-                current.mark_dispatched()
-                with acquire_claude_settings_request(bridge_dir, current.generation):
-                    pass
-                assert current.acknowledge(current.generation)
+                lease.attach(instances[0])
+            current = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
+            augment_claude_args((), bridge_dir=bridge_dir, settings_request=current)
+            current_baseline = current.settings_path(bridge_dir)
+            current_bytes = current_baseline.read_bytes()
+            assert current._request_fd is not None
+            current_binding = os.pread(current._request_fd, 4096, 0)
+            current_epoch = (
+                json.loads(current_binding)["admission_epoch"]
+                if protocol == 2
+                else current_binding.decode()
+            )
+            assert current_epoch == reactivated["admission_epoch"]
+            current.mark_dispatched()
+            with acquire_claude_settings_request(
+                bridge_dir, current.generation, protocol=protocol
+            ):
+                pass
+            assert current.acknowledge(current.generation)
             if delete_again:
                 request_claude_bridge_deletion(bridge_dir, current_session)
             config_bytes = (bridge_dir / "bridge.json").read_bytes()
-        first.close()
+        lifecycle_bytes = lifecycle_path.read_bytes()
         assert [path.read_bytes() for path in baselines] == baseline_bytes
         lease.close()
         assert [path.read_bytes() for path in baselines] == baseline_bytes
+        second.close()
+        assert baselines[0].read_bytes() == baseline_bytes[0]
+        assert not baselines[1].exists()
         if last_owner == "terminal":
-            second.close()
-            assert baselines[0].read_bytes() == baseline_bytes[0]
-            assert not baselines[1].exists()
-        else:
-            await instance.close()
-            assert not claim.exists()
-            assert not baselines[0].exists()
-            assert baselines[1].read_bytes() == baseline_bytes[1]
+            first.close()
+        await instances[0].close()
+        assert baselines[0].read_bytes() == baseline_bytes[0]
+        assert sum(claim.exists() for claim in claims) == 1
         assert (bridge_dir / "bridge.json").read_bytes() == config_bytes
-        if last_owner == "terminal":
-            await instance.close()
-        else:
-            second.close()
-        assert not claim.exists()
+        await instances[1].close()
+        if last_owner == "request":
+            assert baselines[0].read_bytes() == baseline_bytes[0]
+            first.close()
+        assert not any(claim.exists() for claim in claims)
+        for request in (first, second):
+            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+        if current is not None:
+            assert current_baseline.read_bytes() == current_bytes
+            assert lifecycle_path.read_bytes() == lifecycle_bytes
+            assert (bridge_dir / "bridge.json").read_bytes() == config_bytes
+            current.close()
         if reactivation and not delete_again:
             assert not any(path.exists() for path in baselines)
             assert prune_unused_claude_settings(bridge_dir) == 0
@@ -6174,7 +6203,7 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
             assert (reactivated["incarnation"] == original_lifecycle["incarnation"]) is (
                 not malformed_lifecycle and reactivation == "same-session"
             )
-            assert reactivated["admission_epoch"] != binding.decode()
+            assert reactivated["admission_epoch"] != binding_epoch
         assert (bridge_dir.parent / ".locks" / f"{bridge_dir.name}.lock").exists()
         request_claude_bridge_deletion(bridge_dir, current_session)
         assert not bridge_dir.exists()
@@ -6182,7 +6211,10 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
         first.close()
         second.close()
         lease.close()
-        await instance.close()
+        for instance in instances:
+            await instance.close()
+        if current is not None:
+            current.close()
 
 
 def _unstarted_settings_terminal(
@@ -6197,61 +6229,6 @@ def _unstarted_settings_terminal(
             withdraw_unstarted
         ),
     )
-
-
-@pytest.mark.parametrize("switch", ["rotation", "reactivation"])
-@pytest.mark.parametrize("last_owner", ["request", "terminal"])
-@pytest.mark.parametrize("protocol", [1, 2])
-def test_final_settings_owner_retires_generation_after_admission_changes(
-    tmp_path: Path, switch: str, last_owner: str, protocol: int
-) -> None:
-    from omnigent.harnesses.claude_native.settings_generation import (
-        ClaudeSettingsRequest,
-        acquire_claude_settings_request,
-        request_claude_bridge_deletion,
-    )
-
-    bridge_dir = prepare_bridge_dir("conv_old", workspace=tmp_path)
-    with (
-        ClaudeSettingsRequest.create(bridge_dir, protocol=protocol) as request,
-        ExitStack() as owners,
-    ):
-        augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
-        baseline = request.settings_path(bridge_dir)
-        baseline_bytes = baseline.read_bytes()
-        callbacks = []
-        with acquire_claude_settings_request(
-            bridge_dir, request.generation, protocol=protocol
-        ) as lease:
-            for _ in range(2):
-                lease.attach(_unstarted_settings_terminal(tmp_path, callbacks))
-        for close in callbacks:
-            owners.callback(close)
-        if switch == "reactivation":
-            request_claude_bridge_deletion(bridge_dir, "conv_old")
-        prepare_bridge_dir(
-            "conv_new" if switch == "rotation" else "conv_old",
-            bridge_id="conv_old",
-            workspace=tmp_path,
-        )
-        lifecycle = (bridge_dir / ".claude-settings-lifecycle.json").read_bytes()
-        config = (bridge_dir / "bridge.json").read_bytes()
-        with ClaudeSettingsRequest.create(bridge_dir, protocol=protocol) as current:
-            augment_claude_args((), bridge_dir=bridge_dir, settings_request=current)
-            current_baseline = current.settings_path(bridge_dir)
-            current_bytes = current_baseline.read_bytes()
-            if last_owner == "terminal":
-                request.close()
-            callbacks[0]()
-            assert baseline.read_bytes() == baseline_bytes
-            callbacks[1]()
-            if last_owner == "request":
-                assert baseline.read_bytes() == baseline_bytes
-                request.close()
-            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
-            assert current_baseline.read_bytes() == current_bytes
-            assert (bridge_dir / ".claude-settings-lifecycle.json").read_bytes() == lifecycle
-            assert (bridge_dir / "bridge.json").read_bytes() == config
 
 
 def test_claude_bridge_deletion_fences_pending_launches(tmp_path: Path) -> None:
@@ -7189,6 +7166,8 @@ def test_claude_bridge_deletion_io_failure_releases_settings_fds(
     bridge_dir = prepare_bridge_dir("conv_io", workspace=tmp_path)
     request = ClaudeSettingsRequest.create(bridge_dir)
     augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
+    baseline = request.settings_path(bridge_dir)
+    baseline_bytes = baseline.read_bytes()
     fds = [request._request_fd, request._lease._fd, request._lease._bridge_fd]
     config_bytes = (bridge_dir / "bridge.json").read_bytes()
     if failure == "intent-write":
@@ -7200,8 +7179,11 @@ def test_claude_bridge_deletion_io_failure_releases_settings_fds(
             return original_writer(path, *args, **kwargs)
 
         monkeypatch.setattr(claude_native_bridge, "_write_json_file", fail_write)
-        with pytest.raises(OSError, match="intent write failed"):
-            request_claude_bridge_deletion(bridge_dir, "conv_io")
+        request_claude_bridge_deletion(bridge_dir, "conv_io")
+        config_bytes = (bridge_dir / "bridge.json").read_bytes()
+        assert "token" not in json.loads(config_bytes)
+        assert claude_native_bridge.read_bridge_credential_binding(bridge_dir) is None
+        assert "Claude bridge deletion metadata could not be updated" in caplog.text
         monkeypatch.setattr(claude_native_bridge, "_write_json_file", original_writer)
     elif failure.startswith("dispatch-short-write"):
         dispatch = request.settings_path(bridge_dir).with_suffix(".dispatch.owner")
@@ -7237,6 +7219,7 @@ def test_claude_bridge_deletion_io_failure_releases_settings_fds(
             raise OSError("directory removal failed")
 
         monkeypatch.setattr(settings_generation, "shutil", SimpleNamespace(rmtree=fail_remove))
+    assert baseline.read_bytes() == baseline_bytes
     request.close()
     for fd in fds:
         assert fd is not None
@@ -21142,9 +21125,9 @@ async def test_disabled_mcp_settings_launch_hook(
         assert (current_path != baseline_path) is (
             caller or json.loads(current_path.read_bytes()) != json.loads(baseline)
         )
-        return args
+        return args, baseline_path
 
-    original_args = await build_args()
+    original_args, _ = await build_args()
     original_path = Path(original_args[original_args.index("--settings") + 1])
     original = original_path.read_bytes()
     expected_denials = [{"serverName": "caller-disabled"}] if caller else []
@@ -21157,7 +21140,7 @@ async def test_disabled_mcp_settings_launch_hook(
     with patch(
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
-        args = await build_args(active)
+        args, baseline_path = await build_args(active)
     assert hook.call_count == 2
     assert hook.call_args_list[0].kwargs == {
         "executor": "claude-native",
@@ -21169,6 +21152,10 @@ async def test_disabled_mcp_settings_launch_hook(
         "claude_args": caller_args,
     }
     final_context = hook.call_args_list[1].kwargs
+    assert final_context["executor"] == "claude-native"
+    final_launch_args = list(args)
+    final_launch_args[final_launch_args.index("--settings") + 1] = str(baseline_path)
+    assert final_context["claude_args"] == final_launch_args
     assert final_context["active_harnesses"] == active
     assert final_context["cwd"] == (launch_cwd if deferred else workspace)
     assert final_context["discover_inherited"] is True

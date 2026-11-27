@@ -281,9 +281,11 @@ def request_claude_bridge_deletion(bridge_dir: Path, session_id: str) -> None:
             incarnation = prepare_claude_settings_lifecycle(bridge_dir)
             lifecycle = _require_incarnation(bridge_dir, incarnation)
             _write_lifecycle(bridge_dir, replace(lifecycle, delete_for_session=session_id))
-        except ValueError:
-            _logger.warning("Claude bridge deletion metadata is invalid", exc_info=True)
-        retire_bridge_credentials(bridge_dir, session_id)
+        except (OSError, ValueError, RecursionError):
+            lifecycle = None
+            _logger.warning("Claude bridge deletion metadata could not be updated", exc_info=True)
+        finally:
+            retire_bridge_credentials(bridge_dir, session_id)
         if lifecycle is not None:
             _complete_bridge_deletion(
                 bridge_dir, lifecycle.incarnation, admission_epoch=lifecycle.epoch

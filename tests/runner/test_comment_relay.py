@@ -2250,7 +2250,6 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
         "failure",
         "declared-replacement",
         "invalid-settings",
-        "validation-unavailable",
         "unexpected-validator-error",
         "prepared-v2",
         "expired-v2",
@@ -2277,25 +2276,18 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     protocol = 2 if mode.endswith("-v2") else 1
     mode = mode.removesuffix("-v2")
     private_diagnostic = "private-validator-value /private/example/settings.json"
-    if mode in {"invalid-settings", "validation-unavailable"}:
-        fault = (
-            settings_validation._InvalidSettings(private_diagnostic)
-            if mode == "invalid-settings"
-            else OSError(private_diagnostic)
+    validation_failure = None
+    if mode == "invalid-settings":
+        validation_failure = settings_validation.CallerSettingsError(
+            settings_validation.CallerSettingsErrorReason.INVALID_SETTINGS
         )
-        monkeypatch.setattr(settings_validation, "_run_doctor", AsyncMock(side_effect=fault))
-    else:
-        monkeypatch.setattr(
-            settings_validation,
-            "validate_caller_settings",
-            AsyncMock(
-                side_effect=(
-                    ValueError(private_diagnostic)
-                    if mode == "unexpected-validator-error"
-                    else None
-                )
-            ),
-        )
+    elif mode == "unexpected-validator-error":
+        validation_failure = ValueError(private_diagnostic)
+    monkeypatch.setattr(
+        settings_validation,
+        "validate_caller_settings",
+        AsyncMock(side_effect=validation_failure),
+    )
     monkeypatch.chdir(tmp_path)
     if mode == "opaque":
         monkeypatch.setattr(
@@ -2433,7 +2425,6 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                 "expired-after-admission",
                 "failure",
                 "invalid-settings",
-                "validation-unavailable",
                 "unexpected-validator-error",
             }:
                 assert response.status_code == (
@@ -2485,17 +2476,7 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                         "then retry; the launch arguments and bridge settings were left unchanged."
                     )
                 elif mode == "invalid-settings":
-                    assert message == (
-                        "Claude rejected the merged caller settings. Check --settings "
-                        "with the selected Claude CLI, then retry; the launch arguments "
-                        "and bridge settings were left unchanged."
-                    )
-                elif mode == "validation-unavailable":
-                    assert message == (
-                        "Cannot validate caller settings with the selected Claude CLI. "
-                        "The CLI and wrapper must support the read-only '--bare doctor' check; "
-                        "update them or check their startup and sandbox configuration, then retry."
-                    )
+                    assert message == validation_failure.client_message
                 elif mode == "unexpected-validator-error":
                     assert message.startswith(
                         "Request failed on the runner; see the runner log for details: "

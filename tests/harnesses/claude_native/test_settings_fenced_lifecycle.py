@@ -61,12 +61,26 @@ def _populate(request: ClaudeSettingsRequest) -> Path:
 
 
 @pytest.mark.parametrize(
-    "protocol,owner,metadata",
-    [(protocol, owner, None) for protocol in (1, 2) for owner in ("sender", "reader", "unknown")]
-    + [(2, "reader", raw) for raw in (b"{", b"[]", b"\xff")],
+    "protocol,owner,metadata,lifecycle_fault",
+    [
+        (protocol, owner, None, None)
+        for protocol in (1, 2)
+        for owner in ("sender", "reader", "unknown")
+    ]
+    + [(2, "reader", raw, None) for raw in (b"{", b"[]", b"\xff")]
+    + [
+        (protocol, "reader", None, fault)
+        for protocol in (1, 2)
+        for fault in ("symlink", "read", "write", "format", "depth")
+    ],
 )
 def test_deleted_bridge_removes_credentials_and_keeps_owned_inputs(
-    bridge_dir: Path, protocol: int, owner: str, metadata: bytes | None
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: int,
+    owner: str,
+    metadata: bytes | None,
+    lifecycle_fault: str | None,
 ) -> None:
     request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
     baseline = _populate(request)
@@ -92,8 +106,41 @@ def test_deleted_bridge_removes_credentials_and_keeps_owned_inputs(
         (bridge_dir / name).write_text("synthetic-local-credential")
     if metadata is not None:
         (bridge_dir / "bridge.json").write_bytes(metadata)
+    lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+    original_lifecycle = lifecycle_path.read_bytes()
+    target = bridge_dir.parent / "lifecycle-target.json"
     try:
-        request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+        with monkeypatch.context() as faults:
+            if lifecycle_fault == "symlink":
+                target.write_bytes(original_lifecycle)
+                lifecycle_path.unlink()
+                lifecycle_path.symlink_to(target)
+            elif lifecycle_fault == "read":
+                read_settings = bridge._read_caller_settings
+
+                def fail_read(path: Path, **kwargs) -> str:
+                    if path == lifecycle_path:
+                        raise OSError("synthetic lifecycle read failure")
+                    return read_settings(path, **kwargs)
+
+                faults.setattr(bridge, "_read_caller_settings", fail_read)
+            elif lifecycle_fault == "write":
+                write_json = bridge._write_json_file
+
+                def fail_write(path: Path, *args, **kwargs) -> None:
+                    if path == lifecycle_path:
+                        raise OSError("synthetic lifecycle write failure")
+                    write_json(path, *args, **kwargs)
+
+                faults.setattr(bridge, "_write_json_file", fail_write)
+            elif lifecycle_fault in {"format", "depth"}:
+                lifecycle_path.write_text("{" if lifecycle_fault == "format" else "[" * 2000)
+            request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+        if lifecycle_fault == "symlink":
+            assert lifecycle_path.is_symlink()
+            assert target.read_bytes() == original_lifecycle
+        elif lifecycle_fault in {"read", "write"}:
+            assert lifecycle_path.read_bytes() == original_lifecycle
         tombstone = json.loads((bridge_dir / "bridge.json").read_text())
         assert tombstone == {
             **({"bridge_id": "conv_fenced"} if metadata is None else {}),
@@ -118,11 +165,18 @@ def test_deleted_bridge_removes_credentials_and_keeps_owned_inputs(
         if owner == "unknown":
             assert unknown.exists()
     finally:
+        if lifecycle_fault is not None:
+            lifecycle_path.unlink(missing_ok=True)
+            lifecycle_path.write_bytes(original_lifecycle)
         request.close()
         if reader is not None:
             reader.close()
         unknown.unlink(missing_ok=True)
         prune_unused_claude_settings(bridge_dir)
+    if lifecycle_fault is not None:
+        assert bridge_dir.exists()
+        assert not any((bridge_dir / name).exists() for name in credential_files)
+        request_claude_bridge_deletion(bridge_dir, "conv_fenced")
     assert not bridge_dir.exists()
 
 
