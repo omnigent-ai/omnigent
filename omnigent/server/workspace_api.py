@@ -105,8 +105,7 @@ PULL_REQUEST_FAILURE_REASONS = frozenset(
         "pull_request_changed",
         "invalid_input",
         READ_ONLY_CODE_HOST_REASON,
-        # Why an image can't be shown, so a client can tell "not linked" from "try again".
-        "not_in_pr",
+        # Why an image can't be shown, so a client can tell "not allowed" from "try again".
         "host_not_allowed",
         "too_large",
         "not_image",

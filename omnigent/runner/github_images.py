@@ -1,35 +1,29 @@
-"""Images a pull request links to, fetched as the pull request's GitHub account.
+"""Attachment images on a pull request's host, fetched as the pull request's GitHub account.
 
-An image is served only when the pull request's description or comments link to its
-exact URL, the URL is on one of GitHub's image hosts for that pull request's host, and
-the bytes are a raster image. The token goes on the first request only, and only to the
-pull request's own host. Signed redirect URLs carry a credential of their own, so no URL
-is ever logged, cached or put in an error.
+An image is served only when its URL is one of the pull request host's own attachments,
+``https://<host>/user-attachments/assets/<id>``, its redirects stay on that host's signed
+image host, and the bytes are a raster image. The token goes on the first request only, to
+the pull request's own host. Signed redirect URLs carry a credential of their own, so no
+URL is ever logged, cached or put in an error.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextvars
-import hashlib
-import html
 import ipaddress
-import json
 import logging
 import re
 import ssl
 import threading
 import time
 import urllib.request
-from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
 
-from omnigent.runner import github_failures
 from omnigent.runner import github_resource as github
 from omnigent.runner.pull_request_errors import PullRequestError
 from omnigent.runner.session_prs import PullRequestRef
@@ -41,10 +35,6 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_REDIRECTS = 3
 # Image reads this host process runs at once; the others wait for a slot.
 MAX_CONCURRENT_READS = 4
-# Revisions kept in the linked-URL cache; the oldest is dropped first.
-MAX_CACHED_REVISIONS = 64
-# An edit that doesn't bump the pull request's update time is seen within this.
-LINKED_URLS_TTL_SECONDS = 300.0
 # Bounds the whole fetch, every hop and the body. A stalled DNS lookup can outlast it: the
 # loop's shutdown waits for the resolver thread, so the read keeps its slot until that times out.
 FETCH_DEADLINE_SECONDS = 30.0
@@ -52,35 +42,17 @@ FETCH_DEADLINE_SECONDS = 30.0
 SLOT_WAIT_SECONDS = 10.0
 # Each hop's connect, header and body reads, cut to the fetch's time left.
 _HOP_TIMEOUT_SECONDS = 10.0
-# The pull request read and its listings share the gh deadline other PR actions use.
-_READ_PULL_REQUEST_SECONDS = 15.0
-_PAGE_SIZE = 100
-# A listing stops after this many pages, so a very long thread links only its first items.
-_MAX_LISTING_PAGES = 20
+# Reading the account's token shares the gh deadline other PR actions use.
+_READ_TOKEN_SECONDS = 15.0
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-# A destination its text delimits, taken whole: an angle-bracketed Markdown destination or
-# autolink, a Markdown destination with balanced parentheses, or a quoted HTML attribute.
-_DELIMITED_URL = re.compile(
-    r"<(https://[^<>\s]+)>"
-    r"|\]\((https://[^\s()]*(?:\([^\s()]*\)[^\s()]*)*)(?=[\s)])"
-    r"|=\s*\"(https://[^\"\s]+)\""
-    r"|=\s*'(https://[^'\s]+)'"
-)
-# A bare link, which ends before trailing punctuation, as GitHub's autolinks do.
-_URL = re.compile(r"https://[^\s<>\"'()\]\[]+")
-# The asset path an upload answers with, as ``github_resource._is_attachment_url`` matches it.
-_ATTACHMENT_PATH = re.compile(r"/user-attachments/assets/[0-9a-f-]+")
-_GITHUB_IMAGE_HOSTS = frozenset(
-    {"private-user-images.githubusercontent.com", "user-images.githubusercontent.com"}
-)
+# Where github.com's attachment URLs redirect: signed, short-lived image URLs.
+_GITHUB_SIGNED_IMAGE_HOST = "private-user-images.githubusercontent.com"
 # Encoded dots and slashes in the path could reach one the allowlist never checked. A query
 # may carry them: GitHub's signed image URLs do.
 _ENCODED_TRAVERSAL = re.compile(r"%(?:2e|2f|5c)", re.IGNORECASE)
 _UNKNOWN_HOST = "Sign in to this GitHub host with gh, or set GH_HOST to it, before viewing its PRs"
-_READ_FAILED = "GitHub returned an unexpected pull request response."
 _AUTHENTICATION_TIMED_OUT = "GitHub authentication timed out. Try again."
 _IMAGE_MESSAGES = {
-    "not_in_pr": "That image isn't linked from this pull request.",
     "host_not_allowed": "GitHub won't show images from that address.",
     "too_large": "That image is larger than 10 MB.",
     "not_image": "That file isn't a supported image.",
@@ -99,29 +71,43 @@ class ImageRefused(PullRequestError):
 
 @dataclass(frozen=True)
 class PullRequestImage:
-    """The bytes of an image a pull request links to, and the type they were checked as."""
+    """The bytes of an attachment image, and the type they were checked as."""
 
     content_type: str
     data: bytes
 
 
 def checked_image_url(url: str, pr_host: str) -> httpx.URL:
-    """``url`` parsed once, when it is on an allowed image host for a PR on ``pr_host``.
+    """``url`` parsed once, when it is an attachment on ``pr_host``, the PR's own host.
 
-    The parsed value is the one that is fetched, so no other parser can see another host
-    or path. A URL that parsing would change, such as one with dot segments, is refused.
+    Only ``https://<pr_host>/user-attachments/assets/<id>`` is accepted, with no query; a
+    fragment is dropped. The parsed value is the one that is fetched, so no other parser
+    can see another host or path.
 
     :raises ImageRefused: ``host_not_allowed``.
     """
+    host = pr_host.lower()
     without_fragment = url.split("#", 1)[0]
-    if _raw_reference_refused(without_fragment):
+    if not github._is_attachment_url(without_fragment, host):
         raise ImageRefused("host_not_allowed")
+    parsed = _parsed(without_fragment)
+    if parsed is None or not _plain_hostname(host):
+        raise ImageRefused("host_not_allowed")
+    return parsed
+
+
+def _parsed(reference: str) -> httpx.URL | None:
+    """``reference`` parsed, when it is an https URL parsing leaves exactly as written."""
+    if _raw_reference_refused(reference):
+        return None
     try:
-        parsed = httpx.URL(without_fragment)
+        parsed = httpx.URL(reference)
     except httpx.InvalidURL:
-        raise ImageRefused("host_not_allowed") from None
-    if str(parsed) != without_fragment or not _allowed(parsed, pr_host.lower()):
-        raise ImageRefused("host_not_allowed")
+        return None
+    if str(parsed) != reference or parsed.scheme != "https" or parsed.userinfo:
+        return None
+    if parsed.port not in (None, 443):
+        return None
     return parsed
 
 
@@ -141,27 +127,34 @@ def _raw_reference_refused(reference: str) -> bool:
 
 
 def _redirect_target(current: httpx.URL, location: str, pr_host: str) -> httpx.URL:
-    """Where a redirect goes: its reference checked as written, then the URL it resolves to."""
-    if _raw_reference_refused(location.split("#", 1)[0]):
+    """Where a redirect goes, checked as written and once resolved: the signed image host.
+
+    :raises ImageRefused: ``host_not_allowed``.
+    """
+    reference = location.split("#", 1)[0]
+    if _raw_reference_refused(reference):
         raise ImageRefused("host_not_allowed")
-    return checked_image_url(str(current.join(location)), pr_host)
+    # An absolute location is checked as written, case and port included.
+    absolute = reference.lower().startswith("https:")
+    target = _parsed(reference if absolute else str(current.join(reference)))
+    if target is None or not _signed_image_url(target, pr_host.lower()):
+        raise ImageRefused("host_not_allowed")
+    return target
 
 
-def _allowed(url: httpx.URL, pr_host: str) -> bool:
-    if url.scheme != "https" or url.userinfo or url.port not in (None, 443):
-        return False
+def _signed_image_url(url: httpx.URL, pr_host: str) -> bool:
+    """Whether ``url`` is on the signed image host ``pr_host``'s attachments redirect to.
+
+    That is ``private-user-images.githubusercontent.com`` for github.com. An Enterprise
+    Server serves them from ``media.<host>``, or under ``/storage/user/`` on itself.
+    """
     host = url.raw_host.decode("ascii", "replace")
     if not _plain_hostname(host):
         return False
-    path = url.raw_path.split(b"?", 1)[0].decode("ascii", "replace")
-    if any(segment in (".", "..") for segment in path.split("/")):
-        return False
     if pr_host == "github.com":
-        if host == "github.com":
-            return _ATTACHMENT_PATH.fullmatch(path) is not None
-        return host in _GITHUB_IMAGE_HOSTS
+        return host == _GITHUB_SIGNED_IMAGE_HOST
     if host == pr_host:
-        return _ATTACHMENT_PATH.fullmatch(path) is not None or path.startswith("/storage/user/")
+        return url.raw_path.split(b"?", 1)[0].startswith(b"/storage/user/")
     return host == f"media.{pr_host}"
 
 
@@ -178,126 +171,7 @@ def _plain_hostname(host: str) -> bool:
     return not any(label.startswith("xn--") for label in host.split("."))
 
 
-_linked_urls_lock = threading.Lock()
-# Keyed by host, repository, number, account, head SHA and update time: one revision per pull
-# request and account, since a pending review's links show only to the account that wrote it.
-_linked_urls_cache: OrderedDict[
-    tuple[str, str, int, str, str, str], tuple[frozenset[str], float]
-] = OrderedDict()
 _read_slots = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
-
-
-def _gh_json(root: str, reference: PullRequestRef, endpoint: str) -> object:
-    rc, output, err = github._gh(
-        ["api", *github._host_args(root, reference), endpoint],
-        cwd=root,
-        token=github._pr_token(root, reference),
-    )
-    if rc != 0:
-        raise github_failures.refusal(err, reference=reference, action="read this pull request")
-    try:
-        return json.loads(output)
-    except ValueError as exc:
-        raise ValueError(_READ_FAILED) from exc
-
-
-def _pull_request(root: str, reference: PullRequestRef) -> dict[str, Any]:
-    payload = _gh_json(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
-    if not isinstance(payload, dict):
-        raise ValueError(_READ_FAILED)
-    return payload
-
-
-def _listing(root: str, reference: PullRequestRef, collection: str) -> list[dict[str, Any]]:
-    """Every item of a pull request's list, page by page, up to a fixed page bound."""
-    items: list[dict[str, Any]] = []
-    for page in range(1, _MAX_LISTING_PAGES + 1):
-        payload = _gh_json(root, reference, f"{collection}?per_page={_PAGE_SIZE}&page={page}")
-        if not isinstance(payload, list):
-            raise ValueError(_READ_FAILED)
-        items.extend(item for item in payload if isinstance(item, dict))
-        if len(payload) < _PAGE_SIZE:
-            break
-    return items
-
-
-def _linked_urls(
-    root: str, reference: PullRequestRef, pull_request: dict[str, Any]
-) -> frozenset[str]:
-    """Every https URL in the pull request's description, comments, reviews and review comments."""
-    repo, number = reference.repository, reference.number
-    bodies = [pull_request.get("body")]
-    for collection in (
-        f"repos/{repo}/issues/{number}/comments",
-        f"repos/{repo}/pulls/{number}/comments",
-        f"repos/{repo}/pulls/{number}/reviews",
-    ):
-        bodies.extend(item.get("body") for item in _listing(root, reference, collection))
-    urls: set[str] = set()
-    for text in bodies:
-        if isinstance(text, str):
-            urls |= _urls_in(html.unescape(text))
-    return frozenset(urls)
-
-
-def _urls_in(text: str) -> set[str]:
-    """Each link in ``text``, exactly as it delimits it, then each bare link.
-
-    A delimited destination is blanked once taken, so the bare pass can't also record its
-    prefix, such as the part before a parenthesis.
-    """
-    urls: set[str] = set()
-
-    def take(match: re.Match[str]) -> str:
-        urls.add(next(group for group in match.groups() if group is not None))
-        return " " * len(match.group(0))
-
-    rest = _DELIMITED_URL.sub(take, text)
-    urls.update(match.group(0).rstrip(".,;:!?") for match in _URL.finditer(rest))
-    return urls
-
-
-def _revision(pull_request: dict[str, Any]) -> tuple[str, str] | None:
-    """The head SHA and last update that identify the pull request's current revision."""
-    head = pull_request.get("head")
-    head_sha = head.get("sha") if isinstance(head, dict) else None
-    updated_at = pull_request.get("updated_at")
-    if isinstance(head_sha, str) and isinstance(updated_at, str):
-        return head_sha, updated_at
-    return None
-
-
-def linked_image_urls(
-    root: str,
-    reference: PullRequestRef,
-    *,
-    account: str = "",
-    clock: Callable[[], float] = time.monotonic,
-) -> frozenset[str]:
-    """Every https URL the pull request links to, cached per revision for a short while.
-
-    The pull request is read first on every call, as the call's account, so the cache
-    never answers for an account or session that can't read it.
-    """
-    pull_request = _pull_request(root, reference)
-    revision = _revision(pull_request)
-    if revision is None:
-        return _linked_urls(root, reference, pull_request)
-    pull_request_key = (reference.host, reference.repository.casefold(), reference.number, account)
-    key = (*pull_request_key, *revision)
-    with _linked_urls_lock:
-        cached = _linked_urls_cache.get(key)
-        if cached is not None and clock() - cached[1] < LINKED_URLS_TTL_SECONDS:
-            _linked_urls_cache.move_to_end(key)
-            return cached[0]
-    urls = _linked_urls(root, reference, pull_request)
-    with _linked_urls_lock:
-        for stale in [known for known in _linked_urls_cache if known[:4] == pull_request_key]:
-            del _linked_urls_cache[stale]
-        _linked_urls_cache[key] = (urls, clock())
-        while len(_linked_urls_cache) > MAX_CACHED_REVISIONS:
-            _linked_urls_cache.popitem(last=False)
-    return urls
 
 
 def _sniff(data: bytes) -> str | None:
@@ -466,24 +340,23 @@ def read_pull_request_image(
     transport: httpx.AsyncBaseTransport | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> PullRequestImage:
-    """The image at ``image_url``, when the pull request links to it. Blocking.
+    """The attachment image at ``image_url`` on the pull request's host. Blocking.
 
-    The pull request read, its listings and the fetch all run as one account. A host
-    the user hasn't set up for GitHub is refused before ``gh`` runs or a token is read.
+    The fetch runs as the pull request's account. A host the user hasn't set up for
+    GitHub is refused before ``gh`` runs or a token is read.
 
-    :raises ImageRefused: With a reason code: ``not_in_pr``, ``host_not_allowed``,
-        ``too_large``, ``not_image`` or ``fetch_failed``. The message never names the URL.
-    :raises ValueError: When the pull request can't be read.
+    :raises ImageRefused: With a reason code: ``host_not_allowed``, ``too_large``,
+        ``not_image`` or ``fetch_failed``. The message never names the URL.
+    :raises ValueError: When the account's token can't be read.
     """
     url = checked_image_url(image_url, reference.host)
     if not github._known_github_host(reference.host):
         raise ValueError(_UNKNOWN_HOST)
-    with github._one_pr_account(root, reference, timed_out=_AUTHENTICATION_TIMED_OUT):
-        with github._gh_deadline_scope(time.monotonic() + _READ_PULL_REQUEST_SECONDS):
-            token = _image_token(root, reference)
-            linked = linked_image_urls(root, reference, account=_account(token), clock=clock)
-        if image_url not in linked:
-            raise ImageRefused("not_in_pr")
+    with (
+        github._one_pr_account(root, reference, timed_out=_AUTHENTICATION_TIMED_OUT),
+        github._gh_deadline_scope(time.monotonic() + _READ_TOKEN_SECONDS),
+    ):
+        token = _image_token(root, reference)
     if not _read_slots.acquire(timeout=SLOT_WAIT_SECONDS):
         raise ImageRefused("fetch_failed")
     try:
@@ -505,8 +378,3 @@ def _image_token(root: str, reference: PullRequestRef) -> str | None:
     if token is None and github._in_sandbox():
         token = github._gh_active_token(root, reference.host)
     return token
-
-
-def _account(token: str | None) -> str:
-    """A cache key for the account a token belongs to, without keeping the token."""
-    return hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""

@@ -1118,7 +1118,6 @@ async def test_an_image_of_a_pr_the_session_never_recorded_isnt_read(
 @pytest.mark.parametrize(
     ("reason", "code"),
     [
-        ("not_in_pr", Code.FAILED_PRECONDITION),
         ("host_not_allowed", Code.FAILED_PRECONDITION),
         ("too_large", Code.FAILED_PRECONDITION),
         ("not_image", Code.FAILED_PRECONDITION),

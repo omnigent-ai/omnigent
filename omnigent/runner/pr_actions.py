@@ -436,5 +436,5 @@ def enable_auto_merge(
 def read_pull_request_image(
     root: str, *, session_id: str | None, pr_url: str | None, image_url: str
 ) -> PullRequestImage:
-    """The image at ``image_url``, when the selected pull request links to it."""
+    """The attachment image at ``image_url`` on the selected pull request's host."""
     return github_images.read_pull_request_image(root, _target(session_id, pr_url), image_url)

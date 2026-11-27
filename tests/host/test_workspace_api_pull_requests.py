@@ -1815,7 +1815,7 @@ async def test_an_image_refusal_reaches_the_client_with_its_reason_and_no_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def refuse(_root: str, _reference: Any, _image_url: str) -> Any:
-        raise github_images.ImageRefused("not_in_pr")
+        raise github_images.ImageRefused("host_not_allowed")
 
     monkeypatch.setattr(github_images, "read_pull_request_image", refuse)
     client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
@@ -1825,8 +1825,8 @@ async def test_an_image_refusal_reaches_the_client_with_its_reason_and_no_url(
         await _image(client, pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=signed))
 
     assert refused.value.code == Code.FAILED_PRECONDITION
-    assert refused.value.message == "That image isn't linked from this pull request."
-    assert _failure_reasons(refused.value) == ["not_in_pr"]
+    assert refused.value.message == "GitHub won't show images from that address."
+    assert _failure_reasons(refused.value) == ["host_not_allowed"]
 
 
 def _image_stream(tunnel: _Tunnel) -> Any:
@@ -1911,12 +1911,12 @@ async def test_an_image_part_after_the_metadata_waits_the_images_time_too(
 
 
 def test_the_first_image_reply_wait_covers_every_phase_of_the_host_read() -> None:
-    """Account lookup, PR read, slot wait and fetch all come before the metadata."""
+    """Account lookup, token read, slot wait and fetch all come before the metadata."""
     from omnigent.runner import github_resource
 
     phases = (
         github_resource._PR_EDIT_REQUEST_SECONDS
-        + github_images._READ_PULL_REQUEST_SECONDS
+        + github_images._READ_TOKEN_SECONDS
         + github_images.SLOT_WAIT_SECONDS
         + github_images.FETCH_DEADLINE_SECONDS
     )

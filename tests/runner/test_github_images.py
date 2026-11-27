@@ -1,12 +1,10 @@
-"""Pull request images: which URLs are shown, where the token goes, and what is refused."""
+"""Pull request attachment images: which URLs are shown, where the token goes, what is refused."""
 
 from __future__ import annotations
 
 import asyncio
 import gzip
-import json
 import logging
-import re
 import ssl
 import sys
 import threading
@@ -14,7 +12,6 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
 
 import httpcore
 import httpx
@@ -33,31 +30,23 @@ OTHER_TOKEN = "ghp_other_example_token"
 PR_URL = "https://github.com/example-org/example-repo/pull/7"
 GHES = "github.example.com"
 GHES_PR_URL = f"https://{GHES}/example-org/example-repo/pull/7"
+GHES_ASSET = f"https://{GHES}/user-attachments/assets/0f1e2d3c-aaaa"
 ASSET = "https://github.com/user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-000000000001"
-NEWER_ASSET = "https://github.com/user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-000000000002"
 SIGNED = "https://private-user-images.githubusercontent.com/1/2-x.png?jwt=eyJ.secret.sig"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 JPEG = b"\xff\xd8\xff" + b"\x00" * 64
 GIF = b"GIF89a" + b"\x00" * 64
 WEBP = b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 64
 AVIF = b"\x00\x00\x00\x1cftypavif" + b"\x00" * 64
-LISTINGS = ("issues/*/comments", "pulls/*/comments", "pulls/*/reviews")
-PAGE_SIZE = 100
 
 # gh's own token lookup, before a fake replaces it.
 _REAL_ACTIVE_TOKEN = github._gh_active_token
 
 
 class FakeGitHub:
-    """Answers ``gh api`` reads of one pull request and its lists, recording each call."""
+    """Stands in for ``gh``: its account and token lookups, recording each call it runs."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.pull: dict[str, Any] = {
-            "body": f"Screenshot: ![s]({ASSET})",
-            "head": {"sha": "a" * 40},
-            "updated_at": "2026-11-22T10:00:00Z",
-        }
-        self.lists: dict[str, list[str]] = {listing: [] for listing in LISTINGS}
         # Each ``gh`` call: its arguments and the token it ran with.
         self.calls: list[tuple[list[str], str | None]] = []
         monkeypatch.setattr(github, "_gh", self._gh)
@@ -78,28 +67,16 @@ class FakeGitHub:
         self.calls.append((argv, token))
         if argv[:2] == ["auth", "token"]:
             return 0, f"{self.broker_token}\n", ""
-        endpoint = argv[-1]
-        path, _, query = endpoint.partition("?")
-        if not query:
-            return 0, json.dumps(self.pull), ""
-        key = re.sub(r"^repos/[^/]+/[^/]+/", "", re.sub(r"/\d+/", "/*/", path))
-        page = int(parse_qs(query)["page"][0])
-        bodies = self.lists[key][(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
-        return 0, json.dumps([{"body": body} for body in bodies]), ""
-
-    def endpoints(self) -> list[str]:
-        return [argv[-1] for argv, _token in self.calls]
+        return 1, "", "An image read runs no other gh command"
 
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
-    """No stored gh hosts, no GH_HOST, a fresh cache and every read slot free."""
+    """No stored gh hosts, no GH_HOST and every read slot free."""
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
     monkeypatch.delenv("GH_HOST", raising=False)
     monkeypatch.setattr(github_images, "_read_slots", threading.BoundedSemaphore(4))
-    github_images._linked_urls_cache.clear()
     yield
-    github_images._linked_urls_cache.clear()
 
 
 @pytest.fixture
@@ -147,18 +124,8 @@ def _refusal(call: Callable[[], object]) -> str | None:
 # The allowlist.
 
 
-@pytest.mark.parametrize(
-    "url, pr_host",
-    [
-        (ASSET, "github.com"),
-        (SIGNED, "github.com"),
-        ("https://user-images.githubusercontent.com/1/2-x.png", "github.com"),
-        (f"https://{GHES}/user-attachments/assets/0f1e2d3c-aaaa", GHES),
-        (f"https://{GHES}/storage/user/1/files/a.png", GHES),
-        (f"https://media.{GHES}/user/1/a.png", GHES),
-    ],
-)
-def test_an_image_on_its_pull_requests_image_hosts_is_allowed(url: str, pr_host: str) -> None:
+@pytest.mark.parametrize("url, pr_host", [(ASSET, "github.com"), (GHES_ASSET, GHES)])
+def test_an_attachment_on_the_pull_requests_own_host_is_allowed(url: str, pr_host: str) -> None:
     assert str(checked_image_url(url, pr_host)) == url
 
 
@@ -170,26 +137,31 @@ def test_an_image_on_its_pull_requests_image_hosts_is_allowed(url: str, pr_host:
         (f"https://{GHES}.example.net/user-attachments/assets/0f1e", GHES),
         ("https://github.com/example-org/example-repo/issues/1.png", "github.com"),
         ("https://github.com/user-attachments/assets/0f1e/extra", "github.com"),
+        ("https://github.com/user-attachments/assets/0f1e?x=1", "github.com"),
+        ("https://github.com/user-attachments/assets/0F1E", "github.com"),
         ("https://raw.githubusercontent.com/a.png", "github.com"),
         ("https://objects.githubusercontent.com/a.png", "github.com"),
-        ("https://x.user-images.githubusercontent.com/a.png", "github.com"),
         ("https://192.0.2.1/user-attachments/assets/0f1e", "192.0.2.1"),
         ("https://[2001:db8::1]/user-attachments/assets/0f1e", "2001:db8::1"),
         ("https://xn--github-9ta.example/user-attachments/assets/0f1e", "xn--github-9ta.example"),
-        ("https://user-images.githubusercontent.com:8443/a.png", "github.com"),
-        ("https://user@user-images.githubusercontent.com/a.png", "github.com"),
-        ("http://user-images.githubusercontent.com/a.png", "github.com"),
-        ("https://user-images.githubusercontent.com./a.png", "github.com"),
+        ("https://github.com:8443/user-attachments/assets/0f1e", "github.com"),
+        ("https://user@github.com/user-attachments/assets/0f1e", "github.com"),
+        ("http://github.com/user-attachments/assets/0f1e", "github.com"),
+        ("https://github.com./user-attachments/assets/0f1e", "github.com"),
         ("https://GitHub.com/user-attachments/assets/0f1e", "github.com"),
-        ("https://github.com/storage/user/1/a.png", "github.com"),
-        (f"https://media.{GHES}/a.png", "github.com"),
         (ASSET, GHES),
-        (SIGNED, GHES),
+        (GHES_ASSET, "github.com"),
         (f"https://{GHES}/example-org/example-repo/raw/main/a.png", GHES),
-        (f"https://other.{GHES}/storage/user/1/a.png", GHES),
+        # Where an attachment redirects, and older link forms: none is fetched as asked.
+        (SIGNED, "github.com"),
+        ("https://user-images.githubusercontent.com/1/2-x.png", "github.com"),
+        (f"https://{GHES}/storage/user/1/files/a.png", GHES),
+        (f"https://media.{GHES}/user/1/a.png", GHES),
     ],
 )
-def test_lookalikes_and_other_hosts_and_paths_are_refused(url: str, pr_host: str) -> None:
+def test_anything_but_an_attachment_on_the_pull_requests_host_is_refused(
+    url: str, pr_host: str
+) -> None:
     with pytest.raises(ImageRefused, match="GitHub won't show images from that address"):
         checked_image_url(url, pr_host)
 
@@ -197,22 +169,19 @@ def test_lookalikes_and_other_hosts_and_paths_are_refused(url: str, pr_host: str
 @pytest.mark.parametrize(
     "url",
     [
-        "https://user-images.githubusercontent.com/1/%2e%2e/a.png",
-        "https://user-images.githubusercontent.com/1/%2E%2E%2Fa.png",
-        "https://user-images.githubusercontent.com/1%5ca.png",
-        "https://user-images.githubusercontent.com/1\\a.png",
-        "https://user-images.githubusercontent.com/1/./a.png",
-        "https://user-images.githubusercontent.com/1/../a.png",
-        "https://user-images.githubusercontent.com/1/a b.png",
-        "https://user-images.githubusercontent.com/1/a\tb.png",
-        "https://user-images.githubusercontent.com/1/a\x00.png",
-        "https://user-images.githubusercontent.com/1%2F..%2Fa.png?x=1",
+        "https://github.com/user-attachments/assets/%2e%2e/0f1e",
+        "https://github.com/user-attachments/assets/0f1e%2F..%2Fa",
+        "https://github.com/user-attachments/assets/0f1e%5ca",
+        "https://github.com/user-attachments/assets\\0f1e",
+        "https://github.com/user-attachments/./assets/0f1e",
+        "https://github.com/user-attachments/../assets/0f1e",
+        "https://github.com/user-attachments/assets/0f1e 1",
+        "https://github.com/user-attachments/assets/0f1e\t1",
+        "https://github.com/user-attachments/assets/0f1e\x00",
+        "https://user-images.githubusercontent.com/1/2-x.png",
     ],
 )
-def test_encoded_and_dot_segment_paths_are_refused_before_github_is_asked(
-    fake: FakeGitHub, url: str
-) -> None:
-    fake.pull["body"] = url
+def test_a_refused_url_reads_no_token_and_fetches_nothing(fake: FakeGitHub, url: str) -> None:
     transport = Transport()
 
     assert _refusal(lambda: _read(url, transport)) == "host_not_allowed"
@@ -221,135 +190,12 @@ def test_encoded_and_dot_segment_paths_are_refused_before_github_is_asked(
     assert transport.seen == []
 
 
-def test_a_signed_url_whose_query_carries_encoded_slashes_is_followed(
-    fake: FakeGitHub,
-) -> None:
-    signed = SIGNED + "&X-Amz-Credential=key%2F20261127%2Fus-east-1%2Fs3%2Faws4_request"
-    transport = Transport(_redirect(signed), _image())
-
-    assert _read(ASSET, transport).data == PNG
-    assert str(transport.seen[1].url) == signed
-
-
 def test_a_fragment_is_dropped_before_the_check_and_never_fetched(fake: FakeGitHub) -> None:
-    linked = f"{ASSET}#preview"
-    fake.pull["body"] = linked
     transport = Transport(_image())
 
-    assert _read(linked, transport).data == PNG
+    assert _read(f"{ASSET}#preview", transport).data == PNG
 
     assert str(transport.seen[0].url) == ASSET
-
-
-# Linking and the cache.
-
-
-def test_an_image_the_pull_request_doesnt_link_is_refused_with_nothing_fetched(
-    fake: FakeGitHub,
-) -> None:
-    transport = Transport()
-
-    assert _refusal(lambda: _read(NEWER_ASSET, transport)) == "not_in_pr"
-
-    assert transport.seen == []
-
-
-_PARENTHESES = "https://user-images.githubusercontent.com/1/screenshot(1).png"
-_PUNCTUATED = "https://user-images.githubusercontent.com/1/before-and-after!"
-
-
-@pytest.mark.parametrize(
-    "body, linked, prefix",
-    [
-        (f"![shot](<{_PARENTHESES}>)", _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
-        (f"![shot]({_PARENTHESES})", _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
-        (f'![shot]({_PARENTHESES} "Screenshot")', _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
-        (f'<img src="{_PARENTHESES}">', _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
-        (f"<img src='{_PARENTHESES}'>", _PARENTHESES, _PARENTHESES[: -len("(1).png")]),
-        (f"![shot](<{_PUNCTUATED}>)", _PUNCTUATED, _PUNCTUATED[:-1]),
-        (f'<img src="{_PUNCTUATED}">', _PUNCTUATED, _PUNCTUATED[:-1]),
-    ],
-    ids=[
-        "angle-parentheses",
-        "balanced-parentheses",
-        "titled",
-        "html-double",
-        "html-single",
-        "angle-punctuation",
-        "html-punctuation",
-    ],
-)
-def test_a_delimited_destination_is_linked_whole_and_its_prefix_isnt(
-    fake: FakeGitHub, body: str, linked: str, prefix: str
-) -> None:
-    fake.pull["body"] = body
-
-    assert _read(linked, Transport(_image())).data == PNG
-    assert _refusal(lambda: _read(prefix, Transport())) == "not_in_pr"
-
-
-def test_a_bare_link_still_drops_the_punctuation_after_it(fake: FakeGitHub) -> None:
-    fake.pull["body"] = f"Before and after: {_PUNCTUATED[:-1]}!"
-
-    assert _read(_PUNCTUATED[:-1], Transport(_image())).data == PNG
-    assert _refusal(lambda: _read(_PUNCTUATED, Transport())) == "not_in_pr"
-
-
-@pytest.mark.parametrize("listing", LISTINGS)
-def test_an_image_linked_from_any_comment_list_is_served(fake: FakeGitHub, listing: str) -> None:
-    fake.pull["body"] = ""
-    fake.lists[listing] = [f'<img src="{NEWER_ASSET}" alt="after">']
-
-    assert _read(NEWER_ASSET, Transport(_image())).data == PNG
-
-
-def test_an_image_linked_from_a_later_page_is_served(fake: FakeGitHub) -> None:
-    fake.lists["issues/*/comments"] = ["no image"] * PAGE_SIZE + [f"See {NEWER_ASSET}."]
-
-    assert _read(NEWER_ASSET, Transport(_image())).data == PNG
-    assert "repos/example-org/example-repo/issues/7/comments?per_page=100&page=2" in (
-        fake.endpoints()
-    )
-
-
-def test_a_second_read_of_the_same_revision_reads_the_pr_but_lists_once(fake: FakeGitHub) -> None:
-    _read(ASSET, Transport(_image()))
-    _read(ASSET, Transport(_image()))
-
-    pull = "repos/example-org/example-repo/pulls/7"
-    assert fake.endpoints().count(pull) == 2
-    assert len(fake.endpoints()) == 2 + len(LISTINGS)
-
-
-def test_a_new_revision_lists_again(fake: FakeGitHub) -> None:
-    _read(ASSET, Transport(_image()))
-    fake.pull["updated_at"] = "2026-11-22T11:00:00Z"
-    fake.pull["body"] = f"Now: {NEWER_ASSET}"
-
-    assert _read(NEWER_ASSET, Transport(_image())).data == PNG
-    assert _refusal(lambda: _read(ASSET, Transport())) == "not_in_pr"
-    assert len(github_images._linked_urls_cache) == 1
-
-
-def test_a_cached_revision_lists_again_once_its_time_is_up(fake: FakeGitHub) -> None:
-    now = [1000.0]
-    _read(ASSET, Transport(_image()), clock=lambda: now[0])
-    # An edit GitHub didn't stamp with a new update time.
-    fake.pull["body"] = f"Now: {NEWER_ASSET}"
-
-    assert _refusal(lambda: _read(NEWER_ASSET, Transport(), clock=lambda: now[0])) == "not_in_pr"
-    now[0] += github_images.LINKED_URLS_TTL_SECONDS
-    assert _read(NEWER_ASSET, Transport(_image()), clock=lambda: now[0]).data == PNG
-
-
-def test_the_cache_keeps_a_bounded_number_of_revisions(
-    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(github_images, "MAX_CACHED_REVISIONS", 2)
-    for number in (7, 8, 9):
-        _read(ASSET, Transport(_image()), pr_url=f"{PR_URL.rsplit('/', 1)[0]}/{number}")
-
-    assert [key[2] for key in github_images._linked_urls_cache] == [8, 9]
 
 
 # Redirects and where the token goes.
@@ -365,23 +211,33 @@ def test_the_token_goes_only_on_the_first_request_to_the_pr_host(fake: FakeGitHu
     assert first.headers["accept-encoding"] == "identity"
     assert str(second.url) == SIGNED
     assert "authorization" not in second.headers
+    assert fake.calls == []
 
 
-def test_an_image_on_another_host_is_fetched_without_the_token(fake: FakeGitHub) -> None:
-    public = "https://user-images.githubusercontent.com/1/2-x.png"
-    fake.pull["body"] = public
-    transport = Transport(_image())
+def test_a_signed_url_whose_query_carries_encoded_slashes_is_followed(
+    fake: FakeGitHub,
+) -> None:
+    signed = SIGNED + "&X-Amz-Credential=key%2F20261127%2Fus-east-1%2Fs3%2Faws4_request"
+    transport = Transport(_redirect(signed), _image())
 
-    _read(public, transport)
+    assert _read(ASSET, transport).data == PNG
+    assert str(transport.seen[1].url) == signed
 
-    assert "authorization" not in transport.seen[0].headers
 
+@pytest.mark.parametrize(
+    "location",
+    [f"https://media.{GHES}/user/1/a.png?token=a", f"https://{GHES}/storage/user/1/files/a.png"],
+    ids=["media-host", "storage-path"],
+)
+def test_an_enterprise_attachment_redirects_to_its_hosts_signed_images(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    monkeypatch.setenv("GH_HOST", GHES)
+    transport = Transport(_redirect(location), _image())
 
-def test_a_same_host_redirect_doesnt_carry_the_token(fake: FakeGitHub) -> None:
-    transport = Transport(_redirect(NEWER_ASSET), _image())
+    assert _read(GHES_ASSET, transport, pr_url=GHES_PR_URL).data == PNG
 
-    _read(ASSET, transport)
-
+    assert str(transport.seen[1].url) == location
     assert "authorization" not in transport.seen[1].headers
 
 
@@ -390,22 +246,29 @@ def test_a_same_host_redirect_doesnt_carry_the_token(fake: FakeGitHub) -> None:
     [
         "https://example.net/a.png",
         "http://private-user-images.githubusercontent.com/1/2-x.png",
+        "https://user-images.githubusercontent.com/1/2-x.png",
         "https://github.com/storage/user/1/a.png",
+        f"https://media.{GHES}/user/1/a.png",
         "https://raw.githubusercontent.com/a.png",
         "/example-org/example-repo/issues/1",
+        # Back to github.com: another asset, or the same one with a query.
+        "https://github.com/user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-000000000002",
+        "?jwt=a",
         # Each resolves to an allowed URL; the raw reference is what the rules refuse.
         "https://private-user-images.githubusercontent.com/1/../2-x.png?jwt=a",
         "https://private-user-images.githubusercontent.com/1/./2-x.png?jwt=a",
-        "../assets/0f1e2d3c-aaaa-bbbb-cccc-000000000002",
-        "/user-attachments/./assets/0f1e2d3c-aaaa-bbbb-cccc-000000000002",
         "https://private-user-images.githubusercontent.com/1/2 x.png?jwt=a",
         "https://private-user-images.githubusercontent.com/1/%2e%2e/2-x.png?jwt=a",
-        "//evil.example/a.png",
-        "//github.com/../user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-000000000002",
         "https://private-user-images.githubusercontent.com/1/2\tx.png?jwt=a",
+        "//evil.example/a.png",
+        "https://private-user-images.githubusercontent.com:8443/1/2-x.png",
+        "https://user@private-user-images.githubusercontent.com/1/2-x.png",
+        # An absolute location is held to the rules as written, case and port included.
+        "https://PRIVATE-USER-IMAGES.githubusercontent.com/1/2-x.png?jwt=a",
+        "https://private-user-images.githubusercontent.com:443/1/2-x.png?jwt=a",
     ],
 )
-def test_a_redirect_off_the_allowlist_is_refused_with_no_request_to_it(
+def test_a_redirect_off_the_signed_image_host_is_refused_with_no_request_to_it(
     fake: FakeGitHub, location: str
 ) -> None:
     transport = Transport(_redirect(location))
@@ -415,16 +278,16 @@ def test_a_redirect_off_the_allowlist_is_refused_with_no_request_to_it(
     assert len(transport.seen) == 1
 
 
-def test_a_query_only_redirect_stays_on_the_same_asset_without_the_token(
-    fake: FakeGitHub,
+def test_an_enterprise_redirect_to_github_coms_signed_images_is_refused(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """It resolves to the linked asset with a query: allowed, and never sent the token."""
-    transport = Transport(_redirect("?jwt=a"), _image())
+    monkeypatch.setenv("GH_HOST", GHES)
+    transport = Transport(_redirect(SIGNED))
 
-    assert _read(ASSET, transport).data == PNG
-
-    assert str(transport.seen[1].url) == f"{ASSET}?jwt=a"
-    assert "authorization" not in transport.seen[1].headers
+    assert _refusal(lambda: _read(GHES_ASSET, transport, pr_url=GHES_PR_URL)) == (
+        "host_not_allowed"
+    )
+    assert len(transport.seen) == 1
 
 
 def test_three_redirects_are_followed_and_a_fourth_is_refused(fake: FakeGitHub) -> None:
@@ -670,7 +533,7 @@ def test_every_refusal_reads_one_fixed_message() -> None:
         reason: str(ImageRefused(reason)) for reason in github_images.IMAGE_REFUSAL_REASONS
     }
 
-    assert len(set(messages.values())) == 5
+    assert len(set(messages.values())) == 4
     assert all("http" not in message for message in messages.values())
 
 
@@ -834,17 +697,15 @@ def test_a_failed_read_frees_its_slot(fake: FakeGitHub) -> None:
 # The account and the token's source.
 
 
-def test_the_pr_read_its_lists_and_the_fetch_run_as_the_account_active_at_the_start(
-    fake: FakeGitHub,
-) -> None:
+def test_the_fetch_runs_as_the_account_active_at_the_start(fake: FakeGitHub) -> None:
     """Switching gh's active account mid-read must not change whose token fetches."""
     fake.active_tokens = [TOKEN, OTHER_TOKEN]
     transport = Transport(_image())
 
     _read(ASSET, transport)
 
-    assert {token for _argv, token in fake.calls} == {TOKEN}
     assert transport.seen[0].headers["authorization"] == f"token {TOKEN}"
+    assert fake.calls == []
 
 
 def test_a_pr_on_a_host_the_user_never_set_up_reads_nothing_and_sends_no_token(
@@ -854,11 +715,10 @@ def test_a_pr_on_a_host_the_user_never_set_up_reads_nothing_and_sends_no_token(
     monkeypatch.setenv("GH_ENTERPRISE_TOKEN", TOKEN)
     lookups: list[str] = []
     monkeypatch.setattr(github, "_gh_active_token", lambda _root, host: lookups.append(host))
-    url = f"https://{GHES}/user-attachments/assets/0f1e2d3c-aaaa"
     transport = Transport()
 
     with pytest.raises(ValueError, match="Sign in to this GitHub host with gh"):
-        _read(url, transport, pr_url=GHES_PR_URL)
+        _read(GHES_ASSET, transport, pr_url=GHES_PR_URL)
 
     assert fake.calls == []
     assert lookups == []
@@ -869,11 +729,9 @@ def test_a_pr_on_the_gh_host_set_up_is_read(
     fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GH_HOST", GHES)
-    url = f"https://{GHES}/user-attachments/assets/0f1e2d3c-aaaa"
-    fake.pull["body"] = url
     transport = Transport(_image())
 
-    assert _read(url, transport, pr_url=GHES_PR_URL).data == PNG
+    assert _read(GHES_ASSET, transport, pr_url=GHES_PR_URL).data == PNG
     assert transport.seen[0].headers["authorization"] == f"token {TOKEN}"
 
 
@@ -894,17 +752,6 @@ def test_a_sandbox_fetches_with_its_brokered_token_on_the_first_request_only(
     assert first.headers["authorization"] == "token gho_brokered_example"
     assert "authorization" not in second.headers
     assert ["auth", "token", "-h", "github.com"] in [argv for argv, _token in fake.calls]
-
-
-def test_two_accounts_dont_share_a_revisions_linked_urls(fake: FakeGitHub) -> None:
-    """A pending review's links show only to the account that wrote it."""
-    _read(ASSET, Transport(_image()))
-    fake.active_tokens = [OTHER_TOKEN]
-
-    _read(ASSET, Transport(_image()))
-
-    listings = [endpoint for endpoint in fake.endpoints() if "?per_page=" in endpoint]
-    assert len(listings) == 2 * len(LISTINGS)
 
 
 # TLS.
