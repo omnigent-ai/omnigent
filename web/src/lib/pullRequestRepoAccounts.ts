@@ -6,6 +6,7 @@
 import { z } from "zod";
 
 import { createDeviceRecentList } from "@/lib/deviceRecentList";
+import { durableServerScope } from "@/lib/durableServerScope";
 import type { MacNamedReader } from "@/lib/macNamedReads";
 import { pullRequestPageUrl } from "@/lib/pullRequestReadRoute";
 
@@ -27,14 +28,15 @@ export interface PullRequestRepository {
 export type RepoAccountIntent = { mode: "automatic" } | { mode: "account"; login: string };
 
 /**
- * What's saved for a repository: `pending` while the server or workspace user isn't known and
- * this device keeps choices, so nothing reads before learning which account it should use.
+ * What's saved for a repository: `pending` while the workspace user isn't known and this device
+ * keeps choices, so nothing reads before learning which account it should use. A server with no
+ * stable identity keeps no choices, so its repositories are on Automatic.
  */
 export type SavedRepoAccount = { kind: "pending" } | { kind: "saved"; intent: RepoAccountIntent };
 
 /** Why a repository with a chosen login can't be read or changed as it right now. */
 export type RepoReaderBlockedReason =
-  /** The workspace user or server isn't known yet, so their choice can't be read. */
+  /** The workspace user isn't known yet, so their choice can't be read. */
   | "pending"
   /** The shell hasn't said yet whether it can read as a named login. */
   | "checking"
@@ -89,6 +91,8 @@ const scopeOf = ({ host, owner, repo }: PullRequestRepository) => [host, owner, 
 
 /** The choice saved for `repository`, for this server and workspace user. */
 export function savedRepoAccount(repository: PullRequestRepository): SavedRepoAccount {
+  // An embedded server with no stable identity never gets one, so no choice is kept for it.
+  if (durableServerScope() === null) return { kind: "saved", intent: AUTOMATIC };
   // Unknown whose choices apply: wait, unless this device keeps none for anyone.
   if (accounts.owner() === null) {
     return accounts.hasSaved() ? { kind: "pending" } : { kind: "saved", intent: AUTOMATIC };
@@ -97,11 +101,15 @@ export function savedRepoAccount(repository: PullRequestRepository): SavedRepoAc
   return { kind: "saved", intent: saved ? { mode: "account", login: saved.login } : AUTOMATIC };
 }
 
-/** Save the choice for `repository`; false where it couldn't be kept, e.g. no user yet. */
+/**
+ * Save the choice for `repository`; false where it couldn't be kept, e.g. no user yet. Where the
+ * server keeps no choices, Automatic is already in effect and a login can't be kept.
+ */
 export function setRepoAccount(
   repository: PullRequestRepository,
   intent: RepoAccountIntent,
 ): boolean {
+  if (durableServerScope() === null) return intent.mode === "automatic";
   if (accounts.owner() === null) return false;
   if (intent.mode === "account" && !LOGIN_PATTERN.test(intent.login)) return false;
   accounts.write(scopeOf(repository), intent.mode === "account" ? [{ login: intent.login }] : []);

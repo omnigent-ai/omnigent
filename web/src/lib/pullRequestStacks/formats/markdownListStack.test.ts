@@ -100,6 +100,8 @@ describe("markdownListStackFormat on hand-edited descriptions", () => {
       "stack//middle",
       "stack/.middle",
       "stack/middle.",
+      "HEAD",
+      "-oops",
     ].map(
       (label) =>
         [

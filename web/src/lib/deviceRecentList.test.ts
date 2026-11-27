@@ -36,4 +36,7 @@ it("puts a batch first, its last item first, and keeps the list to its limit", (
   expect(list.read(SCOPE)).toEqual(["c", "b", "a"]);
   list.record(SCOPE, ["a", "d"], list.owner());
   expect(list.read(SCOPE)).toEqual(["d", "a", "c"]);
+  // A batch naming an item twice keeps it once, where it was recorded last.
+  list.record(SCOPE, ["b", "e", "b"], list.owner());
+  expect(list.read(SCOPE)).toEqual(["b", "e", "d"]);
 });

@@ -1,6 +1,6 @@
 // When GitHub rate-limits this Mac's reads as one login, the page waits it out as one client:
 // one cooldown per host and reader, held until the shell's deadline or, from a shell that names
-// none, a fallback that doubles only when the first read after it is limited again.
+// none, a fallback that doubles only when the first read after a fallback wait is limited again.
 
 import type {
   CodeHostQueryRequest,
@@ -39,6 +39,8 @@ export interface LocalRateLimitRefusal extends GitHubFastTrackError {
 interface Episode {
   until: number;
   backoffMs: number;
+  /** Whether `until` is a fallback wait, rather than a deadline the shell named. */
+  fallback: boolean;
   limit?: GitHubRateLimit;
 }
 
@@ -191,19 +193,25 @@ export function createGitHubCooldowns({
       const later = deadline !== null && deadline > episode.until;
       const names = named !== undefined && (later || episode.limit === undefined);
       if (!later && !names) return;
-      if (later) episode.until = deadline;
+      if (later) {
+        episode.until = deadline;
+        episode.fallback = false;
+      }
       if (names) episode.limit = named;
     } else if (episode) {
-      // Only a fallback wait doubles: a deadline the shell named says nothing about the next one.
-      if (deadline === null) {
+      // Only a fallback wait that proved too short doubles the next; a deadline the shell named
+      // says nothing about how long a fallback should be.
+      if (deadline === null && episode.fallback) {
         episode.backoffMs = Math.min(episode.backoffMs * 2, MAX_FALLBACK_COOLDOWN_MS);
       }
       episode.until = deadline ?? fallbackDeadline(time, episode.backoffMs);
+      episode.fallback = deadline === null;
       episode.limit = named;
     } else {
       episodes.set(key, {
         backoffMs: FALLBACK_COOLDOWN_MS,
         until: deadline ?? fallbackDeadline(time, FALLBACK_COOLDOWN_MS),
+        fallback: deadline === null,
         ...(named ? { limit: named } : {}),
       });
     }

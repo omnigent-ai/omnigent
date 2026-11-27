@@ -31,6 +31,11 @@ describe("markdownLines", () => {
     expect(lines.map((line) => line.fenced)).toEqual([true, true, true, true, true, false]);
   });
 
+  it("reads a line of inline code in triple backticks as prose, so what follows stays unfenced", () => {
+    const lines = markdownLines("```inline```\n## Stack\n~~~ a`b\nx\n~~~\n");
+    expect(lines.map((line) => line.fenced)).toEqual([false, false, true, true, true]);
+  });
+
   it("leaves an unclosed fence open to the end", () => {
     expect(markdownLines("~~~\nx\n").map((line) => line.fenced)).toEqual([true, true]);
   });

@@ -5,7 +5,10 @@ import type * as HostModule from "@/lib/host";
 import type * as IdentityModule from "@/lib/identity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const identity = vi.hoisted(() => ({ userId: "user-1" as string | null }));
+const identity = vi.hoisted(() => ({
+  userId: "user-1" as string | null,
+  server: "server-1" as string | null,
+}));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   getCurrentUserId: () => identity.userId,
@@ -13,11 +16,13 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 vi.mock("@/lib/host", async (importOriginal) => ({
   ...(await importOriginal<typeof HostModule>()),
-  getOmnigentServerIdentity: () => "server-1",
+  getOmnigentServerIdentity: () => identity.server,
 }));
 
+import { repoReaderState } from "./pullRequestRepoReader";
 import {
   MAX_REPO_ACCOUNTS,
+  NO_REPO_READER,
   pullRequestRepository,
   repositoryKey,
   resetRepoAccountsForTests,
@@ -32,6 +37,7 @@ const LIB = { host: "github.com", owner: "acme", repo: "lib" };
 beforeEach(() => {
   window.localStorage.clear();
   identity.userId = "user-1";
+  identity.server = "server-1";
 });
 
 afterEach(() => {
@@ -118,6 +124,24 @@ describe("the saved choice", () => {
     identity.userId = null;
     expect(savedRepoAccount(APP)).toEqual({ kind: "pending" });
     expect(setRepoAccount(APP, { mode: "automatic" })).toBe(false);
+  });
+
+  it("is Automatic, never pending, on a server with no stable identity, which keeps no choices", () => {
+    setRepoAccount(APP, { mode: "account", login: "bob" });
+    // An embedded server that names no identity, with a known user.
+    identity.server = null;
+    expect(savedRepoAccount(LIB)).toEqual({ kind: "saved", intent: { mode: "automatic" } });
+    expect(savedRepoAccount(APP)).toEqual({ kind: "saved", intent: { mode: "automatic" } });
+    expect(repoReaderState("https://github.com/acme/lib/pull/1")).toEqual(NO_REPO_READER);
+    // Automatic is already in effect; a login can't be kept here.
+    expect(setRepoAccount(LIB, { mode: "automatic" })).toBe(true);
+    expect(setRepoAccount(LIB, { mode: "account", login: "bob" })).toBe(false);
+    // The choice made under the server that names itself is still there for it.
+    identity.server = "server-1";
+    expect(savedRepoAccount(APP)).toEqual({
+      kind: "saved",
+      intent: { mode: "account", login: "bob" },
+    });
   });
 
   it(`keeps the ${MAX_REPO_ACCOUNTS} repositories used most recently`, () => {

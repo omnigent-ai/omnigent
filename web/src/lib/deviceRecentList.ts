@@ -167,7 +167,11 @@ export function createDeviceRecentList<Item>({
   const record = (scope: readonly string[], added: readonly Item[], owner: string | null) => {
     if (added.length === 0 || owner === null || owner !== userPrefix()) return;
     const kept = read(scope).filter((known) => !added.some((fresh) => same(fresh, known)));
-    write(scope, [...[...added].reverse(), ...kept].slice(0, maxItems));
+    // A batch naming an item twice keeps it once, where it was recorded last.
+    const newest = [...added]
+      .reverse()
+      .filter((fresh, index, all) => all.findIndex((other) => same(other, fresh)) === index);
+    write(scope, [...newest, ...kept].slice(0, maxItems));
   };
 
   // Ends what `follow` listens to; null while nothing is followed.

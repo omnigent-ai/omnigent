@@ -28,8 +28,12 @@ export function markdownLines(body: string): MarkdownLine[] {
     const raw = body.slice(start, newline === -1 ? end : newline);
     const text = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     const fence = FENCE.exec(text)?.[1] ?? null;
-    const fenced = openFence !== null || fence !== null;
-    if (openFence === null && fence !== null) {
+    // A backtick fence's info string holds no backtick, so "```a```" is inline code, not a fence.
+    const opens =
+      fence !== null &&
+      !(fence[0] === "`" && text.slice(text.indexOf(fence) + fence.length).includes("`"));
+    const fenced = openFence !== null || opens;
+    if (openFence === null && opens && fence !== null) {
       openFence = fence;
     } else if (
       openFence !== null &&

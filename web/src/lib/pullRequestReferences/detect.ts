@@ -34,6 +34,9 @@ const SHORTHAND = new RegExp(
   "gu",
 );
 
+const UNSPACED_CHARACTER = new RegExp(`^[${UNSPACED_SCRIPT}]$`, "u");
+const PATH_SEPARATOR = /^[/\\]$/;
+
 /** The whole character that ends just before `index`, astral ones included; "" at the start. */
 function characterBefore(text: string, index: number): string {
   if (index === 0) return "";
@@ -47,6 +50,21 @@ function characterBefore(text: string, index: number): string {
 /** GitHub's largest PR number fits a signed 32-bit integer. */
 const MAX_NUMBER = 2 ** 31 - 1;
 
+/**
+ * Whether the start at `index` follows a run of Han, kana or Hangul that itself follows a path
+ * separator, as `/修正#12` does: that's a path or URL, though prose may border the run.
+ */
+function endsUnspacedPathSegment(text: string, index: number): boolean {
+  let at = index;
+  let before = characterBefore(text, at);
+  if (!UNSPACED_CHARACTER.test(before)) return false;
+  while (UNSPACED_CHARACTER.test(before)) {
+    at -= before.length;
+    before = characterBefore(text, at);
+  }
+  return PATH_SEPARATOR.test(before);
+}
+
 /** Every PR reference in `text`, in order; none when the text has no `#`. */
 export function detectPullRequestShorthand(text: string): PullRequestShorthand[] {
   if (!text.includes("#")) return [];
@@ -54,7 +72,10 @@ export function detectPullRequestShorthand(text: string): PullRequestShorthand[]
   SHORTHAND.lastIndex = 0;
   for (let match = SHORTHAND.exec(text); match; match = SHORTHAND.exec(text)) {
     // A blocked start may still begin a reference one character on, as a lookbehind would try.
-    if (BLOCKS_BEFORE.test(characterBefore(text, match.index))) {
+    if (
+      BLOCKS_BEFORE.test(characterBefore(text, match.index)) ||
+      endsUnspacedPathSegment(text, match.index)
+    ) {
       SHORTHAND.lastIndex = match.index + 1;
       continue;
     }
