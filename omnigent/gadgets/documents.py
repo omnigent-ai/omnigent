@@ -898,17 +898,15 @@ class ImmutableDocumentStore:
         head = self._load_head(ref)
         if head is None:
             raise NotFound("document does not exist")
-        # Cheap reuse/replay check on the revisions already in hand. When the
-        # precondition below holds the operation cannot have been applied yet.
-        replay = self._find_operation(ref, head, operation_id, 2)
+        # The whole replay window, even when the caller names the current version: an
+        # operation ID used a few revisions ago for something else is reuse, refused, and
+        # its first request keeps its replay.
+        replay = self._find_operation(ref, head, operation_id, self._limits.idempotency_window)
         if replay is not None:
             return self._replay(ref, replay, digest)
         current = self._version_of(ref, head.latest)
         deleted = head.latest.kind in _GONE
         if deleted or current != if_version:
-            replay = self._find_operation(ref, head, operation_id, self._limits.idempotency_window)
-            if replay is not None:
-                return self._replay(ref, replay, digest)
             if deleted:
                 raise NotFound("document was deleted")
             raise Conflict(
@@ -956,12 +954,6 @@ class ImmutableDocumentStore:
         claim: str | None,
     ) -> Document | DeleteResult:
         now = self._now()
-        if head is not None and head.latest.kind == _CREATE:
-            # A create notes itself in the index after its revision commits; a writer that
-            # stopped in between left the newest revision unindexed. Every later revision is
-            # written here, under the lock, so noting it now leaves no create unindexed once
-            # it is no longer the newest.
-            self._index_create(ref, head.latest.operation_id, head.count)
         if head is None:
             number, generation, prev_digest = 1, 1, None
             created_at, created_by = now, actor
@@ -985,6 +977,13 @@ class ImmutableDocumentStore:
                 raise Conflict(
                     "document was removed while it was written", reason="concurrent_write"
                 )
+            if previous.kind == _CREATE:
+                # A create notes itself in the index after its revision commits; a writer
+                # that stopped in between left the newest revision unindexed. Every later
+                # revision is written here, under the lock, so noting it now leaves no create
+                # unindexed once it is no longer the newest. Only after the check above, so
+                # a writer holding an old incarnation's head never notes it in a new one.
+                self._index_create(ref, previous.operation_id, head.count)
             if (
                 self._segment_of(number) > 1
                 and (number - 1) % self._limits.revisions_per_segment == 0
@@ -1127,7 +1126,9 @@ class ImmutableDocumentStore:
         # before it (see _append_locked).
         if revision.kind == _CREATE and revision is head.latest:
             with self._record_lock(ref) as held:
-                if held:
+                # Still this incarnation's newest revision: a record removed and created
+                # again since must not get this old create's entry.
+                if held and self._still_chained(ref, head.count + 1, revision.digest):
                     self._index_create(ref, revision.operation_id, head.count)
         return result
 
@@ -1603,12 +1604,16 @@ class ImmutableDocumentStore:
         return False
 
     def _has_revisions(self, ref: _Ref) -> bool:
-        """Whether the record's directory holds anything; a record's first entry is its
-        first revision, so an empty or missing directory is a record never written."""
+        """Whether the record was ever written: a record's first entry is its first
+        revision, so it is probed by name, however long the record's history (never by
+        listing its directory). An unreadable first revision still counts as written."""
         try:
-            return bool(self._files.list_paths(ref.directory))
+            self._files.read_json(self._revision_path(ref, 1))
         except NotFound:
             return False
+        except CorruptData:
+            return True
+        return True
 
     def _claim_path(self, collection: str, doc_id: str) -> str | None:
         """The capacity slot *doc_id* holds, or ``None`` if it holds none."""

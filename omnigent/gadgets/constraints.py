@@ -139,6 +139,22 @@ def _json_equal(left: Any, right: Any) -> bool:
     return _canonical(_json_key(left)) == _canonical(_json_key(right))
 
 
+UNGUARDED_HOLD_S = 60
+"""How long an unguarded write's reservation holds rebuilds back (see ``mark_stale``)."""
+
+
+def _live_reservations(state: dict, now: float) -> dict[str, int]:
+    """The unguarded writes' reservations younger than :data:`UNGUARDED_HOLD_S`."""
+    held = state.get("unguarded")
+    if not isinstance(held, dict):
+        return {}
+    return {
+        token: at
+        for token, at in held.items()
+        if isinstance(token, str) and type(at) is int and now - at < UNGUARDED_HOLD_S
+    }
+
+
 def _epoch_name(number: int) -> str:
     return f"e{number:06d}"
 
@@ -763,12 +779,9 @@ class ConstraintGuard:
         elif kind == "unique":
             keys = plan.unique.setdefault(rule["name"], {})
             old_key, new_key = self._unique_key(rule, old), self._unique_key(rule, new)
-            # Keeping its value: allowed even for a value earlier data already repeats.
-            if (
-                new_key is not None
-                and old_key == new_key
-                and record_id in _holders(keys.get(new_key))
-            ):
+            # Keeping its value: allowed even for a value earlier data already repeats, and
+            # even when the state over capacity keeps no holders to say so.
+            if new_key is not None and old_key == new_key:
                 return
             if old_key is not None:
                 _set_holders(
@@ -1077,7 +1090,13 @@ class ConstraintGuard:
                 self.actor,
             )
 
-    def mark_stale(self, *, unguarded_write: bool = False) -> None:
+    def mark_stale(
+        self,
+        *,
+        unguarded_write: bool = False,
+        reserve: str | None = None,
+        release: str | None = None,
+    ) -> None:
         """Mark the derived state stale, so the next guarded write rebuilds it.
 
         For an *unguarded_write*, one the published rules don't cover (no rules, or rules
@@ -1088,6 +1107,12 @@ class ConstraintGuard:
         A change left pending stays pending: the next guarded writer finishes it before it
         rebuilds, so a change that can't finish yet never fails this. A gadget that never had
         rules has no state, and nothing is written.
+
+        An unguarded write *reserve*s a token before it writes and *release*s it after: while
+        a reservation is younger than :data:`UNGUARDED_HOLD_S`, no rebuild commits, so one
+        that read the records before the write landed can't take the place of the mark the
+        write would make after it. A release that never comes (the mark failed, the process
+        stopped) only holds rebuilds that long; the next one then reads the landed write.
         """
         if not self._epochs():
             return
@@ -1102,16 +1127,25 @@ class ConstraintGuard:
             # A rebuild under way may already have read the record this write changed, so
             # it starts over even when the state is stale or the rules match.
             rebuilding = isinstance(current.get("rebuild"), dict)
-            if not rebuilding and (
+            settled = not rebuilding and (
                 current.get("rules") == _STALE
                 or (unguarded_write and current.get("rules") == self.digest)
-            ):
+            )
+            reservations = _live_reservations(current, time.time())
+            if reserve is not None:
+                reservations[reserve] = int(time.time())
+            if release is not None:
+                reservations.pop(release, None)
+            if settled and reserve is None and release is None:
                 return
+            value = {**current, "unguarded": reservations}
+            if not settled:
+                value.update(rules=_STALE, rebuild=None, over_capacity=None)
             try:
                 self.guard.replace(
                     _GUARD_COLLECTION,
                     epoch,
-                    {**current, "rules": _STALE, "rebuild": None, "over_capacity": None},
+                    value,
                     state.version,
                     self._guard_operation(state, "stale"),
                     self.actor,
@@ -1176,6 +1210,12 @@ class ConstraintGuard:
             # reads them until the rebuild commits (writes help with it first, and a pending
             # change was finished before it began), so they make room for the new ones.
             updated = {**value, "counts": {}, "unique": {}, "rebuild": progress, "writes": writes}
+        elif _live_reservations(value, time.time()):
+            # An unguarded write is on its way: this rebuild may have read the records before
+            # it landed, so it doesn't commit; the write's own mark restarts it.
+            raise Conflict(
+                "A write to this gadget is still finishing; try again shortly", reason="busy"
+            )
         else:
             updated = {
                 **value,

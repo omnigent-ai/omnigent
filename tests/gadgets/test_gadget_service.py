@@ -1725,6 +1725,49 @@ def test_a_dependent_removed_while_its_rule_update_waited_counts_as_done(
     assert _run(service, app, "r1") is None
 
 
+def test_a_write_whose_last_mark_failed_still_counts_once_its_reservation_expires(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unguarded write reserves, then rules are published and a guarded write would
+    # rebuild before the write lands; the write's mark after it fails. No rebuild commits
+    # while the reservation lives, and the one after it counts the landed record.
+    import time as real_time
+
+    class Clock:
+        now = real_time.time()
+
+        def time(self) -> float:
+            return self.now
+
+        def sleep(self, seconds: float) -> None:
+            pass
+
+    clock = Clock()
+    monkeypatch.setattr(constraints_module, "time", clock)
+    service = gadgets.service()
+    limit = {"name": "one", "kind": "max_records", "collection": "cards", "max": 1}
+    app = publish_ruled_board(service, [limit])
+    first = card(service, app, "first", "todo")  # Gives the rules their state.
+    rpc(service, app, "delete", id="first", if_version=first["version"], operation_id="d-first")
+    app = _republish(service, app, ruled_revision(service, app["id"], []))
+    gadget = gadgets.store.get(app["id"])
+    files = service._files(gadget)
+    store = documents_module.ImmutableDocumentStore(
+        files, "data", limits=service_module._DATA_STORE_LIMITS
+    )
+    marker = ConstraintGuard(files, "data/_guard", store, [], service.viewer.user_id)
+    marker.mark_stale(unguarded_write=True, reserve="late-write")
+    app = _republish(service, app, ruled_revision(service, app["id"], [limit]))
+    with pytest.raises(Conflict):  # The rebuild can't commit past the reservation.
+        card(service, app, "a", "todo")
+    # The unguarded write lands; its release mark never happens.
+    store.create("cards", "late", {"title": "late", "column": "todo"}, "late", "x")
+
+    clock.now += constraints_module.UNGUARDED_HOLD_S + 1
+    with pytest.raises(ConstraintViolation):
+        card(service, app, "b", "todo")  # "late" fills the one place.
+
+
 def test_marking_the_rule_state_stale_never_fails_a_write_that_landed(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2130,6 +2173,43 @@ def test_a_rebuild_over_many_unique_keys_keeps_the_collection_writable(gadgets: 
         value={"title": "t000", "column": "todo"},
         operation_id="c-again",
     )
+
+
+def test_a_delete_over_capacity_unsets_dependents_that_share_a_grandfathered_value(
+    gadgets: Fixture,
+) -> None:
+    # More unique keys than the rule state holds, and two runs written before the rule with
+    # the same state, both naming card x. Deleting x unsets both: neither changes its state.
+    service = gadgets.service()
+    app = publish_ruled_board(service, [])
+    target = card(service, app, "x", "todo")
+    for index in range(340):
+        rpc(
+            service,
+            app,
+            "create",
+            collection="runs",
+            id=f"r{index:063d}",
+            value={"state": f"s{index:04d}"},
+            operation_id=f"c-{index}",
+        )
+    for name in ("da", "db"):
+        rpc(
+            service,
+            app,
+            "create",
+            collection="runs",
+            id=name,
+            value={"cardId": "x", "state": "dup"},
+            operation_id=f"c-{name}",
+        )
+    unique = {"name": "one_state", "kind": "unique", "collection": "runs", "fields": ["state"]}
+    app = _republish(service, app, ruled_revision(service, app["id"], [unique, _UNSET_RUN_CARD]))
+
+    rpc(service, app, "delete", id="x", if_version=target["version"], operation_id="x-del")
+
+    for name in ("da", "db"):
+        assert _run(service, app, name)["value"] == {"state": "dup"}
 
 
 def test_rules_published_over_more_unique_keys_than_fit_still_allow_deletes(

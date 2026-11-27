@@ -1708,7 +1708,9 @@ class GadgetService:
         # before anything changes; marked again after it (below) in case rules rebuilt in
         # between.
         stale_marker = guard or ConstraintGuard(files, "data/_guard", store, [], actor)
-        stale_marker.mark_stale(unguarded_write=True)
+        # Reserved until the mark after the write, so a rebuild can't commit in between.
+        reservation = _digest([collection, record_id, operation_id, actor], 24)
+        stale_marker.mark_stale(unguarded_write=True, reserve=reservation)
         if method == "data.v1.create":
             result = store.create(collection, record_id, params.get("value"), operation_id, actor)
         elif method == "data.v1.replace":
@@ -1719,9 +1721,9 @@ class GadgetService:
         else:
             result = store.delete(collection, record_id, cast(str, version), operation_id, actor)
         try:
-            stale_marker.mark_stale(unguarded_write=True)
+            stale_marker.mark_stale(unguarded_write=True, release=reservation)
         except StoreError:
-            # The write landed and the state was already marked before it; only a rebuild
-            # racing this write is left uncounted, and that one saw the write's collection.
+            # The write landed and the state was marked before it; its reservation keeps any
+            # rebuild from committing until it expires, after which a rebuild reads the write.
             _log.warning("could not mark a gadget's rule state stale after a write", exc_info=True)
         return result.to_dict()

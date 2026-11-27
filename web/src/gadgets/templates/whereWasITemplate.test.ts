@@ -469,6 +469,29 @@ describe("where was I template", () => {
     expect(byId("next-section").textContent).not.toContain("Working on it");
   });
 
+  it("offers a step again, on a click, whose old run record still says running", async () => {
+    // A fresh page: the run record says running, written hours ago, and no action is tracked
+    // for it any more (its runner stopped before updating the record).
+    const { emit, emitActions, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
+    const step = { label: "Ramp the flag to 10%", task: "rollout" };
+    const hoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    emit("step_runs", [
+      {
+        id: "ramp-10",
+        version: "v1",
+        value: { ...step, state: "running", updated: hoursAgo },
+      },
+    ]);
+    emitActions([]);
+
+    await waitFor(() =>
+      expect(byId("next-section").textContent).toContain("Stopped without saying it finished"),
+    );
+    expect(byId("next-section").textContent).not.toContain("Working on it");
+  });
+
   it("keeps counting a scan from its request after the page reloads", async () => {
     const { emit, emitActions, ready } = startRadar();
     await waitFor(() => expect(ready()).toBe(true));

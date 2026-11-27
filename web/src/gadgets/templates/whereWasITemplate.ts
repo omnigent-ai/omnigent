@@ -449,6 +449,8 @@ const KIT_SCRIPT = `
 ${GADGET_KIT_HELPERS}
   var OPEN = ['pending', 'queued', 'running', 'needs_input'];
   var PENDING_MS = 10 * 60 * 1000;
+  // A next step whose run record says running, with no action tracked, untouched this long.
+  var STALE_RUN_MS = 60 * 60 * 1000;
   var STATE_LABELS = { active: 'Active', blocked: 'Blocked', waiting: 'Waiting', done: 'Done' };
   var STATE_ORDER = { blocked: 0, active: 1, waiting: 2, done: 3 };
   // The delivery lifecycle a task's track is laid out on, and the default steps of each stage,
@@ -920,7 +922,16 @@ ${GADGET_KIT_HELPERS}
     if (finish && !(record && (record.state === 'done' || record.state === 'failed'))) {
       return { run: finish.state, text: finish.state === 'done' ? 'Done' : 'Did not work', session: action ? action.sessionId : record && record.session_id, again: true };
     }
-    if (record && record.state === 'running' && !action) return { run: 'running', text: 'Working on it…', spin: true, session: record.session_id };
+    if (record && record.state === 'running' && !action) {
+      // Its action is no longer tracked: recent, it is still being worked on; long untouched,
+      // its run stopped without saying so. Offered again only on an explicit click, since
+      // its work may have been delivered.
+      var touched = Date.parse(record.updated || runDocs[step.id].updatedAt || '');
+      if (!isNaN(touched) && Date.now() - touched > STALE_RUN_MS) {
+        return { run: 'failed', text: 'Stopped without saying it finished. Check its session before trying again.', session: record.session_id, again: true };
+      }
+      return { run: 'running', text: 'Working on it…', spin: true, session: record.session_id };
+    }
     if (record && (record.state === 'done' || record.state === 'failed')) {
       return { run: record.state, text: (record.state === 'done' ? 'Done' : 'Did not work') + (record.outcome ? ': ' + record.outcome : ''), session: record.session_id, again: true };
     }

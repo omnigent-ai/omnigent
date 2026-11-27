@@ -204,6 +204,25 @@ def test_a_recreated_record_keeps_its_history_and_refuses_stale_versions(env: En
     assert env.docs.verify_record("cards", "c1").generation == 2  # type: ignore[union-attr]
 
 
+def test_an_operation_id_used_a_few_revisions_ago_is_reuse_even_at_the_current_version(
+    tmp_path: Path,
+) -> None:
+    env = Env(tmp_path, StoreLimits(**{**vars(SMALL), "idempotency_window": 16}))
+    first = env.docs.create("cards", "a", {"n": 1}, "op-create", ACTOR)
+    second = env.docs.replace("cards", "a", {"n": 2}, first.version, "op-two", ACTOR)
+    third = env.docs.replace("cards", "a", {"n": 3}, second.version, "op-three", ACTOR)
+    fourth = env.docs.replace("cards", "a", {"n": 4}, third.version, "op-four", ACTOR)
+
+    # "op-two" names another change, three revisions back, inside the replay window.
+    with pytest.raises(Conflict) as reused:
+        env.docs.replace("cards", "a", {"n": 99}, fourth.version, "op-two", ACTOR)
+    assert reused.value.reason == "operation_reuse"
+    assert env.docs.get("cards", "a").value == {"n": 4}  # type: ignore[union-attr]
+    # Its own retry still replays.
+    again = env.docs.replace("cards", "a", {"n": 2}, first.version, "op-two", ACTOR)
+    assert again.version == second.version
+
+
 def test_a_page_can_be_empty_and_still_continue(tmp_path: Path) -> None:
     limits = StoreLimits(
         **{**vars(SMALL), "max_records_per_collection": 4, "max_scan_per_list": 2}
@@ -317,6 +336,30 @@ def test_a_stale_writer_that_stops_after_writing_leaves_the_new_record_usable(
     assert docs.get("cards", "a") == fresh
     assert docs.verify_record("cards", "a").revisions == 1  # type: ignore[union-attr]
     assert docs.replace("cards", "a", {"n": 3}, fresh.version, "op-a3", ACTOR).value == {"n": 3}
+
+
+def test_a_stale_writer_holding_an_old_create_never_indexes_it_in_the_new_record(
+    env: Env,
+) -> None:
+    # The writer read a record whose newest revision is its create, then paused while the
+    # record was deleted, removed and created again by another operation.
+    old = env.docs.create("cards", "a", {"n": 1}, "op-old", ACTOR)
+    ref = env.docs._ref("cards", "a")
+    stale = env.docs._load_head(ref)
+    assert stale is not None and stale.latest.kind == "create"
+    env.docs.delete("cards", "a", old.version, "del-a", ACTOR)
+    env.clock.advance(61)
+    env.docs._purge(ref, env.docs._load_head(ref))
+    fresh = env.docs.create("cards", "a", {"n": 2}, "op-new", ACTOR)
+    index = env.root.parent / env.docs._create_index_path(ref, "op-old")
+
+    with pytest.raises(Conflict):
+        env.docs._append(ref, stale, "replace", {"n": 9}, "op-stale", ACTOR, "d" * 64)
+
+    # The new record's index never names the old create, whose operation ID is free for
+    # a later create of this record to record its own receipt under.
+    assert not index.exists()
+    assert env.docs.get("cards", "a") == fresh
 
 
 def test_a_reclaim_racing_a_writer_waits_for_it(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -814,6 +857,35 @@ def test_a_create_probes_a_bounded_run_of_capacity_slots(tmp_path: Path) -> None
     # 64 capacity slots, plus about 2*log2(300) reads to find the end of the collection's
     # order for its new entry.
     assert files.examined <= 100
+
+
+@pytest.mark.parametrize("history", [1, 400])
+def test_a_full_collection_checks_live_claimants_without_reading_their_history(
+    tmp_path: Path, history: int
+) -> None:
+    # Aged live records, one with a long history: deciding a claimant was written never
+    # lists its revisions, so the work a full create does doesn't grow with them.
+    limits = StoreLimits(
+        max_records_per_collection=4,
+        max_list_entries=64,
+        max_scan_per_list=10,
+        revisions_per_segment=4,
+        tombstone_retention_s=60,
+        purge_abandon_s=30,
+    )
+    files, docs, clock = _counting(tmp_path, limits)
+    for n in range(4):
+        current = docs.create("cards", f"c{n}", {"n": 0}, f"create-{n}", ACTOR)
+    for edit in range(history - 1):
+        current = docs.replace("cards", "c3", {"n": edit + 1}, current.version, f"e-{edit}", ACTOR)
+    clock.advance(61)
+    files.reset()
+
+    with pytest.raises(CapacityExceeded):
+        docs.create("cards", "fresh", {"n": 1}, "create-fresh", ACTOR)
+
+    # Fixed apart from a log-sized head lookup: 400 revisions cost about what 1 does.
+    assert files.examined <= 60
 
 
 def test_reclaiming_capacity_looks_at_a_bounded_number_of_records(tmp_path: Path) -> None:

@@ -558,10 +558,23 @@ export function useGadgetRailTabState(
     }
     const marker = `${location.key}\n${urlGadget}`;
     if (handledUrlRef.current === marker) return;
+    // Asked for only once the session's gadgets are known, and only for one among them: a
+    // stale link, or one on a server without gadgets, never opens the workspace for nothing.
+    if (loading) return;
+    const key = gadgetRailKey(urlGadget);
+    if (!tabKeys.includes(key)) {
+      // Not linked here (yet): nothing to show, and no request left to show it later. Not
+      // marked handled, so a link that lands afterwards still shows it.
+      const pending = useGadgetRailRequest.getState().requested;
+      if (pending?.conversationId === conversationId && pending.key === key) {
+        clearGadgetRailRequest();
+      }
+      return;
+    }
     handledUrlRef.current = marker;
     if (fullScreenGadgetId === urlGadget) return;
-    requestGadgetRailTab(conversationId, gadgetRailKey(urlGadget), { maximize: true, keepSidebar });
-  }, [urlGadget, location.key, conversationId, fullScreenGadgetId, keepSidebar]);
+    requestGadgetRailTab(conversationId, key, { maximize: true, keepSidebar });
+  }, [urlGadget, location.key, conversationId, fullScreenGadgetId, keepSidebar, loading, tabKeys]);
   // Entering or leaving full screen updates the URL in place; the history entry stays the same.
   const shownFullScreenRef = useRef<string | null>(null);
   useEffect(() => {

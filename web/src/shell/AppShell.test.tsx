@@ -3021,6 +3021,8 @@ describe("gadget full screen contract", () => {
 
     await act(async () => listed([BOARD]));
     await waitFor(() => expect(covers()).toBe("false"));
+    // Nothing was asked of the rail for it, so no later visit can open it for nothing.
+    expect(useGadgetRailRequest.getState().requested).toBeNull();
   });
 
   describe("opened from a fresh link", () => {
