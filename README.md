@@ -196,13 +196,35 @@ harnesses (`omnigent run <agent.yaml>` with the claude-sdk / cursor / codex
 harnesses). Agents run under a Windows **Job Object** for process-tree
 containment.
 
-What is **not** available on Windows (use Linux/macOS, or WSL, for these):
+What is **not** available on Windows (use Linux/macOS, or a host in WSL2, for
+these):
 
-- the native `omnigent claude` / `omnigent codex` / `omnigent cursor`
-  tmux/PTY terminal wrappers (run an SDK harness or the web UI instead);
+- every native (tmux-backed) harness: `claude-native`, `codex-native`,
+  `pi-native`, `cursor-native` and the other `*-native` ids, which back the
+  `omnigent claude` / `omnigent codex` / `omnigent pi` terminal wrappers. A
+  Windows host reports them as unavailable, so the web UI shows them as needing
+  setup on that host even when their CLIs are installed and signed in. Use an
+  SDK harness instead, or run the host in WSL2 (below);
 - `bwrap`/`seatbelt` filesystem & network sandboxing and the L7 egress proxy
   — the Job Object backend contains the process tree and enforces resource
   limits but does **not** isolate the filesystem or network.
+
+**Native harnesses from a Windows machine: run the host in WSL2.** Omnigent
+treats WSL2 as Linux, so the Linux prerequisites apply:
+
+1. Use a distro whose packaged tmux is 3.3 or newer, such as Ubuntu 24.04.
+   Ubuntu 22.04 ships tmux 3.2, which is too old for native harnesses.
+2. In the WSL shell, install Omnigent with the installer script above, plus
+   `tmux` and `bubblewrap` (`sudo apt install tmux bubblewrap`).
+3. Install the harness CLIs (`claude`, `codex`, `pi`) inside WSL and set up
+   their credentials there, with `omnigent setup` or each CLI's own sign-in.
+   WSL doesn't read Windows-side CLI config (such as a gateway base URL), and
+   Omnigent refuses to launch a Windows `claude.exe` from WSL.
+4. From the WSL shell, run `omnigent login https://your-host` and then
+   `omnigent host https://your-host`. By default the WSL host gets the Windows
+   machine's hostname, so stop any Windows-side host for the same server
+   (`omnigent host stop --server https://your-host` in PowerShell) to keep the
+   two from being confused in the host picker.
 
 </details>
 
