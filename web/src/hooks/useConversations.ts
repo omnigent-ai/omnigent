@@ -88,6 +88,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
+import { nestFamilyUnder } from "@/lib/sessionFamilies";
 import type { Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
@@ -2641,9 +2642,14 @@ export function useMoveToNest() {
       return (await response.json()) as Conversation;
     },
     onMutate: async ({ id, destination }) => {
+      // Open-session rows refetch without tombstones, so a fetch in flight would undo the
+      // paint. Only rows already shown get painted, so only their fetches are cancelled.
+      const backfills = [id, ...(destination ? [destination.id] : [])]
+        .map((rowId) => ["conversation-backfill", rowId])
+        .filter((queryKey) => queryClient.getQueryData<Conversation | null>(queryKey));
       await Promise.all(
-        ["conversations", "project-sessions"].map((key) =>
-          queryClient.cancelQueries({ queryKey: [key] }),
+        [["conversations"], ["project-sessions"], ...backfills].map((queryKey) =>
+          queryClient.cancelQueries({ queryKey }),
         ),
       );
       const row = findCachedConversationRow(queryClient, id);
@@ -2655,14 +2661,24 @@ export function useMoveToNest() {
           ?.name ??
         projectLabel ??
         null;
+      // Paint a new nest only under a quiet standalone head. One with its own move in flight,
+      // or whose former nest still uses its id until the server re-keys it, shows the nest
+      // once the server answers, so neither row disagrees with the other meanwhile.
+      const waitForServer =
+        !!destination &&
+        !destination.family &&
+        (movingSessions.has(destination.id) || isCachedFamilyId(queryClient, destination.id));
       const move: MoveTombstone = {
         project,
         projectId,
         projectLabel,
-        family: destination?.family ?? null,
+        family: waitForServer ? undefined : destination ? nestFamilyUnder(destination) : null,
       };
       markSessionMoving(id, move);
+      const head = waitForServer ? null : paintNestHead(queryClient, destination, move);
       const moved = withMoveTombstone(row);
+      const tombstoned = new Map([[id, moved]]);
+      if (head) tombstoned.set(head.row.id, head.row);
       const queries = ["conversations", "project-sessions"].flatMap((key) =>
         queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: [key] }),
       );
@@ -2690,31 +2706,32 @@ export function useMoveToNest() {
         const filters = inProject
           ? filtersFromProjectQueryKey(key)
           : filtersFromConversationQueryKey(key);
-        const items = new Map([[id, moved]]);
-        let next = mergeItemsIntoPages(data, items, filters).data;
+        let next = mergeItemsIntoPages(data, tombstoned, filters).data;
         if (inProject && key[1] === project && !globallyVisible)
-          next = insertNewRowsIntoPages(next, items, filters).data;
+          next = insertNewRowsIntoPages(next, new Map([[id, moved]]), filters).data;
         if (next !== data) queryClient.setQueryData(key, next);
       }
       queryClient.setQueryData(["conversation-backfill", id], backfill ? moved : backfill);
       if (pins)
         queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
           ...pins,
-          conversations: pins.conversations.map((c) => (c.id === id ? moved : c)),
+          conversations: pins.conversations.map((c) => tombstoned.get(c.id) ?? c),
         });
-      return { queries, backfill, pins, move };
+      return { queries, backfill, pins, move, head };
     },
     onError: (error, { id }, previous) => {
       showToast(error.message);
       if (!previous) return;
       unmarkSessionMoving(id, previous.move);
+      if (previous.head) unmarkSessionMoving(previous.head.row.id, previous.move);
       for (const [key, data] of previous.queries) if (data) queryClient.setQueryData(key, data);
       restoreOpenSessionRow(queryClient, id, previous.backfill);
+      if (previous.head) restoreNestHeadFamily(queryClient, previous.head);
       queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, previous.pins);
     },
     onSuccess: (updated, _variables, previous) => {
       if (!previous) return;
-      previous.move.family = updated.family ?? null;
+      if (previous.move.family !== undefined) previous.move.family = updated.family ?? null;
       previous.move.projectId = updated.project_id ?? null;
       previous.move.projectLabel = updated.labels?.[PROJECT_LABEL_KEY] || undefined;
       previous.move.project =
@@ -2731,12 +2748,65 @@ export function useMoveToNest() {
           ["project-sessions"],
           ["projects"],
           ["session", id],
+          ...(previous?.head ? [["session", previous.head.row.id]] : []),
+          // Open-session rows: the moved row, the head, and any re-keyed former nest members.
+          ["conversation-backfill"],
           PINNED_CONVERSATIONS_KEY,
         ].map((queryKey) => queryClient.invalidateQueries({ queryKey })),
       );
-      if (previous) unmarkSessionMoving(id, previous.move);
+      if (!previous) return;
+      unmarkSessionMoving(id, previous.move);
+      if (previous.head) unmarkSessionMoving(previous.head.row.id, previous.move);
     },
   });
+}
+
+/** Whether a cached list, pinned or open-session row still belongs to the family `familyId`. */
+function isCachedFamilyId(queryClient: QueryClient, familyId: string): boolean {
+  const inFamily = (row: Conversation) => row.family?.id === familyId;
+  const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+  if (pinned?.conversations.some(inFamily)) return true;
+  const backfills = queryClient.getQueriesData<Conversation | null>({
+    queryKey: ["conversation-backfill"],
+  });
+  if (backfills.some(([, row]) => row && inFamily(row))) return true;
+  return ["conversations", "project-sessions"].some((key) =>
+    queryClient
+      .getQueriesData<ConversationsInfiniteData>({ queryKey: [key] })
+      .some(([, data]) => data?.pages.some((page) => page.data.some(inFamily))),
+  );
+}
+
+/** A standalone nest destination, painted as the head of the nest a move creates. */
+interface NestHeadPaint {
+  /** The head's row as it looks leading the nest; it carries the move's tombstone. */
+  row: Conversation;
+  /** The head's family before the move, restored on its open-session row if the move fails. */
+  previousFamily: Conversation["family"];
+}
+
+/** Show a standalone `destination` leading the nest `move` creates; `null` when it has a nest. */
+function paintNestHead(
+  queryClient: QueryClient,
+  destination: Conversation | null,
+  move: MoveTombstone,
+): NestHeadPaint | null {
+  if (!destination || destination.family) return null;
+  markSessionMoving(destination.id, move);
+  const cached = findCachedConversationRow(queryClient, destination.id) ?? destination;
+  const row = { ...withMoveTombstone(cached), family: move.family };
+  const backfillKey = ["conversation-backfill", destination.id];
+  if (queryClient.getQueryData<Conversation | null>(backfillKey)) {
+    queryClient.setQueryData(backfillKey, row);
+  }
+  return { row, previousFamily: cached.family };
+}
+
+/** Undo a failed move's family on the head's open-session row, keeping newer streamed fields. */
+function restoreNestHeadFamily(queryClient: QueryClient, head: NestHeadPaint): void {
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", head.row.id], (row) =>
+    row ? { ...row, family: head.previousFamily } : row,
+  );
 }
 
 /**

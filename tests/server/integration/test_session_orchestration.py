@@ -3,7 +3,7 @@
 import json
 from contextvars import ContextVar
 from unittest.mock import Mock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -3682,3 +3682,17 @@ async def test_owner_moves_one_session_into_and_out_of_a_nest(auth_client, peers
     assert detached.status_code == 200, detached.text
     assert detached.json().get("family") is None
     assert {row.id for row in store.get_session_family(source["id"])} == {source["id"], peer.id}
+    dashed = str(UUID(hex=moved["id"]))
+    for path_id, source_id in ((moved["id"], moved["id"]), (moved["id"], dashed)):
+        refused = await auth_client.patch(
+            f"/v1/sessions/{path_id}", json={"nest_source_id": source_id}
+        )
+        assert refused.status_code == 400, (source_id, refused.text)
+    assert store.get_conversation(moved["id"]).family_id is None
+    standalone = await _create_session_as(auth_client, "", "alice")
+    nested = await auth_client.patch(
+        f"/v1/sessions/{moved['id']}", json={"nest_source_id": standalone["id"]}
+    )
+    assert nested.status_code == 200, nested.text
+    assert nested.json()["family"]["id"] == standalone["id"]
+    assert nested.json()["family"]["representative_id"] == standalone["id"]

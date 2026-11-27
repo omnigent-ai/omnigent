@@ -177,6 +177,7 @@ from omnigent.stores.session_journal_store import (
     reserve_fork_journal,
 )
 from omnigent.util.session_lifecycle import title_without_closed_marker
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -2083,7 +2084,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise ConversationNotFoundError(source_id)
         family_id = source.family_id or self._conversation_storage_id(source.id)
         target = self.get_conversation(session_id) if move_existing else None
-        if source.family_id is None:
+        # A move keys a new nest by the standalone source's own ID so the source heads it;
+        # write() re-keys an old nest that still uses that ID.
+        if source.family_id is None and not move_existing:
             with self._session("prepare_sibling_membership") as session:
                 members = self._family_member_ids(session, family_id)
                 if members and source_id not in members:
@@ -2185,6 +2188,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "Sibling source is no longer available", code=ErrorCode.CONFLICT
                     )
                 members = self._family_member_ids(session, family_id)
+                if move_existing and source_meta.family_id is None and members:
+                    self._rekey_family(session, members)
+                    members = []
                 if source_meta.family_id is None and members:
                     raise OmnigentError(
                         "This session ID is still used by another family",
@@ -2238,11 +2244,33 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
 
+    def _rekey_family(self, session: Session, member_ids: list[str]) -> None:
+        """
+        Give a family a fresh ID, freeing its old one for the session it was keyed by.
+
+        A nest keeps its head's ID after the head leaves it. Re-keying lets that
+        session head a new nest under its own ID. Call it holding the family lock.
+
+        :param session: The metadata transaction holding the family's lock.
+        :param member_ids: Every member of the family, e.g. ``["conv_a1", "conv_a2"]``.
+        """
+        session.execute(
+            update(SqlConversationMetadata)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id.in_(member_ids),
+            )
+            .values(family_id=uuid.uuid4().hex)
+        )
+
     def set_session_nest(
         self, session_id: str, source_id: str | None, *, user_id: str | None
     ) -> None:
-        if source_id == session_id:
-            return
+        # Ids arrive in any accepted spelling (bare, dashed or legacy-prefixed).
+        if source_id is not None and normalize_uuid(source_id) == normalize_uuid(session_id):
+            raise OmnigentError(
+                "A session can't be nested under itself", code=ErrorCode.INVALID_INPUT
+            )
         if source_id is not None:
             self.add_new_sibling(source_id, session_id, user_id=user_id, move_existing=True)
             return

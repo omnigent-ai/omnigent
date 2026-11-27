@@ -10660,6 +10660,34 @@ def test_move_one_session_between_nests(request, store_name, monkeypatch):
     assert store.get_conversation(later.id).family_id == head.id
 
 
+@pytest.mark.parametrize("store_name", ["conversation_store", "split_db_conversation_store"])
+def test_nesting_under_a_standalone_session_makes_it_the_head(request, store_name, monkeypatch):
+    from omnigent.errors import OmnigentError
+
+    store = request.getfixturevalue(store_name)
+    clock = [100]
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: clock[0]
+    )
+    older = store.create_conversation()
+    clock[0] = 200
+    head = store.create_conversation()
+    left_behind = store.create_conversation()
+    store.add_new_sibling(head.id, left_behind.id, user_id="owner")
+    store.set_session_nest(head.id, None, user_id="owner")
+    # The nest the head left is still keyed by the head's ID.
+    assert store.get_conversation(left_behind.id).family_id == head.id
+
+    store.set_session_nest(older.id, head.id, user_id="owner")
+
+    assert [row.id for row in store.get_session_family(head.id)] == [head.id, older.id]
+    assert store.get_conversation(left_behind.id).family_id not in (None, head.id)
+    assert [row.id for row in store.get_session_family(left_behind.id)] == [left_behind.id]
+    with pytest.raises(OmnigentError, match="nested under itself"):
+        store.set_session_nest(older.id, older.id, user_id="owner")
+    assert store.get_conversation(older.id).family_id == head.id
+
+
 @pytest.mark.parametrize("split_database", [False, True])
 def test_failed_family_project_move_preserves_legacy_membership(
     tmp_path, monkeypatch, split_database

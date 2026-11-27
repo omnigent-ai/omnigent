@@ -10,6 +10,7 @@ import {
   orderSessionFamilies,
   isIndentedSibling,
   isSessionPinned,
+  nestFamilyUnder,
   sessionFamilyGroups,
 } from "@/lib/sessionFamilies";
 import { filterSessionScope } from "@/lib/sessionVisibility";
@@ -136,7 +137,7 @@ import {
 } from "@dnd-kit/sortable";
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueries, useQueryClient } from "@tanstack/react-query";
-import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { PIN_WRITE_MUTATION_KEY, SIDE_CHAT_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   canFlagUnread,
   isConversationMuted,
@@ -491,8 +492,31 @@ const NestMoveContext = createContext<{
   destinations: Conversation[];
   move: (id: string, destination: Conversation | null) => void;
   canJoin: boolean;
+  /** Whether the server lets a standalone session lead a new nest. */
+  standalone: boolean;
   saving: boolean;
 } | null>(null);
+
+/**
+ * Whether the viewer can nest sessions under `row`: an owned, active, top-level
+ * session. A standalone one then leads a new nest; a nest member stands for its nest.
+ * `standalone` is false for servers that only move sessions into existing nests.
+ */
+function isNestDestination(
+  row: Conversation,
+  viewerId: string | null,
+  standalone: boolean,
+): boolean {
+  return (
+    (standalone || !!row.family) &&
+    !row.archived &&
+    !row.provisional &&
+    !row.nested_draft_source_id &&
+    !row.parent_session_id &&
+    row.labels?.[SIDE_CHAT_LABEL_KEY] === undefined &&
+    isOwnedByViewer(row, viewerId)
+  );
+}
 // Moves a session into another row's slot in the Custom order (row menu Move up/down).
 const SessionReorderContext = createContext<(fromId: string, toId: string) => void>(() => {});
 
@@ -3081,10 +3105,9 @@ function ConversationList({
   const nestMovesSupported = serverInfo !== "loading" && serverInfo.session_nest_moves === true;
   const moveNest = useStableCallback((id: string, destination: Conversation | null) => {
     if (moveToNest.isPending) return;
-    if (destination?.family) {
-      setCollapsedFamilies(
-        (previous) => new Set([...previous].filter((key) => key !== destination.family!.id)),
-      );
+    if (destination) {
+      const familyId = nestFamilyUnder(destination).id;
+      setCollapsedFamilies((previous) => new Set([...previous].filter((key) => key !== familyId)));
       const project =
         projects.find((p) => p.id === destination.project_id)?.name ??
         destination.labels[PROJECT_LABEL_KEY];
@@ -3093,19 +3116,30 @@ function ConversationList({
     moveToNest.mutate({ id, destination });
   });
   const canJoinNests = serverInfo !== "loading" && serverInfo.sibling_sessions === true;
+  const standaloneNests =
+    serverInfo !== "loading" && serverInfo.session_nest_standalone_destinations === true;
   const nestMoveValue = useMemo(
     () =>
       nestMovesSupported
         ? {
-            destinations: allConversations.filter(
-              (row) => row.family && !row.archived && isOwnedByViewer(row, viewerId),
+            destinations: allConversations.filter((row) =>
+              isNestDestination(row, viewerId, standaloneNests),
             ),
             move: moveNest,
             canJoin: canJoinNests,
+            standalone: standaloneNests,
             saving: moveToNest.isPending,
           }
         : null,
-    [nestMovesSupported, allConversations, viewerId, moveNest, canJoinNests, moveToNest.isPending],
+    [
+      nestMovesSupported,
+      allConversations,
+      viewerId,
+      moveNest,
+      canJoinNests,
+      standaloneNests,
+      moveToNest.isPending,
+    ],
   );
   // The session currently being dragged (id + source project + pinned state), or
   // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
@@ -3689,7 +3723,11 @@ function ConversationList({
             });
             if (nest) {
               const destination = nest.data?.droppableContainer.data.current?.destination;
-              return destination.family?.id === source?.familyId ? [] : [nest];
+              // A drop into the session's own nest, or onto itself, moves nothing.
+              const sameNest = destination.family
+                ? destination.family.id === source?.familyId
+                : destination.id === args.active.id;
+              return sameNest ? [] : [nest];
             }
             const detachToList = collisions.find(
               (hit) => hit.data?.droppableContainer.data.current?.type === "detach-nest",
@@ -6448,10 +6486,18 @@ function ConversationRowImpl({
   const canReorder = reorderGroup !== undefined && isOwner && !isArchived;
   const nestMoves = useContext(NestMoveContext);
   const canMoveNest = !!nestMoves && isOwner && !isArchived && !conversation.parent_session_id;
+  // In the Pinned section each row is also a reorder target for other pins.
+  const pinOrder = useContext(PinOrderContext);
+  const isPinOrderTarget = !!pinOrder && isPinned && pinOrder.ids.includes(conversation.id);
   const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
     id: `nest:${conversation.id}`,
     data: { type: "session-nest", destination: conversation },
-    disabled: !canMoveNest || !conversation.family,
+    // A standalone pin's center keeps reordering pins, even while a pin write holds those
+    // drops; nest under it from the row menu.
+    disabled:
+      !canMoveNest ||
+      !isNestDestination(conversation, viewerId, nestMoves?.standalone === true) ||
+      (isPinned && !conversation.family),
   });
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -6502,12 +6548,10 @@ function ConversationRowImpl({
     const from = reorderDrag?.data.current?.reorderIndex as number;
     reorderInsertion = from < reorderIndex ? "after" : "before";
   }
-  // In the Pinned section each row is also a reorder target for other pins.
-  const pinOrder = useContext(PinOrderContext);
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
     id: `pin-order:${conversation.id}`,
     data: { type: "pin-order", id: conversation.id },
-    disabled: !pinOrder || !isPinned || !pinOrder.ids.includes(conversation.id),
+    disabled: !isPinOrderTarget,
   });
   // A pin dragged down lands below this row and one dragged up above it; a new
   // pin lands on the side of the row the pointer is on.
@@ -7928,24 +7972,28 @@ function NestPickerMenu({
   });
   const label = (row: Conversation) =>
     row.family?.representative_title ?? conversationDisplayLabel(row);
+  // One entry per nest, plus one per standalone session that would lead a new nest.
+  const nestKey = (row: Conversation) =>
+    row.family ? `family:${row.family.id}` : `session:${row.id}`;
+  // Search can lag the sidebar's rows (e.g. a just-made nest), so a hit uses the loaded row.
+  const loaded = new Map(nests.destinations.map((row) => [row.id, row]));
+  const searched = query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : [];
   const destinations = [
     ...new Map(
       [
         ...nests.destinations.filter((row) =>
           label(row).toLowerCase().includes(search.trim().toLowerCase()),
         ),
-        ...(query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : []),
+        ...searched.map((row) => loaded.get(row.id) ?? row),
       ]
         .filter(
           (row) =>
             nests.canJoin &&
-            row.family &&
-            row.family.id !== conversation.family?.id &&
+            isNestDestination(row, viewerId, nests.standalone) &&
             row.id !== conversation.id &&
-            !row.archived &&
-            isOwnedByViewer(row, viewerId),
+            (!row.family || row.family.id !== conversation.family?.id),
         )
-        .map((row) => [row.family!.id, row]),
+        .map((row) => [nestKey(row), row]),
     ).values(),
   ];
   const select = (destination: Conversation | null) => {
@@ -7968,7 +8016,7 @@ function NestPickerMenu({
       <div className="max-h-48 overflow-y-auto">
         {destinations.map((row) => (
           <C.Item
-            key={row.family!.id}
+            key={nestKey(row)}
             disabled={nests.saving}
             textValue={label(row)}
             onSelect={() => select(row)}

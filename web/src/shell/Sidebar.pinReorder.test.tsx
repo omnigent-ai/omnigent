@@ -49,7 +49,10 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 import { useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
-import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
+import {
+  EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+  PINNED_CONVERSATION_IDS_STORAGE_KEY,
+} from "./sidebarNav";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 const ROW_HEIGHT = 30;
@@ -176,6 +179,7 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
     expectTarget: false,
     offsetY: ROW_HEIGHT / 2 + 2,
   });
+  // A server without standalone nest destinations treats a standalone row as list space.
   await dropOnto("conv_member", "conv_c", { expectTarget: false });
   expect(mocks.moveNest).toHaveBeenCalledTimes(3);
   for (const [move] of mocks.moveNest.mock.calls)
@@ -211,10 +215,12 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
     conv("conv_member", { family, project_id: "project" }),
   ];
   vi.mocked(useConversations).mockReturnValue(conversationPage([]));
+  // Open the folder through storage: for 50 ms after a drag ends, dnd-kit swallows
+  // document clicks, so clicking the folder header here would race the last drop.
+  localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Demo"]));
   renderSidebar({
     info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Demo" }));
   const head = document.querySelector('li[data-sidebar-session-id="conv_d"]')!;
   const headStart = rowCenter("conv_d");
   fireEvent.mouseDown(head, { button: 0, ...headStart });
@@ -229,6 +235,35 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
   });
   expect(mocks.moveProject).toHaveBeenLastCalledWith({ id: "conv_d", project: "" });
 }, 15_000);
+
+it("starts a nest at a standalone row's center, but not over the dragged row itself", async () => {
+  const head = conv("conv_d");
+  vi.mocked(useConversations).mockReturnValue(conversationPage([conv("conv_c"), head]));
+  renderSidebar({
+    info: {
+      ...FALLBACK_SERVER_INFO,
+      sibling_sessions: true,
+      session_nest_moves: true,
+      session_nest_standalone_destinations: true,
+      features: { sidebar_grouping_ui: true },
+    },
+  });
+  await dropOnto("conv_c", "conv_c", { expectTarget: false });
+  // A row's edge still reorders, starting a Custom order.
+  await dropOnto("conv_c", "conv_d", {
+    expectTarget: false,
+    offsetY: ROW_HEIGHT / 2 - 2,
+    whileOver: () => expect(screen.getByTestId("session-order-insertion")).toBeInTheDocument(),
+  });
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view") ?? "{}").ordering).toBe("custom");
+  // A standalone pin's center still pins into that slot instead of nesting.
+  mocks.pinFn.mockResolvedValue({});
+  await dropOnto("conv_c", "conv_a");
+  expect(mocks.pinFn).toHaveBeenCalledOnce();
+  expect(mocks.moveNest).not.toHaveBeenCalled();
+  await dropOnto("conv_c", "conv_d", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenCalledExactlyOnceWith({ id: "conv_c", destination: head });
+});
 
 describe("dropping an unpinned session onto a pinned row", () => {
   it("pins it into that slot and renumbers the existing pins", async () => {
@@ -364,29 +399,46 @@ describe("dropping an unpinned session onto a pinned row", () => {
     expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
-  it("ignores a second drop while the first pin is saving, and still renumbers for the first", async () => {
-    let resolveFirst!: () => void;
-    mocks.pinFn.mockImplementation(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveFirst = resolve;
-        }),
-    );
-    renderSidebar();
+  it.each([false, true])(
+    "ignores a second drop while the first pin is saving, and still renumbers for the first (standalone nests=%s)",
+    async (standaloneNests) => {
+      let resolveFirst!: () => void;
+      mocks.pinFn.mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      );
+      renderSidebar(
+        standaloneNests
+          ? {
+              info: {
+                ...FALLBACK_SERVER_INFO,
+                sibling_sessions: true,
+                session_nest_moves: true,
+                session_nest_standalone_destinations: true,
+              },
+            }
+          : undefined,
+      );
 
-    await dropOnto("conv_c", "conv_b");
-    await waitFor(() => expect(mocks.pinFn).toHaveBeenCalledOnce());
-    // Pinned rows take no drops while a pin write is saving.
-    await dropOnto("conv_d", "conv_a", { expectTarget: false });
-    expect(mocks.pinFn).toHaveBeenCalledOnce();
+      await dropOnto("conv_c", "conv_b");
+      await waitFor(() => expect(mocks.pinFn).toHaveBeenCalledOnce());
+      // Pinned rows take no drops while a pin write is saving, not even as nests.
+      await dropOnto("conv_d", "conv_a", { expectTarget: false });
+      expect(mocks.pinFn).toHaveBeenCalledOnce();
+      expect(mocks.moveNest).not.toHaveBeenCalled();
 
-    await act(async () => {
-      resolveFirst();
-    });
-    await waitFor(() =>
-      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 1002 }]),
-    );
-  });
+      await act(async () => {
+        resolveFirst();
+      });
+      await waitFor(() =>
+        expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([
+          { id: "conv_b", pinnedAt: 1002 },
+        ]),
+      );
+    },
+  );
 
   it("offers no pinned-row reordering when the server can't store pins", async () => {
     mocks.filterHonored = false;

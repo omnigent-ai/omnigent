@@ -1142,13 +1142,20 @@ describe("two-step move menu", () => {
         representative_title: "Destination nest",
       },
     };
+    const standalone = { ...CONV, id: "standalone", title: "Standalone session" };
     mockConversations([
       { ...CONV, family: { id: "current", representative_id: CONV.id, pinned: false } },
       destination,
+      standalone,
+      { ...CONV, id: "shared", title: "Standalone shared", owner: "someone-else" },
     ]);
     const view = renderSidebar(
       undefined,
-      serverInfo({ sibling_sessions: true, session_nest_moves: true }),
+      serverInfo({
+        sibling_sessions: true,
+        session_nest_moves: true,
+        session_nest_standalone_destinations: true,
+      }),
     );
     const open = async (item: HTMLElement) => {
       if (mobile) fireEvent.click(item);
@@ -1175,6 +1182,10 @@ describe("two-step move menu", () => {
     expect(screen.queryByRole("menuitem", { name: "Destination nest" })).toBeNull();
     fireEvent.change(search, { target: { value: "Destination" } });
     expect(screen.getByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    // A standalone session the viewer owns is a destination: it would lead the new nest.
+    fireEvent.change(search, { target: { value: "Standalone" } });
+    expect(screen.getByRole("menuitem", { name: "Standalone session" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Standalone shared" })).toBeNull();
     const remote = {
       ...destination,
       id: "remote",
@@ -1186,12 +1197,24 @@ describe("two-step move menu", () => {
         representative_title: "Remote nest",
       },
     };
-    mocks.searchRows = [remote];
+    const subAgent = { ...CONV, id: "child", title: "Member child", parent_session_id: "remote" };
+    // Search lags the sidebar: it still sees the loaded nest's head as standalone.
+    const stale = { ...destination, title: "Member destination", family: null };
+    mocks.searchRows = [remote, subAgent, stale];
     fireEvent.change(search, { target: { value: "Member" } });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Remote nest" }));
+    const remoteItem = await screen.findByRole("menuitem", { name: "Remote nest" });
+    expect(screen.queryByRole("menuitem", { name: "Member child" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Member destination" })).toBeNull();
+    fireEvent.click(remoteItem);
     expect(mocks.moveToNest.mutate).toHaveBeenCalledWith({ id: CONV.id, destination: remote });
     view.unmount();
-    renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
+    // A server without standalone destinations still offers existing nests.
+    mocks.searchRows = [];
+    const fallback = renderSidebar(
+      undefined,
+      serverInfo({ sibling_sessions: true, session_nest_moves: true }),
+    );
     fireEvent.pointerDown(
       within(
         document.querySelector('li[data-sidebar-session-id="conv_1"]') as HTMLElement,
@@ -1200,8 +1223,36 @@ describe("two-step move menu", () => {
     );
     await open(screen.getByTestId("move-to-project"));
     await open(await screen.findByRole("menuitem", { name: "Nests" }));
+    expect(await screen.findByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Standalone session" })).toBeNull();
     fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from nest" }));
     expect(mocks.moveToNest.mutate).toHaveBeenLastCalledWith({ id: CONV.id, destination: null });
+    fallback.unmount();
+    // A pinned standalone session keeps pin drops, so the keyboard picker is how to nest under it.
+    mocks.pinnedStore.set([standalone.id]);
+    renderSidebar(
+      undefined,
+      serverInfo({
+        sibling_sessions: true,
+        session_nest_moves: true,
+        session_nest_standalone_destinations: true,
+      }),
+    );
+    fireEvent.pointerDown(
+      within(
+        document.querySelector('li[data-sidebar-session-id="conv_1"]') as HTMLElement,
+      ).getByTestId("conversation-actions"),
+      { button: 0 },
+    );
+    await open(screen.getByTestId("move-to-project"));
+    await open(await screen.findByRole("menuitem", { name: "Nests" }));
+    const pinnedHead = await screen.findByRole("menuitem", { name: "Standalone session" });
+    pinnedHead.focus();
+    fireEvent.keyDown(pinnedHead, { key: "Enter" });
+    expect(mocks.moveToNest.mutate).toHaveBeenLastCalledWith({
+      id: CONV.id,
+      destination: standalone,
+    });
   });
 });
 

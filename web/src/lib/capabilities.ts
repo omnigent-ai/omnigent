@@ -101,6 +101,8 @@ export interface ServerInfo {
   admin_view?: boolean;
   sibling_sessions?: boolean;
   session_nest_moves?: boolean;
+  /** Nest moves accept a standalone destination, which then leads the new nest. */
+  session_nest_standalone_destinations?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
@@ -727,6 +729,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         cachedServerInfo = {
           sibling_sessions: data.sibling_sessions === true,
           session_nest_moves: data.session_nest_moves === true,
+          session_nest_standalone_destinations: data.session_nest_standalone_destinations === true,
           sibling_session_destinations: parseSiblingSessionDestinations(
             data.sibling_session_destinations,
           ),
