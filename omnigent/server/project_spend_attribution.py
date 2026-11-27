@@ -3,9 +3,11 @@
 Spend is recorded per root session and UTC day (see ``ProjectSpend.root_days``).
 
 **By role:** each root session's member (``member_key_for_session``) decides its role:
-an identity is that role, the Lead is the Lead, the agent-workers pool is "Other
-agents", and every person's own chats are pooled as "People's own chats". The rows sum
-to the window's spend.
+an identity is that role, the Lead is the Lead, and every person's own chats are pooled
+as "People's own chats". A helper session with no role of its own counts for whoever
+created it, walking ``created_by_session_id`` up to the first session that has one; only
+helpers whose chain ends without one stay "Other agents". The rows sum to the window's
+spend.
 
 **By ticket:** each root session's spend on a day goes to tickets in this order:
 
@@ -23,7 +25,7 @@ stored.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -73,6 +75,50 @@ def spend_by_role(rows: Iterable[SpendRow], role_names: Mapping[str, str]) -> li
         for key, amount in micros.items()
     ]
     return sorted(result, key=lambda row: (-row["spend_usd"], row["name"]))
+
+
+#: Longest creator chain followed; deeper (or cyclic) chains stay "Other agents".
+MAX_CREATOR_DEPTH = 10
+
+
+def inherit_creator_roles(
+    rows: list[SpendRow],
+    creator_of: Callable[[list[str]], dict[str, str]],
+    member_of: Callable[[list[str]], dict[str, MemberKey]],
+) -> list[SpendRow]:
+    """Re-credit "Other agents" rows to the member of the nearest creator that has one.
+
+    :param creator_of: Session IDs to the session that created each, for those that know.
+    :param member_of: Session IDs to their member keys.
+    """
+    pending = {root for root, _, _, member in rows if member == WORKERS_MEMBER_KEY}
+    resolved: dict[str, MemberKey] = {}
+    current = {root: root for root in pending}
+    seen: dict[str, set[str]] = {root: {root} for root in pending}
+    for _ in range(MAX_CREATOR_DEPTH):
+        if not current:
+            break
+        creators = creator_of(sorted(set(current.values())))
+        nxt = {
+            root: creators[at]
+            for root, at in current.items()
+            if at in creators and creators[at] not in seen[root]
+        }
+        members = member_of(sorted(set(nxt.values()))) if nxt else {}
+        current = {}
+        for root, creator in nxt.items():
+            seen[root].add(creator)
+            member = members.get(creator)
+            if member is None:
+                continue
+            if member == WORKERS_MEMBER_KEY:
+                current[root] = creator
+            else:
+                resolved[root] = member
+    return [
+        (root, day, micros, resolved.get(root, member) if member == WORKERS_MEMBER_KEY else member)
+        for root, day, micros, member in rows
+    ]
 
 
 def finished_at(histories: StageHistories) -> dict[str, int]:

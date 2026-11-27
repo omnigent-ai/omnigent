@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import httpx
 
@@ -131,3 +132,80 @@ async def test_telemetry_splits_spend_and_filters_to_one_role(
     assert role["spend"]["total_usd"] == 3.0
     missing = await project_client.get(f"{path}/telemetry", params={"identity_id": "nope"})
     assert missing.status_code == 404
+
+
+def test_helpers_count_for_the_nearest_creator_with_a_role() -> None:
+    from omnigent.server.project_spend_attribution import inherit_creator_roles
+
+    creators = {
+        "helper": "sub-helper-parent",
+        "sub-helper-parent": "pm-session",
+        "lead-helper": "lead-session",
+        "orphan": "gone",
+        "loop-a": "loop-b",
+        "loop-b": "loop-a",
+    }
+    members = {
+        "sub-helper-parent": WORKERS_MEMBER_KEY,
+        "pm-session": "identity:pm",
+        "lead-session": LEAD_MEMBER_KEY,
+        "loop-a": WORKERS_MEMBER_KEY,
+        "loop-b": WORKERS_MEMBER_KEY,
+    }
+    rows = [
+        ("helper", DAY, 1, WORKERS_MEMBER_KEY),
+        ("lead-helper", DAY, 2, WORKERS_MEMBER_KEY),
+        ("orphan", DAY, 3, WORKERS_MEMBER_KEY),
+        ("loop-a", DAY, 4, WORKERS_MEMBER_KEY),
+        ("pm-session", DAY, 5, "identity:pm"),
+    ]
+    resolved = inherit_creator_roles(
+        rows,
+        lambda ids: {i: creators[i] for i in ids if i in creators},
+        lambda ids: {i: members[i] for i in ids if i in members},
+    )
+    assert [member for *_, member in resolved] == [
+        "identity:pm",  # Two levels up, through another helper.
+        LEAD_MEMBER_KEY,
+        WORKERS_MEMBER_KEY,  # Its creator is gone.
+        WORKERS_MEMBER_KEY,  # A cycle never resolves.
+        "identity:pm",
+    ]
+    assert sum(micros for _, _, micros, _ in resolved) == sum(micros for _, _, micros, _ in rows)
+
+
+async def test_telemetry_credits_a_helper_to_the_role_that_started_it(
+    project_client: httpx.AsyncClient,  # noqa: F811 - imported fixture
+    db_uri: str,
+) -> None:
+    import sqlalchemy as sa
+
+    from omnigent.db.db_models import SqlConversationMetadata
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+
+    created = (await project_client.post("/v1/projects", json={"name": "zz-helpers"})).json()
+    path = f"/v1/projects/{created['id']}"
+    pm = (
+        await project_client.post(f"{path}/identities", json={"name": "PM", "instructions": "x"})
+    ).json()
+    conversations = SqlAlchemyConversationStore(db_uri)
+    helper = conversations.create_conversation(
+        project_id=created["id"],
+        labels={CREATED_BY_SESSION_LABEL_KEY: pm["active_session_id"]},
+    )
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            sa.update(SqlConversationMetadata)
+            .where(SqlConversationMetadata.id == helper.id)
+            .values(family_id=uuid4().hex)
+        )
+    today = datetime.now(UTC).date().isoformat()
+    conversations.add_session_daily_cost(helper.id, today, 2.0)
+    conversations.add_session_daily_cost(pm["active_session_id"], today, 1.0)
+
+    spend = (await project_client.get(f"{path}/telemetry")).json()["spend"]
+    assert {row["name"]: row["spend_usd"] for row in spend["by_role"]} == {"PM": 3.0}
+    assert spend["total_usd"] == 3.0
+    role = (await project_client.get(f"{path}/telemetry", params={"identity_id": pm["id"]})).json()
+    assert role["throughput"]["spend_usd"] == 3.0

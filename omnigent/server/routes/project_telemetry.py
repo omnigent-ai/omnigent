@@ -26,14 +26,17 @@ from omnigent.server.project_kpis import (
 )
 from omnigent.server.project_spend_attribution import (
     finished_at,
+    inherit_creator_roles,
     spend_by_role,
     spend_by_ticket,
 )
 from omnigent.server.project_status import (
+    MemberKey,
     StatusSources,
     StatusWindow,
     identity_member_key,
     load_status_sources,
+    member_key_for_session,
     status_period,
 )
 from omnigent.server.project_status_cache import project_status_cache
@@ -56,6 +59,7 @@ from omnigent.server.routes.project_kpis import (
 )
 from omnigent.server.routes.project_status import _measure, move_member_resolver
 from omnigent.server.usage_events import usage_event_store
+from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 
 if TYPE_CHECKING:
     from omnigent.entities import Project
@@ -437,6 +441,32 @@ def create_project_telemetry_router(
             return daily_trends(inputs, filed)
         return daily_trends(inputs, filed, role.ticket_ids, role.session_ids)
 
+    def creators(session_ids: list[str]) -> dict[str, str]:
+        """Each session's creator, from its ``created_by_session_id`` label."""
+        labels = conversation_store.get_labels(session_ids, (CREATED_BY_SESSION_LABEL_KEY,))
+        return {
+            session_id: found[CREATED_BY_SESSION_LABEL_KEY]
+            for session_id, found in labels.items()
+            if found.get(CREATED_BY_SESSION_LABEL_KEY)
+        }
+
+    def members(project: Project, session_ids: list[str]) -> dict[str, MemberKey]:
+        """Each session's member, through its root, as the spend source credits it."""
+        found = conversation_store.get_conversations(session_ids)
+        roots = {
+            session_id: conversation.root_conversation_id or session_id
+            for session_id, conversation in found.items()
+        }
+        root_sessions = conversation_store.get_conversations(sorted(set(roots.values())))
+        owners = conversation_store.get_session_owners(list(root_sessions), owner_only=True)
+        return {
+            session_id: member_key_for_session(
+                project, root_sessions[root], owner_user_id=owners.get(root)
+            )
+            for session_id, root in roots.items()
+            if root in root_sessions
+        }
+
     def spend_split(
         project: Project,
         period: Any,
@@ -493,6 +523,10 @@ def create_project_telemetry_router(
             if spend_source is not None and hasattr(spend_source, "root_days")
             else None
         )
+        if spend_rows is not None:
+            spend_rows = inherit_creator_roles(
+                spend_rows, lambda ids: creators(ids), lambda ids: members(project, ids)
+            )
         role = None
         if identity is not None:
             key = identity_member_key(identity.id)
