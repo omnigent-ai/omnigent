@@ -2049,6 +2049,28 @@ async def test_grant_valid_level_succeeds(
     assert resp.json()["level"] == LEVEL_EDIT, "Returned level should match the granted level."
 
 
+async def test_grant_stores_the_canonical_grantee_id(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """The grant route stores the grantee as canonicalized, not as typed.
+
+    Header mode keeps case, so only the outer space is dropped here; the
+    lowercasing modes are covered by the ``canonical_grantee_id`` unit tests.
+    """
+    s1 = await _create_session_as(auth_client, "", "bryan")
+
+    resp = await _grant_permission(
+        auth_client,
+        s1["id"],
+        granter="bryan",
+        target_user="  Someone@Example.com ",
+        level=LEVEL_READ,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["user_id"] == "Someone@Example.com"
+
+
 # ── Pagination with permission filter ──────────────────────
 
 

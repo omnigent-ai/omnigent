@@ -32,7 +32,13 @@ from omnigent.entities import ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    canonical_grantee_id,
+)
 from omnigent.server.feature_flags import Feature
 from omnigent.server.managed_hosts import is_repo_workspace
 from omnigent.server.scheduled.run_sharing import (
@@ -361,11 +367,13 @@ def register_scheduled_task_permissions_routes(
     load_owned_task: Callable[[Request, str], ScheduledTask],
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
+    auth_provider: AuthProvider | None = None,
 ) -> None:
     """Register the automation share routes on the scheduled-tasks *router*.
 
     :param load_owned_task: Returns the caller's live automation, or raises the
         not-found error the other automation routes give.
+    :param auth_provider: Decides how a typed grantee ID is canonicalized.
     """
 
     def require_sharing(request: Request, *, granting: bool) -> PermissionStore:
@@ -504,7 +512,8 @@ def register_scheduled_task_permissions_routes(
         if not store.scheduled_task_shareable(task.id):
             raise OmnigentError(UNSHAREABLE_AUTOMATION_MESSAGE, code=ErrorCode.FORBIDDEN)
         [(grantee, level)] = await asyncio.to_thread(
-            store.validate_grants, [(body.user_id, body.level)]
+            store.validate_grants,
+            [(canonical_grantee_id(auth_provider, body.user_id), body.level)],
         )
         # On the canonical ID, which is how the store names the owner and the public.
         if grantee == (task.user_id or RESERVED_USER_LOCAL):

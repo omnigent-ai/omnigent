@@ -35,6 +35,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     AuthProvider,
+    canonical_grantee_id,
 )
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
@@ -146,33 +147,34 @@ def register_permissions_routes(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        if body.user_id == user_id:
+        grantee = canonical_grantee_id(auth_provider, body.user_id)
+        if grantee == user_id:
             raise OmnigentError(
                 "Cannot modify your own permissions",
                 code=ErrorCode.FORBIDDEN,
             )
-        if body.user_id == RESERVED_USER_PUBLIC:
+        if grantee == RESERVED_USER_PUBLIC:
             require_public_grant_allowed(request.app.state, level=body.level)
-        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
-        with target_account_scope(body.user_id, target.account_generation if target else None):
-            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+        target = await asyncio.to_thread(permission_store.get_user, grantee)
+        with target_account_scope(grantee, target.account_generation if target else None):
+            existing = await asyncio.to_thread(permission_store.get, grantee, session_id)
             if existing is not None and existing.level == LEVEL_OWNER:
                 raise OmnigentError(
                     "Cannot modify owner permissions",
                     code=ErrorCode.FORBIDDEN,
                 )
-            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
+            await asyncio.to_thread(permission_store.ensure_user, grantee)
             perm = await asyncio.to_thread(
                 permission_store.grant,
-                body.user_id,
+                grantee,
                 session_id,
                 body.level,
                 ensure_minimum=body.ensure_minimum,
             )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
-        _announce_session_added(body.user_id, session_id)
-        add_audit_attrs(target_user_id=body.user_id, level=perm.level)
+        _announce_session_added(grantee, session_id)
+        add_audit_attrs(target_user_id=grantee, level=perm.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
