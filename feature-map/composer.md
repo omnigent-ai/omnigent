@@ -342,8 +342,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   steer the same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
   after its current step in the timestamp row. The note stays visible, with
-  truncation, on desktop and touch until the agent reads the message, while the
-  row's timestamp and actions keep their hover reveal on desktop.
+  truncation, on desktop and touch until the agent reads the message, and the
+  row's timestamp and actions stay visible beside it; once the note clears they
+  return to their hover reveal on desktop.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
