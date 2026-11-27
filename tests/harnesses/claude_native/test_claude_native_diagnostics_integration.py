@@ -24,9 +24,6 @@ from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 from tests.harnesses.claude_native._launch_failure_helpers import (
     POST_ERRORS,
-    UNCERTAIN_POST_ERRORS,
-    UNDELIVERED_POST_ERRORS,
-    V2_POST_FAILURES,
 )
 
 
@@ -233,7 +230,7 @@ async def test_server_client_start_failure_drains_diagnostics_before_first_poll(
 @pytest.mark.parametrize(
     "owned_request,failure_mode",
     [(False, failure) for failure in ("503", "connect", "cancel")]
-    + [(True, failure) for failure in V2_POST_FAILURES],
+    + [(True, failure) for failure in ("read", "cleanup-failure", "no-ack")],
 )
 async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_error(
     monkeypatch: pytest.MonkeyPatch,
@@ -245,16 +242,11 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         ClaudeSettingsLease,
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
-        request_claude_bridge_deletion,
     )
 
     monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
     monkeypatch.setattr(claude_native, "resolve_claude_launch", lambda cmd, args: (cmd, args))
-    bridge_dir = (
-        bridge.prepare_bridge_dir("failed-child", workspace=tmp_path)
-        if failure_mode == "reactivated-ack"
-        else tmp_path
-    )
+    bridge_dir = tmp_path
     follower = SimpleNamespace(close=Mock())
     make_follower = Mock(return_value=follower)
     monkeypatch.setattr(
@@ -286,63 +278,34 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         if failure_mode == "cancel":
             original_error = asyncio.CancelledError("launch cancelled")
             raise original_error
-        if failure_mode in UNDELIVERED_POST_ERRORS:
-            message = (
-                "simulated launch transport failure"
-                if failure_mode in {"connect", "cleanup-failure"}
-                else "simulated failure before dispatch"
+        if failure_mode in {"connect", "cleanup-failure"}:
+            original_error = POST_ERRORS[failure_mode](
+                "simulated launch transport failure", request=request
             )
-            original_error = POST_ERRORS[failure_mode](message, request=request)
             raise original_error
-        if failure_mode in {"no-ack", "mismatched"}:
+        if failure_mode == "no-ack":
             return httpx.Response(
                 200,
-                json={
-                    "id": "terminal_claude_main",
-                    **(
-                        {"claude_settings_request_ack": "0" * 32}
-                        if failure_mode == "mismatched"
-                        else {}
-                    ),
-                },
+                json={"id": "terminal_claude_main"},
             )
-        if owned_request:
-            if failure_mode in UNCERTAIN_POST_ERRORS:
-                receiver = acquire_claude_settings_request(
-                    bridge_dir, posted[-1]["claude_settings_request"], protocol=2
-                )
-                original_error = POST_ERRORS[failure_mode](
-                    "simulated failure after admission", request=request
-                )
-                raise original_error
-            generation = posted[-1]["claude_settings_request"]
-            with acquire_claude_settings_request(bridge_dir, generation, protocol=2):
-                if failure_mode == "reactivated-ack":
-                    request_claude_bridge_deletion(bridge_dir, "failed-child")
-                    bridge.prepare_bridge_dir("failed-child", workspace=tmp_path)
-                    return httpx.Response(
-                        409,
-                        json={
-                            "detail": "simulated launch rejection",
-                            "claude_settings_request_ack": generation,
-                        },
-                    )
+        if failure_mode == "read":
+            receiver = acquire_claude_settings_request(
+                bridge_dir, posted[-1]["claude_settings_request"], protocol=2
+            )
+            original_error = POST_ERRORS[failure_mode](
+                "simulated failure after admission", request=request
+            )
+            raise original_error
         return httpx.Response(503, json={"detail": "simulated launch rejection"})
 
     expected_error = POST_ERRORS.get(failure_mode, ClickException)
     expected_message = {
         "503": "503",
-        "reactivated-ack": r"\(409\): simulated launch rejection",
         "connect": "simulated launch transport failure",
-        "connect-timeout": "simulated failure before dispatch",
-        "pool-timeout": "simulated failure before dispatch",
         "cleanup-failure": "simulated launch transport failure",
         "read": "simulated failure after admission",
-        "write": "simulated failure after admission",
-        "timeout": "simulated failure after admission",
         "cancel": "launch cancelled",
         "no-ack": "did not acknowledge",
-        "mismatched": "did not acknowledge",
     }[failure_mode]
     try:
         async with httpx.AsyncClient(

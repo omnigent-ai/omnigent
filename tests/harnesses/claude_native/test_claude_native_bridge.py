@@ -6201,8 +6201,9 @@ def _unstarted_settings_terminal(
 
 @pytest.mark.parametrize("switch", ["rotation", "reactivation"])
 @pytest.mark.parametrize("last_owner", ["request", "terminal"])
+@pytest.mark.parametrize("protocol", [1, 2])
 def test_final_settings_owner_retires_generation_after_admission_changes(
-    tmp_path: Path, switch: str, last_owner: str
+    tmp_path: Path, switch: str, last_owner: str, protocol: int
 ) -> None:
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
@@ -6211,12 +6212,17 @@ def test_final_settings_owner_retires_generation_after_admission_changes(
     )
 
     bridge_dir = prepare_bridge_dir("conv_old", workspace=tmp_path)
-    with ClaudeSettingsRequest.create(bridge_dir) as request, ExitStack() as owners:
+    with (
+        ClaudeSettingsRequest.create(bridge_dir, protocol=protocol) as request,
+        ExitStack() as owners,
+    ):
         augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
         baseline = request.settings_path(bridge_dir)
         baseline_bytes = baseline.read_bytes()
         callbacks = []
-        with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
+        with acquire_claude_settings_request(
+            bridge_dir, request.generation, protocol=protocol
+        ) as lease:
             for _ in range(2):
                 lease.attach(_unstarted_settings_terminal(tmp_path, callbacks))
         for close in callbacks:
@@ -6230,7 +6236,7 @@ def test_final_settings_owner_retires_generation_after_admission_changes(
         )
         lifecycle = (bridge_dir / ".claude-settings-lifecycle.json").read_bytes()
         config = (bridge_dir / "bridge.json").read_bytes()
-        with ClaudeSettingsRequest.create(bridge_dir) as current:
+        with ClaudeSettingsRequest.create(bridge_dir, protocol=protocol) as current:
             augment_claude_args((), bridge_dir=bridge_dir, settings_request=current)
             current_baseline = current.settings_path(bridge_dir)
             current_bytes = current_baseline.read_bytes()
@@ -7536,7 +7542,19 @@ def test_pop_caller_settings_passes_unreadable_inputs_through(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["denied", "truncated", "non-utf8", "missing", "invalid-utf8"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "denied",
+        "truncated",
+        "non-utf8",
+        "missing",
+        "invalid-utf8",
+        "malformed-file",
+        "non-object",
+        "malformed-inline",
+    ],
+)
 async def test_unreadable_caller_settings_warn_without_contents_or_argument_changes(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
@@ -7552,13 +7570,14 @@ async def test_unreadable_caller_settings_warn_without_contents_or_argument_chan
     environment = Mock(spec=OSEnvironment, cwd=tmp_path)
     environment.read = AsyncMock(
         return_value={
-            "content": secret,
+            "content": f'["{secret}"]' if failure == "non-object" else secret,
             "error": secret if failure == "denied" else None,
             "truncated": failure == "truncated",
             "encoding": "base64" if failure == "non-utf8" else "utf-8",
         }
     )
-    args = augment_claude_args(("--settings", str(caller)), bridge_dir=tmp_path)
+    operand = '{"' + secret if failure == "malformed-inline" else str(caller)
+    args = augment_claude_args(("--settings", operand), bridge_dir=tmp_path)
     instance = TerminalInstance(
         name="claude",
         session_key="main",
@@ -7580,9 +7599,10 @@ async def test_unreadable_caller_settings_warn_without_contents_or_argument_chan
         record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
     ]
     assert len(warnings) == 1
-    assert "caller settings file was not applied" in warnings[0]
+    assert "caller settings input was not applied" in warnings[0]
     assert "preserving its original argument" in warnings[0]
     assert secret not in warnings[0]
+    assert str(caller) not in warnings[0]
 
 
 @pytest.mark.asyncio

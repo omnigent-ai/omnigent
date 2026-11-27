@@ -2288,7 +2288,12 @@ def _bridge_credentials_current(
 
 def retire_bridge_credentials(bridge_dir: Path, session_id: str) -> None:
     """Remove auth snapshots under the preparation lock, retaining only deletion identity."""
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    try:
+        config = json.loads(_read_caller_settings(bridge_dir / _CONFIG_FILE, nofollow=True))
+    except (OSError, ValueError, RecursionError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
     tombstone: _JsonObject = {
         "active_session_id": session_id,
         "conversation_id": session_id,
@@ -3689,6 +3694,7 @@ def _pop_caller_settings(
     *,
     workspace: Path | None,
     read_file: Callable[[Path], str] | None = None,
+    warn_unapplied: bool = False,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """
     Remove caller ``--settings`` flags from ``args`` and return their parsed values.
@@ -3702,6 +3708,7 @@ def _pop_caller_settings(
     :param workspace: Terminal workspace for relative settings paths.
     :param read_file: Reader authorized by the terminal's resolved policy.
         Without one, file flags remain untouched.
+    :param warn_unapplied: Report parsing refusals during the final composition pass.
     :returns: ``(args without the merged flags, parsed settings in flag order)``.
     """
     kept: list[str] = []
@@ -3725,6 +3732,7 @@ def _pop_caller_settings(
             i += 1
             continue
         parsed: object = None
+        payload: str | None = None
         try:
             inline = value.lstrip().startswith("{")
             settings_path = Path(value)
@@ -3736,19 +3744,34 @@ def _pop_caller_settings(
                 if read_file is None:
                     raise ValueError("caller settings files require the terminal read policy")
                 payload = read_file(settings_path)
-            parsed = json.loads(
-                payload,
-                parse_float=_finite_settings_number,
-                parse_constant=_finite_settings_number,
-            )
         except (OSError, ValueError, RecursionError):
-            parsed = None
+            pass
+        if payload is not None:
+            reason = "non_object"
+            try:
+                parsed = json.loads(
+                    payload,
+                    parse_float=_finite_settings_number,
+                    parse_constant=_finite_settings_number,
+                )
+            except (ValueError, RecursionError):
+                reason = "invalid_json"
+            if not isinstance(parsed, dict) and warn_unapplied:
+                _warn_unapplied_caller_settings(reason)
         if isinstance(parsed, dict):
             found.append(parsed)
         else:
             kept.extend(args[i : i + step])
         i += step
     return kept, found
+
+
+def _warn_unapplied_caller_settings(reason: str) -> None:
+    _logger.warning(
+        "Claude caller settings input was not applied: reason=%s; "
+        "preserving its original argument, which Claude may ignore",
+        reason,
+    )
 
 
 def _generation_settings_path(bridge_dir: Path, generation: str) -> Path:
@@ -3956,11 +3979,7 @@ async def finalize_claude_caller_settings(
             unavailable_reason = type(exc).__name__
         if unavailable_reason is not None:
             # Settings operands and read errors can contain credential-bearing text.
-            _logger.warning(
-                "Claude caller settings file was not applied: reason=%s; "
-                "preserving its original argument, which Claude may ignore",
-                unavailable_reason,
-            )
+            _warn_unapplied_caller_settings(unavailable_reason)
 
     def read_file(path: Path) -> str:
         if path == settings_path or path not in contents:
@@ -3968,7 +3987,9 @@ async def finalize_claude_caller_settings(
         return contents[path]
 
     def merge_settings() -> tuple[list[str], dict[str, Any] | None, bool]:
-        kept, callers = _pop_caller_settings(args, workspace=workspace, read_file=read_file)
+        kept, callers = _pop_caller_settings(
+            args, workspace=workspace, read_file=read_file, warn_unapplied=True
+        )
         _ensure_secure_dir(bridge_dir)
         baseline = json.loads(
             _read_caller_settings(settings_path, nofollow=True),

@@ -2713,8 +2713,9 @@ async def test_cancelled_settings_route_disposes_late_owner_before_rollback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", [1, 2])
 async def test_settings_route_publishes_before_cancelled_admission_release(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: int
 ) -> None:
     from omnigent.harnesses.claude_native import settings_generation
     from omnigent.harnesses.claude_native.main import _claude_terminal_request
@@ -2751,7 +2752,7 @@ async def test_settings_route_publishes_before_cancelled_admission_release(
     callbacks: list[Callable[[], None]] = []
     terminal.add_resource_cleanup.side_effect = callbacks.append
     bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
-    request = ClaudeSettingsRequest.create(bridge_dir)
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
     body = _claude_terminal_request(
         (), command="claude", bridge_dir=bridge_dir, settings_request=request
     )
@@ -2770,8 +2771,8 @@ async def test_settings_route_publishes_before_cancelled_admission_release(
     close = ClaudeSettingsLease.close
     launch = registry.launch_required_terminal
 
-    def acquire_owner(*args) -> ClaudeSettingsLease:
-        owner = acquire(*args)
+    def acquire_owner(*args, **kwargs) -> ClaudeSettingsLease:
+        owner = acquire(*args, **kwargs)
         admitted.append(owner)
         return owner
 
@@ -2799,8 +2800,9 @@ async def test_settings_route_publishes_before_cancelled_admission_release(
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://runner"
     ) as client:
+        terminal_path = "claude-settings-v2/terminals" if protocol == 2 else "terminals"
         task = asyncio.create_task(
-            client.post(f"/v1/sessions/{session_id}/resources/terminals", json=body)
+            client.post(f"/v1/sessions/{session_id}/resources/{terminal_path}", json=body)
         )
         try:
             await asyncio.wait_for(closing.wait(), timeout=5)

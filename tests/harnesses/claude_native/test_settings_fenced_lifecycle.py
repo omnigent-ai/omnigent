@@ -60,10 +60,13 @@ def _populate(request: ClaudeSettingsRequest) -> Path:
     return request.settings_path(request.bridge_dir)
 
 
-@pytest.mark.parametrize("protocol", [1, 2])
-@pytest.mark.parametrize("owner", ["sender", "reader", "unknown"])
+@pytest.mark.parametrize(
+    "protocol,owner,metadata",
+    [(protocol, owner, None) for protocol in (1, 2) for owner in ("sender", "reader", "unknown")]
+    + [(2, "reader", raw) for raw in (b"{", b"[]", b"\xff")],
+)
 def test_deleted_bridge_removes_credentials_and_keeps_owned_inputs(
-    bridge_dir: Path, protocol: int, owner: str
+    bridge_dir: Path, protocol: int, owner: str, metadata: bytes | None
 ) -> None:
     request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
     baseline = _populate(request)
@@ -87,11 +90,13 @@ def test_deleted_bridge_removes_credentials_and_keeps_owned_inputs(
     credential_files = ["permission_hook.json", "server.json", "tool_relay.json", "tool_relay.env"]
     for name in credential_files[1:]:
         (bridge_dir / name).write_text("synthetic-local-credential")
+    if metadata is not None:
+        (bridge_dir / "bridge.json").write_bytes(metadata)
     try:
         request_claude_bridge_deletion(bridge_dir, "conv_fenced")
         tombstone = json.loads((bridge_dir / "bridge.json").read_text())
         assert tombstone == {
-            "bridge_id": "conv_fenced",
+            **({"bridge_id": "conv_fenced"} if metadata is None else {}),
             "active_session_id": "conv_fenced",
             "conversation_id": "conv_fenced",
             "deleted": True,
@@ -119,6 +124,30 @@ def test_deleted_bridge_removes_credentials_and_keeps_owned_inputs(
         unknown.unlink(missing_ok=True)
         prune_unused_claude_settings(bridge_dir)
     assert not bridge_dir.exists()
+
+
+@pytest.mark.parametrize("identity_fault", ["session", "directory", "unreadable"])
+def test_malformed_bridge_deletion_preserves_unverified_activation(
+    bridge_dir: Path, identity_fault: str
+) -> None:
+    lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+    lifecycle = json.loads(lifecycle_path.read_text())
+    if identity_fault == "session":
+        lifecycle["session_id"] = "another-session"
+    elif identity_fault == "directory":
+        lifecycle["bridge_identity"][1] += 1
+    lifecycle_path.write_text("{" if identity_fault == "unreadable" else json.dumps(lifecycle))
+    config = bridge_dir / "bridge.json"
+    config.write_text("{")
+    credentials = bridge_dir / "permission_hook.json"
+    credentials.write_text("synthetic-other-activation")
+    before = {path.name: path.read_bytes() for path in bridge_dir.iterdir() if path.is_file()}
+
+    request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+
+    assert {
+        path.name: path.read_bytes() for path in bridge_dir.iterdir() if path.is_file()
+    } == before
 
 
 def test_old_owners_cannot_remove_or_refresh_reactivated_credentials(bridge_dir: Path) -> None:

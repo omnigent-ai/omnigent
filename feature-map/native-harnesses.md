@@ -599,9 +599,10 @@ run the relevant node IDs below with `uv run --no-sync pytest --reruns 0`:
   typed startup refusals and ownership release without spawning a vendor CLI.
 - `tests/runner/test_app_claude_native_launch_args.py::test_auto_create_claude_settings_preserve_configured_argument_boundary`
   checks configured web-launch settings through preparation, and
-  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_native_terminal_start_error_guidance_and_redaction`
-  checks automatic startup guidance, log references and error IDs without
-  exposing settings values or private paths.
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_native_terminal_start_error_publication_envelope`
+  checks both startup publication envelopes.
+  `tests/runner/test_native_terminal_start_error_payload.py::test_native_start_error_payload_guidance_and_redaction`
+  checks guidance, log references, error IDs and private-value redaction at the formatter.
 
 These component checks leave real CLI and browser composition/refusal journeys
 unverified. Follow the launch preconditions above for those separate drives.

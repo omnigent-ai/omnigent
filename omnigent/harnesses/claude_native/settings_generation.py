@@ -263,9 +263,19 @@ def request_claude_bridge_deletion(bridge_dir: Path, session_id: str) -> None:
         try:
             if not _session_matches(bridge_dir, session_id):
                 return
-        except ValueError:
-            _logger.warning("Claude bridge deletion session is invalid", exc_info=True)
-            return
+        except (ValueError, RecursionError):
+            try:
+                binding = _read_lifecycle(bridge_dir)
+                matched = (
+                    binding is not None
+                    and binding.session_id == session_id
+                    and binding.bridge_identity == _directory_identity(bridge_dir)
+                )
+            except (OSError, ValueError, RecursionError):
+                matched = False
+            if not matched:
+                _logger.warning("Claude bridge deletion session identity is unverified")
+                return
         lifecycle = None
         try:
             incarnation = prepare_claude_settings_lifecycle(bridge_dir)

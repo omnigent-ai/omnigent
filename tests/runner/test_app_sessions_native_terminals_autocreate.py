@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -39,10 +40,6 @@ from omnigent.harnesses.claude_native.bridge import (
     read_permission_hook_config,
 )
 from omnigent.harnesses.claude_native.main import claude_tool_env_file
-from omnigent.harnesses.claude_native.settings_validation import (
-    CallerSettingsError,
-    CallerSettingsErrorReason,
-)
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
     CodexNativeBridgeState,
@@ -4362,85 +4359,53 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
 
 
 @pytest.mark.parametrize("surface", ["publish", "ensure"])
-@pytest.mark.parametrize(
-    "failure",
-    ["invalid-settings", "unexpected-validator"],
-)
-def test_native_terminal_start_error_guidance_and_redaction(
-    caplog: pytest.LogCaptureFixture,
-    pinned_runner_log: Path,
-    surface: str,
-    failure: str,
+def test_native_terminal_start_error_publication_envelope(
+    monkeypatch: pytest.MonkeyPatch, surface: str
 ) -> None:
-    """Only typed settings failures add safe guidance to either startup surface."""
+    """Both startup adapters preserve the formatted payload and failure context."""
     published: list[_PublishedEvent] = []
-    private_value = "private-validator-value"
-    private_path = "/private/example/settings.json"
-    guidance = None
-    runtime_name = "Claude"
-    if failure == "unexpected-validator":
-        raised: Exception = ValueError(f"{private_value} {private_path}")
-    else:
-        settings_error = CallerSettingsError(CallerSettingsErrorReason.INVALID_SETTINGS)
-        guidance = settings_error.client_message
-        settings_error.args = (f"{private_value} {private_path}",)
-        raised = settings_error
-
-    def _capture(session_id: str, event: dict[str, Any]) -> None:
-        published.append(_PublishedEvent(session_id=session_id, event=event))
-
-    with caplog.at_level(logging.WARNING):
-        if surface == "publish":
-            error = _publish_native_terminal_start_error(
-                _capture, "415c9954e2fe4b9276083a4d2c66f689", runtime_name, raised
-            )
-        else:
-            response = _native_terminal_start_error_response(
-                raised, runtime_name, session_id="415c9954e2fe4b9276083a4d2c66f689"
-            )
-            assert response.status_code == 500
-            envelope = json.loads(response.body)
-            error = envelope["error"]
-
-    error_id = error["error_id"]
-    assert error_id.startswith("err_")
-    assert len(error_id) == 36
-    int(error_id.removeprefix("err_"), 16)
-    message = (
-        f"{guidance} See the runner log for details: {pinned_runner_log}"
-        if guidance is not None
-        else (
-            f"Native {runtime_name} terminal failed to start ({type(raised).__name__}); "
-            f"see the runner log for details: {pinned_runner_log}"
-        )
-    )
-    assert error == {
+    raised = RuntimeError("synthetic startup failure")
+    session_id = "415c9954e2fe4b9276083a4d2c66f689"
+    payload = {
         "code": "native_terminal_start_failed",
-        "error_id": error_id,
-        "message": f"{message} Error ID: {error_id}.",
+        "error_id": "err_" + "1" * 32,
+        "message": "Safe startup guidance",
     }
-    assert private_value not in json.dumps(error)
-    assert private_path not in json.dumps(error)
-    assert str(raised) in caplog.text
-    assert error_id in caplog.text
+    format_payload = Mock(return_value=payload)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._native_terminal_start_error_payload",
+        format_payload,
+    )
+
+    def capture(target: str, event: dict[str, Any]) -> None:
+        published.append(_PublishedEvent(session_id=target, event=event))
+
     failure_context = {
         "failure_source": "native_terminal_start",
-        "failure_id": error_id,
-        "exception_type": type(raised).__name__,
+        "failure_id": payload["error_id"],
+        "exception_type": "RuntimeError",
     }
     if surface == "publish":
-        assert [p.event for p in published] == [
-            {
-                "type": "session.status",
-                "status": "failed",
-                "error": error,
-                "failure_context": failure_context,
-            },
+        assert (
+            _publish_native_terminal_start_error(capture, session_id, "Claude", raised) is payload
+        )
+        assert published == [
+            _PublishedEvent(
+                session_id=session_id,
+                event={
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": payload,
+                    "failure_context": failure_context,
+                },
+            )
         ]
-        assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
     else:
-        assert envelope == {"error": error, "failure_context": failure_context}
+        response = _native_terminal_start_error_response(raised, "Claude", session_id=session_id)
+        assert response.status_code == 500
+        assert json.loads(response.body) == {"error": payload, "failure_context": failure_context}
         assert not published
+    format_payload.assert_called_once_with(raised, "Claude", session_id=session_id)
 
 
 def test_publish_native_terminal_start_error_redacts_mismatch_path(

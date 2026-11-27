@@ -127,7 +127,14 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     ]
     + [
         pytest.param(owner, 2, id=f"{owner}-v2")
-        for owner in ("pending", "admitted", "failed-close", "timed-out-close", "reactivated")
+        for owner in (
+            "pending",
+            "admitted",
+            "failed-close",
+            "timed-out-close",
+            "reactivated",
+            "malformed",
+        )
     ],
 )
 async def test_delete_session_removes_native_bridge_dir(
@@ -256,6 +263,8 @@ async def test_delete_session_removes_native_bridge_dir(
                 )
 
     credentials.write_bytes(credential_bytes)
+    if owner == "malformed":
+        (bridge_dir / "bridge.json").write_text("{")
     url = f"/v1/sessions/{session_id}{endpoint}"
     try:
         resp = await client.delete(url)
