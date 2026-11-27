@@ -831,9 +831,21 @@ async def test_repeated_cancellation_waits_for_actual_worker_retirement(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "ending", ["cancel", "close", "timeout", "partial-timeout", "write-cancel"]
+    "ending",
+    [
+        "cancel",
+        "close",
+        "timeout",
+        "partial-timeout",
+        "write-cancel",
+        "malformed-json",
+        "nonobject-json",
+        "multiple-frames",
+        "oversized",
+        "eof",
+    ],
 )
-async def test_blocked_metadata_preparation_retires_without_a_reply(
+async def test_metadata_preparation_failures_retire_before_any_command(
     monkeypatch: pytest.MonkeyPatch,
     caller_environment: CallerProcessOSEnvironment,
     ending: str,
@@ -859,6 +871,8 @@ async def test_blocked_metadata_preparation_retires_without_a_reply(
 
     process.terminate.side_effect = terminate
     process.wait.side_effect = reap
+    execute = MagicMock(side_effect=AssertionError("Metadata rejection must precede execution"))
+    monkeypatch.setattr(shell_request.BwrapShellRequest, "run", execute)
     helper._proc = process
     helper._prepared = _PreparedHelper(helper.sandbox, helper.cwd, {"PATH": os.defpath})
     monkeypatch.setattr(helper, "_ensure_started_locked", lambda: None)
@@ -887,6 +901,7 @@ async def test_blocked_metadata_preparation_retires_without_a_reply(
     )
     monkeypatch.setattr(helper, "_stop_egress_proxy_locked", broker_stop)
     closing = None
+    peer_open = True
     expected: type[BaseException]
     task = asyncio.create_task(environment.isolated_shell("must-not-run", timeout=7))
     try:
@@ -895,7 +910,21 @@ async def test_blocked_metadata_preparation_retires_without_a_reply(
             assert json.loads(os.read(peer_input, 4096)) == {"op": "shell_encoding"}
         if ending == "partial-timeout":
             os.write(peer_output, b'{"encoding":')
-        if ending == "close":
+        if ending in {"malformed-json", "nonobject-json", "multiple-frames", "oversized"}:
+            reply = {
+                "malformed-json": b"{invalid}\n",
+                "nonobject-json": b"[]\n",
+                "multiple-frames": b"{}\n{}\n",
+                "oversized": b"x" * os_env_module._MAX_SHELL_METADATA_BYTES + b"\n",
+            }[ending]
+            written = await asyncio.wait_for(asyncio.to_thread(os.write, peer_output, reply), 2)
+            assert written == len(reply)
+            expected = ValueError if ending == "malformed-json" else OSError
+        elif ending == "eof":
+            os.close(peer_output)
+            peer_open = False
+            expected = OSError
+        elif ending == "close":
             closing = threading.Thread(target=environment.close)
             closing.start()
             expected = RequestCancelled
@@ -906,16 +935,19 @@ async def test_blocked_metadata_preparation_retires_without_a_reply(
             expected = TimeoutError
         with pytest.raises(expected):
             await asyncio.wait_for(asyncio.shield(task), timeout=2)
-        os.fstat(peer_output)
+        if peer_open:
+            os.fstat(peer_output)
         assert retired.is_set()
         assert helper._proc is None and helper._prepared is None
         assert process.stdin.closed and process.stdout.closed
         assert broker_stop.call_count >= 1
+        execute.assert_not_called()
         if closing is not None:
             await poll_until_async(lambda: not closing.is_alive(), timeout_s=2, interval_s=0.001)
     finally:
         os.close(peer_input)
-        os.close(peer_output)
+        if peer_open:
+            os.close(peer_output)
         await asyncio.gather(task, return_exceptions=True)
         if closing is not None:
             closing.join(timeout=2)

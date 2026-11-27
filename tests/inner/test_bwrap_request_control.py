@@ -102,55 +102,29 @@ def readiness(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock, Ma
     return control, process, close
 
 
+@pytest.mark.parametrize("encoding", [None, b"utf-8", b"ISO-8859-1"])
 def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
     readiness: tuple[MagicMock, MagicMock, MagicMock],
+    encoding: bytes | None,
 ) -> None:
     control, process, close = readiness
+    if encoding is not None:
+        payload, metadata, flags, address = control.recvmsg.return_value
+        control.recvmsg.return_value = (payload + b":" + encoding, metadata, flags, address)
     owner = request_control.BwrapRequestControl.receive(
-        control, process, _TOKEN, expected_init_pid=73, launcher_pidfd=_LAUNCHER_FD
+        control,
+        process,
+        _TOKEN,
+        expected_init_pid=73,
+        launcher_pidfd=_LAUNCHER_FD,
+        encoding_required=encoding is not None,
     )
     assert not owner.admitted and not owner.done.is_set()
+    assert owner._encoding == (encoding.decode("ascii") if encoding is not None else None)
     request_control.os.set_inheritable.assert_called_once_with(_INIT_FD, False)
     assert control.recvmsg.call_args.args[2] == socket.MSG_CMSG_CLOEXEC
     control.send.assert_not_called()
     close.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "encoding",
-    [b"utf-8", b"ISO-8859-1", b"", b"unknown-encoding", b"x" * 129, b"\xff", None],
-)
-def test_required_output_encoding_is_bound_to_the_validated_readiness(
-    readiness: tuple[MagicMock, MagicMock, MagicMock], encoding: bytes | None
-) -> None:
-    control, process, close = readiness
-    payload, metadata, flags, address = control.recvmsg.return_value
-    if encoding is not None:
-        payload += b":" + encoding
-    control.recvmsg.return_value = (payload, metadata, flags, address)
-    if encoding in (b"utf-8", b"ISO-8859-1"):
-        owner = request_control.BwrapRequestControl.receive(
-            control,
-            process,
-            _TOKEN,
-            expected_init_pid=73,
-            launcher_pidfd=_LAUNCHER_FD,
-            encoding_required=True,
-        )
-        assert owner._encoding == encoding.decode("ascii")
-        close.assert_not_called()
-    else:
-        with pytest.raises(OSError, match=r"encoding|readiness"):
-            request_control.BwrapRequestControl.receive(
-                control,
-                process,
-                _TOKEN,
-                expected_init_pid=73,
-                launcher_pidfd=_LAUNCHER_FD,
-                encoding_required=True,
-            )
-        close.assert_called_once_with(_INIT_FD)
-    control.send.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -172,7 +146,11 @@ def test_required_output_encoding_is_bound_to_the_validated_readiness(
             "launcher",
         )
     ]
-    + [(problem, True) for problem in ("token", "sender", "truncated", "payload-truncated")],
+    + [(problem, True) for problem in ("token", "sender", "truncated", "payload-truncated")]
+    + [
+        ("encoding-" + problem, True)
+        for problem in ("missing", "empty", "unknown", "oversized", "non-ascii")
+    ],
 )
 def test_invalid_readiness_never_admits_and_releases_every_received_handle(
     monkeypatch: pytest.MonkeyPatch,
@@ -221,10 +199,17 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
         flags = socket.MSG_CTRUNC
     elif problem == "payload-truncated":
         flags = socket.MSG_TRUNC
-    else:
+    elif problem == "unexpected-before-rights":
         metadata.insert(0, (socket.SOL_SOCKET, -1, b"unknown"))
-    if encoding_required:
-        payload += b":utf-8"
+    encoding = {
+        "encoding-missing": None,
+        "encoding-empty": b"",
+        "encoding-unknown": b"unknown-encoding",
+        "encoding-oversized": b"x" * 129,
+        "encoding-non-ascii": b"\xff",
+    }.get(problem, b"utf-8")
+    if encoding_required and encoding is not None:
+        payload += b":" + encoding
     control.recvmsg.return_value = (payload, metadata, flags, address)
     with pytest.raises((OSError, ValueError)):
         request_control.BwrapRequestControl.receive(
