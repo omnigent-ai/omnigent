@@ -5,7 +5,7 @@ import {
   SCHEDULED_TASK_LAUNCH_LABEL_KEY,
 } from "@/lib/automationSessions";
 import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
-import type { StatusBucket } from "@/shell/sidebarNav";
+import { statusBucket, type StatusBucket } from "@/shell/sidebarNav";
 import {
   filterKanbanCards,
   kanbanColumns,
@@ -102,6 +102,25 @@ describe("project kanban", () => {
     const asking = cardOf(parent, askingFailed);
     expect(asking.column).toBe("Needs attention");
     expect(nestedAttentionLabel(asking)).toBe("1 needs attention");
+  });
+
+  it("still rolls up an older nested turn parked on a terminal prompt, and a lone head", () => {
+    const columnOf = (c: Conversation) => statusBucket(c, false, false);
+    const parent = { ...row("parent", 1, true), status: "idle", updated_at: 200 } as Conversation;
+    const parked = {
+      ...row("parked", 2, true),
+      status: "running",
+      blocked_on: "permission prompt",
+      updated_at: 100,
+    } as Conversation;
+    const [card] = kanbanColumns([parent, parked], columnOf).get("Needs attention")!;
+    expect(card.attentionMembers).toEqual([parked]);
+    expect(nestedAttentionLabel(card)).toBe("1 needs attention");
+
+    const lone = { ...row("parent", 1, true), status: "failed", updated_at: 1 } as Conversation;
+    const [head] = kanbanColumns([lone], columnOf).get("Needs attention")!;
+    expect(head.members).toEqual([lone]);
+    expect(nestedAttentionLabel(head)).toBeNull();
   });
 
   it("keeps a failed head in Needs attention without a nested note", () => {
