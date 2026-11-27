@@ -121,3 +121,27 @@ describe("the session list's view in ⌘K", () => {
     expect(viewCommands()).toEqual([]);
   });
 });
+describe("the sidebar's destinations in ⌘K", () => {
+  const navLabels = () =>
+    usePaletteCommandsStore
+      .getState()
+      .groups["sidebar-nav"]?.commands.map((command) => command.label) ?? [];
+
+  it("offers Go to Canvas and Go to Usage exactly when the sidebar links them", async () => {
+    renderSidebar({ features: { ...QUICK_PICK, canvas: true, usage_page: true } });
+    expect(await screen.findByTestId("canvas-nav")).toBeInTheDocument();
+    expect(screen.getByTestId("usage-nav")).toBeInTheDocument();
+    await waitFor(() => expect(navLabels()).toEqual(["Go to Canvas", "Go to Usage"]));
+  });
+
+  it("offers neither without their pages, nor with the palette flag off", async () => {
+    const { unmount } = renderSidebar({ features: QUICK_PICK });
+    await screen.findByText("Alpha");
+    expect(screen.queryByTestId("canvas-nav")).toBeNull();
+    expect(navLabels()).toEqual([]);
+    unmount();
+    renderSidebar({ features: { canvas: true, usage_page: true } });
+    expect(await screen.findByTestId("canvas-nav")).toBeInTheDocument();
+    expect(navLabels()).toEqual([]);
+  });
+});

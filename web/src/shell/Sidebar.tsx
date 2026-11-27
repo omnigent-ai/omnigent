@@ -145,14 +145,7 @@ import {
   showsUnreadFor,
   useMutedProjects,
 } from "@/lib/sessionMute";
-import {
-  Link,
-  useLocation,
-  useNavigate,
-  useParams,
-  useRebasePath,
-  useSearchParams,
-} from "@/lib/routing";
+import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSearchButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -227,6 +220,7 @@ import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { useSidebarNavCommands, useSidebarNavDestinations } from "./sidebarNavCommands";
 import {
   useQuickPickPaletteCommands,
   useQuickPickPaletteEnabled,
@@ -392,8 +386,7 @@ import {
   SIDEBAR_OPEN_MENU_HIGHLIGHT,
   SIDEBAR_FAMILY_LINE,
 } from "./sidebarStyles";
-import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
-import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
+import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { projectHomePath, projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { getEmbedRoot } from "../lib/host";
 import { canCreateProject, projectsMatching } from "./projectChoices";
@@ -852,11 +845,12 @@ function SidebarImpl({
   const sidebarData = useSidebarData();
   const branding = useBranding();
   const serverInfo = useServerInfo();
-  const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  // Canvas and Usage: the same gates and destinations for the nav links and ⌘K.
+  const navDestinations = useSidebarNavDestinations();
+  useSidebarNavCommands(navDestinations);
+  const usagePageEnabled = navDestinations.usage.enabled;
   const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows");
-  const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
-  const [searchParams] = useSearchParams();
-  const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
+  const canvasEnabled = navDestinations.canvas.enabled;
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -1616,7 +1610,7 @@ function SidebarImpl({
               </Button>
               {canvasEnabled && (
                 <PrimaryNavLink
-                  to={canvasDestination.pathname + canvasDestination.search}
+                  to={navDestinations.canvas.to}
                   label="Canvas"
                   icon={LayoutDashboardIcon}
                   active={isCanvasPage}
@@ -1641,7 +1635,11 @@ function SidebarImpl({
                   )}
                   data-testid="usage-nav"
                 >
-                  <Link to="/usage" onClick={onNavClick} componentId="sidebar.usage">
+                  <Link
+                    to={navDestinations.usage.to}
+                    onClick={onNavClick}
+                    componentId="sidebar.usage"
+                  >
                     <WalletIcon
                       className={cn(
                         "ui-icon",
