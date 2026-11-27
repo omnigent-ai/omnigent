@@ -942,6 +942,13 @@ Cross-harness journeys:
   metadata. When a current runner reports an uncertain legacy submission,
   the public warning also names the possible saved-default change. Older
   runners without that optional detail keep the generic warning.
+  A native child using an inherited host can retain the existing HTTP 200
+  saved-intent response when no model request reaches a runner. This confirms
+  stored intent only; the live terminal selection is unconfirmed. The fresh
+  receipt requirement applies to forwarded live selections and excludes these
+  saved-intent responses. A direct-host dispatch miss returns 503 and also
+  preserves intent. These outcomes are covered by
+  `tests/server/integration/test_native_model_change_failures.py::test_claude_model_change_without_a_runner_saves_intent_without_forwarding`.
   Older servers may roll back intent or report the prior
   model after uncertainty. Older runners retain their existing CLI actuator and
   saved-default behavior. Legacy requests and both peer directions are covered by
