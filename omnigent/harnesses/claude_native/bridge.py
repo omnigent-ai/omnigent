@@ -4277,8 +4277,8 @@ def _transcript_model_pricing(
 
     :param model: API model id from a transcript ``message.model``,
         e.g. ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``.
-    :param provider_config: Parsed provider configuration for this transcript
-        scan.
+    :param provider_config: Runtime provider configuration, including any saved
+        inference binding, for this transcript scan.
     :param provider_config_fingerprint: Digest used to invalidate pricing when
         the provider configuration changes.
     :returns: The model's :class:`ModelPricing`, or ``None`` when pricing
@@ -4288,11 +4288,19 @@ def _transcript_model_pricing(
     cached = _TRANSCRIPT_PRICING_CACHE.get(model)
     if cached is not None and cached[0] == provider_config_fingerprint:
         return cached[1]
+    from omnigent.inference_config import resolve_bound_provider
     from omnigent.llms.context_window import fetch_model_pricing_with_provider
 
-    # For claude-native transcript pricing, assume claude-native harness
+    try:
+        provider_entry = resolve_bound_provider(provider_config, "claude-native", allow_empty=True)
+    except Exception:  # noqa: BLE001 — pricing must not interrupt usage forwarding.
+        _logger.warning("Could not resolve transcript pricing provider; using legacy pricing")
+        provider_entry = None
     pricing = fetch_model_pricing_with_provider(
-        model, provider_config=provider_config, harness="claude-native"
+        model,
+        provider_config=provider_config,
+        harness="claude-native",
+        provider_entry=provider_entry,
     )
     if pricing is not None:
         _TRANSCRIPT_PRICING_CACHE[model] = (provider_config_fingerprint, pricing)

@@ -11885,7 +11885,7 @@ def test_compute_transcript_cumulative_cost_sums_priced_messages(
 def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Changing provider pricing invalidates the transcript pricing memo."""
+    """Saved bindings override defaults and participate in pricing invalidation."""
 
     def provider_config(input_per_million: float) -> dict[str, Any]:
         return {
@@ -11905,9 +11905,10 @@ def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
             }
         }
 
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
     active_config = provider_config(1.0)
     monkeypatch.setattr(
-        "omnigent.onboarding.provider_config.load_config",
+        "omnigent.onboarding.provider_config._load_config",
         lambda: active_config,
     )
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
@@ -11925,6 +11926,31 @@ def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
     assert claude_native_bridge.compute_transcript_cumulative_cost(
         path, include_sidechains=True
     ) == pytest.approx(2.0)
+
+    saved_config = provider_config(0.25)
+    saved_provider = provider_config(7.0)["providers"]["anthropic-local"]
+    saved_provider.pop("default")
+    saved_config["providers"]["launch-named"] = saved_provider
+    saved_config["inference"] = {
+        "harnesses": {"claude-native": {"provider": "launch-named", "model_allowlist": []}}
+    }
+    saved_path = tmp_path / "inference.json"
+    saved_path.write_text(json.dumps(saved_config), encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", str(saved_path))
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(7.0)
+
+    active_config = provider_config(100.0)
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(7.0)
+
+    saved_provider["anthropic"]["pricing"]["input_per_million"] = 11.0
+    saved_path.write_text(json.dumps(saved_config), encoding="utf-8")
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(11.0)
 
 
 def test_compute_transcript_cumulative_cost_excludes_parent_sidechains(
