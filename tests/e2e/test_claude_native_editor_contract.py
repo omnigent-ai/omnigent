@@ -379,7 +379,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert source.find(flag.encode()) >= 0 and source.find(b"pasted_content") >= 0
         with native_binary.open("rb") as stream:
             binary_digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        native_config = bridge.claude_global_config_path(env)
+        native_config = bridge.claude_global_config_path(cwd=workspace, env=env)
         assert native_config is not None and native_config.parent == config
         global_config = json.loads(native_config.read_text())
         now_ms = int(time.time() * 1000)
