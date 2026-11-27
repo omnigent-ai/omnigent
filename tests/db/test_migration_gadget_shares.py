@@ -125,6 +125,21 @@ def test_rows_are_unique_per_grantee_and_bounded(db_engine: Engine) -> None:
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_grantees_that_differ_only_in_case_or_accents_are_separate_rows(
+    db_engine: Engine,
+) -> None:
+    """Grantee IDs compare exactly, so one grant never matches another principal's ID
+    (MySQL's default collation would treat these as one key)."""
+    shares = sa.Table(_TABLE, sa.MetaData(), autoload_with=db_engine)
+    with db_engine.begin() as conn:
+        for user_id in ("reader", "Reader", "réader"):
+            conn.execute(_share(shares, user_id=user_id))
+    with db_engine.connect() as conn:
+        rows = conn.execute(sa.select(shares.c.user_id).where(shares.c.user_id == "reader"))
+        assert [row.user_id for row in rows] == ["reader"]
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_gadget_ids_are_the_stores_own_and_bounded(db_engine: Engine) -> None:
     """A UUID-hex, decimal or slug gadget ID is stored as given; a 65th character is
     refused, by the column width or, on SQLite and D1, by the byte check."""
