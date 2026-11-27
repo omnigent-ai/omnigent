@@ -1,48 +1,49 @@
-// Whose per-user state the Mac read path keeps: the workspace user on one server and API base
-// path. A user id names someone only on its own server, so what was kept for "user-1" on one
-// server is not for "user-1" on another, and no event says when the server changes.
+// The Mac read path serves only the owner its page started with: one workspace user on one server
+// and API base path. After any change of owner, every pull request reads through the session's
+// host until the page reloads: no Mac reads, and no per-owner state saved or kept is applied.
 
-import { durableServerScope } from "@/lib/durableServerScope";
+import { getApiBasePath } from "@/lib/basePath";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { getCurrentUserId } from "@/lib/identity";
 
-/** The workspace user with the server and base path they're signed in to, as one key. */
+/** The owner as one key: server identity, API base path and workspace user, each kept apart. */
 export function readPathOwner(): string {
-  return JSON.stringify([durableServerScope(), getCurrentUserId()]);
+  return JSON.stringify([getOmnigentServerIdentity(), getApiBasePath(), getCurrentUserId()]);
 }
 
-/** How a store hears that its owner changed: at once from an identity event, or lazily. */
-export type ReadPathOwnerSwitch = "event" | "lazy";
-
-/** A store's watch on its owner; see {@link createReadPathOwnerWatch}. */
-export interface ReadPathOwnerWatch {
-  /** Run the store's switch once if the owner differs from the last look; says whether it did. */
-  (how?: ReadPathOwnerSwitch): boolean;
-  /** Start over with no owner seen, for a store's test reset. */
-  forget: () => void;
-}
+let pageOwner: string | null = null;
+let moved = false;
+const movedListeners = new Set<() => void>();
 
 /**
- * A store's watch on its owner, which runs `onSwitch` when the owner changes. Stores call it from
- * identity events and as they're read, since a server switch fires nothing; a lazy switch should
- * notify listeners after the read.
+ * Whether the owner changed since the page's first known owner, which stays so until a reload.
+ * A user not known yet is no owner: a page starts before sign-in, and a refresh can blank it.
  */
-export function createReadPathOwnerWatch(
-  onSwitch: (how: ReadPathOwnerSwitch) => void,
-): ReadPathOwnerWatch {
-  let owner: string | null = null;
-  const check = (how: ReadPathOwnerSwitch = "lazy") => {
-    const now = readPathOwner();
-    if (owner === null || owner === now) {
-      owner = now;
-      return false;
-    }
-    owner = now;
-    onSwitch(how);
-    return true;
-  };
-  return Object.assign(check, {
-    forget: () => {
-      owner = null;
-    },
+export function readPathOwnerMoved(): boolean {
+  if (moved) return true;
+  if (getCurrentUserId() === null) return false;
+  const owner = readPathOwner();
+  if (pageOwner === null) {
+    pageOwner = owner;
+    return false;
+  }
+  if (owner === pageOwner) return false;
+  moved = true;
+  // Found while something reads: stores re-render after that read, never during it.
+  queueMicrotask(() => {
+    for (const listener of [...movedListeners]) listener();
   });
+  return true;
+}
+
+/** Call `listener` once the owner moves, so a store's readers decide again; returns the stop. */
+export function onReadPathOwnerMoved(listener: () => void): () => void {
+  movedListeners.add(listener);
+  return () => movedListeners.delete(listener);
+}
+
+/** Forget the page's owner, as a reload would, so a test starts clean. */
+export function resetReadPathOwnerForTests(): void {
+  pageOwner = null;
+  moved = false;
 }

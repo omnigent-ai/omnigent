@@ -5,7 +5,11 @@
 import { useSyncExternalStore } from "react";
 
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
-import { createReadPathOwnerWatch } from "@/lib/readPathOwner";
+import {
+  onReadPathOwnerMoved,
+  readPathOwnerMoved,
+  resetReadPathOwnerForTests,
+} from "@/lib/readPathOwner";
 
 import type { CodeHostProviderId } from "@/lib/codeHosts";
 
@@ -80,33 +84,20 @@ const advanceListeners = new Set<(key: MacReadScopeKey, move: MacReadScopeMove) 
 let watchedUser: string | null | undefined;
 let stopWatchingUser: (() => void) | null = null;
 
-/**
- * Advance every scope of the user who was signed in when the workspace user, server or base
- * path changes: a user id is only that server's, so a read kept for it can't show on another.
- */
-const syncOwner = createReadPathOwnerWatch((how) => {
-  const previous = watchedUser;
-  watchedUser = getCurrentUserId();
-  // Including a scope whose only read is still in flight, or one only list stats read.
-  const moved = [...scopes.keys()]
-    .map((scope) => JSON.parse(scope) as MacReadScopeKey)
-    .filter((key) => key[1] === previous);
-  // Refused at once; found while something reads, listeners hear it after that read.
-  for (const key of moved) moveScope(stateOf(scopeId(key)));
-  const notify = () => {
-    version += 1;
-    for (const listener of listeners) listener();
-    for (const key of moved) for (const listener of advanceListeners) listener(key, "advanced");
-  };
-  if (how === "event") notify();
-  else queueMicrotask(notify);
-});
-
+/** Advance every scope of the user who was signed in, whenever the workspace user changes. */
 function watchWorkspaceUser(): void {
-  syncOwner();
   if (stopWatchingUser) return;
   watchedUser = getCurrentUserId();
-  stopWatchingUser = subscribeIdentity(() => syncOwner("event"));
+  stopWatchingUser = subscribeIdentity(() => {
+    const previous = watchedUser;
+    watchedUser = getCurrentUserId();
+    if (previous === watchedUser) return;
+    // Including a scope whose only read is still in flight, or one only list stats read.
+    for (const scope of [...scopes.keys()]) {
+      const key = JSON.parse(scope) as MacReadScopeKey;
+      if (key[1] === previous) advanceMacReadScope(key);
+    }
+  });
 }
 let version = 0;
 
@@ -124,7 +115,6 @@ function stateOf(scope: string): ScopeState {
 /** Number a read of `key` before it's sent; every batch in the scope shares the order. */
 export function beginMacRead(key: MacReadScopeKey): MacReadTicket {
   watchWorkspaceUser();
-  syncOwner();
   const scope = scopeId(key);
   const state = stateOf(scope);
   state.sequence += 1;
@@ -137,7 +127,8 @@ export function acceptMacRead(
   reader: string,
   { restored = false }: { restored?: boolean } = {},
 ): MacReadVerdict {
-  syncOwner();
+  // Nothing read on this Mac is kept once the page's owner changed.
+  if (readPathOwnerMoved()) return "rejected";
   const state = stateOf(ticket.scope);
   const sequence = ticket.sequence;
   // Sent before the latest change of reader: older than it, whoever read it.
@@ -174,7 +165,7 @@ export function acceptMacRead(
  * answers that name none (older shells): kept only within the same order.
  */
 export function macReadCurrent(ticket: MacReadTicket): boolean {
-  syncOwner();
+  if (readPathOwnerMoved()) return false;
   return ticket.sequence >= stateOf(ticket.scope).floor;
 }
 
@@ -187,20 +178,16 @@ export function advanceMacReadScope(
   key: MacReadScopeKey,
   move: "advanced" | "left" = "advanced",
 ): MacReadScopeKey {
-  moveScope(stateOf(scopeId(key)));
-  version += 1;
-  for (const listener of listeners) listener();
-  for (const listener of advanceListeners) listener(key, move);
-  return key;
-}
-
-/** Refuse every read of a scope sent before now and forget its reader. */
-function moveScope(state: ScopeState): void {
+  const state = stateOf(scopeId(key));
   state.sequence += 1;
   state.floor = state.sequence;
   state.highWater = state.sequence;
   state.reader = null;
   state.epoch += 1;
+  version += 1;
+  for (const listener of listeners) listener();
+  for (const listener of advanceListeners) listener(key, move);
+  return key;
 }
 
 /**
@@ -240,7 +227,6 @@ export function refuseMacReadSentAt(
   code: string,
 ): boolean {
   if (!MAC_REFUSED_CODES.has(code)) return false;
-  syncOwner();
   if (!key[1] || key[1] !== getCurrentUserId() || ticket.scope !== scopeId(key)) return false;
   const state = scopes.get(ticket.scope);
   if (!state || ticket.sequence < state.floor || ticket.sequence < state.highWater) return false;
@@ -261,7 +247,7 @@ export function onMacReadScopeAdvanced(
 
 /** The reader whose answers `key` shows, or null before any answer was kept. */
 export function acceptedMacReader(key: MacReadScopeKey): string | null {
-  syncOwner();
+  if (readPathOwnerMoved()) return null;
   return scopes.get(scopeId(key))?.reader ?? null;
 }
 
@@ -271,7 +257,6 @@ export function acceptedMacReader(key: MacReadScopeKey): string | null {
  * in their key, so the same login back after a sign-out never reaches what it kept before.
  */
 export function macReadEpoch(key: MacReadScopeKey): number {
-  syncOwner();
   return scopes.get(scopeId(key))?.epoch ?? 0;
 }
 
@@ -293,7 +278,7 @@ export function macReadPublishable(
   viewer: string | null,
   owner: MacRecordOwner,
 ): boolean {
-  syncOwner();
+  if (readPathOwnerMoved()) return false;
   if (!owner.scope[1] || owner.scope[1] !== getCurrentUserId()) return false;
   if (ticket.scope !== scopeId(owner.scope)) return false;
   const state = scopes.get(ticket.scope);
@@ -315,6 +300,12 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+// Every scope's answers stop showing when the page's owner changes: readers re-render then.
+onReadPathOwnerMoved(() => {
+  version += 1;
+  for (const listener of listeners) listener();
+});
+
 /** Re-render when any scope's reader changes; returns the store's version. */
 export function useMacReadScopeVersion(): number {
   return useSyncExternalStore(
@@ -334,6 +325,7 @@ export class StaleMacReadError extends Error {
 
 /** Forget every scope, so a test starts clean. */
 export function resetMacReadScopesForTests(): void {
+  resetReadPathOwnerForTests();
   scopes.clear();
   listeners.clear();
   // Advance listeners stay: a query client bound to the scopes outlives a reset.
@@ -341,5 +333,4 @@ export function resetMacReadScopesForTests(): void {
   stopWatchingUser?.();
   stopWatchingUser = null;
   watchedUser = undefined;
-  syncOwner.forget();
 }

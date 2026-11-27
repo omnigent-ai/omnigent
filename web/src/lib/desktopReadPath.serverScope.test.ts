@@ -1,11 +1,11 @@
-// What the read path keeps for a workspace user belongs to that user on one server and API base
-// path: a user id names someone only on its own server. Each state switches A → B → A here, with
-// the same user id, since no event says the server changed.
+// The read path serves only the owner its page started with: server identity, API base path and
+// workspace user. After any change of owner, every PR reads through the session's host until a
+// reload, with no Mac read kept and no per-owner choice applied, even back on the first owner.
 
 import type * as BasePathModule from "@/lib/basePath";
 import type * as HostModule from "@/lib/host";
 import type * as IdentityModule from "@/lib/identity";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 const SERVER_A = "https://server-a.example.com";
 const SERVER_B = "https://server-b.example.com";
@@ -29,11 +29,11 @@ vi.mock("@/lib/basePath", async (importOriginal) => ({
 
 import {
   chooseReadSource,
-  discoverMacIdentity,
-  findBranchOnSessionMachine,
-  findsBranchOnSessionMachine,
+  desktopReadTarget,
   GITHUB_MAC_READ_OPERATIONS,
-  macIdentity,
+  githubMacReadsPreference,
+  macOffers,
+  macReadTarget,
   macReadTargetAs,
   readChoiceFor,
   readRouteFor,
@@ -50,17 +50,17 @@ import {
   resetMacNamedReadsForTests,
 } from "./macNamedReads";
 import {
-  acceptedMacReader,
   acceptMacRead,
   beginMacRead,
-  macNamedReadScopeKey,
+  macReadCurrent,
   macReadScopeKey,
-  onMacReadScopeAdvanced,
   resetMacReadScopesForTests,
 } from "./macReadScope";
 import { resetRepoAccountsForTests, setRepoAccount } from "./pullRequestRepoAccounts";
+import { repoReaderState } from "./pullRequestRepoReader";
 
 const PR = "https://github.com/example-org/example-repo/pull/7";
+const OTHER_PR = "https://github.com/example-org/other-repo/pull/8";
 const REPOSITORY = { host: "github.com", owner: "example-org", repo: "example-repo" };
 const READER = { host: "github.com", login: "bob" };
 
@@ -71,15 +71,7 @@ async function namedReadsOn() {
     kind: "electron",
     codeHostQuery: async () => ({ ok: false }),
     codeHostAccounts: {
-      // This Mac reads GitHub as `alice` when no login is named.
-      get: async () => ({
-        ok: true,
-        data: {
-          intent: { mode: "automatic" },
-          effective: { login: "alice", generation: 1 },
-          accounts: [{ login: "alice", active: true, state: "success" }],
-        },
-      }),
+      get: async () => ({ ok: false }),
       set: async () => ({ ok: false }),
       onChanged: () => () => {},
       onNamedChanged: () => () => {},
@@ -125,128 +117,69 @@ afterEach(() => {
   state.base = "/api";
 });
 
-describe("routes and read choices", () => {
-  it("routes a repository's chosen login only on its own server, not after a switch to one with no identity", async () => {
-    await namedReadsOn();
-    expect(setRepoAccount(REPOSITORY, { mode: "account", login: "bob" })).toBe(true);
-    await vi.waitFor(() => expect(readRouteFor(PR)).toMatchObject({ kind: "mac" }));
-    expect(macReadTargetAs(PR, null)).toMatchObject({ readAs: "bob" });
-
-    // An embedded backend with no stable identity, for the same user: no choice applies there.
-    state.server = null;
-    expect(readRouteFor(PR)).toEqual({ kind: "host" });
-    expect(macReadTargetAs(PR, null)?.readAs).toBeUndefined();
-
-    state.server = SERVER_A;
-    expect(readRouteFor(PR)).toMatchObject({ kind: "mac" });
-  });
-
-  it("keeps a PR's read choice on the server it was made on, so another's saved login applies there", async () => {
-    await namedReadsOn();
-    state.server = SERVER_B;
-    expect(setRepoAccount(REPOSITORY, { mode: "account", login: "carol" })).toBe(true);
-    state.server = SERVER_A;
-    chooseReadSource(PR, "session");
-    expect(readRouteFor(PR)).toEqual({ kind: "host" });
-
-    // Server B's own saved login reads the PR, not server A's choice of the session's machine.
-    state.server = SERVER_B;
-    expect(readChoiceFor(PR)).toBe("automatic");
-    await vi.waitFor(() => expect(readRouteFor(PR)).toMatchObject({ kind: "mac" }));
-    expect(macReadTargetAs(PR, null)).toMatchObject({ readAs: "carol" });
-
-    // Back on A, its choice was for that visit: the PR is on Automatic again.
-    state.server = SERVER_A;
-    expect(readChoiceFor(PR)).toBe("automatic");
-  });
-
-  it("drops a read choice when only the API base path changes", async () => {
-    await namedReadsOn();
-    chooseReadSource(PR, "session");
-    state.base = "/other/api";
-    expect(readChoiceFor(PR)).toBe("automatic");
-    state.base = "/api";
-    expect(readChoiceFor(PR)).toBe("automatic");
-  });
-});
-
-it("forgets which sessions find their branch on the session's machine at a server switch", async () => {
-  await namedReadsOn();
-  findBranchOnSessionMachine("conv_1");
-  expect(findsBranchOnSessionMachine("conv_1")).toBe(true);
-  state.server = SERVER_B;
-  expect(findsBranchOnSessionMachine("conv_1")).toBe(false);
-  state.server = SERVER_A;
-  expect(findsBranchOnSessionMachine("conv_1")).toBe(false);
-});
-
-it("forgets the account this Mac reads a host as at a server switch, until asked again", async () => {
-  await namedReadsOn();
-  expect(await discoverMacIdentity("github.com")).toBe("alice");
-  state.server = SERVER_B;
-  expect(macIdentity("github.com")).toBeNull();
-  state.server = SERVER_A;
-  expect(macIdentity("github.com")).toBeNull();
-  expect(await discoverMacIdentity("github.com")).toBe("alice");
-});
-
-it("refuses a Mac read sent on another server, and drops what each scope showed", async () => {
-  await namedReadsOn();
-  const key = macReadScopeKey("github", "github.com");
-  const advanced: unknown[] = [];
-  const stop = onMacReadScopeAdvanced((moved) => advanced.push(moved));
-  expect(acceptMacRead(beginMacRead(key), "alice")).toBe("accepted");
-  const sentOnA = beginMacRead(key);
-
-  state.server = SERVER_B;
-  expect(acceptMacRead(sentOnA, "alice")).toBe("rejected");
-  expect(acceptedMacReader(key)).toBeNull();
-  // Queries cached under the scope are dropped once the read that found the switch is done.
-  expect(advanced).toEqual([]);
-  await Promise.resolve();
-  expect(advanced).toEqual([key]);
-
-  state.server = SERVER_A;
-  expect(acceptMacRead(sentOnA, "alice")).toBe("rejected");
-  expect(acceptMacRead(beginMacRead(key), "alice")).toBe("accepted");
-  stop();
-});
-
-it("proves no named writer or restore after a server switch, even back on the first", async () => {
+it("keeps no named-read proof or Mac read after A, then B read only for a route, then A again", async () => {
   await namedReadsOn();
   expect(acceptNamedAnswer(namedReadTicket(READER), namedAnswer("bob"))).toBe("accepted");
   const proof = namedRestoreProof(READER, "bob")!;
-  expect(namedWriterIdentity(READER)).toEqual({ login: "bob", generation: 0 });
+  expect(namedRestoreProofHolds(READER, proof)).toBe(true);
+  const key = macReadScopeKey("github", "github.com");
+  const pending = beginMacRead(key);
 
+  // On B, only a route is asked.
   state.server = SERVER_B;
-  expect(namedWriterIdentity(READER)).toBe("checking");
-  expect(namedRestoreProofHolds(READER, proof)).toBe(false);
+  readRouteFor(PR);
 
   state.server = SERVER_A;
-  expect(namedWriterIdentity(READER)).toBe("checking");
   expect(namedRestoreProofHolds(READER, proof)).toBe(false);
   expect(namedRestoreProof(READER, "bob")).toBeNull();
+  expect(namedWriterIdentity(READER)).toBe("checking");
+  expect(macReadCurrent(pending)).toBe(false);
+  expect(acceptMacRead(pending, "alice")).toBe("rejected");
 });
 
-it("never retires a login a PR read as on another server, when a choice changes on this one", async () => {
+it("applies no PR read choice after the API base path changes on a server with no identity", async () => {
+  state.server = null;
+  state.base = "/one";
   await namedReadsOn();
+  chooseReadSource(PR, "session");
+  expect(readChoiceFor(PR)).toBe("session");
+
+  state.base = "/two";
+  expect(readChoiceFor(PR)).toBe("automatic");
+  // Choosing again applies nothing either, until a reload.
+  chooseReadSource(PR, "mac");
+  expect(readChoiceFor(PR)).toBe("automatic");
+  state.base = "/one";
+  expect(readChoiceFor(PR)).toBe("automatic");
+});
+
+it("reads every PR through the session's host after a switch, and keeps doing so back on the first server", async () => {
+  await namedReadsOn();
+  githubMacReadsPreference.write("on");
   expect(setRepoAccount(REPOSITORY, { mode: "account", login: "bob" })).toBe(true);
+  chooseReadSource(OTHER_PR, "mac");
+  const AUTOMATIC_PR = "https://github.com/example-org/third-repo/pull/9";
+  // On A: the saved login, the explicit choice and Automatic each read on this Mac.
   await vi.waitFor(() => expect(readRouteFor(PR)).toMatchObject({ kind: "mac" }));
-  const moves: string[] = [];
-  const bob = JSON.stringify(macNamedReadScopeKey("github.com", "bob"));
-  const stop = onMacReadScopeAdvanced((key, move) => {
-    if (JSON.stringify(key) === bob) moves.push(move);
-  });
+  expect(readRouteFor(OTHER_PR)).toMatchObject({ kind: "mac" });
+  expect(readRouteFor(AUTOMATIC_PR)).toMatchObject({ kind: "mac" });
 
-  // On B, nothing reads the PR before another repository's choice changes.
-  state.server = SERVER_B;
-  setRepoAccount({ ...REPOSITORY, repo: "other-repo" }, { mode: "account", login: "carol" });
-  await Promise.resolve();
-  expect(moves).not.toContain("left");
-
-  state.server = SERVER_A;
-  setRepoAccount({ ...REPOSITORY, repo: "other-repo" }, { mode: "automatic" });
-  await Promise.resolve();
-  expect(moves).not.toContain("left");
-  stop();
+  for (const server of [SERVER_B, SERVER_A]) {
+    state.server = server;
+    const urls = [PR, OTHER_PR, AUTOMATIC_PR];
+    for (const url of urls) {
+      expect(readRouteFor(url), `${server} ${url}`).toEqual({ kind: "host" });
+      expect(macReadTarget(url)).toBeNull();
+      expect(macReadTargetAs(url, READER)).toBeNull();
+    }
+    // oxlint-disable-next-line no-await-in-loop -- each server's reads are checked in turn
+    expect(await Promise.all(urls.map((url) => desktopReadTarget(url)))).toEqual([
+      null,
+      null,
+      null,
+    ]);
+    expect(repoReaderState(PR)).toEqual({ kind: "none" });
+    expect(macOffers("github", "pull_request_inbox")).toBe(false);
+    expect(namedReadsAvailable()).toBe(false);
+  }
 });

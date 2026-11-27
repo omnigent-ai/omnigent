@@ -34,10 +34,13 @@ import {
   createAutomaticFeaturePreference,
 } from "@/lib/automaticFeaturePreference";
 import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
-import { durableServerScope } from "@/lib/durableServerScope";
+import {
+  onReadPathOwnerMoved,
+  readPathOwnerMoved,
+  resetReadPathOwnerForTests,
+} from "@/lib/readPathOwner";
 import { resolveAutomaticGitHubReaderWith } from "@/lib/githubCooldown";
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
-import { createReadPathOwnerWatch, readPathOwner } from "@/lib/readPathOwner";
 import { acceptedWorkspaceDesign, subscribeAcceptedWorkspaceDesign } from "@/lib/workspaceSurfaces";
 import {
   acceptMacRead,
@@ -223,7 +226,7 @@ interface ScopeState {
   failed: boolean;
 }
 
-let support: DesktopReadSupport | null = null;
+let shellSupport: DesktopReadSupport | null = null;
 let supportRequest: Promise<DesktopReadSupport> | null = null;
 let automaticPolicy = false;
 const githubHosts = new Set<string>();
@@ -233,6 +236,8 @@ const unsignedHosts = new Set<string>();
 // GitHub hosts whose account main is being asked for again, after a change dropped it.
 const identityChecks = new Set<string>();
 const scopes = new Map<string, ScopeState>();
+// The workspace user the scopes' reads were for, so a switch drops that user's.
+let scopeUser: string | null = null;
 // Each PR's explicit read choice for this app run, by canonical URL; absent is Automatic.
 const readChoices = new Map<string, Exclude<ReadChoice, "automatic">>();
 // Sessions whose branch PR the user asked the session's machine to find, for this run.
@@ -247,27 +252,6 @@ function changed(): void {
   version += 1;
   for (const listener of listeners) listener();
 }
-
-// What a workspace user on one server chose or was told is theirs alone: another user, server
-// or base path starts on Automatic, with no account named for any host.
-const syncOwner = createReadPathOwnerWatch((how) => {
-  for (const entry of scopes.values()) {
-    entry.identity = null;
-    entry.failed = false;
-  }
-  readChoices.clear();
-  sessionMachineBranches.clear();
-  identityChecks.clear();
-  identityCheckUsers.clear();
-  if (how === "event") changed();
-  else {
-    // Found while something reads: listeners hear it after that read, never during it.
-    version += 1;
-    queueMicrotask(() => {
-      for (const listener of listeners) listener();
-    });
-  }
-});
 
 function scopeState(provider: MacReadProvider, host: string): ScopeState {
   const key = `${provider}\n${host.toLowerCase()}`;
@@ -335,8 +319,7 @@ export function ensureMacIdentity(host: string): void {
   const entry = githubScope(name);
   // A check still out for the previous workspace user doesn't answer for this one.
   if (entry.identity) return;
-  syncOwner();
-  if (identityChecks.has(name) && identityCheckUsers.get(name) === readPathOwner()) return;
+  if (identityChecks.has(name) && identityCheckUsers.get(name) === getCurrentUserId()) return;
   resolveMacIdentity(name, entry);
   changed();
 }
@@ -381,12 +364,12 @@ const MAX_STALE_IDENTITY_ANSWERS = 3;
 function resolveMacIdentity(name: string, entry: ScopeState, staleAnswers = 0): void {
   const request = (identityRequests.get(name) ?? 0) + 1;
   identityRequests.set(name, request);
-  const owner = readPathOwner();
+  const userId = getCurrentUserId();
   identityChecks.add(name);
-  identityCheckUsers.set(name, owner);
+  identityCheckUsers.set(name, userId);
   const resolution = desktopMacAccounts(name).then((choice) => {
     if (identityRequests.get(name) !== request) return;
-    if (owner !== readPathOwner()) {
+    if (userId !== getCurrentUserId()) {
       identityChecks.delete(name);
       changed();
       return;
@@ -430,15 +413,28 @@ function start(): void {
   const stopAccounts = onDesktopMacAccountsChanged(accountsChanged);
   // Another workspace user's answers must not show: keys carry the user, and the
   // shared scope advances every one of the previous user's. What main said about
-  // accounts was for them too; a switch of server is found as the store is read.
-  syncOwner();
-  const stopIdentity = subscribeIdentity(() => syncOwner("event"));
+  // accounts was for them too.
+  scopeUser = getCurrentUserId();
+  const stopIdentity = subscribeIdentity(() => {
+    const previous = scopeUser;
+    scopeUser = getCurrentUserId();
+    if (previous === scopeUser) return;
+    for (const entry of scopes.values()) {
+      entry.identity = null;
+      entry.failed = false;
+    }
+    // A choice was the previous user's; the next one starts on Automatic.
+    readChoices.clear();
+    changed();
+  });
+  const stopMoved = onReadPathOwnerMoved(changed);
   stopWatching = () => {
     stopReadsFlag();
     stopPreference();
     stopDesign();
     stopAccounts();
     stopIdentity();
+    stopMoved();
   };
 }
 
@@ -484,7 +480,8 @@ export function repoReaderPolicyChanged(): void {
 /** Who `url`'s repository is read as on this Mac; see {@link RepoReaderState}. */
 export function repoReaderFor(rawUrl: string | null | undefined): RepoReaderState {
   const url = pullRequestPageUrl(rawUrl);
-  if (!url) return NO_REPO_READER;
+  // Another owner's saved login reads nothing: the session's host reads it instead.
+  if (!url || readPathOwnerMoved()) return NO_REPO_READER;
   if (repoPolicy) return repoPolicy.readerFor(url);
   const repository = pullRequestRepository(url);
   if (!repository) return NO_REPO_READER;
@@ -507,25 +504,36 @@ function repoNamedReader(url: string | null | undefined): MacNamedReader | null 
 
 function loadSupport(): Promise<DesktopReadSupport> {
   start();
-  if (support) return Promise.resolve(support);
+  if (readPathOwnerMoved()) return Promise.resolve(NO_DESKTOP_READS);
+  if (shellSupport) return Promise.resolve(shellSupport);
   if (!hasCodeHostBridge()) {
-    support = NO_DESKTOP_READS;
-    return Promise.resolve(support);
+    shellSupport = NO_DESKTOP_READS;
+    return Promise.resolve(shellSupport);
   }
   supportRequest ??= getDesktopFeatures().then(
     (features) => {
-      support = supportFrom(features?.codeHosts);
+      shellSupport = supportFrom(features?.codeHosts);
       changed();
-      return support;
+      return shellSupport;
     },
     () => {
-      support = NO_DESKTOP_READS;
+      shellSupport = NO_DESKTOP_READS;
       changed();
-      return support;
+      return shellSupport;
     },
   );
-  return supportRequest;
+  return supportRequest.then(supportNowOr);
 }
+
+/**
+ * What the shell reads as seen by this page's owner: nothing once the owner moved, so every
+ * pull request reads through the session's host until a reload.
+ */
+function supportNow(): DesktopReadSupport | null {
+  return readPathOwnerMoved() ? NO_DESKTOP_READS : shellSupport;
+}
+
+const supportNowOr = (known: DesktopReadSupport) => supportNow() ?? known;
 
 // Each refresh is numbered, so a slower, older answer can't replace a newer one.
 let writesRefresh = 0;
@@ -540,7 +548,7 @@ export async function refreshDesktopReadSupport(): Promise<void> {
   const known = await loadSupport();
   const request = ++writesRefresh;
   const features = await getDesktopFeatures();
-  if (request !== writesRefresh || !features || support !== known || !known.github) return;
+  if (request !== writesRefresh || !features || shellSupport !== known || !known.github) return;
   const fresh = supportFrom(features.codeHosts).github;
   const writes = fresh?.writes;
   const readAs = fresh?.readAs;
@@ -552,14 +560,16 @@ export async function refreshDesktopReadSupport(): Promise<void> {
   ) {
     return;
   }
-  support = { ...known, github: { ...known.github, writes, readAs, writeAs } };
+  shellSupport = { ...known, github: { ...known.github, writes, readAs, writeAs } };
   changed();
 }
 
 /** Whether this shell reads GitHub as a login a page names (`macLogin`), as last answered. */
 export function macNamedReadsOffered(): boolean {
+  const support = supportNow();
   // Named reads come with this Mac's accounts, which list who can be named.
-  return support?.github?.readAs === 1 && support.github.accounts === true;
+  const github = support?.github;
+  return github?.readAs === 1 && github.accounts === true;
 }
 
 /**
@@ -567,6 +577,7 @@ export function macNamedReadsOffered(): boolean {
  * capability and its preload method both, so a partial shell never gets a named write.
  */
 export function macNamedWritesOffered(): boolean {
+  const support = supportNow();
   return macNamedReadsOffered() && support?.github?.writeAs === 1 && hasNamedCodeHostWriteBridge();
 }
 
@@ -574,27 +585,21 @@ function githubReadsEnabledNow(): boolean {
   return githubMacReadsEnabled(githubMacReadsPreference.read(), automaticPolicy);
 }
 
-// Each PR's route as of the store's version and server: a long list asks for every row's route
-// several times a render, and a switch of server, which moves no version, changes its choices.
+// Each PR's route as of the store's version and the shell's support as this owner sees it: a long
+// list asks for every row's route several times a render, and working one out parses the URL.
 let routeCache: {
   version: number;
   support: DesktopReadSupport | null;
-  serverScope: string | null;
   routes: Map<string, ReadRoute>;
 } | null = null;
 
 /** The PR's effective read route now, from the automatic policy and the user's choice. */
 export function readRouteFor(rawUrl: string | null | undefined): ReadRoute {
-  syncOwner();
   // Before the store listens, a change to the setting wouldn't move its version.
   if (!rawUrl || !started) return routeNow(rawUrl);
-  const serverScope = durableServerScope();
-  if (
-    routeCache?.version !== version ||
-    routeCache.support !== support ||
-    routeCache.serverScope !== serverScope
-  ) {
-    routeCache = { version, support, serverScope, routes: new Map() };
+  const support = supportNow();
+  if (routeCache?.version !== version || routeCache.support !== support) {
+    routeCache = { version, support, routes: new Map() };
   }
   let route = routeCache.routes.get(rawUrl);
   if (!route) {
@@ -605,6 +610,7 @@ export function readRouteFor(rawUrl: string | null | undefined): ReadRoute {
 }
 
 function routeNow(rawUrl: string | null | undefined): ReadRoute {
+  const support = supportNow();
   // Every page of a PR routes as the PR itself, so a subpage can't slip past a choice.
   const url = pullRequestPageUrl(rawUrl) ?? rawUrl;
   const choice = appliedReadChoiceFor(url);
@@ -614,7 +620,11 @@ function routeNow(rawUrl: string | null | undefined): ReadRoute {
   if (repo.kind === "blocked") return { kind: "blocked", reason: "repo_account" };
   if (repo.kind === "named") {
     const forced = support
-      ? classifyPullRequestRead(url, { support, githubReadsEnabled: true, githubHosts })
+      ? classifyPullRequestRead(url, {
+          support,
+          githubReadsEnabled: true,
+          githubHosts,
+        })
       : null;
     return forced ? { kind: "mac", target: forced } : { kind: "blocked", reason: "repo_account" };
   }
@@ -626,7 +636,11 @@ function routeNow(rawUrl: string | null | undefined): ReadRoute {
     automatic: choice === "automatic" ? classifyIgnoringChoice(url) : null,
     forced:
       choice === "mac"
-        ? classifyPullRequestRead(url, { support, githubReadsEnabled: true, githubHosts })
+        ? classifyPullRequestRead(url, {
+            support,
+            githubReadsEnabled: true,
+            githubHosts,
+          })
         : null,
   });
 }
@@ -637,9 +651,14 @@ function routeNow(rawUrl: string | null | undefined): ReadRoute {
  * the host. Null before the shell answers and where this Mac can't read it at all.
  */
 export function macReadCandidate(rawUrl: string | null | undefined): CodeHostPullRequest | null {
+  const support = supportNow();
   if (!support) return null;
   const url = pullRequestPageUrl(rawUrl) ?? rawUrl;
-  return classifyPullRequestRead(url, { support, githubReadsEnabled: true, githubHosts });
+  return classifyPullRequestRead(url, {
+    support,
+    githubReadsEnabled: true,
+    githubHosts,
+  });
 }
 
 /** What Automatic would pick for `url` now, whatever the user chose. */
@@ -649,7 +668,8 @@ export function automaticReadRoute(url: string | null | undefined): "mac" | "hos
 
 /** The user's choice for `url`; Automatic when there is none. */
 export function readChoiceFor(url: string | null | undefined): ReadChoice {
-  syncOwner();
+  // Choices were the page's first owner's; after a move every PR reads through the host.
+  if (readPathOwnerMoved()) return "automatic";
   const key = readChoiceKey(url);
   return (key ? readChoices.get(key) : undefined) ?? "automatic";
 }
@@ -667,7 +687,7 @@ function appliedReadChoiceFor(url: string | null | undefined): ReadChoice {
 export function chooseReadSource(url: string, choice: ReadChoice): void {
   start();
   const key = readChoiceKey(url);
-  if (!key || readChoiceFor(key) === choice) return;
+  if (!key || readPathOwnerMoved() || readChoiceFor(key) === choice) return;
   if (choice === "automatic") readChoices.delete(key);
   else readChoices.set(key, choice);
   repoPolicy?.readChoiceChanged(key);
@@ -689,6 +709,7 @@ function classifyNow(url: string | null | undefined): CodeHostPullRequest | null
 
 /** What this Mac could read, setting aside a PR the user sent to the session's machine. */
 function classifyIgnoringChoice(url: string | null | undefined): CodeHostPullRequest | null {
+  const support = supportNow();
   if (!support) return null;
   return classifyPullRequestRead(url, {
     support,
@@ -724,7 +745,6 @@ export function branchDiscoveryProvider(
   sessionId: string,
   host: string | null,
 ): CodeHostPullRequest["provider"] | null {
-  syncOwner();
   if (!host || sessionMachineBranches.has(sessionId)) return null;
   const name = host.toLowerCase();
   const provider = codeHostProvider(name, githubHosts) ?? null;
@@ -738,6 +758,7 @@ export function branchDiscoveryProvider(
  * this Mac's gh answers.
  */
 export function branchDiscoverySettled(host: string | null): boolean {
+  const support = supportNow();
   if (!desktopReadSupportKnown()) {
     void loadSupport();
     return false;
@@ -770,13 +791,11 @@ export function contextHostProvider(host: string): CodeHostProviderId | "pending
 
 /** Whether the user asked the session's machine to find this session's branch PR. */
 export function findsBranchOnSessionMachine(sessionId: string): boolean {
-  syncOwner();
   return sessionMachineBranches.has(sessionId);
 }
 
 /** Find the session's branch PR with the session's machine for the rest of this app run. */
 export function findBranchOnSessionMachine(sessionId: string): void {
-  syncOwner();
   if (sessionMachineBranches.has(sessionId)) return;
   sessionMachineBranches.add(sessionId);
   changed();
@@ -784,7 +803,6 @@ export function findBranchOnSessionMachine(sessionId: string): void {
 
 /** Find the session's branch PR on this Mac again, undoing {@link findBranchOnSessionMachine}. */
 export function findBranchOnThisMacAgain(sessionId: string): void {
-  syncOwner();
   if (sessionMachineBranches.delete(sessionId)) changed();
 }
 
@@ -839,6 +857,7 @@ export async function desktopReadTarget(
 
 /** The host of `url` when only asking this Mac's gh can tell whether it serves GitHub. */
 function unprobedGitHubHost(rawUrl: string | null | undefined): string | null {
+  const support = supportNow();
   // Any page of a PR probes as the PR itself, as its route does.
   const url = pullRequestPageUrl(rawUrl) ?? rawUrl;
   // A host already known, including for a PR sent to the session's machine, is settled,
@@ -958,7 +977,6 @@ const isMacReadProvider = (provider: Provider): provider is MacReadProvider =>
 
 /** The account this Mac last read `host` as, or null before its first read. */
 export function macIdentity(host: string): Pick<MacAccountIdentity, "login" | "generation"> | null {
-  syncOwner();
   return scopes.get(`github\n${host.toLowerCase()}`)?.identity ?? null;
 }
 
@@ -973,13 +991,13 @@ export async function discoverMacIdentity(host: string): Promise<string | null> 
   if (known) return known.login;
   const epoch = accountEpochs.get(name) ?? 0;
   const lifetime = readPathLifetime;
-  const owner = readPathOwner();
+  const userId = getCurrentUserId();
   // Main is asked once per account change: a check that named nobody answers until the next.
   const asked = identityResolutions.get(name);
-  if (!asked || identityCheckUsers.get(name) !== owner) ensureMacIdentity(name);
+  if (!asked || identityCheckUsers.get(name) !== getCurrentUserId()) ensureMacIdentity(name);
   await latestIdentityAnswer(name);
   const moved = (accountEpochs.get(name) ?? 0) !== epoch || readPathLifetime !== lifetime;
-  if (moved || readPathOwner() !== owner) return null;
+  if (moved || getCurrentUserId() !== userId) return null;
   return macIdentity(name)?.login ?? null;
 }
 
@@ -1018,6 +1036,7 @@ export function macReadTicket(provider: MacReadProvider, host: string): MacAnswe
 
 /** Whether this shell's Mac answers for `provider` carry provenance to check. */
 export function macAnswersCarryProvenance(provider: MacReadProvider): boolean {
+  const support = supportNow();
   const entry = provider === "github" ? support?.github : support?.named[provider];
   return entry?.answerProvenance === 1;
 }
@@ -1178,6 +1197,7 @@ export function readsHostOnThisMac(
   host: string | null,
   operation: string,
 ): boolean {
+  const support = supportNow();
   if (!support || !provider || !host || !macOffers(provider, operation)) return false;
   if (!desktopReadsProvider(support, provider)) return false;
   if (provider !== "github") return namedCodeHost(host)?.provider === provider;
@@ -1187,6 +1207,7 @@ export function readsHostOnThisMac(
 
 /** Whether this shell runs `operation` for `provider` on the Mac, beyond the panel's basics. */
 export function macOffers(provider: CodeHostPullRequest["provider"], operation: string): boolean {
+  const support = supportNow();
   const host =
     provider === "github"
       ? support?.github
@@ -1196,8 +1217,9 @@ export function macOffers(provider: CodeHostPullRequest["provider"], operation: 
   return !!host?.operations.includes(operation);
 }
 
-/** The shell's read support, once known. */
+/** The shell's read support as this page's owner sees it, once known. */
 export function desktopReadSupport(): DesktopReadSupport | null {
+  const support = supportNow();
   return support;
 }
 
@@ -1221,13 +1243,14 @@ export function useDesktopReadPathVersion(): number {
 
 /** Whether this shell can read GitHub PRs on the Mac, so the setting applies; live. */
 export function useGitHubMacReadsAvailable(): boolean {
+  const support = supportNow();
   useDesktopReadPathVersion();
   return !!support && desktopReadsProvider(support, "github");
 }
 
 /** Whether the shell has said what it reads; true at once in browsers. */
 export function desktopReadSupportKnown(): boolean {
-  return support !== null || !hasCodeHostBridge();
+  return shellSupport !== null || !hasCodeHostBridge();
 }
 
 /** Deliver the shell's account-change event for `host`, as its bridge would. */
@@ -1244,8 +1267,9 @@ export function resetDesktopReadPathForTests(): void {
   accountEpochs.clear();
   readPathLifetime += 1;
   identityCheckUsers.clear();
-  support = null;
+  shellSupport = null;
   supportRequest = null;
+  resetReadPathOwnerForTests();
   automaticPolicy = false;
   githubHosts.clear();
   probedHosts.clear();
@@ -1253,7 +1277,7 @@ export function resetDesktopReadPathForTests(): void {
   identityChecks.clear();
   scopes.clear();
   resetMacReadScopesForTests();
-  syncOwner.forget();
+  scopeUser = null;
   readChoices.clear();
   sessionMachineBranches.clear();
   listeners.clear();
