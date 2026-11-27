@@ -30,6 +30,7 @@ from omnigent.runner.github_resource import (
     github_pr_diff,
 )
 from omnigent.runner.session_prs import PullRequestRef
+from omnigent.util.gh_env import gh_subprocess_env
 from tests.budgets import budget
 
 
@@ -103,16 +104,16 @@ def test_gh_starts_gh_with_todays_command_and_environment(
 
     result = github_resource._gh(argv, cwd="/workspace", token=token)
 
-    if not sandbox and token is None:
-        expected_env = None
-    else:
-        expected_env = _without_tokens(ambient) if sandbox else dict(ambient)
-        if token is not None:
-            expected_env = {
-                **_without_tokens(expected_env),
-                "GH_TOKEN": token,
-                "GH_ENTERPRISE_TOKEN": token,
-            }
+    expected_env = _without_tokens(ambient) if sandbox else dict(ambient)
+    if token is not None:
+        expected_env = {
+            **_without_tokens(expected_env),
+            "GH_TOKEN": token,
+            "GH_ENTERPRISE_TOKEN": token,
+        }
+    # Every gh call also gets a session-bus address, so gh never launches a bus.
+    expected_env = gh_subprocess_env(expected_env)
+    assert "DBUS_SESSION_BUS_ADDRESS" in expected_env
     assert result == (0, "answer", "")
     assert gh_starts == [
         {
@@ -135,7 +136,12 @@ def test_gh_keeps_a_callers_timeout_and_starts_nothing_past_its_deadline(
 
     assert late == (None, "", "gh deadline exceeded")
     assert gh_starts == [
-        {"argv": ["gh", "api", "user"], "cwd": "/workspace", "timeout": 90.0, "env": None}
+        {
+            "argv": ["gh", "api", "user"],
+            "cwd": "/workspace",
+            "timeout": 90.0,
+            "env": gh_subprocess_env(os.environ),
+        }
     ]
 
 
@@ -1924,9 +1930,12 @@ def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_gh_inherits_env_outside_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Local dev (not a sandbox): env is inherited untouched (env=None), so the
-    # developer's own gh auth / GH_TOKEN keeps working — no regression.
+    # Local dev (not a sandbox): the developer's env is passed through, so their
+    # own gh auth / GH_TOKEN keeps working; only a session-bus address is added
+    # so gh's keyring lookup can never start a bus that outlives the call.
     monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "dev-tok")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/7/bus")
     captured: dict[str, object] = {}
 
     def fake_run(argv: Sequence[str], *, cwd: str, timeout: float, env=None):
@@ -1935,7 +1944,10 @@ def test_gh_inherits_env_outside_sandbox(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(github_resource, "_run", fake_run)
     github_resource._gh(["pr", "diff"], cwd="/tmp")
-    assert captured["env"] is None
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["GH_TOKEN"] == "dev-tok"
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/7/bus"
 
 
 def test_gh_applies_account_token(monkeypatch: pytest.MonkeyPatch) -> None:

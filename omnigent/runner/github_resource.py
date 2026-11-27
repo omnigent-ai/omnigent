@@ -90,6 +90,7 @@ from omnigent.runner.git_providers import (
 )
 from omnigent.runner.session_prs import PullRequestRef
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
+from omnigent.util.gh_env import gh_subprocess_env
 
 _logger = logging.getLogger(__name__)
 
@@ -262,6 +263,8 @@ def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> G
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
         env.pop("GITHUB_ENTERPRISE_TOKEN", None)
+    # Never let gh's keyring lookup start a session bus that outlives the call.
+    env = gh_subprocess_env(os.environ if env is None else env)
     return GhInvocation(argv=["gh", *argv], env=env, host=host)
 
 
