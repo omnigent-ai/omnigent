@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 
 const {
+  menuStateChanged,
   registerDesktopCommandStateReset,
   registerPickListMenuYield,
   sanitizeDesktopCommandState,
@@ -26,6 +27,26 @@ describe("sanitizeDesktopCommandState", () => {
     assert.equal(sanitizeDesktopCommandState(null), null);
     assert.equal(sanitizeDesktopCommandState("close"), null);
     assert.deepEqual([...sanitizeDesktopCommandState({}).commands], []);
+  });
+});
+
+describe("menuStateChanged", () => {
+  const state = (overrides = {}) =>
+    sanitizeDesktopCommandState({ commands: ["close", "go-back"], ...overrides });
+
+  it("ignores a report that only moves pick-list focus", () => {
+    assert.equal(menuStateChanged(state(), state({ pickListFocused: true })), false);
+    assert.equal(menuStateChanged(state(), state({ commands: ["go-back", "close"] })), false);
+  });
+
+  it("sees what the menu shows change: its items, Pin and Archive, or a first report", () => {
+    assert.equal(menuStateChanged(state(), state({ commands: ["close"] })), true);
+    assert.equal(menuStateChanged(state(), state({ commands: ["close", "quit"] })), true);
+    assert.equal(menuStateChanged(state(), state({ sessionPinned: true })), true);
+    assert.equal(menuStateChanged(state(), state({ sessionArchived: true })), true);
+    assert.equal(menuStateChanged(null, state()), true);
+    assert.equal(menuStateChanged(state(), null), true);
+    assert.equal(menuStateChanged(null, null), false);
   });
 });
 

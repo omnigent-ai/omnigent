@@ -167,6 +167,7 @@ const {
   serverPageOf,
 } = require("./floating_composer_support");
 const {
+  menuStateChanged,
   registerDesktopCommandStateReset,
   registerPickListMenuYield,
   sanitizeDesktopCommandState,
@@ -5490,8 +5491,11 @@ function registerIpc() {
   ipcMain.on("omnigent:set-desktop-command-state", (event, state) => {
     if (!isPinnedOriginSender(event)) return;
     const win = BrowserWindow.fromWebContents(event.sender);
-    windows.get(win).desktopCommands = sanitizeDesktopCommandState(state);
-    if (BrowserWindow.getFocusedWindow() === win) buildMenu();
+    const previous = windows.get(win).desktopCommands;
+    const next = sanitizeDesktopCommandState(state);
+    windows.get(win).desktopCommands = next;
+    // A report that only moves pick-list focus leaves the menu as it is.
+    if (menuStateChanged(previous, next) && BrowserWindow.getFocusedWindow() === win) buildMenu();
   });
 
   // The conversation this window's page has loaded for its signed-in user. A

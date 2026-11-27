@@ -53,6 +53,23 @@ function sanitizeDesktopCommandState(raw) {
 }
 
 /**
+ * Whether two reported states differ in what the menu shows: which items are enabled and the
+ * Session menu's Pin and Archive labels. Pick-list focus alone doesn't change the menu.
+ *
+ * @param {DesktopCommandState | null | undefined} previous
+ * @param {DesktopCommandState | null} next
+ */
+function menuStateChanged(previous, next) {
+  if (!previous || !next) return previous !== next;
+  return (
+    previous.sessionPinned !== next.sessionPinned ||
+    previous.sessionArchived !== next.sessionArchived ||
+    previous.commands.size !== next.commands.size ||
+    [...next.commands].some((command) => !previous.commands.has(command))
+  );
+}
+
+/**
  * Whether a key press is Ctrl-N or Ctrl-P alone, the keys an open pick list steps on. A
  * non-Latin layout falls back to the physical key, as the page's own check does.
  *
@@ -95,6 +112,7 @@ function registerDesktopCommandStateReset(webContents, onReset) {
 
 module.exports = {
   DESKTOP_COMMANDS,
+  menuStateChanged,
   registerDesktopCommandStateReset,
   registerPickListMenuYield,
   sanitizeDesktopCommandState,
