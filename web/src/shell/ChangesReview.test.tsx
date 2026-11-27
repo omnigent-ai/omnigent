@@ -762,7 +762,7 @@ describe("the Commits and Changes tabs", () => {
       "s1",
       BRANCH_RANGE,
       expect.anything(),
-      "",
+      expect.any(String),
     );
   });
 

@@ -13,7 +13,10 @@ const workspace = vi.hoisted(() => ({
     dataUpdatedAt: 0,
   },
   environmentAvailable: true,
+  environmentRoot: undefined as string | undefined,
   serveable: true as boolean | undefined,
+  // Whether the last render asked the runner for its listing.
+  runnerEnabled: undefined as boolean | undefined,
 }));
 
 const sessionAccess = vi.hoisted(() => ({
@@ -25,20 +28,27 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
 }));
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
-  useWorkspaceChangedFiles: () => workspace.head,
-  useWorkspaceEnvironment: () => ({ data: { available: workspace.environmentAvailable } }),
+  useWorkspaceChangedFiles: (_sessionId: string | undefined, options?: { enabled?: boolean }) => {
+    workspace.runnerEnabled = options?.enabled;
+    return workspace.head;
+  },
+  useWorkspaceEnvironment: () => ({
+    data: { available: workspace.environmentAvailable, root: workspace.environmentRoot },
+  }),
   useWorkspaceServeable: () => workspace.serveable,
 }));
 
 import { LEVEL_READ } from "@/lib/permissionsApi";
 import { setSessionHost } from "@/lib/sessionHost";
 import type { BranchPointListing } from "@/lib/workingCopyComparison";
+import type { RevisionSpec } from "@/lib/customComparison";
 import {
+  baseIntentSource,
+  resetFolderBaseIntentsForTests,
   writeWorkingCopyBaseIntent,
   readWorkingCopyBaseIntent,
-  subscribeWorkingCopyBaseIntent,
 } from "@/lib/workingCopyBasePreference";
-import { WorkingCopyComparisonOwner } from "@/lib/workingCopyComparisonOwner";
+import { LAST_COMMIT_SPEC, WorkingCopyComparisonOwner } from "@/lib/workingCopyComparisonOwner";
 import {
   invalidateWorkingCopyChanges,
   setWorkingCopyComparisonsForTests,
@@ -77,29 +87,62 @@ function branchPointEntry(path: string) {
   };
 }
 
-let listings: { resolve: (listing: BranchPointListing) => void; signal: AbortSignal }[];
+let listings: {
+  resolve: (listing: BranchPointListing) => void;
+  signal: AbortSignal;
+  spec: RevisionSpec | null;
+}[];
 
-function installOwner() {
-  listings = [];
-  const owner = new WorkingCopyComparisonOwner({
-    fetchListing: (_sessionId, { signal }) =>
+/** An owner whose listings the test answers: the workspace's, or a repository folder's. */
+function makeOwner(folder?: { repository: string; workspaceKey: string }) {
+  const intent = baseIntentSource(folder?.repository ?? "", folder?.workspaceKey);
+  return new WorkingCopyComparisonOwner({
+    ...folder,
+    fetchListing: (_sessionId, { signal, spec }) =>
       new Promise((resolve) => {
-        listings.push({ resolve, signal });
+        listings.push({ resolve, signal, spec });
       }),
     watchRoute: (_target, onRoute) => {
       queueMicrotask(() => onRoute({ state: "served" }));
       return { stop: () => {}, ask: () => {} };
     },
-    readIntent: readWorkingCopyBaseIntent,
-    subscribeIntent: subscribeWorkingCopyBaseIntent,
+    readIntent: intent.read,
+    subscribeIntent: intent.subscribe,
     now: () => Date.now(),
     setTimeout: (callback, ms) => setTimeout(callback, ms),
     clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     documentVisible: () => true,
     subscribeAttention: () => () => {},
   });
+}
+
+function installOwner() {
+  listings = [];
+  const owner = makeOwner();
   setWorkingCopyComparisonsForTests(owner);
   return owner;
+}
+
+/** Renders under `client`, and in `owner`'s repository folder review when given. */
+function wrapperFor(client: QueryClient, owner?: WorkingCopyComparisonOwner) {
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={client}>
+        {owner ? (
+          <ComparisonOwnerContext.Provider value={owner}>
+            {children}
+          </ComparisonOwnerContext.Provider>
+        ) : (
+          children
+        )}
+      </QueryClientProvider>
+    );
+  };
+}
+
+/** The base command shown as chosen. */
+function checkedId(commands: { id: string; checked?: boolean }[]) {
+  return commands.find((command) => command.checked)?.id;
 }
 
 function answerListing(paths: string[], id = "cmp_1") {
@@ -117,6 +160,15 @@ function answerListing(paths: string[], id = "cmp_1") {
         entries: paths.map(branchPointEntry),
         unrepresentableNames: 0,
         listedAt: 123,
+        // The host names the revisions it compared when they were asked for.
+        ...(pending!.spec && {
+          revisions: {
+            spec: pending!.spec,
+            baseDisplay: "HEAD",
+            headDisplay: "Working copy",
+            headIsWorkingCopy: true,
+          },
+        }),
       },
     });
   });
@@ -131,6 +183,7 @@ beforeEach(() => {
     dataUpdatedAt: 1,
   };
   workspace.environmentAvailable = true;
+  workspace.environmentRoot = undefined;
   workspace.serveable = true;
   // A loaded session with permissions off, as in single-user mode.
   sessionAccess.session = { permissionLevel: null };
@@ -141,6 +194,7 @@ beforeEach(() => {
 afterEach(() => {
   setSessionHost(SESSION, null);
   setWorkingCopyComparisonsForTests(null);
+  resetFolderBaseIntentsForTests();
   window.localStorage.clear();
 });
 
@@ -245,103 +299,97 @@ describe("useWorkingCopyChanges", () => {
   });
 });
 
-describe("a base chosen in a repository folder's review", () => {
-  it("keeps the workspace's saved base, comparison and count", async () => {
+describe("a repository folder's review", () => {
+  const FOLDER = {
+    repository: ".worktrees/feature",
+    workspaceKey: workspaceKeyOf("host_1", "/repo"),
+  };
+
+  it("shows the host's last-commit listing, never the runner's workspace files", async () => {
+    // A folder's last commit is a typed comparison in its workspace, made once the root is known.
+    workspace.environmentRoot = "/repo";
+    const owner = makeOwner(FOLDER);
+    baseIntentSource(FOLDER.repository, FOLDER.workspaceKey).write("head");
+    const { result } = renderHook(() => useWorkingCopyChanges(SESSION, { kind: "surface" }), {
+      wrapper: wrapperFor(new QueryClient(), owner),
+    });
+    expect(workspace.runnerEnabled).toBe(false);
+    expect(result.current.data).toBeUndefined();
+    await waitFor(() => expect(listings).toHaveLength(1));
+    expect(listings[0]!.spec).toEqual(LAST_COMMIT_SPEC);
+    expect(result.current.data).toBeUndefined();
+
+    answerListing(["feature_only.ts"]);
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.comparison.base).toBe("head");
+    expect(result.current.data?.data.map((entry) => entry.path)).toEqual(["feature_only.ts"]);
+    expect(result.current.dataUpdatedAt).toBe(123);
+    expect(workspace.runnerEnabled).toBe(false);
+    owner.dispose();
+  });
+
+  it("keeps the workspace's saved base, comparison and count when a base is chosen there", async () => {
     const client = new QueryClient();
-    const plain = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    );
-    const folder = workingCopyComparisonsAt(".worktrees/feature");
-    const inFolder = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>
-        <ComparisonOwnerContext.Provider value={folder}>{children}</ComparisonOwnerContext.Provider>
-      </QueryClientProvider>
-    );
     // The sidebar's count: Automatic shows the workspace's branch point.
     const count = renderHook(() => useWorkingCopyChanges(SESSION, { kind: "count" }), {
-      wrapper: plain,
+      wrapper: wrapperFor(client),
     });
     await waitFor(() => expect(listings).toHaveLength(1));
     answerListing(["branch_only.ts"]);
     await waitFor(() => expect(count.result.current.comparison.base).toBe("branch-point"));
 
+    const folder = workingCopyComparisonsAt(".worktrees/feature");
     const folderCommands = renderHook(() => useWorkingCopyBaseCommands(SESSION), {
-      wrapper: inFolder,
+      wrapper: wrapperFor(client, folder),
     });
     act(() =>
       folderCommands.result.current.find((command) => command.id === "compare-head")!.run(),
     );
 
-    const checked = (commands: { id: string; checked?: boolean }[]) =>
-      commands.find((command) => command.checked)?.id;
-    expect(checked(folderCommands.result.current)).toBe("compare-head");
+    expect(checkedId(folderCommands.result.current)).toBe("compare-head");
     expect(readWorkingCopyBaseIntent()).toBe("automatic");
     const workspaceCommands = renderHook(() => useWorkingCopyBaseCommands(SESSION), {
-      wrapper: plain,
+      wrapper: wrapperFor(client),
     });
-    expect(checked(workspaceCommands.result.current)).toBe("compare-automatic");
+    expect(checkedId(workspaceCommands.result.current)).toBe("compare-automatic");
     expect(count.result.current.comparison.base).toBe("branch-point");
     expect(count.result.current.data?.data.map((entry) => entry.path)).toEqual(["branch_only.ts"]);
   });
 
-  it("stays apart from a folder of the same name in another workspace or host", () => {
+  it("keeps a base chosen there apart from a same-named folder in another workspace or host", () => {
     const client = new QueryClient();
-    const inFolderAt = (owner: WorkingCopyComparisonOwner) =>
-      function InFolder({ children }: { children: ReactNode }) {
-        return (
-          <QueryClientProvider client={client}>
-            <ComparisonOwnerContext.Provider value={owner}>
-              {children}
-            </ComparisonOwnerContext.Provider>
-          </QueryClientProvider>
-        );
-      };
     const at = (hostId: string, root: string) =>
       workingCopyComparisonsAt(".worktrees/feature", workspaceKeyOf(hostId, root));
-    const alpha = at("host-alpha", "/projects/alpha");
-    const beta = at("host-beta", "/projects/beta");
-    const sameHostOtherRoot = at("host-alpha", "/projects/other");
     const render = (owner: WorkingCopyComparisonOwner) =>
-      renderHook(() => useWorkingCopyBaseCommands(SESSION), { wrapper: inFolderAt(owner) });
-    const checked = (commands: { id: string; checked?: boolean }[]) =>
-      commands.find((command) => command.checked)?.id;
-    const inAlpha = render(alpha);
-    const inBeta = render(beta);
-    const inOther = render(sameHostOtherRoot);
+      renderHook(() => useWorkingCopyBaseCommands(SESSION), { wrapper: wrapperFor(client, owner) });
+    const inAlpha = render(at("host-alpha", "/projects/alpha"));
+    const inBeta = render(at("host-beta", "/projects/beta"));
+    const inOther = render(at("host-alpha", "/projects/other"));
 
     act(() => inAlpha.result.current.find((command) => command.id === "compare-head")!.run());
 
-    expect(checked(inAlpha.result.current)).toBe("compare-head");
-    expect(checked(inBeta.result.current)).toBe("compare-automatic");
-    expect(checked(inOther.result.current)).toBe("compare-automatic");
+    expect(checkedId(inAlpha.result.current)).toBe("compare-head");
+    expect(checkedId(inBeta.result.current)).toBe("compare-automatic");
+    expect(checkedId(inOther.result.current)).toBe("compare-automatic");
   });
 
   it("counts a choice there as the session's, so a tab's landing knows it is older", () => {
-    const client = new QueryClient();
     const folder = workingCopyComparisonsAt(".worktrees/feature");
-    const inFolder = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>
-        <ComparisonOwnerContext.Provider value={folder}>{children}</ComparisonOwnerContext.Provider>
-      </QueryClientProvider>
-    );
-    const commands = renderHook(() => useWorkingCopyBaseCommands(SESSION), { wrapper: inFolder });
+    const commands = renderHook(() => useWorkingCopyBaseCommands(SESSION), {
+      wrapper: wrapperFor(new QueryClient(), folder),
+    });
     const before = sessionChoiceCount(SESSION);
     act(() => commands.result.current.find((command) => command.id === "compare-head")!.run());
     expect(sessionChoiceCount(SESSION)).toBe(before + 1);
   });
 
   it("follows the workspace's saved base until a base is chosen there", () => {
-    const client = new QueryClient();
     const folder = workingCopyComparisonsAt(".worktrees/feature");
-    const inFolder = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>
-        <ComparisonOwnerContext.Provider value={folder}>{children}</ComparisonOwnerContext.Provider>
-      </QueryClientProvider>
-    );
-    const commands = renderHook(() => useWorkingCopyBaseCommands(SESSION), { wrapper: inFolder });
-    const checked = () => commands.result.current.find((command) => command.checked)?.id;
-    expect(checked()).toBe("compare-automatic");
+    const commands = renderHook(() => useWorkingCopyBaseCommands(SESSION), {
+      wrapper: wrapperFor(new QueryClient(), folder),
+    });
+    expect(checkedId(commands.result.current)).toBe("compare-automatic");
     act(() => void writeWorkingCopyBaseIntent("branch-point"));
-    expect(checked()).toBe("compare-branch-point");
+    expect(checkedId(commands.result.current)).toBe("compare-branch-point");
   });
 });

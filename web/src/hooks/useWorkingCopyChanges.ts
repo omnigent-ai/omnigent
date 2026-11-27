@@ -102,7 +102,7 @@ export function useWorkingCopyChanges(
   const readable =
     allowed && !!sessionId && serveable !== false && environment.data?.available === true;
 
-  // Views report the workspace's root; a folder's owner keeps its typed comparisons apart.
+  // Always the workspace's root: a folder's owner resolves `repository` against it.
   const root = environment.data?.root ?? null;
   const consumer = useMemo(
     () => ({ kind, enabled: readable, sessionHostId, root }),

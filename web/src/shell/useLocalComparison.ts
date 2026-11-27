@@ -2,9 +2,9 @@
 // base, and the reference design's view of that comparison. It reuses the
 // session's shared comparison, so the badge, Changes list and both reviews agree.
 
-import { useChoosingComparisonOwner } from "@/hooks/useComparisonOwner";
 import { useMemo } from "react";
 
+import { useChoosingComparisonOwner } from "@/hooks/useComparisonOwner";
 import {
   type WorkingCopyChanges,
   useWorkingCopyBaseCommands,
