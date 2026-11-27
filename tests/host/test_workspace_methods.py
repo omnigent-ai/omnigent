@@ -25,8 +25,8 @@ _PULL_REQUEST_READS = frozenset(
         "ListReviewThreadComments",
     }
 )
-# Reviewed by hand: each changes pull requests the session links, or reads what its
-# edit controls offer. Only the session's owner may call them. A new one is added here.
+# Reviewed by hand: each changes pull requests the session links, or reads or searches
+# what its edit controls offer. Only the session's owner may call them. A new one is added here.
 _PULL_REQUEST_OWNER_METHODS = frozenset(
     {
         "ListLabels",
@@ -64,6 +64,8 @@ _PULL_REQUEST_OWNER_METHODS = frozenset(
         "EnqueuePullRequest",
         "DequeuePullRequest",
         "GetPullRequestStack",
+        "SearchReviewers",
+        "SearchCompletions",
         "ReadPullRequestImage",
     }
 )
@@ -77,6 +79,8 @@ _PULL_REQUEST_WRITES = _PULL_REQUEST_OWNER_METHODS - {
     "GetPendingReview",
     "GetMergeQueue",
     "GetPullRequestStack",
+    "SearchReviewers",
+    "SearchCompletions",
     "ReadPullRequestImage",
 }
 # Only the server's call frame carries these; a request message never does.

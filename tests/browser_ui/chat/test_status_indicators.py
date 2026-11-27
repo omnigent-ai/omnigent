@@ -133,7 +133,7 @@ def test_mobile_layout_reveals_timestamps_and_pending_steering(
 def test_steering_explanation_stays_visible_on_desktop(
     page: Page, chat_session_contract: ChatSessionContract, message: str
 ) -> None:
-    """An unread steer must not look delivered until the pointer hovers it."""
+    """An unread steer shows its note and whole footer without waiting for hover."""
     chat = chat_session_contract
     chat.harness = "codex-native"
     chat.update_session(status="running", labels={"omnigent.wrapper": "codex-native-ui"})
@@ -164,7 +164,10 @@ def test_steering_explanation_stays_visible_on_desktop(
         value *= Number(getComputedStyle(node).opacity);
       return value;
     }"""
-    page.wait_for_function(f"element => ({opacity})(element) >= 0.99", arg=notice.element_handle())
+    for element in (notice, page.get_by_test_id("message-timestamp")):
+        page.wait_for_function(
+            f"element => ({opacity})(element) >= 0.99", arg=element.element_handle()
+        )
 
 
 def _presented_frames_per_second(page: Page, seconds: float) -> float:

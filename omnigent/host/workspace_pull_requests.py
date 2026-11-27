@@ -20,7 +20,7 @@ from connectrpc.errors import ConnectError
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host.frames import PullRequestVouch
 from omnigent.host.workspace_pull_request_input import PullRequestRefused
-from omnigent.runner import pr_actions, pr_resource
+from omnigent.runner import github_search, pr_actions, pr_resource
 from omnigent.runner.github_images import ImageRefused, PullRequestImage
 from omnigent.runner.pull_request_errors import (
     InvalidPullRequestInput,
@@ -267,6 +267,18 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     ),
     "ListReviewerCandidates": lambda reader, call, request: reader.github_reviewers(
         call.session_id, _url(request)
+    ),
+    "SearchReviewers": lambda reader, call, request: github_search.search_reviewers(
+        _root(reader),
+        pr_actions._target(call.session_id, _url(request)),
+        text=request.text,
+        page_size=request.page_size,
+    ),
+    "SearchCompletions": lambda reader, call, request: github_search.search_completions(
+        _root(reader),
+        pr_actions._target(call.session_id, _url(request)),
+        kind=pb.CompletionKind.Name(request.kind).removeprefix("COMPLETION_KIND_"),
+        text=request.text,
     ),
     "GetMergeOptions": lambda reader, call, request: reader.github_merge_options(
         call.session_id, _url(request)

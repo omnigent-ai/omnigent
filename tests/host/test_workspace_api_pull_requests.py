@@ -347,6 +347,16 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
             pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png"),
             "The attachment is empty",
         ),
+        (
+            "SearchReviewers",
+            pb.SearchReviewersRequest(pr_url=_PR, page_size=21),
+            "Ask for at most 20 reviewers",
+        ),
+        (
+            "SearchCompletions",
+            pb.SearchCompletionsRequest(pr_url=_PR, text="al"),
+            "Choose what to complete: people or pull requests",
+        ),
     ],
     ids=[
         "account-without-pr",
@@ -357,6 +367,8 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         "upload-long-name",
         "upload-long-url",
         "upload-empty",
+        "reviewer-page-too-large",
+        "completion-of-no-kind",
     ],
 )
 async def test_a_request_the_api_doesnt_serve_is_refused_before_the_vouch(
@@ -1135,6 +1147,28 @@ async def test_a_github_call_to_an_unlinked_pr_is_refused_before_the_host(
     assert refused.value.code == Code.FAILED_PRECONDITION
     assert host_calls == []
     assert github_changes == []
+
+
+@pytest.mark.parametrize("method", sorted(host_tests._SEARCH_CALLS))
+async def test_a_search_of_a_pr_on_a_read_only_code_host_is_served(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    github_changes: list[tuple[str, str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    """A search changes nothing, so the read-only refusal never applies."""
+    request, function, _kwargs = host_tests._SEARCH_CALLS[method]
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=("github.com",)
+    )
+
+    await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
+
+    assert [(call.session_id, call.vouch) for call in host_calls] == [
+        (_SESSION, PullRequestVouch(server_tracked=True)),
+    ]
+    assert [(call[0], call[2]) for call in github_changes] == [(function, _PR)]
 
 
 @pytest.fixture

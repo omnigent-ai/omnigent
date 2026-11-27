@@ -83,8 +83,7 @@ export type FeatureKey =
   | "floating_panes"
   | "gadgets"
   | "pull_requests_v2"
-  | "shared_session_updates_socket"
-  | "warm_switch_keep_mounted_ui";
+  | "shared_session_updates_socket";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

@@ -91,10 +91,42 @@ function splice(
   };
 }
 
+/**
+ * Where *region* of *requested* lies in *written*, found from their longest common prefix and
+ * suffix: null when the span between them reaches into the region, which leaves its bounds unknown.
+ */
+function regionAfterEdit(
+  requested: string,
+  written: string,
+  region: { start: number; text: string },
+): [number, number] | null {
+  const shortest = Math.min(requested.length, written.length);
+  let prefix = 0;
+  while (prefix < shortest && requested[prefix] === written[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < shortest - prefix && requested.at(-1 - suffix) === written.at(-1 - suffix))
+    suffix += 1;
+  const end = region.start + region.text.length;
+  if (prefix >= end) return [region.start, end];
+  const shift = written.length - requested.length;
+  if (requested.length - suffix <= region.start) return [region.start + shift, end + shift];
+  return null;
+}
+
 export function useDictationInsert(
   draft: string,
-  setDraft: (next: string) => void,
+  /**
+   * Writes `next`, which is `draft` with `change` made; `final` when it pins an utterance. A
+   * setter that writes through the input returns the text it then holds, as an editor may adjust it.
+   */
+  setDraft: (
+    next: string,
+    change: { from: number; to: number; insert: string },
+    final: boolean,
+  ) => string | void,
   textareaRef?: RefObject<ComposerTextTarget | null>,
+  /** The input's text now, or null: an editor the setter writes through holds edits not rendered yet. */
+  readDraft?: () => string | null,
 ): {
   /** Pin a final utterance, replacing any pending interim region. */
   appendFinal: (text: string) => void;
@@ -102,6 +134,8 @@ export function useDictationInsert(
   replaceInterim: (text: string) => void;
   /** Report that the composer has been focused, so its caret is real. */
   noteFocus: () => void;
+  /** End a take's hold on the draft: a partial left in it becomes text no later take replaces. */
+  release: () => void;
   /** A streaming partial is in the draft, so the composer must not swap its input now. */
   hasInterim: boolean;
 } {
@@ -140,7 +174,8 @@ export function useDictationInsert(
     if (position === null) return;
     wantCaretRef.current = null;
     const ta = textareaRef?.current;
-    if (!ta) return;
+    // A caret asked for in a draft edited since this hook's write would land inside that edit.
+    if (!ta || producedRef.current === null) return;
     // Deliberately does not focus: a take is usually driven from the mic
     // button, and stealing focus drops its Enter-commit / Esc-cancel keys.
     // Some browsers scroll an unfocused element to reveal the new selection,
@@ -156,6 +191,14 @@ export function useDictationInsert(
 
   const insert = useCallback(
     (text: string, pin: boolean) => {
+      // An edit can reach the input before its render reaches here. It isn't this hook's, so
+      // the hook gives up the draft, as a render would, and builds on the text the input holds.
+      const held = readDraft?.() ?? null;
+      if (held !== null && held !== draftRef.current) {
+        producedRef.current = null;
+        wantCaretRef.current = null;
+        draftRef.current = held;
+      }
       const current = draftRef.current;
       const mine = producedRef.current;
       const region = mine?.region ?? null;
@@ -199,13 +242,43 @@ export function useDictationInsert(
         return;
       }
 
-      draftRef.current = spliced.next;
-      producedRef.current = settled;
-      wantCaretRef.current = spliced.caret;
-      setInterimPending(settled.region !== null);
-      setDraft(spliced.next);
+      const change = {
+        from: spliced.region.start,
+        to: spliced.region.start + (region?.text.length ?? 0),
+        insert: spliced.region.text,
+      };
+      const written = setDraft(spliced.next, change, pin) ?? spliced.next;
+      draftRef.current = written;
+      // A refused write changed nothing, so what this hook owned still stands.
+      if (written === current) return;
+      // An editor may adjust a write, as it keeps a card's line its own. What it wrote between
+      // the text on either side is then the region.
+      const head = base.slice(0, spliced.region.start);
+      const rest = base.slice(spliced.region.start);
+      let from = head.length;
+      let end = written.length - rest.length;
+      if (end < from || !written.startsWith(head) || !written.endsWith(rest)) {
+        // It changed text beside the region too. A partial keeps a region that change missed;
+        // anything else leaves nothing to revise.
+        const moved = pin ? null : regionAfterEdit(spliced.next, written, spliced.region);
+        if (moved === null) {
+          producedRef.current = null;
+          wantCaretRef.current = null;
+          setInterimPending(false);
+          return;
+        }
+        [from, end] = moved;
+      }
+      const body = written.slice(from, end);
+      // The caret stays as far before the region's end as the splice put it, within the region.
+      const gap = spliced.region.start + spliced.region.text.length - spliced.caret;
+      const caret = Math.min(Math.max(end - gap, from), end);
+      const owned = settled.region && body ? { start: from, text: body } : null;
+      producedRef.current = { value: written, region: owned, tail: caret };
+      wantCaretRef.current = caret;
+      setInterimPending(owned !== null);
     },
-    [setDraft, textareaRef],
+    [setDraft, textareaRef, readDraft],
   );
 
   return {
@@ -213,6 +286,11 @@ export function useDictationInsert(
     replaceInterim: useCallback((text: string) => insert(text, false), [insert]),
     noteFocus: useCallback(() => {
       focusedRef.current = true;
+    }, []),
+    release: useCallback(() => {
+      producedRef.current = null;
+      wantCaretRef.current = null;
+      setInterimPending(false);
     }, []),
     // A draft the hook didn't write releases its region during render, before state catches up.
     hasInterim: interimPending && (producedRef.current?.region ?? null) !== null,
