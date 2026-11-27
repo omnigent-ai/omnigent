@@ -49,7 +49,6 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.entities.scheduled_task import SCHEDULED_TASK_OVERLAP_MODES
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -2832,6 +2831,10 @@ def create_app(
     app.state.automation_overlap_mode_enabled = automations_v2_enabled and (
         resolved_feature_flags.enabled(Feature.AUTOMATION_OVERLAP_MODE)
     )
+    # Queuing waits, in turn, until every one of them holds a queued run back.
+    app.state.automation_overlap_queue_enabled = app.state.automation_overlap_mode_enabled and (
+        resolved_feature_flags.enabled(Feature.AUTOMATION_OVERLAP_QUEUE)
+    )
 
     app.state.scheduled_task_store = scheduled_task_store
     app.state.proactive_provisioner = ProactiveProvisioner()
@@ -4258,9 +4261,15 @@ def create_app(
                 and bool(app.state.scheduled_task_dispatch_enabled),
                 "scheduled_task_retries": automations_enabled
                 and bool(app.state.automation_retries_enabled),
-                "scheduled_task_overlap_modes": list(SCHEDULED_TASK_OVERLAP_MODES)
-                if automations_enabled and app.state.automation_overlap_mode_enabled
-                else ["allow"],
+                "scheduled_task_overlap_modes": [
+                    mode
+                    for mode, enabled in (
+                        ("allow", True),
+                        ("skip", app.state.automation_overlap_mode_enabled),
+                        ("queue", app.state.automation_overlap_queue_enabled),
+                    )
+                    if enabled and (automations_enabled or mode == "allow")
+                ],
                 "session_timers": bool(app.state.session_timers_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,

@@ -2580,7 +2580,8 @@
             "default": "allow",
             "enum": [
               "allow",
-              "skip"
+              "skip",
+              "queue"
             ],
             "title": "Overlap Mode",
             "type": "string"
@@ -16078,7 +16079,8 @@
               {
                 "enum": [
                   "allow",
-                  "skip"
+                  "skip",
+                  "queue"
                 ],
                 "type": "string"
               },

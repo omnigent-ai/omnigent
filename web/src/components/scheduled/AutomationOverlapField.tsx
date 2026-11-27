@@ -14,6 +14,7 @@ import type { ScheduledTaskOverlapMode } from "@/lib/scheduledTasksApi";
 export const OVERLAP_MODE_LABELS: Record<ScheduledTaskOverlapMode, string> = {
   allow: "Start it anyway",
   skip: "Skip it",
+  queue: "Queue it",
 };
 
 interface AutomationOverlapFieldProps {
@@ -50,7 +51,8 @@ export function AutomationOverlapField({
         <DropdownMenuContent align="end" className="w-72 max-w-[calc(100vw-2rem)]">
           <p className="px-2 py-1.5 text-xs whitespace-normal text-muted-foreground">
             What a scheduled run does while the previous run is still going: its session is busy or
-            waits on an approval. Run now always starts.
+            waits on an approval. Only one run waits in the queue; later ones are skipped. Run now
+            always starts.
           </p>
           <DropdownMenuSeparator />
           <DropdownMenuRadioGroup

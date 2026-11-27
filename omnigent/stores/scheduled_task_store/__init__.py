@@ -191,7 +191,8 @@ class ScheduledTaskStore(ABC):
             its prompt reached the agent is started again; ``0`` never retries.
         :param retry_delay_seconds: How long to wait before each retry.
         :param overlap_mode: What a due occurrence does while the previous run
-            is still going: ``"allow"`` starts it anyway, ``"skip"`` skips it.
+            is still going: ``"allow"`` starts it anyway, ``"skip"`` skips it, and
+            ``"queue"`` starts it once the previous run finishes (at most one waits).
         :param session_mode: ``"new"`` (default) starts a new session per
             firing; ``"continue"`` sends each firing's prompt into one session.
         :param session_id: The existing session a ``"continue"`` task sends
@@ -393,6 +394,8 @@ class ScheduledTaskStore(ABC):
 
         Pausing the task, or setting ``max_retries`` below the attempt of a retry
         that is waiting to start, records that retry as ``skipped`` in the same write.
+        Pausing also skips an occurrence queued behind the task's previous run, and
+        so does changing ``overlap_mode`` from ``queue`` to ``skip``.
 
         Returns ``None`` if the task does not exist.
 

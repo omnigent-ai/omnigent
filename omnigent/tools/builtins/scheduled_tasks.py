@@ -81,11 +81,13 @@ _RETRY_PROPERTIES: dict[str, dict[str, Any]] = {
 # The overlap mode, the same in the create and update schemas.
 _OVERLAP_MODE_PROPERTY: dict[str, Any] = {
     "type": "string",
-    "enum": ["allow", "skip"],
+    "enum": ["allow", "skip", "queue"],
     "description": (
         "Optional. What a scheduled run does while the previous run is still going (its "
         "session busy or waiting on an approval): 'allow' (default) starts it anyway, "
-        "'skip' records it as skipped. Run now always starts."
+        "'skip' records it as skipped, 'queue' starts it once the previous run finishes, "
+        "keeping at most one queued (later runs are skipped meanwhile). Run now always "
+        "starts."
     ),
 }
 _RRULE_DESC = (

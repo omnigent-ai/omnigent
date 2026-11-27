@@ -620,6 +620,10 @@ describe("describeRunFailure", () => {
       stage: "Schedule",
       reason: "The previous run was still going.",
     });
+    expect(describeRunFailure("queue_full", "skipped")).toEqual({
+      stage: "Schedule",
+      reason: "Another run was already queued behind the previous run.",
+    });
   });
 
   it("points settings failures at editing the automation", () => {

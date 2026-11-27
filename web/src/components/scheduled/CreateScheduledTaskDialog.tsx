@@ -175,7 +175,7 @@ const AUTOMATION_CONTROL_TRIGGER_CLASS_NAME =
 const AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME = `${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} border-transparent`;
 
 // Offered in this order when the server accepts them.
-const OVERLAP_MODES: readonly ScheduledTaskOverlapMode[] = ["allow", "skip"];
+const OVERLAP_MODES: readonly ScheduledTaskOverlapMode[] = ["allow", "skip", "queue"];
 
 type AutomationTriggerType = "schedule" | TriggerSource;
 const AUTOMATION_TRIGGER_TYPES: readonly AutomationTriggerType[] = ["schedule", ...TRIGGER_SOURCES];

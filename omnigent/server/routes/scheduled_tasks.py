@@ -374,10 +374,25 @@ def overlap_modes_supported(request: Request) -> bool:
     return bool(getattr(request.app.state, "automation_overlap_mode_enabled", False))
 
 
+def queue_mode_supported(request: Request) -> bool:
+    """Whether tasks may save the ``queue`` mode.
+
+    Gated by the ``automation_overlap_queue`` release feature as well, because a
+    database scheduler from before queuing would start a queued run at once.
+    """
+    return bool(getattr(request.app.state, "automation_overlap_queue_enabled", False))
+
+
 def _require_overlap_mode_support(request: Request, overlap_mode: str) -> None:
     if overlap_mode != "allow" and not overlap_modes_supported(request):
         raise OmnigentError(
             "overlap_mode needs automation overlap modes, which this server does not enable",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if overlap_mode == "queue" and not queue_mode_supported(request):
+        raise OmnigentError(
+            "overlap_mode 'queue' needs automation overlap queuing, which this server "
+            "does not enable",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -1508,7 +1523,9 @@ def create_scheduled_tasks_router(
         # Settings saved before their release feature was turned off are not copied.
         if not retries_supported(request):
             create = create.model_copy(update={"max_retries": 0})
-        if not overlap_modes_supported(request):
+        if not overlap_modes_supported(request) or (
+            create.overlap_mode == "queue" and not queue_mode_supported(request)
+        ):
             create = create.model_copy(update={"overlap_mode": "allow"})
         return await _create_task(request, create, cloned_from=task)
 

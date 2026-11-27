@@ -30,7 +30,7 @@ MAX_RETRY_DELAY_SECONDS = 60 * 60
 DEFAULT_RETRY_DELAY_SECONDS = 5 * 60
 
 # What a due occurrence can do while the task's previous run is still going.
-ScheduledTaskOverlapMode = Literal["allow", "skip"]
+ScheduledTaskOverlapMode = Literal["allow", "skip", "queue"]
 SCHEDULED_TASK_OVERLAP_MODES: tuple[str, ...] = get_args(ScheduledTaskOverlapMode)
 
 
@@ -90,8 +90,9 @@ class ScheduledTask:
     :param retry_delay_seconds: How long the scheduler waits after a failed
         startup before retrying it, e.g. ``300``.
     :param overlap_mode: What a due occurrence does while the task's previous
-        run is still going: ``"allow"`` (default) starts it anyway, and
-        ``"skip"`` records it as a skipped run.
+        run is still going: ``"allow"`` (default) starts it anyway, ``"skip"``
+        records it as a skipped run, and ``"queue"`` starts it once the previous
+        run finishes, keeping at most one queued.
     :param session_mode: ``"new"`` (default) starts a new session per firing;
         ``"continue"`` sends each firing's prompt into ``session_id``.
     :param session_id: The session a ``"continue"`` task sends its prompt to.

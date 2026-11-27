@@ -120,6 +120,16 @@ def manual_trigger_key() -> str:
 
 _RETRY_TRIGGER_PREFIX = "retry:"
 
+
+def is_queued_trigger_key(trigger_key: str | None) -> bool:
+    """Whether a pending run keyed *trigger_key* is an occurrence queued behind its previous run.
+
+    Only a task whose ``overlap_mode`` is ``queue`` leaves a scheduled occurrence pending;
+    every other occurrence is claimed or skipped when it comes due.
+    """
+    return trigger_key is not None and trigger_key.startswith("schedule:")
+
+
 # Executor failures from before the prompt could reach the agent that a later attempt
 # can get past. Ones a retry would repeat, such as a rejected permission mode, are left out.
 RETRYABLE_STARTUP_ERROR_CODES = frozenset(

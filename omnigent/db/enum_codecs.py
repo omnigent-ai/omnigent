@@ -131,8 +131,7 @@ SCHEDULED_TASK_SESSION_MODE: dict[str, int] = {
     "continue": 2,
 }
 
-# What a due occurrence does while the task's previous run is still going. ``queue`` is in
-# the schema but not offered yet; a task a newer server saved with it starts every occurrence.
+# What a due occurrence does while the task's previous run is still going.
 SCHEDULED_TASK_OVERLAP_MODE: dict[str, int] = {
     "allow": 1,
     "skip": 2,

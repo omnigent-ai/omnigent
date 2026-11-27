@@ -8404,20 +8404,34 @@ describe("CreateScheduledTaskDialog overlap mode", () => {
     },
   );
 
-  it("saves the picked overlap mode", async () => {
+  it.each([
+    ["skip", "Skip it"],
+    ["queue", "Queue it"],
+  ] as const)("saves the picked overlap mode %s", async (mode, label) => {
     render(
       <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />,
-      { info: { scheduled_task_overlap_modes: ["allow", "skip"] } },
+      { info: { scheduled_task_overlap_modes: ["allow", "skip", "queue"] } },
     );
     closeTopLevelPopovers();
     const trigger = screen.getByTestId("task-overlap-trigger");
     expect(trigger).toHaveTextContent("Start it anyway");
     fireEvent.keyDown(trigger, { key: "Enter" });
-    fireEvent.click(screen.getByTestId("task-overlap-skip"));
-    expect(trigger).toHaveTextContent("Skip it");
+    fireEvent.click(screen.getByTestId(`task-overlap-${mode}`));
+    expect(trigger).toHaveTextContent(label);
 
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ overlapMode: "skip" });
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ overlapMode: mode });
+  });
+
+  it("offers queuing only on a server that accepts it", () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />,
+      { info: { scheduled_task_overlap_modes: ["allow", "skip"] } },
+    );
+    closeTopLevelPopovers();
+    fireEvent.keyDown(screen.getByTestId("task-overlap-trigger"), { key: "Enter" });
+    expect(screen.getByTestId("task-overlap-skip")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-overlap-queue")).not.toBeInTheDocument();
   });
 });

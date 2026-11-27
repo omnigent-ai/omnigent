@@ -70,10 +70,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
-from omnigent.entities.scheduled_task import (
-    DEFAULT_RETRY_DELAY_SECONDS,
-    SCHEDULED_TASK_OVERLAP_MODES,
-)
+from omnigent.entities.scheduled_task import DEFAULT_RETRY_DELAY_SECONDS
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.scheduled.run_reconciler import (
@@ -83,6 +80,7 @@ from omnigent.server.scheduled.run_reconciler import (
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     fits_reminder,
+    is_queued_trigger_key,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
@@ -130,8 +128,8 @@ _PENDING_RUN_FILTER = (
 )
 
 
-# A retry only follows an automation that can still fire; a completed one-time task's
-# final occurrence still gets its retries.
+# A retry or queued occurrence only starts for an automation that can still fire; a
+# completed one-time task's final occurrence still gets its retries or its queued start.
 _RETRYABLE_TASK_STATES = {encode_scheduled_task_state(state) for state in ("active", "completed")}
 _PENDING, _SKIPPED, _STARTING, _RUNNING = (
     encode_scheduled_task_run_status(status)
@@ -148,14 +146,9 @@ _SCHEDULE_KIND, _MANUAL_KIND, _RETRY_KIND = (
 _NOT_DISPATCHED, _DISPATCHED = (
     encode_scheduled_task_run_prompt_dispatch(state) for state in ("not_started", "started")
 )
+_SKIP_MODE, _QUEUE_MODE = (encode_scheduled_task_overlap_mode(mode) for mode in ("skip", "queue"))
 # How many of a task's ``running`` runs the overlap check reads for one that is not stale.
 _RUNNING_RUN_READ_LIMIT = 20
-
-
-def _overlap_mode(code: int) -> str:
-    """The stored mode; ``queue``, which only a later release saves, runs as ``allow``."""
-    mode = decode_scheduled_task_overlap_mode(code)
-    return mode if mode in SCHEDULED_TASK_OVERLAP_MODES else "allow"
 
 
 def _trigger_kind_code(trigger_key: str) -> int | None:
@@ -330,11 +323,30 @@ def _has_unfinished_run(
     return None if len(running) == _RUNNING_RUN_READ_LIMIT else False
 
 
+def _skipped_run_values(now: int, error_code: str) -> dict[str, Any]:
+    """Columns of a run that never started; the code is the whole reason, so no error text."""
+    return {"status": _SKIPPED, "finished_at": now, "error_code": error_code}
+
+
 def _skip_run(run: SqlScheduledTaskRun, now: int, error_code: str) -> None:
-    """Record that *run* never started; the code is the whole reason, so no error text."""
-    run.status = _SKIPPED
-    run.finished_at = now
-    run.error_code = error_code
+    """Record that the pending *run* never started."""
+    for column, value in _skipped_run_values(now, error_code).items():
+        setattr(run, column, value)
+
+
+def _has_queued_run(session: Session, workspace_id: int, task_id: str) -> bool:
+    """Whether an occurrence of the task is queued; the task has at most one."""
+    queued = session.scalar(
+        select(SqlScheduledTaskRun.id)
+        .where(
+            SqlScheduledTaskRun.workspace_id == workspace_id,
+            SqlScheduledTaskRun.scheduled_task_id == task_id,
+            SqlScheduledTaskRun.status == _PENDING,
+            SqlScheduledTaskRun.trigger_kind == _SCHEDULE_KIND,
+        )
+        .limit(1)
+    )
+    return queued is not None
 
 
 def _supersede_waiting_retry(session: Session, task: SqlScheduledTask, now: int) -> None:
@@ -359,6 +371,28 @@ def _drop_ruled_out_retry(session: Session, task: SqlScheduledTask, now: int) ->
         _skip_run(retry, now, "task_paused")
     elif retry_attempt(retry.trigger_key) > task.max_retries:
         _skip_run(retry, now, "retry_cancelled")
+
+
+def _drop_queued_run(session: Session, task: SqlScheduledTask, now: int, error_code: str) -> None:
+    """Skip the occurrence queued for a task that was just paused or moved to ``skip``.
+
+    With the edit, like a waiting retry: a scheduler from before queuing starts a
+    queued run at once, whatever its task's state. The caller holds the task lock.
+    """
+    queued = session.scalars(
+        select(SqlScheduledTaskRun)
+        .where(
+            SqlScheduledTaskRun.workspace_id == task.workspace_id,
+            SqlScheduledTaskRun.scheduled_task_id == task.id,
+            SqlScheduledTaskRun.status == _PENDING,
+            SqlScheduledTaskRun.trigger_kind == _SCHEDULE_KIND,
+        )
+        .limit(1)
+        # A current read, as for the waiting retry: ``update`` read before it locked.
+        .with_for_update()
+    ).first()
+    if queued is not None:
+        _skip_run(queued, now, error_code)
 
 
 def _is_skipped_retry(status: int, trigger_kind: int | None) -> bool:
@@ -529,7 +563,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         max_cost_usd=row.max_cost_usd,
         max_retries=row.max_retries,
         retry_delay_seconds=row.retry_delay_seconds,
-        overlap_mode=_overlap_mode(row.overlap_mode),
+        overlap_mode=decode_scheduled_task_overlap_mode(row.overlap_mode),
         session_mode=decode_scheduled_task_session_mode(row.session_mode),
         kind=decode_scheduled_task_kind(row.kind),
         session_id=row.session_id,
@@ -970,6 +1004,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             ):
                 require_active_account(session, row.user_id, generation=row.account_generation)
             schedule_before = (row.rrule, row.timezone, row.state)
+            overlap_before = row.overlap_mode
             trigger_before = is_trigger_automation(_to_entity(row))
             changed = False
             if name is not None and row.name != name:
@@ -1073,6 +1108,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 encode_scheduled_task_state("deleted")
             ):
                 _drop_ruled_out_retry(session, row, updated_at)
+            if state is not None and row.state == encode_scheduled_task_state("paused"):
+                _drop_queued_run(session, row, updated_at, "task_paused")
+            elif overlap_before == _QUEUE_MODE and row.overlap_mode == _SKIP_MODE:
+                # As ``skip`` would have recorded it when it came due behind the previous run.
+                _drop_queued_run(session, row, updated_at, "previous_run_active")
             if changed:
                 row.updated_at = updated_at
             session.flush()
@@ -1894,6 +1934,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row.next_run_at = None
             row.updated_at = timestamp
             _drop_ruled_out_retry(session, row, timestamp)
+            _drop_queued_run(session, row, timestamp, "task_paused")
             return True
 
         return run_write_transaction(self._session_immediate, "pause_invalid_schedule", write)
@@ -2091,7 +2132,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         host_id: str | None,
         running_since: int | None,
     ) -> ScheduledTaskRun | None:
-        """Record the due occurrence as ``skipped``, with no error text; see the protocol."""
+        """Record the due occurrence as ``skipped``; see the protocol."""
 
         def skipped(session: Session, row: SqlScheduledTask) -> dict[str, Any] | None:
             if running_since is not None:
@@ -2102,7 +2143,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 if not unfinished:
                     # No run is known to be going; a later poll starts this occurrence.
                     return None
-            return {"status": _SKIPPED, "finished_at": now, "error_code": "previous_run_active"}
+            return _skipped_run_values(now, "previous_run_active")
 
         return self._record_due_occurrence(
             task,
@@ -2112,6 +2153,42 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             operation="skip_overlapping_run",
             run_values=skipped,
         )
+
+    def queue_overlapping_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run_at: int | None, host_id: str | None
+    ) -> ScheduledTaskRun | None:
+        """Record the due occurrence as pending, or ``skipped`` when one already is.
+
+        Whether one is queued is read under the task lock, so two replicas can't
+        both queue one.
+        """
+
+        def queued(session: Session, row: SqlScheduledTask) -> dict[str, Any]:
+            if _has_queued_run(session, row.workspace_id, row.id):
+                return _skipped_run_values(now, "queue_full")
+            return {"status": encode_scheduled_task_run_status("scheduled")}
+
+        return self._record_due_occurrence(
+            task,
+            now=now,
+            next_run_at=next_run_at,
+            host_id=host_id,
+            operation="queue_overlapping_run",
+            run_values=queued,
+        )
+
+    def has_queued_run(self, task: ScheduledTask) -> bool:
+        """Read without a lock; :meth:`queue_overlapping_occurrence` checks again under one."""
+        with self._session("select_queued_task_run") as session:
+            return _has_queued_run(session, task.workspace_id, task.id)
+
+    def get_run_task(self, run: ScheduledTaskRun) -> ScheduledTask | None:
+        """The task a run belongs to, or ``None`` once it is deleted."""
+        with self._session("select_run_task") as session:
+            row = session.get(SqlScheduledTask, (run.workspace_id, run.scheduled_task_id))
+            if row is None or row.state == encode_scheduled_task_state("deleted"):
+                return None
+            return _to_entity(row)
 
     def request_manual_run(
         self, task: ScheduledTask, *, now: int, trigger_key: str, host_id: str | None
@@ -2159,9 +2236,18 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return [_run_to_entity(row) for row in session.scalars(stmt)]
 
     def claim_pending_run(
-        self, run: ScheduledTaskRun, *, now: int, lease_seconds: int
+        self,
+        run: ScheduledTaskRun,
+        *,
+        now: int,
+        lease_seconds: int,
+        queued_task: ScheduledTask | None = None,
     ) -> tuple[ScheduledTask, ScheduledTaskRun] | None:
-        """Lock the task, then the run, matching deletion's lock order."""
+        """Lock the task, then the run, matching deletion's lock order.
+
+        A queued occurrence starts only for *queued_task*, the task as the scheduler
+        read it to decide; see the protocol.
+        """
         self.check_dispatch_support()
         if lease_seconds <= 0:
             raise ValueError(
@@ -2191,26 +2277,44 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 _purge_finished_deleted_task(session, task, row)
                 return None
             attempt = retry_attempt(row.trigger_key)
-            if attempt > 0:
-                if row.scheduled_at > now:
-                    return None
-                if task.state not in _RETRYABLE_TASK_STATES:
-                    _skip_run(row, now, "task_paused")
-                    return None
-                if attempt > task.max_retries:
-                    _skip_run(row, now, "retry_cancelled")
-                    return None
-                if task.next_run_at is not None and task.next_run_at <= now:
-                    # That occurrence runs instead, even if another replica claims it later.
-                    _skip_run(row, now, "retry_superseded")
-                    return None
+            queued = is_queued_trigger_key(row.trigger_key)
+            if attempt > 0 and row.scheduled_at > now:
+                return None
             snapshot = _to_entity(task)
+            if queued and snapshot != queued_task:
+                # The scheduler decided on an older task; its next poll decides again.
+                return None
+            if (attempt > 0 or queued) and task.state not in _RETRYABLE_TASK_STATES:
+                _skip_run(row, now, "task_paused")
+                return None
+            if attempt > task.max_retries:
+                _skip_run(row, now, "retry_cancelled")
+                return None
+            if attempt > 0 and task.next_run_at is not None and task.next_run_at <= now:
+                # That occurrence runs instead, even if another replica records it later.
+                _skip_run(row, now, "retry_superseded")
+                return None
             host_id = occurrence_host_id(snapshot, row.trigger_key)
             if host_id != row.host_id:
                 # The task's target changed after the request; leave the run for
                 # the replica that owns its new host.
                 row.host_id = host_id
                 return None
+            if queued:
+                if task.overlap_mode == _QUEUE_MODE:
+                    running_since = now - STALE_RUN_MAX_AGE_SECONDS
+                    unfinished = _has_unfinished_run(
+                        session, task.workspace_id, task.id, running_since
+                    )
+                    if unfinished is None:
+                        # Stale runs may hide a newer one: clear a page, decide on a later poll.
+                        _fail_stale_runs(session, task, running_since)
+                    if unfinished is not False:
+                        # A run started since the scheduler looked, such as a retry on
+                        # another replica, or the check can't tell yet.
+                        return None
+                # An older retry must not start beside the occurrence that replaced it.
+                _supersede_waiting_retry(session, task, now)
             row.status = encode_scheduled_task_run_status("starting")
             row.fired_at = now
             row.lease_expires_at = now + lease_seconds

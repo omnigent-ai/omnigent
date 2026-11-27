@@ -217,10 +217,14 @@ to customize.
   `automation_overlap_mode` release feature, Advanced has an Overlapping runs
   row for a schedule. It sets what a scheduled run does while the previous run
   is still going (its session busy or waiting on an approval): **Start it
-  anyway**, the default, or **Skip it**. A skipped run appears in run history
-  with "The previous run was still going." Run now always starts. A trigger has
-  no such row. The detail page's Configuration lists the setting when it isn't
-  the default.
+  anyway**, the default, **Skip it**, or **Queue it**, which starts the run once
+  the previous one finishes and keeps at most one waiting. **Queue it** is
+  offered only when the list includes `queue`, which also needs the
+  `automation_overlap_queue` release feature. A skipped run appears
+  in run history with "The previous run was still going.", and one that came due
+  while another was queued with "Another run was already queued behind the
+  previous run." Run now always starts. A trigger has no such row. The detail
+  page's Configuration lists the setting when it isn't the default.
 - **MCP services:** when the server's MCP registry is on and `/v1/info` reports
   `scheduled_task_mcp_services`, Advanced has an MCP services row that opens
   the new-chat service list and its sign-in. A new automation starts with none,

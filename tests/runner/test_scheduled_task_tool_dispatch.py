@@ -540,13 +540,27 @@ async def test_retry_settings_reach_only_a_server_that_supports_them(
     ("advertised", "mode", "refusal"),
     [
         (["allow", "skip"], "skip", None),
+        (["allow", "skip", "queue"], "queue", None),
+        (
+            ["allow", "skip"],
+            "queue",
+            "does not support overlap_mode 'queue'; it accepts 'allow', 'skip'",
+        ),
         (["allow"], "allow", None),
         (["allow"], "skip", "does not support overlap_mode 'skip'; it accepts 'allow'"),
         # An older server rejects the field itself, whatever its value.
         (None, "allow", "does not support overlap_mode; omit it"),
         (None, "skip", "does not support overlap_mode; omit it"),
     ],
-    ids=["supported", "allow-only", "feature-off", "older-server-default", "older-server"],
+    ids=[
+        "skip",
+        "queue",
+        "queue-unsupported",
+        "allow-only",
+        "feature-off",
+        "older-server-default",
+        "older-server",
+    ],
 )
 async def test_an_overlap_mode_reaches_only_a_server_that_accepts_it(
     advertised: list[str] | None, mode: str, refusal: str | None

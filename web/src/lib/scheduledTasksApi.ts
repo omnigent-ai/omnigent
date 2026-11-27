@@ -23,7 +23,7 @@ export const MAX_SCHEDULED_TASK_RETRIES = 5;
 export const DEFAULT_RETRY_DELAY_SECONDS = 5 * 60;
 
 /** What a due run does while the previous run is still going. */
-export type ScheduledTaskOverlapMode = "allow" | "skip";
+export type ScheduledTaskOverlapMode = "allow" | "skip" | "queue";
 
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
