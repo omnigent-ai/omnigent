@@ -395,8 +395,8 @@ function TranscriptImpl({
     [display.streamBubbles],
   );
 
-  // With quick_pick_palette, the registry's message steps, which leave Ctrl+Alt+Shift+↑/↓ to
-  // session steps off macOS; without it, Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) as before.
+  // Message steps: the registry's chords with quick_pick_palette, which leave Ctrl+Alt+Shift+↑/↓
+  // to session steps off macOS; otherwise any Cmd+Alt+↑/↓ (Ctrl+Alt on Windows and Linux).
   const registryMessageSteps = useQuickPickPaletteEnabled();
   useMessageNavHotkeys(nav, registryMessageSteps);
   useEffect(() => {
