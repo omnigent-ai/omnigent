@@ -112,7 +112,10 @@ def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
             if default_branch is None:
                 # Without the boundary, a release PR from it would look like a parent.
                 members, truncated = [], True
-            elif current.get("headRefName") == default_branch:
+            elif current.get("headRefName") == default_branch and not current.get(
+                "isCrossRepository"
+            ):
+                # A backport from the default branch; a fork's own main can still have a parent.
                 members, truncated = [], False
             else:
                 members, truncated = _walk(root, reference, token, current, default_branch, calls)

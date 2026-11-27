@@ -45,6 +45,8 @@ class StackGraph:
         self.lists: list[tuple[str, str]] = []
         self.tokens: list[str | None] = []
         self.token_lookups = 0
+        # Whether the chosen account's token can be read.
+        self.token_readable = True
         # Branches whose list fails, or runs past the walk's deadline.
         self.failing: set[str] = set()
         self.timing_out: set[str] = set()
@@ -71,6 +73,8 @@ class StackGraph:
         self.deadlines.append(deadline)
         if argv[:2] == ["auth", "token"]:
             self.token_lookups += 1
+            if not self.token_readable:
+                return 1, "", "no oauth token found for github.com account octocat"
             return 0, TOKEN + "\n", ""
         if argv[:3] == ["auth", "status", "--json"]:
             if not self.status_json:
@@ -150,6 +154,19 @@ def test_every_list_runs_as_the_account_looked_up_once(monkeypatch: pytest.Monke
     # The pull request's read and every list share one lookup.
     assert graph.token_lookups == 1
     assert len(graph.tokens) > 1 and set(graph.tokens) == {TOKEN}
+
+
+def test_with_the_account_s_token_unreadable_every_call_runs_as_the_active_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = StackGraph(monkeypatch, _chain(4), current=2)
+    graph.token_readable = False
+
+    stack = github_stack.pull_request_stack("/workspace", _reference(2))
+
+    assert _numbers(stack) == [1, 2, 3, 4]
+    assert graph.token_lookups == 1
+    assert len(graph.tokens) > 1 and set(graph.tokens) == {None}
 
 
 def test_a_cycle_marks_the_stack_truncated_instead_of_looping(
@@ -272,6 +289,20 @@ def test_a_pull_request_from_another_repository_has_nothing_stacked_on_it(
 
     assert _numbers(stack) == [1]
     assert ("--base", "branch-1") not in graph.lists
+
+
+def test_a_pull_request_from_another_repository_s_default_branch_still_has_its_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The contributor's main is not this repository's default branch.
+    prs = [_pr(1, "feature", "main"), _pr(2, "main", "feature", cross_repository=True)]
+    graph = StackGraph(monkeypatch, prs, current=2)
+
+    stack = github_stack.pull_request_stack("/workspace", _reference(2))
+
+    assert _numbers(stack) == [1, 2]
+    assert stack["truncated"] is False
+    assert ("--base", "main") not in graph.lists
 
 
 def test_a_pull_request_github_cant_load_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
