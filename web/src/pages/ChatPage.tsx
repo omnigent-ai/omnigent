@@ -158,6 +158,7 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { quoteTextStart, settleQuoteLines } from "@/lib/replyDraftDocument";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -2429,19 +2430,24 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  const composerEngine = useRequestedComposerEngine();
+  // On the CodeMirror engine the whole draft is one document; ChatComposer says when it switches.
   const {
     draft,
     value,
     setValue,
     fullText,
     storedReplyDraft,
+    replyDocument,
+    setReplyDocument,
+    setSingleDocument,
     activeTextId,
     focusText,
     editText,
     replaceText,
     appendQuote,
     removeQuote,
-  } = useReplyDraft();
+  } = useReplyDraft(composerEngine === "codemirror");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   useDismissOnEscape(commandError !== null, () => setCommandError(null));
@@ -2523,14 +2529,53 @@ function ComposerImpl(
     setTailTextareaNode(element);
     if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
   }, []);
-  const composerEngine = useRequestedComposerEngine();
   // An engine switch replaces every input; keep the active one current even without focus.
   const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
     textareaRef.current = target;
   }, []);
+  // A take in the one document: the document before it, the one dictation last left, and
+  // whether anything else edited it since. See onVoiceDiscard.
+  const voiceTakeRef = useRef<{ before: string; last: string; clean: boolean } | null>(null);
+  // Set while dictation writes through the editor, so its own change doesn't count as another edit.
+  const writingDictationRef = useRef(false);
+  // In the one document dictation writes through the editor, so its card rules apply.
+  // Only a final is an undo step, so undo takes back a whole utterance and never shows a partial.
+  const writeDictation = (
+    next: string,
+    change: { from: number; to: number; insert: string },
+    final: boolean,
+  ) => {
+    const target = textareaRef.current;
+    if (replyDocument === null) return setValue(next);
+    if (!target || isComposerTextarea(target)) {
+      // No editor to apply the card rules, so the document is settled here.
+      const settled = settleQuoteLines(next);
+      setReplyDocument(settled);
+      return settled;
+    }
+    const take = voiceTakeRef.current;
+    if (take && target.value !== take.last) take.clean = false;
+    writingDictationRef.current = true;
+    try {
+      target.insertText(change.insert, change.from, change.to, { history: final });
+    } finally {
+      writingDictationRef.current = false;
+    }
+    if (take) take.last = target.value;
+    return target.value;
+  };
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(value, setValue, textareaRef);
+  const dictation = useDictationInsert(
+    replyDocument ?? value,
+    writeDictation,
+    textareaRef,
+    // The editor holds the whole document, and a keystroke there can beat its render.
+    () => {
+      const target = textareaRef.current;
+      return replyDocument !== null && target && !isComposerTextarea(target) ? target.value : null;
+    },
+  );
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -3987,8 +4032,10 @@ function ComposerImpl(
     replyQuoteInsertedRef.current = false;
     const textarea = tailTextareaRef.current;
     if (!textarea) return;
+    // Under the new card, set before focus, or the editor would take focus at its start.
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
     if (!isMobileRef.current) textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(0, 0);
+    if (!isComposerTextarea(textarea)) textarea.revealCaret();
     const inputArea = composerTargetElement(textarea).closest("[data-composer-input-area]");
     if (inputArea) inputArea.scrollTop = inputArea.scrollHeight;
     onGrowthRef.current?.();
@@ -4399,7 +4446,9 @@ function ComposerImpl(
       !e.altKey
     ) {
       const ta = e.currentTarget;
-      if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+      // In the one document the caret's top is under any cards that open it.
+      const top = replyDocument === null ? 0 : quoteTextStart(ta.value);
+      if (e.key === "ArrowUp" && ta.selectionStart === top) {
         // Empty-composer recall takes the last queued row before browsing history.
         if (composerEmptyForRecall) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
@@ -4431,7 +4480,10 @@ function ComposerImpl(
     const input = e.currentTarget;
     noteMentionTextChange(e);
     slashCompletion.onSelectionChange(input);
-    editText(id, input.value);
+    // Any edit but dictation's own keeps the take from being discarded, even one undone by hand.
+    if (voiceTakeRef.current && !writingDictationRef.current) voiceTakeRef.current.clean = false;
+    if (replyDocument !== null) setReplyDocument(input.value);
+    else editText(id, input.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
@@ -4582,9 +4634,11 @@ function ComposerImpl(
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
+        onRenderedEngineChange={(engine) => setSingleDocument(engine === "codemirror")}
         input={{
           ref: bindTailTextarea,
-          value: draft.text,
+          value: replyDocument ?? draft.text,
+          replyQuotes: true,
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
@@ -4621,7 +4675,7 @@ function ComposerImpl(
                         ? "Send a follow-up (queued) — Esc to stop"
                         : readyPlaceholder,
           rows: 1,
-          heightMode: draft.quotes.length > 0 ? "unbounded" : "compact",
+          heightMode: draft.quotes.length > 0 && replyDocument === null ? "unbounded" : "compact",
           disabled: inputDisabled,
           "data-slash-command": highlight.input["data-slash-command"],
           "data-shell-command": highlight.input["data-shell-command"],
@@ -4633,7 +4687,7 @@ function ComposerImpl(
         }}
         slots={{
           inputPrefix:
-            draft.quotes.length > 0 ? (
+            draft.quotes.length > 0 && replyDocument === null ? (
               <ReplyDraftBlocks
                 quotes={draft.quotes}
                 activeTextId={activeTextId}
@@ -4899,14 +4953,43 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
+                  dictation.release();
                   voiceSnapshotRef.current = value;
+                  voiceTakeRef.current =
+                    replyDocument === null
+                      ? null
+                      : { before: replyDocument, last: replyDocument, clean: true };
                 }}
                 onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
+                  const take = voiceTakeRef.current;
+                  voiceTakeRef.current = null;
+                  // A take belongs to the engine it began on; after a switch the draft stays.
+                  if (replyDocument === null) {
+                    if (take === null) setValue(voiceSnapshotRef.current);
+                    return;
+                  }
+                  // Only a take nothing else edited goes back, so a quote or edit made in it stays.
+                  const untouched = take?.clean && textareaRef.current?.value === take.last;
+                  if (untouched && take.last !== take.before) setReplyDocument(take.before);
                 }}
-                onListeningChange={setDictating}
+                onListeningChange={(listening) => {
+                  setDictating(listening);
+                  // However a take ends, a partial it leaves is the user's text from now on.
+                  if (!listening) dictation.release();
+                  // A take leaves focus on the mic button, where the editor's undo and redo keys
+                  // don't reach; give it back to the editor once the take ends.
+                  const active = document.activeElement;
+                  const onOwnButton =
+                    active instanceof HTMLButtonElement &&
+                    composerFormRef.current?.contains(active);
+                  if (!listening && replyDocument !== null && onOwnButton && !isMobileRef.current) {
+                    textareaRef.current?.focus({ preventScroll: true });
+                  }
+                }}
                 inputRef={textareaRef}
                 onTranscript={(text) => {
+                  // In the editor the partial goes first, so the final is inserted as one step.
+                  if (replyDocument !== null) dictation.replaceInterim("");
                   dictation.appendFinal(text);
                   dirtyRef.current = true;
                   // Dictation is a user-driven edit — exit prompt-recall mode

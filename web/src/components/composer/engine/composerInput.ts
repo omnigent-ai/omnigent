@@ -40,6 +40,8 @@ export interface ComposerEditorSurface {
 export interface ComposerInsertOptions {
   /** Make this edit its own undo step (the CodeMirror surface always does; textareas only when set). */
   separateUndo?: boolean;
+  /** `false` leaves the edit out of the CodeMirror surface's undo history, as for a partial. */
+  history?: boolean;
 }
 
 /** What the composer edits: a <textarea> as-is, or another engine's surface. */
@@ -170,6 +172,8 @@ export interface ComposerInputProps {
   inputId?: string;
   /** Tagged @-mention tokens to present as one unit, such as "@README.md". */
   mentionTokens?: readonly string[];
+  /** The value is a reply draft's document, whose quote tokens the editor shows as cards. */
+  replyQuotes?: boolean;
   /** Leading command to tint, such as "/context"; a `{token, start}` pins it to an offset. */
   commandToken?: string | ComposerTokenAt | null;
   onChange?: (event: ComposerInputEvent) => void;

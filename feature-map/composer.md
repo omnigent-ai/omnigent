@@ -28,6 +28,24 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that leaves the editor (switching sessions, a new-session handoff, a recovered
   send) keeps each chip's file as a tray attachment with its `@name` text
   unchanged.
+- `reply-quote-cards`: with the CodeMirror editor (see `codemirror-input`),
+  selecting text in a chat message and choosing **Reply** quotes it in the main
+  chat's one editor, each quote a card on a line of its own. Arrow keys step over a card, and the caret never rests on one. Backspace
+  at the start of the line after a card, Delete at the end of the line before
+  it, or the card's X removes it; undo brings it back. After Reply the caret is
+  on the empty line under the new card. Copy, cut and drag give a quote as `> `
+  markdown, and a readline kill (⌃K, ⌃U, ⌃W) stops at a card. Message-text
+  setters, including slash-command clears, `/side`, and attachments, change only
+  the tail; recall and send replace the whole draft. Removing a card takes its
+  line and a blank line that only separates it,
+  and keeps the text around it as shown, so the text above and below joins with
+  one line break; the textarea joins them with a blank line, so the sent text
+  can differ. Discarding a dictation puts back the text from before the take
+  only when nothing else edited the draft during it. A draft saved on one engine
+  restores on the other. An engine switch keeps a caret that is in the text
+  after the last card; one anywhere else goes to the end of the draft. When a
+  take ends, focus goes back to the editor. Only the main chat has the cards:
+  side chats, and the textarea, keep one input per quote.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
@@ -496,6 +514,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
   pick a prompt (search, or **Load older prompts** in a long session). The new
   chat opens with that prompt, and its attachments, in the composer.
+- With `chat_composer_codemirror` on, at a desktop width, select text in an
+  agent's message and choose **Reply**: the quote becomes a card in the main
+  chat's message box, with the caret on the line under it
+  (`reply-quote-cards`). A side chat, and the textarea without the flag, show
+  each quote as its own block with an input above it.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -1071,6 +1094,16 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   Restart the server with
   `OMNIGENT_DICTATION_ENGINE=fake`, reconnect, and expect the mic, the listening
   state on click, and the fake transcript in the message box.
+- **`reply-quote-cards`:** component coverage, run with vitest from `web/`:
+  `web/src/lib/replyDraftDocument.test.ts`,
+  `web/src/components/composer/engine/CodeMirrorComposerInput.test.tsx` and its
+  `.mac.test.tsx`, and `web/src/pages/ChatPage.composer.test.tsx`
+  (`Composer reply quotes in the CodeMirror editor`). Manually, with
+  `chat_composer_codemirror` on: choose **Reply** on a passage, type under the
+  card, step over it with ← and →, then press Backspace at the start of the
+  line under it to remove it, and ⌘Z (Ctrl+Z) to bring it back. Its X also
+  removes it. Send, and the message matches what the textarea sends. Repeat in
+  a side chat to see its stacked quote inputs, which this doesn't change.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
