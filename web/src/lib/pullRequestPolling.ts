@@ -177,7 +177,7 @@ export function pacedPollInterval(
   let paced = interval === false ? failureBackoff(failures) : interval;
   if (state.error != null && failures > 0) paced = Math.max(paced, failureBackoff(failures));
   const budget = budgets.pace(cooldownKey);
-  if (budget.pace !== "normal") budgets.hold(query);
+  if (budget.pace !== "normal") budgets.hold(query, budget);
   if (budget.pace === "slow" && kind === "poll") paced *= budget.factor;
   if (idlePaced && kind === "poll" && interval !== false) {
     // Woken by input, it reads at once only once it's had its usual wait and nothing holds it.

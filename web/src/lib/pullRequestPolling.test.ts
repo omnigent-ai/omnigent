@@ -337,6 +337,17 @@ describe("pacedPollInterval on the reader's hourly budget", () => {
     expect(readsAt).toEqual([0, 120, 240, 360, 480, 600]);
   });
 
+  it("returns a slowed poll to its usual pace at the reset, without waiting out the slowed interval", async () => {
+    vi.useFakeTimers();
+    const budgets = createGitHubReadBudgets();
+    budgets.observe(KEY, budget(1000, 3 * 60_000));
+    const { readsAt, stop } = poll(budgets);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    stop();
+    // Slowed to 2 minutes until the reset at 180 s, then every 30 s from it.
+    expect(readsAt).toEqual([0, 120, 210, 240, 270, 300]);
+  });
+
   it("pauses below a tenth until the reset, then reads with no read needed to lift it", async () => {
     vi.useFakeTimers();
     const budgets = createGitHubReadBudgets();
@@ -385,13 +396,21 @@ describe("pacedPollInterval in an unfocused window", () => {
 
   it("stops a real observer's poll 2 minutes after the window loses focus, and reads once on focus", async () => {
     vi.useFakeTimers();
+    // The window's focus as the test sets it, which the focus check also reads.
+    let hasFocus = true;
     let onFocus = () => {};
     let onBlur = () => {};
     const focus = createGitHubPollFocus({
-      focused: () => true,
+      focused: () => hasFocus,
       listen: (focusListener, blurListener) => {
-        onFocus = focusListener;
-        onBlur = blurListener;
+        onFocus = () => {
+          hasFocus = true;
+          focusListener();
+        };
+        onBlur = () => {
+          hasFocus = false;
+          blurListener();
+        };
       },
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -434,13 +453,21 @@ describe("pacedPollInterval when focus returns", () => {
   function watch(interval = PULL_REQUEST_LIST_POLL_MS) {
     const started = Date.now();
     const readsAt: number[] = [];
+    // The window's focus as the test sets it, which the focus check also reads.
+    let hasFocus = true;
     let onFocus = () => {};
     let onBlur = () => {};
     const focus = createGitHubPollFocus({
-      focused: () => true,
+      focused: () => hasFocus,
       listen: (focusListener, blurListener) => {
-        onFocus = focusListener;
-        onBlur = blurListener;
+        onFocus = () => {
+          hasFocus = true;
+          focusListener();
+        };
+        onBlur = () => {
+          hasFocus = false;
+          blurListener();
+        };
       },
     });
     const budgets = createGitHubReadBudgets();
