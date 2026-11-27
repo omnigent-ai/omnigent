@@ -38,9 +38,10 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     config.mkdir()
     instruction = tmp_path / "editor-instruction.json"
     observed = tmp_path / "editor-observed.jsonl"
+    invoked = tmp_path / "editor-invoked.jsonl"
     hook_record = tmp_path / "blocked-prompt.json"
     process_context = (
-        "import os, psutil\n"
+        "import os, psutil, shutil\n"
         "def native_context():\n"
         "    parents = psutil.Process().parents()[:3]\n"
         "    return {'parents': [{'pid': p.pid, 'created': p.create_time(), "
@@ -48,7 +49,11 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "'tty': os.ttyname(0) if os.isatty(0) else None, "
         "'session_env': {key: os.environ.get(key) for key in "
         "('CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', "
-        "'CLAUDE_CODE_PARENT_SESSION_ID', 'TMUX_PANE')}}\n"
+        "'CLAUDE_CODE_PARENT_SESSION_ID', 'TMUX_PANE')}, "
+        "'editor_env': {'visual_configured': bool(os.environ.get('VISUAL')), "
+        "'editor_configured': bool(os.environ.get('EDITOR')), "
+        "'path_head': os.environ.get('PATH', '').split(os.pathsep)[0], "
+        "'code': shutil.which('code')}}\n"
     )
     hook = tmp_path / "block-prompt.py"
     hook.write_text(
@@ -93,11 +98,16 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         + process_context
         + f"instruction = Path({str(instruction)!r})\n"
         f"observed = Path({str(observed)!r})\n"
+        f"invoked = Path({str(invoked)!r})\n"
+        "program = sys.argv[sys.argv.index('--editor-program') + 1]\n"
+        "with invoked.open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps({'program': program, "
+        "'arguments': [arg if arg.startswith('-') else Path(arg).name "
+        "for arg in sys.argv[sys.argv.index('--editor-program') + 2:]]}) + '\\n')\n"
         "source = Path(sys.argv[-1])\n"
         "content = source.read_bytes().decode('utf-8')\n"
         "request = json.loads(instruction.read_text())\n"
         "accepted = content == request['expected']\n"
-        "program = sys.argv[sys.argv.index('--editor-program') + 1]\n"
         "with observed.open('a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps({'content': content, 'accepted': accepted, "
         "'program': program, 'native_context': native_context()}) + '\\n')\n"
@@ -250,6 +260,11 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert get_mock_message_requests(isolated_mock_llm_server_url) == []
         finally:
             try:
+                final_pane_error = None
+                try:
+                    pane()
+                except (OSError, subprocess.SubprocessError) as exc:
+                    final_pane_error = type(exc).__name__
                 diagnostics = {
                     "version": version.strip(),
                     "editor_source": editor_source,
@@ -258,7 +273,13 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     if hook_record.exists()
                     else None,
                     "editor_observations": observations(),
+                    "editor_invocations": [
+                        json.loads(line) for line in invoked.read_text().splitlines()
+                    ]
+                    if invoked.exists()
+                    else [],
                     "last_pane": last_pane,
+                    "final_pane_error": final_pane_error,
                     "provider_messages": len(
                         get_mock_message_requests(isolated_mock_llm_server_url)
                     ),
