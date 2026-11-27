@@ -6,9 +6,11 @@ import array
 import errno
 import io
 import json
+import logging
 import signal
 import socket
 import subprocess
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -317,6 +319,7 @@ def test_config_preserves_exact_command_and_environment(monkeypatch: pytest.Monk
 )
 def test_request_starts_its_own_relay_after_protection_and_reports_the_child_encoding(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     init_calls: tuple[MagicMock, MagicMock],
     utf8_mode: bool,
     output_encoding: str | None,
@@ -330,12 +333,23 @@ def test_request_starts_its_own_relay_after_protection_and_reports_the_child_enc
         request_init, "sys", SimpleNamespace(flags=SimpleNamespace(utf8_mode=utf8_mode))
     )
     monkeypatch.setattr(request_init.locale, "getencoding", lambda: "ISO-8859-1")
+    relay_logger = logging.getLogger(request_init._RELAY_MODULE)
+    monkeypatch.setattr(relay_logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(relay_logger, "propagate", False)
+
+    def launch_command(*_args: object, **_kwargs: object) -> MagicMock:
+        print("command stdout")
+        print("command stderr", file=sys.stderr)
+        return init_calls[1].return_value
+
+    init_calls[1].side_effect = launch_command
 
     def start_relay(port: int, path: str) -> SimpleNamespace:
         init_calls[0].assert_called_once()
         init_calls[1].assert_not_called()
         control.sendmsg.assert_not_called()
         assert (port, path) == (1234, "/private/broker.sock")
+        relay_logger.warning("Internal relay connection diagnostic")
         return SimpleNamespace(wait=lambda _timeout: True)
 
     load = MagicMock(return_value={"start_relay": start_relay})
@@ -347,7 +361,10 @@ def test_request_starts_its_own_relay_after_protection_and_reports_the_child_enc
         output_encoding=output_encoding,
     )
     request_init._run_request(control, config)
-    load.assert_called_once_with("/runtime/relay.py")
+    load.assert_called_once_with("/runtime/relay.py", run_name=request_init._RELAY_MODULE)
+    captured = capsys.readouterr()
+    assert captured.out == "command stdout\n"
+    assert captured.err == "command stderr\n"
     expected = (
         config.output_encoding.encode("ascii")
         if config.output_encoding is not None
@@ -367,7 +384,9 @@ def test_relay_start_failure_never_publishes_readiness_or_runs_a_command(
     start = MagicMock(return_value=SimpleNamespace(wait=lambda _timeout: False))
     if failure == "bind":
         start.side_effect = OSError("relay bind failed")
-    monkeypatch.setattr(request_init.runpy, "run_path", lambda _path: {"start_relay": start})
+    monkeypatch.setattr(
+        request_init.runpy, "run_path", MagicMock(return_value={"start_relay": start})
+    )
     config = replace(
         _CONFIG, relay=request_init._RelayConfig("/runtime/relay.py", 1234, "/broker.sock")
     )

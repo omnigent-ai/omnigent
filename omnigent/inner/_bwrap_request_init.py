@@ -11,6 +11,7 @@ import codecs
 import ctypes
 import json
 import locale
+import logging
 import os
 import runpy
 import select
@@ -29,6 +30,7 @@ _OWNER_POLL_S = 0.05
 _INIT_FAILURE = 125
 _PR_SET_PDEATHSIG = 1
 _PR_SET_DUMPABLE = 4
+_RELAY_MODULE = "_omnigent_shell_request_relay"
 
 
 def _validate_control_socket(control: socket.socket) -> None:
@@ -186,8 +188,12 @@ def _run_request(control: socket.socket, config: _RequestConfig) -> None:
     control.set_inheritable(False)
     control.settimeout(_ADMISSION_TIMEOUT_S)
     if config.relay is not None:
+        # Relay diagnostics share these pipes with command output.
+        relay_logger = logging.getLogger(_RELAY_MODULE)
+        relay_logger.handlers = [logging.NullHandler()]
+        relay_logger.propagate = False
         # Reuse the maintained stdlib relay inside this request's network namespace.
-        start_relay = runpy.run_path(config.relay.source)["start_relay"]
+        start_relay = runpy.run_path(config.relay.source, run_name=_RELAY_MODULE)["start_relay"]
         relay_ready = start_relay(config.relay.port, config.relay.socket_path)
         if not relay_ready.wait(_ADMISSION_TIMEOUT_S):
             raise TimeoutError("Shell request relay did not become ready")

@@ -511,6 +511,7 @@ def test_startup_cancellation_retires_the_unadmitted_launcher_promptly(
         "success",
         "nonzero",
         "nonzero-truncated",
+        "nonzero-discarded-tail",
         "timeout",
         "not-admitted",
         "lost",
@@ -568,7 +569,7 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
 
     result = BwrapRequestResult(
         capture(b"caf\xe9\r\n"),
-        capture(b"problem\r"),
+        capture(b"    problem\r" if ending == "nonzero-discarded-tail" else b"problem\r"),
         None if ending.startswith("timeout") else 7 if ending.startswith("nonzero") else 0,
         ending.startswith("timeout"),
         encoding,
@@ -624,7 +625,9 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
             }
         else:
             assert isinstance(actual["stdout"], str) and actual["stdout"].startswith("café")
-            assert actual["stderr"].startswith("prob")
+            assert actual["stderr"].startswith(
+                "    " if ending == "nonzero-discarded-tail" else "prob"
+            )
             assert ("truncated" in actual["stderr"]) == (limit == 4)
             assert actual["timed_out"] == (ending == "timeout")
             if ending == "nonzero":
@@ -632,6 +635,12 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
             if ending == "nonzero-truncated":
                 assert actual["error"].startswith("Command exited with status 7: prob\n")
                 assert "stderr truncated: 4 characters omitted" in actual["error"]
+            if ending == "nonzero-discarded-tail":
+                assert result.stderr.nonblank and not result.stderr.text.strip()
+                assert actual["error"].startswith(
+                    "Command exited with status 7: [stderr truncated:"
+                )
+                assert "café" not in actual["error"]
             if ending == "timeout":
                 assert actual["exit_code"] is None
                 assert actual["error"] == "Command timed out after 7 seconds"
