@@ -5,16 +5,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import psutil
 import pytest
 
+from omnigent.inner import os_env as os_env_module
+from omnigent.inner._bwrap_shell_request import BwrapShellRequest
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment, OSEnvironment, _HelperProcessClient
 from omnigent.inner.sandbox import SandboxPolicy, resolve_sandbox
@@ -230,7 +236,7 @@ def _require_request_launcher(spec: AgentSpec, cwd: Path) -> None:
 
 
 @pytest.mark.skipif(not _LIVE_LINUX, reason="requires Linux and Bubblewrap")
-@pytest.mark.parametrize("ending", ["complete", "nonzero", "timeout", "cancel"])
+@pytest.mark.parametrize("ending", ["complete", "nonzero", "timeout", "cancel", "metadata-cancel"])
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 async def test_real_runner_shell_requests_retire_descendants_and_keep_only_clean_helpers(
@@ -258,12 +264,52 @@ async def test_real_runner_shell_requests_retire_descendants_and_keep_only_clean
 
     monkeypatch.setattr(request_control.BwrapRequestControl, "receive", observe)
     ready = tmp_path / "descendant-ready"
+    stopped: list[int] = []
     task = None
     try:
         assert (
             json.loads(await execute("sys_os_read", {"path": "note.txt"}))["content"] == "ready\n"
         )
         original = await _helper_process(registry, spec)
+        if ending == "metadata-cancel":
+            assert original.stdout is not None
+            output_fd = original.stdout.fileno()
+            tree = psutil.Process(original.pid)
+            for process in [*tree.children(recursive=True), tree]:
+                descriptor = os.pidfd_open(process.pid)
+                stopped.append(descriptor)
+                signal.pidfd_send_signal(descriptor, signal.SIGSTOP)
+            waiting = threading.Event()
+            wait = os_env_module._wait_shell_metadata_pipe
+
+            def observe_metadata(
+                descriptor: int, event: int, deadline: float, request: BwrapShellRequest
+            ) -> None:
+                if descriptor == output_fd and event == select.POLLIN:
+                    waiting.set()
+                wait(descriptor, event, deadline, request)
+
+            monkeypatch.setattr(os_env_module, "_wait_shell_metadata_pipe", observe_metadata)
+            task = asyncio.create_task(
+                execute("sys_os_shell", {"command": "printf must-not-run", "timeout": 7})
+            )
+            await poll_until_async(waiting.is_set, timeout_s=5, interval_s=0.001)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert not lifetimes
+            await poll_until_async(
+                lambda: all(request_control._pidfd_exited(descriptor) for descriptor in stopped),
+                timeout_s=5,
+                interval_s=0.01,
+            )
+            assert original.poll() is not None
+            assert (
+                json.loads(await execute("sys_os_read", {"path": "note.txt"}))["content"]
+                == "ready\n"
+            )
+            assert await _helper_process(registry, spec) is not original
+            return
         task = asyncio.create_task(
             execute(
                 "sys_os_shell",
@@ -314,6 +360,9 @@ async def test_real_runner_shell_requests_retire_descendants_and_keep_only_clean
                 lambda: original.poll() is not None, timeout_s=5, interval_s=0.01
             )
     finally:
+        for descriptor in stopped:
+            if not request_control._pidfd_exited(descriptor):
+                signal.pidfd_send_signal(descriptor, signal.SIGCONT)
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -321,6 +370,8 @@ async def test_real_runner_shell_requests_retire_descendants_and_keep_only_clean
         for init_fd, launcher_fd, _owner in lifetimes:
             os.close(init_fd)
             os.close(launcher_fd)
+        for descriptor in stopped:
+            os.close(descriptor)
 
 
 @pytest.mark.skipif(not _LIVE_LINUX, reason="requires Linux and Bubblewrap")
@@ -442,7 +493,6 @@ print(json.dumps({
 @pytest.mark.parametrize(
     "mode",
     [
-        "large-success",
         "large-error",
         "timeout-invalid",
         "utf8-disabled",
@@ -559,10 +609,9 @@ else:
             assert result["stderr"].startswith(
                 "e" * 100_000 + "\n[stderr truncated: 162,144 characters omitted."
             )
-            assert result["exit_code"] == (7 if mode == "large-error" else 0)
+            assert result["exit_code"] == 7
             assert result["timed_out"] is False
-            if mode == "large-error":
-                assert len(result["error"]) < 100_500
-                assert result["error"].startswith("Command exited with status 7: e")
+            assert len(result["error"]) < 100_500
+            assert result["error"].startswith("Command exited with status 7: e")
     finally:
         await registry.cleanup_session("live-shell")

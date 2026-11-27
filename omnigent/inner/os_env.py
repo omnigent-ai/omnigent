@@ -13,6 +13,7 @@ import json
 import locale
 import logging
 import os
+import select
 import shutil
 import stat
 import subprocess
@@ -90,6 +91,8 @@ OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # Ops without side effects: safe to send again if the helper died before replying.
 _REPLAY_SAFE_OPS = frozenset({"read", "shell_encoding"})
+_SHELL_METADATA_TIMEOUT_S = 10.0
+_MAX_SHELL_METADATA_BYTES = 64 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -438,6 +441,22 @@ class _PreparedHelper:
     env: dict[str, str]
 
 
+def _wait_shell_metadata_pipe(
+    descriptor: int, event: int, deadline: float, request: BwrapShellRequest
+) -> None:
+    from ._bwrap_request_control import RequestCancelled
+
+    poller = select.poll()
+    poller.register(descriptor, event)
+    while not request.cancelled.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("OS helper shell metadata preparation timed out")
+        if poller.poll(max(1, round(min(remaining, 0.05) * 1000))):
+            return
+    raise RequestCancelled("Shell request was cancelled during metadata preparation")
+
+
 class _HelperProcessClient:
     """JSON-line RPC client for the sandboxed OS helper process."""
 
@@ -572,7 +591,11 @@ class _HelperProcessClient:
         self._ensure_started_locked()
         metadata = self._shell_metadata
         if metadata is None:
-            response = self._request_locked({"op": "shell_encoding"}, allow_retry=True)
+            try:
+                response = self._read_shell_metadata_locked(request, timeout)
+            except BaseException:
+                self._stop_locked()
+                raise
             encoding, locale_env = response.get("encoding"), response.get("locale")
             if (
                 not isinstance(encoding, str)
@@ -583,6 +606,7 @@ class _HelperProcessClient:
                 )
                 or _shell_locale_env(locale_env) != locale_env
             ):
+                self._stop_locked()
                 return {"error": "Failed to read the OS helper's shell locale and encoding"}
             metadata = (encoding, locale_env)
             self._shell_metadata = metadata
@@ -650,6 +674,45 @@ class _HelperProcessClient:
             cwd=prepared.cwd,
             max_output=max_output,
         )
+
+    def _read_shell_metadata_locked(self, request: BwrapShellRequest, timeout: int) -> OpResult:
+        assert self._proc is not None
+        assert self._proc.stdin is not None and self._proc.stdout is not None
+        outgoing = memoryview(b'{"op":"shell_encoding"}\n')
+        incoming = bytearray()
+        deadline = time.monotonic() + min(timeout, _SHELL_METADATA_TIMEOUT_S)
+        input_fd, output_fd = self._proc.stdin.fileno(), self._proc.stdout.fileno()
+        with contextlib.ExitStack() as restore:
+            for descriptor in (input_fd, output_fd):
+                blocking = os.get_blocking(descriptor)
+                os.set_blocking(descriptor, False)
+                restore.callback(os.set_blocking, descriptor, blocking)
+            while outgoing:
+                _wait_shell_metadata_pipe(input_fd, select.POLLOUT, deadline, request)
+                try:
+                    written = os.write(input_fd, outgoing)
+                except BlockingIOError:
+                    continue
+                if written <= 0:
+                    raise OSError("OS helper closed before shell metadata preparation")
+                outgoing = outgoing[written:]
+            while b"\n" not in incoming:
+                _wait_shell_metadata_pipe(output_fd, select.POLLIN, deadline, request)
+                try:
+                    chunk = os.read(output_fd, _MAX_SHELL_METADATA_BYTES + 1 - len(incoming))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    raise OSError("OS helper closed during shell metadata preparation")
+                incoming.extend(chunk)
+                if len(incoming) > _MAX_SHELL_METADATA_BYTES:
+                    raise OSError("OS helper returned oversized shell metadata")
+        if not incoming.endswith(b"\n") or b"\n" in incoming[:-1]:
+            raise OSError("OS helper returned an invalid shell metadata frame")
+        response = json.loads(incoming)
+        if not isinstance(response, dict):
+            raise OSError("OS helper returned invalid shell metadata")
+        return response
 
     def _spawn_shell_request(
         self, argv: list[str], env: dict[str, str], descriptors: tuple[int, ...]
@@ -1028,6 +1091,7 @@ class _HelperProcessClient:
                 except Exception:  # noqa: BLE001 — terminate may fail on already-exited process; escalate to kill
                     with contextlib.suppress(Exception):
                         proc.kill()
+                        proc.wait()
         finally:
             # Release the containment handle (Windows Job Object): with
             # kill-on-close this also reaps any helper descendants that

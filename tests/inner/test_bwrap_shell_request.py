@@ -562,11 +562,14 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
     )
     monkeypatch.setattr(os_env_module.locale, "getencoding", lambda: encoding)
     metadata = MagicMock(
-        side_effect=lambda request, **_kwargs: os_env_module._handle_helper_request(
-            request=request, cwd=tmp_path, shell_path="/bin/sh", sandbox=prepared.sandbox
+        side_effect=lambda *_args: os_env_module._handle_helper_request(
+            request={"op": "shell_encoding"},
+            cwd=tmp_path,
+            shell_path="/bin/sh",
+            sandbox=prepared.sandbox,
         )
     )
-    monkeypatch.setattr(helper, "_request_locked", metadata)
+    monkeypatch.setattr(helper, "_read_shell_metadata_locked", metadata)
     if ending == "invalid-locale":
         metadata.side_effect = None
         metadata.return_value = {"encoding": encoding, "locale": {"UNGRANTED_SECRET": "fixture"}}
@@ -605,7 +608,7 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
         assert options["output_encoding"] == encoding
         assert options["command_env"]["LC_CTYPE"] == "C.UTF-8"
         assert prepared.env["LC_CTYPE"] == "C"
-        metadata.assert_called_once_with({"op": "shell_encoding"}, allow_retry=True)
+        metadata.assert_called_once_with(request, 7)
         assert "launch_env" not in options
         assert options["command_env"]["PATH"] == prepared.env["PATH"]
         assert prepared.env["PATH"].startswith(str(tmp_path) + os.pathsep)
@@ -680,7 +683,7 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
             refreshed = helper.shell_request("printf result", 7, limit, restarted_request)
             assert refreshed["stdout"] == "λok" and refreshed["exit_code"] == 0
             assert metadata.call_count == 2 and run.call_count == 3
-            assert metadata.call_args == call({"op": "shell_encoding"}, allow_retry=True)
+            assert metadata.call_args == call(restarted_request, 7)
             assert run.call_args.kwargs["output_encoding"] == "utf-8"
             assert os_env_module._shell_locale_env(run.call_args.kwargs["command_env"]) == {
                 "LC_CTYPE": "C",
@@ -824,6 +827,98 @@ async def test_repeated_cancellation_waits_for_actual_worker_retirement(
     finally:
         retirement.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ending", ["cancel", "close", "timeout", "partial-timeout", "write-cancel"]
+)
+async def test_blocked_metadata_preparation_retires_without_a_reply(
+    monkeypatch: pytest.MonkeyPatch,
+    caller_environment: CallerProcessOSEnvironment,
+    ending: str,
+) -> None:
+    environment = caller_environment
+    helper = environment._helper
+    peer_input, parent_input = os.pipe()
+    parent_output, peer_output = os.pipe()
+    process = MagicMock(spec=subprocess.Popen)
+    process.stdin = os.fdopen(parent_input, "w", encoding="utf-8")
+    process.stdout = os.fdopen(parent_output, "r", encoding="utf-8")
+    process.stderr = io.StringIO()
+    process.poll.return_value = None
+    retired, waiting = threading.Event(), threading.Event()
+
+    def terminate() -> None:
+        process.poll.return_value = 0
+
+    def reap(*_args: object, **_kwargs: object) -> int:
+        assert process.poll() == 0
+        retired.set()
+        return 0
+
+    process.terminate.side_effect = terminate
+    process.wait.side_effect = reap
+    helper._proc = process
+    helper._prepared = _PreparedHelper(helper.sandbox, helper.cwd, {"PATH": os.defpath})
+    monkeypatch.setattr(helper, "_ensure_started_locked", lambda: None)
+    wait = os_env_module._wait_shell_metadata_pipe
+
+    def observe(
+        descriptor: int, event: int, deadline: float, request: shell_request.BwrapShellRequest
+    ) -> None:
+        if descriptor == (parent_input if ending == "write-cancel" else parent_output):
+            waiting.set()
+        wait(descriptor, event, deadline, request)
+
+    monkeypatch.setattr(os_env_module, "_wait_shell_metadata_pipe", observe)
+    if "timeout" in ending:
+        monkeypatch.setattr(os_env_module, "_SHELL_METADATA_TIMEOUT_S", 0.1)
+    if ending == "write-cancel":
+        os.set_blocking(parent_input, False)
+        try:
+            while True:
+                os.write(parent_input, b"x" * 4096)
+        except BlockingIOError:
+            pass
+        os.set_blocking(parent_input, True)
+    broker_stop = MagicMock(
+        side_effect=lambda: retired.is_set() or pytest.fail("broker retired before helper")
+    )
+    monkeypatch.setattr(helper, "_stop_egress_proxy_locked", broker_stop)
+    closing = None
+    expected: type[BaseException]
+    task = asyncio.create_task(environment.isolated_shell("must-not-run", timeout=7))
+    try:
+        await poll_until_async(waiting.is_set, timeout_s=2, interval_s=0.001)
+        if ending != "write-cancel":
+            assert json.loads(os.read(peer_input, 4096)) == {"op": "shell_encoding"}
+        if ending == "partial-timeout":
+            os.write(peer_output, b'{"encoding":')
+        if ending == "close":
+            closing = threading.Thread(target=environment.close)
+            closing.start()
+            expected = RequestCancelled
+        elif "cancel" in ending:
+            task.cancel()
+            expected = asyncio.CancelledError
+        else:
+            expected = TimeoutError
+        with pytest.raises(expected):
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        os.fstat(peer_output)
+        assert retired.is_set()
+        assert helper._proc is None and helper._prepared is None
+        assert process.stdin.closed and process.stdout.closed
+        assert broker_stop.call_count >= 1
+        if closing is not None:
+            await poll_until_async(lambda: not closing.is_alive(), timeout_s=2, interval_s=0.001)
+    finally:
+        os.close(peer_input)
+        os.close(peer_output)
+        await asyncio.gather(task, return_exceptions=True)
+        if closing is not None:
+            closing.join(timeout=2)
 
 
 @pytest.mark.asyncio
