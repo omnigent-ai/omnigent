@@ -9,20 +9,23 @@ import subprocess
 import uuid
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge, model_switch
+from tests._helpers.mock_llm import advertised_tool_names
 from tests._helpers.native_claude import (
     _PINNED_CLAUDE_MODELS,
     _assert_mock_claude_turn,
     _assert_native_claude_turn,
+    _claude_text_blocks,
     _live_claude_snapshot,
     _require_session_only_claude,
     isolated_claude_mock_routing_stack,
 )
 from tests._helpers.polling import poll_until
 from tests._helpers.session import message_item_text, ordered_message_items
-from tests.e2e.conftest import get_mock_message_requests, set_fallback_mock_llm
+from tests.e2e.conftest import configure_mock_llm, get_mock_message_requests, set_fallback_mock_llm
 from tests.e2e.routing._helpers import claude_settings_snapshot
 from tests.harnesses.claude_native._model_status_oracle import native_claude_wire_model
 
@@ -197,5 +200,216 @@ def test_claude_model_switch_preserves_application_wrapped_drafts(
                     timeout_s=10,
                 )
                 assert claude_settings_snapshot(settings_path) == saved_settings
+        finally:
+            client.delete(f"/v1/sessions/{session_id}").raise_for_status()
+
+
+def test_claude_model_control_during_an_active_turn_preserves_delivery(
+    tmp_path: Path,
+    isolated_mock_llm_server_url: str,
+    claude_managed_settings: None,
+) -> None:
+    mock_url = isolated_mock_llm_server_url
+    with isolated_claude_mock_routing_stack(
+        tmp_path,
+        mock_url,
+        models=_PINNED_CLAUDE_MODELS,
+        judge_model="mock-claude-active-turn-judge",
+    ) as (base_url, client, host_id, workspace, settings_path):
+        agents = client.get("/v1/agents")
+        agents.raise_for_status()
+        agent_id = next(
+            row["id"] for row in agents.json()["data"] if row["name"] == "claude-native-ui"
+        )
+        created = client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": host_id,
+                "workspace": str(workspace),
+                "cost_control_mode_override": "off",
+            },
+            timeout=120,
+        )
+        created.raise_for_status()
+        session_id = str(created.json()["id"])
+        try:
+            _require_session_only_claude(base_url, session_id)
+            saved_settings = claude_settings_snapshot(settings_path)
+            selected = client.patch(
+                f"/v1/sessions/{session_id}", json={"model_override": "sonnet"}
+            )
+            assert selected.status_code == 200, selected.text
+            initial_model = _PINNED_CLAUDE_MODELS["sonnet"]
+            nonce = uuid.uuid4().hex[:8]
+            marker, reply = f"warm-user-{nonce}", f"warm-reply-{nonce}"
+            set_fallback_mock_llm(mock_url, "default", reply)
+            set_fallback_mock_llm(mock_url, native_claude_wire_model(initial_model), reply)
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"Reply with {reply}. {marker}"}],
+                },
+            ).raise_for_status()
+            poll_until(
+                lambda: any(
+                    item.get("role") == "assistant" and message_item_text(item) == reply
+                    for item in ordered_message_items(base_url, session_id)
+                ),
+                timeout_s=30,
+            )
+            native_session, user_text = _assert_native_claude_turn(
+                base_url, session_id, marker, reply, initial_model
+            )
+            prior_request = _assert_mock_claude_turn(
+                mock_url, marker, initial_model, native_session=native_session, user_text=user_text
+            )
+            tool_names = sorted(advertised_tool_names([prior_request]))
+            assert tool_names, (
+                "A conversation tool must distinguish the held turn from title calls"
+            )
+            snapshot = _live_claude_snapshot(base_url, session_id)
+            bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
+            bridge_dir = bridge.bridge_dir_for_bridge_id(bridge_id)
+            advert = bridge.read_tmux_target(bridge_dir)
+            assert advert is not None, "The owned Claude terminal advertised no tmux pane"
+            target = advert["tmux_target"]
+            evidence = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
+            evidence.mkdir(parents=True, exist_ok=True)
+            busy_marker, busy_reply = f"busy-user-{nonce}", f"busy-reply-{nonce}"
+            busy_prompt = f"Reply with exactly {busy_reply}. Context marker: {busy_marker}."
+            configure_mock_llm(
+                mock_url,
+                [{"text": busy_reply, "block": True}],
+                match=busy_marker,
+                required_tools=tool_names[:1],
+            )
+            with httpx.Client(base_url=mock_url, timeout=10) as model_client:
+                try:
+                    client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json={
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": busy_prompt}],
+                        },
+                    ).raise_for_status()
+                    poll_until(
+                        lambda: bool(model_client.get("/gate/pending").json()["pending"]),
+                        timeout_s=30,
+                    )
+                    assert client.get(f"/v1/sessions/{session_id}").json()["status"] == "running"
+                    (evidence / "busy-before-controls.txt").write_text(
+                        bridge._capture_pane(advert["socket_path"], target)
+                    )
+                    response = client.patch(
+                        f"/v1/sessions/{session_id}",
+                        json={"model_override": "opus"},
+                        timeout=40,
+                    )
+                    pending = model_client.get("/gate/pending").json()["pending"]
+                    (evidence / "busy-model-control.json").write_text(
+                        json.dumps(
+                            {
+                                "version": json.loads(
+                                    (bridge_dir / bridge.CONTEXT_RAW_FILE).read_text()
+                                ).get("version"),
+                                "status": response.status_code,
+                                "provider_still_held": pending,
+                                "saved_settings_unchanged": (
+                                    claude_settings_snapshot(settings_path) == saved_settings
+                                ),
+                                "terminal": bridge._capture_pane(advert["socket_path"], target),
+                            },
+                            indent=2,
+                        )
+                    )
+                    assert response.status_code == 200, response.text
+                    assert pending, "Model control must finish before the active turn is released"
+                    assert claude_settings_snapshot(settings_path) == saved_settings
+                    poll_until(
+                        lambda: (
+                            _live_claude_snapshot(base_url, session_id).get("llm_model")
+                            == native_claude_wire_model(_PINNED_CLAUDE_MODELS["opus"])
+                        ),
+                        timeout_s=10,
+                    )
+                    assert client.get(f"/v1/sessions/{session_id}").json()["status"] == "running"
+                finally:
+                    while model_client.post("/gate/release").json()["released"]:
+                        pass
+            poll_until(
+                lambda: any(
+                    item.get("role") == "assistant" and message_item_text(item) == busy_reply
+                    for item in ordered_message_items(base_url, session_id)
+                ),
+                timeout_s=30,
+            )
+            (evidence / "busy-after-release.txt").write_text(
+                bridge._capture_pane(advert["socket_path"], target)
+            )
+            items = ordered_message_items(base_url, session_id)
+            for role, token in (("user", busy_marker), ("assistant", busy_reply)):
+                assert (
+                    sum(
+                        item.get("role") == role and token in message_item_text(item)
+                        for item in items
+                    )
+                    == 1
+                )
+            transcript = bridge.read_transcript_path(bridge_dir)
+            assert transcript is not None
+            busy_users = [
+                record
+                for line in transcript.read_text().splitlines()
+                if line.strip()
+                and (record := json.loads(line)).get("type") == "user"
+                and busy_marker in json.dumps(record.get("message", {}).get("content"))
+            ]
+            assert len(busy_users) == 1 and busy_users[0]["sessionId"] == native_session
+            busy_blocks = _claude_text_blocks(busy_users[0]["message"]["content"])
+            assert len(busy_blocks) == 1
+            _assert_mock_claude_turn(
+                mock_url,
+                busy_marker,
+                initial_model,
+                native_session=native_session,
+                user_text=busy_blocks[0],
+            )
+
+            marker, reply = f"after-busy-user-{nonce}", f"after-busy-reply-{nonce}"
+            model = _PINNED_CLAUDE_MODELS["opus"]
+            set_fallback_mock_llm(mock_url, native_claude_wire_model(model), reply)
+            configure_mock_llm(
+                mock_url,
+                [{"text": reply}],
+                match=marker,
+                required_tools=tool_names[:1],
+            )
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"Reply with {reply}. {marker}"}],
+                },
+            ).raise_for_status()
+            poll_until(
+                lambda: any(
+                    item.get("role") == "assistant" and message_item_text(item) == reply
+                    for item in ordered_message_items(base_url, session_id)
+                ),
+                timeout_s=30,
+            )
+            observed_session, user_text = _assert_native_claude_turn(
+                base_url, session_id, marker, reply, model
+            )
+            assert observed_session == native_session
+            _assert_mock_claude_turn(
+                mock_url, marker, model, native_session=native_session, user_text=user_text
+            )
+            assert claude_settings_snapshot(settings_path) == saved_settings
         finally:
             client.delete(f"/v1/sessions/{session_id}").raise_for_status()

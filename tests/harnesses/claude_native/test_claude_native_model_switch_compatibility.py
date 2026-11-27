@@ -126,6 +126,42 @@ def test_model_changes_preserve_the_version_appropriate_behavior(
         assert composer.overlay is None
 
 
+def test_legacy_value_only_catalog_cannot_confirm_an_unchanged_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer(legacy_dialog_delay_s=0)
+    composer.version = "2.1.322"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    config_path = bridge_dir / "bridge.json"
+    config = json.loads(config_path.read_text())
+    config.pop("model_picker_options")
+    config_path.write_text(json.dumps(config))
+    initial_model = composer.model
+    composer.install(monkeypatch)
+
+    with pytest.raises(bridge.ClaudeModelSwitchRefused) as caught:
+        bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert caught.value.model_may_have_changed
+    assert caught.value.phase == "legacy"
+    assert composer.model == composer.saved_default == initial_model
+    assert composer._legacy_pending == "private-glm[1m]"
+    assert composer.confirmations == 0
+    assert composer.submitted == ["/model private-glm[1m]"]
+
+    composer._run_tmux("synthetic-socket", "send-keys", "Enter")
+    raw_path = bridge_dir / bridge.CONTEXT_RAW_FILE
+    raw = json.loads(raw_path.read_text())
+    raw["model"] = {"id": composer.model}
+    raw_path.write_text(json.dumps(raw))
+    before = list(composer.sends)
+    observed = bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert observed.already_selected and not observed.confirmation_pending
+    assert composer.model == composer.saved_default == "private-glm[1m]"
+    assert composer.sends == before
+
+
 @pytest.mark.parametrize(
     ("version", "requested", "reported", "pin"),
     [
@@ -249,6 +285,7 @@ def test_legacy_bridge_metadata_needs_no_reregistration(
 
     assert type(result).__name__ == "ClaudeLegacyModelSwitchResult"
     assert result.picker_value == composer.model == composer.saved_default == target
+    assert result.confirmation_pending
     assert [command for command in composer.submitted if command] == [f"/model {target}"]
     assert composer.status_queries == 0
 

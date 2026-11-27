@@ -5994,8 +5994,14 @@ def _inject_legacy_model_command_locked(
         )
         until = min(time.monotonic() + _CONFIRM_DIALOG_TIMEOUT_S, transaction.deadline.at)
         while True:
-            if _confirm_legacy_model_dialog_locked(bridge_dir, receipt=receipt) is not False:
+            confirmed = _confirm_legacy_model_dialog_locked(bridge_dir, receipt=receipt)
+            if confirmed is True:
                 return receipt
+            if confirmed is None:
+                raise transaction.refuse(
+                    "Claude's legacy model selection could not be confirmed. "
+                    "Check the terminal's model and saved default before retrying."
+                )
             remaining = until - time.monotonic()
             if remaining <= 0:
                 return replace(receipt, confirmation_pending=True)
@@ -6100,11 +6106,11 @@ def _confirm_legacy_model_dialog_locked(
     ):
         return True
     label = receipt.confirmation_label
-    if label is None:
-        return None
     pane = _capture_pane(origin.socket_path, origin.tmux_target)
     require_origin()
     _raise_if_user_prompt_pending(bridge_dir, pane)
+    if label is None:
+        return None if _model_control_surface(pane) is not None else False
     if not _cache_cost_confirmation(pane, label, yes_selected=True):
         return None if _model_control_surface(pane) is not None else False
 

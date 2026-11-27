@@ -778,9 +778,12 @@ composer with its prompt`).
   success journey. Requires Claude Code and tmux. Use a clean container when
   machine-managed settings override the mock endpoint; short synthetic replies
   do not establish live gateway compatibility or inference beyond 200K tokens.
-  A held Sonnet turn also checks that the browser stays visibly working while
-  a model control completes; that turn finishes once and the following turn
-  uses Opus.
+- **`model-picker`, active native turn (own environment):**
+  `tests/e2e/test_claude_native_model_drafts.py::test_claude_model_control_during_an_active_turn_preserves_delivery`
+  holds a Sonnet provider response while the API changes the model to Opus.
+  The session stays running through the control, the held turn finishes once
+  on Sonnet, and the following turn uses Opus. Saved settings stay unchanged.
+  This uses the native CLI and an owned mock provider without a browser.
 - **`model-picker`, terminal draft preservation (own environment):**
   `tests/e2e/test_claude_native_model_drafts.py::test_claude_model_switch_preserves_application_wrapped_drafts`
   uses a real Claude CLI and an owned loopback provider without a browser.

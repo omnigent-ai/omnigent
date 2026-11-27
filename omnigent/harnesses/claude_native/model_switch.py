@@ -945,9 +945,16 @@ class SessionOnlyModelSwitch:
         if draft or (draft is None and self.owned_draft is not None):
             if self.owned_draft is None or not self.draft_matches(pane, self.owned_draft):
                 raise self.refuse(
-                    "The input box contains text that could not be confirmed as your saved "
-                    "message; it was left untouched. Inspect the input and resubmit your "
-                    "message. It will not be replayed automatically."
+                    (
+                        "The input box contains text that could not be confirmed as your saved "
+                        "message; it was left untouched. Inspect the input and resubmit your "
+                        "message. It will not be replayed automatically."
+                    )
+                    if self.owned_draft is not None
+                    else (
+                        "The input was left untouched. Clear or send it in Terminal, "
+                        "then retry the model change."
+                    )
                 )
             self.clear_owned_draft(self.owned_draft)
         before_selection: str | None = None

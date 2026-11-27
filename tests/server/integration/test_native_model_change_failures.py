@@ -683,19 +683,21 @@ async def test_cancelled_claude_model_change_keeps_intent_after_losing_the_reply
 
 
 @pytest.mark.parametrize(
-    "native_session",
+    ("native_session", "transport_offline"),
     [
-        "claude-native",
-        "custom-claude-native",
-        "inherited-claude-native",
-        "inherited-custom-claude-native",
+        pytest.param("claude-native", False, id="claude-native"),
+        pytest.param("custom-claude-native", False, id="custom-claude-native"),
+        pytest.param("inherited-claude-native", False, id="inherited-claude-native"),
+        pytest.param("inherited-custom-claude-native", False, id="inherited-custom-claude-native"),
+        pytest.param("claude-native", True, id="offline-tunnel"),
     ],
-    indirect=True,
+    indirect=["native_session"],
 )
 async def test_claude_model_change_without_a_runner_saves_intent_without_forwarding(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
+    transport_offline: bool,
 ) -> None:
     session = native_session
     assert session.claude is not None
@@ -703,10 +705,15 @@ async def test_claude_model_change_without_a_runner_saves_intent_without_forward
     forward = routes_core._forward_session_change_to_runner
 
     async def lose_client_before_forward(*args: Any, **kwargs: Any) -> Any:
-        monkeypatch.setattr(
-            "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=None)
-        )
-        monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+        if transport_offline:
+            session.tunnel.registry.deregister(
+                session.tunnel.session.runner_id, session=session.tunnel.session
+            )
+        else:
+            monkeypatch.setattr(
+                "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=None)
+            )
+            monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
         return await forward(*args, **kwargs)
 
     monkeypatch.setattr(

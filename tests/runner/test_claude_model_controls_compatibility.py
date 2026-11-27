@@ -440,16 +440,26 @@ async def test_model_control_rejects_a_mismatched_result(
     assert composer.sends == []
 
 
+@pytest.mark.parametrize("fault", ["submit", "value-only-dialog"])
 async def test_legacy_submission_failure_reports_uncertainty_about_the_saved_default(
     model_control: tuple[native_controls.NativeControls, _SessionModelComposer, Path],
     monkeypatch: pytest.MonkeyPatch,
+    fault: str,
 ) -> None:
     controls, composer, bridge_dir = model_control
     path = bridge_dir / bridge.CONTEXT_RAW_FILE
     raw = json.loads(path.read_text())
     raw["version"] = "2.1.322"
     path.write_text(json.dumps(raw))
-    monkeypatch.setattr(bridge, "_verify_submit_accepted", Mock(return_value=False))
+    initial_model = composer.model
+    if fault == "submit":
+        monkeypatch.setattr(bridge, "_verify_submit_accepted", Mock(return_value=False))
+    else:
+        composer.legacy_dialog_delay_s = 0
+        config_path = bridge_dir / "bridge.json"
+        config = json.loads(config_path.read_text())
+        config.pop("model_picker_options")
+        config_path.write_text(json.dumps(config))
 
     response = await controls.handle_claude_native_model_change("web-session", "private-glm[1m]")
 
@@ -458,7 +468,15 @@ async def test_legacy_submission_failure_reports_uncertainty_about_the_saved_def
     assert error["error"] == "claude_native_model_unconfirmed"
     assert error["uncertainty_scope"] == "session_and_saved_default"
     assert "saved default" in error["detail"]
-    assert composer.model == composer.saved_default == "private-glm[1m]"
+    assert (
+        composer.model
+        == composer.saved_default
+        == ("private-glm[1m]" if fault == "submit" else initial_model)
+    )
+    if fault == "value-only-dialog":
+        assert composer._legacy_pending == "private-glm[1m]"
+        assert composer.confirmations == 0
+        assert composer.submitted == ["/model private-glm[1m]"]
 
 
 async def test_busy_legacy_model_control_handles_a_confirmation_after_the_immediate_watch(

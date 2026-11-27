@@ -8293,8 +8293,9 @@ async def _forward_session_change_to_runner_impl(
     :param transport_error_result: Optional caller outcome for a failed POST,
         distinguishing a possibly committed control from no runner client.
     :returns: The runner's HTTP status/body, or ``None`` when no
-        runner client could be resolved. A transport failure returns
-        ``transport_error_result``, defaulting to the saved-value fallback.
+        runner client could be resolved or the connection failed before dispatch.
+        Other transport failures return ``transport_error_result``, defaulting
+        to the saved-value fallback.
     """
     from omnigent.runtime import get_runner_client
     from omnigent.server.runtime_compatibility import RuntimeSupportError
@@ -8328,7 +8329,7 @@ async def _forward_session_change_to_runner_impl(
             json=event,
             timeout=timeout_s,
         )
-    except (httpx.HTTPError, ConnectionError):
+    except (httpx.HTTPError, ConnectionError) as exc:
         # A lost reply may follow a committed control; callers can retain that uncertainty.
         _logger.warning(
             "Session-change forward did not reach the runner or lost its reply for "
@@ -8339,7 +8340,11 @@ async def _forward_session_change_to_runner_impl(
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return transport_error_result
+        return (
+            None
+            if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout)
+            else transport_error_result
+        )
     if resp.status_code >= 400:
         _logger.warning(
             "Session-change forward rejected for session=%s type=%r status=%s body=%s",

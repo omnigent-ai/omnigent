@@ -946,7 +946,8 @@ Cross-harness journeys:
   model after uncertainty. Older runners retain their existing CLI actuator and
   saved-default behavior. Legacy requests and both peer directions are covered by
   `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_requires_the_same_immediate_picker_receipt`,
-  `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_refuses_unsupported_queued_or_unconfirmed_states`,
+  `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_serializes_a_refused_dialog_without_session_events`,
+  `tests/runner/test_claude_model_controls_compatibility.py::test_model_control_names_the_step_a_blocked_terminal_needs`,
   `tests/server/integration/test_native_model_change_failures.py::test_claude_model_confirmation_controls_public_patch_and_rollback`,
   `tests/server/integration/test_native_model_change_failures.py::test_refused_model_change_preserves_newer_silent_selection`,
   and `tests/server/integration/test_native_model_change_failures.py::test_new_server_accepts_legacy_runner_replies_without_losing_newer_metadata`.
@@ -968,6 +969,11 @@ Cross-harness journeys:
   Each draft is then explicitly submitted and its complete text must match in
   the native transcript and exactly one conversation request. Screen rows alone
   do not establish logical newline boundaries or ownership for automated clearing.
+  `tests/e2e/test_claude_native_model_drafts.py::test_claude_model_control_during_an_active_turn_preserves_delivery`
+  covers an API model change while a native provider response is held: the
+  session stays running, that turn finishes once on its original model, and
+  the next turn uses the new model without changing saved defaults. It uses
+  the same isolated native stack as draft preservation, without a browser.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
   pauses its owned CLI to force a real unconfirmed switch; a late 503 preserves
   a newer same-value model write and its effort while the applied model stays
