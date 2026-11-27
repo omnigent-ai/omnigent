@@ -3,7 +3,11 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { UNFOCUSED_POLL_PAUSE_MS, createGitHubPollFocus } from "./githubPollFocus";
+import {
+  FRAME_FOCUS_CHECK_MS,
+  UNFOCUSED_POLL_PAUSE_MS,
+  createGitHubPollFocus,
+} from "./githubPollFocus";
 
 function focusHarness({ focused = true } = {}) {
   let clock = 1_000_000;
@@ -44,11 +48,15 @@ function focusHarness({ focused = true } = {}) {
     },
   });
   const advance = (ms: number) => {
-    clock += ms;
-    for (const timer of timers.filter((each) => each.at <= clock)) {
-      timers.splice(timers.indexOf(timer), 1);
-      timer.callback();
+    const until = clock + ms;
+    for (;;) {
+      const next = timers.filter((each) => each.at <= until).sort((a, b) => a.at - b.at)[0];
+      if (!next) break;
+      clock = Math.max(clock, next.at);
+      timers.splice(timers.indexOf(next), 1);
+      next.callback();
     }
+    clock = until;
   };
   const poll = () => {
     const setOptions = vi.fn();
@@ -75,8 +83,20 @@ function focusHarness({ focused = true } = {}) {
     poll,
     live,
     timers,
-    blur: () => onBlur(),
-    refocus: () => onFocus(),
+    /** The app loses the keyboard: the window blurs and the page has no focus. */
+    blur: () => {
+      windowFocused = false;
+      onBlur();
+    },
+    /** A frame in the page takes the keyboard: the window blurs, but the page keeps focus. */
+    focusFrame: () => {
+      windowFocused = true;
+      onBlur();
+    },
+    refocus: () => {
+      windowFocused = true;
+      onFocus();
+    },
     setEnabled: (enabled: boolean) => setEnabled(enabled),
     /** The listeners and flag setter as this start handed them out, to call after a reset. */
     handedOut: () => ({ onFocus, onBlur, setEnabled }),
@@ -98,6 +118,29 @@ describe("githubPollFocus", () => {
     advance(1);
     expect(focus.pollPaused(query)).toBe(true);
     expect(focus.paused()).toBe(true);
+  });
+
+  it("keeps polling while a frame in the page has the keyboard, and pauses once it leaves the app", () => {
+    const { focus, advance, poll, focusFrame, setWindowFocused, refocus } = focusHarness();
+    const { query, refetch } = poll();
+    focus.pollPaused(query);
+    focusFrame();
+    advance(10 * UNFOCUSED_POLL_PAUSE_MS);
+    expect(focus.pollPaused(query)).toBe(false);
+    // The keyboard leaves the app from the frame: the window hears nothing, the check notices.
+    setWindowFocused(false);
+    advance(FRAME_FOCUS_CHECK_MS);
+    advance(UNFOCUSED_POLL_PAUSE_MS - 1);
+    expect(focus.paused()).toBe(false);
+    advance(1);
+    expect(focus.pollPaused(query)).toBe(true);
+    // Coming back straight into the frame ends the pause too, without a window focus event.
+    setWindowFocused(true);
+    advance(FRAME_FOCUS_CHECK_MS);
+    expect(focus.paused()).toBe(false);
+    expect(refetch).toHaveBeenCalledTimes(1);
+    refocus();
+    expect(refetch).toHaveBeenCalledTimes(1);
   });
 
   it("reschedules the polls asked while unfocused at the pause, so none waits for its next read", () => {
@@ -223,7 +266,8 @@ describe("a test reset", () => {
     const { focus, live, timers } = focusHarness({ focused: false });
     focus.paused();
     expect(live).toEqual({ listeners: 1, watches: 1, starts: 1 });
-    expect(timers).toHaveLength(1);
+    // The pause and the frame focus check.
+    expect(timers).toHaveLength(2);
     focus.resetForTests();
     expect(live).toMatchObject({ listeners: 0, watches: 0 });
     expect(timers).toHaveLength(0);

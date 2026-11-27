@@ -8,6 +8,9 @@ import { createHeldPolls, pollingObserver, type HeldPoll } from "@/lib/heldPolls
 /** How long the window stays unfocused before its GitHub polls stop. */
 export const UNFOCUSED_POLL_PAUSE_MS = 2 * 60_000;
 
+/** How often a blurred window checks whether one of its frames holds the keyboard. */
+export const FRAME_FOCUS_CHECK_MS = 15_000;
+
 /** The rollback flag: off, polls run while the window is unfocused, as before. */
 export const GITHUB_POLL_FOCUS_PAUSE_FLAG = "github-poll-focus-pause";
 
@@ -50,6 +53,7 @@ export function createGitHubPollFocus({
   // The pause began, by its timer or a poll it stopped: focus releases then, whatever the clock says.
   let pauseReached = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let focusCheck: ReturnType<typeof setTimeout> | null = null;
 
   const isPaused = () =>
     enabled && blurredAt !== null && now() - blurredAt >= UNFOCUSED_POLL_PAUSE_MS;
@@ -87,14 +91,40 @@ export function createGitHubPollFocus({
     );
   }
 
+  function cancelFocusCheck() {
+    if (focusCheck !== null) clearTimer(focusCheck);
+    focusCheck = null;
+  }
+
+  // A frame taking the keyboard blurs the window while the page keeps focus, and the window hears
+  // nothing when the keyboard leaves the app from that frame or comes back into one: so ask.
+  function checkFocus(ms: number) {
+    cancelFocusCheck();
+    focusCheck = setTimer(() => {
+      focusCheck = null;
+      if (focused()) release();
+      else if (blurredAt === null) {
+        blurredAt = now();
+        schedulePause();
+      }
+      checkFocus(FRAME_FOCUS_CHECK_MS);
+    }, ms);
+  }
+
   function onBlur() {
     if (blurredAt !== null) return;
     blurredAt = now();
     schedulePause();
+    checkFocus(0);
+  }
+
+  function onFocus() {
+    cancelFocusCheck();
+    release();
   }
 
   // Each stopped poll reads once if it still polls and its pacer would let it; else it reschedules.
-  function onFocus() {
+  function release() {
     const wasPaused = pauseReached || isPaused();
     blurredAt = null;
     pauseReached = false;
@@ -131,7 +161,10 @@ export function createGitHubPollFocus({
       (...args: Args) => {
         if (current === lifecycle) handler(...args);
       };
-    if (!focused()) blurredAt = now();
+    if (!focused()) {
+      blurredAt = now();
+      checkFocus(FRAME_FOCUS_CHECK_MS);
+    }
     stopListening = listen(live(onFocus), live(onBlur)) ?? null;
     stopWatching = watchEnabled(live(setEnabled)) ?? null;
     schedulePause();
@@ -163,6 +196,7 @@ export function createGitHubPollFocus({
   function resetForTests() {
     lifecycle += 1;
     cancelTimer();
+    cancelFocusCheck();
     stopListening?.();
     stopWatching?.();
     stopListening = null;
