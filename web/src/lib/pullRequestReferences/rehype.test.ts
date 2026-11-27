@@ -88,7 +88,7 @@ describe("rehypeMentions", () => {
         element("p", [
           element("code", [text("@octo")]),
           element("a", [text("@octo")], { href: "https://example.com" }),
-          text(" octo@example.com octo_acme@example.com @octo_ @octo__acme"),
+          text(" octo@example.com octo_acme@example.com @octo_ @octo__acme café@octo @octoé"),
         ]),
         element("pre", [element("code", [text("@decorator")])]),
       ],

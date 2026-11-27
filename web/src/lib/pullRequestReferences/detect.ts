@@ -26,7 +26,7 @@ const UNSPACED_SCRIPT = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=H
 const WORD = `(?![${UNSPACED_SCRIPT}])[\\p{L}\\p{N}\\p{M}_]`;
 // Not inside a word, a path, a URL fragment, an entity or a mention. Checked by hand, since
 // Safari before 16.4 can't parse a lookbehind.
-const BLOCKS_BEFORE = new RegExp(`^(?:${WORD}|[./#&@-])$`, "u");
+const BLOCKS_BEFORE = new RegExp(`^(?:${WORD}|[./\\\\#&@-])$`, "u");
 // Not followed by more of a word, `.md`, or `:12`.
 const AFTER = `(?!${WORD}|-|[.:][\\p{L}\\p{N}])`;
 const SHORTHAND = new RegExp(
@@ -38,7 +38,7 @@ const UNSPACED_CHARACTER = new RegExp(`^[${UNSPACED_SCRIPT}]$`, "u");
 const PATH_SEPARATOR = /^[/\\]$/;
 
 /** The whole character that ends just before `index`, astral ones included; "" at the start. */
-function characterBefore(text: string, index: number): string {
+export function characterBefore(text: string, index: number): string {
   if (index === 0) return "";
   const low = text.charCodeAt(index - 1);
   const paired = index >= 2 && low >= 0xdc00 && low <= 0xdfff;

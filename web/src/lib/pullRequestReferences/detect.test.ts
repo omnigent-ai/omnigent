@@ -48,6 +48,8 @@ describe("detectPullRequestShorthand", () => {
     ["a Han path segment in a URL", "https://example.com/修正#12"],
     ["a Han path segment", "path/修正#12"],
     ["a kana segment of a Windows path", "docs\\テスト#3"],
+    ["a segment of a Windows path", "docs\\app#3"],
+    ["a drive path", "C:\\repo\\app#12"],
     ["a mention", "@team#4"],
     ["a leading zero", "#012"],
     ["a number too large", "#99999999999"],
