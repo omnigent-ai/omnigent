@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.harnesses.claude_native import bridge, editor_owner
+from omnigent.harnesses.claude_native import bridge, editor_delegate, editor_owner
 from tests._helpers.native_claude import _PINNED_CLAUDE_MODELS
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_message_requests
@@ -56,6 +56,9 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "'name': p.name(), 'exe': p.exe()} for p in parents], "
         "'owner_source_sha256': hashlib.sha256("
         "Path(editor_owner.__file__).read_bytes()).hexdigest(), "
+        "'editor_environment_sha256': hashlib.sha256(json.dumps("
+        "{key: os.environ.get(key) for key in ('VISUAL', 'EDITOR', 'PATH')}, "
+        "sort_keys=True).encode()).hexdigest(), "
         "'tty': os.ttyname(0) if os.isatty(0) else None, "
         "'session_env': {key: os.environ.get(key) for key in "
         "('CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', "
@@ -184,6 +187,59 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             )
             launcher.chmod(0o700)
         env["PATH"] = str(programs) + os.pathsep + env["PATH"]
+    original_editor_environment = {key: env.get(key) for key in ("VISUAL", "EDITOR", "PATH")}
+    editor_environment_digest = hashlib.sha256(
+        json.dumps(original_editor_environment, sort_keys=True).encode()
+    ).hexdigest()
+    delegate_manifests: list[tuple[Path, list[str]]] = []
+    delegate_prefix: str | None = None
+
+    def delegate_command(command: list[str], name: str) -> list[str]:
+        manifest = tmp_path / f"delegate-{name}.json"
+        delegate_manifests.append((manifest, command))
+        return [sys.executable, "-m", editor_delegate.__name__, "--manifest", str(manifest), "--"]
+
+    if editor_source == "configured":
+        for key, program in (("VISUAL", "visual"), ("EDITOR", "editor")):
+            env[key] = shlex.join(
+                delegate_command(
+                    [sys.executable, str(editor), "--editor-program", program], program
+                )
+            )
+    else:
+        delegates = tmp_path / "delegated-editors"
+        delegates.mkdir()
+        delegate_prefix = str(delegates)
+        for original_program in sorted(programs.iterdir()):
+            program = original_program.name
+            launcher = delegates / program
+            launcher.write_text(
+                "#!/bin/sh\nexec "
+                + shlex.join(
+                    delegate_command(
+                        [sys.executable, str(editor), "--editor-program", program], program
+                    )
+                )
+                + ' "$@"\n'
+            )
+            launcher.chmod(0o700)
+        env["PATH"] = str(delegates) + os.pathsep + env["PATH"]
+    replaced_keys = ("VISUAL", "EDITOR") if editor_source == "configured" else ()
+    for manifest, command in delegate_manifests:
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "command": command,
+                    "restore_environment": {
+                        key: original_editor_environment[key] for key in replaced_keys
+                    },
+                    "injected_environment": {key: env[key] for key in replaced_keys},
+                    "path_prefix": delegate_prefix,
+                }
+            )
+        )
+        manifest.chmod(0o600)
     bridge.ensure_claude_workspace_trusted(workspace, env)
     version = subprocess.check_output([claude, "--version"], env=env, text=True, timeout=10)
     typed_draft = (
@@ -315,6 +371,10 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 assert actual == expected, {"step": index, "expected": expected, "actual": actual}
                 assert observation["accepted"] is accepted
                 assert observation["native_context"]["owner_source_sha256"] == owner_source
+                assert (
+                    observation["native_context"]["editor_environment_sha256"]
+                    == editor_environment_digest
+                )
                 poll_until(
                     lambda expected=("/status" if accepted else expected): (
                         bridge._composer_box(pane()) is not None
@@ -333,6 +393,10 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 diagnostics = {
                     "version": version.strip(),
                     "editor_source": editor_source,
+                    "editor_delegation_source_sha256": hashlib.sha256(
+                        Path(editor_delegate.__file__).read_bytes()
+                    ).hexdigest(),
+                    "expected_editor_environment_sha256": editor_environment_digest,
                     "typed_draft": typed_draft,
                     "blocked_hook": json.loads(hook_record.read_text())
                     if hook_record.exists()
