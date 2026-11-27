@@ -38,6 +38,8 @@ JPEG = b"\xff\xd8\xff" + b"\x00" * 64
 GIF = b"GIF89a" + b"\x00" * 64
 WEBP = b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 64
 AVIF = b"\x00\x00\x00\x1cftypavif" + b"\x00" * 64
+# An AVIF whose major brand is the generic image file format, naming AVIF as compatible.
+MIF1_AVIF = b"\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00mif1avifmiaf" + b"\x00" * 64
 
 # gh's own token lookup, before a fake replaces it.
 _REAL_ACTIVE_TOKEN = github._gh_active_token
@@ -282,6 +284,9 @@ def test_an_enterprise_attachment_redirects_to_its_hosts_signed_images(
         # An absolute location is held to the rules as written, case and port included.
         "https://PRIVATE-USER-IMAGES.githubusercontent.com/1/2-x.png?jwt=a",
         "https://private-user-images.githubusercontent.com:443/1/2-x.png?jwt=a",
+        # So is a scheme-relative one, which names its host too.
+        "//PRIVATE-USER-IMAGES.githubusercontent.com/1/2-x.png?jwt=a",
+        "//private-user-images.githubusercontent.com:443/1/2-x.png?jwt=a",
     ],
 )
 def test_a_redirect_off_the_signed_image_host_is_refused_with_no_request_to_it(
@@ -491,6 +496,7 @@ def test_the_whole_fetch_ends_at_its_deadline_though_no_wait_passes_its_cap(
         ("image/gif", GIF, {}),
         ("image/webp", WEBP, {}),
         ("image/avif", AVIF, {}),
+        ("image/avif", MIF1_AVIF, {}),
         ("image/PNG; charset=binary", PNG, {}),
         ("image/png", PNG, {"content-encoding": "identity"}),
     ],
@@ -512,6 +518,10 @@ def test_each_raster_type_with_matching_bytes_is_served(
         ("image/jpeg", b"<svg/>"),
         ("text/html; charset=image/png", PNG),
         ("", PNG),
+        # An image file format box naming no AVIF brand, then AVIF past the box's bounds.
+        ("image/avif", b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00mif1heic" + b"\x00" * 64),
+        ("image/avif", b"\x00\x00\x00\x14ftypmif1\x00\x00\x00\x00mif1avif" + b"\x00" * 64),
+        ("image/avif", b"\x00\x00\x00\x20ftypmif1\x00\x00\x00\x00mif1avif"),
     ],
 )
 def test_anything_but_a_matching_raster_image_is_refused(
@@ -756,6 +766,23 @@ def test_the_fetch_runs_as_the_account_active_at_the_start(fake: FakeGitHub) -> 
 
     assert transport.seen[0].headers["authorization"] == f"token {TOKEN}"
     assert fake.calls == []
+
+
+def test_the_fetch_runs_as_the_account_saved_for_the_repository(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A login chosen for the repository fetches with its own token, not the active one."""
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: "saved-login")
+    fake.broker_token = "gho_saved_example"
+    transport = Transport(_image())
+
+    _read(ASSET, transport)
+
+    assert transport.seen[0].headers["authorization"] == "token gho_saved_example"
+    assert [argv for argv, _token in fake.calls] == [
+        ["auth", "token", "--user", "saved-login", "-h", "github.com"]
+    ]
+    assert fake.token_lookups == []
 
 
 def test_a_pr_on_a_host_the_user_never_set_up_reads_nothing_and_sends_no_token(

@@ -134,9 +134,14 @@ def _redirect_target(current: httpx.URL, location: str, pr_host: str) -> httpx.U
     reference = location.split("#", 1)[0]
     if _raw_reference_refused(reference):
         raise ImageRefused("host_not_allowed")
-    # An absolute location is checked as written, case and port included.
-    absolute = reference.lower().startswith("https:")
-    target = _parsed(reference if absolute else str(current.join(reference)))
+    # A location that names its host is checked as written, case and port included; a
+    # scheme-relative one takes the current scheme, which is always https.
+    if reference.lower().startswith("https:"):
+        target = _parsed(reference)
+    elif reference.startswith("//"):
+        target = _parsed(f"https:{reference}")
+    else:
+        target = _parsed(str(current.join(reference)))
     if target is None or not _signed_image_url(target, pr_host.lower()):
         raise ImageRefused("host_not_allowed")
     return target
@@ -184,9 +189,27 @@ def _sniff(data: bytes) -> str | None:
         return "image/gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
-    if data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
+    if _avif_brand(data):
         return "image/avif"
     return None
+
+
+# An ISO base media file starts with an ftyp box: size, "ftyp", major brand, minor version,
+# then the compatible brands. A real one names a few; the cap bounds the scan.
+_FTYP_HEADER_BYTES = 16
+_MAX_FTYP_BYTES = 256
+_AVIF_BRANDS = frozenset({b"avif", b"avis"})
+
+
+def _avif_brand(data: bytes) -> bool:
+    """Whether a well-formed leading ftyp box names AVIF as its major or a compatible brand."""
+    if data[4:8] != b"ftyp":
+        return False
+    size = int.from_bytes(data[:4], "big")
+    if not _FTYP_HEADER_BYTES <= size <= min(_MAX_FTYP_BYTES, len(data)) or size % 4:
+        return False
+    brands = [data[8:12]] + [data[offset : offset + 4] for offset in range(16, size, 4)]
+    return any(brand in _AVIF_BRANDS for brand in brands)
 
 
 async def _read_image(
