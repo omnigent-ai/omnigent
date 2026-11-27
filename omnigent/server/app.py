@@ -10,7 +10,7 @@ import re
 import tarfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from importlib import import_module
@@ -965,17 +965,37 @@ def _resolve_audit_route(request: Request) -> tuple[str, str, str | None]:
     route (or ``/v1/sessions`` list) resolves to a null session id. Returns
     ``("unmatched", "<unmatched>", None)`` when nothing matches.
     """
-    for route in request.app.router.routes:
+    route, child_scope = _match_leaf_route(request.app.router.routes, request.scope)
+    if route is None:
+        return "unmatched", _UNMATCHED_ROUTE_TEMPLATE, None
+    name = getattr(route, "name", None) or "unmatched"
+    template = getattr(route, "path", _UNMATCHED_ROUTE_TEMPLATE)
+    session_id = child_scope.get("path_params", {}).get("session_id")
+    return name, template, session_id
+
+
+def _match_leaf_route(routes: Iterable[Any], scope: Scope) -> tuple[Any | None, Scope]:
+    """Return the first route that fully matches *scope*, and its child scope.
+
+    An included router is matched through to the route inside it: FastAPI 0.137+
+    keeps ``app.include_router(...)`` as one nameless entry in the app's routes
+    whose ``effective_candidates()`` are its prefixed routes (or further
+    included routers), where older releases flattened the routes into the app.
+    """
+    for route in routes:
         try:
-            match, child_scope = route.matches(request.scope)
+            match, child_scope = route.matches(scope)
+            if match is not Match.FULL:
+                continue
+            effective_candidates: Callable[[], Iterable[Any]] | None = getattr(
+                route, "effective_candidates", None
+            )
+            if effective_candidates is not None and not getattr(route, "name", None):
+                return _match_leaf_route(effective_candidates(), scope)
         except Exception:  # noqa: BLE001 — route matching must never fail a request
             continue
-        if match is Match.FULL:
-            name = getattr(route, "name", None) or "unmatched"
-            template = getattr(route, "path", _UNMATCHED_ROUTE_TEMPLATE)
-            session_id = child_scope.get("path_params", {}).get("session_id")
-            return name, template, session_id
-    return "unmatched", _UNMATCHED_ROUTE_TEMPLATE, None
+        return route, child_scope
+    return None, {}
 
 
 def _emit_audit_event(
