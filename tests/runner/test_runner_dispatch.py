@@ -4002,6 +4002,8 @@ async def test_runner_os_env_cold_shell_preserves_file_helper(
     from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
+    # Unsupported kernels/launchers keep the established disposable shell path.
+    monkeypatch.setattr("omnigent.inner._bwrap_shell_request.request_launcher", lambda *_: None)
     shell_started = asyncio.Event()
     shell_blocked = asyncio.Event()
     shell_result = {

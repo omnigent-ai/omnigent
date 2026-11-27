@@ -256,6 +256,7 @@ class ToolEnvironmentLease:
     :param sandbox: Sandbox policy resolved from *spec* when it was built.
     :param environment: The live environment; its helper stays warm between calls.
     :param leased: Whether a call currently holds the environment.
+    :param shell_launcher: Trusted host executable selected for this shell lease.
     """
 
     registry: SessionResourceRegistry
@@ -264,6 +265,7 @@ class ToolEnvironmentLease:
     sandbox: SandboxPolicy
     environment: OSEnvironment
     leased: bool = False
+    shell_launcher: str | None = None
 
     async def release(self, *, reusable: bool) -> None:
         """End the call's hold; close the environment unless it stays reusable.
@@ -1301,7 +1303,7 @@ class SessionResourceRegistry:
         raise ValueError(f"Environment {environment_id!r} not found for session {session_id!r}")
 
     async def lease_tool_environment(
-        self, session_id: str, spec: OSEnvSpec
+        self, session_id: str, spec: OSEnvSpec, *, for_shell: bool = False
     ) -> ToolEnvironmentLease | None:
         """Lease the session's reusable ``sys_os_*`` environment for one call.
 
@@ -1310,6 +1312,7 @@ class SessionResourceRegistry:
 
         :param session_id: Session/conversation identifier.
         :param spec: Effective spec for this call, with a concrete cwd.
+        :param for_shell: Require an independently contained Linux shell request.
         :returns: The lease, or ``None`` while another call holds it so
             concurrent calls fall back to their own environment.
         """
@@ -1319,6 +1322,15 @@ class SessionResourceRegistry:
         # Resolution follows symlinks in the spec's paths, so compare a fresh one.
         cwd = Path(spec.cwd or ".").resolve(strict=False)
         sandbox = resolve_sandbox(spec, cwd)
+        launcher = None
+        if for_shell:
+            from omnigent.inner._bwrap_shell_request import request_launcher
+
+            if spec.fork or spec.start_in_scratch:
+                return None
+            launcher = await asyncio.to_thread(request_launcher, sandbox)
+            if launcher is None:
+                return None
         with self._lock:
             lease = self._tool_envs.get(session_id)
             if (
@@ -1346,6 +1358,7 @@ class SessionResourceRegistry:
                 lease = None
             if lease is not None:
                 lease.leased = True
+                lease.shell_launcher = launcher
         if replaced is not None:
             try:
                 await run_sync_cleanup(
