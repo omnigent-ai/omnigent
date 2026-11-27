@@ -38,59 +38,6 @@ export function useChoosingComparisonOwner(): WorkingCopyComparisonOwner {
   return workingCopyComparisonsAt(useComparisonRepository(), useComparisonWorkspaceKey());
 }
 
-/** The repository folder each session's on-screen Diffs reviews when it isn't the workspace. */
-const reviewedRepositories = new Map<string, ReviewedFolder>();
-const reviewedRepositoryListeners = new Set<() => void>();
-
-/**
- * Says the session's Diffs on screen reviews `repository`, until the returned cleanup runs,
- * so ⌘K's comparison commands act on that review rather than the workspace's.
- */
-export function publishReviewedRepository(
-  sessionId: string,
-  token: object,
-  repository: string,
-  workspaceKey = "",
-): () => void {
-  reviewedRepositories.set(sessionId, { token, repository, workspaceKey });
-  reviewedRepositoryListeners.forEach((listener) => listener());
-  return () => {
-    if (reviewedRepositories.get(sessionId)?.token !== token) return;
-    reviewedRepositories.delete(sessionId);
-    reviewedRepositoryListeners.forEach((listener) => listener());
-  };
-}
-
-interface ReviewedFolder {
-  token: object;
-  repository: string;
-  workspaceKey: string;
-}
-
-function subscribeReviewedRepositories(listener: () => void): () => void {
-  reviewedRepositoryListeners.add(listener);
-  return () => {
-    reviewedRepositoryListeners.delete(listener);
-  };
-}
-
-function useReviewedFolder(sessionId: string | undefined): ReviewedFolder | null {
-  return useSyncExternalStore(subscribeReviewedRepositories, () =>
-    sessionId ? (reviewedRepositories.get(sessionId) ?? null) : null,
-  );
-}
-
-/** The repository folder the session's Diffs on screen reviews; empty for the workspace. */
-export function useReviewedRepository(sessionId: string | undefined): string {
-  return useReviewedFolder(sessionId)?.repository ?? "";
-}
-
-/** The owner ⌘K's comparison commands change for a session: its on-screen Diffs' folder's. */
-export function useSessionChoosingOwner(sessionId: string | undefined): WorkingCopyComparisonOwner {
-  const reviewed = useReviewedFolder(sessionId);
-  return workingCopyComparisonsAt(reviewed?.repository ?? "", reviewed?.workspaceKey);
-}
-
 /** How many comparisons the person has chosen for the session, in any folder's review. */
 export function useSessionChoiceCount(sessionId: string): number {
   const subscribe = useCallback(
