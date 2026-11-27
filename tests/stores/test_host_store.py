@@ -159,6 +159,78 @@ async def test_unbound_only_session_delete_keeps_bound_sessions(
 
 
 @pytest.mark.parametrize("split_database", [False, True])
+@pytest.mark.parametrize("interruption", ["late_bind", "row_delete_fails", "rows_already_deleted"])
+def test_unbound_only_session_delete_settles_concurrent_changes(
+    tmp_path, split_database, interruption, monkeypatch
+):
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    uri = f"sqlite:///{tmp_path / 'metadata.db'}"
+    conversations = SqlAlchemyConversationStore(
+        uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+    hosts = HostStore(uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    unlaunched = conversations.create_conversation(host_id=host_id, workspace="/work")
+    observed: list[Any] = []
+
+    def interrupt(maker, operation, write):
+        if (
+            interruption == "rows_already_deleted"
+            and operation == "delete_conversation_metadata"
+            and not observed
+        ):
+            # Another request deleted the rows and has not yet deleted the metadata.
+            observed.append(operation)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                guarded = conversations.delete_conversation(unlaunched.id, require_unbound=True)
+                observed.append(pool.submit(asyncio.run, guarded).result(timeout=15))
+        result = run_write_transaction(maker, operation, write)
+        if (
+            interruption == "late_bind"
+            and operation.startswith("delete_unbound_conversation")
+            and not observed
+        ):
+            observed.append(
+                conversations.update_conversation_with_changes(
+                    unlaunched.id, terminal_launch_args=[]
+                )
+            )
+            observed.append(conversations.set_runner_id(unlaunched.id, "runner_late"))
+        return result
+
+    def fail_row_delete(*_args):
+        raise RuntimeError("row delete failed")
+
+    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", interrupt)
+    if interruption == "row_delete_fails":
+        monkeypatch.setattr(sqlalchemy_store, "delete_fts_by_conversation_ids", fail_row_delete)
+        with pytest.raises(RuntimeError, match="row delete failed"):
+            asyncio.run(conversations.delete_conversation(unlaunched.id, require_unbound=True))
+        assert conversations.get_conversation(unlaunched.id).host_id == host_id
+        assert hosts.get_host(host_id) is not None
+        assert conversations.set_runner_id(unlaunched.id, "runner_retry")
+        return
+    if interruption == "late_bind":
+        assert asyncio.run(conversations.delete_conversation(unlaunched.id, require_unbound=True))
+        assert observed == [None, False]
+    else:
+        assert asyncio.run(conversations.delete_conversation(unlaunched.id))
+        assert observed == ["delete_conversation_metadata", True]
+    assert conversations.get_conversation(unlaunched.id) is None
+    assert hosts.get_host(host_id) is None
+
+
+@pytest.mark.parametrize("split_database", [False, True])
 @pytest.mark.parametrize("uploaded_agent", [False, True])
 def test_last_session_delete_races_new_binding(
     tmp_path, split_database, uploaded_agent, monkeypatch

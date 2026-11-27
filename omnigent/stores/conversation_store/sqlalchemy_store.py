@@ -7688,7 +7688,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param preserve_host_binding: Keep the root's metadata reservation for
             same-host replacement. Creation consumes it under the host lock.
         :param require_unbound: Delete only while the root has no runner bound.
-            Its metadata row goes first, so a later bind finds no row to update.
+            The check holds the root's metadata row until its conversation rows
+            are deleted, so a later bind or settings update finds no row.
         :returns: ``True`` if the conversation existed (and, with
             *require_unbound*, was unbound), ``False`` otherwise.
         """
@@ -7700,28 +7701,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         # and only an explicit agent removal deletes one.
 
         from omnigent.server.scheduled.schedule import continued_sandbox_host_id
-
-        released_host_ids: list[str] = []
-        if require_unbound:
-
-            def release_unbound(session: Session) -> list[str] | None:
-                meta = session.get(
-                    SqlConversationMetadata,
-                    (current_workspace_id(), conversation_id),
-                    with_for_update=True,
-                )
-                if meta is None or meta.runner_id is not None:
-                    return None
-                host_ids = [meta.host_id] if meta.host_id is not None else []
-                session.delete(meta)
-                return host_ids
-
-            released = run_write_transaction(
-                self._session_immediate, "delete_unbound_conversation_metadata", release_unbound
-            )
-            if released is None:
-                return False
-            released_host_ids = released
 
         def delete_ap(ap_sess: Session) -> tuple[list[str], dict[str, str]] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
@@ -7781,14 +7760,45 @@ class SqlAlchemyConversationStore(ConversationStore):
             ap_sess.delete(row)
             return subtree_ids, retained_tasks
 
-        ap_result = run_write_transaction(
-            self._conv_session_immediate,
-            "delete_conversation_rows",
-            delete_ap,
-        )
-        if ap_result is None:
-            return False
-        subtree_ids, retained_tasks = ap_result
+        released_host_ids: list[str] = []
+        if require_unbound:
+
+            def delete_unbound(
+                session: Session,
+            ) -> tuple[tuple[list[str], dict[str, str]], list[str]] | None:
+                meta = session.get(
+                    SqlConversationMetadata,
+                    (current_workspace_id(), conversation_id),
+                    with_for_update=True,
+                )
+                if meta is None or meta.runner_id is not None:
+                    return None
+                # Binds wait on this lock; once it is released, no row is left to bind or recreate.
+                if self._conv_engine is self._engine:
+                    deleted = delete_ap(session)
+                else:
+                    deleted = run_write_transaction(
+                        self._conv_session_immediate, "delete_conversation_rows", delete_ap
+                    )
+                host_ids = [meta.host_id] if meta.host_id is not None else []
+                session.delete(meta)
+                return deleted or ([conversation_id], {}), host_ids
+
+            released = run_write_transaction(
+                self._session_immediate, "delete_unbound_conversation", delete_unbound
+            )
+            if released is None:
+                return False
+            (subtree_ids, retained_tasks), released_host_ids = released
+        else:
+            ap_result = run_write_transaction(
+                self._conv_session_immediate,
+                "delete_conversation_rows",
+                delete_ap,
+            )
+            if ap_result is None:
+                return False
+            subtree_ids, retained_tasks = ap_result
 
         def delete_metadata(session: Session, batch_ids: tuple[str, ...]) -> None:
             host_ids = session.scalars(

@@ -869,7 +869,10 @@ def register_core_routes(
                 session_id, require_unbound=True
             ):
                 return
-            await _delete_session_files(session_id)
+            try:
+                await _delete_session_files(session_id)
+            except Exception:
+                _logger.exception("Failed to delete files of unlaunched session %s", session_id)
             if (
                 body.git is not None
                 and not body.git.existing_worktree
@@ -2053,7 +2056,7 @@ def register_core_routes(
                 # The orchestrating caller never sends the first task to an unconfirmed
                 # create, so a session left here would never start.
                 if orchestration_source is not None:
-                    await _delete_unlaunched_session(request, resp.id, body)
+                    await _delete_unlaunched_session(request, resp.id, resolved_body)
                 raise
             if launched is not None:
                 runner_id, launch_failed = launched
