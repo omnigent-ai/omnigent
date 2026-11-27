@@ -16,6 +16,7 @@ import {
   type ComparisonEntry,
   ComparisonFileError,
   comparisonHeadIsWorkingCopy,
+  hostListing,
   isSettledFileReason,
   needsRelist,
   StaleComparisonReadError,
@@ -54,7 +55,7 @@ export function useComparisonFileDiff(
   const changes = useWorkingCopyChanges(conversationId, { kind: "file" });
   useForgetDiffTextWhenRevoked(conversationId, changes.permitted);
   const { comparison } = changes;
-  const listing = comparison.base === "branch-point" ? comparison.comparison : null;
+  const listing = hostListing(comparison);
   const entry =
     listing && path ? listing.entries.find((file: ComparisonEntry) => file.path === path) : null;
   const base: ComparisonFileDiffBase | null =
@@ -71,7 +72,8 @@ export function useComparisonFileDiff(
     // A listing's text never changes: a new version gets a new fingerprint, and so a new key.
     staleTime: Infinity,
   });
-  if (comparison.base === "head") return { base: "head" };
+  // The runner lists the last commit's changes, except in a repository folder, where the host does.
+  if (comparison.base === "head" && !listing) return { base: "head" };
   return {
     base: "comparison",
     changed: !!entry,

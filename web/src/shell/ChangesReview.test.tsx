@@ -733,7 +733,12 @@ describe("the Commits and Changes tabs", () => {
     expect(tab("Commits")).toContainElement(
       screen.getByText("2", { selector: "[data-slot=badge]" }),
     );
-    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith("s1", BRANCH_RANGE, expect.anything());
+    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith(
+      "s1",
+      BRANCH_RANGE,
+      expect.anything(),
+      "",
+    );
 
     await userEvent.click(tab("Commits"));
     expect(await screen.findByRole("option", { name: /Fix the build/ })).toBeVisible();
@@ -751,11 +756,13 @@ describe("the Commits and Changes tabs", () => {
       "s1",
       { base: "v1", head: "feature" },
       expect.anything(),
+      "",
     );
     expect(mocks.fetchBranchCommits).not.toHaveBeenCalledWith(
       "s1",
       BRANCH_RANGE,
       expect.anything(),
+      expect.any(String),
     );
   });
 

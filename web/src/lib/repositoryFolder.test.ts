@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import type { HostWorktree } from "@/hooks/useHostWorktrees";
+import { type HostWorktree, matchWorktree } from "@/hooks/useHostWorktrees";
 
 import {
   diffRootFor,
   repositoryFolderOf,
   repositoryPathOf,
+  repositoryRootIn,
   workspaceInsideLargerRepository,
   workspacePathInRepository,
 } from "./repositoryFolder";
@@ -93,6 +94,29 @@ describe("diffRootFor", () => {
 
   it("keeps the workspace while the worktrees are unknown", () => {
     expect(diffRootFor("/repo/.worktrees/feature", "/repo", [])).toBe("/repo");
+  });
+});
+
+describe("repositoryRootIn", () => {
+  it.each([
+    ["the workspace itself", "/repo", "", "/repo"],
+    ["a folder", "/repo", ".worktrees/feature", "/repo/.worktrees/feature"],
+    [
+      "a folder of a workspace written with a slash",
+      "/repo/",
+      ".worktrees/feature",
+      "/repo/.worktrees/feature",
+    ],
+    ["a folder of the filesystem root", "/", "project", "/project"],
+    ["a folder of a Windows drive's root", "C:\\", "project", "C:\\project"],
+    ["a folder of a Windows workspace", "C:\\repo\\", "project", "C:\\repo/project"],
+  ])("names %s", (_case, workspace, repository, root) => {
+    expect(repositoryRootIn(workspace, repository)).toBe(root);
+  });
+
+  it("names a root the worktree matcher finds", () => {
+    const listed = [worktree("C:/project")];
+    expect(matchWorktree(listed, repositoryRootIn("C:\\", "project"))).toBe(listed[0]);
   });
 });
 
