@@ -91,6 +91,7 @@ import {
   KANBAN_COLUMNS,
   kanbanColumns,
   kanbanDropAction,
+  nestedAttentionLabel,
   projectBoardRows,
   takeArrivals,
   type KanbanCard,
@@ -696,6 +697,17 @@ function KanbanCardBody({
   }
   if (nestedCount > 0) {
     metaParts.push({ key: "nested", icon: ListChevronsUpDownIcon, value: `${nestedCount} nested` });
+  }
+  const attentionLabel = nestedAttentionLabel(card);
+  if (attentionLabel !== null) {
+    metaParts.push({
+      key: "nested-attention",
+      value: (
+        <span title={card.attentionMembers.map(conversationDisplayLabel).join(", ")}>
+          {attentionLabel}
+        </span>
+      ),
+    });
   }
   if (show.includes("environment")) {
     metaParts.push({
