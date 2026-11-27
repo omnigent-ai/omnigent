@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
+from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
 from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
 from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     DATABRICKS_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
@@ -21,7 +26,13 @@ from omnigent.server.managed_hosts import (
     relaunch_managed_host,
     resume_managed_host,
 )
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import FakeSandboxLauncher
 
 _WS = "https://ws.cloud.databricks.com"
@@ -188,6 +199,8 @@ async def test_relaunch_for_an_unconnected_owner_is_a_409_and_keeps_the_host(
 
     assert info.value.status_code == 409
     assert "Connect Databricks" in str(info.value.detail)
+    # A relaunch may come from a collaborator, so it also says what they can do.
+    assert "fork the session" in str(info.value.detail)
     _assert_dormant_host_kept(host_store)
 
 
@@ -278,3 +291,56 @@ def test_inactivity_timeout_must_outlast_the_keepalive(
     else:
         with pytest.raises(ValueError, match="twice the keepalive interval"):
             parse_sandbox_config(raw)
+
+
+async def test_collaborator_message_wakes_the_sandbox_as_its_owner(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    # An editor's message wakes the owner's stopped sandbox with the OWNER's
+    # credential, and a missing owner connection tells the editor what to do.
+    asked_for: list[str] = []
+
+    def resolve(user_id: str) -> dict[str, object] | None:
+        asked_for.append(user_id)
+        return None
+
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conv_store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=permission_store,
+        auth_provider=UnifiedAuthProvider(source="header"),
+        host_store=host_store,
+        sandbox_config=_owner_deployment({"databricks": resolve}),
+    )
+    _dormant_owner_host(host_store)
+    conv = conv_store.create_conversation(
+        agent_id=None, host_id=_DORMANT_HOST_ID, workspace="/root/workspace"
+    )
+    permission_store.grant("alice@example.com", conv.id, LEVEL_OWNER)
+    permission_store.grant("bob@example.com", conv.id, LEVEL_EDIT)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv.id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+            headers={"X-Forwarded-Email": "bob@example.com"},
+            timeout=30.0,
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert asked_for and set(asked_for) == {"alice@example.com"}
+    message = resp.json()["error"]["message"]
+    assert "session owner" in message
+    assert "fork" in message.lower()
+    _assert_dormant_host_kept(host_store)
