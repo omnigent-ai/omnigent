@@ -872,6 +872,20 @@ class ConstraintGuard:
             with contextlib.suppress(NotFound):
                 self.files.delete_tree(f"{directory}/ids/{record_id}")
 
+    def _target_exists(self, collection: str, field: str, target_id: Any) -> bool:
+        """Whether the record *field* of *collection* names under a reference rule is live."""
+        for rule in self.rules:
+            if (
+                rule["kind"] == "reference"
+                and rule["collection"] == collection
+                and rule["field"] == field
+                and isinstance(target_id, str)
+            ):
+                with contextlib.suppress(InvalidInput):
+                    if self.data.get(rule["target"], target_id) is not None:
+                        return True
+        return False
+
     def _apply_again(self, operation: dict) -> dict:
         """A rule's update of a dependent that changed after the plan: done against its
         current version while it still names the deleted record, and dropped once it doesn't.
@@ -899,8 +913,14 @@ class ConstraintGuard:
             return {}  # The planned version's history is gone: the record was removed since.
         if planned != self.data.incarnation(collection, record_id):
             return {}
+        # A field naming its target again is only the plan's while that target is still
+        # gone: a writer that finished this change may have created the target again since,
+        # and the reference is then valid, however many edits ago the plan's version was.
         naming = [
-            field for field, target in targets.items() if _field(current.value, field) == target
+            field
+            for field, target in targets.items()
+            if _field(current.value, field) == target
+            and not self._target_exists(collection, field, target)
         ]
         if not naming or not isinstance(current.value, dict):
             return {}

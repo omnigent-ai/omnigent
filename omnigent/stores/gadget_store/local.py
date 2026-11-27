@@ -68,6 +68,8 @@ _OWNER_SEGMENT_SIZE = 1000
 _EXCLUSIVE_WAIT_S = 5
 # Lock files behind GadgetFiles.exclusive; two names in one stripe just wait for each other.
 _LOCK_STRIPES = 1024
+# The stripe lock files each thread holds, with how deeply.
+_HELD_STRIPES = threading.local()
 # A page cursor: the segment, and the last gadget ID read in it (none: start of the segment).
 _OWNER_CURSOR = re.compile(rf"({_OWNER_SEGMENT.pattern})/((?:{GADGET_ID_PATTERN.pattern})?)")
 _METADATA_FILE = "gadget.json"
@@ -179,6 +181,10 @@ def _drain_trash(trash: Path, budget: int | None = None) -> int:
     return removed
 
 
+# How long a create or listing waits for another process's owner-index update.
+_OWNER_INDEX_WAIT_S = 30
+
+
 class LocalGadgetFiles(GadgetFiles):
     """Create-only JSON files under one directory (see module docstring)."""
 
@@ -206,15 +212,28 @@ class LocalGadgetFiles(GadgetFiles):
         stripe = int.from_bytes(digest[:4], "big") % _LOCK_STRIPES
         locks = store_root / ".locks"
         locks.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(str(locks / f"x{stripe:04d}.lock"), timeout=_EXCLUSIVE_WAIT_S)
+        path = str(locks / f"x{stripe:04d}.lock")
+        # Nested locks of this thread can land on one stripe; the outer hold covers them
+        # rather than waiting on itself.
+        held = _HELD_STRIPES.__dict__.setdefault("paths", {})
+        if held.get(path):
+            held[path] += 1
+            try:
+                yield True
+            finally:
+                held[path] -= 1
+            return
+        lock = FileLock(path, timeout=_EXCLUSIVE_WAIT_S)
         try:
             lock.acquire()
         except Timeout:
             yield False
             return
+        held[path] = 1
         try:
             yield True
         finally:
+            held.pop(path, None)
             lock.release()
 
     def _missing_scope(self) -> NotFound:
@@ -493,8 +512,19 @@ class LocalGadgetStore(GadgetStore):
         sharing the directory."""
         locks = self._root / ".locks"
         locks.mkdir(exist_ok=True)
-        with self._owner_lock, FileLock(str(locks / f"{owner_dir.name}.lock"), timeout=30):
-            yield
+        with self._owner_lock:
+            lock = FileLock(str(locks / f"{owner_dir.name}.lock"), timeout=_OWNER_INDEX_WAIT_S)
+            try:
+                lock.acquire()
+            except Timeout:
+                # Another process holds it: the caller's retryable busy answer, not a failure.
+                raise Conflict(
+                    "The gadget owner index is busy; try again", reason="busy"
+                ) from None
+            try:
+                yield
+            finally:
+                lock.release()
 
     def _write_head(self, owner_dir: Path, first: int, last: int) -> None:
         owner_dir.mkdir(parents=True, exist_ok=True)

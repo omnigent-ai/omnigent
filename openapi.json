@@ -18583,7 +18583,7 @@
     },
     "/v1/gadgets/{app_id}": {
       "delete": {
-        "description": "Delete a gadget for everyone; needs manage permission.",
+        "description": "Delete a gadget for everyone; needs manage permission. With `?if_unbuilt=true`\nonly while it was never published nor taken by the caller's gadget session:\n`{\"deleted\": false}` when it was kept.",
         "operationId": "delete_gadget_v1_gadgets__app_id__delete",
         "parameters": [
           {
@@ -18593,6 +18593,13 @@
             "schema": {
               "title": "App Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "if_unbuilt",
+            "schema": {
+              "type": "boolean"
             }
           }
         ],

@@ -345,6 +345,16 @@ export async function deleteGadget(appId: string): Promise<void> {
   await gadgetRequest(appPath(appId), { method: "DELETE" });
 }
 
+/**
+ * Deletes a gadget only while nothing was built from it (never published, not taken by the
+ * viewer's gadget session), checked on the server together with the delete. Resolves whether
+ * it was deleted.
+ */
+export async function discardUnbuiltGadget(appId: string): Promise<boolean> {
+  const body = await gadgetRequest(`${appPath(appId)}?if_unbuilt=true`, { method: "DELETE" });
+  return isRecord(body) && body.deleted === true;
+}
+
 export async function createGadgetRevision(
   appId: string,
   revision: CreateGadgetRevisionRequest,

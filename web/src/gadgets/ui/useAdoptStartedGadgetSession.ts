@@ -4,7 +4,7 @@ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 
 import { useLocation, useRebasePath, useReplaceSearchParams } from "@/lib/routing";
 import { noteGadgetStartFailed, requestGadgetRailTab } from "@/lib/gadgetRailTabs";
-import { deleteGadget, getGadget, getGadgetGadgetSession } from "@/gadgets/api/gadgetApi";
+import { discardUnbuiltGadget, getGadget, getGadgetGadgetSession } from "@/gadgets/api/gadgetApi";
 import { GADGET_START_PARAM, sessionIdFromPath } from "@/gadgets/host/gadgetPages";
 import {
   acknowledgeStartedGadgetInput,
@@ -90,8 +90,8 @@ async function discardIfUnbuilt(gadgetId: string, queryClient: QueryClient): Pro
     if (gadget.published_revision !== null || !gadget.permissions.manage) return;
     if ((await getGadgetGadgetSession(gadgetId)) !== null) return;
     if (!stillDiscarding()) return;
-    await deleteGadget(gadgetId);
-    invalidateGadgets(queryClient);
+    // Checked again on the server with the delete: another tab may publish or adopt it.
+    if (await discardUnbuiltGadget(gadgetId)) invalidateGadgets(queryClient);
   } catch {
     // It stays in the list, unpublished; the viewer can delete it there.
   } finally {

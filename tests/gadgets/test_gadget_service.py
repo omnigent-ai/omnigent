@@ -661,6 +661,59 @@ def test_a_ruled_collection_still_refuses_a_record_past_the_public_depth(
         )
 
 
+def _blank(service: GadgetService) -> tuple[dict, str]:
+    app = service.create("Synthetic draft")
+    return app, ruled_revision(service, app["id"], [])
+
+
+@pytest.mark.parametrize("built", ["nothing", "published", "adopted"])
+def test_a_discard_deletes_only_a_gadget_nothing_was_built_from(
+    gadgets: Fixture, built: str
+) -> None:
+    service = gadgets.service()
+    app, revision = _blank(service)
+    if built == "published":
+        service.publish(app["id"], {"revision_id": revision, "if_version": None})
+    elif built == "adopted":
+        service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+
+    result = service.discard_unbuilt(app["id"])
+
+    assert result["deleted"] is (built == "nothing")
+    assert (gadgets.store.get(app["id"]) is None) is (built == "nothing")
+
+
+def test_publishing_waits_out_a_discard_that_is_checking(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Another tab publishes while the discard has checked and is deleting: the publish
+    # can't land between the two, so it is told the gadget is busy, not silently lost.
+    import omnigent.stores.gadget_store.local as local_module
+
+    monkeypatch.setattr(local_module, "_EXCLUSIVE_WAIT_S", 0.05)
+    service = gadgets.service()
+    app, revision = _blank(service)
+    other_tab = gadgets.service()
+    real_delete = gadgets.store.delete
+    raced: list[BaseException] = []
+
+    def publish_from_the_other_tab() -> None:
+        try:
+            other_tab.publish(app["id"], {"revision_id": revision, "if_version": None})
+        except Conflict as error:
+            raced.append(error)
+
+    def delete(gadget_id: str) -> bool:
+        # Another request, so another thread, while the discard holds the gadget.
+        with ThreadPoolExecutor(1) as pool:
+            pool.submit(publish_from_the_other_tab).result()
+        return real_delete(gadget_id)
+
+    monkeypatch.setattr(gadgets.store, "delete", delete)
+    assert service.discard_unbuilt(app["id"])["deleted"] is True
+    assert len(raced) == 1 and raced[0].reason == "busy"
+
+
 def test_a_unique_rule_refuses_duplicates_and_frees_a_deleted_value(gadgets: Fixture) -> None:
     service = gadgets.service()
     rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
@@ -1238,6 +1291,83 @@ def test_a_late_rule_update_leaves_a_dependent_created_again_alone(
     assert after is not None
     assert after["value"]["cardId"] == "x"
     assert after["value"]["state"] == "done-17"
+
+
+def test_a_late_unset_leaves_a_reference_restored_to_a_card_created_again(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Like the test above, but the run is kept: another writer finishes the unset, the card
+    # is created again, and the same run is pointed back at it and edited past the replay
+    # window. The resumed unset must leave that valid reference alone.
+    import threading
+
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_UNSET_RUN_CARD])
+    target = card(service, app, "x", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="d",
+        value={"cardId": "x", "state": "done"},
+        operation_id="d",
+    )
+    real_apply = ConstraintGuard._apply
+    paused = threading.Event()
+    resume = threading.Event()
+    late = threading.current_thread()
+
+    def apply(self, operation):
+        if (
+            operation["kind"] == "unset"
+            and operation["collection"] == "runs"
+            and threading.current_thread() is not late
+            and not paused.is_set()
+        ):
+            paused.set()
+            assert resume.wait(10)
+        return real_apply(self, operation)
+
+    monkeypatch.setattr(ConstraintGuard, "_apply", apply)
+    late_writer = gadgets.service()
+    with ThreadPoolExecutor(1) as pool:
+        stopped = pool.submit(
+            rpc,
+            late_writer,
+            app,
+            "delete",
+            id="x",
+            if_version=target["version"],
+            operation_id="x-1",
+        )
+        assert paused.wait(10)
+        card(service, app, "z", "todo")  # Finishes the pending change: "d" loses cardId.
+        assert "cardId" not in _run(service, app, "d")["value"]
+        rpc(
+            service,
+            app,
+            "create",
+            id="x",
+            value={"title": "x again", "column": "todo"},
+            operation_id="x-again",
+        )
+        for edit in range(18):
+            current = _run(service, app, "d")
+            rpc(
+                service,
+                app,
+                "replace",
+                collection="runs",
+                id="d",
+                value={"cardId": "x", "state": f"new-{edit}"},
+                if_version=current["version"],
+                operation_id=f"d-edit-{edit}",
+            )
+        resume.set()
+        stopped.result(10)
+    after = _run(service, app, "d")
+    assert after["value"] == {"cardId": "x", "state": "new-17"}
 
 
 @pytest.mark.parametrize("gone", ["deleted", "version_reclaimed"])

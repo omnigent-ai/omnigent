@@ -20,13 +20,14 @@ beside each of their sessions) lives in their own user files.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import re
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
@@ -587,6 +588,34 @@ class GadgetService:
             gadget = renamed
         return self._app(gadget, permissions)
 
+    @contextlib.contextmanager
+    def _lifecycle(self, gadget: Gadget) -> Iterator[None]:
+        """Hold the gadget against publishing, adoption and a discard of it unbuilt, in this
+        process and others sharing its storage, so a discard checks and deletes at once."""
+        with self._files(gadget).exclusive("lifecycle") as held:
+            if not held:
+                raise Conflict("The gadget is busy; try again", reason="busy")
+            yield
+
+    def discard_unbuilt(self, app_id: str) -> dict:
+        """Deletes the gadget only while nothing was built from it: never published, and no
+        gadget session of the viewer's took it. Checked and deleted under the gadget's
+        lifecycle lock, which publishing and adoption also take, so another tab publishing
+        or adopting it meanwhile keeps it.
+
+        :returns: ``{"id", "deleted"}``; ``deleted`` false when it was kept.
+        """
+        gadget, permissions = self._resolve(app_id)
+        self._require(permissions, "manage")
+        with self._lifecycle(gadget):
+            viewer = self._sessions(gadget).get("viewers", self.viewer.key)
+            adopted = viewer is not None and isinstance(viewer.value.get("session_id"), str)
+            if self._publication(gadget) is not None or adopted:
+                return {"id": app_id, "deleted": False}
+            self.access.forget(gadget.id)
+            self.store.delete(gadget.id)
+        return {"id": app_id, "deleted": True}
+
     def delete(self, app_id: str) -> dict:
         """Deletes the gadget for everyone, with its versions, data and comments."""
         gadget, permissions = self._resolve(app_id)
@@ -959,6 +988,10 @@ class GadgetService:
     def publish(self, app_id: str, body: dict) -> dict:
         gadget, permissions = self._resolve(app_id)
         self._require(permissions, "publish")
+        with self._lifecycle(gadget):
+            return self._publish(gadget, permissions, body)
+
+    def _publish(self, gadget: Gadget, permissions: Any, body: dict) -> dict:
         revision = self._frontend(gadget, body.get("revision_id"))
         expected = body.get("if_version")
         if expected is not None and (not isinstance(expected, str) or len(expected) > 2048):
@@ -1213,6 +1246,10 @@ class GadgetService:
         return self._register_gadget_session(gadget, session_id)
 
     def _register_gadget_session(self, gadget: Gadget, session_id: str) -> dict:
+        with self._lifecycle(gadget):
+            return self._register_gadget_session_locked(gadget, session_id)
+
+    def _register_gadget_session_locked(self, gadget: Gadget, session_id: str) -> dict:
         store = self._sessions(gadget)
         record_id = self.viewer.key
         current = store.get("viewers", record_id)

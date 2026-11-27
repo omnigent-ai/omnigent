@@ -8,7 +8,7 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ServerInfo } from "@/lib/capabilities";
 import { resetGadgetRailRequests, useGadgetRailRequest } from "@/lib/gadgetRailTabs";
 import {
-  deleteGadget,
+  discardUnbuiltGadget,
   getGadget,
   getGadgetGadgetSession,
   recordGadgetActionDelivery,
@@ -44,7 +44,7 @@ vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetApiModule>()),
   getGadget: vi.fn(),
   getGadgetGadgetSession: vi.fn(),
-  deleteGadget: vi.fn(),
+  discardUnbuiltGadget: vi.fn(),
   recordGadgetActionDelivery: vi.fn(async () => undefined),
 }));
 
@@ -330,14 +330,14 @@ describe("a session started beside a gadget", () => {
       gadgetFixture({ id: "board", published_revision: null }),
     );
     vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
-    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(discardUnbuiltGadget).mockResolvedValue(true);
     rememberUnbuiltGadget("board");
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Existing session" }));
     // Not linked, its requests not acknowledged, and Build's unbuilt gadget goes as if New
     // session were left.
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
-    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
+    await waitFor(() => expect(discardUnbuiltGadget).toHaveBeenCalledWith("board"));
     // A session created later from a plain New session isn't the gadget's either.
     fireEvent.click(screen.getByRole("button", { name: "Created" }));
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
@@ -348,13 +348,13 @@ describe("a session started beside a gadget", () => {
       gadgetFixture({ id: "board", published_revision: null }),
     );
     vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
-    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(discardUnbuiltGadget).mockResolvedValue(true);
     noteSessionCreatedHere("conv_old", "Earlier work");
     rememberUnbuiltGadget("board");
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Existing session" }));
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
-    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
+    await waitFor(() => expect(discardUnbuiltGadget).toHaveBeenCalledWith("board"));
   });
 
   it("keeps and links the gadget when Build was sent and the viewer left before the session existed", async () => {
@@ -364,7 +364,7 @@ describe("a session started beside a gadget", () => {
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
     await Promise.resolve();
     expect(getGadget).not.toHaveBeenCalled();
-    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(discardUnbuiltGadget).not.toHaveBeenCalled();
 
     // The create finishes while the viewer is on another page.
     finishCreate("conv_9", "Build");
@@ -382,7 +382,7 @@ describe("a session started beside a gadget", () => {
       gadgetFixture({ id: "board", published_revision: null }),
     );
     vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
-    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(discardUnbuiltGadget).mockResolvedValue(true);
     rememberUnbuiltGadget("board");
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Creating" }));
@@ -393,7 +393,7 @@ describe("a session started beside a gadget", () => {
     // A plain session the viewer creates later is not the gadget's, and Build's gadget goes.
     noteSessionCreatedHere("conv_plain", "Other work", beginSessionCreation());
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
-    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
+    await waitFor(() => expect(discardUnbuiltGadget).toHaveBeenCalledWith("board"));
   });
 
   it("never deletes an existing gadget whose Create session failed", async () => {
@@ -403,7 +403,7 @@ describe("a session started beside a gadget", () => {
       gadgetFixture({ id: "board", published_revision: null }),
     );
     vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
-    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(discardUnbuiltGadget).mockResolvedValue(true);
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Creating" }));
     noteSessionCreationFailed(pendingAttempt!);
@@ -411,7 +411,7 @@ describe("a session started beside a gadget", () => {
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
     await Promise.resolve();
     await Promise.resolve();
-    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(discardUnbuiltGadget).not.toHaveBeenCalled();
   });
 
   it("links the session its own create makes, when another create finishes first", () => {
@@ -446,11 +446,11 @@ describe("a session started beside a gadget", () => {
       gadgetFixture({ id: "board", published_revision: null }),
     );
     vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
-    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(discardUnbuiltGadget).mockResolvedValue(true);
     rememberUnbuiltGadget("board");
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
-    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
+    await waitFor(() => expect(discardUnbuiltGadget).toHaveBeenCalledWith("board"));
   });
 
   it("keeps the gadget when the viewer returns and sends Build while the discard is waiting", async () => {
@@ -463,7 +463,7 @@ describe("a session started beside a gadget", () => {
         answerSessionLookup = resolve;
       }),
     );
-    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(discardUnbuiltGadget).mockResolvedValue(true);
     rememberUnbuiltGadget("board");
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
@@ -475,10 +475,10 @@ describe("a session started beside a gadget", () => {
     await new Promise((resolve) => {
       setTimeout(resolve, 0);
     });
-    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(discardUnbuiltGadget).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Created" }));
     await waitFor(() => expect(adoptStartedGadgetSession).toHaveBeenCalled());
-    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(discardUnbuiltGadget).not.toHaveBeenCalled();
   });
 
   it("keeps a gadget that has a version or a session, or that a session started from", async () => {
@@ -487,7 +487,7 @@ describe("a session started beside a gadget", () => {
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
     await waitFor(() => expect(getGadget).toHaveBeenCalledWith("board"));
-    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(discardUnbuiltGadget).not.toHaveBeenCalled();
 
     // Unpublished, but it already has a gadget session.
     resetGadgetStarts();
@@ -499,14 +499,14 @@ describe("a session started beside a gadget", () => {
     renderShell();
     fireEvent.click(screen.getAllByRole("button", { name: "Elsewhere" }).at(-1)!);
     await waitFor(() => expect(getGadgetGadgetSession).toHaveBeenCalledWith("board"));
-    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(discardUnbuiltGadget).not.toHaveBeenCalled();
 
     resetGadgetStarts();
     rememberUnbuiltGadget("board");
     renderShell();
     fireEvent.click(screen.getAllByRole("button", { name: "Created" }).at(-1)!);
     await waitFor(() => expect(adoptStartedGadgetSession).toHaveBeenCalled());
-    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(discardUnbuiltGadget).not.toHaveBeenCalled();
   });
 });
 
@@ -519,6 +519,6 @@ describe("with gadgets off", () => {
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
     expect(getGadget).not.toHaveBeenCalled();
     expect(getGadgetGadgetSession).not.toHaveBeenCalled();
-    expect(deleteGadget).not.toHaveBeenCalled();
+    expect(discardUnbuiltGadget).not.toHaveBeenCalled();
   });
 });

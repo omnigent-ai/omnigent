@@ -426,10 +426,19 @@ def create_gadgets_router(
         body = await _body(request)
         return _json(await run(request, lambda service: service.rename(app_id, body)))
 
-    @router.delete("/gadgets/{app_id}")
+    @router.delete(
+        "/gadgets/{app_id}",
+        openapi_extra={
+            "parameters": [{"name": "if_unbuilt", "in": "query", "schema": {"type": "boolean"}}]
+        },
+    )
     async def delete_gadget(app_id: str, request: Request) -> Response:
-        """Delete a gadget for everyone; needs manage permission."""
+        """Delete a gadget for everyone; needs manage permission. With ``?if_unbuilt=true``
+        only while it was never published nor taken by the caller's gadget session:
+        ``{"deleted": false}`` when it was kept."""
         require_trusted_origin(request)
+        if request.query_params.get("if_unbuilt") == "true":
+            return _json(await run(request, lambda service: service.discard_unbuilt(app_id)))
         return _json(await run(request, lambda service: service.delete(app_id)))
 
     @router.get("/gadgets/{app_id}/session/status")

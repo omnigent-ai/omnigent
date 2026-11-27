@@ -731,6 +731,27 @@ async def test_viewers_read_only_the_published_revision(client: httpx.AsyncClien
     assert own.json()["html"] == "<p>Synthetic draft</p>"
 
 
+async def test_a_create_waiting_too_long_for_the_owner_index_is_busy_and_retryable(
+    client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from filelock import FileLock
+
+    import omnigent.stores.gadget_store.local as local_module
+
+    first = await client.post("/v1/gadgets", json={"name": "Board"}, headers=_as(ALICE))
+    assert first.status_code == 201
+    owner_dir = stores.gadgets._owner_dir(ALICE, first.json().get("owner_registration"))
+    monkeypatch.setattr(local_module, "_OWNER_INDEX_WAIT_S", 0.05)
+    # Another process updating Alice's owner index meanwhile.
+    held = FileLock(str(stores.root / ".locks" / f"{owner_dir.name}.lock"))
+    with held:
+        busy = await client.post("/v1/gadgets", json={"name": "Second"}, headers=_as(ALICE))
+    assert busy.status_code == 503 and busy.headers["retry-after"] == "1"
+    assert busy.json()["error"]["details"] == {"reason": "busy", "retryable": True}
+    again = await client.post("/v1/gadgets", json={"name": "Second"}, headers=_as(ALICE))
+    assert again.status_code == 201
+
+
 async def test_store_conflicts_carry_their_reason_and_busy_ones_are_retryable() -> None:
     from omnigent.server.gadgets import gadget_failure
     from omnigent.stores.gadget_store import Conflict
