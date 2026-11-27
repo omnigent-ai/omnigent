@@ -42,6 +42,9 @@ from packaging.version import Version
 from omnigent._platform import resolve_cli_binary
 from omnigent.inner.codex_executor import CodexExecutor
 
+# Provider name of the Databricks gateway entry the codex executor writes.
+_GATEWAY_PROVIDER_NAME = "omnigent_databricks"
+
 # Env override for an explicit genie binary, mirroring codex's
 # ``OMNIGENT_CODEX_PATH``. Set this when genie lives on a PATH the host daemon
 # doesn't inherit.
@@ -86,6 +89,31 @@ def genie_model_id(model: str) -> str:
     return slug
 
 
+def _with_workspace_header(override: str, workspace_id: str) -> str:
+    """Add ``x-databricks-workspace-id`` to the Databricks gateway provider override.
+
+    Shared hosts route AI Gateway calls by this header, as Genie's own onboarding
+    writes it. It must sit inside the provider entry: a separate
+    ``model_providers.<name>.*`` override replaces the whole entry.
+
+    :param override: One config override, e.g. ``'model="genie-code-cli-primary"'``.
+    :param workspace_id: The workspace ID, e.g. ``"1234"``.
+    :returns: *override* unchanged unless it defines the gateway provider.
+    """
+    prefix = f"model_providers.{_GATEWAY_PROVIDER_NAME}="
+    if not override.startswith(prefix):
+        return override
+    import tomlkit
+
+    parsed = tomlkit.parse(f"value = {override.removeprefix(prefix)}")["value"]
+    # A fresh inline table: tomlkit drops the separator when appending to a parsed one.
+    provider = tomlkit.inline_table()
+    for key, value in parsed.items():
+        provider[key] = value
+    provider["http_headers"] = {"x-databricks-workspace-id": workspace_id}
+    return prefix + provider.as_string()
+
+
 class GenieExecutor(CodexExecutor):
     """Drive the genie CLI's ``app-server`` over the shared codex protocol.
 
@@ -102,7 +130,7 @@ class GenieExecutor(CodexExecutor):
     _brokered_min_version = Version("0.2.0")
     _brokered_catalog_probe = False
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, workspace_id: str | None = None, **kwargs: Any) -> None:
         # Force the genie home spelling regardless of what a caller passed, so
         # the per-session private home is handed to genie under the env var it
         # actually reads.
@@ -121,6 +149,16 @@ class GenieExecutor(CodexExecutor):
                 "host; configure a provider for genie with `omnigent setup`."
             )
         super().__init__(**kwargs)
+        profile = kwargs.get("databricks_profile")
+        if profile and kwargs.get("gateway"):
+            # Genie's Databricks CLI tools default to the signed-in profile. With only the
+            # inherited DATABRICKS_HOST, a shared host resolves to the account, not the workspace.
+            self._env["DATABRICKS_CONFIG_PROFILE"] = profile
+        if workspace_id and kwargs.get("gateway"):
+            self._codex_config_overrides = [
+                _with_workspace_header(override, workspace_id)
+                for override in self._codex_config_overrides
+            ]
 
     def _find_cli(self) -> str | None:
         return _find_genie_cli()

@@ -2232,21 +2232,20 @@ def test_overview_dispatches_to_correct_manager(
     assert called == [manager_attr]
 
 
-def test_overview_genie_row_is_third_and_manages_openai_family(
+def test_overview_genie_row_is_third_and_opens_the_genie_manager(
     isolated_config, monkeypatch
 ) -> None:
-    """Genie sits at position 3 (after Codex) and drills into the OpenAI-family manager.
-
-    Genie reuses Codex's OpenAI-family provider, so selecting it must call
-    ``_manage_harness_providers("openai")`` rather than a Genie-specific manager.
-    """
+    """Genie sits at position 3 (after Codex) and opens its own sign-in flow."""
     called: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.cli_config._manage_genie_harness", lambda: called.append("genie")
+    )
     monkeypatch.setattr(
         "omnigent.cli_config._manage_harness_providers", lambda family: called.append(family)
     )
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="3\nq\n")
     assert result.exit_code == 0, result.output
-    assert called == ["openai"]
+    assert called == ["genie"]
 
     # Checked last: the capture helper replaces the shared ``select`` for the rest
     # of the test, so it can't precede a scripted-stdin run.
@@ -2255,6 +2254,34 @@ def test_overview_genie_row_is_third_and_manages_openai_family(
     )
     names = _overview_row_names(options, selectable)
     assert names[:4] == ["Claude", "Codex", "Genie", "Cursor"]
+
+
+def test_genie_sign_in_binds_only_a_databricks_login(isolated_config, monkeypatch) -> None:
+    """Genie's setup signs in with the Databricks CLI only and binds the provider to Genie."""
+    from omnigent.cli_config import _load_global_config, _manage_genie_harness
+
+    logins: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda _key: True
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.interactive.prompt_text",
+        lambda _label: "workspace.example.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.setup.login_databricks_workspace",
+        lambda url, console=None: logins.append(url) or "example-profile",
+    )
+
+    _manage_genie_harness()
+
+    config = _load_global_config()
+    assert logins == ["https://workspace.example.com"]
+    assert config["providers"]["genie-databricks"] == {
+        "kind": "databricks",
+        "profile": "example-profile",
+    }
+    assert config["inference"] == {"harnesses": {"genie": {"provider": "genie-databricks"}}}
 
 
 def test_overview_status_color_distinguishes_missing_from_unconfigured(

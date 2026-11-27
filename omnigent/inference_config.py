@@ -135,6 +135,7 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             "claude-native",
             "codex",
             "codex-native",
+            "genie",
             "openai-agents",
             "qwen",
             "jcode",
