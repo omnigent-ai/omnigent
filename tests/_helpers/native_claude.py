@@ -147,7 +147,15 @@ def _assert_mock_claude_turn(
         ):
             details["purpose"] = "background title"
         else:
-            raise AssertionError({"unclassified_request": details, "marker": marker})
+            raise AssertionError(
+                {
+                    "unclassified_request": details,
+                    "marker": marker,
+                    "has_tools": bool(body.get("tools")),
+                    "user_text_blocks": text_blocks,
+                    "system_prefixes": [text[:256] for text in system_blocks],
+                }
+            )
         observed.append(details)
     assert len(turn_requests) == 1, {"marker": marker, "requests": observed}
     assert turn_requests[0]["body"]["model"] == _native_claude_wire_model(model)
