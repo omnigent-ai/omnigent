@@ -1492,6 +1492,26 @@ class ConversationStore(ABC):
         """
         ...
 
+    def get_labels(self, conversation_id: str, keys: tuple[str, ...]) -> dict[str, str]:
+        """
+        Read only the named labels of a conversation.
+
+        For callers that check a few fixed keys: the read is bounded by *keys*
+        however many labels the conversation carries. This default loads the
+        conversation; SQL stores override it to select just those rows.
+
+        :param conversation_id: The conversation to read, e.g. ``"conv_abc123"``.
+        :param keys: The exact label keys wanted, e.g.
+            ``("omnigent.scheduled_task_run",)``.
+        :returns: The labels among *keys* that are set, e.g.
+            ``{"omnigent.scheduled_task_run": "run_abc"}``; empty for a missing
+            conversation.
+        """
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return {}
+        return {key: conversation.labels[key] for key in keys if key in conversation.labels}
+
     def replace_label_if(
         self,
         conversation_id: str,
@@ -1540,8 +1560,7 @@ class ConversationStore(ABC):
         :raises RuntimeError: If other writers kept changing the label.
         """
         for _ in range(_LABEL_SWAP_ATTEMPTS):
-            conversation = self.get_conversation(conversation_id)
-            previous = conversation.labels.get(key) if conversation is not None else None
+            previous = self.get_labels(conversation_id, (key,)).get(key)
             if self.replace_label_if(conversation_id, key, expected=previous, value=value):
                 return previous
         raise RuntimeError(f"label {key!r} on {conversation_id!r} kept changing")

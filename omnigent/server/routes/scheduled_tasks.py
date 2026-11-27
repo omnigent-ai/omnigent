@@ -2702,8 +2702,7 @@ def create_scheduled_tasks_router(
                 try:
                     previous = conversation_store.swap_label(conv.id, label, task.id)
                     # Superseded while this loop was being saved: its viewers moved on.
-                    current = conversation_store.get_conversation(conv.id)
-                    if current and LOOP_TIMER_SUPERSEDED_LABEL_KEY in current.labels:
+                    if conversation_store.get_labels(conv.id, (LOOP_TIMER_SUPERSEDED_LABEL_KEY,)):
                         conversation_store.replace_label_if(
                             conv.id, label, expected=task.id, value=None
                         )
@@ -2768,8 +2767,8 @@ def create_scheduled_tasks_router(
         # Clear the label only while it still names the loop read, then cancel that loop;
         # an arm that moved the label meanwhile keeps its loop and the stop looks again.
         for _ in range(_LOOP_STOP_ATTEMPTS):
-            fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-            timer_id = (fresh or conv).labels.get(label)
+            named = await asyncio.to_thread(conversation_store.get_labels, conv.id, (label,))
+            timer_id = named.get(label)
             if not timer_id:
                 return {"timer_id": None, "status": "none"}
             cleared = await asyncio.to_thread(

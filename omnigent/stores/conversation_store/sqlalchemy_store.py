@@ -4034,6 +4034,13 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
 
+    def get_labels(self, conversation_id: str, keys: tuple[str, ...]) -> dict[str, str]:
+        """Select only the named label rows. See base class for contract."""
+        if not keys:
+            return {}
+        with self._conv_session("read_labels_by_key") as session:
+            return _fetch_labels(session, conversation_id, keys=keys)
+
     def replace_label_if(
         self,
         conversation_id: str,

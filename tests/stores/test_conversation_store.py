@@ -149,43 +149,52 @@ def test_swap_label_returns_the_value_it_replaced(
 ) -> None:
     """The previous value comes from the write itself, even when another writer gets in first."""
     source = conversation_store.create_conversation()
+    conversation_store.set_labels(source.id, {"unrelated": "x"})
     assert conversation_store.swap_label(source.id, "k", "a") is None
     assert conversation_store.swap_label(source.id, "k", "b") == "a"
+    # A keyed read returns the named labels only, whatever else the conversation carries.
+    assert conversation_store.get_labels(source.id, ("k", "absent")) == {"k": "b"}
+    assert conversation_store.get_labels("f" * 32, ("k",)) == {}
 
-    read = conversation_store.get_conversation
-    reads = 0
+    read = conversation_store.get_labels
+    reads: list[tuple[str, ...]] = []
 
-    def read_then_lose_the_race(conversation_id: str) -> Any:
-        nonlocal reads
-        reads += 1
-        conversation = read(conversation_id)
-        if reads == 1:
+    def read_then_lose_the_race(conversation_id: str, keys: tuple[str, ...]) -> Any:
+        reads.append(keys)
+        labels = read(conversation_id, keys)
+        if len(reads) == 1:
             conversation_store.set_labels(conversation_id, {"k": "c"})
-        return conversation
+        return labels
 
-    monkeypatch.setattr(conversation_store, "get_conversation", read_then_lose_the_race)
+    def whole_conversation_read(conversation_id: str) -> Any:
+        raise AssertionError("a label swap must not load every label")
 
-    assert conversation_store.swap_label(source.id, "k", "d") == "c"
-    assert (reads, read(source.id).labels["k"]) == (2, "d")
+    with monkeypatch.context() as patched:
+        patched.setattr(conversation_store, "get_labels", read_then_lose_the_race)
+        patched.setattr(conversation_store, "get_conversation", whole_conversation_read)
+        assert conversation_store.swap_label(source.id, "k", "d") == "c"
+
+    assert reads == [("k",), ("k",)]
+    assert conversation_store.get_conversation(source.id).labels["k"] == "d"
 
 
 def test_swap_label_gives_up_on_a_label_that_keeps_changing(
     conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = conversation_store.create_conversation()
-    read = conversation_store.get_conversation
+    read = conversation_store.get_labels
     writes = iter(range(100))
 
-    def read_then_lose_the_race(conversation_id: str) -> Any:
-        conversation = read(conversation_id)
+    def read_then_lose_the_race(conversation_id: str, keys: tuple[str, ...]) -> Any:
+        labels = read(conversation_id, keys)
         conversation_store.set_labels(conversation_id, {"k": f"other-{next(writes)}"})
-        return conversation
+        return labels
 
-    monkeypatch.setattr(conversation_store, "get_conversation", read_then_lose_the_race)
+    monkeypatch.setattr(conversation_store, "get_labels", read_then_lose_the_race)
 
     with pytest.raises(RuntimeError, match="kept changing"):
         conversation_store.swap_label(source.id, "k", "mine")
-    assert read(source.id).labels["k"].startswith("other-")
+    assert conversation_store.get_conversation(source.id).labels["k"].startswith("other-")
 
 
 @pytest.mark.parametrize("initial_run", [None, "d" * 32])
