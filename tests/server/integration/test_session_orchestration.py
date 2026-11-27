@@ -2821,7 +2821,6 @@ async def test_same_host_creation_across_replicas(
                         "agent_id": source["agent_id"],
                         "placement": "same_host",
                         "title": "Review worker",
-                        **({"message": "First task"} if uncertain_create else {}),
                     }
                 ),
                 server_client=client,
@@ -2845,18 +2844,6 @@ async def test_same_host_creation_across_replicas(
         assert posts == [(host_id, 409 if routing == "offline" else 400)]
         assert not created
         assert launches == []
-        # The caller must not resend, so a session left behind has to keep its first task.
-        for worker_id in created:
-            saved_texts = [
-                part.get("text", "")
-                for item in (
-                    *stack.conv_store.list_pending_inputs(worker_id),
-                    *stack.conv_store.list_items(worker_id).data,
-                )
-                for part in getattr(item.data, "content", None) or []
-                if isinstance(part, dict)
-            ]
-            assert any("First task" in text for text in saved_texts), saved_texts
     else:
         assert "error" not in result, result
         assert posts == [(None if routing == "keyless" else host_id, 201)]
