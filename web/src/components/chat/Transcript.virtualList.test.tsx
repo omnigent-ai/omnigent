@@ -430,19 +430,32 @@ it("toggles mobile message actions on tap and shows the latest assistant's actio
   }
 });
 
+const undeliveredCopy: Bubble = { ...bubble, itemId: "lost", pending: true, undelivered: true };
+
+/** A scrolled-up pane whose stick-to-bottom lock starts as `lock`, for history-prepend holds. */
+function scrolledPane(lock: { isAtBottom: boolean; escapedFromLock: boolean }) {
+  const scrollEl = document.createElement("div");
+  Object.defineProperties(scrollEl, {
+    scrollTop: { configurable: true, writable: true, value: 100 },
+    clientHeight: { configurable: true, value: 500 },
+    scrollHeight: { configurable: true, value: 1_000 },
+  });
+  scrollEl.getBoundingClientRect = () => ({ top: 0 }) as DOMRect;
+  const state = { ...lock, scrollTop: 100 };
+  const stopScroll = vi.fn();
+  scrollContext.current = { state, stopScroll, scrollToBottom: vi.fn() };
+  const transcript = (bubbles: Bubble[], loadingMoreHistory = false) => (
+    <MemoryRouter>
+      {list(false, scrollEl, vi.fn(), false, bubbles, loadingMoreHistory)}
+    </MemoryRouter>
+  );
+  return { state, stopScroll, transcript };
+}
+
 it.each([false, true])(
   "holds the visible row when a leading undelivered copy stays first (copy visible: %s)",
   (copyVisible) => {
-    const scrollEl = document.createElement("div");
-    Object.defineProperties(scrollEl, {
-      scrollTop: { configurable: true, writable: true, value: 100 },
-      clientHeight: { configurable: true, value: 500 },
-      scrollHeight: { configurable: true, value: 1_000 },
-    });
-    scrollEl.getBoundingClientRect = () => ({ top: 0 }) as DOMRect;
-    const state = { isAtBottom: false, escapedFromLock: true, scrollTop: 100 };
-    const stopScroll = vi.fn();
-    scrollContext.current = { state, stopScroll, scrollToBottom: vi.fn() };
+    const pane = scrolledPane({ isAtBottom: false, escapedFromLock: true });
     const passThrough = vi.mocked(useVirtualizer).getMockImplementation()!;
     vi.mocked(useVirtualizer).mockImplementation((options) => {
       const instance = passThrough(options);
@@ -454,23 +467,14 @@ it.each([false, true])(
             : [instance.measurementsCache.at(-1)!],
       } as never;
     });
-    const lost: Bubble = { ...bubble, itemId: "lost", pending: true, undelivered: true };
     try {
-      const view = render(
-        <MemoryRouter>
-          {list(false, scrollEl, vi.fn(), false, [lost, assistantBubble])}
-        </MemoryRouter>,
-      );
+      const view = render(pane.transcript([undeliveredCopy, assistantBubble]));
       const row = view.container.querySelector<HTMLElement>('[data-index="1"]')!;
       expect(row).toHaveAttribute("data-bubble-key", "assistant:response-1");
       const renamed: Bubble = { ...assistantBubble, stableId: "assistant-0" };
-      view.rerender(
-        <MemoryRouter>
-          {list(false, scrollEl, vi.fn(), false, [lost, bubble, renamed])}
-        </MemoryRouter>,
-      );
-      expect(stopScroll).toHaveBeenCalled();
-      expect(state.scrollTop).toBe(300);
+      view.rerender(pane.transcript([undeliveredCopy, bubble, renamed]));
+      expect(pane.stopScroll).toHaveBeenCalled();
+      expect(pane.state.scrollTop).toBe(300);
       expect(view.container.querySelector('[data-index="2"]')).toBe(row);
     } finally {
       vi.mocked(useVirtualizer).mockImplementation(passThrough);
@@ -479,51 +483,26 @@ it.each([false, true])(
 );
 
 it("holds an undelivered-only viewport when older history loads above it", () => {
-  const scrollEl = document.createElement("div");
-  Object.defineProperties(scrollEl, {
-    scrollTop: { configurable: true, writable: true, value: 100 },
-    clientHeight: { configurable: true, value: 500 },
-    scrollHeight: { configurable: true, value: 1_000 },
-  });
-  scrollEl.getBoundingClientRect = () => ({ top: 0 }) as DOMRect;
-  const state = { isAtBottom: false, escapedFromLock: true, scrollTop: 100 };
-  const stopScroll = vi.fn();
-  scrollContext.current = { state, stopScroll, scrollToBottom: vi.fn() };
-  const lost: Bubble = { ...bubble, itemId: "lost", pending: true, undelivered: true };
-  const view = render(<MemoryRouter>{list(false, scrollEl, vi.fn(), false, [lost])}</MemoryRouter>);
-  view.rerender(<MemoryRouter>{list(false, scrollEl, vi.fn(), false, [lost], true)}</MemoryRouter>);
-  view.rerender(
-    <MemoryRouter>{list(false, scrollEl, vi.fn(), false, [bubble, lost], false)}</MemoryRouter>,
-  );
-  expect(stopScroll).toHaveBeenCalled();
-  expect(state.scrollTop).toBe(300);
+  const pane = scrolledPane({ isAtBottom: false, escapedFromLock: true });
+  const view = render(pane.transcript([undeliveredCopy]));
+  view.rerender(pane.transcript([undeliveredCopy], true));
+  view.rerender(pane.transcript([bubble, undeliveredCopy]));
+  expect(pane.stopScroll).toHaveBeenCalled();
+  expect(pane.state.scrollTop).toBe(300);
 });
 
 it.each([
   { scenario: "the first snapshot", loadingPage: false },
   { scenario: "a page leaving the copy first", loadingPage: true },
 ])("does not hold an undelivered-only viewport for $scenario", ({ loadingPage }) => {
-  const scrollEl = document.createElement("div");
-  Object.defineProperties(scrollEl, {
-    scrollTop: { configurable: true, writable: true, value: 100 },
-    clientHeight: { configurable: true, value: 500 },
-    scrollHeight: { configurable: true, value: 1_000 },
-  });
-  scrollEl.getBoundingClientRect = () => ({ top: 0 }) as DOMRect;
-  const state = { isAtBottom: true, escapedFromLock: false, scrollTop: 100 };
-  const stopScroll = vi.fn();
-  scrollContext.current = { state, stopScroll, scrollToBottom: vi.fn() };
-  const lost: Bubble = { ...bubble, itemId: "lost", pending: true, undelivered: true };
-  const view = render(<MemoryRouter>{list(false, scrollEl, vi.fn(), false, [lost])}</MemoryRouter>);
-  if (loadingPage) {
-    view.rerender(
-      <MemoryRouter>{list(false, scrollEl, vi.fn(), false, [lost], true)}</MemoryRouter>,
-    );
-  }
-  const next = loadingPage ? [lost, bubble] : [bubble, lost];
-  view.rerender(<MemoryRouter>{list(false, scrollEl, vi.fn(), false, next)}</MemoryRouter>);
-  expect(stopScroll).not.toHaveBeenCalled();
-  expect(state).toEqual({ isAtBottom: true, escapedFromLock: false, scrollTop: 100 });
+  const pane = scrolledPane({ isAtBottom: true, escapedFromLock: false });
+  const view = render(pane.transcript([undeliveredCopy]));
+  if (loadingPage) view.rerender(pane.transcript([undeliveredCopy], true));
+  view.rerender(
+    pane.transcript(loadingPage ? [undeliveredCopy, bubble] : [bubble, undeliveredCopy]),
+  );
+  expect(pane.stopScroll).not.toHaveBeenCalled();
+  expect(pane.state).toEqual({ isAtBottom: true, escapedFromLock: false, scrollTop: 100 });
 });
 
 it("keeps a renamed top bubble's row across a history prepend", () => {

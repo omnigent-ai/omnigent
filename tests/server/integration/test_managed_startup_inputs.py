@@ -1093,7 +1093,7 @@ async def test_failed_create_launch_is_visible_to_every_replica(
 
 
 async def test_undelivered_inputs_name_the_transcript_items_around_them(
-    startup_env: _Env,
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Clients place each undelivered message next to the items saved around it, not last."""
     env = startup_env
@@ -1139,6 +1139,25 @@ async def test_undelivered_inputs_name_the_transcript_items_around_them(
     assert first["following_item_ids"] == earlier[:20]
     assert second["preceding_item_ids"] == earlier[::-1][:20]
     assert second["following_item_ids"] == later[:20]
+
+    # An input resolved while its neighbors are read drops out; the read still succeeds.
+    first_input, _ = env.conv_store.list_pending_inputs(session_id)
+    list_items = env.conv_store.list_items
+    resolved: list[str] = []
+
+    def resolve_before_neighbor_lookup(conversation_id: str, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("after") == first_input.id and not resolved:
+            assert env.conv_store.transition_pending_input(
+                conversation_id, first_input.id, expected="failed", status=None
+            )
+            resolved.append(first_input.id)
+        return list_items(conversation_id, *args, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "list_items", resolve_before_neighbor_lookup)
+    response = await env.client.get(f"/v1/sessions/{session_id}")
+    assert response.status_code == 200, response.text
+    assert resolved == [first_input.id]
+    assert response.json()["failed_inputs"] == [second]
 
 
 async def test_registration_timeout_fences_prompt_before_provider_hint(
