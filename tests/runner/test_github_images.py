@@ -399,6 +399,9 @@ def test_a_same_host_redirect_doesnt_carry_the_token(fake: FakeGitHub) -> None:
         "/user-attachments/./assets/0f1e2d3c-aaaa-bbbb-cccc-000000000002",
         "https://private-user-images.githubusercontent.com/1/2 x.png?jwt=a",
         "https://private-user-images.githubusercontent.com/1/%2e%2e/2-x.png?jwt=a",
+        "//evil.example/a.png",
+        "//github.com/../user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-000000000002",
+        "https://private-user-images.githubusercontent.com/1/2\tx.png?jwt=a",
     ],
 )
 def test_a_redirect_off_the_allowlist_is_refused_with_no_request_to_it(
@@ -409,6 +412,18 @@ def test_a_redirect_off_the_allowlist_is_refused_with_no_request_to_it(
     assert _refusal(lambda: _read(ASSET, transport)) == "host_not_allowed"
 
     assert len(transport.seen) == 1
+
+
+def test_a_query_only_redirect_stays_on_the_same_asset_without_the_token(
+    fake: FakeGitHub,
+) -> None:
+    """It resolves to the linked asset with a query: allowed, and never sent the token."""
+    transport = Transport(_redirect("?jwt=a"), _image())
+
+    assert _read(ASSET, transport).data == PNG
+
+    assert str(transport.seen[1].url) == f"{ASSET}?jwt=a"
+    assert "authorization" not in transport.seen[1].headers
 
 
 def test_three_redirects_are_followed_and_a_fourth_is_refused(fake: FakeGitHub) -> None:
