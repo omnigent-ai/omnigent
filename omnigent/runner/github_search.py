@@ -27,7 +27,9 @@ _SEARCH_OPERATORS = frozenset({"AND", "OR", "NOT"})
 _UNKNOWN_HOST = "Sign in to this GitHub host with gh before searching it"
 _UNREADABLE = "GitHub couldn't answer this search. Try again."
 MAX_BRANCH_PULL_REQUESTS = 20
-_BRANCH_FIELDS = "url,number,title,state,isDraft,updatedAt,headRefName"
+_BRANCH_FIELDS = (
+    "url,number,title,state,isDraft,updatedAt,headRefName,headRepository,headRepositoryOwner"
+)
 _UNKNOWN_WORKSPACE_HOST = "The workspace's repository isn't on a GitHub host set up here."
 _UNLISTED = "GitHub couldn't list this branch's pull requests. Try again."
 
@@ -229,14 +231,50 @@ def search_completions(
     }
 
 
+def _config_value(root: str, key: str) -> str | None:
+    rc, output, _ = github._git(["config", "--get", key], cwd=root)
+    value = output.strip()
+    return value if rc == 0 and value and value != "." else None
+
+
+def _remote_repository(root: str, remote: str) -> tuple[str, str] | None:
+    """The host and ``owner/repo`` a remote names, by the provider's port-aware parser.
+
+    ``None`` for a missing remote, a path, or a host never set up for GitHub.
+    """
+    rc, url, _ = github._git(["remote", "get-url", remote], cwd=root)
+    if rc != 0:
+        return None
+    parsed = GitHubProvider().parse_remote_url(url.strip(), EnvInstances())
+    return (parsed.host, parsed.repository) if parsed is not None else None
+
+
 def _base_remote(root: str) -> str:
-    """The remote ``gh repo set-default`` chose as the base, else the branch's or ``origin``."""
+    """The remote pull requests are opened against, as gh resolves it.
+
+    The one ``gh repo set-default`` chose, else the checked-out branch's tracking remote
+    when it names a GitHub repository, else ``origin``.
+    """
     rc, output, _ = github._git(["config", "--get-regexp", r"^remote\..*\.gh-resolved$"], cwd=root)
     for line in output.splitlines() if rc == 0 else []:
         key, _, value = line.partition(" ")
         if value.strip() == "base":
             return key.removeprefix("remote.").removesuffix(".gh-resolved")
-    return github._commit_lookup_remote(root)
+    rc, checked_out, _ = github._git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=root)
+    tracking = _config_value(root, f"branch.{checked_out.strip()}.remote") if rc == 0 else None
+    if tracking and _remote_repository(root, tracking) is not None:
+        return tracking
+    return "origin"
+
+
+def _push_remote(root: str, branch: str) -> str:
+    """The remote ``branch`` is pushed to, by git's own order of settings."""
+    return (
+        _config_value(root, f"branch.{branch}.pushRemote")
+        or _config_value(root, "remote.pushDefault")
+        or _config_value(root, f"branch.{branch}.remote")
+        or "origin"
+    )
 
 
 def workspace_repository(root: str) -> tuple[str, str] | None:
@@ -247,17 +285,24 @@ def workspace_repository(root: str) -> tuple[str, str] | None:
     :raises PullRequestError: For a remote on a host never set up for GitHub, so that
         isn't reported as a branch with no pull requests.
     """
-    rc, url, _ = github._git(["remote", "get-url", _base_remote(root)], cwd=root)
-    if rc != 0:
-        return None
-    # The provider's parser takes SSH and HTTPS remotes with a port, and checks the host.
-    parsed = GitHubProvider().parse_remote_url(url.strip(), EnvInstances())
-    if parsed is not None:
-        return parsed.host, parsed.repository
-    host = host_of(url.strip())
+    remote = _base_remote(root)
+    found = _remote_repository(root, remote)
+    if found is not None:
+        return found
+    rc, url, _ = github._git(["remote", "get-url", remote], cwd=root)
+    host = host_of(url.strip()) if rc == 0 else None
     if host and not github._known_github_host(host):
         raise PullRequestError(_UNKNOWN_WORKSPACE_HOST)
     return None
+
+
+def _head_repository(entry: dict[str, Any]) -> str | None:
+    """``owner/repo`` of the repository a pull request's head branch is in."""
+    owner = entry.get("headRepositoryOwner")
+    repository = entry.get("headRepository")
+    login = owner.get("login") if isinstance(owner, dict) else None
+    name = repository.get("name") if isinstance(repository, dict) else None
+    return f"{login}/{name}" if isinstance(login, str) and isinstance(name, str) else None
 
 
 def _repository_token(root: str, host: str, repository: str) -> str | None:
@@ -282,9 +327,11 @@ def _same_repository(url: str, host: str, repository: str) -> bool:
 
 
 def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
-    """The pull requests whose head is ``branch``, in the workspace's own repository.
+    """The pull requests from the workspace's ``branch``, in the workspace's own repository.
 
-    The most recent :data:`MAX_BRANCH_PULL_REQUESTS` in any state, newest first as GitHub
+    A pull request counts only when its head is ``branch`` in the repository the workspace
+    pushes it to, so a same-named branch in someone else's fork isn't this branch. The most
+    recent :data:`MAX_BRANCH_PULL_REQUESTS` in any state, newest first as GitHub
     orders them; ``has_more`` says older ones exist. A workspace without a repository
     remote has none.
 
@@ -296,6 +343,9 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
     if found is None:
         return {"object": "list", "data": [], "has_more": False}
     host, repository = found
+    # A fork workflow pushes to its own remote and opens pull requests on the base.
+    pushed_to = _remote_repository(root, _push_remote(root, branch))
+    source = pushed_to[1] if pushed_to is not None and pushed_to[0] == host else repository
     with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
         rc, output, _ = github._gh(
             [
@@ -337,6 +387,7 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
         if isinstance(entry, dict)
         and isinstance(entry.get("url"), str)
         and entry.get("headRefName") == branch
+        and (_head_repository(entry) or "").lower() == source.lower()
         and _same_repository(entry["url"], host, repository)
     ]
     return {

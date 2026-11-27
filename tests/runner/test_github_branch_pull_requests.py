@@ -32,8 +32,16 @@ def _entry(number: int, head: str = "feature/login", **fields: Any) -> dict[str,
         "isDraft": False,
         "updatedAt": "2026-01-02T03:04:05Z",
         "headRefName": head,
+        # Pushed from the repository itself unless a test says otherwise.
+        "headRepository": {"name": "example-repo"},
+        "headRepositoryOwner": {"login": "example-org"},
         **fields,
     }
+
+
+def _from_fork(number: int, owner: str) -> dict[str, Any]:
+    """A pull request into the repository from ``owner``'s fork's ``feature/login``."""
+    return _entry(number, headRepositoryOwner={"login": owner})
 
 
 class FakeGh:
@@ -85,6 +93,17 @@ def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
 @pytest.fixture
 def fake(monkeypatch: pytest.MonkeyPatch) -> FakeGh:
     return FakeGh(monkeypatch)
+
+
+def _commit(root: str) -> None:
+    """A first commit, so git can name the checked-out branch."""
+    identity = ["-c", "user.name=Example", "-c", "user.email=dev@example.com"]
+    commit = ["commit", "-q", "--allow-empty", "-m", "start"]
+    subprocess.run(["git", *identity, *commit], cwd=root, check=True)
+
+
+def _git_config(root: str, key: str, value: str) -> None:
+    subprocess.run(["git", "config", key, value], cwd=root, check=True)
 
 
 def _checkout(tmp_path: Path, **remotes: str) -> str:
@@ -160,32 +179,19 @@ def test_every_remote_form_lists_the_same_repository(
     assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
 
 
-def test_the_base_remote_gh_resolved_is_listed_before_origin(tmp_path: Path, fake: FakeGh) -> None:
-    """A fork's pull requests live in the base repository ``gh repo set-default`` chose."""
-    root = _checkout(
-        tmp_path,
-        origin="https://github.com/someone/example-repo.git",
-        upstream=f"https://github.com/{REPOSITORY}.git",
-    )
-    subprocess.run(["git", "config", "remote.upstream.gh-resolved", "base"], cwd=root, check=True)
-
-    github_search.branch_pull_requests(root, branch="feature/login")
-
-    argv = fake.list_arguments()
-    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
-
-
-def test_the_base_remote_gh_resolved_is_listed_before_the_branchs_tracking_remote(
+def test_the_base_remote_gh_resolved_is_listed_before_tracking_and_origin(
     tmp_path: Path, fake: FakeGh
 ) -> None:
+    """A fork's pull requests live in the base repository ``gh repo set-default`` chose."""
     root = _checkout(
         tmp_path,
         origin="https://github.com/someone/example-repo.git",
         fork="https://github.com/another/example-repo.git",
         upstream=f"https://github.com/{REPOSITORY}.git",
     )
-    subprocess.run(["git", "config", "branch.main.remote", "fork"], cwd=root, check=True)
-    subprocess.run(["git", "config", "remote.upstream.gh-resolved", "base"], cwd=root, check=True)
+    _commit(root)
+    _git_config(root, "branch.main.remote", "fork")
+    _git_config(root, "remote.upstream.gh-resolved", "base")
 
     github_search.branch_pull_requests(root, branch="feature/login")
 
@@ -193,24 +199,80 @@ def test_the_base_remote_gh_resolved_is_listed_before_the_branchs_tracking_remot
     assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
 
 
+@pytest.mark.parametrize(
+    "tracking",
+    [
+        f"https://github.com/{REPOSITORY}.git",
+        f"ssh://git@github.com:22/{REPOSITORY}.git",
+        f"https://github.com:443/{REPOSITORY}",
+    ],
+    ids=["https", "ssh-port", "https-port"],
+)
 def test_without_a_base_remote_the_branchs_tracking_remote_is_listed(
-    tmp_path: Path, fake: FakeGh
+    tmp_path: Path, fake: FakeGh, tracking: str
 ) -> None:
+    root = _checkout(
+        tmp_path, origin="https://github.com/someone/example-repo.git", tracked=tracking
+    )
+    _commit(root)
+    _git_config(root, "branch.main.remote", "tracked")
+
+    github_search.branch_pull_requests(root, branch="feature/login")
+
+    argv = fake.list_arguments()
+    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
+
+
+def _fork_checkout(tmp_path: Path, **settings: str) -> str:
+    """A fork workflow: ``origin`` is someone's fork, and gh's base is the repository."""
     root = _checkout(
         tmp_path,
         origin="https://github.com/someone/example-repo.git",
-        fork=f"https://github.com/{REPOSITORY}.git",
+        upstream=f"https://github.com/{REPOSITORY}.git",
+        mirror="https://github.com/mirror-owner/example-repo.git",
     )
-    # The checked-out branch needs a commit before git can name it.
-    identity = ["-c", "user.name=Example", "-c", "user.email=dev@example.com"]
-    commit = ["commit", "-q", "--allow-empty", "-m", "start"]
-    subprocess.run(["git", *identity, *commit], cwd=root, check=True)
-    subprocess.run(["git", "config", "branch.main.remote", "fork"], cwd=root, check=True)
+    _git_config(root, "remote.upstream.gh-resolved", "base")
+    for key, value in settings.items():
+        _git_config(root, key, value)
+    return root
 
-    github_search.branch_pull_requests(root, branch="feature/login")
 
-    argv = fake.list_arguments()
-    assert argv[argv.index("-R") + 1] == f"github.com/{REPOSITORY}"
+@pytest.mark.parametrize(
+    ("settings", "pushed_from"),
+    [
+        ({}, "someone"),
+        ({"branch.feature/login.remote": "mirror"}, "mirror-owner"),
+        ({"remote.pushDefault": "mirror"}, "mirror-owner"),
+        (
+            {"branch.feature/login.remote": "origin", "branch.feature/login.pushRemote": "mirror"},
+            "mirror-owner",
+        ),
+    ],
+    ids=["origin", "branch-remote", "push-default", "push-remote"],
+)
+def test_a_fork_lists_its_own_branchs_pull_request_but_not_another_forks(
+    tmp_path: Path, fake: FakeGh, settings: dict[str, str], pushed_from: str
+) -> None:
+    """Another fork's ``feature/login`` is a different branch, though GitHub lists both."""
+    root = _fork_checkout(tmp_path, **settings)
+    owners = ["someone", "mirror-owner", "another", "example-org"]
+    fake.listed = [_from_fork(number, owner) for number, owner in enumerate(owners, 1)]
+
+    rows = github_search.branch_pull_requests(root, branch="feature/login")["data"]
+
+    expected = owners.index(pushed_from) + 1
+    assert [row["number"] for row in rows] == [expected]
+
+
+def test_a_same_repository_branch_lists_no_forks_pull_request(
+    tmp_path: Path, fake: FakeGh
+) -> None:
+    root = _checkout(tmp_path, origin=f"https://github.com/{REPOSITORY}.git")
+    fake.listed = [_entry(1), _from_fork(2, "another")]
+
+    rows = github_search.branch_pull_requests(root, branch="feature/login")["data"]
+
+    assert [row["number"] for row in rows] == [1]
 
 
 @pytest.mark.parametrize(
@@ -222,6 +284,9 @@ def test_without_a_base_remote_the_branchs_tracking_remote_is_listed(
         [_entry(3, url="javascript:alert(1)")],
         # Another branch's, and entries GitHub never sends.
         [_entry(4, head="main")],
+        # Another fork's same-named branch, and a head repository since deleted.
+        [_from_fork(7, "another")],
+        [_entry(8, headRepository=None, headRepositoryOwner=None)],
         [_entry(5, url=None)],
         ["not an entry"],
         {"url": f"https://github.com/{REPOSITORY}/pull/6"},
@@ -231,6 +296,8 @@ def test_without_a_base_remote_the_branchs_tracking_remote_is_listed(
         "other-host",
         "not-a-url",
         "other-branch",
+        "other-fork",
+        "deleted-fork",
         "no-url",
         "string",
         "object",
@@ -255,24 +322,19 @@ def test_a_title_that_isnt_text_is_shown_empty(tmp_path: Path, fake: FakeGh) -> 
     assert row["title"] == ""
 
 
-def test_the_list_is_capped_whatever_github_answers(tmp_path: Path, fake: FakeGh) -> None:
+@pytest.mark.parametrize(
+    ("listed", "shown", "has_more"), [(39, 20, True), (21, 20, True), (20, 20, False)]
+)
+def test_the_list_is_capped_and_says_when_github_has_more(
+    tmp_path: Path, fake: FakeGh, listed: int, shown: int, has_more: bool
+) -> None:
     root = _checkout(tmp_path, origin=f"https://github.com/{REPOSITORY}")
-    fake.listed = [_entry(number) for number in range(1, 40)]
+    fake.listed = [_entry(number) for number in range(1, listed + 1)]
 
     found = github_search.branch_pull_requests(root, branch="feature/login")
 
-    assert len(found["data"]) == github_search.MAX_BRANCH_PULL_REQUESTS
-    assert found["has_more"] is True
-
-
-def test_a_list_github_didnt_cut_has_no_more(tmp_path: Path, fake: FakeGh) -> None:
-    root = _checkout(tmp_path, origin=f"https://github.com/{REPOSITORY}")
-    fake.listed = [_entry(number) for number in range(1, 21)]
-
-    found = github_search.branch_pull_requests(root, branch="feature/login")
-
-    assert len(found["data"]) == github_search.MAX_BRANCH_PULL_REQUESTS
-    assert found["has_more"] is False
+    assert len(found["data"]) == shown
+    assert found["has_more"] is has_more
 
 
 @pytest.mark.parametrize(
