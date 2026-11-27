@@ -506,9 +506,16 @@ describe("UserBubble awaiting-agent marker", () => {
   });
 
   it("stays hidden for a send that started a turn and for committed history", () => {
+    const hoverReveal = [
+      "md:opacity-0",
+      "md:group-hover:opacity-100",
+      "md:group-focus-within:opacity-100",
+    ];
     const [pending] = buildPendingBubbles([{ tempId: "pend_2", content }], null);
-    const { rerender } = renderBubble(pending!);
+    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+    const { rerender } = renderBubble({ ...pending, createdAtS: 1_762_000_000 });
     expect(screen.queryByTestId("message-awaiting-agent")).toBeNull();
+    expect(screen.getByTestId("message-timestamp").parentElement).toHaveClass(...hoverReveal);
     // A promoted bubble drops the marker even if a stale flag were carried over.
     rerender(
       <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
@@ -518,11 +525,7 @@ describe("UserBubble awaiting-agent marker", () => {
       </FileViewerContext.Provider>,
     );
     expect(screen.queryByTestId("message-awaiting-agent")).toBeNull();
-    expect(screen.getByTestId("message-timestamp").parentElement).toHaveClass(
-      "md:opacity-0",
-      "md:group-hover:opacity-100",
-      "md:group-focus-within:opacity-100",
-    );
+    expect(screen.getByTestId("message-timestamp").parentElement).toHaveClass(...hoverReveal);
   });
 });
 
