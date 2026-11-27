@@ -81,6 +81,7 @@ from omnigent.harnesses.claude_native import (
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.settings_generation import (
+    ClaudeSettingsRequestExpired,
     prepare_claude_settings_lifecycle,
     settings_generation_path,
 )
@@ -1477,6 +1478,7 @@ class ClaudeNativeToolRelay:
         relay_info: _JsonObject,
         tool_executor: ToolExecutor,
         closed: threading.Event,
+        credential_binding: ClaudeBridgeCredentialBinding | None = None,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1487,6 +1489,7 @@ class ClaudeNativeToolRelay:
         :param advertised_url: Base URL advertised in ``tool_relay.json``.
         :param relay_info: Current relay advertisement, including its stable token.
         :param tool_executor: Callback for the current tool surface.
+        :param credential_binding: Bridge activation owned by this relay.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
@@ -1499,22 +1502,29 @@ class ClaudeNativeToolRelay:
         self._advertised_tool_names = _relay_info_tool_names(relay_info)
         self._tool_executor = tool_executor
         self._closed = closed
+        self._credential_binding = credential_binding or read_bridge_credential_binding(bridge_dir)
 
     def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
 
         :param tools: Replacement tool schemas.
         :param tool_executor: Callback dispatching against the updated spec.
+        :raises RuntimeError: When this relay's activation has ended.
         """
         relay_info = {
             **self._relay_info,
             "tools": _normalize_relay_tool_specs(tools),
             "updated_at": time.time(),
         }
-        _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
-        self._relay_info = relay_info
-        self._advertised_tool_names = _relay_info_tool_names(relay_info)
-        self._tool_executor = tool_executor
+        with _bridge_metadata_write_lock(self._bridge_dir):
+            if self._closed.is_set() or not _bridge_credentials_current(
+                self._bridge_dir, self._credential_binding
+            ):
+                raise RuntimeError("Native tool relay activation has ended")
+            _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
+            self._relay_info = relay_info
+            self._advertised_tool_names = _relay_info_tool_names(relay_info)
+            self._tool_executor = tool_executor
 
     def close(self) -> None:
         """
@@ -1535,9 +1545,13 @@ class ClaudeNativeToolRelay:
         # A newer relay that overwrote the file advertises a different url
         # (this relay's socket is still bound, so its port is unique), so the
         # file is left for that relay to own.
-        if _read_json_file(relay_file).get("url") == self._advertised_url:
-            with contextlib.suppress(FileNotFoundError):
-                relay_file.unlink()
+        with _bridge_metadata_write_lock(self._bridge_dir):
+            current = _read_json_file(relay_file)
+            if current.get("url") == self._advertised_url and current.get(
+                "token"
+            ) == self._relay_info.get("token"):
+                with contextlib.suppress(FileNotFoundError):
+                    relay_file.unlink()
         self._closed.set()
         self._httpd.shutdown()
         self._httpd.server_close()
@@ -2221,16 +2235,79 @@ def read_active_session_id(bridge_dir: Path) -> str | None:
 
     :param bridge_dir: Bridge directory path.
     :returns: Active Omnigent session id, e.g. ``"conv_abc123"``, or
-        ``None`` when the bridge config is absent or malformed.
+        ``None`` when the bridge is deleted or its config is absent or malformed.
     """
     config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not isinstance(config, dict):
+    if not isinstance(config, dict) or config.get("deleted") is True:
         return None
     active = config.get("active_session_id")
     if isinstance(active, str) and active:
         return active
     legacy = config.get("conversation_id")
     return legacy if isinstance(legacy, str) and legacy else None
+
+
+@dataclass(frozen=True)
+class ClaudeBridgeCredentialBinding:
+    """Identify one bridge activation without retaining its credential."""
+
+    directory_identity: tuple[int, int]
+    token_digest: str
+
+
+def read_bridge_credential_binding(bridge_dir: Path) -> ClaudeBridgeCredentialBinding | None:
+    """Return an activation binding that changes after deletion or replacement."""
+    try:
+        info = bridge_dir.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            return None
+        config = json.loads(_read_caller_settings(bridge_dir / _CONFIG_FILE, nofollow=True))
+        if not isinstance(config, dict) or config.get("deleted") is True:
+            return None
+        token = config.get("token")
+        if not isinstance(token, str) or not token:
+            return None
+        current = bridge_dir.stat(follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            return None
+        return ClaudeBridgeCredentialBinding(
+            (info.st_dev, info.st_ino), hashlib.sha256(token.encode()).hexdigest()
+        )
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return None
+
+
+def _bridge_credentials_current(
+    bridge_dir: Path, binding: ClaudeBridgeCredentialBinding | None
+) -> bool:
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    return config.get("deleted") is not True and (
+        binding is None or read_bridge_credential_binding(bridge_dir) == binding
+    )
+
+
+def retire_bridge_credentials(bridge_dir: Path, session_id: str) -> None:
+    """Remove auth snapshots under the preparation lock, retaining only deletion identity."""
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    tombstone: _JsonObject = {
+        "active_session_id": session_id,
+        "conversation_id": session_id,
+        "deleted": True,
+    }
+    if isinstance(config.get("bridge_id"), str):
+        tombstone["bridge_id"] = config["bridge_id"]
+    first_error: OSError | None = None
+    try:
+        _write_json_file(bridge_dir / _CONFIG_FILE, tombstone)
+    except OSError as exc:
+        first_error = exc
+    for filename in (_PERMISSION_HOOK_FILE, _SERVER_FILE, _TOOL_RELAY_FILE, _TOOL_RELAY_ENV_FILE):
+        try:
+            (bridge_dir / filename).unlink(missing_ok=True)
+        except OSError as exc:
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
 
 
 def read_launch_model(bridge_dir: Path) -> str | None:
@@ -2320,7 +2397,7 @@ def record_model_vocabulary(
     # with its own stale read.
     with _bridge_metadata_write_lock(bridge_dir):
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
-        if not isinstance(config, dict) or not config:
+        if not isinstance(config, dict) or not config or config.get("deleted") is True:
             # No prepared bridge config yet (missing/malformed reads as {}):
             # recording would materialize an incomplete bridge dir that has
             # no owner.pid, which orphan pruning then skips forever.
@@ -2384,6 +2461,8 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
         if not config:
             raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
+        if config.get("deleted") is True:
+            raise ClaudeSettingsRequestExpired()
         if (config.get("active_session_id") or config.get("conversation_id")) != session_id:
             prepare_claude_settings_lifecycle(bridge_dir, reactivate=True, session_id=session_id)
         config["active_session_id"] = session_id
@@ -2402,8 +2481,10 @@ def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
     :returns: Permission hook config, e.g.
         ``{"ap_server_url": "http://127.0.0.1:8787",
         "ap_auth_headers": {"Authorization": "Bearer token"}}``.
-        Empty dict when the file is absent or malformed.
+        Empty dict when the bridge is deleted or the file is absent or malformed.
     """
+    if _read_json_file(bridge_dir / _CONFIG_FILE).get("deleted") is True:
+        return {}
     payload = _read_json_file(bridge_dir / _PERMISSION_HOOK_FILE)
     return payload if isinstance(payload, dict) else {}
 
@@ -2411,21 +2492,27 @@ def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
 def update_permission_hook_auth_headers(
     bridge_dir: Path,
     headers: dict[str, str],
+    *,
+    credential_binding: ClaudeBridgeCredentialBinding | None = None,
 ) -> bool:
     """Atomically replace the permission hook's server auth headers.
 
     :param bridge_dir: Native Claude bridge directory.
     :param headers: Fresh server request headers.
-    :returns: ``True`` when the hook config existed and was updated.
+    :param credential_binding: Activation owned by the refreshing task, when known.
+    :returns: ``True`` when the current activation's hook config was updated.
     """
-    path = bridge_dir / _PERMISSION_HOOK_FILE
-    payload = _read_json_file(path)
-    if not payload:
-        return False
-    payload["ap_auth_headers"] = dict(headers)
-    payload["updated_at"] = time.time()
-    _write_json_file(path, payload)
-    return True
+    with _bridge_metadata_write_lock(bridge_dir):
+        if not _bridge_credentials_current(bridge_dir, credential_binding):
+            return False
+        path = bridge_dir / _PERMISSION_HOOK_FILE
+        payload = _read_json_file(path)
+        if not payload:
+            return False
+        payload["ap_auth_headers"] = dict(headers)
+        payload["updated_at"] = time.time()
+        _write_json_file(path, payload)
+        return True
 
 
 def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> _JsonObject:
@@ -2711,6 +2798,7 @@ def build_hook_settings(
         session does not route.
     :returns: JSON-serializable Claude settings fragment.
     """
+    credential_binding = read_bridge_credential_binding(bridge_dir)
     python = python_executable or sys.executable
     # -I (isolated mode) prevents Python from adding the session's
     # working directory to sys.path, which would shadow the installed
@@ -2840,14 +2928,17 @@ def build_hook_settings(
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
-        _write_json_file(
-            bridge_dir / _PERMISSION_HOOK_FILE,
-            {
-                "ap_server_url": ap_server_url,
-                "ap_auth_headers": ap_auth_headers or {},
-                "updated_at": time.time(),
-            },
-        )
+        with _bridge_metadata_write_lock(bridge_dir):
+            if not _bridge_credentials_current(bridge_dir, credential_binding):
+                raise ClaudeSettingsRequestExpired()
+            _write_json_file(
+                bridge_dir / _PERMISSION_HOOK_FILE,
+                {
+                    "ap_server_url": ap_server_url,
+                    "ap_auth_headers": ap_auth_headers or {},
+                    "updated_at": time.time(),
+                },
+            )
         # ``PermissionRequest`` fires only when Claude is about to
         # show its TUI permission prompt — that's exactly the
         # interception point we want for routing to the web UI.
@@ -9150,6 +9241,7 @@ def start_tool_relay(
         registry.
     :returns: Started relay handle. Call :meth:`close` when done.
     """
+    credential_binding = read_bridge_credential_binding(bridge_dir)
     token = secrets.token_urlsafe(32)
     closed = threading.Event()
 
@@ -9188,13 +9280,19 @@ def start_tool_relay(
     }
     if session_id is not None:
         relay_info["session_id"] = session_id
-    _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
-    # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
-    # Hooks source this file whenever they run, so it is replaced whole.
-    _write_private_file(
-        bridge_dir / _TOOL_RELAY_ENV_FILE,
-        f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
-    )
+    try:
+        with _bridge_metadata_write_lock(bridge_dir):
+            if not _bridge_credentials_current(bridge_dir, credential_binding):
+                raise ClaudeSettingsRequestExpired()
+            _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
+            # Hooks source this file whenever they run, so replace it whole.
+            _write_private_file(
+                bridge_dir / _TOOL_RELAY_ENV_FILE,
+                f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
+            )
+    except BaseException:
+        httpd.server_close()
+        raise
     relay = ClaudeNativeToolRelay(
         bridge_dir=bridge_dir,
         httpd=httpd,
@@ -9202,6 +9300,7 @@ def start_tool_relay(
         relay_info=relay_info,
         tool_executor=tool_executor,
         closed=closed,
+        credential_binding=credential_binding,
     )
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -9297,7 +9396,8 @@ def _start_http_ingress(
         writer thread.
     :returns: Started server; ``shutdown`` and ``server_close`` end it.
     """
-    handler_cls = _handler_factory(token, notification_queue)
+    credential_binding = read_bridge_credential_binding(bridge_dir)
+    handler_cls = _handler_factory(token, notification_queue, bridge_dir=bridge_dir)
     server_info: _JsonObject = {
         "token": token,
         "pid": os.getpid(),
@@ -9310,7 +9410,14 @@ def _start_http_ingress(
     else:
         httpd, socket_path = _start_unix_control_server(handler_cls)
         server_info["socket"] = str(socket_path)
-    _write_json_file(bridge_dir / _SERVER_FILE, server_info)
+    try:
+        with _bridge_metadata_write_lock(bridge_dir):
+            if not _bridge_credentials_current(bridge_dir, credential_binding):
+                raise ClaudeSettingsRequestExpired()
+            _write_json_file(bridge_dir / _SERVER_FILE, server_info)
+    except BaseException:
+        httpd.server_close()
+        raise
     thread = threading.Thread(
         target=httpd.serve_forever,
         name="claude-native-mcp-http",
@@ -9373,6 +9480,8 @@ def _start_unix_control_server(
 def _handler_factory(
     token: str,
     notification_queue: queue.Queue[_JsonObject | None],
+    *,
+    bridge_dir: Path | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class bound to the MCP notification queue.
@@ -9380,8 +9489,11 @@ def _handler_factory(
     :param token: Bearer token expected in ``Authorization``.
     :param notification_queue: Queue receiving MCP notification
         payloads.
+    :param bridge_dir: Activation whose deletion retires this endpoint's token.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
+
+    credential_binding = read_bridge_credential_binding(bridge_dir) if bridge_dir else None
 
     class _ControlHandler(BaseHTTPRequestHandler):
         """HTTP handler for the local MCP control endpoint."""
@@ -9417,7 +9529,10 @@ def _handler_factory(
             if self.path != "/tools-changed":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            if self.headers.get("Authorization") != f"Bearer {token}":
+            if self.headers.get("Authorization") != f"Bearer {token}" or (
+                bridge_dir is not None
+                and not _bridge_credentials_current(bridge_dir, credential_binding)
+            ):
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
             length = int(self.headers.get("Content-Length") or 0)
@@ -9494,6 +9609,8 @@ def _tool_relay_handler_factory(
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
+    credential_binding = read_bridge_credential_binding(bridge_dir) if bridge_dir else None
+
     class _ToolRelayHandler(BaseHTTPRequestHandler):
         """HTTP handler for active Omnigent tool relay calls."""
 
@@ -9524,7 +9641,10 @@ def _tool_relay_handler_factory(
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            if self.headers.get("Authorization") != f"Bearer {token}":
+            if self.headers.get("Authorization") != f"Bearer {token}" or (
+                bridge_dir is not None
+                and not _bridge_credentials_current(bridge_dir, credential_binding)
+            ):
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
             payload = self._read_json_body()

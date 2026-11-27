@@ -109,18 +109,25 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 
 @pytest.mark.parametrize("endpoint", ["", "/resources"])
 @pytest.mark.parametrize(
-    "owner",
+    ("owner", "protocol"),
     [
-        "absent",
-        "removed-before-lock",
-        "none",
-        "pending",
-        "undelivered",
-        "unacknowledged",
-        "admitted",
-        "failed-close",
-        "timed-out-close",
-        "reactivated",
+        pytest.param(owner, 1, id=owner)
+        for owner in (
+            "absent",
+            "removed-before-lock",
+            "none",
+            "pending",
+            "undelivered",
+            "unacknowledged",
+            "admitted",
+            "failed-close",
+            "timed-out-close",
+            "reactivated",
+        )
+    ]
+    + [
+        pytest.param(owner, 2, id=f"{owner}-v2")
+        for owner in ("pending", "admitted", "failed-close", "timed-out-close", "reactivated")
     ],
 )
 async def test_delete_session_removes_native_bridge_dir(
@@ -130,8 +137,9 @@ async def test_delete_session_removes_native_bridge_dir(
     monkeypatch: pytest.MonkeyPatch,
     endpoint: str,
     owner: str,
+    protocol: int,
 ) -> None:
-    """Delete retains settings until pending requests and terminals release them."""
+    """Delete retires credentials while pending requests and terminals retain inputs."""
     from omnigent.harnesses.claude_native import settings_generation
     from omnigent.harnesses.claude_native.bridge import augment_claude_args
     from omnigent.harnesses.claude_native.settings_generation import (
@@ -195,7 +203,7 @@ async def test_delete_session_removes_native_bridge_dir(
     instance = None
     revoked = []
     if owner != "none":
-        request = ClaudeSettingsRequest.create(bridge_dir)
+        request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
         augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
         baseline = settings_generation_path(bridge_dir, request.generation)
         baseline_bytes = baseline.read_bytes()
@@ -204,7 +212,9 @@ async def test_delete_session_removes_native_bridge_dir(
             if owner == "undelivered":
                 request.cancel_undelivered_dispatch()
             elif owner == "admitted":
-                reader = acquire_claude_settings_request(bridge_dir, request.generation)
+                reader = acquire_claude_settings_request(
+                    bridge_dir, request.generation, protocol=protocol
+                )
             request.close()
         if owner in {"failed-close", "timed-out-close", "reactivated"}:
             private_dir = tmp_path / "terminal"
@@ -218,7 +228,9 @@ async def test_delete_session_removes_native_bridge_dir(
                 socket_path=private_dir / "tmux.sock",
                 running=owner != "reactivated",
             )
-            with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
+            with acquire_claude_settings_request(
+                bridge_dir, request.generation, protocol=protocol
+            ) as lease:
                 lease.attach(instance)
             encoded = process_lifetime.encode_process_leases(instance.process_lifetime_leases)
             assert encoded is not None
@@ -251,14 +263,15 @@ async def test_delete_session_removes_native_bridge_dir(
         assert not cached.exists()
         if request is not None and owner != "undelivered":
             assert baseline.read_bytes() == baseline_bytes
-            assert credentials.read_bytes() == credential_bytes
+            assert not credentials.exists()
+            assert "token" not in json.loads((bridge_dir / "bridge.json").read_text())
             if instance is not None:
                 if owner == "reactivated":
                     bridge_inode = bridge_dir.stat().st_ino
                     prepare_bridge_dir(session_id, workspace=tmp_path)
                     assert bridge_dir.stat().st_ino == bridge_inode
                     assert baseline.read_bytes() == baseline_bytes
-                    assert credentials.read_bytes() == credential_bytes
+                    assert not credentials.exists()
                     assert (await client.delete(url)).status_code == 200
                 else:
                     assert instance._resource_cleanup_task is not None
@@ -285,7 +298,8 @@ async def test_delete_session_removes_native_bridge_dir(
             else:
                 assert baseline.read_bytes() == baseline_bytes
                 assert output.exists()
-            assert credentials.read_bytes() == credential_bytes
+            assert not credentials.exists()
+            assert "token" not in json.loads((bridge_dir / "bridge.json").read_text())
         else:
             assert not bridge_dir.exists(), "released bridge dir (with token) must be deleted"
     finally:

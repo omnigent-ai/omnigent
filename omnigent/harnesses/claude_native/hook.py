@@ -24,6 +24,7 @@ from omnigent.harnesses.claude_native.bridge import (
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
+    read_bridge_credential_binding,
     read_bridge_id,
     read_claude_session_id,
     read_claude_status_model,
@@ -1063,42 +1064,46 @@ def _permission_hook_reauth(
     bridge_dir: Path, server_url: str, headers: dict[str, str], started_from: object
 ) -> Callable[[], dict[str, str] | None]:
     """
-    Renew the permission hook's auth from the runner's refreshed header snapshot.
+    Renew the permission hook's auth while its bridge activation remains current.
 
-    The hook cannot mint a token itself (the runner keeps its credential from
-    child processes), so a prompt parked past its token's lifetime takes the
-    headers the runner last wrote to ``permission_hook.json``. It mints instead
-    when the hook did not start from that snapshot, the snapshot is for another
-    server, or it has not changed.
+    A parked prompt first takes refreshed headers from ``permission_hook.json``.
+    It tries minting instead when it did not start from that snapshot, the
+    snapshot is for another server, or it has not changed. Deletion or bridge
+    replacement retires both renewal paths, including an in-flight result.
 
     :param bridge_dir: Bridge directory holding ``permission_hook.json``.
     :param server_url: Omnigent server URL the hook POSTs to.
     :param headers: Headers the hook started with.
     :param started_from: The snapshot those headers came from, or ``None`` when
-        they did not come from ``permission_hook.json``; ``None`` always mints.
+        they did not come from ``permission_hook.json``; ``None`` selects minting.
     :returns: A reauth callable for :func:`_post_hook_with_reattach`.
     """
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
     mint = policy_hook_reauth(server_url, headers)
+    binding = read_bridge_credential_binding(bridge_dir)
     seen = [started_from]
 
     def reauth() -> dict[str, str] | None:
+        if binding is None or read_bridge_credential_binding(bridge_dir) != binding:
+            return None
         if started_from is None:
-            return mint()
-        config = read_permission_hook_config(bridge_dir)
-        snapshot = config.get("ap_auth_headers")
-        if (
-            config.get("ap_server_url") == server_url
-            and isinstance(snapshot, dict)
-            and snapshot
-            and snapshot != seen[0]
-        ):
-            seen[0] = snapshot
-            fresh = {str(key): str(value) for key, value in snapshot.items()}
-            _merge_identity_headers(fresh, server_url)
-            return fresh
-        return mint()
+            fresh = mint()
+        else:
+            config = read_permission_hook_config(bridge_dir)
+            snapshot = config.get("ap_auth_headers")
+            if (
+                config.get("ap_server_url") == server_url
+                and isinstance(snapshot, dict)
+                and snapshot
+                and snapshot != seen[0]
+            ):
+                seen[0] = snapshot
+                fresh = {str(key): str(value) for key, value in snapshot.items()}
+                _merge_identity_headers(fresh, server_url)
+            else:
+                fresh = mint()
+        return fresh if read_bridge_credential_binding(bridge_dir) == binding else None
 
     return reauth
 

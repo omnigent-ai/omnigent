@@ -252,7 +252,9 @@ def _complete_bridge_deletion(bridge_dir: Path, incarnation: str, *, admission_e
 
 
 def request_claude_bridge_deletion(bridge_dir: Path, session_id: str) -> None:
-    """Remove an unowned bridge, or let its final matching owner complete deletion."""
+    """Retire credentials immediately and defer owned inputs until matching cleanup."""
+    from omnigent.harnesses.claude_native.bridge import retire_bridge_credentials
+
     if not bridge_dir.exists():
         return
     with bridge_dir_preparation_lock(bridge_dir):
@@ -261,12 +263,21 @@ def request_claude_bridge_deletion(bridge_dir: Path, session_id: str) -> None:
         try:
             if not _session_matches(bridge_dir, session_id):
                 return
+        except ValueError:
+            _logger.warning("Claude bridge deletion session is invalid", exc_info=True)
+            return
+        lifecycle = None
+        try:
             incarnation = prepare_claude_settings_lifecycle(bridge_dir)
             lifecycle = _require_incarnation(bridge_dir, incarnation)
             _write_lifecycle(bridge_dir, replace(lifecycle, delete_for_session=session_id))
-            _complete_bridge_deletion(bridge_dir, incarnation, admission_epoch=lifecycle.epoch)
         except ValueError:
             _logger.warning("Claude bridge deletion metadata is invalid", exc_info=True)
+        retire_bridge_credentials(bridge_dir, session_id)
+        if lifecycle is not None:
+            _complete_bridge_deletion(
+                bridge_dir, lifecycle.incarnation, admission_epoch=lifecycle.epoch
+            )
 
 
 def settings_generation_path(bridge_dir: Path, generation: str) -> Path:

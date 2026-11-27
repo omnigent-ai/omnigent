@@ -403,10 +403,12 @@ finalized output and cancellation-safe ownership transfer. The process guard,
 deferred bridge deletion and uncertain-consumer records serve the broader
 reclamation contract: completed launches must stop accumulating unused files,
 while live, overlapping, resumed and transferred consumers keep their inputs.
-The positive completion/recovery transition is still missing. Uncertainty
-retention protects live inputs but can also retain credential-bearing bridge
-files after deletion; immediate credential revocation/removal must be separated
-from retention of inputs an unknown consumer may still need.
+The positive completion/recovery transition is still missing. Explicit deletion
+removes framework credential snapshots immediately, leaving an identity-only
+bridge tombstone while uncertain consumers retain their inputs. Cached local
+endpoints and auth refreshes are bound to the deleted activation; preparing the
+bridge again issues a fresh token. Server and provider bearers retain their
+issuers' existing validity rules.
 
 Terminal claims in new v2 generations, older v1 records and historical untracked
 generations retain conservative ownership rules. Terminal preparation, shutdown

@@ -6,8 +6,10 @@ import asyncio
 import base64
 import contextlib
 import inspect
+import io
 import json
 import os
+import queue
 import shlex
 import shutil
 import subprocess
@@ -50,6 +52,212 @@ def bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _populate(request: ClaudeSettingsRequest) -> Path:
     bridge.augment_claude_args((), bridge_dir=request.bridge_dir, settings_request=request)
     return request.settings_path(request.bridge_dir)
+
+
+@pytest.mark.parametrize("protocol", [1, 2])
+@pytest.mark.parametrize("owner", ["sender", "reader", "unknown"])
+def test_deleted_bridge_removes_credentials_and_keeps_owned_inputs(
+    bridge_dir: Path, protocol: int, owner: str
+) -> None:
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
+    baseline = _populate(request)
+    contents = baseline.read_bytes()
+    reader = (
+        acquire_claude_settings_request(bridge_dir, request.generation, protocol=protocol)
+        if owner == "reader"
+        else None
+    )
+    unknown = baseline.with_suffix(f".terminal-{'1' * 32}.unconfirmed.owner")
+    if owner == "unknown":
+        unknown.touch(mode=0o600)
+        request.close()
+    bridge.build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://example.com",
+        ap_auth_headers={"Authorization": "Bearer synthetic-launch"},
+    )
+    binding = bridge.read_bridge_credential_binding(bridge_dir)
+    assert binding is not None
+    credential_files = ["permission_hook.json", "server.json", "tool_relay.json", "tool_relay.env"]
+    for name in credential_files[1:]:
+        (bridge_dir / name).write_text("synthetic-local-credential")
+    try:
+        request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+        tombstone = json.loads((bridge_dir / "bridge.json").read_text())
+        assert tombstone == {
+            "bridge_id": "conv_fenced",
+            "active_session_id": "conv_fenced",
+            "conversation_id": "conv_fenced",
+            "deleted": True,
+        }
+        assert not any((bridge_dir / name).exists() for name in credential_files)
+        assert bridge.read_active_session_id(bridge_dir) is None
+        assert bridge.read_bridge_credential_binding(bridge_dir) is None
+        assert baseline.read_bytes() == contents
+        assert has_live_claude_settings_owners(bridge_dir)
+        assert not bridge.update_permission_hook_auth_headers(
+            bridge_dir,
+            {"Authorization": "Bearer synthetic-late"},
+            credential_binding=binding,
+        )
+        with pytest.raises(ValueError, match="expired"):
+            bridge.build_hook_settings(bridge_dir, ap_server_url="https://example.com")
+        assert not (bridge_dir / "permission_hook.json").exists()
+        assert baseline.read_bytes() == contents
+        if owner == "unknown":
+            assert unknown.exists()
+    finally:
+        request.close()
+        if reader is not None:
+            reader.close()
+        unknown.unlink(missing_ok=True)
+        prune_unused_claude_settings(bridge_dir)
+    assert not bridge_dir.exists()
+
+
+def test_old_owners_cannot_remove_or_refresh_reactivated_credentials(bridge_dir: Path) -> None:
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=2)
+    baseline = _populate(request)
+    reader = acquire_claude_settings_request(bridge_dir, request.generation, protocol=2)
+    binding = bridge.read_bridge_credential_binding(bridge_dir)
+    assert binding is not None
+    try:
+        request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+        bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+        current = bridge.read_bridge_credential_binding(bridge_dir)
+        assert current is not None and current != binding
+        assert current.directory_identity == binding.directory_identity
+        bridge.build_hook_settings(
+            bridge_dir,
+            ap_server_url="https://example.com",
+            ap_auth_headers={"Authorization": "Bearer synthetic-new-activation"},
+        )
+        config = (bridge_dir / "bridge.json").read_bytes()
+        snapshot = (bridge_dir / "permission_hook.json").read_bytes()
+        assert not bridge.update_permission_hook_auth_headers(
+            bridge_dir,
+            {"Authorization": "Bearer synthetic-old-activation"},
+            credential_binding=binding,
+        )
+        with pytest.raises(ValueError, match="expired"):
+            acquire_claude_settings_request(bridge_dir, request.generation, protocol=2)
+        request.close()
+        reader.close()
+        assert not baseline.exists()
+        request_claude_bridge_deletion(bridge_dir, "another-session")
+        assert (bridge_dir / "bridge.json").read_bytes() == config
+        assert (bridge_dir / "permission_hook.json").read_bytes() == snapshot
+        assert bridge.read_active_session_id(bridge_dir) == "conv_fenced"
+    finally:
+        reader.close()
+        request.close()
+
+
+@pytest.mark.parametrize("kind", ["control", "relay"])
+@pytest.mark.parametrize("reactivate", [False, True])
+def test_cached_local_handlers_refuse_a_deleted_bridge_activation(
+    bridge_dir: Path, kind: str, reactivate: bool
+) -> None:
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    _populate(request)
+    notifications: queue.Queue = queue.Queue()
+    handler_class = (
+        bridge._handler_factory("synthetic-local-token", notifications, bridge_dir=bridge_dir)
+        if kind == "control"
+        else bridge._tool_relay_handler_factory(
+            "synthetic-local-token", AsyncMock(), Mock(), bridge_dir=bridge_dir
+        )
+    )
+    handler = handler_class.__new__(handler_class)
+    handler.path = "/tools-changed" if kind == "control" else "/hook/observe-tool"
+    handler.headers = {"Authorization": "Bearer synthetic-local-token", "Content-Length": "2"}
+    handler.rfile = io.BytesIO(b"{}")
+    handler.send_error = Mock()
+    handler._send_json = Mock()
+    try:
+        handler.do_POST()
+        handler.send_error.assert_not_called()
+        handler._send_json.assert_called_once()
+        request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+        if reactivate:
+            bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+        handler.do_POST()
+        handler.send_error.assert_called_once_with(401)
+        handler._send_json.assert_called_once()
+    finally:
+        request.close()
+
+
+@pytest.mark.parametrize("kind", ["control", "relay"])
+@pytest.mark.parametrize("reactivate", [False, True])
+def test_deleted_bridge_cannot_be_republished_by_an_inflight_endpoint_start(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, kind: str, reactivate: bool
+) -> None:
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    _populate(request)
+    server = Mock()
+
+    def retire_during_bind(_handler: object) -> tuple[Mock, object]:
+        request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+        if reactivate:
+            bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+        return server, "http://unused.invalid" if kind == "relay" else bridge_dir / "control.sock"
+
+    monkeypatch.setattr(bridge, "IS_WINDOWS", False)
+    monkeypatch.delenv(bridge.BRIDGE_BIND_HOST_ENV_VAR, raising=False)
+    monkeypatch.setattr(bridge, "_start_bridge_http_server", retire_during_bind)
+    monkeypatch.setattr(bridge, "_start_unix_control_server", retire_during_bind)
+    try:
+        with pytest.raises(ValueError, match="expired"):
+            if kind == "relay":
+                bridge.start_tool_relay(
+                    bridge_dir=bridge_dir, tools=[], tool_executor=AsyncMock(), loop=Mock()
+                )
+            else:
+                bridge._start_http_ingress(bridge_dir, "synthetic-local-token", queue.Queue())
+        server.server_close.assert_called_once()
+        server.serve_forever.assert_not_called()
+        for name in ("server.json", "tool_relay.json", "tool_relay.env"):
+            assert not (bridge_dir / name).exists()
+        assert bridge.read_active_session_id(bridge_dir) == ("conv_fenced" if reactivate else None)
+    finally:
+        request.close()
+
+
+@pytest.mark.parametrize("reactivate", [False, True])
+def test_old_relay_refresh_and_close_preserve_reactivated_credentials(
+    bridge_dir: Path, reactivate: bool
+) -> None:
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    _populate(request)
+    info = {"url": "http://unused.invalid", "token": "synthetic-old-relay", "tools": []}
+    relay = bridge.ClaudeNativeToolRelay(
+        bridge_dir=bridge_dir,
+        httpd=Mock(),
+        advertised_url=info["url"],
+        relay_info=info,
+        tool_executor=AsyncMock(),
+        closed=threading.Event(),
+        credential_binding=bridge.read_bridge_credential_binding(bridge_dir),
+    )
+    relay_file = bridge_dir / "tool_relay.json"
+    try:
+        relay.update_tools([], AsyncMock())
+        assert json.loads(relay_file.read_text())["token"] == info["token"]
+        request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+        if reactivate:
+            bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+            bridge._write_json_file(relay_file, {**info, "token": "synthetic-new-relay"})
+            current = relay_file.read_bytes()
+        with pytest.raises(RuntimeError, match="activation has ended"):
+            relay.update_tools([], AsyncMock())
+        relay.close()
+        if reactivate:
+            assert relay_file.read_bytes() == current
+        else:
+            assert not relay_file.exists()
+    finally:
+        request.close()
 
 
 @pytest.mark.parametrize("admitted", [False, True])

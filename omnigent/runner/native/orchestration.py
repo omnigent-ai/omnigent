@@ -37,6 +37,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
+    from omnigent.harnesses.claude_native.bridge import ClaudeBridgeCredentialBinding
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.app_server import (
         CodexAppServerClient,
@@ -452,6 +453,7 @@ async def _refresh_claude_permission_hook_auth(
     server_url: str,
     auth_token_factory: Callable[[], str | None],
     refresh_interval_s: float = _PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S,
+    credential_binding: ClaudeBridgeCredentialBinding | None = None,
 ) -> None:
     """Keep the Claude permission hook's header snapshot on a live bearer.
 
@@ -463,18 +465,29 @@ async def _refresh_claude_permission_hook_auth(
     :param server_url: Omnigent server receiving permission requests.
     :param auth_token_factory: Refresh-capable runner bearer factory.
     :param refresh_interval_s: Delay between snapshot refreshes.
+    :param credential_binding: Bridge activation that owns this background task.
     """
     from omnigent.cli_auth import databricks_request_headers
-    from omnigent.harnesses.claude_native.bridge import update_permission_hook_auth_headers
+    from omnigent.harnesses.claude_native.bridge import (
+        read_bridge_credential_binding,
+        update_permission_hook_auth_headers,
+    )
 
+    binding = credential_binding or read_bridge_credential_binding(bridge_dir)
+    if binding is None:
+        return
     last_token: str | None = None
     while True:
         await asyncio.sleep(refresh_interval_s)
+        if read_bridge_credential_binding(bridge_dir) != binding:
+            return
         try:
             token = await asyncio.to_thread(auth_token_factory)
             if token and token != last_token:
                 headers = databricks_request_headers(server_url, bearer_token=token)
-                if update_permission_hook_auth_headers(bridge_dir, headers):
+                if update_permission_hook_auth_headers(
+                    bridge_dir, headers, credential_binding=binding
+                ):
                     last_token = token
         except asyncio.CancelledError:
             raise
@@ -9712,6 +9725,7 @@ async def _auto_create_claude_terminal(
         claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
+        read_bridge_credential_binding,
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
@@ -9806,6 +9820,7 @@ async def _auto_create_claude_terminal(
         bridge_id=bridge_id,
         workspace=Path(workspace),
     )
+    hook_credential_binding = read_bridge_credential_binding(bridge_dir)
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)
@@ -10744,6 +10759,7 @@ async def _auto_create_claude_terminal(
                         bridge_dir=bridge_dir,
                         server_url=server_url,
                         auth_token_factory=_auth_factory,
+                        credential_binding=hook_credential_binding,
                     ),
                     name=f"claude-hook-auth-{session_id}",
                 )
