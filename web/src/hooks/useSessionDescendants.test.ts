@@ -4,6 +4,12 @@ import { authenticatedFetch } from "@/lib/identity";
 import { getSessionParent } from "@/lib/sessionHost";
 import { fetchSessionDescendants, SUB_AGENT_LIST_CAP } from "./useSessionDescendants";
 
+/** A read that answers only by failing once its signal aborts, as a cancelled fetch does. */
+const pendingUntilAborted = (signal: AbortSignal | undefined) =>
+  new Promise<Response>((_resolve, reject) => {
+    signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+  });
+
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
 }));
@@ -151,6 +157,33 @@ describe("fetchSessionDescendants", () => {
       expect(result.truncated).toBe(false);
     },
   );
+
+  it("cancels the siblings it read ahead once the first parent fills the cap, and reads no others", async () => {
+    const siblings = ["conv_cap_b", "conv_cap_c", "conv_cap_d", "conv_cap_e", "conv_cap_f"];
+    const signals = new Map<string, AbortSignal | undefined>();
+    let next = 0;
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = new URL(String(input), "http://test.local");
+      const parent = url.pathname.split("/")[3]!;
+      // No depths, so the hook walks: the root lists its children, then each child's.
+      if (parent === "conv_cap_root") return page(["conv_cap_a", ...siblings].map((id) => row(id)));
+      if (parent === "conv_cap_a") {
+        const rows = Array.from({ length: 200 }, () => row(`conv_cap_child_${(next += 1)}`));
+        return page(rows, rows.at(-1)!.id);
+      }
+      signals.set(parent, init?.signal ?? undefined);
+      return pendingUntilAborted(init?.signal ?? undefined);
+    });
+
+    const result = await fetchSessionDescendants("conv_cap_root");
+
+    expect(result.truncated).toBe(true);
+    expect(result.rows).toHaveLength(SUB_AGENT_LIST_CAP);
+    expect(ids(result).slice(0, 7)).toEqual(["conv_cap_a", ...siblings, "conv_cap_child_1"]);
+    // Only the next three parents were read ahead, and each read was cancelled.
+    expect([...signals.keys()]).toEqual(["conv_cap_b", "conv_cap_c", "conv_cap_d"]);
+    expect([...signals.values()].every((signal) => signal?.aborted)).toBe(true);
+  });
 
   it("stops the walk at the row cap and says the list is cut short", async () => {
     let next = 0;
