@@ -78,6 +78,32 @@ describe("project kanban", () => {
     expect(nestedAttentionLabel(approval)).toBe("1 needs attention");
   });
 
+  it("counts only fresh nested failures, ties included, and approvals on failed members", () => {
+    const member = (id: string, fields: Partial<Conversation>) =>
+      ({ ...row(id, 1, true), ...fields }) as Conversation;
+    const columnOf = (c: Conversation): StatusBucket =>
+      c.status === "failed" || (c.pending_elicitations_count ?? 0) > 0 ? "Needs attention" : "Done";
+    const cardOf = (...members: Conversation[]) =>
+      [...kanbanColumns(members, columnOf).values()].flat()[0];
+    const parent = member("parent", { status: "idle", updated_at: 100 });
+
+    const older = member("older", { status: "failed", updated_at: 50 });
+    const newer = member("newer", { status: "failed", updated_at: 150 });
+    expect(cardOf(parent, older, newer).attentionMembers.map((m) => m.id)).toEqual(["newer"]);
+
+    const tied = member("tied", { status: "failed", updated_at: 100 });
+    expect(cardOf(parent, tied).column).toBe("Needs attention");
+
+    const askingFailed = member("asking", {
+      status: "failed",
+      pending_elicitations_count: 1,
+      updated_at: 1,
+    });
+    const asking = cardOf(parent, askingFailed);
+    expect(asking.column).toBe("Needs attention");
+    expect(nestedAttentionLabel(asking)).toBe("1 needs attention");
+  });
+
   it("keeps a failed head in Needs attention without a nested note", () => {
     const failedHead = {
       ...row("parent", 1, true),

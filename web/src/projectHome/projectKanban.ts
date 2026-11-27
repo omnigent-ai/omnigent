@@ -99,9 +99,10 @@ export function kanbanColumns(
 export function nestedAttentionLabel(card: KanbanCard): string | null {
   const count = card.attentionMembers.length;
   if (count === 0) return null;
-  return card.attentionMembers.every((member) => member.status === "failed")
-    ? `${count} failed`
-    : `${count} need${count === 1 ? "s" : ""} attention`;
+  const onlyFailures = card.attentionMembers.every(
+    (member) => member.status === "failed" && (member.pending_elicitations_count ?? 0) === 0,
+  );
+  return onlyFailures ? `${count} failed` : `${count} need${count === 1 ? "s" : ""} attention`;
 }
 
 /** Cards with any session matching the search, by the sidebar search's title-or-id rule. */

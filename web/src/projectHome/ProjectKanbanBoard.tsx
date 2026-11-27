@@ -657,7 +657,7 @@ function useLastResponsePreview(conversation: Conversation): string | undefined 
   return data ? leadingSentences(data, RESPONSE_PREVIEW_SENTENCES) : undefined;
 }
 
-function KanbanCardBody({
+export function KanbanCardBody({
   card,
   hideAwaitingTag = false,
   reserveCornerAction = false,
