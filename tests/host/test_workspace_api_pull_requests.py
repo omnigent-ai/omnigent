@@ -1225,6 +1225,8 @@ async def test_an_auto_merge_batch_waits_longer_and_its_lost_answer_is_unconfirm
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A batch reads and changes up to 20 pull requests, past a single change's 20 s."""
+    assert workspace_api._reply_timeout("EnableAutoMerge", changes=True) == 120.0
+    assert workspace_api._reply_timeout("SetPullRequestState", changes=True) == 20.0
     monkeypatch.setattr(workspace_api, "_WRITE_REPLY_TIMEOUT_S", 60.0)
     monkeypatch.setattr(workspace_api, "_AUTO_MERGE_REPLY_TIMEOUT_S", 0.05)
     tunnel = _tunnel(tmp_path)
