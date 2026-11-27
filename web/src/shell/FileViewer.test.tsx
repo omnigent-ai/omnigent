@@ -277,6 +277,7 @@ interface RenderProps {
   frameless?: boolean;
   besideSidebar?: boolean;
   toolbarLeading?: React.ReactNode;
+  toolbarTrailing?: React.ReactNode;
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
   open?: boolean;
@@ -320,6 +321,7 @@ function viewerTree({
   frameless,
   besideSidebar,
   toolbarLeading,
+  toolbarTrailing,
   mobileOverlay,
   position,
   open = false,
@@ -351,6 +353,7 @@ function viewerTree({
           frameless={frameless}
           besideSidebar={besideSidebar}
           toolbarLeading={toolbarLeading}
+          toolbarTrailing={toolbarTrailing}
           mobileOverlay={mobileOverlay}
           position={position}
           open={open}
@@ -593,6 +596,31 @@ describe("FileViewer mobile keyboard inset", () => {
     expect(toolbar.querySelector("button")).toBe(leading);
     // The banner and content sit in the cell beside the sidebar.
     expect(root.children[1]).toHaveClass("col-start-2", "row-start-2");
+  });
+
+  it("ends the toolbar with a trailing control, after the file's actions", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({
+      open: true,
+      frameless: true,
+      besideSidebar: true,
+      toolbarTrailing: <button type="button">Hide tree</button>,
+    });
+    const toolbar = screen.getByTestId("file-viewer").firstElementChild as HTMLElement;
+    const buttons = within(toolbar).getAllByRole("button");
+    expect(buttons.at(-1)).toHaveAccessibleName("Hide tree");
+    expect(within(toolbar).getAllByRole("button", { name: "Hide tree" })).toHaveLength(1);
+  });
+
+  it("draws no trailing slot when none is given, as every classic viewer is", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, frameless: true });
+    const toolbar = screen.getByTestId("file-viewer").firstElementChild as HTMLElement;
+    const actions = within(toolbar).getByTestId("FILESTOOLBAR");
+    // The file's actions end the toolbar, followed only by the hidden measuring clones.
+    expect([...actions.children].filter((child) => !child.hasAttribute("aria-hidden")).at(-1)).toBe(
+      actions.querySelector(":scope > div.flex.items-center.justify-end"),
+    );
   });
 
   it("does not pad the desktop rail for the iOS keyboard", () => {

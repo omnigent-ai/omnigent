@@ -304,6 +304,7 @@ function useToolbarOverflow(actionsKey: string): {
   navRef: React.RefObject<HTMLDivElement | null>;
   pathMeasureRef: React.RefObject<HTMLSpanElement | null>;
   chipRef: React.RefObject<HTMLSpanElement | null>;
+  trailingRef: React.RefObject<HTMLDivElement | null>;
   measureRef: React.RefObject<HTMLDivElement | null>;
   collapsed: boolean;
 } {
@@ -312,6 +313,7 @@ function useToolbarOverflow(actionsKey: string): {
   const navRef = useRef<HTMLDivElement | null>(null);
   const pathMeasureRef = useRef<HTMLSpanElement | null>(null);
   const chipRef = useRef<HTMLSpanElement | null>(null);
+  const trailingRef = useRef<HTMLDivElement | null>(null);
   const measureRef = useRef<HTMLDivElement | null>(null);
   const [collapsed, setCollapsed] = useState(false);
 
@@ -328,6 +330,7 @@ function useToolbarOverflow(actionsKey: string): {
       const backWidth = backRef.current?.offsetWidth ?? 0;
       const navWidth = navRef.current?.offsetWidth ?? 0;
       const chipWidth = chipRef.current?.offsetWidth ?? 0;
+      const trailingWidth = trailingRef.current?.offsetWidth ?? 0;
       const buttonsWidth = measure.scrollWidth;
       // Path-aware reserve: the label's intrinsic text width, clamped. Measured
       // from an OFFSCREEN, unconstrained clone of the label — NOT the live
@@ -339,7 +342,8 @@ function useToolbarOverflow(actionsKey: string): {
         TOOLBAR_MAX_TITLE_PX,
       );
       // ~12px covers the inter-group flex gaps.
-      const required = backWidth + navWidth + titleReserve + chipWidth + buttonsWidth + 12;
+      const required =
+        backWidth + navWidth + titleReserve + chipWidth + buttonsWidth + trailingWidth + 12;
       setCollapsed(available < required);
     };
     evaluate();
@@ -351,7 +355,16 @@ function useToolbarOverflow(actionsKey: string): {
     return () => ro.disconnect();
   }, [actionsKey]);
 
-  return { headerRef, backRef, navRef, pathMeasureRef, chipRef, measureRef, collapsed };
+  return {
+    headerRef,
+    backRef,
+    navRef,
+    pathMeasureRef,
+    chipRef,
+    trailingRef,
+    measureRef,
+    collapsed,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +422,8 @@ interface FileViewerProps {
   besideSidebar?: boolean;
   /** Shown first in the toolbar, such as a sidebar's toggle. */
   toolbarLeading?: ReactNode;
+  /** Shown last in the toolbar, such as the toggle of a sidebar docked below it at the right. */
+  toolbarTrailing?: ReactNode;
   /**
    * Shows the file's changes in the Changes review, as the tabs sidebar's text files do:
    * the toolbar's diff button then reads "Show changes", and "Open file" in a diff.
@@ -490,6 +505,7 @@ function FileViewerBody({
   pathHeader,
   besideSidebar = false,
   toolbarLeading,
+  toolbarTrailing,
   onShowChanges,
   mobileOverlay = false,
   viewport,
@@ -1732,18 +1748,21 @@ function FileViewerBody({
     navRef: toolbarNavRef,
     pathMeasureRef: toolbarPathMeasureRef,
     chipRef: toolbarChipRef,
+    trailingRef: toolbarTrailingRef,
     measureRef: toolbarMeasureRef,
     collapsed: toolbarCollapsed,
   } = useToolbarOverflow(
     // Re-measure when anything that contributes to the required width changes:
     // the action set (per view mode), the save chip's presence, the prev/next
-    // nav cluster's presence, or the file path (its intrinsic width feeds the
-    // path-aware title reserve). Each shifts the constants the effect reads.
+    // nav cluster's presence, a trailing control's presence, or the file path (its
+    // intrinsic width feeds the path-aware title reserve). Each shifts the constants
+    // the effect reads.
     [
       toolbarActions.map((a) => a.key).join(","),
       `back:${!frameless || mobileOverlay}`,
       `chip:${saveStatus !== "idle"}`,
       `nav:${showNavButtons}`,
+      `trailing:${toolbarTrailing !== undefined}`,
       `path:${path}`,
     ].join("|"),
   );
@@ -2115,6 +2134,11 @@ function FileViewerBody({
               renderActionButtons(true)
             )}
           </div>
+          {toolbarTrailing !== undefined && (
+            <div ref={toolbarTrailingRef} className="flex shrink-0 items-center">
+              {toolbarTrailing}
+            </div>
+          )}
           {/* Offscreen measurement clones — rendered out of flow and out of the
               a11y tree purely so the overflow hook can read intrinsic widths
               that don't depend on the live (flex-coupled) layout:
