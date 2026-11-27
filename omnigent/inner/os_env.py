@@ -579,6 +579,8 @@ class _HelperProcessClient:
             ):
                 raise OSError("Shell request did not bound its output")
         except OSError as exc:
+            if not request.admitted:
+                return {"error": f"Failed to start isolated shell request: {exc}"}
             return {
                 "error": (
                     "Lost the isolated shell request; it may already have run, "

@@ -87,6 +87,13 @@ class BwrapShellRequest:
         self.cancelled = threading.Event()
         self._lock = threading.Lock()
         self._owner: BwrapRequestControl | None = None
+        self._admitted = False
+
+    @property
+    def admitted(self) -> bool:
+        """Include a possibly delivered admission even after its owner retires."""
+        with self._lock:
+            return self._admitted or (self._owner is not None and self._owner.admitted)
 
     def cancel(self) -> None:
         self.cancelled.set()
@@ -205,6 +212,8 @@ class BwrapShellRequest:
                 return owner.run(deadline=time.monotonic() + timeout, max_output=max_output)
             finally:
                 with self._lock:
+                    if owner is not None and owner.admitted:
+                        self._admitted = True
                     self._owner = None
                 with contextlib.ExitStack() as streams:
                     if process is not None:

@@ -137,6 +137,7 @@ def launch_case(monkeypatch: pytest.MonkeyPatch) -> _LaunchCase:
     process.stderr = io.BytesIO()
     process.communicate.return_value = (b"", b"")
     owner = MagicMock(spec=shell_request.BwrapRequestControl)
+    owner.admitted = False
     configuration: dict[str, object] = {}
     descriptors: list[int] = []
     transfer: list[int] = []
@@ -177,6 +178,7 @@ def launch_case(monkeypatch: pytest.MonkeyPatch) -> _LaunchCase:
         return owner
 
     def run(*_args: object, **_kwargs: object) -> BwrapRequestResult:
+        owner.admitted = True
         os.close(transfer.pop())
         return BwrapRequestResult(b"done\r\n", b"", 0, False, "utf-8")
 
@@ -223,6 +225,7 @@ def test_launch_delivers_private_config_and_preserves_the_relay_until_owner_comp
         "socket_path": "/private/broker.sock",
     }
     case.owner.run.assert_called_once()
+    assert case.request.admitted
     assert case.owner.run.call_args.kwargs["max_output"] == 17
     case.process.communicate.assert_not_called()
     assert case.process.stdout.closed and case.process.stderr.closed
@@ -231,12 +234,25 @@ def test_launch_delivers_private_config_and_preserves_the_relay_until_owner_comp
             os.fstat(descriptor)
 
 
-@pytest.mark.parametrize("failure", ["readiness-timeout", "invalid-metadata", "receive", "spawn"])
-def test_pre_admission_failure_closes_the_channel_reaps_the_launcher_and_never_retries(
-    launch_case: _LaunchCase, tmp_path: Path, failure: str
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unsupported",
+        "readiness-timeout",
+        "invalid-metadata",
+        "receive",
+        "spawn",
+        "unadmitted",
+        "admission-lost",
+    ],
+)
+def test_launch_failures_preserve_admission_and_retire_resources_without_retry(
+    launch_case: _LaunchCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     case = launch_case
-    if failure == "readiness-timeout":
+    if failure == "unsupported":
+        monkeypatch.setattr(shell_request, "request_launcher", lambda *_args: None)
+    elif failure == "readiness-timeout":
         case.poll.return_value = []
     elif failure == "invalid-metadata":
         original = case.spawn.side_effect
@@ -252,14 +268,31 @@ def test_pre_admission_failure_closes_the_channel_reaps_the_launcher_and_never_r
         case.spawn.side_effect = invalid_metadata
     elif failure == "receive":
         case.receive.side_effect = OSError("readiness rejected")
+    elif failure in {"unadmitted", "admission-lost"}:
+        original_run = case.owner.run.side_effect
+
+        def failed_run(*args: object, **kwargs: object) -> None:
+            original_run(*args, **kwargs)
+            case.owner.admitted = failure == "admission-lost"
+            raise OSError("admission failed")
+
+        case.owner.run.side_effect = failed_run
     else:
         case.spawn.side_effect = OSError("spawn failed")
     with pytest.raises(OSError):
         _launch(case, tmp_path)
-    case.spawn.assert_called_once()
-    case.owner.run.assert_not_called()
-    if failure != "spawn":
+    assert case.request.admitted == (failure == "admission-lost")
+    if failure == "unsupported":
+        case.spawn.assert_not_called()
+    else:
+        case.spawn.assert_called_once()
+    if failure in {"unadmitted", "admission-lost"}:
+        case.owner.run.assert_called_once()
+    else:
+        case.owner.run.assert_not_called()
+    if failure in {"readiness-timeout", "invalid-metadata", "receive"}:
         case.process.communicate.assert_called_once_with(timeout=1)
+    if failure not in {"spawn", "unsupported"}:
         assert case.process.stdout.closed and case.process.stderr.closed
     for descriptor in case.descriptors:
         with pytest.raises(OSError):
@@ -275,7 +308,16 @@ def test_cancelled_request_never_reaches_spawn(launch_case: _LaunchCase, tmp_pat
 
 @pytest.mark.parametrize(
     "ending",
-    ["success", "nonzero", "nonzero-truncated", "timeout", "lost", "decode", "timeout-invalid"],
+    [
+        "success",
+        "nonzero",
+        "nonzero-truncated",
+        "timeout",
+        "not-admitted",
+        "lost",
+        "decode",
+        "timeout-invalid",
+    ],
 )
 def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semantics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
@@ -312,7 +354,10 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
         encoding,
     )
     run = MagicMock(return_value=result)
-    if ending == "lost":
+    if ending == "not-admitted":
+        run.side_effect = OSError("request did not start")
+    elif ending == "lost":
+        request._admitted = True
         run.side_effect = OSError("result lost after admission")
     monkeypatch.setattr(request, "run", run)
     try:
@@ -329,7 +374,11 @@ def test_helper_uses_only_prepared_environment_and_preserves_shell_result_semant
             options["command_env"]["HTTP_PROXY"] == "http://omnigent:broker-secret@127.0.0.1:1234"
         )
         assert prepared.env["HTTP_PROXY"] == "http://127.0.0.1:1234"
-        if ending == "lost":
+        if ending == "not-admitted":
+            assert actual == {
+                "error": "Failed to start isolated shell request: request did not start"
+            }
+        elif ending == "lost":
             assert "not sent again" in actual["error"]
         elif ending == "decode":
             assert actual["error"].startswith("os_env helper exception:")
