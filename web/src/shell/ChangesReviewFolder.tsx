@@ -3,7 +3,7 @@
 // header opens the same folder browser Files does; choosing a folder moves both.
 
 import { FolderOpenIcon, FolderSearchIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { useSession } from "@/hooks/useSession";
@@ -118,7 +118,10 @@ export function useReviewFolder(
   // A workspace inside a larger repository can't choose, so choosing waits until that's known.
   const canChoose = canRoam && worktreesKnown && !insideLargerRepository;
   const [open, setOpen] = useState(false);
-  const showWorkspace = () => rememberBrowseLocation(conversationId, null);
+  const showWorkspace = useCallback(
+    () => rememberBrowseLocation(conversationId, null),
+    [conversationId],
+  );
   const dialog =
     canChoose && workspace ? (
       <WorkspacePickerDialog
@@ -156,13 +159,21 @@ export function useReviewFolder(
                     icon: FolderOpenIcon,
                     keywords: ["worktree", "workspace", "folder", "diffs", "changes"],
                     availability: AVAILABLE,
-                    run: () => rememberBrowseLocation(conversationId, null),
+                    run: showWorkspace,
                   },
                 ]
               : []),
           ]
         : [],
-    [active, canChoose, cannotChooseReason, conversationId, awayFromWorkspace, workspace],
+    [
+      active,
+      canChoose,
+      cannotChooseReason,
+      conversationId,
+      awayFromWorkspace,
+      workspace,
+      showWorkspace,
+    ],
   );
   usePaletteCommands(`changes-review-folder:${conversationId}`, "Changes", commands);
   return {

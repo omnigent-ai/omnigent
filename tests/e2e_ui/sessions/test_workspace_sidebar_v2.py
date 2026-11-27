@@ -916,14 +916,11 @@ def test_diffs_folder_name_picks_a_worktree_that_files_follows(
     expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
     _open_app(page, sidebar, "Diffs")
 
-    def changed(name: str) -> Locator:
-        return _changed(sidebar, name)
-
     folder = _pick_worktree_in_diffs(page, sidebar)
 
     # Diffs reviews the worktree on its own: its change, and none of the workspace's.
-    expect(changed("only_in_worktree.txt")).to_be_visible(timeout=30_000)
-    expect(changed("only_in_workspace.txt")).to_have_count(0)
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_have_count(0)
     expect(sidebar.get_by_text("Not available on this host yet.")).to_have_count(0)
 
     # A comparison changed in the worktree is a step there: Back returns to the worktree's
@@ -938,7 +935,7 @@ def test_diffs_folder_name_picks_a_worktree_that_files_follows(
     ).click()
     expect(trigger).to_contain_text("All branch changes", timeout=30_000)
     expect(folder).to_have_text("wt")
-    expect(changed("only_in_worktree.txt")).to_be_visible(timeout=30_000)
+    expect(_changed(sidebar, "only_in_worktree.txt")).to_be_visible(timeout=30_000)
 
     # Files moved with it.
     _open_app(page, sidebar, "Files")
@@ -956,7 +953,7 @@ def test_diffs_folder_name_picks_a_worktree_that_files_follows(
     palette.fill("Show repository in Diffs")
     page.get_by_role("option", name=re.compile("Show repository in Diffs")).first.click()
     expect(folder).to_have_text("repository", timeout=30_000)
-    expect(changed("only_in_workspace.txt")).to_be_visible(timeout=30_000)
+    expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
     strip.get_by_role("tab", name="Files", exact=True).click()
     expect(
         sidebar.get_by_role("treeitem", name="only_in_workspace.txt", exact=True)
