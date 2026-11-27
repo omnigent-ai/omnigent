@@ -20,6 +20,8 @@
 //   * This module never throws: a broken/old shell must not take down
 //     notifications in the browser path.
 
+import type { CodeHostDesktopApi, CodeHostDesktopFeatures } from "./nativeBridgeCodeHost";
+
 /**
  * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
  * `move` are live drag frames carrying an open fraction; `open` and `close`
@@ -231,7 +233,7 @@ export interface NativeViewModeParams {
  * server-served and may be newer than the installed shell, whose preload then
  * lacks these methods.
  */
-interface ElectronDesktopApi extends NativeShellApi {
+interface ElectronDesktopApi extends NativeShellApi, CodeHostDesktopApi {
   kind: "electron";
   /** The runner picked during onboarding for this server, returned once. */
   takeOnboardingRunner?: () => Promise<OnboardingRunner | null>;
@@ -627,7 +629,7 @@ export function workspaceSocketBridge():
  * Desktop-shell feature gates the server can't know about. All fields
  * optional: an older shell reports fewer.
  */
-export interface DesktopFeatures {
+export interface DesktopFeatures extends CodeHostDesktopFeatures {
   /**
    * Managed features (e.g. the Arca host option) are enabled.
    * Already scoped by the shell: true only when the flag is set AND the
@@ -1970,3 +1972,5 @@ export async function droppedFilePath(file: File): Promise<string | null> {
     return null;
   }
 }
+
+export * from "./nativeBridgeCodeHost";
