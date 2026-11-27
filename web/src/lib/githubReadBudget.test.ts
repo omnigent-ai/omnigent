@@ -64,6 +64,9 @@ describe("githubReadBudgets", () => {
       store.observe(KEY, graphql(remaining, limit));
       expect(store.pace(KEY).pace, `${remaining}/${limit}`).toBe(pace);
     }
+    const slowed = budgets().store;
+    slowed.observe(KEY, graphql(1000));
+    expect(slowed.pace(KEY)).toEqual({ pace: "slow", factor: 4 });
     const { store } = budgets();
     store.observe(KEY, graphql(10));
     expect(store.pace(KEY)).toEqual({ pace: "stopped", until: RESET });

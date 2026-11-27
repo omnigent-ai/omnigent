@@ -426,7 +426,10 @@ describe("a browser's own overrides", () => {
   beforeEach(() => {
     registerBrowserFlagDefinitions([{ name: FLAG, type: "boolean", rendererVisible: true }]);
   });
+  // Each read's subscription, ended after its test so no later test hears an earlier one.
+  const reads: (() => void)[] = [];
   afterEach(() => {
+    for (const unsubscribe of reads.splice(0)) unsubscribe();
     resetBrowserFlagDefinitionsForTests();
   });
 
@@ -435,6 +438,7 @@ describe("a browser's own overrides", () => {
     const unsubscribe = readDesktopFeatureFlag(FLAG, { fallback, accepts }, (reading) =>
       readings.push(reading),
     );
+    reads.push(unsubscribe);
     return { readings, unsubscribe };
   }
 

@@ -95,7 +95,9 @@ export function browserFlagOverrides(): BrowserFlagOverrides {
 
 /** The choice for `name`, or undefined while it's Automatic. */
 export function browserFlagOverride(name: string): boolean | undefined {
-  return browserFlagOverrides()[name];
+  const overrides = browserFlagOverrides();
+  // Own choices only, so a flag named like `constructor` never reads an inherited function.
+  return Object.hasOwn(overrides, name) ? overrides[name] : undefined;
 }
 
 /**

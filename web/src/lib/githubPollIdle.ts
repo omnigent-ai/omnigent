@@ -1,6 +1,6 @@
-// A focused window nobody has touched for a few minutes polls its GitHub lists 4 times slower.
-// The first input after that reads each slowed poll that's past its usual interval, once, if
-// its pacer would let it; the others go back to their usual pace.
+// A window nobody has touched for a few minutes polls its GitHub lists 4 times slower, focused or
+// not: the focus pause is a separate policy. The first input after that reads each slowed poll
+// past its usual interval once, if its pacer would let it; the others go back to their pace.
 
 import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
 import { createHeldPolls, pollingObserver, type HeldPoll } from "@/lib/heldPolls";

@@ -64,6 +64,10 @@ function focusHarness({ focused = true } = {}) {
   return {
     focus,
     advance,
+    /** Move the clock on by `ms` without firing timers, as a suspended renderer does. */
+    suspend: (ms: number) => {
+      clock += ms;
+    },
     /** Set the wall clock back by `ms`, as a time zone or NTP correction can. */
     rewind: (ms: number) => {
       clock -= ms;
@@ -144,6 +148,20 @@ describe("githubPollFocus", () => {
     focus.pollPaused(brief.query);
     refocus();
     expect(brief.refetch).not.toHaveBeenCalled();
+  });
+
+  it("recovers polls at focus after a suspended renderer passed the pause without its timer", () => {
+    const { focus, poll, blur, refocus, suspend } = focusHarness();
+    const eligible = poll();
+    const ineligible = poll();
+    expect(focus.pollPaused(eligible.query)).toBe(false);
+    expect(focus.pollPaused(ineligible.query, () => false)).toBe(false);
+    blur();
+    suspend(UNFOCUSED_POLL_PAUSE_MS + 1);
+    refocus();
+    expect(eligible.refetch).toHaveBeenCalledTimes(1);
+    expect(ineligible.refetch).not.toHaveBeenCalled();
+    expect(ineligible.setOptions).toHaveBeenCalledTimes(1);
   });
 
   it("reads through an observer that still polls, never one that's off or stopped polling", () => {

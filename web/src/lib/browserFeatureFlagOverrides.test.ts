@@ -87,6 +87,21 @@ describe("browserFlagOverrides", () => {
     expect(browserFlagOverrides()).toEqual({ [FLAG]: true });
   });
 
+  it("reads only its own choices, even for a flag named like an object's own members", () => {
+    registerBrowserFlagDefinitions([
+      ...DEFINITIONS,
+      { name: "constructor", type: "boolean", rendererVisible: true },
+      { name: "toString", type: "boolean", rendererVisible: true },
+    ]);
+    expect(browserFlagOverride("constructor")).toBeUndefined();
+    expect(browserFlagOverride("toString")).toBeUndefined();
+    expect(browserFlagOverride("hasOwnProperty")).toBeUndefined();
+    setBrowserFlagOverride("constructor", true);
+    setBrowserFlagOverride("toString", false);
+    expect(browserFlagOverride("constructor")).toBe(true);
+    expect(browserFlagOverride("toString")).toBe(false);
+  });
+
   it("drops a registered flag's value that isn't a boolean", () => {
     for (const value of ["on", 1, null, { on: true }]) {
       store({ [FLAG]: value });
