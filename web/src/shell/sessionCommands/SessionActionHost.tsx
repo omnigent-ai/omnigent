@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { showToast } from "@/components/ui/toast";
 import {
   type Conversation,
   useMoveToNest,
@@ -42,13 +43,17 @@ export function SessionActionHost() {
   return request ? <SessionActionResolver key={request.key} request={request} /> : null;
 }
 
-/** Looks the session up as the action starts; one gone since does nothing. */
+/** Looks the session up as the action starts; one gone since says so and does nothing. */
 function SessionActionResolver({ request }: { request: SessionActionRequest }) {
   const queryClient = useQueryClient();
   const [conversation] = useState(() => {
     const row = currentSessionRow(queryClient, request.conversation, request.listed);
     // A request for a session gone by now is spent, so it can't run if the session returns.
-    if (!row) startSessionAction(request.key);
+    if (!row && startSessionAction(request.key)) {
+      showToast(
+        `Couldn't find “${conversationDisplayLabel(request.conversation)}”. It may have been deleted.`,
+      );
+    }
     return row;
   });
   return conversation ? (
@@ -95,7 +100,14 @@ function SessionActionRunner({
     // Once per request, even on a host mounted again.
     if (!current || !startSessionAction(key)) return;
     // Checked against the session's current state, which may have changed since its row showed.
-    if (!sessionCommand(current, command).availability.available) return;
+    const { availability, label } = sessionCommand(current, command);
+    if (!availability.available) {
+      showToast(
+        availability.reason ??
+          `${label} isn't available for “${conversationDisplayLabel(conversation)}” now.`,
+      );
+      return;
+    }
     const { id, updated_at: updatedAt } = conversation;
     const run = latest.current.actions;
     switch (command) {

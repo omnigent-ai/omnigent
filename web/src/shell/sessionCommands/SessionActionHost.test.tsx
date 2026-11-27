@@ -194,12 +194,16 @@ describe("SessionActionHost", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("does nothing for an action that stopped applying, such as pinning it once archived", () => {
+  it("says why, and does nothing, for an action that stopped applying", () => {
     renderHost();
     act(() => requestSessionAction({ ...SESSION, archived: true }, "pin"));
     act(() => requestSessionAction({ ...SESSION, owner: "someone-else" }, "rename"));
     expect(writes.pin).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).toBeNull();
+    expect(ui.toast.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringMatching(/^Pin.* isn't available for “.+” now\.$/),
+      "Only the session owner can rename this session",
+    ]);
   });
 
   it("renames from its dialog", async () => {
@@ -412,10 +416,14 @@ describe("SessionActionHost", () => {
       expect(writes.pin).not.toHaveBeenCalled();
     });
 
-    it("does nothing once a listed session has left every list", () => {
+    it("says so, and does nothing, once a listed session has left every list", () => {
       renderHost(cachedSessions());
       act(() => requestSessionAction(SESSION, "pin", { listed: true }));
       expect(writes.pin).not.toHaveBeenCalled();
+      expect(ui.toast).toHaveBeenCalledTimes(1);
+      expect(ui.toast).toHaveBeenCalledWith(
+        expect.stringMatching(/^Couldn't find “.+”\. It may have been deleted\.$/),
+      );
     });
 
     it("checks the current owner, not the one the row showed", () => {
