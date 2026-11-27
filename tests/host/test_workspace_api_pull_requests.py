@@ -1421,7 +1421,11 @@ async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
 
 # Every change to the pull request on its code host, with a valid request for it.
 _CODE_HOST_CHANGES = sorted(_PULL_REQUEST_WRITES - {"SetPullRequestAccount"})
-_CHANGE_REQUESTS = {**host_tests._OWNER_CALLS, **host_tests._REVIEW_CALLS}
+_CHANGE_REQUESTS = {
+    **host_tests._OWNER_CALLS,
+    **host_tests._REVIEW_CALLS,
+    **host_tests._QUEUE_CALLS,
+}
 _READ_ONLY_GITHUB = ("github.com",)
 
 
