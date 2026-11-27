@@ -44,6 +44,9 @@ class WorkspaceMethod:
 
 # The request fields that name pull requests; the server vouches for each one named.
 PULL_REQUEST_FIELDS = frozenset({"pr_url", "pull_requests"})
+# Pull request methods that find pull requests beyond the session's own. Only the server's
+# route serves them, and it sends them with no vouch, since they need none of the session's.
+PULL_REQUEST_FINDERS: frozenset[str] = frozenset({"GetPullRequestListStats", "LookupPullRequest"})
 
 
 def _snake_case(name: str) -> str:
@@ -55,9 +58,7 @@ def _snake_case(name: str) -> str:
 DECLARED_NOT_SERVED: frozenset[str] = frozenset(
     {
         "GetMergeReadiness",
-        "GetPullRequestListStats",
         "ListBranchPullRequests",
-        "LookupPullRequest",
         "PreviewReviewerPing",
         "SendReviewerPing",
     }
@@ -100,7 +101,8 @@ WORKSPACE_METHODS: dict[str, WorkspaceMethod] = {
         request_type=message_factory.GetMessageClass(method.input_type),
         response_type=message_factory.GetMessageClass(method.output_type),
         streaming=method.server_streaming,
-        pull_request=bool(PULL_REQUEST_FIELDS & set(method.input_type.fields_by_name)),
+        pull_request=method.name in PULL_REQUEST_FINDERS
+        or bool(PULL_REQUEST_FIELDS & set(method.input_type.fields_by_name)),
         no_side_effects=method.GetOptions().idempotency_level == MethodOptions.NO_SIDE_EFFECTS,
     )
     for method in workspace_pb2.DESCRIPTOR.services_by_name["WorkspaceService"].methods

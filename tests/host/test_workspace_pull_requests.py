@@ -26,6 +26,7 @@ from omnigent.host.workspace_tokens import mint_token
 from omnigent.runner import (
     github_images,
     github_lifecycle,
+    github_lookup,
     github_merge_queue,
     github_resource,
     github_reviews,
@@ -301,6 +302,8 @@ def _naming_the_pr(method: str) -> Any:
     request_type = WORKSPACE_METHODS[method].request_type
     if "pr_url" in request_type.DESCRIPTOR.fields_by_name:
         return request_type(pr_url=_PR)
+    if "pr_urls" in request_type.DESCRIPTOR.fields_by_name:
+        return request_type(pr_urls=[_PR])
     return request_type(pull_requests=[{"pr_url": _PR}])
 
 
@@ -577,6 +580,19 @@ _SEARCH_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
 }
 # The methods that act on GitHub for the session's selected pull request.
 _SELECTED_PR_CALLS = {**_GITHUB_CHANGE_CALLS, **_QUEUE_CALLS, **_STACK_CALLS, **_SEARCH_CALLS}
+# The methods that read pull requests by URL alone: a request, its function and arguments.
+_FINDER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "LookupPullRequest": (
+        pb.LookupPullRequestRequest(pr_url=_OTHER_PR),
+        "lookup_pull_request",
+        {"pr_url": _OTHER_PR},
+    ),
+    "GetPullRequestListStats": (
+        pb.GetPullRequestListStatsRequest(pr_urls=[_PR, _OTHER_PR]),
+        "pull_request_list_stats",
+        {"pr_urls": [_PR, _OTHER_PR]},
+    ),
+}
 
 
 def record_github_changes(
@@ -649,7 +665,11 @@ def test_every_owner_method_has_a_call_case() -> None:
         set(_GITHUB_CHANGE_CALLS) | set(_QUEUE_CALLS) | set(_STACK_CALLS)
     )
     owner_unary = _PULL_REQUEST_OWNER_METHODS - _PULL_REQUEST_OWNER_STREAMS
-    assert set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) | {"EnableAutoMerge"} == owner_unary
+    assert not set(_FINDER_CALLS) & (set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS))
+    assert (
+        set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) | set(_FINDER_CALLS) | {"EnableAutoMerge"}
+        == owner_unary
+    )
 
 
 @pytest.mark.parametrize("method", sorted(_OWNER_CALLS))
@@ -1004,6 +1024,82 @@ async def test_a_reference_completion_passes_its_kind_to_the_search(
 
     assert code is None, message
     assert [call[3] for call in github_changes] == [{"kind": "REFERENCE", "text": "fix"}]
+
+
+def record_finder_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    """Each finder's runner call: the function, its root and arguments."""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    for function in {name for _request, name, _kwargs in _FINDER_CALLS.values()}:
+
+        def record(root: str, *, _function: str = function, **kwargs: Any) -> dict[str, Any]:
+            calls.append((_function, root, kwargs))
+            return {"object": "test"}
+
+        monkeypatch.setattr(github_lookup, function, record)
+    return calls
+
+
+@pytest.fixture
+def finder_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    return record_finder_calls(monkeypatch)
+
+
+@pytest.mark.parametrize("vouch", [None, _VOUCHED], ids=["no-vouch", "vouched"])
+@pytest.mark.parametrize("method", sorted(_FINDER_CALLS))
+async def test_a_finder_reads_the_requests_urls_for_a_session_that_links_none(
+    tmp_path: Path,
+    method: str,
+    vouch: PullRequestVouch | None,
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+    provider_reads: list[str | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It reads no PR of the session's: no record, vouch or selected PR is consulted."""
+    selected: list[Any] = []
+    monkeypatch.setattr(pr_resource, "_selected_pr", lambda *args: selected.append(args))
+    request, function, kwargs = _FINDER_CALLS[method]
+    messages, code, message = await _answer(
+        _frame(tmp_path, method, request.SerializeToString(), vouch=vouch)
+    )
+
+    assert code is None, message
+    assert finder_calls == [(function, str(tmp_path.resolve()), kwargs)]
+    payload = WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload
+    assert payload_dict(payload) == {"object": "test"}
+    assert selected == []
+    assert provider_reads == []
+
+
+@pytest.mark.parametrize(
+    ("request_message", "refusal"),
+    [
+        (pb.LookupPullRequestRequest(), "Expected a pull request URL"),
+        (
+            pb.LookupPullRequestRequest(pr_url="https://github.com/" + "x" * 2048),
+            "The pull request URL is longer than 2048 characters",
+        ),
+        (pb.GetPullRequestListStatsRequest(), "Ask for 1 to 50 pull requests"),
+        (
+            pb.GetPullRequestListStatsRequest(pr_urls=[_PR] * 51),
+            "Ask for 1 to 50 pull requests",
+        ),
+        (pb.GetPullRequestListStatsRequest(pr_urls=[_PR, ""]), "Expected a pull request URL"),
+    ],
+    ids=["lookup-none", "lookup-long", "stats-none", "stats-too-many", "stats-empty-url"],
+)
+async def test_a_finder_naming_no_usable_url_is_refused_with_nothing_read(
+    tmp_path: Path,
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+    request_message: Any,
+    refusal: str,
+) -> None:
+    method = type(request_message).__name__.removesuffix("Request")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, request_message.SerializeToString())
+    )
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
+    assert finder_calls == []
 
 
 @pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))
