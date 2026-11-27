@@ -37,6 +37,7 @@ import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
 import { durableServerScope } from "@/lib/durableServerScope";
 import { resolveAutomaticGitHubReaderWith } from "@/lib/githubCooldown";
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
+import { createReadPathOwnerWatch, readPathOwner } from "@/lib/readPathOwner";
 import { acceptedWorkspaceDesign, subscribeAcceptedWorkspaceDesign } from "@/lib/workspaceSurfaces";
 import {
   acceptMacRead,
@@ -232,8 +233,6 @@ const unsignedHosts = new Set<string>();
 // GitHub hosts whose account main is being asked for again, after a change dropped it.
 const identityChecks = new Set<string>();
 const scopes = new Map<string, ScopeState>();
-// The workspace user the scopes' reads were for, so a switch drops that user's.
-let scopeUser: string | null = null;
 // Each PR's explicit read choice for this app run, by canonical URL; absent is Automatic.
 const readChoices = new Map<string, Exclude<ReadChoice, "automatic">>();
 // Sessions whose branch PR the user asked the session's machine to find, for this run.
@@ -248,6 +247,27 @@ function changed(): void {
   version += 1;
   for (const listener of listeners) listener();
 }
+
+// What a workspace user on one server chose or was told is theirs alone: another user, server
+// or base path starts on Automatic, with no account named for any host.
+const syncOwner = createReadPathOwnerWatch((how) => {
+  for (const entry of scopes.values()) {
+    entry.identity = null;
+    entry.failed = false;
+  }
+  readChoices.clear();
+  sessionMachineBranches.clear();
+  identityChecks.clear();
+  identityCheckUsers.clear();
+  if (how === "event") changed();
+  else {
+    // Found while something reads: listeners hear it after that read, never during it.
+    version += 1;
+    queueMicrotask(() => {
+      for (const listener of listeners) listener();
+    });
+  }
+});
 
 function scopeState(provider: MacReadProvider, host: string): ScopeState {
   const key = `${provider}\n${host.toLowerCase()}`;
@@ -315,7 +335,8 @@ export function ensureMacIdentity(host: string): void {
   const entry = githubScope(name);
   // A check still out for the previous workspace user doesn't answer for this one.
   if (entry.identity) return;
-  if (identityChecks.has(name) && identityCheckUsers.get(name) === getCurrentUserId()) return;
+  syncOwner();
+  if (identityChecks.has(name) && identityCheckUsers.get(name) === readPathOwner()) return;
   resolveMacIdentity(name, entry);
   changed();
 }
@@ -360,12 +381,12 @@ const MAX_STALE_IDENTITY_ANSWERS = 3;
 function resolveMacIdentity(name: string, entry: ScopeState, staleAnswers = 0): void {
   const request = (identityRequests.get(name) ?? 0) + 1;
   identityRequests.set(name, request);
-  const userId = getCurrentUserId();
+  const owner = readPathOwner();
   identityChecks.add(name);
-  identityCheckUsers.set(name, userId);
+  identityCheckUsers.set(name, owner);
   const resolution = desktopMacAccounts(name).then((choice) => {
     if (identityRequests.get(name) !== request) return;
-    if (userId !== getCurrentUserId()) {
+    if (owner !== readPathOwner()) {
       identityChecks.delete(name);
       changed();
       return;
@@ -409,20 +430,9 @@ function start(): void {
   const stopAccounts = onDesktopMacAccountsChanged(accountsChanged);
   // Another workspace user's answers must not show: keys carry the user, and the
   // shared scope advances every one of the previous user's. What main said about
-  // accounts was for them too.
-  scopeUser = getCurrentUserId();
-  const stopIdentity = subscribeIdentity(() => {
-    const previous = scopeUser;
-    scopeUser = getCurrentUserId();
-    if (previous === scopeUser) return;
-    for (const entry of scopes.values()) {
-      entry.identity = null;
-      entry.failed = false;
-    }
-    // A choice was the previous user's; the next one starts on Automatic.
-    readChoices.clear();
-    changed();
-  });
+  // accounts was for them too; a switch of server is found as the store is read.
+  syncOwner();
+  const stopIdentity = subscribeIdentity(() => syncOwner("event"));
   stopWatching = () => {
     stopReadsFlag();
     stopPreference();
@@ -575,6 +585,7 @@ let routeCache: {
 
 /** The PR's effective read route now, from the automatic policy and the user's choice. */
 export function readRouteFor(rawUrl: string | null | undefined): ReadRoute {
+  syncOwner();
   // Before the store listens, a change to the setting wouldn't move its version.
   if (!rawUrl || !started) return routeNow(rawUrl);
   const serverScope = durableServerScope();
@@ -638,6 +649,7 @@ export function automaticReadRoute(url: string | null | undefined): "mac" | "hos
 
 /** The user's choice for `url`; Automatic when there is none. */
 export function readChoiceFor(url: string | null | undefined): ReadChoice {
+  syncOwner();
   const key = readChoiceKey(url);
   return (key ? readChoices.get(key) : undefined) ?? "automatic";
 }
@@ -712,6 +724,7 @@ export function branchDiscoveryProvider(
   sessionId: string,
   host: string | null,
 ): CodeHostPullRequest["provider"] | null {
+  syncOwner();
   if (!host || sessionMachineBranches.has(sessionId)) return null;
   const name = host.toLowerCase();
   const provider = codeHostProvider(name, githubHosts) ?? null;
@@ -757,11 +770,13 @@ export function contextHostProvider(host: string): CodeHostProviderId | "pending
 
 /** Whether the user asked the session's machine to find this session's branch PR. */
 export function findsBranchOnSessionMachine(sessionId: string): boolean {
+  syncOwner();
   return sessionMachineBranches.has(sessionId);
 }
 
 /** Find the session's branch PR with the session's machine for the rest of this app run. */
 export function findBranchOnSessionMachine(sessionId: string): void {
+  syncOwner();
   if (sessionMachineBranches.has(sessionId)) return;
   sessionMachineBranches.add(sessionId);
   changed();
@@ -769,6 +784,7 @@ export function findBranchOnSessionMachine(sessionId: string): void {
 
 /** Find the session's branch PR on this Mac again, undoing {@link findBranchOnSessionMachine}. */
 export function findBranchOnThisMacAgain(sessionId: string): void {
+  syncOwner();
   if (sessionMachineBranches.delete(sessionId)) changed();
 }
 
@@ -942,6 +958,7 @@ const isMacReadProvider = (provider: Provider): provider is MacReadProvider =>
 
 /** The account this Mac last read `host` as, or null before its first read. */
 export function macIdentity(host: string): Pick<MacAccountIdentity, "login" | "generation"> | null {
+  syncOwner();
   return scopes.get(`github\n${host.toLowerCase()}`)?.identity ?? null;
 }
 
@@ -956,13 +973,13 @@ export async function discoverMacIdentity(host: string): Promise<string | null> 
   if (known) return known.login;
   const epoch = accountEpochs.get(name) ?? 0;
   const lifetime = readPathLifetime;
-  const userId = getCurrentUserId();
+  const owner = readPathOwner();
   // Main is asked once per account change: a check that named nobody answers until the next.
   const asked = identityResolutions.get(name);
-  if (!asked || identityCheckUsers.get(name) !== getCurrentUserId()) ensureMacIdentity(name);
+  if (!asked || identityCheckUsers.get(name) !== owner) ensureMacIdentity(name);
   await latestIdentityAnswer(name);
   const moved = (accountEpochs.get(name) ?? 0) !== epoch || readPathLifetime !== lifetime;
-  if (moved || getCurrentUserId() !== userId) return null;
+  if (moved || readPathOwner() !== owner) return null;
   return macIdentity(name)?.login ?? null;
 }
 
@@ -1236,7 +1253,7 @@ export function resetDesktopReadPathForTests(): void {
   identityChecks.clear();
   scopes.clear();
   resetMacReadScopesForTests();
-  scopeUser = null;
+  syncOwner.forget();
   readChoices.clear();
   sessionMachineBranches.clear();
   listeners.clear();

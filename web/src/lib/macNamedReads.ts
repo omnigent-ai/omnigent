@@ -12,6 +12,7 @@ import {
   useDesktopReadPathVersion,
 } from "@/lib/desktopReadPath";
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
+import { createReadPathOwnerWatch } from "@/lib/readPathOwner";
 import {
   acceptMacRead,
   acceptedMacReader,
@@ -138,6 +139,23 @@ let started = false;
 /** Ends what `start` listens to, so a test's reset leaves no subscription behind. */
 let stopWatching: (() => void) | null = null;
 
+// Who each login proved to be, or was refused as, was for the previous workspace user, server or
+// base path; every epoch moves, so what was kept as a login goes.
+const syncOwner = createReadPathOwnerWatch((how) => {
+  identityChanges += 1;
+  writers.clear();
+  refusedReaders.clear();
+  answeredFor.clear();
+  if (how === "event") changed();
+  else {
+    // Found while something reads: listeners hear it after that read, never during it.
+    version += 1;
+    queueMicrotask(() => {
+      for (const listener of listeners) listener();
+    });
+  }
+});
+
 function changed(): void {
   version += 1;
   for (const listener of listeners) listener();
@@ -161,6 +179,7 @@ function bumpEpoch(host: string, login: string): void {
 
 /** Moves whenever what was read as `reader` must go: it signed out, the page left it, or the user changed. */
 export function namedReaderEpoch(reader: MacNamedReader): number {
+  syncOwner();
   return (epochs.get(scopeId(reader.host, reader.login)) ?? 0) + identityChanges;
 }
 
@@ -211,18 +230,8 @@ function start(): void {
       changed();
     },
   );
-  // Who each login proved to be, or was refused as, was for the previous workspace user.
-  let user = getCurrentUserId();
-  const stopIdentity = subscribeIdentity(() => {
-    const previous = user;
-    user = getCurrentUserId();
-    if (previous === user) return;
-    identityChanges += 1;
-    writers.clear();
-    refusedReaders.clear();
-    answeredFor.clear();
-    changed();
-  });
+  syncOwner();
+  const stopIdentity = subscribeIdentity(() => syncOwner("event"));
   stopWatching = () => {
     stopFlag();
     stopAccounts();
@@ -299,6 +308,7 @@ export function namedReadsSettled(): boolean {
 
 /** Number a read as `reader` before it's sent. */
 export function namedReadTicket(reader: MacNamedReader): NamedAnswerTicket {
+  syncOwner();
   start();
   seen.add(scopeId(reader.host, reader.login));
   const key = namedReadScope(reader);
@@ -314,6 +324,7 @@ export function acceptNamedAnswer(
   ticket: NamedAnswerTicket,
   answer: { identity?: unknown; provenance?: unknown },
 ): "accepted" | "moved" | "unproven" {
+  syncOwner();
   const { host, login } = ticket.reader;
   if (ticket.userId !== getCurrentUserId() || !macReadCurrent(ticket.read)) return "moved";
   // Rolled back, or the shell stopped offering it, while this read was out.
@@ -365,6 +376,7 @@ export function acceptNamedReaderFor(
   ticket: NamedAnswerTicket,
   reader: { login: string; generation: number; named?: true },
 ): "accepted" | "moved" {
+  syncOwner();
   const { host, login } = ticket.reader;
   if (ticket.userId !== getCurrentUserId() || !macReadCurrent(ticket.read)) return "moved";
   if (!namedReadsAvailable() || reader.named !== true || !sameLogin(reader.login, login)) {
@@ -389,6 +401,7 @@ export function acceptNamedReaderFor(
 export function namedWriterIdentity(
   reader: MacNamedReader,
 ): { login: string; generation: number } | "checking" | "refused" {
+  syncOwner();
   const id = scopeId(reader.host, reader.login);
   const known = writers.get(id);
   if (known) return known;
@@ -452,6 +465,7 @@ export function namedRestoreProof(
   reader: MacNamedReader,
   viewer: string,
 ): { epoch: number; userId: string } | null {
+  syncOwner();
   const userId = getCurrentUserId();
   if (!userId || !namedReadsAvailable()) return null;
   const id = scopeId(reader.host, reader.login);
@@ -467,6 +481,7 @@ export function namedRestoreProofHolds(
   reader: MacNamedReader,
   proof: { epoch: number; userId: string },
 ): boolean {
+  syncOwner();
   return (
     proof.userId === getCurrentUserId() &&
     namedReadsAvailable() &&
@@ -477,6 +492,7 @@ export function namedRestoreProofHolds(
 
 /** Forget everything, so a test starts clean. */
 export function resetMacNamedReadsForTests(): void {
+  syncOwner.forget();
   stopWatching?.();
   stopWatching = null;
   floors.clear();

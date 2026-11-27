@@ -8,6 +8,7 @@ import {
   repoReaderPolicyChanged,
 } from "@/lib/desktopReadPath";
 import { readChoiceKey } from "@/lib/pullRequestReadRoute";
+import { createReadPathOwnerWatch } from "@/lib/readPathOwner";
 import {
   leaveNamedReader,
   namedReadsAvailable,
@@ -52,6 +53,13 @@ function stateFor(repository: PullRequestRepository): RepoReaderState {
 const named = new Map<string, MacNamedReader>();
 let availability: string | null = null;
 let installed = false;
+// What each PR read as was another workspace user's, server's or base path's: it goes, and routes
+// are decided again after the read that found the switch. Reads still out as those logins are
+// already refused, since every scope of the previous owner advanced.
+const syncOwner = createReadPathOwnerWatch(() => {
+  named.clear();
+  queueMicrotask(repoReaderPolicyChanged);
+});
 // Ends what `follow` listens to; null while nothing is followed.
 let stopFollowing: (() => void) | null = null;
 
@@ -74,6 +82,7 @@ const availabilityNow = () =>
 
 function readerFor(url: string): RepoReaderState {
   follow();
+  syncOwner();
   const state = repoReaderState(url);
   // Kept under the PR's choice key, so a change of its read source finds it however it's spelled.
   if (state.kind === "named") named.set(readChoiceKey(url) ?? url, state.reader);
@@ -86,6 +95,7 @@ function readerFor(url: string): RepoReaderState {
  * its scope, and its answers can't be told apart by the view that asked.
  */
 function retireLeft(urls: Iterable<string>): void {
+  syncOwner();
   const left: MacNamedReader[] = [];
   for (const url of urls) {
     const reader = named.get(url);
@@ -134,4 +144,5 @@ export function resetRepoReaderForTests(): void {
   named.clear();
   availability = null;
   installed = false;
+  syncOwner.forget();
 }
