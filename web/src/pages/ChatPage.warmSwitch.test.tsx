@@ -40,6 +40,9 @@ import {
 import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import * as clipboard from "@/lib/clipboard";
 import * as serverOrigin from "@/lib/serverOrigin";
+import * as alwaysSteer from "@/lib/alwaysSteerPreferences";
+import * as conversationSnapshot from "@/store/conversationSnapshot";
+import { resetStreamSlotManager } from "@/store/streamSlots";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import { ChatPage } from "./ChatPage";
@@ -993,4 +996,451 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
     expect(transcriptNode()).toBe(surface);
   });
+});
+
+const raceIds = ["conv_a", "conv_b", "conv_c"] as const;
+type RaceId = (typeof raceIds)[number];
+
+function raceRandom(seed: number) {
+  let state = seed;
+  return (limit: number) => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return (state >>> 0) % limit;
+  };
+}
+
+async function nextTask() {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 0);
+    });
+  });
+}
+
+async function runSwitchRace(seed: number, enabled: boolean) {
+  resetStreamSlotManager();
+  vi.spyOn(alwaysSteer, "readAlwaysSteer").mockReturnValue(false);
+  const random = raceRandom(seed);
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  initChatStore(qc);
+  for (const id of ["conv_a", "conv_b"] as const) {
+    seedLiveEntry(id, `${id} transcript`);
+  }
+  for (const id of raceIds) {
+    qc.setQueryData(["session", id], {
+      id,
+      agentId: "agent_example",
+      agentName: "Example agent",
+      permissionLevel: 4,
+      status: "idle",
+      labels: {},
+    });
+  }
+  const send = vi.fn().mockResolvedValue(undefined);
+  const enqueue = vi.fn();
+  useChatStore.setState({
+    blocks: [userBlock("conv_a", "conv_a transcript")],
+    boundAgentId: "agent_example",
+    send,
+    enqueueMessage: enqueue,
+  });
+  const rows = sessionRowsPage(raceIds.map((id) => conversation(id)));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((url: string, options?: RequestInit) => {
+      if (String(url).includes("/projects")) return Promise.resolve(new Response("[]"));
+      if (String(url).includes("/v1/sessions?"))
+        return Promise.resolve(new Response(JSON.stringify(rows)));
+      return new Promise<Response>((_resolve, reject) => {
+        options?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true },
+        );
+      });
+    }),
+  );
+  let finishCold: (() => void) | undefined;
+  vi.spyOn(conversationSnapshot, "fetchConversationSnapshot").mockImplementation(
+    (_client, id) =>
+      new Promise((resolve) => {
+        finishCold = () =>
+          resolve({
+            session: {
+              id,
+              agentId: "agent_example",
+              agentName: "Example agent",
+              permissionLevel: 4,
+              status: "idle",
+              labels: {},
+            } as Session,
+            page: {
+              items: [
+                {
+                  id: `item_${id}`,
+                  response_id: `response_${id}`,
+                  type: "message",
+                  role: "user",
+                  status: "completed",
+                  content: [{ type: "input_text", text: `${id} transcript` }],
+                },
+              ],
+              hasMore: false,
+            },
+          });
+      }),
+  );
+  const routing = seed % 2 ? reactRouterRouting : basenamedRouting("/embed");
+  renderPage({ warm_switch_keep_mounted_ui: enabled }, qc, {
+    routing,
+    sidebar: true,
+    cancelBetaNavigation: true,
+  });
+  await screen.findByText("conv_a");
+  await screen.findByText("conv_a transcript");
+  const rowsById = Object.fromEntries(raceIds.map((id) => [id, screen.getByText(id)])) as Record<
+    RaceId,
+    HTMLElement
+  >;
+  const cancelBeta = screen.getByRole("link", { name: "open beta" });
+  const input = () => document.querySelector("textarea")!;
+  const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+  const drafts: Record<RaceId, string> = { conv_a: "", conv_b: "", conv_c: "" };
+  const history: RaceId[] = ["conv_a"];
+  let index = 0;
+  let current: RaceId = "conv_a";
+  let coldReady = false;
+  const trace: string[] = [];
+
+  function recordNavigation(target: RaceId) {
+    if (target === current) return;
+    history.splice(index + 1);
+    history.push(target);
+    index = history.length - 1;
+    current = target;
+  }
+
+  function check() {
+    expect(window.location.pathname).toBe(routing.rebasePath(`/c/${current}`));
+    expect(useChatStore.getState().conversationId).toBe(current);
+    expect(transcriptNode()?.textContent).toContain(`${current} transcript`);
+    expect(document.body.textContent).not.toContain("Loading conversation…");
+    expect(input()).toHaveValue(drafts[current]);
+    for (const id of raceIds) expect(getSessionDraft(id)?.text ?? "").toBe(drafts[id]);
+  }
+
+  async function click(target: RaceId, cold = false) {
+    const source = current;
+    const surface = transcriptNode();
+    const firstCall = switchTo.mock.calls.length;
+    fireEvent.click(rowsById[target]);
+    recordNavigation(target);
+    if (cold) {
+      expect(document.body.textContent).toContain("Loading conversation…");
+      await waitFor(() => expect(finishCold).toBeDefined());
+      await act(async () => finishCold?.());
+      finishCold = undefined;
+      await waitFor(() => expect(transcriptNode()?.textContent).toContain(`${target} transcript`));
+    } else if (source !== target) {
+      if (enabled) {
+        expect(document.body.textContent).not.toContain("Loading conversation…");
+        expect(transcriptNode()).toBe(surface);
+      } else {
+        expect(transcriptNode()).not.toBe(surface);
+      }
+    }
+    await nextTask();
+    if (enabled && source !== target)
+      expect(switchTo.mock.calls.slice(firstCall)).not.toContainEqual([source]);
+  }
+
+  async function coldClick() {
+    await click("conv_c", !coldReady);
+    coldReady = true;
+  }
+
+  async function traverse(direction: "back" | "forward") {
+    const next = index + (direction === "back" ? -1 : 1);
+    if (next < 0 || next >= history.length) return;
+    await act(async () => {
+      const popped = new Promise<void>((resolve) => {
+        window.addEventListener("popstate", () => resolve(), { once: true });
+      });
+      window.history[direction]();
+      await popped;
+    });
+    index = next;
+    current = history[index]!;
+    await nextTask();
+  }
+
+  function typeDraft(text: string) {
+    fireEvent.change(input(), { target: { value: text } });
+    drafts[current] = text;
+  }
+
+  async function submit(queue: boolean, step: number) {
+    if (!drafts[current]) typeDraft(`draft ${seed} ${step} for ${current}`);
+    const text = drafts[current];
+    const sendCount = send.mock.calls.length;
+    const queueCount = enqueue.mock.calls.length;
+    act(() => useChatStore.setState({ sessionStatus: queue ? "running" : "idle" }));
+    fireEvent.keyDown(input(), { key: "Enter" });
+    if (queue) {
+      expect(enqueue).toHaveBeenCalledTimes(queueCount + 1);
+      expect(enqueue.mock.calls.at(-1)?.[0]).toBe(text);
+      expect(enqueue.mock.calls.at(-1)?.[3]).toBe(current);
+      expect(send).toHaveBeenCalledTimes(sendCount);
+    } else {
+      expect(send).toHaveBeenCalledTimes(sendCount + 1);
+      expect(send.mock.calls.at(-1)?.[0]).toBe(text);
+      expect(send.mock.calls.at(-1)?.[3]).toMatchObject({ pinnedConversationId: current });
+      expect(enqueue).toHaveBeenCalledTimes(queueCount);
+    }
+    drafts[current] = "";
+    act(() => useChatStore.setState({ sessionStatus: "idle" }));
+    await nextTask();
+  }
+
+  try {
+    check();
+    const actions = [
+      "live",
+      "cold",
+      "active",
+      "modified",
+      "back",
+      "forward",
+      "draft",
+      "send",
+      "queue",
+      "cancel",
+      "double",
+    ];
+    const steps = enabled ? 30 : 11;
+    const shuffled = [...actions];
+    for (let shuffleIndex = shuffled.length - 1; shuffleIndex > 0; shuffleIndex--) {
+      const other = random(shuffleIndex + 1);
+      [shuffled[shuffleIndex], shuffled[other]] = [shuffled[other]!, shuffled[shuffleIndex]!];
+    }
+    const runAction = async (step: number) => {
+      const action = shuffled[step] ?? actions[random(actions.length)]!;
+      trace.push(`${step}:${action}:${current}`);
+      if (action === "live") {
+        const targets = raceIds.filter((id) => id !== current && (coldReady || id !== "conv_c"));
+        await click(targets[random(targets.length)]!);
+      } else if (action === "cold") {
+        await coldClick();
+      } else if (action === "active") {
+        await click(current);
+      } else if (action === "modified") {
+        const calls = switchTo.mock.calls.length;
+        window.addEventListener("click", (event) => event.preventDefault(), { once: true });
+        fireEvent.click(rowsById[raceIds[random(raceIds.length)]!], { metaKey: true });
+        await nextTask();
+        expect(switchTo).toHaveBeenCalledTimes(calls);
+      } else if (action === "back" || action === "forward") {
+        if (action === "back" && index === 0) {
+          await click(current === "conv_a" ? "conv_b" : "conv_a");
+        }
+        if (action === "forward" && index === history.length - 1) {
+          await click(current === "conv_a" ? "conv_b" : "conv_a");
+          await traverse("back");
+        }
+        await traverse(action);
+      } else if (action === "draft") {
+        typeDraft(`draft ${seed} ${step} for ${current}`);
+      } else if (action === "send" || action === "queue") {
+        await submit(action === "queue", step);
+      } else if (action === "cancel") {
+        if (useChatStore.getState().conversationId === "conv_b") await click("conv_a");
+        const source = current;
+        fireEvent.click(cancelBeta);
+        await nextTask();
+        expect(useChatStore.getState().conversationId).toBe(source);
+      } else if (action === "double") {
+        if (!coldReady) await coldClick();
+        const targets = raceIds.filter((id) => id !== current);
+        const first = targets[random(targets.length)]!;
+        const second = targets.find((id) => id !== first)!;
+        const source = current;
+        const surface = transcriptNode();
+        const firstCall = switchTo.mock.calls.length;
+        act(() => {
+          fireEvent.click(rowsById[first]);
+          fireEvent.click(rowsById[second]);
+        });
+        recordNavigation(first);
+        recordNavigation(second);
+        await nextTask();
+        if (enabled) {
+          expect(transcriptNode()).toBe(surface);
+          expect(switchTo.mock.calls.slice(firstCall)).not.toContainEqual([source]);
+        }
+      }
+      check();
+    };
+    let sequence = Promise.resolve();
+    for (let step = 0; step < steps; step++) sequence = sequence.then(() => runAction(step));
+    await sequence;
+  } catch (error) {
+    throw new Error(`warm switch race seed ${seed}, flag ${enabled}, ${trace.join(" ")}`, {
+      cause: error,
+    });
+  } finally {
+    qc.clear();
+  }
+}
+
+async function runPendingRace(seed: number) {
+  vi.spyOn(alwaysSteer, "readAlwaysSteer").mockReturnValue(false);
+  const random = raceRandom(seed);
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  initChatStore(qc);
+  for (const id of raceIds) {
+    seedLiveEntry(id, `${id} transcript`);
+    qc.setQueryData(["session", id], {
+      id,
+      agentId: "agent_example",
+      permissionLevel: 4,
+      status: "idle",
+      labels: {},
+    });
+  }
+  const send = vi.fn().mockResolvedValue(undefined);
+  const enqueue = vi.fn();
+  useChatStore.setState({
+    blocks: [userBlock("conv_a", "conv_a transcript")],
+    boundAgentId: "agent_example",
+    send,
+    enqueueMessage: enqueue,
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise<Response>(() => {})),
+  );
+  const routing = seed % 2 ? reactRouterRouting : basenamedRouting("/embed");
+  renderPage({ warm_switch_keep_mounted_ui: true }, qc, { routing, deferNavigation: true });
+  await screen.findByText("conv_a transcript");
+  const open = {
+    conv_a: screen.getByRole("link", { name: "open alpha" }),
+    conv_b: screen.getByRole("link", { name: "open beta" }),
+    conv_c: screen.getByRole("link", { name: "open gamma" }),
+  };
+  const finish = {
+    conv_a: screen.getByRole("link", { name: "finish alpha navigation" }),
+    conv_b: screen.getByRole("link", { name: "finish beta navigation" }),
+    conv_c: screen.getByRole("link", { name: "finish gamma navigation" }),
+  };
+  const input = () => document.querySelector("textarea")!;
+  const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+  const surface = transcriptNode();
+  const drafts: Record<RaceId, string> = { conv_a: "", conv_b: "", conv_c: "" };
+  let router: RaceId = "conv_a";
+  let visible: RaceId = "conv_a";
+  const trace: string[] = [];
+
+  function check() {
+    expect(window.location.pathname).toBe(routing.rebasePath(`/c/${visible}`));
+    expect(commitLog.at(-1)).toMatchObject({ urlConvId: router, activeConversationId: visible });
+    expect(useChatStore.getState().conversationId).toBe(visible);
+    expect(isWarmSwitchPending(visible, router, routing.rebasePath)).toBe(visible !== router);
+    expect(transcriptNode()).toBe(surface);
+    expect(transcriptNode()?.textContent).toContain(`${visible} transcript`);
+    expect(document.body.textContent).not.toContain("Loading conversation…");
+    expect(input()).toHaveValue(drafts[visible]);
+    for (const id of raceIds) expect(getSessionDraft(id)?.text ?? "").toBe(drafts[id]);
+  }
+
+  async function switchPending() {
+    const source = visible;
+    const choices = raceIds.filter((id) => id !== visible && id !== router);
+    visible = choices[random(choices.length)]!;
+    const firstCall = switchTo.mock.calls.length;
+    fireEvent.click(open[visible]);
+    check();
+    await nextTask();
+    expect(switchTo.mock.calls.slice(firstCall)).not.toContainEqual([source]);
+  }
+
+  function typeDraft(step: number) {
+    drafts[visible] = `pending draft ${seed} ${step} for ${visible}`;
+    fireEvent.change(input(), { target: { value: drafts[visible] } });
+  }
+
+  async function submit(queue: boolean, step: number) {
+    if (!drafts[visible]) typeDraft(step);
+    const text = drafts[visible];
+    const count = queue ? enqueue.mock.calls.length : send.mock.calls.length;
+    act(() => useChatStore.setState({ sessionStatus: queue ? "running" : "idle" }));
+    fireEvent.keyDown(input(), { key: "Enter" });
+    if (queue) {
+      expect(enqueue).toHaveBeenCalledTimes(count + 1);
+      expect(enqueue.mock.calls.at(-1)?.[0]).toBe(text);
+      expect(enqueue.mock.calls.at(-1)?.[3]).toBe(visible);
+    } else {
+      expect(send).toHaveBeenCalledTimes(count + 1);
+      expect(send.mock.calls.at(-1)?.[0]).toBe(text);
+      expect(send.mock.calls.at(-1)?.[3]).toMatchObject({ pinnedConversationId: visible });
+    }
+    drafts[visible] = "";
+    act(() => useChatStore.setState({ sessionStatus: "idle" }));
+  }
+
+  function finishCommit() {
+    if (visible === router) return;
+    fireEvent.click(finish[visible]);
+    router = visible;
+  }
+
+  try {
+    const runAction = async (step: number) => {
+      const action =
+        step === 0
+          ? "switch"
+          : step === 1
+            ? "send"
+            : step === 2
+              ? "queue"
+              : step === 29
+                ? "finish"
+                : ["switch", "draft", "send", "queue", "finish"][random(5)]!;
+      trace.push(`${step}:${action}:${router}->${visible}`);
+      if (action === "switch") await switchPending();
+      else if (action === "draft") typeDraft(step);
+      else if (action === "send" || action === "queue") await submit(action === "queue", step);
+      else finishCommit();
+      check();
+    };
+    let sequence = Promise.resolve();
+    for (let step = 0; step < 30; step++) sequence = sequence.then(() => runAction(step));
+    await sequence;
+  } catch (error) {
+    throw new Error(`pending switch race seed ${seed}, ${trace.join(" ")}`, { cause: error });
+  } finally {
+    qc.clear();
+  }
+}
+
+const raceSeed = Number(process.env.WARM_SWITCH_RACE_SEED ?? 1);
+const raceSeedCount = Number(process.env.WARM_SWITCH_RACE_SEEDS ?? 20);
+const browserRaceSeedCount = Math.ceil(raceSeedCount / 5);
+
+describe("seeded warm switch race", () => {
+  it.each(Array.from({ length: browserRaceSeedCount }, (_, index) => raceSeed + index))(
+    "keeps session state isolated for seed %i",
+    async (seed) => runSwitchRace(seed, true),
+    30000,
+  );
+  it.each(
+    Array.from(
+      { length: raceSeedCount - browserRaceSeedCount },
+      (_, index) => raceSeed + browserRaceSeedCount + index,
+    ),
+  )("keeps pending commits isolated for seed %i", async (seed) => runPendingRace(seed), 30000);
+  it.each([1, 2])("retains the flag-off behavior for seed %i", async (seed) =>
+    runSwitchRace(seed, false),
+  );
 });
