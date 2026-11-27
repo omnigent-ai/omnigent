@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from omnigent.harnesses.claude_native import (
     editor_transaction,
     model_switch,
 )
+from omnigent.runner.turn_routing import write_pending_replay, write_turn_routing_marker
 from tests._helpers.native_claude import _PINNED_CLAUDE_MODELS
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_message_requests
@@ -33,7 +35,7 @@ from tests.e2e.conftest import get_mock_message_requests
 pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
 
 
-@pytest.mark.parametrize("draft_mode", ["editor", "picker"])
+@pytest.mark.parametrize("draft_mode", ["editor", "picker", "controller-clear"])
 @pytest.mark.parametrize("editor_source", ["configured", "configured-code", "default"])
 def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     monkeypatch: pytest.MonkeyPatch,
@@ -47,7 +49,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     claude, tmux_binary = shutil.which("claude"), shutil.which("tmux")
     assert claude is not None and tmux_binary is not None
     launch_model = (
-        "draft-initial-model" if draft_mode == "picker" else _PINNED_CLAUDE_MODELS["sonnet"]
+        "draft-initial-model" if draft_mode != "editor" else _PINNED_CLAUDE_MODELS["sonnet"]
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -147,7 +149,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     saved_settings = config / "settings.json"
     saved_contents: bytes | None = None
     picker_observations: list[dict[str, object]] = []
-    if draft_mode == "picker":
+    controller_observations: list[dict[str, object]] = []
+    if draft_mode != "editor":
         value = json.loads(settings.read_text())
         value["modelPicker"] = {
             "replaceBuiltInOptions": True,
@@ -162,6 +165,25 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         settings.write_text(json.dumps(value))
         saved_contents = json.dumps({"model": "draft-saved-default"}).encode()
         saved_settings.write_bytes(saved_contents)
+        bridge.record_model_vocabulary(
+            bridge_dir,
+            launch_env=None,
+            launch_model=launch_model,
+            picker_values=[launch_model, "draft-test-model"],
+            picker_options=[
+                {
+                    "value": identity,
+                    "model": identity,
+                    "display_name": label,
+                    "enabled": True,
+                    "provenance": "structured",
+                }
+                for identity, label in (
+                    (launch_model, "Draft initial"),
+                    ("draft-test-model", "Draft target"),
+                )
+            ],
+        )
     editor.write_text(
         "import json, re, sys\n"
         "from pathlib import Path\n"
@@ -448,6 +470,74 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert owner["bridge_session_id"] == bridge.read_active_session_id(bridge_dir)
             assert owner["native_session_id"] == payload["session_id"]
             assert owner["process"] == payload["native_process"]
+            if draft_mode == "controller-clear":
+                session_id = bridge.read_active_session_id(bridge_dir)
+                assert session_id is not None
+                assert write_turn_routing_marker(bridge_dir, session_id=session_id)
+                wrong = draft + "changed-claim"
+                assert write_pending_replay(
+                    bridge_dir,
+                    session_id=session_id,
+                    prompt=wrong,
+                    blocked_turn_id=None,
+                    model="draft-test-model",
+                )
+                count = len(observations())
+                with pytest.raises(model_switch.ClaudeModelSwitchRefused) as refusal:
+                    bridge.inject_model_command(
+                        bridge_dir, model="draft-test-model", owned_draft=wrong, timeout_s=30
+                    )
+                wait_for_editor(count, draft)
+                refused = observations()[-1]
+                assert refused["kind"] == "controller" and refused["accepted"] is False
+                assert refused["content"] == refused["after"] == draft
+                controller_observations.append(
+                    {
+                        "kind": "refused",
+                        "phase": refusal.value.phase,
+                        "model_may_have_changed": refusal.value.model_may_have_changed,
+                    }
+                )
+                assert not (bridge_dir / "editor-operation.json").exists()
+                count = len(observations())
+                instruction.write_text(
+                    json.dumps(
+                        {
+                            "expected": draft,
+                            "replacement": "must-never-be-imported",
+                            "owner": owner,
+                            "cancelled": False,
+                            "observe_only": True,
+                        }
+                    )
+                )
+                command("send-keys", "-t", target, "C-g")
+                wait_for_editor(count, draft)
+                assert observations()[-1]["content"] == draft
+                assert observations()[-1]["accepted"] is True
+                assert write_pending_replay(
+                    bridge_dir,
+                    session_id=session_id,
+                    prompt=draft,
+                    blocked_turn_id=None,
+                    model="draft-test-model",
+                )
+                count = len(observations())
+                result = bridge.inject_model_command(
+                    bridge_dir, model="draft-test-model", owned_draft=draft, timeout_s=30
+                )
+                assert isinstance(result, model_switch.ClaudeModelSwitchResult)
+                controller_observations.append({"kind": "selected", "receipt": asdict(result)})
+                wait_for_editor(count, "")
+                cleared = observations()[-1]
+                assert cleared["kind"] == "controller" and cleared["accepted"] is True
+                assert cleared["content"] == draft and cleared["after"] == ""
+                assert result.resolved_model == result.status_model == "draft-test-model"
+                assert result.session_id == payload["session_id"]
+                assert not (bridge_dir / "editor-operation.json").exists()
+                assert saved_settings.read_bytes() == saved_contents
+                assert get_mock_message_requests(isolated_mock_llm_server_url) == []
+                return
             if draft_mode == "picker":
 
                 def raw_status() -> dict[str, object]:
@@ -481,9 +571,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
 
                 def live_picker():
                     rendered = pane()
-                    footer = model_switch._PICKER_FOOTER.search(rendered)
-                    # The fixture's known draft contains no picker-shaped text.
-                    return model_switch._picker(rendered[: footer.end()]) if footer else None
+                    return model_switch._picker(rendered)
 
                 def open_picker() -> None:
                     command("send-keys", "-t", target, "M-p")
@@ -681,6 +769,10 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     "editor_source": editor_source,
                     "draft_mode": draft_mode,
                     "picker_observations": picker_observations,
+                    "controller_observations": controller_observations,
+                    "model_switch_source_sha256": hashlib.sha256(
+                        Path(model_switch.__file__).read_bytes()
+                    ).hexdigest(),
                     "saved_model_settings_unchanged": saved_settings.read_bytes() == saved_contents
                     if saved_contents is not None
                     else None,

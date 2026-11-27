@@ -9,6 +9,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.editor_handoff import NativeEditorBinding
+    from omnigent.runner.turn_routing import PendingReplay
 
 from omnigent.models.claude_model_vocabulary import (
     claude_picker_model_key,
@@ -496,6 +501,9 @@ class SessionOnlyModelSwitch:
         self.owned_picker: _Picker | None = None
         self.owned_status: dict[str, str] | None = None
         self.status_close_attempted = False
+        self.retained_owner: NativeEditorBinding | None = None
+        self.pending_replay: PendingReplay | None = None
+        self.statusline_before_ns = 0
 
     def refuse(self, message: str, *, unsupported: bool = False) -> ClaudeModelSwitchRefused:
         return ClaudeModelSwitchRefused(
@@ -508,6 +516,11 @@ class SessionOnlyModelSwitch:
 
     def check(self) -> None:
         self.bridge._check_injection_cancelled()
+        if self.retained_owner is not None and not self.retained_owner_is_current():
+            raise self.refuse(
+                "The saved message or its terminal owner changed. "
+                "Inspect Terminal before retrying."
+            )
         if self.legacy_pane is not None:
             current = self.bridge._legacy_model_pane(self.bridge_dir)
             if (
@@ -579,6 +592,7 @@ class SessionOnlyModelSwitch:
                     "commit": "Claude did not return to an empty input box after model selection.",
                     "confirmation": "Claude did not finish the cache-cost model confirmation.",
                     "status": "Claude did not finish the fresh local model status check.",
+                    "handoff": "Claude did not finish handing off the saved message.",
                 }[self.phase]
                 raise self.refuse(
                     f"{action} Check the terminal before retrying; "
@@ -593,6 +607,13 @@ class SessionOnlyModelSwitch:
         return pane
 
     def command(self, command: str) -> None:
+        if self.retained_owner is not None and command == "/model":
+            pane = self.pane()
+            if _draft(pane) is None or _model_control_surface(pane) is not None:
+                raise self.refuse("Claude's input is occupied or clipped. Inspect Terminal first.")
+            self.submitted = True
+            self.send("M-p")
+            return
         self.empty()
         self.command_draft = command
         self.send(command, literal=True)
@@ -661,7 +682,9 @@ class SessionOnlyModelSwitch:
                 and _picker(pane) == self.owned_picker
             ):
                 self.send("Escape")
-                self.wait(lambda text: _draft(text) == "" and _picker(text) is None, seconds=1.0)
+                self.wait(
+                    lambda text: self.input_ready(text) and _picker(text) is None, seconds=1.0
+                )
             elif (
                 self.owned_status
                 and not self.status_close_attempted
@@ -705,6 +728,37 @@ class SessionOnlyModelSwitch:
 
     def local_status(self) -> str:
         self.phase = "status"
+        if self.retained_owner is not None:
+            observed = ""
+
+            def fresh_status(pane: str) -> bool:
+                nonlocal observed
+                if not self.input_ready(pane) or _model_control_surface(pane) is not None:
+                    return False
+                path = self.bridge_dir / self.bridge.CONTEXT_RAW_FILE
+                try:
+                    before = path.stat()
+                    raw = self.bridge._read_json_file(path) or {}
+                    after = path.stat()
+                except OSError:
+                    return False
+                model = raw.get("model")
+                identity = model.get("id") if isinstance(model, dict) else model
+                if (
+                    (before.st_ino, before.st_mtime_ns, before.st_size)
+                    != (after.st_ino, after.st_mtime_ns, after.st_size)
+                    or after.st_mtime_ns <= self.statusline_before_ns
+                    or raw.get("session_id") != self.session
+                    or raw.get("version") != self.version
+                    or not isinstance(identity, str)
+                    or not self.status_matches(identity, exact_context=False)
+                ):
+                    return False
+                observed = identity
+                return True
+
+            self.wait(fresh_status, seconds=2.0)
+            return observed
         self.command("/status")
         pane = self.wait(lambda text: _status(text) is not None, seconds=2.0)
         fields = _status(pane)
@@ -725,7 +779,7 @@ class SessionOnlyModelSwitch:
 
     def finish_commit(self) -> None:
         def settled(pane: str) -> bool:
-            if _draft(pane) == "" and _model_control_surface(pane) is None:
+            if self.input_ready(pane) and _model_control_surface(pane) is None:
                 return True
             label = self.choice.confirmation_label
             picker = self.owned_picker
@@ -839,14 +893,17 @@ class SessionOnlyModelSwitch:
         if _picker(self.pane()) != picker:
             raise self.refuse("Claude's model picker changed before context could be confirmed.")
         self.send("Escape")
-        self.wait(lambda text: _draft(text) == "" and _picker(text) is None, seconds=1.0)
+        self.wait(lambda text: self.input_ready(text) and _picker(text) is None, seconds=1.0)
         self.owned_picker = None
         self.phase = "status"
         return confirmed
 
     def run(self) -> ClaudeModelSwitchResult:
         try:
-            return self._run()
+            result = self._run()
+            if self.retained_owner is not None:
+                self.clear_retained_draft()
+            return result
         except self.bridge.ClaudeTerminalExited:
             raise
         except ClaudeModelSwitchRefused:
@@ -867,6 +924,61 @@ class SessionOnlyModelSwitch:
                 "Claude could not finish the session-only model selection. Inspect the terminal "
                 "before retrying; the dependent prompt was not sent."
             ) from exc
+
+    def input_ready(self, pane: str) -> bool:
+        draft = _draft(pane)
+        return draft is not None if self.retained_owner is not None else draft == ""
+
+    def retained_owner_is_current(self) -> bool:
+        from omnigent.harnesses.claude_native.editor_handoff import read_controller_editor_binding
+        from omnigent.runner.turn_routing import read_pending_replay, turn_routing_marker_present
+
+        return (
+            self.retained_owner is not None
+            and read_controller_editor_binding(self.bridge_dir) == self.retained_owner
+            and read_pending_replay(self.bridge_dir) == self.pending_replay
+            and turn_routing_marker_present(self.bridge_dir, self.active_session or "")
+        )
+
+    def retain_saved_draft(self) -> bool:
+        from omnigent.harnesses.claude_native.editor_handoff import read_controller_editor_binding
+        from omnigent.runner.turn_routing import read_pending_replay, turn_routing_marker_present
+
+        owner = read_controller_editor_binding(self.bridge_dir)
+        pending = read_pending_replay(self.bridge_dir)
+        if (
+            owner is None
+            or pending is None
+            or pending.session_id != self.active_session
+            or pending.prompt != self.owned_draft
+            or pending.model != self.model
+            or owner.owner.bridge_session_id != self.active_session
+            or owner.owner.native_session_id != self.session
+            or owner.socket_path != self.info["socket_path"]
+            or owner.tmux_target != self.info["tmux_target"]
+            or not turn_routing_marker_present(self.bridge_dir, pending.session_id)
+            or self.choice.status_only
+        ):
+            return False
+        self.retained_owner, self.pending_replay = owner, pending
+        return True
+
+    def clear_retained_draft(self) -> None:
+        from omnigent.harnesses.claude_native.editor_control import NativeEditorControl
+
+        self.check()
+        assert self.retained_owner is not None and self.owned_draft is not None
+        self.phase = "handoff"
+        control = NativeEditorControl(
+            self.bridge_dir,
+            binding=self.retained_owner,
+            expected_text=self.owned_draft,
+            replacement_text="",
+            cancelled=lambda: self.deadline.is_set() or not self.retained_owner_is_current(),
+            deadline=self.deadline.at,
+        )
+        control.run(lambda: self.send("C-g"))
+        self.wait(lambda text: _draft(text) == "", seconds=1.0)
 
     def _run(self) -> ClaudeModelSwitchResult:
         self.choice = _target(
@@ -943,7 +1055,10 @@ class SessionOnlyModelSwitch:
         pane = self.pane()
         draft = _draft(pane)
         if draft or (draft is None and self.owned_draft is not None):
-            if self.owned_draft is None or not self.draft_matches(pane, self.owned_draft):
+            retained = self.owned_draft is not None and self.retain_saved_draft()
+            if not retained and (
+                self.owned_draft is None or not self.draft_matches(pane, self.owned_draft)
+            ):
                 raise self.refuse(
                     (
                         "The input box contains text that could not be confirmed as your saved "
@@ -956,10 +1071,12 @@ class SessionOnlyModelSwitch:
                         "then retry the model change."
                     )
                 )
-            self.clear_owned_draft(self.owned_draft)
+            if not retained:
+                assert self.owned_draft is not None
+                self.clear_owned_draft(self.owned_draft)
         before_selection: str | None = None
         plain_context = not claude_picker_model_key(self.choice.model).endswith("[1m]")
-        if hinted_current or not plain_context:
+        if self.retained_owner is None and (hinted_current or not plain_context):
             before_selection = self.local_status()
             if hinted_current and self.status_matches(before_selection, exact_context=True):
                 if not plain_context or (
@@ -1008,6 +1125,10 @@ class SessionOnlyModelSwitch:
                 )
                 self.phase = "commit"
                 self.commit_attempted = True
+                if self.retained_owner is not None:
+                    self.statusline_before_ns = (
+                        (self.bridge_dir / self.bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns
+                    )
                 self.send("s", literal=True)
                 break
             identity = (selected.number, selected.text)
