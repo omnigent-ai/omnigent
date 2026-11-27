@@ -32,8 +32,11 @@ export interface HostWorktree {
   updated_at?: number | null;
 }
 
-/** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
-const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
+/**
+ * Windows absolute path: a drive (``C:\repo`` / ``C:/repo``) or a UNC share (``\\server\share`` /
+ * ``//server/share``), as the server's ``_is_unc_path`` reads it.
+ */
+const WINDOWS_ABS_PATH = /^(?:[A-Za-z]:[/\\]|\\\\|\/\/)/;
 
 /** Whether ``path`` is absolute on its host: POSIX or a Windows drive. */
 export function isAbsoluteHostPath(path: string): boolean {
@@ -134,7 +137,8 @@ interface VerifiedGitWorktreeCache {
 
 function normalizedHostPath(path: string): string {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
-  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+  // Drive and UNC paths ignore case, as in {@link matchKind}.
+  return /^(?:[A-Za-z]:\/|\/\/)/.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 export function pathIsWithinWorktree(path: string, root: string): boolean {

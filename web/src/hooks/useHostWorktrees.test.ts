@@ -4,8 +4,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  type HostWorktree,
   isAbsoluteHostPath,
   isWorktreeRoot,
+  matchWorktree,
   pathInWorktree,
   trimHostPath,
   useHostWorktrees,
@@ -180,8 +182,8 @@ describe("isAbsoluteHostPath and trimHostPath", () => {
     ["/repo", true],
     ["C:\\repo", true],
     ["c:/repo", true],
-    // UNC shares aren't read as Windows paths by the worktree matcher.
-    ["\\\\server\\share", false],
+    ["\\\\server\\share", true],
+    ["//server/share", true],
     ["src/a.ts", false],
     ["C:repo", false],
   ])("reads %s as absolute: %s", (path, absolute) => {
@@ -196,7 +198,50 @@ describe("isAbsoluteHostPath and trimHostPath", () => {
     ["C:\\", "C:\\"],
     ["C:/", "C:/"],
     ["C:\\\\", "C:\\"],
+    ["\\\\server\\share\\", "\\\\server\\share"],
   ])("trims %s to %s", (path, trimmed) => {
     expect(trimHostPath(path)).toBe(trimmed);
+  });
+});
+
+describe("matchWorktree", () => {
+  const share = (path: string): HostWorktree => ({
+    path,
+    branch: "main",
+    is_main: true,
+    detached: false,
+  });
+
+  it.each([
+    ["a UNC share across separators", "//server/share/repo", "\\\\server\\share\\repo", true],
+    ["a UNC share in another case", "\\\\Server\\Share\\Repo", "\\\\server\\share\\repo", true],
+    [
+      "a folder inside a UNC share",
+      "\\\\server\\share\\repo",
+      "//server/share/repo/packages/web",
+      true,
+    ],
+    [
+      "a forward-slash UNC share in another case",
+      "//Server/Share/repo",
+      "//server/share/Repo",
+      true,
+    ],
+    [
+      "a forward-slash UNC folder in another case",
+      "//server/share/Repo",
+      "//Server/Share/repo/src",
+      true,
+    ],
+    [
+      "another share on the same server",
+      "\\\\server\\share\\repo",
+      "\\\\server\\other\\repo",
+      false,
+    ],
+    ["a POSIX path with a backslash, unchanged", "/home/a/repo", "/home/a/repo\\evil", false],
+  ])("matches %s: %s", (_case, root, workspace, matches) => {
+    const worktree = share(root);
+    expect(matchWorktree([worktree], workspace)).toBe(matches ? worktree : null);
   });
 });
