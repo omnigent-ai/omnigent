@@ -79,6 +79,13 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# Re-install omnigent and the sibling SDKs without -e (see deploy/docker/Dockerfile):
+# a community sandbox provider installed into the image must not turn the
+# top-level `omnigent` into a namespace package. -I: the working directory is /build.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} --no-deps . ./sdks/python-client ./sdks/ui \
+ && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages \
+ && python -I -c "import omnigent, os, sysconfig; f = os.path.realpath(omnigent.__file__); roots = [os.path.realpath(sysconfig.get_paths()[k]) for k in ('purelib', 'platlib')]; assert any(f.startswith(r + os.sep) for r in roots), f"
+
 # ── Node alias stage ─────────────────────────────────────
 FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS node-runtime
 
