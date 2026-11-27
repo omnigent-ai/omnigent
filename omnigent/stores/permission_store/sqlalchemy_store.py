@@ -655,15 +655,23 @@ def delete_deleted_account_gadget_grants(
 
 
 def holds_gadget_grants(session: Session, user_id: str) -> bool:
-    """Whether any gadget grant to *user_id* remains in the workspace, in one indexed probe."""
-    return session.execute(
-        select(
-            exists().where(
+    """Whether any gadget grant to *user_id* remains in the workspace, in one indexed probe.
+
+    A locking read, so it sees grants committed after the transaction's snapshot (MySQL's
+    REPEATABLE READ would otherwise answer from it) and holds the row it finds.
+    """
+    return (
+        session.execute(
+            select(SqlGadgetShare.gadget_id)
+            .where(
                 SqlGadgetShare.workspace_id == current_workspace_id(),
                 SqlGadgetShare.user_id == user_id,
             )
-        )
-    ).scalar_one()
+            .limit(1)
+            .with_for_update()
+        ).first()
+        is not None
+    )
 
 
 def _to_gadget_permission(row: SqlGadgetShare) -> GadgetPermission:
