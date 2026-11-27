@@ -8,6 +8,7 @@ store only arbitrates and records.
 
 from __future__ import annotations
 
+import hmac
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,7 +17,11 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlProjectSlackAudit, SqlProjectSlackBinding, current_workspace_id
+from omnigent.db.db_models import (
+    SqlProjectSlackAudit,
+    SqlProjectSlackBinding,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -157,6 +162,16 @@ class ProjectSlackStore:
         with self._session("get_slack_binding_by_id") as session:
             row = session.get(SqlProjectSlackBinding, (current_workspace_id(), binding_id))
             return None if row is None else _binding(row)
+
+    def relay_binding(self, binding_id: str, key_hash: str) -> SlackBinding | None:
+        """The link whose current relay key hashes to *key_hash*, else ``None``."""
+        with self._session("authenticate_slack_relay") as session:
+            row = session.get(SqlProjectSlackBinding, (current_workspace_id(), binding_id))
+            if row is None or row.relay_key_hash is None:
+                return None
+            if not hmac.compare_digest(row.relay_key_hash, key_hash):
+                return None
+            return _binding(row)
 
     def holder_of(self, slack_team_id: str, channel_id: str) -> str | None:
         """The project that holds a channel, if any."""

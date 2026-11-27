@@ -17576,7 +17576,7 @@
                 "type": "null"
               }
             ],
-            "description": "Where the watcher automation runs: org, repo and model. Omit to use the server's defaults.",
+            "description": "Where the watcher automation runs: org, repo, model, and the owner's username on the automation service. Omit to use the server's defaults.",
             "title": "Destination"
           },
           "slack_team_id": {

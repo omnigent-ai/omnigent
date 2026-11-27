@@ -4844,6 +4844,22 @@ def create_app(
                 from omnigent.stores.project_slack_store import ProjectSlackStore
 
                 app.state.project_slack_store = ProjectSlackStore(kpi_location)
+                from omnigent.server.slack_provisioning import (
+                    SlackAutomationConfig,
+                    SlackProvisioner,
+                )
+
+                _slack_automation = SlackAutomationConfig.from_env()
+                app.state.slack_provisioner = (
+                    SlackProvisioner(
+                        _slack_automation,
+                        app.state.project_slack_store,
+                        connection_store=getattr(app.state, "databricks_store", None),
+                        connection_client=getattr(app.state, "databricks_client", None),
+                    )
+                    if _slack_automation is not None
+                    else None
+                )
                 app.include_router(
                     create_project_slack_router(
                         project_store,

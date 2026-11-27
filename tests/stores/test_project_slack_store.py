@@ -10,7 +10,9 @@ from omnigent.errors import OmnigentError
 from omnigent.stores.project_slack_store import ChannelTakenError, ProjectSlackStore
 
 
-def _claim(store: ProjectSlackStore, project_id: str, channel_id: str = "C0001", team: str = "T01"):
+def _claim(
+    store: ProjectSlackStore, project_id: str, channel_id: str = "C0001", team: str = "T01"
+):
     return store.claim(
         project_id,
         slack_team_id=team,

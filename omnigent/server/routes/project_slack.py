@@ -36,7 +36,7 @@ _CLIENT_LINK = re.compile(r"^https://app\.slack\.com/client/([A-Z0-9]+)/([A-Z0-9
 _ARCHIVE_LINK = re.compile(
     r"^https://[a-z0-9-]+\.(?:enterprise\.)?slack\.com/archives/([A-Z0-9]+)/?(?:[?#].*)?$"
 )
-_DESTINATION_KEYS = ("org", "repo", "model")
+_DESTINATION_KEYS = ("org", "repo", "model", "username")
 
 
 class SlackLinkBody(BaseModel):
@@ -56,7 +56,8 @@ class SlackLinkBody(BaseModel):
     channel_name: str | None = Field(default=None, max_length=128)
     destination: dict[str, str] | None = Field(
         default=None,
-        description="Where the watcher automation runs: org, repo and model. "
+        description="Where the watcher automation runs: org, repo, model, and the owner's "
+        "username on the automation service. "
         "Omit to use the server's defaults.",
     )
 
@@ -80,9 +81,7 @@ def parse_channel(body: SlackLinkBody) -> tuple[str, str]:
                 code=ErrorCode.INVALID_INPUT,
             )
     if channel_id is None or not CHANNEL_ID.match(channel_id):
-        raise OmnigentError(
-            "Give a Slack channel ID like C0123ABCD", code=ErrorCode.INVALID_INPUT
-        )
+        raise OmnigentError("Give a Slack channel ID like C0123ABCD", code=ErrorCode.INVALID_INPUT)
     if team_id is None or not TEAM_ID.match(team_id):
         raise OmnigentError(
             "Give the Slack workspace (team) ID like T0123ABCD, or paste an "
@@ -97,7 +96,7 @@ def clean_destination(destination: dict[str, str] | None) -> dict[str, str]:
     for key, value in (destination or {}).items():
         if key not in _DESTINATION_KEYS:
             raise OmnigentError(
-                f"Unknown destination setting {key!r}; use org, repo or model",
+                f"Unknown destination setting {key!r}; use org, repo, model or username",
                 code=ErrorCode.INVALID_INPUT,
             )
         value = str(value).strip()
@@ -161,7 +160,11 @@ def create_project_slack_router(
         """The project's Slack channel link, its state, and whether the caller may change it."""
         _, project, can_manage = await load(request, project_id)
         binding = await asyncio.to_thread(slack_store.get, project.id)
-        return binding_json(binding, can_manage=can_manage)
+        body = binding_json(binding, can_manage=can_manage)
+        active = provisioner(request)
+        if binding is not None and can_manage and active is not None:
+            body["overlaps"] = await active.overlaps(binding)
+        return body
 
     @router.put("")
     async def link_project_slack(

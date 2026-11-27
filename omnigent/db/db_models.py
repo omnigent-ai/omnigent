@@ -1261,9 +1261,7 @@ class SqlProjectSlackBinding(OmnigentBase):
     # claimed | active | disabled | error | needs_reconnect
     state: Mapped[str] = mapped_column(String(24), nullable=False)
     # Where the watcher automation runs: {"host", "org", "repo", "model"}.
-    destination: Mapped[dict[str, Any] | None] = mapped_column(
-        EnvelopedJSON(4096), nullable=True
-    )
+    destination: Mapped[dict[str, Any] | None] = mapped_column(EnvelopedJSON(4096), nullable=True)
     automation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # SHA-256 of the per-binding relay key; the key itself is never stored.
     relay_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
