@@ -56,6 +56,9 @@ describe("DiffReviewToolbar's status", () => {
       lineCounts.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(status.parentElement).toHaveClass("ml-auto");
+    // It comes before the source's own controls, which follow it at the right.
+    const find = screen.getByRole("button", { name: "Find in changes" });
+    expect(status.compareDocumentPosition(find) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("keeps an empty live region of the spinner's size while idle, so nothing rewraps", () => {
