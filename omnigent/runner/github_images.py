@@ -114,12 +114,7 @@ def checked_image_url(url: str, pr_host: str) -> httpx.URL:
     :raises ImageRefused: ``host_not_allowed``.
     """
     without_fragment = url.split("#", 1)[0]
-    before_query = without_fragment.split("?", 1)[0]
-    if (
-        any(ord(character) <= 0x20 or ord(character) == 0x7F for character in without_fragment)
-        or "\\" in without_fragment
-        or _ENCODED_TRAVERSAL.search(before_query)
-    ):
+    if _raw_reference_refused(without_fragment):
         raise ImageRefused("host_not_allowed")
     try:
         parsed = httpx.URL(without_fragment)
@@ -128,6 +123,28 @@ def checked_image_url(url: str, pr_host: str) -> httpx.URL:
     if str(parsed) != without_fragment or not _allowed(parsed, pr_host.lower()):
         raise ImageRefused("host_not_allowed")
     return parsed
+
+
+def _raw_reference_refused(reference: str) -> bool:
+    """Whether a URL or redirect reference, as written, breaks a rule that resolving it hides.
+
+    Control characters, spaces, backslashes, dot segments and encoded dots or slashes in the
+    path are refused before parsing, since resolving a reference rewrites each of them.
+    """
+    before_query = reference.split("?", 1)[0]
+    return (
+        any(ord(character) <= 0x20 or ord(character) == 0x7F for character in reference)
+        or "\\" in reference
+        or _ENCODED_TRAVERSAL.search(before_query) is not None
+        or any(segment in (".", "..") for segment in before_query.split("/"))
+    )
+
+
+def _redirect_target(current: httpx.URL, location: str, pr_host: str) -> httpx.URL:
+    """Where a redirect goes: its reference checked as written, then the URL it resolves to."""
+    if _raw_reference_refused(location.split("#", 1)[0]):
+        raise ImageRefused("host_not_allowed")
+    return checked_image_url(str(current.join(location)), pr_host)
 
 
 def _allowed(url: httpx.URL, pr_host: str) -> bool:
@@ -394,7 +411,7 @@ async def _fetch(
                         location = response.headers.get("location")
                         if not location or hop == MAX_REDIRECTS:
                             raise ImageRefused("fetch_failed")
-                        current = checked_image_url(str(current.join(location)), pr_host)
+                        current = _redirect_target(current, location, pr_host)
                         continue
                     if response.status_code != 200:
                         raise ImageRefused("fetch_failed")
