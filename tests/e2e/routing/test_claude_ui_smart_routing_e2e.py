@@ -34,7 +34,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.harnesses.claude_native import bridge, editor_handoff
+from omnigent.harnesses.claude_native import bridge, editor_handoff, model_switch
 from omnigent.runner.turn_routing import read_pending_replay, turn_routing_marker_present
 from omnigent.server.smart_routing import models_in_family
 from tests._helpers.native_claude import (
@@ -238,14 +238,57 @@ def _assert_mock_created_session_preserves_default(
                 target = bridge.read_tmux_target(bridge_dir)
                 state_keys = ("status", "model_override", "llm_model", "last_task_error")
                 owner = editor_handoff.read_controller_editor_binding(bridge_dir)
+                pending = read_pending_replay(bridge_dir)
+                choice = (
+                    model_switch._target(
+                        pending.model,
+                        bridge.read_model_picker_options(bridge_dir),
+                        bridge.read_model_picker_values(bridge_dir),
+                        bridge.read_model_env(bridge_dir),
+                    )
+                    if pending is not None and pending.model is not None
+                    else None
+                )
+                items = client.get(
+                    f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
+                )
+                items.raise_for_status()
+                log_paths = sorted((tmp_path / "host").rglob("*.log"))
                 record_property(
                     "routing_failure",
                     json.dumps(
                         {
                             "entry": entry,
                             "state": {key: snapshot.get(key) for key in state_keys},
-                            "pending": repr(read_pending_replay(bridge_dir)),
+                            "pending": repr(pending),
                             "owner": repr(owner),
+                            "target": repr(choice),
+                            "marker": turn_routing_marker_present(bridge_dir, session_id),
+                            "native_status": bridge._read_json_file(
+                                bridge_dir / bridge.CONTEXT_RAW_FILE
+                            ),
+                            "nonmessage_items": [
+                                item
+                                for item in items.json().get("data", [])
+                                if item.get("type") != "message"
+                            ],
+                            "routing_logs": {
+                                str(path.relative_to(tmp_path)): "\n".join(
+                                    line
+                                    for line in path.read_text(errors="replace").splitlines()
+                                    if any(
+                                        key in line.lower()
+                                        for key in (
+                                            "route-turn:",
+                                            "replay",
+                                            "model switch",
+                                            "model_switch",
+                                        )
+                                    )
+                                )[-12000:]
+                                for path in log_paths
+                                if path.is_file()
+                            },
                             "pane": capture_pane(target["socket_path"], target["tmux_target"])
                             if target is not None
                             else None,
