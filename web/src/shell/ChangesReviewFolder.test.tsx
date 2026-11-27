@@ -22,6 +22,8 @@ const mocks = vi.hoisted(() => ({
   workspace: "/repo",
   worktrees: [] as { path: string; branch: string; is_main: boolean; detached: boolean }[],
   worktreeLookups: [] as (string | null)[],
+  /** How the worktree lookup answers: a list, a failure, or not yet. */
+  worktreeAnswer: "ok" as "ok" | "unknown" | "pending",
 }));
 vi.mock("./FileViewerContext", () => ({ useWorkspacePaths: () => ({ root: mocks.workspace }) }));
 vi.mock("./fileCommands/target", () => ({ useSessionHostId: () => "host_1" }));
@@ -36,7 +38,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (_session: string, _host: string, workspace: string | null) => {
     mocks.worktreeLookups.push(workspace);
-    return { data: workspace ? { status: "ok", worktrees: mocks.worktrees } : undefined };
+    if (!workspace) return { data: undefined, isLoading: false };
+    if (mocks.worktreeAnswer === "pending") return { data: undefined, isLoading: true };
+    if (mocks.worktreeAnswer === "unknown")
+      return { data: { status: "unknown" }, isLoading: false };
+    return { data: { status: "ok", worktrees: mocks.worktrees }, isLoading: false };
   },
 }));
 vi.mock("./WorkspacePickerDialog", () => ({
@@ -96,6 +102,7 @@ beforeEach(() => {
   mocks.workspace = "/repo";
   mocks.worktrees = WORKTREES;
   mocks.worktreeLookups = [];
+  mocks.worktreeAnswer = "ok";
 });
 afterEach(() => rememberBrowseLocation(SESSION, null));
 
@@ -181,6 +188,42 @@ describe("useReviewFolder", () => {
     act(() => rememberBrowseLocation(SESSION, "/monorepo/app/.worktrees/feature/src"));
     expect(screen.getByTestId("root")).toHaveTextContent("/monorepo/app");
     expect(screen.getByTestId("repository")).toBeEmptyDOMElement();
+  });
+
+  it.each(["pending", "unknown"] as const)(
+    "offers no way to choose a folder while the worktree lookup is %s",
+    (answer) => {
+      // Inside a larger repository, a choice made before the lookup answers would move Files alone.
+      mocks.workspace = "/monorepo/app";
+      mocks.worktrees = LARGER_REPOSITORY;
+      mocks.worktreeAnswer = answer;
+      const { rerender } = render(<Harness />);
+      expect(screen.queryByTestId("changes-review-folder")).toBeNull();
+      expect(paletteCommand("Choose Folder for Diffs…")).toBeUndefined();
+      expect(rememberedBrowseLocation(SESSION)).toBeNull();
+
+      mocks.worktreeAnswer = "ok";
+      rerender(<Harness />);
+      expect(screen.getByTestId("changes-review-folder-fixed")).toHaveTextContent("app");
+      expect(paletteCommand("Choose Folder for Diffs…")?.availability).toEqual({
+        available: false,
+        reason: LARGER_REPOSITORY_REASON,
+      });
+    },
+  );
+
+  it("isn't resolved while the worktree lookup fails, then resolves on the list", () => {
+    mocks.worktreeAnswer = "unknown";
+    const { result, rerender } = renderHook(() =>
+      useReviewFolder(SESSION, true, "/repo/.worktrees/feature"),
+    );
+    expect(result.current.resolved).toBe(false);
+    expect(result.current.canChoose).toBe(false);
+    mocks.worktreeAnswer = "ok";
+    rerender();
+    expect(result.current.resolved).toBe(true);
+    expect(result.current.canChoose).toBe(true);
+    expect(result.current.rootFor("/repo/.worktrees/feature")).toBe("/repo/.worktrees/feature");
   });
 
   it("offers no command while Diffs is off screen", () => {

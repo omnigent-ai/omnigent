@@ -21,6 +21,10 @@ import { openFindForActiveSurface } from "@/lib/findRouting";
 import { resetShownReviewsForTests, reviewMembership, shownReview } from "@/lib/reviewFileLinks";
 import { useChoosingComparisonOwner } from "@/hooks/useComparisonOwner";
 import type * as ReviewFolderModule from "./ChangesReviewFolder";
+import type * as FileViewerContextModule from "./FileViewerContext";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as SessionWorktreesModule from "@/hooks/useSessionWorktrees";
+import type { SessionWorktreesResult } from "@/hooks/useSessionWorktrees";
 import type { ReviewFolder } from "./ChangesReviewFolder";
 import { comparisonChoiceOf } from "@/lib/comparisonChoice";
 import type { ComparisonAvailability } from "@/shell/useVisitComparison";
@@ -59,32 +63,74 @@ const mocks = vi.hoisted(() => ({
   folder: null as ReviewFolder | ((directory: string | null) => ReviewFolder) | null,
   /** What each file's actions were resolved with. */
   fileTargets: [] as { path: string; base?: string }[],
+  /**
+   * When set, the review uses the real folder hook, over the workspace `/repo` with this worktree
+   * answer; otherwise `folder` above.
+   */
+  realFolder: null as { worktrees: SessionWorktreesResult } | null,
 }));
+// The real folder hook's inputs, given only while a test asks for that hook.
+vi.mock("./FileViewerContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof FileViewerContextModule>();
+  return {
+    ...actual,
+    useWorkspacePaths: () => {
+      const paths = actual.useWorkspacePaths();
+      return mocks.realFolder ? { ...paths, root: "/repo" } : paths;
+    },
+  };
+});
+vi.mock("@/hooks/useSession", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseSessionModule>();
+  return {
+    ...actual,
+    useSession: (...args: Parameters<typeof actual.useSession>) =>
+      mocks.realFolder
+        ? { session: { permissionLevel: 4 }, isLoading: false, error: null }
+        : actual.useSession(...args),
+  };
+});
+vi.mock("@/hooks/useSessionWorktrees", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionWorktreesModule>();
+  return {
+    ...actual,
+    useSessionWorktrees: (...args: Parameters<typeof actual.useSessionWorktrees>) =>
+      mocks.realFolder
+        ? { data: mocks.realFolder.worktrees, isLoading: false }
+        : actual.useSessionWorktrees(...args),
+  };
+});
 vi.mock("./ChangesReviewFolder", async (importOriginal) => {
   const actual = await importOriginal<typeof ReviewFolderModule>();
   const { useRememberedBrowseLocation } = await import("./filesPane/browseLocations");
+  // The folder a test sets, or the workspace's.
+  const useTestFolder: typeof actual.useReviewFolder = (conversationId) => {
+    const directory = useRememberedBrowseLocation(conversationId);
+    const folder = mocks.folder;
+    if (typeof folder === "function") return folder(directory);
+    return (
+      folder ?? {
+        workspace: null,
+        root: null,
+        repository: "",
+        workspaceKey: "",
+        directory: null,
+        canChoose: false,
+        cannotChooseReason: null,
+        resolved: true,
+        rootFor: () => null,
+        choose: () => {},
+        showWorkspace: () => {},
+        dialog: null,
+      }
+    );
+  };
   return {
     ...actual,
-    useReviewFolder: (conversationId: string): ReviewFolder => {
-      const directory = useRememberedBrowseLocation(conversationId);
-      const folder = mocks.folder;
-      if (typeof folder === "function") return folder(directory);
-      return (
-        folder ?? {
-          workspace: null,
-          root: null,
-          repository: "",
-          workspaceKey: "",
-          directory: null,
-          canChoose: false,
-          cannotChooseReason: null,
-          resolved: true,
-          rootFor: () => null,
-          choose: () => {},
-          showWorkspace: () => {},
-          dialog: null,
-        }
-      );
+    // The real hook when a test asks for it; one or the other for a whole test.
+    useReviewFolder: (conversationId: string, active: boolean, lookUp: string | null = null) => {
+      const useFolder = mocks.realFolder ? actual.useReviewFolder : useTestFolder;
+      return useFolder(conversationId, active, lookUp);
     },
   };
 });
@@ -108,10 +154,20 @@ vi.mock("@/hooks/useWorkingCopyChanges", async (importOriginal) => ({
     return mocks.commitChanges(spec);
   },
 }));
-vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
-  ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
-  useWorkspaceAsleep: mocks.asleep,
-}));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof WorkspaceChangedFilesModule>();
+  return {
+    ...actual,
+    useWorkspaceAsleep: mocks.asleep,
+    useWorkspaceEnvironment: (...args: Parameters<typeof actual.useWorkspaceEnvironment>) =>
+      mocks.realFolder
+        ? {
+            data: { available: true, root: "/repo", reachable: { unconfined: true, roots: [] } },
+            isLoading: false,
+          }
+        : actual.useWorkspaceEnvironment(...args),
+  };
+});
 // The shared notice follows the same asleep signal the review reads.
 vi.mock("@/hooks/useSandboxResume", () => ({
   useSandboxResume: () => ({
@@ -137,7 +193,7 @@ vi.mock("./fileCommands/useFileCommandFacts", () => ({
   useFileCommandEnvironment: () => ({}),
 }));
 vi.mock("./fileCommands/target", () => ({
-  useSessionHostId: () => null,
+  useSessionHostId: () => (mocks.realFolder ? "host_1" : null),
   resolveFileCommandTarget: (path: string, options: { base?: string }) => {
     mocks.fileTargets.push({ path, base: options.base });
     return { path };
@@ -263,6 +319,7 @@ afterEach(() => {
   vi.clearAllMocks();
   mocks.commitComparisons = null;
   mocks.folder = null;
+  mocks.realFolder = null;
   rememberBrowseLocation("s1", null);
   mocks.fileTargets = [];
   mocks.width.mockReturnValue(0);
@@ -1418,6 +1475,40 @@ describe("a review of a worktree inside the workspace", () => {
       rerender(<ChangesReview {...props} />);
       expect(rememberedBrowseLocation("s1")).toBe(ROOT);
       expect(data.choice.choose).toHaveBeenCalledWith(visit);
+    });
+
+    it("keeps the visit while the worktree lookup fails, and brings it back once they list", () => {
+      mocks.realFolder = { worktrees: { status: "unknown" } };
+      const data = source(changes({ workspace: { hostId: "host_1", root: "/repo" } }));
+      mocks.source.mockReturnValue(data);
+      const onComparisonShown = vi.fn();
+      const landing = landed();
+      const { props, rerender, unmount } = renderReview({
+        comparison: visit,
+        comparisonRoot: ROOT,
+        landing,
+        onComparisonShown,
+      });
+      // A failed lookup proves nothing about the worktree, so the visit is neither applied nor replaced.
+      expect(onComparisonShown).not.toHaveBeenCalled();
+      expect(data.choice.choose).not.toHaveBeenCalled();
+      expect(landing.settled).toBe(false);
+      expect(rememberedBrowseLocation("s1")).toBeNull();
+
+      mocks.realFolder = {
+        worktrees: {
+          status: "ok",
+          worktrees: [
+            { path: "/repo", branch: "main", is_main: true, detached: false },
+            { path: ROOT, branch: "feature", is_main: false, detached: false },
+          ],
+        },
+      };
+      rerender(<ChangesReview {...props} />);
+      expect(rememberedBrowseLocation("s1")).toBe(ROOT);
+      expect(data.choice.choose).toHaveBeenCalledWith(visit);
+      // Unmounted while the real hook still applies, since the next test's folder mock differs.
+      unmount();
     });
 
     it("waits for the worktrees before comparing folders, then returns to the workspace", () => {

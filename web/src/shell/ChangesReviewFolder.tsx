@@ -58,7 +58,10 @@ export interface ReviewFolder {
   canChoose: boolean;
   /** Why the folder can't be chosen here when the viewer otherwise could; null when it can. */
   cannotChooseReason: string | null;
-  /** `root`, `rootFor` and `canChoose` rest on loaded answers, not on lookups still in flight. */
+  /**
+   * `root`, `rootFor` and `canChoose` rest on answers: false while a lookup is in flight or
+   * failed, since neither says which folders exist.
+   */
   resolved: boolean;
   /** The repository Diffs would review for `directory`: absolute, or null for the workspace. */
   rootFor: (directory: string | null) => string | null;
@@ -84,6 +87,8 @@ export function useReviewFolder(
   const needsWorktrees = active || directory !== null || lookUp !== null;
   const worktrees = useSessionWorktrees(conversationId, hostId, needsWorktrees ? workspace : null);
   const listed = worktrees.data?.status === "ok" ? worktrees.data.worktrees : null;
+  // Only a list, or "not a Git repository", says which folders exist; a failed lookup doesn't.
+  const worktreesKnown = listed !== null || worktrees.data?.status === "not_git";
   const insideLargerRepository =
     workspace !== null && listed !== null && workspaceInsideLargerRepository(workspace, listed);
   const root = workspace ? diffRootFor(directory, workspace, listed ?? []) : null;
@@ -99,7 +104,7 @@ export function useReviewFolder(
     workspace !== null &&
     !sessionLoading &&
     !environment.isLoading &&
-    (!needsWorktrees || !worktrees.isLoading);
+    (!needsWorktrees || worktreesKnown);
   const canRoam =
     workspace !== null &&
     browseNavigation({
@@ -110,7 +115,8 @@ export function useReviewFolder(
       reach: environment.data?.reachable ?? null,
     }).canRoam;
   const cannotChooseReason = canRoam && insideLargerRepository ? LARGER_REPOSITORY_REASON : null;
-  const canChoose = canRoam && !insideLargerRepository;
+  // A workspace inside a larger repository can't choose, so choosing waits until that's known.
+  const canChoose = canRoam && worktreesKnown && !insideLargerRepository;
   const [open, setOpen] = useState(false);
   const showWorkspace = () => rememberBrowseLocation(conversationId, null);
   const dialog =

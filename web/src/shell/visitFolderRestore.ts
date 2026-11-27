@@ -38,8 +38,8 @@ export interface VisitFolderInput {
   /** The session's directory, which Files shares. */
   directory: string | null;
   /**
-   * `shownRoot`, `visitRootShows` and `canChoose` rest on loaded answers: true once those loads
-   * finish, including when they fail, so a hold ends.
+   * `shownRoot`, `visitRootShows` and `canChoose` rest on answers: false while a lookup is in
+   * flight or failed, so the visit holds rather than being replaced by the workspace's.
    */
   resolved: boolean;
   /** Moving to `visitRoot` would review it: false once its worktree is gone. */
