@@ -4,10 +4,15 @@
 import { afterEach, expect, it, vi } from "vitest";
 
 import { queryCodeHost } from "./desktopCodeHostReads";
-import { githubCooldownKey, githubCooldowns } from "./githubCooldown";
+import {
+  githubCooldownKey,
+  githubCooldowns,
+  resolveAutomaticGitHubReaderWith,
+} from "./githubCooldown";
 
 afterEach(() => {
   githubCooldowns.reset();
+  resolveAutomaticGitHubReaderWith({ known: () => null, discover: async () => null });
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
 });
 
@@ -73,4 +78,34 @@ it("starts the reader's cooldown from a partial answer that met a limit", async 
   const result = await queryCodeHost(request("pull_request_view"));
   expect(result.ok).toBe(true);
   expect(githubCooldowns.heldUntil(githubCooldownKey("github.com", "octo"))).toBe(retryAt);
+});
+
+it("holds the reader for as long as the shell's rate-limited answer says", async () => {
+  const retryAt = Date.now() + 90_000;
+  const shell = installShell({
+    answer: { ok: false, error: { code: "rate_limited", message: "Slow down", retryAt } },
+  });
+  const result = await queryCodeHost(request("pull_request_view"));
+  expect(result).toMatchObject({ ok: false, error: { code: "rate_limited" } });
+  expect(githubCooldowns.heldUntil(githubCooldownKey("github.com", "octo"))).toBe(retryAt);
+  // The next read as that reader waits it out here.
+  expect(await queryCodeHost(request("pull_request_view"))).toMatchObject({
+    error: { code: "rate_limited", local: true },
+  });
+  expect(shell.codeHostQuery).toHaveBeenCalledTimes(1);
+});
+
+it("finds out who an Automatic read reads as while another reader on its host cools down", async () => {
+  const shell = installShell();
+  resolveAutomaticGitHubReaderWith({ known: () => null, discover: async () => "octo" });
+  githubCooldowns.rateLimited(githubCooldownKey("github.com", "other"), Date.now() + 60_000);
+  const automatic = { ...request("pull_request_view"), login: undefined };
+  // Not this reader's cooldown: it reads, and settles as the reader it found.
+  expect((await queryCodeHost(automatic)).ok).toBe(true);
+  githubCooldowns.rateLimited(githubCooldownKey("github.com", "octo"), Date.now() + 60_000);
+  // Its own reader is held: refused here, without asking the shell.
+  expect(await queryCodeHost(automatic)).toMatchObject({
+    error: { code: "rate_limited", local: true },
+  });
+  expect(shell.codeHostQuery).toHaveBeenCalledTimes(1);
 });

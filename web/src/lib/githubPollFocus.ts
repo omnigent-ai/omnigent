@@ -153,11 +153,7 @@ export function createGitHubPollFocus({
     return isPaused();
   }
 
-  /**
-   * Back to how a fresh page starts, for tests, which share this module across a whole file: no
-   * timer, listeners, subscribers or flag watch, no held polls (none is read or woken), the pause on until the
-   * flag says otherwise, and the unfocused count starting again at the next use.
-   */
+  /** Restore a fresh page's state for tests that share this module. */
   function resetForTests() {
     lifecycle += 1;
     cancelTimer();

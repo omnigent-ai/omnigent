@@ -3,11 +3,23 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createGitHubReadBudgets, GITHUB_READ_BUDGET_FLAG } from "./githubReadBudget";
+import {
+  createGitHubReadBudgets,
+  GITHUB_READ_BUDGET_FLAG,
+  githubReadBudgets,
+  type GitHubReadBudgets,
+} from "./githubReadBudget";
 
 const KEY = "github.com\namy";
 const START = 1_000_000;
 const RESET = START + 30 * 60_000;
+
+// Each test's stores, cleared after it so no reset timer or flag watch outlives it.
+const stores: GitHubReadBudgets[] = [];
+afterEach(() => {
+  for (const store of stores.splice(0)) store.clear();
+  githubReadBudgets.clear();
+});
 
 function budgets() {
   let clock = START;
@@ -18,6 +30,7 @@ function budgets() {
       setEnabled = set;
     },
   });
+  stores.push(store);
   return {
     store,
     setEnabled: (enabled: boolean) => setEnabled(enabled),
@@ -243,6 +256,7 @@ describe("githubReadBudgets and the shell's rollback flag", () => {
         return stopWatching;
       },
     });
+    stores.push(store);
     const eased = vi.fn();
     const changed = vi.fn();
     store.subscribe(eased);
@@ -295,15 +309,17 @@ describe("githubReadBudgets and the shell's rollback flag", () => {
       getDesktopFeatures: async () => ({ featureFlags: { names: [GITHUB_READ_BUDGET_FLAG] } }),
     };
     vi.resetModules();
-    const { githubReadBudgets } = await import("./githubReadBudget");
+    // A fresh module's singleton, which watches the shell's flag: cleared after the test.
+    const fresh = (await import("./githubReadBudget")).githubReadBudgets;
+    stores.push(fresh);
     const budget = { ...graphql(10), resetAt: Date.now() + 30 * 60_000 };
-    githubReadBudgets.observe(KEY, budget);
+    fresh.observe(KEY, budget);
     await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1));
     expect(subscribe.mock.calls[0]![0]).toBe(GITHUB_READ_BUDGET_FLAG);
     deliver(true);
-    githubReadBudgets.observe(KEY, budget);
-    expect(githubReadBudgets.pace(KEY).pace).toBe("stopped");
+    fresh.observe(KEY, budget);
+    expect(fresh.pace(KEY).pace).toBe("stopped");
     deliver(false);
-    expect(githubReadBudgets.pace(KEY).pace).toBe("normal");
+    expect(fresh.pace(KEY).pace).toBe("normal");
   });
 });

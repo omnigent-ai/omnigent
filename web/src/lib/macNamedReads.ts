@@ -347,9 +347,11 @@ export function acceptNamedAnswer(
     advance(host, login);
     return "moved";
   }
-  if (acceptMacRead(ticket.read, identity.login as string) === "rejected") return "moved";
   const id = scopeId(host, login);
   const known = writers.get(id);
+  // Answered after a newer one, with no account change between: it never replaces the newer.
+  if (known && (generation as number) < known.generation) return "moved";
+  if (acceptMacRead(ticket.read, identity.login as string) === "rejected") return "moved";
   refusedReaders.delete(id);
   if (!known || known.generation !== generation || known.login !== identity.login) {
     writers.set(id, { login: identity.login as string, generation: generation as number });

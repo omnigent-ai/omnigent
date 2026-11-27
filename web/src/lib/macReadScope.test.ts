@@ -15,10 +15,6 @@ import {
   showsMacReader,
   useMacReadScopeVersion,
 } from "@/lib/macReadScope";
-import { EXAMPLE_DEVICE_HOST, withPullRequestIntegrations } from "@/test/pullRequestIntegrations";
-
-// Example Host stand-in hosts are recognized by name, as a build that registers Example Host does.
-withPullRequestIntegrations({ namedCodeHosts: [EXAMPLE_DEVICE_HOST] });
 
 const currentUser = vi.hoisted(() => ({
   id: "user-1" as string | null,

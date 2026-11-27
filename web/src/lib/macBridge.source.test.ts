@@ -1,5 +1,6 @@
 // Every pull request call to this Mac's shell goes through `macBridge.ts`, which closes when the
-// page's server moves. No other file imports one from `nativeBridge`, or reads it off the window.
+// page's server moves. This scans static imports, re-exports, dynamic imports and window reads;
+// it does not follow a bridge function handed on as a value.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -88,20 +89,30 @@ function bridgeMembers(): string[] {
 
 const FORBIDDEN_EXPORTS = new Set(bridgeExports().filter((name) => !ALLOWED_EXPORTS.has(name)));
 const FORBIDDEN_MEMBERS = bridgeMembers().filter((name) => !ALLOWED_MEMBERS.has(name));
-const FROM_BRIDGE = String.raw`from\s+"[^"]*nativeBridge(?:CodeHost)?"`;
+const BRIDGE_PATH = String.raw`"[^"]*nativeBridge(?:CodeHost)?"`;
+const FROM_BRIDGE = String.raw`from\s+${BRIDGE_PATH}`;
 
-/** What `source` takes from the bridge that only the gate may: imports, and window reads. */
+/**
+ * What `source` takes from the bridge that only the gate may: static imports and re-exports by
+ * name, a namespace's uses, a dynamic import, and code-host members read off the window.
+ */
 function bypasses(source: string): string[] {
   const code = withoutComments(source);
   const found: string[] = [];
   for (const match of code.matchAll(
-    new RegExp(String.raw`import\s+(type\s+)?\{([^}]*)\}\s+${FROM_BRIDGE}`, "g"),
+    new RegExp(String.raw`(import|export)\s+(type\s+)?\{([^}]*)\}\s+${FROM_BRIDGE}`, "g"),
   )) {
-    if (match[1]) continue;
-    for (const specifier of match[2]!.split(",")) {
+    if (match[2]) continue;
+    for (const specifier of match[3]!.split(",")) {
       const name = specifier.trim().split(/\s+as\s+/)[0]!;
-      if (FORBIDDEN_EXPORTS.has(name)) found.push(`imports ${name}`);
+      if (FORBIDDEN_EXPORTS.has(name)) found.push(`${match[1]}s ${name}`);
     }
+  }
+  if (new RegExp(String.raw`export\s+\*(?:\s+as\s+\w+)?\s+${FROM_BRIDGE}`).test(code)) {
+    found.push("re-exports the whole bridge");
+  }
+  if (new RegExp(String.raw`import\(\s*${BRIDGE_PATH}\s*\)`).test(code)) {
+    found.push("imports the bridge dynamically");
   }
   for (const match of code.matchAll(
     new RegExp(String.raw`import\s+\*\s+as\s+(\w+)\s+${FROM_BRIDGE}`, "g"),
@@ -150,6 +161,18 @@ describe("pull request calls to this Mac's shell", () => {
     expect(FORBIDDEN_MEMBERS).toEqual(
       expect.arrayContaining(["codeHostQuery", "githubQuery", "localPullRequestLinks"]),
     );
+  });
+
+  it("would catch a re-export, a whole re-export and a dynamic import", () => {
+    expect(bypasses(`export { desktopCodeHostQuery } from "@/lib/nativeBridge";`)).toEqual([
+      "exports desktopCodeHostQuery",
+    ]);
+    expect(bypasses(`export * from "@/lib/nativeBridge";`)).toEqual([
+      "re-exports the whole bridge",
+    ]);
+    expect(bypasses(`const bridge = await import("@/lib/nativeBridge");`)).toEqual([
+      "imports the bridge dynamically",
+    ]);
   });
 
   it("would catch a named import, a renamed one, a namespace use and a window read", () => {

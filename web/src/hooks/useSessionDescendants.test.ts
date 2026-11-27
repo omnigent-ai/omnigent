@@ -102,6 +102,25 @@ describe("fetchSessionDescendants", () => {
     expect(result.truncated).toBe(false);
   });
 
+  it("registers a grandchild from a depth-bearing answer under its real parent", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      page([
+        row("conv_child", { depth: 1, parent_session_id: "conv_root" }),
+        row("conv_grandchild", { depth: 2, parent_session_id: "conv_child" }),
+      ]),
+    );
+
+    const result = await fetchSessionDescendants("conv_root");
+
+    expect(result.rows.map((entry) => [entry.info.id, entry.parentId, entry.depth])).toEqual([
+      ["conv_child", "conv_root", 1],
+      ["conv_grandchild", "conv_child", 2],
+    ]);
+    expect(getSessionParent("conv_grandchild")).toBe("conv_child");
+    // One read answers the whole tree.
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  });
+
   it("stops the walk at the row cap and says the list is cut short", async () => {
     let next = 0;
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {

@@ -107,7 +107,12 @@ describe("githubCooldowns", () => {
 
   it("doubles only after a fallback wait, never after a deadline the shell named", () => {
     const { cooldowns, advance, now } = harness();
+    // The shell names the first wait: the first fallback starts at its base.
+    cooldowns.rateLimited(KEY, now() + 30_000);
+    advance(30_000);
     cooldowns.rateLimited(KEY, null);
+    expect(cooldowns.heldUntil(KEY)).toBe(now() + FALLBACK_COOLDOWN_MS);
+    // A named wait between fallbacks doesn't double the next one either.
     advance(FALLBACK_COOLDOWN_MS);
     cooldowns.rateLimited(KEY, now() + 30_000);
     advance(30_000);
@@ -117,14 +122,6 @@ describe("githubCooldowns", () => {
     advance(FALLBACK_COOLDOWN_MS);
     cooldowns.rateLimited(KEY, null);
     expect(cooldowns.heldUntil(KEY)).toBe(now() + 2 * FALLBACK_COOLDOWN_MS);
-  });
-
-  it("starts the first fallback at its base after a wait the shell named", () => {
-    const { cooldowns, advance, now } = harness();
-    cooldowns.rateLimited(KEY, now() + 30_000);
-    advance(30_000);
-    cooldowns.rateLimited(KEY, null);
-    expect(cooldowns.heldUntil(KEY)).toBe(now() + FALLBACK_COOLDOWN_MS);
   });
 
   it("ends the cooldown at the first answer after it, and ignores answers while it waits", () => {

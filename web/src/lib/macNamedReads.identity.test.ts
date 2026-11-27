@@ -75,8 +75,8 @@ async function namedReadsOn() {
   await vi.waitFor(() => expect(namedReadsAvailable()).toBe(true));
 }
 
-const answerAs = (login: string) => ({
-  identity: { host: "github.com", login, generation: 0, named: true },
+const answerAs = (login: string, generation = 0) => ({
+  identity: { host: "github.com", login, generation, named: true },
   provenance: { version: 1, provider: "github", host: "github.com", viewer: login },
 });
 
@@ -151,4 +151,14 @@ it.each([
   await namedReadsOn();
   expect(acceptNamedAnswer(namedReadTicket(READER), answer)).toBe("unproven");
   expect(namedWriterIdentity(READER)).toBe("checking");
+});
+
+it("keeps the newest generation a login proved when an older answer lands after it", async () => {
+  await namedReadsOn();
+  const older = namedReadTicket(READER);
+  const newer = namedReadTicket(READER);
+  expect(acceptNamedAnswer(newer, answerAs("octo", 2))).toBe("accepted");
+  // Sent first and answered last, with no account change between them.
+  expect(acceptNamedAnswer(older, answerAs("octo", 1))).toBe("moved");
+  expect(namedWriterIdentity(READER)).toEqual({ login: "octo", generation: 2 });
 });
