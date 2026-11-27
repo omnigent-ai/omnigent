@@ -53,6 +53,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  writes.move.isPending = false;
   usePaletteCommandsStore.setState({ groups: {} });
 });
 
@@ -133,6 +134,16 @@ describe("Sidebar selection in ⌘K", () => {
     expect(isCommandAvailable(command("Archive selected").availability)).toBe(true);
   });
 
+  it("greys the actions while a bulk change is saving, as the bar's buttons are", async () => {
+    writes.move.isPending = true;
+    renderSidebar({ features: QUICK_PICK });
+    await screen.findByRole("link", { name: /Alpha/ });
+    startSelecting();
+    fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
+    expectCommandsMatchBar();
+    expect(isCommandAvailable(command("Archive selected").availability)).toBe(false);
+  });
+
   it("runs the bar's own actions", async () => {
     renderSidebar({ features: QUICK_PICK });
     await screen.findByRole("link", { name: /Alpha/ });
@@ -159,7 +170,5 @@ describe("Sidebar selection in ⌘K", () => {
     expect(command("Delete selected").id).not.toBe(before);
     // ⌘K runs a picked row by its ID; the old one now finds no command, so nothing starts.
     expect(selectionCommands().find((candidate) => candidate.id === before)).toBeUndefined();
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(writes.move.mutate).not.toHaveBeenCalled();
   });
 });

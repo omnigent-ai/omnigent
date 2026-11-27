@@ -584,11 +584,3 @@ def test_quick_pick_moves_the_project_in_view(request: pytest.FixtureRequest) ->
         page, f"move project {first} down", f"Move Project {first} Down", closes=True
     )
     poll_until(lambda: order() == [second, first], timeout_s=15.0)
-
-
-def _rendered_row_ids(page: Page) -> list[str]:
-    """Sidebar session row ids in render order, the first listing of each."""
-    ids = page.locator("li[data-sidebar-session-id]").evaluate_all(
-        "rows => rows.map(row => row.dataset.sidebarSessionId)"
-    )
-    return list(dict.fromkeys(ids))

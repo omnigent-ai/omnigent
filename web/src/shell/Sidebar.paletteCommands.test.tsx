@@ -72,6 +72,15 @@ const run = (label: string) =>
     if (!command) throw new Error(`No "${label}" among: ${labels().join(", ")}`);
     command.run();
   });
+/** A command of the selection groups ⌘K offers while selecting. */
+const selectionCommand = (label: string): PaletteCommand => {
+  const found = Object.entries(usePaletteCommandsStore.getState().groups)
+    .filter(([source]) => source.startsWith("sidebar.selection"))
+    .flatMap(([, group]) => group.commands)
+    .find((candidate) => candidate.label === label);
+  if (!found) throw new Error(`No selection command "${label}"`);
+  return found;
+};
 /** The label of the value a setting row shows as chosen. */
 const settingValue = (label: string) => {
   const setting = commands().find((command) => command.label === label)?.setting;
@@ -173,13 +182,6 @@ describe("the project list in ⌘K", () => {
     expect(labels()).not.toContain("Expand All Projects");
   });
 
-  it("offers Select Sessions, starting the same selection as the header button", async () => {
-    renderSidebar({ features: QUICK_PICK });
-    await waitFor(() => expect(labels()).toContain("Select Sessions"));
-    run("Select Sessions");
-    expect(await screen.findByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
-  });
-
   it("registers nothing with the flag off", async () => {
     renderSidebar({ features: {} });
     await screen.findByText("Alpha");
@@ -235,11 +237,11 @@ describe("moving a project", () => {
 });
 
 describe("the entry points and ⌘K agree", () => {
-  it("withdraws the project controls from both while selecting sessions", async () => {
+  it("starts the header button's selection from Select Sessions, then withdraws the project controls", async () => {
     renderSidebar({ features: QUICK_PICK });
     await waitFor(() => expect(labels()).toContain("Select Sessions"));
     run("Select Sessions");
-    await screen.findByRole("button", { name: "Exit selection mode" });
+    expect(await screen.findByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
     expect(screen.queryByTestId("project-list-actions")).toBeNull();
     await waitFor(() => expect(labels()).toEqual([]));
   });
@@ -270,6 +272,13 @@ describe("the entry points and ⌘K agree", () => {
     await screen.findByText("Filed session");
     run("Select Sessions");
     expect(await screen.findByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+    // The filed row is selectable, and Select all reaches it.
+    fireEvent.click(screen.getByRole("link", { name: /Filed session/ }));
+    expect(screen.getByText(/\d+ selected/).textContent).toBe("1 selected");
+    fireEvent.click(screen.getByRole("link", { name: /Filed session/ }));
+    expect(screen.getByText(/\d+ selected/).textContent).toBe("0 selected");
+    act(() => selectionCommand("Select all sessions").run());
+    expect(screen.getByText(/\d+ selected/).textContent).toBe("1 selected");
   });
 
   it("withdraws the project header's rows when grouping hides the Projects section", async () => {
