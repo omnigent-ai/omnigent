@@ -304,7 +304,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { usePublishSidebarSessionOrder } from "@/hooks/useSidebarSessionOrder";
 import {
-  isLeavingOpenSession,
+  leavingSessionOfOpenView,
   leaveSessionView,
   navigateAfterArchiving,
   newSessionPathFor,
@@ -8407,18 +8407,17 @@ function BulkActionBar({
     // session they switched to meanwhile. Mirrors handleDelete.
     const leavingIds = toArchive.map((c) => c.id);
     // With quick_pick_palette, a sub-agent's view also leaves with its archived parent.
-    const leavesOpenView = quickPick
-      ? isLeavingOpenSession(queryClient, activeId, leavingIds)
-      : toArchive.some((c) => c.id === activeId);
-    if (leavesOpenView) {
+    const leavingWithOpenView = quickPick
+      ? leavingSessionOfOpenView(queryClient, activeId, leavingIds)
+      : leavingIds.find((id) => id === activeId);
+    const leaving = toArchive.find((c) => c.id === leavingWithOpenView);
+    if (leaving) {
+      // New session, if nothing is left to open, starts in that session's project.
       navigateAfterArchiving({
         leavingIds,
         source: "bulk",
         navigate,
-        newSessionPath: newSessionPathFor(
-          queryClient,
-          toArchive.find((c) => c.id === activeId) ?? toArchive[0],
-        ),
+        newSessionPath: newSessionPathFor(queryClient, leaving),
         queryClient,
       });
     }

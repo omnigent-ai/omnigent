@@ -362,9 +362,14 @@ describe("archiving the open session", () => {
     { ...CONV, id: "conv_b", title: "Bravo" },
     { ...CONV, id: "conv_c", title: "Charlie" },
   ];
+  const QUICK_PICK: ServerInfo = {
+    ...FALLBACK_SERVER_INFO,
+    features: { quick_pick_palette: true },
+  };
 
   function LocationProbe() {
-    return <output data-testid="location">{useLocation().pathname}</output>;
+    const { pathname, search } = useLocation();
+    return <output data-testid="location">{pathname + search}</output>;
   }
 
   // On a session route, so the sidebar knows which session is open.
@@ -426,7 +431,7 @@ describe("archiving the open session", () => {
   it("opens the session visited before it from the row menu, as ⌃[ would", () => {
     mockConversations(SESSIONS);
     registerRecentSessions(["conv_b", "conv_c", "conv_a"]);
-    renderOnSession("conv_b");
+    renderOnSession("conv_b", { info: QUICK_PICK });
     openRowMenu("Bravo");
     fireEvent.click(screen.getByTestId("archive-conversation"));
 
@@ -439,14 +444,39 @@ describe("archiving the open session", () => {
   it("opens the most recent session not being archived after a bulk archive", () => {
     mockConversations(SESSIONS);
     registerRecentSessions(["conv_b", "conv_c", "conv_a"]);
-    renderOnSession("conv_b");
+    renderOnSession("conv_b", { info: QUICK_PICK });
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
     fireEvent.click(screen.getByRole("link", { name: /Bravo/ }));
     fireEvent.click(screen.getByRole("link", { name: /Charlie/ }));
     fireEvent.click(screen.getByTestId("bulk-archive"));
 
     expect(mocks.bulkArchive.mutate).toHaveBeenCalledTimes(1);
+    const { ids } = mocks.bulkArchive.mutate.mock.calls[0][0];
+    expect([...ids].sort()).toEqual(["conv_b", "conv_c"]);
     expect(location()).toBe("/c/conv_a");
+  });
+
+  it("starts New session in the project of the archived parent the open sub-agent leaves with", () => {
+    const inProject = (session: Conversation, project: string) => ({
+      ...session,
+      labels: { ...session.labels, omni_project: project },
+    });
+    const [alpha, bravo] = SESSIONS;
+    mockConversations([inProject(alpha, "Ops"), inProject(bravo, "Payments")]);
+    useRecentSessionSwitchStore.setState({
+      history: ["conv_child", "conv_a", "conv_b"],
+      readLiveSessionIds: () => new Set(["conv_a", "conv_b"]),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+    renderOnSession("conv_child", { info: QUICK_PICK, parentOf: { conv_child: "conv_a" } });
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Bravo/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    // Nothing live is left to open, so New session opens in Alpha's project, not Bravo's.
+    expect(location()).toBe("/?project=Ops");
   });
 
   it("leaves a sub-agent's view with its bulk-archived parent only with quick_pick_palette", () => {
