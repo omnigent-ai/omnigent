@@ -181,10 +181,19 @@ def _holds_gadget_data(session: Session, user: SqlUser, gadget_store: GadgetStor
     from omnigent.db.account_authority import account_registration
     from omnigent.gadgets.access import workspace_registration
     from omnigent.gadgets.documents import ImmutableDocumentStore
-    from omnigent.gadgets.service import _STATE_STORE_LIMITS, SHELF_ROOT
+    from omnigent.gadgets.service import _STATE_STORE_LIMITS, SHELF_ROOT, VIEWER_DATA_ROOT
+    from omnigent.stores.gadget_store import NotFound as GadgetNotFound
 
     registration = workspace_registration(account_registration(user.created_at))
     if gadget_store.owns_any(user.id, owner_registration=registration):
+        return True
+    files = gadget_store.user_files(user.id, owner_registration=registration)
+    # Their own records in other people's gadgets' viewer collections live here too.
+    try:
+        viewer_data, _ = files.list_page(VIEWER_DATA_ROOT, after=None, limit=1)
+    except GadgetNotFound:
+        viewer_data = []
+    if viewer_data:
         return True
     shelf = ImmutableDocumentStore(
         gadget_store.user_files(user.id, owner_registration=registration),

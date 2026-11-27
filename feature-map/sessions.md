@@ -421,7 +421,10 @@ the header menu), and each place is a separate entry point.
   (where **Address all** sends the open comments to its session), **Share** (only where
   the server offers gadget sharing, as the bundled SQL store does), and a **⋯** menu with
   **Gadget details**, **Make a copy** (for a published gadget: a copy the viewer owns, with
-  its data if they check **Copy its data too**) and **Delete gadget**. A gadget that asks to
+  its data if they check **Copy its data too**) and **Delete gadget**.
+  A gadget's collections are shared, or per viewer (`collection_scopes`): in a
+  per-viewer collection each viewer, even one who can only view, keeps their own
+  records, which no one else sees and a copy never takes. A gadget that asks to
   read the viewer's sessions waits for **Allow** / **Don’t allow** first; a gadget
   that navigated itself stops with **Reload gadget**, after which it asks again.
   The Gadget page lists the viewer's gadgets and, with sharing, a **Shared with you** section; each

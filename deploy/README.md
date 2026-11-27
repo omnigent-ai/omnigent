@@ -226,6 +226,23 @@ to browsers (e.g. `docker compose up` with no proxy, reached over
 plain HTTP). That's fine for a single window; put a proxy in front once
 you or your team routinely open several.
 
+## Turning on gadget sharing
+
+Gadgets (the `gadgets` feature) can be shared once the database has the
+`gadget_shares` table. A grant names a username, and a release with gadget
+sharing removes an account's grants when it is deleted and refuses to register
+that username again until they are gone. So:
+
+1. Upgrade every server replica first, then turn on `gadgets`. If it is already
+   on, finish the rolling upgrade before anyone shares a gadget: an older
+   replica can delete an account and register its username again without
+   removing the grants, and the new account inherits them.
+2. Once anyone has shared a gadget, don't roll back to a release without
+   gadget sharing while `gadgets` is on. Turn the feature off first; the
+   schema downgrade drops every share, so it is safe only before the first one.
+
+See [`designs/GADGETS.md`](../designs/GADGETS.md) for details.
+
 ## Execution model
 
 Omnigent runs in two pieces that talk to each other over a

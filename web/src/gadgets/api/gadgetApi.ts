@@ -72,6 +72,8 @@ export interface CreateGadgetRevisionRequest {
   sdk_version: 1;
   capabilities: GadgetCapability[];
   collections: Record<string, Record<string, unknown>>;
+  /** Collections where each viewer keeps their own records; the others are shared. */
+  collection_scopes?: Record<string, "shared" | "viewer">;
   /** Markdown for agents: what the collections mean, conventions and common tasks. */
   guide?: string;
   constraints?: GadgetConstraint[];

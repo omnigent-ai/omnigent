@@ -329,11 +329,55 @@ def _frontend_input(
     return html, sorted(set(capabilities)), collections, guide, constraints, actions
 
 
+COLLECTION_SCOPES = ("shared", "viewer")
+# Where a viewer's records of ``viewer`` collections live, in their own files.
+VIEWER_DATA_ROOT = "viewer-data"
+
+
+def _collection_scopes(value: Any, collections: dict, constraints: list[dict]) -> dict[str, str]:
+    """The ``viewer`` collections of a revision, ``{name: "viewer"}``; others are shared.
+
+    :raises InvalidInput: For an unknown collection or scope, or a rule spanning scopes:
+        a reference between a ``viewer`` and a ``shared`` collection is not supported.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise InvalidInput("collection_scopes must map collection names to a scope")
+    scopes: dict[str, str] = {}
+    for name, scope in value.items():
+        if name not in collections:
+            raise InvalidInput(f"collection_scopes names {name!r}, which is not declared")
+        if scope not in COLLECTION_SCOPES:
+            raise InvalidInput(f"Collection {name} scope must be shared or viewer")
+        if scope == "viewer":
+            scopes[name] = scope
+    for rule in constraints:
+        if rule["kind"] == "reference" and (rule["collection"] in scopes) != (
+            rule["target"] in scopes
+        ):
+            raise InvalidInput(
+                f"Constraint {rule['name']} references across scopes: a viewer collection "
+                "can reference only viewer collections, and a shared one only shared ones",
+                details={"constraint": rule["name"]},
+            )
+    return scopes
+
+
+def _scope_digest(schema: Any, scope: str) -> str:
+    """A collection's identity: its schema, and its scope when that isn't ``shared``, so
+    publishing a change of either is refused. Shared collections keep their old digest."""
+    if scope == "shared":
+        return hashlib.sha256(canonical_bytes(schema)).hexdigest()
+    return hashlib.sha256(canonical_bytes({"scope": scope, "schema": schema})).hexdigest()
+
+
 # A revision derived from another carries these from it unless the request gives them.
 _REVISION_FIELDS = (
     "sdk_version",
     "capabilities",
     "collections",
+    "collection_scopes",
     "guide",
     "constraints",
     "actions",
@@ -653,7 +697,9 @@ class GadgetService:
         records: list[tuple[str, str, Any]] = []
         if include_data:
             source = ImmutableDocumentStore(self._files(gadget), "data", limits=_DATA_STORE_LIMITS)
-            for collection in sorted(revision["collections"]):
+            # Viewer collections' records are each viewer's own and are never copied.
+            shared = set(revision["collections"]) - set(revision.get("collection_scopes", {}))
+            for collection in sorted(shared):
                 cursor = None
                 while True:
                     page = source.list(collection, _DATA_STORE_LIMITS.max_list_limit, cursor)
@@ -1076,6 +1122,9 @@ class GadgetService:
             value["constraints"] = constraints
         if actions:
             value["actions"] = actions
+        scopes = _collection_scopes(body.get("collection_scopes"), collections, constraints)
+        if scopes:
+            value["collection_scopes"] = scopes
         files = self._files(gadget)
         files.mkdirs("code/revisions")
         files.create_json(f"code/revisions/{revision_id}.json", value)
@@ -1112,10 +1161,14 @@ class GadgetService:
         ):
             raise CorruptData("Invalid publication schema catalogue")
         identities = dict(identities)
+        scopes = revision.get("collection_scopes", {})
         for name, schema in revision["collections"].items():
-            digest = hashlib.sha256(canonical_bytes(schema)).hexdigest()
+            digest = _scope_digest(schema, scopes.get(name, "shared"))
             if name in identities and identities[name] != digest:
-                raise InvalidInput("An existing collection schema cannot change")
+                raise InvalidInput(
+                    "An existing collection's schema and scope cannot change; "
+                    "use a new collection name"
+                )
             identities[name] = digest
         if len(identities) > MAX_COLLECTION_IDENTITIES:
             raise CapacityExceeded("Gadget has reached its lifetime collection limit")
@@ -1178,13 +1231,16 @@ class GadgetService:
             & _SUPPORTED_CAPABILITIES
             & set(publication["value"].get("approved_capabilities", []))
         )
-        if not permissions.write_data:
+        scopes = revision.get("collection_scopes", {})
+        # A viewer who can't change shared data still writes their own viewer records.
+        if not permissions.write_data and not scopes:
             granted.discard("data.write")
         return {
             "revision_id": revision["id"],
             "html": revision["html"],
             "sdk_version": 1,
             "capabilities": sorted(granted),
+            "collection_scopes": scopes,
             "viewer": {
                 "id": self._gadget_user_id(gadget, self.viewer.user_id),
                 "display_name": self._shown_name(),
@@ -1269,6 +1325,7 @@ class GadgetService:
             "sdk_version": 1,
             "capabilities": revision["capabilities"],
             "collections": revision["collections"],
+            "collection_scopes": revision.get("collection_scopes", {}),
             "guide": revision.get("guide"),
             "constraints": revision.get("constraints", []),
             "actions": revision.get("actions", []),
@@ -1291,6 +1348,8 @@ class GadgetService:
             "published_at": publication["updated_at"] if publication is not None else None,
             "guide": revision.get("guide"),
             "collections": revision.get("collections", {}),
+            # Collections each viewer keeps their own records of; the rest are shared.
+            "collection_scopes": revision.get("collection_scopes", {}),
             "constraints": revision.get("constraints", []),
             "actions": revision.get("actions", []),
             "next_steps": _NEXT_STEPS_UNPUBLISHED if publication is None else _NEXT_STEPS,
@@ -1677,6 +1736,14 @@ class GadgetService:
             app_id, _revision_id(revision_id)
         )
         result = self._rpc(gadget, permissions, revision, publication, method, params)
+        if (
+            method in {"data.v1.create", "data.v1.replace", "data.v1.delete"}
+            and isinstance(params, dict)
+            and params.get("collection") in revision.get("collection_scopes", {})
+        ):
+            # Viewer records are the viewer's own files, which their account's deletion
+            # removes: a write that lands after it queues that cleanup again.
+            self._after_owned_write()
         return self._for_gadget_code(gadget, result)
 
     def _rpc(
@@ -1703,12 +1770,15 @@ class GadgetService:
                 "The published gadget is not approved for this capability",
                 403,
             )
-        if method in writes:
-            self._require(permissions, "write_data")
         collection = _identifier(params.get("collection"), "collection")
         schema = revision["collections"].get(collection)
         if schema is None:
             raise InvalidInput("Collection is not declared by the published gadget")
+        scopes = revision.get("collection_scopes", {})
+        viewer_scope = collection in scopes
+        # Anyone who can read the gadget keeps their own records of a viewer collection.
+        if method in writes and not viewer_scope:
+            self._require(permissions, "write_data")
         if method in {"data.v1.create", "data.v1.replace"}:
             if "value" not in params:
                 raise InvalidInput("Document value is required")
@@ -1717,9 +1787,22 @@ class GadgetService:
             )
             if error is not None:
                 raise _schema_mismatch(collection, error)
-        files = self._files(gadget)
-        store = ImmutableDocumentStore(files, "data", limits=_DATA_STORE_LIMITS)
-        rules = revision.get("constraints", [])
+        if viewer_scope:
+            # The viewer's own files, beside their shelf: no one else reads them.
+            files = self.store.user_files(
+                self.viewer.user_id, owner_registration=self.viewer.registration
+            )
+            root = f"{VIEWER_DATA_ROOT}/{gadget.id}"
+        else:
+            files, root = self._files(gadget), "data"
+        store = ImmutableDocumentStore(files, root, limits=_DATA_STORE_LIMITS)
+        # Each scope's rules are enforced over that scope's records: a viewer's unique values
+        # and limits count only their own.
+        rules = [
+            rule
+            for rule in revision.get("constraints", [])
+            if (rule["collection"] in scopes) == viewer_scope
+        ]
         # `_guard` cannot be a collection name, so the guard never shares a directory with records.
         collections = revision["collections"]
 
@@ -1744,7 +1827,7 @@ class GadgetService:
         guard = (
             ConstraintGuard(
                 files,
-                "data/_guard",
+                f"{root}/_guard",
                 store,
                 rules,
                 self.viewer.user_id,
@@ -1783,7 +1866,7 @@ class GadgetService:
         # never saw it. Marked before the write, so a write the mark can't follow is refused
         # before anything changes; marked again after it (below) in case rules rebuilt in
         # between.
-        stale_marker = guard or ConstraintGuard(files, "data/_guard", store, [], actor)
+        stale_marker = guard or ConstraintGuard(files, f"{root}/_guard", store, [], actor)
         # Reserved until the mark after the write, so a rebuild can't commit in between.
         reservation = _digest([collection, record_id, operation_id, actor], 24)
         stale_marker.mark_stale(unguarded_write=True, reserve=reservation)

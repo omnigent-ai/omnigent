@@ -112,7 +112,22 @@ is refused while any remain: a new account never inherits the old one's access. 
 that keeps no grants reports `supports_gadget_grants` false: the server then advertises
 `gadget_sharing: false`, the web UI hides Share and the Shared list, and the share routes
 answer `FORBIDDEN`. A `PermissionStore` or `GadgetAccess` that keeps grants elsewhere, such
-as one backed by folder permissions, shares through the same routes. Moving the documents to SQL would be worth it if gadgets needed queries
+as one backed by folder permissions, shares through the same routes. 
+
+That cleanup and refusal are what keep a username registered again from inheriting grants,
+so every server process that can delete or register accounts must run a release that has
+them before gadget sharing is used. **Deployment order:** upgrade every replica, then enable
+the `gadgets` feature; on a server that already has it on, finish the rolling upgrade before
+anyone shares a gadget. A replica of an older release can delete and register the same
+username again without removing its grants, and the new account then holds them; a later
+cleanup does not take them back once that account is live. **Rollback floor:** once a grant
+has been saved, don't run a release older than this one while the feature is on. Rolling back
+further needs the feature off first, and the `gadget_shares` downgrade drops every share, so
+it is safe only before the first one. Binding grants to a registration instead (a column on
+`gadget_shares`) would remove the ordering requirement; it is not done because group grants
+have no registration to bind to.
+
+Moving the documents to SQL would be worth it if gadgets needed queries
 across gadgets or users (search over records, reporting), or transactions across records;
 both are out of scope below.
 
@@ -244,22 +259,19 @@ the first sight of what it sends.
 
 Some gadgets are for collaborating on one set of data; others are apps each person runs on
 their own data, and many mix the two (a shared catalog with each viewer's progress). Both are
-to be supported in one gadget, plus a copy for people who want their own code. Make a copy
-is built; collection scope is planned.
+supported in one gadget, plus a copy for people who want their own code.
 
-### Collection scope (planned)
+### Collection scope
 
-The publisher declares each collection's scope in the gadget's schema:
+A revision declares which collections are per viewer, beside their schemas:
 
 ```json
-"collections": {
-  "catalog":  {"scope": "shared", "schema": {...}},
-  "progress": {"scope": "viewer", "schema": {...}}
-}
+"collections": {"catalog": {...}, "progress": {...}},
+"collection_scopes": {"progress": "viewer"}
 ```
 
-- `shared` (the default) is today's behavior: one set of records that everyone the gadget is
-  shared with reads, and Can edit or above writes.
+- `shared` (the default, for any collection not named) is one set of records that everyone
+  the gadget is shared with reads, and Can edit or above writes.
 - `viewer` gives each viewer their own records in that collection. No one else reads them, the
   owner and managers included.
 
@@ -267,26 +279,33 @@ Rules:
 
 - **Access.** Can view is enough to read and write one's own `viewer` records, so a gadget can
   be handed out as an app without letting its users change shared data or code. Shared
-  collections keep the levels in [Permissions](#permissions).
-- **References.** A `viewer` record may reference a `shared` record; a `shared` record may not
-  reference into `viewer` data, which other viewers could not resolve.
-- **Unique and limit rules** apply within one viewer's records of that collection.
+  collections keep the levels in [Permissions](#permissions). The page a read-only viewer
+  loads keeps `data.write` when the revision has a `viewer` collection; writes to shared
+  collections are still refused.
+- **References** stay within one scope: a `viewer` collection references only `viewer`
+  collections (one viewer's records), and a `shared` one only `shared` ones. A revision with a
+  `reference` across scopes is refused. A viewer record naming a shared record by ID is
+  allowed as plain data, without a rule: a reference rule from viewer data to shared data
+  would need a shared delete to reach every viewer's records.
+- **Unique and limit rules** on a `viewer` collection apply within one viewer's records.
 - **Actions** run in the clicker's gadget session and see the clicker's `viewer` records plus
-  the shared ones. Gadget code addresses a collection by name either way; the server picks the
-  viewer's records from the scope. The opaque per-gadget viewer ID is unchanged.
-- **Changing a collection's scope** is refused at publish: data is not moved between scopes,
-  so a publisher who needs it uses a new collection name.
+  the shared ones. Gadget code and the SDK address a collection by name either way; the server
+  picks the viewer's records from the scope. The opaque per-gadget viewer ID is unchanged.
+- **Changing a collection's scope** is refused at publish, like changing its schema (the
+  collection's published identity covers both): data is not moved between scopes, so a
+  publisher who needs it uses a new collection name.
 
-### Where `viewer` data lives (planned)
+### Where `viewer` data lives
 
 In the viewer's own storage, not the gadget's: the viewer's `GadgetStore.user_files` scope,
 beside their shelf (in the bundled store,
 `<data_dir>/gadgets/users/<viewer key>/viewer-data/<gadget id>/`, where the key covers the
-viewer's registration); on a store backed by folder permissions, the viewer's own folder. So the gadget's owner cannot read it even with
-direct access to the gadget's storage, it counts against the viewer, and losing access to the
-gadget hides it rather than deleting it: sharing the gadget again shows it again. Deleting the
-gadget leaves it unreachable; the viewer's account cleanup, or deleting it from the viewer's
-gadget list, removes it.
+viewer's registration); on a store backed by folder permissions, the viewer's own folder. So
+the gadget's owner cannot read it even with direct access to the gadget's storage, it counts
+against the viewer, and losing access to the gadget hides it rather than deleting it: sharing
+the gadget again shows it again. Deleting the gadget leaves it unreachable. Deleting the
+viewer's account removes it with the rest of their files, and identity migration refuses a
+user who has any, as it does one with a shelf.
 
 ### Make a copy
 
@@ -294,8 +313,8 @@ Anyone who can read a published gadget can make a copy (`POST /v1/gadgets/{id}/c
 gadget they own with the source's published revision, published again in the copy, and, if
 they choose (`include_data`), the records of its collections with their IDs, written before
 the copy's rules are published so they count as existing data. Comments, grants, the action
-ledger and gadget sessions stay with the source, and once collection scope lands `viewer`
-data is never copied, the copier's own included. One copy holds at most
+ledger and gadget sessions stay with the source, and `viewer` data is never copied, the
+copier's own included: the copy starts with none. One copy holds at most
 `MAX_COPIED_RECORDS` (2,000) records; more is refused before anything is created, and a copy
 that fails half-way is deleted. The copy keeps no link to its source; updating a copy from
 its source is a later addition.

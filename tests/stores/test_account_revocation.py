@@ -2646,3 +2646,53 @@ def test_an_account_named_like_the_cleanup_scope_keeps_the_others_cleanup_notes(
     )
     gadgets.resume()
     assert resumed == ["mallory"]
+
+
+def test_deletion_removes_the_accounts_own_records_in_other_peoples_gadgets(
+    db_uri: str, tmp_path
+) -> None:
+    """Viewer-collection records live in the viewer's own files, which go with the account:
+    the name registered again starts with none, and the gadget's owner keeps theirs."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    _, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    bob = service("bob")
+    app = bob.create("Bob's course")
+    created = bob.create_revision(
+        app["id"],
+        {
+            "html": "<main>Course</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read", "data.write"],
+            "collections": {"progress": {"type": "object"}},
+            "collection_scopes": {"progress": "viewer"},
+        },
+    )
+    app = bob.publish(app["id"], {"revision_id": created["id"], "if_version": None})
+    permissions.grant_for_gadget("alice", app["id"], 1)
+
+    def progress(who):
+        page = who.rpc(
+            app["id"], app["published_revision"], "data.v1.list", {"collection": "progress"}
+        )
+        return [item["id"] for item in page["items"]]
+
+    def write(who, record_id):
+        who.rpc(
+            app["id"],
+            app["published_revision"],
+            "data.v1.create",
+            {"collection": "progress", "id": record_id, "value": {}, "operation_id": record_id},
+        )
+
+    write(service("alice"), "a1")
+    write(bob, "b1")
+
+    assert accounts.delete_user("alice") is True
+    accounts.create_user_with_password("alice", "replacement-hash")
+    permissions.grant_for_gadget("alice", app["id"], 1)
+
+    assert progress(service("alice")) == []
+    assert progress(bob) == ["b1"]
