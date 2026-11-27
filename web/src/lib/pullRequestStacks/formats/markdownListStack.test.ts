@@ -140,6 +140,29 @@ describe("markdownListStackFormat on hand-edited descriptions", () => {
     expect(shape(parsed)).toEqual(shape(parse(withoutFooter)));
   });
 
+  it("never verifies a section a code example holds", () => {
+    // A no-break space can't close the fence, and an outdented fence opens a new one.
+    for (const before of ["```\n```\u00a0\n", "- Example\n  ```\n  sample\n```\n"]) {
+      expect(parse(`${before}${LINEAR}\`\`\`\n`)).toBeNull();
+    }
+  });
+
+  it("reads a section after a list item's code example", () => {
+    expect(parse(`- Example\n  \`\`\`\n  sample\n${LINEAR}`)?.trust).toBe("verified");
+  });
+
+  it("reads the same description the same way every time, even with a global intro pattern", () => {
+    const format = markdownListStackFormat({
+      id: "global-intro",
+      header: "## Stacked changes",
+      headerSuffix: " (_written by stk_)",
+      introLine: /^Review the changes/g,
+    });
+    const first = format.parse(LINEAR, SELF);
+    expect(format.parse(LINEAR, SELF)).toEqual(first);
+    expect(first).not.toBeNull();
+  });
+
   it("ignores a footer inside a code block or quote above the header", () => {
     const withoutFooter = LINEAR.replace("\n---------\n", "\n");
     for (const above of ["```\n---------\n```", "> ---------"]) {

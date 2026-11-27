@@ -36,6 +36,26 @@ describe("markdownLines", () => {
     expect(lines.map((line) => line.fenced)).toEqual([false, false, true, true, true]);
   });
 
+  it("closes a fence only with spaces or tabs after it, never another space character", () => {
+    const lines = markdownLines("```\n```\u00a0\ninside\n``` \t\nafter\n");
+    expect(lines.map((line) => line.fenced)).toEqual([true, true, true, true, false]);
+  });
+
+  it("ends a list item's fence where the item ends, and reads an outdented fence as a new one", () => {
+    const outdented = markdownLines("- Example\n  ```\n  sample\n```\n## Stack\n```\nafter\n");
+    expect(outdented.map((line) => line.fenced)).toEqual([
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+    ]);
+    const ended = markdownLines("- Example\n  ```\n  sample\n## Stack\n");
+    expect(ended.map((line) => line.fenced)).toEqual([false, true, true, false]);
+  });
+
   it("leaves an unclosed fence open to the end", () => {
     expect(markdownLines("~~~\nx\n").map((line) => line.fenced)).toEqual([true, true]);
   });

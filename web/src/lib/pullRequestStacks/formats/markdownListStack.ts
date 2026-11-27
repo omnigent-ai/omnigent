@@ -151,7 +151,11 @@ function sectionEnd(
  *     <the user's description>
  */
 export function markdownListStackFormat(syntax: MarkdownListStackSyntax): StackFormat {
-  const { id, header: heading, headerSuffix, introLine, landing } = syntax;
+  const { id, header: heading, headerSuffix, landing } = syntax;
+  // Without `g` or `y`, `test` keeps no state between parses.
+  const introLine = syntax.introLine
+    ? new RegExp(syntax.introLine.source, syntax.introLine.flags.replace(/[gy]/g, ""))
+    : undefined;
   // The heading as a whole word, so `## Stack` never claims a `## Stacked changes` section.
   const isHeader = (line: MarkdownLine) =>
     !line.fenced &&
