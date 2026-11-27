@@ -47,8 +47,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "temporary.write_text(json.dumps({key: payload.get(key) for key in "
         "('prompt', 'session_id', 'hook_event_name')}))\n"
         "temporary.replace(destination)\n"
-        "print('blocked-draft-ownership-probe', file=sys.stderr)\n"
-        "sys.exit(2)\n"
+        "print(json.dumps({'decision': 'block', "
+        "'reason': 'blocked-draft-ownership-probe'}))\n"
     )
     settings = tmp_path / "hook-settings.json"
     settings.write_text(
