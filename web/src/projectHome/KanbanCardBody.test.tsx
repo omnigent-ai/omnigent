@@ -15,7 +15,14 @@ afterEach(cleanup);
 
 const family = { id: "family", representative_id: "head", pinned: false };
 const session = (id: string, title: string, fields: Partial<Conversation>) =>
-  ({ id, title, created_at: 1, family, ...fields }) as Conversation;
+  ({
+    id,
+    title,
+    created_at: 1,
+    family,
+    labels: { "omnigent.last_task_error_at": String(fields.updated_at) },
+    ...fields,
+  }) as Conversation;
 const columnOf = (c: Conversation) => (c.status === "failed" ? "Needs attention" : "Done");
 
 function renderCard(...members: Conversation[]) {

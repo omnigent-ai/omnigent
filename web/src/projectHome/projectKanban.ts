@@ -26,7 +26,12 @@ export interface KanbanCard {
  */
 function isStaleNestedFailure(member: Conversation, members: readonly Conversation[]): boolean {
   if (member.status !== "failed" || (member.pending_elicitations_count ?? 0) > 0) return false;
-  return members.some((other) => other !== member && other.updated_at > member.updated_at);
+  // Status changes do not advance updated_at. Some failures have no recorded
+  // timestamp, so keep those visible rather than guessing their age.
+  const failedAt = Number(member.labels?.["omnigent.last_task_error_at"]);
+  if (!Number.isFinite(failedAt) || failedAt <= 0) return false;
+  const latestActivity = Math.max(failedAt, member.updated_at);
+  return members.some((other) => other !== member && other.updated_at > latestActivity);
 }
 
 /** The board's left-to-right lanes, so a finished turn moves right into Unread beside Done. */

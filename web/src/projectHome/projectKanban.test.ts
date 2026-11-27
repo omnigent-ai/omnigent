@@ -49,7 +49,11 @@ describe("project kanban", () => {
 
   it("drops a nested failure older than the family's latest activity", () => {
     const member = (id: string, fields: Partial<Conversation>) =>
-      ({ ...row(id, 1, true), ...fields }) as Conversation;
+      ({
+        ...row(id, 1, true),
+        labels: { "omnigent.last_task_error_at": String(fields.updated_at) },
+        ...fields,
+      }) as Conversation;
     const columnOf = (c: Conversation): StatusBucket =>
       c.status === "failed" || (c.pending_elicitations_count ?? 0) > 0 ? "Needs attention" : "Done";
     const cardOf = (...members: Conversation[]) =>
@@ -67,6 +71,26 @@ describe("project kanban", () => {
     expect(fresh.attentionMembers).toEqual([freshFailure]);
     expect(nestedAttentionLabel(fresh)).toBe("1 failed");
 
+    // The worker last spoke at T100, the head at T150, then recovery failed at T200.
+    const silentFailure = member("failed", {
+      status: "failed",
+      updated_at: 100,
+      labels: { "omnigent.last_task_error_at": "200" },
+    });
+    const beforeFailure = member("parent", { status: "idle", updated_at: 150 });
+    expect(cardOf(beforeFailure, silentFailure).attentionMembers).toEqual([silentFailure]);
+    const afterFailure = member("parent", { status: "idle", updated_at: 250 });
+    expect(cardOf(afterFailure, silentFailure).column).toBe("Done");
+
+    for (const timestamp of [undefined, "", "invalid", "0", "-1", "Infinity"]) {
+      const unknownFailure = member("failed", {
+        status: "failed",
+        updated_at: 100,
+        labels: timestamp === undefined ? {} : { "omnigent.last_task_error_at": timestamp },
+      });
+      expect(cardOf(afterFailure, unknownFailure).attentionMembers).toEqual([unknownFailure]);
+    }
+
     // An outstanding approval rolls up however old it is.
     const asking = member("asking", {
       status: "idle",
@@ -80,7 +104,11 @@ describe("project kanban", () => {
 
   it("counts only fresh nested failures, ties included, and approvals on failed members", () => {
     const member = (id: string, fields: Partial<Conversation>) =>
-      ({ ...row(id, 1, true), ...fields }) as Conversation;
+      ({
+        ...row(id, 1, true),
+        labels: { "omnigent.last_task_error_at": String(fields.updated_at) },
+        ...fields,
+      }) as Conversation;
     const columnOf = (c: Conversation): StatusBucket =>
       c.status === "failed" || (c.pending_elicitations_count ?? 0) > 0 ? "Needs attention" : "Done";
     const cardOf = (...members: Conversation[]) =>
@@ -90,6 +118,10 @@ describe("project kanban", () => {
     const older = member("older", { status: "failed", updated_at: 50 });
     const newer = member("newer", { status: "failed", updated_at: 150 });
     expect(cardOf(parent, older, newer).attentionMembers.map((m) => m.id)).toEqual(["newer"]);
+    const activeSibling = member("sibling", { status: "idle", updated_at: 200 });
+    const superseded = cardOf(parent, newer, activeSibling);
+    expect(superseded.column).toBe("Done");
+    expect(superseded.attentionMembers).toEqual([]);
 
     const tied = member("tied", { status: "failed", updated_at: 100 });
     expect(cardOf(parent, tied).column).toBe("Needs attention");
