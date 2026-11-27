@@ -571,6 +571,16 @@ describe("Changes tab", () => {
       { replace: false },
     );
     expect(onNavigate).not.toHaveBeenCalled();
+    cleanup();
+
+    // A visit recorded in a worktree hands the review that folder, and a workspace visit none.
+    renderView({ kind: "changes", comparison: typed, comparisonRoot: "/repo/.worktrees/wt" });
+    await screen.findByTestId("changes-review");
+    expect(captured.review?.comparisonRoot).toBe("/repo/.worktrees/wt");
+    cleanup();
+    renderView({ kind: "changes", comparison: typed });
+    await screen.findByTestId("changes-review");
+    expect(captured.review?.comparisonRoot).toBeNull();
   });
 
   it("opens a file from the review's tree in a Diffs tab of its own, keeping the range", async () => {
