@@ -59,6 +59,11 @@ function inWorkspace(workspace: string, relative: string): string {
   return isHostRoot(base) ? `${base}${relative}` : `${base}/${relative}`;
 }
 
+/** `repository`'s root as an absolute path, as the workspace's host names it; the workspace's own for none. */
+export function repositoryRootIn(workspace: string, repository: string): string {
+  return repository ? inWorkspace(workspace, repository) : workspace;
+}
+
 /**
  * A workspace-relative or absolute path as `repository`'s listing names it; null when it lies
  * outside that folder.

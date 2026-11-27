@@ -5,6 +5,7 @@
 import type { DiffReviewBase } from "@/components/diff-review/DiffReviewBaseMenu";
 import { useComparisonRepository } from "@/hooks/useComparisonOwner";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
+import { repositoryRootIn } from "@/lib/repositoryFolder";
 import { branchPointLabel, type EffectiveComparison } from "@/lib/workingCopyComparison";
 import type { WorkingCopyBaseCommand } from "@/lib/workingCopyBaseCommands";
 import { useSessionWorktrees, type SessionWorktreesResult } from "@/hooks/useSessionWorktrees";
@@ -42,7 +43,7 @@ export function useWorkingCopyBase(conversationId: string): WorkingCopyBase | nu
   const worktrees = useSessionWorktrees(conversationId, hostId, root);
   // A review of a worktree inside the workspace names that worktree's branch.
   const repository = useComparisonRepository();
-  const reviewed = root && repository ? `${root.replace(/\/+$/, "")}/${repository}` : root;
+  const reviewed = root ? repositoryRootIn(root, repository) : root;
   return workingCopyBase(worktrees.data, reviewed);
 }
 
