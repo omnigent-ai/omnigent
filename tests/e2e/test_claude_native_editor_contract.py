@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mmap
 import os
 import shlex
 import shutil
@@ -46,6 +47,7 @@ pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
         "launch-picker",
         "launch-controller-clear",
         "launch-paste-diagnostic",
+        "launch-framed-paste-diagnostic",
     ],
 )
 @pytest.mark.parametrize("editor_source", ["configured", "configured-code", "default"])
@@ -60,10 +62,14 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
 ) -> None:
     claude, tmux_binary = shutil.which("claude"), shutil.which("tmux")
     assert claude is not None and tmux_binary is not None
+    paste_diagnostic = draft_mode in {
+        "launch-paste-diagnostic",
+        "launch-framed-paste-diagnostic",
+    }
     launch_model = (
         "draft-initial-model" if draft_mode != "editor" else _PINNED_CLAUDE_MODELS["sonnet"]
     )
-    if draft_mode == "launch-paste-diagnostic":
+    if paste_diagnostic:
         launch_model = _PINNED_CLAUDE_MODELS["sonnet"]
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -259,7 +265,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "EDITOR": editor_command + " --editor-program editor",
         "VISUAL": editor_command + " --editor-program visual",
     }
-    if draft_mode == "launch-paste-diagnostic":
+    if paste_diagnostic:
         env.update(build_native_claude_terminal_env(None, client_surface="cli"))
     if editor_source in {"default", "configured-code"}:
         if editor_source == "default":
@@ -362,13 +368,43 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         )
         manifest.chmod(0o600)
     bridge.ensure_claude_workspace_trusted(workspace, env)
+    native_feature_profile: dict[str, object] | None = None
+    if draft_mode == "launch-framed-paste-diagnostic":
+        flag = "tengu_virtual_pancake"
+        native_binary = Path(claude).resolve()
+        with (
+            native_binary.open("rb") as stream,
+            mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as source,
+        ):
+            assert source.find(flag.encode()) >= 0 and source.find(b"pasted_content") >= 0
+        with native_binary.open("rb") as stream:
+            binary_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        native_config = bridge.claude_global_config_path(env)
+        assert native_config is not None and native_config.parent == config
+        global_config = json.loads(native_config.read_text())
+        now_ms = int(time.time() * 1000)
+        for key in ("cachedFeatureFlags", "cachedGrowthBookFeatures"):
+            current = global_config.get(key, {})
+            assert isinstance(current, dict)
+            global_config[key] = {**current, flag: True}
+            global_config[key + "At"] = now_ms
+        native_config.write_text(json.dumps(global_config))
+        native_feature_profile = {
+            "flag": flag,
+            "fixture_value": True,
+            "binary_sha256": binary_digest,
+            "config_path": str(native_config),
+            "diagnostic_only": True,
+        }
     version = subprocess.check_output([claude, "--version"], env=env, text=True, timeout=10)
+    if native_feature_profile is not None:
+        assert version.strip() == "2.1.323 (Claude Code)"
     typed_draft = (
         "  editor-wrapped-draft "
         + "0123456789 " * 24
         + "draft-end\n\nsecond line with spaces  \nthird line 😀\n"
     )
-    if draft_mode == "launch-paste-diagnostic":
+    if paste_diagnostic:
         prefix = (
             "This is turn 1. Context marker native-paste-draft-end. "
             "Reply with exactly this token and nothing else: native-paste-reply\n\n"
@@ -477,7 +513,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 raise AssertionError({"phase": "initial-composer", "pane": pane()}) from exc
             command("load-buffer", "-b", "editor-draft", "-", text=typed_draft)
             command("paste-buffer", "-d", "-p", "-b", "editor-draft", "-t", target)
-            if draft_mode == "launch-paste-diagnostic":
+            if paste_diagnostic:
                 time.sleep(1.0)
                 picker_observations.append({"kind": "settled-paste-before-submit", "pane": pane()})
             else:
@@ -487,10 +523,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             poll_until(
                 lambda: (
                     "blocked-draft-ownership-probe" in pane()
-                    and (
-                        draft_mode == "launch-paste-diagnostic"
-                        or bridge._draft_in_input_box(last_pane, "draft-end")
-                    )
+                    and (paste_diagnostic or bridge._draft_in_input_box(last_pane, "draft-end"))
                 ),
                 timeout_s=10,
             )
@@ -506,7 +539,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
             assert owner["bridge_session_id"] == bridge.read_active_session_id(bridge_dir)
             assert owner["native_session_id"] == payload["session_id"]
             assert owner["process"] == payload["native_process"]
-            if draft_mode == "launch-paste-diagnostic":
+            if paste_diagnostic:
                 assert "<pasted_content" in draft, "The diagnostic did not reach a collapsed paste"
                 picker_observations.append({"kind": "before-observation", "pane": pane()})
                 count = len(observations())
@@ -524,6 +557,15 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 command("send-keys", "-t", target, "C-g")
                 poll_until(lambda: len(observations()) == count + 1, timeout_s=15)
                 assert observations()[-1]["observe_only"] is True
+                if draft_mode == "launch-framed-paste-diagnostic":
+                    poll_until(lambda: model_switch._draft(pane()) is not None, timeout_s=10)
+                    assert json.loads(hook_record.read_text()) == payload
+                    current_binding = editor_handoff.read_controller_editor_binding(bridge_dir)
+                    assert current_binding is not None and asdict(current_binding.owner) == owner
+                    assert saved_settings.read_bytes() == saved_contents
+                    assert get_mock_message_requests(isolated_mock_llm_server_url) == []
+                    assert not controller_observations
+                    return
                 session_id = bridge.read_active_session_id(bridge_dir)
                 assert session_id is not None
                 assert write_turn_routing_marker(bridge_dir, session_id=session_id)
@@ -847,10 +889,17 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     pane()
                 except (OSError, subprocess.SubprocessError) as exc:
                     final_pane_error = type(exc).__name__
+                if native_feature_profile is not None:
+                    current_native_config = json.loads(native_config.read_text())
+                    native_feature_profile["saved_values_after_observation"] = {
+                        key: current_native_config.get(key, {}).get(flag)
+                        for key in ("cachedFeatureFlags", "cachedGrowthBookFeatures")
+                    }
                 diagnostics = {
                     "version": version.strip(),
                     "editor_source": editor_source,
                     "draft_mode": draft_mode,
+                    "native_feature_profile": native_feature_profile,
                     "picker_observations": picker_observations,
                     "controller_observations": controller_observations,
                     "model_switch_source_sha256": hashlib.sha256(
