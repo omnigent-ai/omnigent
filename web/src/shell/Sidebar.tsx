@@ -227,6 +227,18 @@ import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import {
+  useQuickPickPaletteCommands,
+  useQuickPickPaletteEnabled,
+} from "./screenCommands/useQuickPickPaletteCommands";
+import {
+  GROUPING_LABELS,
+  ORDERING_LABELS,
+  SHOW_LABELS,
+  sidebarFilters,
+  sidebarViewChoices,
+  sidebarViewCommands,
+} from "./sidebarViewCommands";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { useSessionActions } from "./useSessionActions";
@@ -273,7 +285,6 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { usePublishSidebarSessionOrder } from "@/hooks/useSidebarSessionOrder";
 import { leaveSessionView } from "./sessionCommands/archiveNavigation";
-import { useQuickPickPaletteEnabled } from "@/shell/screenCommands/useQuickPickPaletteCommands";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import {
@@ -564,13 +575,6 @@ function SidebarRowDataProvider({
  * helpers, which validate a stored value against it.
  */
 type SidebarTab = SessionFilter;
-
-const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
-  { value: "all", label: "All sessions" },
-  { value: "mine", label: "My sessions" },
-  { value: "shared", label: "Shared with me" },
-  { value: "archived", label: "Archived sessions" },
-];
 
 // Shown in place of the list when a filter matches nothing.
 const SIDEBAR_FILTER_EMPTY: Record<SidebarTab, string> = {
@@ -2423,6 +2427,20 @@ function ConversationList({
         : undefined;
     saveView(custom ? { ...patch, custom } : patch);
   });
+  // The filter menu's choices, which ⌘K offers as settings running the menu's handlers.
+  const viewChoices = useMemo(
+    () =>
+      sidebarViewChoices({
+        filter: activeTab,
+        multiUser,
+        view: groupingUi ? view : null,
+        onFilterChange: onActiveTabChange,
+        onViewChange: updateView,
+      }),
+    [activeTab, multiUser, groupingUi, view, onActiveTabChange, updateView],
+  );
+  const viewCommands = useMemo(() => sidebarViewCommands(viewChoices), [viewChoices]);
+  useQuickPickPaletteCommands("sidebar-view", "Session list", viewCommands);
   const grouped = view.grouping !== "default";
   const harnessLabels = useHarnessLabels(view.grouping === "harness");
   const harnessLabel = useCallback(
@@ -4456,26 +4474,6 @@ function SectionHeader({
 
 // Scope filter on the Sessions heading. A radio group: the options are
 // mutually exclusive slices of one list.
-const GROUPING_LABELS: Record<SidebarGrouping, string> = {
-  default: "Default",
-  status: "Status",
-  harness: "Harness",
-  created: "Created",
-  updated: "Updated",
-};
-const ORDERING_LABELS: Record<SidebarOrdering, string> = {
-  updated: "Updated",
-  created: "Created",
-  custom: "Custom",
-};
-const SHOW_LABELS: Record<SidebarShowField, string> = {
-  harness: "Harness",
-  project: "Project",
-  updated: "Updated",
-  environment: "Environment",
-  repo: "Repo",
-  branch: "Branch",
-};
 
 // Mobile has no room for a side flyout, so filter submenus replace the main
 // menu body in place. `open` is the shown submenu's test id, or null for the main list.
@@ -4575,9 +4573,7 @@ function SessionFilterMenu({
   const isMobile = useIsMobileViewport();
   const pages = isMobile ? { open: openPage, setOpen: setOpenPage } : undefined;
   const tooltip = useMenuGuardedTooltip(menuOpen);
-  const filters = multiUser
-    ? SIDEBAR_FILTERS
-    : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
+  const filters = sidebarFilters(multiUser);
   const displayOptions = (
     <DropdownMenuRadioGroup value={value} onValueChange={(next) => onChange(next as SidebarTab)}>
       {filters.map((filter) => (
