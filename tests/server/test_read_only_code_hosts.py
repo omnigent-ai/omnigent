@@ -151,10 +151,27 @@ def test_an_overview_is_about_its_selected_pull_request(info: dict, expected: ob
     assert selected_pull_request(info) == expected
 
 
-def test_the_config_lists_its_read_only_hosts() -> None:
+def test_the_config_lists_its_read_only_hosts(caplog: pytest.LogCaptureFixture) -> None:
     config = {"read_only_code_hosts": ["*.Code.Example.com", "git.example.org"]}
 
-    assert server_config.read_only_code_hosts(config) == PATTERNS
+    with caplog.at_level(logging.WARNING, logger=server_config.logger.name):
+        assert server_config.read_only_code_hosts(config) == PATTERNS
+
+    assert caplog.text == ""
+
+
+@pytest.mark.parametrize("entry", [123, None, "  "], ids=["number", "null", "blank"])
+def test_a_config_entry_that_isnt_a_host_name_is_ignored_with_a_warning(
+    caplog: pytest.LogCaptureFixture, entry: object
+) -> None:
+    """So an operator can tell a policy that's on from one a typo left empty."""
+    config = {"read_only_code_hosts": [entry, "git.example.org"]}
+
+    with caplog.at_level(logging.WARNING, logger=server_config.logger.name):
+        assert server_config.read_only_code_hosts(config) == ("git.example.org",)
+
+    assert "read_only_code_hosts" in caplog.text
+    assert repr(entry) in caplog.text
 
 
 @pytest.mark.parametrize(

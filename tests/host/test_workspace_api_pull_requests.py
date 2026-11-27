@@ -1545,7 +1545,7 @@ async def test_a_change_naming_no_pr_reaches_the_host_when_the_first_is_writable
     assert [call.method for call in host_calls] == ["CreateComment"]
     [(function, _root, arguments)] = owner_calls
     assert function == "create_pr_comment"
-    # Forwarded as sent: the host picks the session's PR, as it does with no policy.
+    # Forwarded as sent; the real host then refuses a comment that names no PR.
     assert arguments["pr_url"] is None
     assert arguments["body"] == "Looks good"
 
