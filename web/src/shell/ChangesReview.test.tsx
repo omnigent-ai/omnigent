@@ -473,6 +473,21 @@ describe("ChangesReview", () => {
     expect(screen.getByRole("button", { name: "Change compared revisions" })).toBeInTheDocument();
   });
 
+  it("draws the tree's icon at the right of its loading toolbar, where the toggle will be", () => {
+    mocks.source.mockReturnValue(
+      source(
+        changes({
+          data: undefined,
+          comparison: { base: "pending", message: "Comparing with the branch point…" },
+        }),
+      ),
+    );
+    renderReview();
+    const toolbar = screen.getByRole("toolbar", { name: "Diff review" });
+    expect(toolbar.lastElementChild).toBe(screen.getByTestId("diff-review-tree-placeholder"));
+    expect(screen.getByTestId("diff-review-tree-placeholder")).toHaveClass("ml-auto");
+  });
+
   it("offers Resume while the sandbox sleeps, never calling an unread working copy clean", () => {
     mocks.asleep.mockReturnValue(true);
     const unread = { available: true, data: [] };
