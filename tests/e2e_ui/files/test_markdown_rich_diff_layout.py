@@ -120,9 +120,8 @@ def _wait_until_the_guide_takes_the_pointer(page: Page) -> None:
     page.wait_for_function(_GUIDE_TAKES_POINTER, timeout=10_000)
 
 
-def _press_guide_switch_watching_its_top(page: Page, review: Locator) -> None:
-    """Press the guide's switch with the pointer, recording the guide's top from before it."""
-    _wait_until_the_guide_takes_the_pointer(page)
+def _watch_guide_top(page: Page) -> None:
+    """Record the guide's top now and at every frame after."""
     page.evaluate(
         """(read) => {
           const top = new Function(`return (${read})`)();
@@ -137,6 +136,12 @@ def _press_guide_switch_watching_its_top(page: Page, review: Locator) -> None:
         }""",
         _GUIDE_TOP,
     )
+
+
+def _press_guide_switch_watching_its_top(page: Page, review: Locator) -> None:
+    """Press the guide's switch with the pointer, recording the guide's top from before it."""
+    _wait_until_the_guide_takes_the_pointer(page)
+    _watch_guide_top(page)
     review.get_by_role("button", name="Rich diff of docs/guide.md").click()
 
 
@@ -170,7 +175,7 @@ def test_switching_a_file_to_its_rich_diff_keeps_it_in_place(
     )
     toggle = review.get_by_role("button", name="Rich diff of docs/guide.md")
     expect(toggle).to_have_attribute("aria-pressed", "false", timeout=30_000)
-    # The guide's header 300 px down the view.
+    # The guide's file element 300 px down the view.
     page.evaluate(
         f"""(top) => {{
           const scroller = document.querySelector("[data-perf-scroller]");
@@ -198,16 +203,19 @@ def test_switching_a_file_to_its_rich_diff_keeps_it_in_place(
     assert all(abs(each - top) <= 2 for each in seen), (top, seen)
 
     # On a slow machine a second click comes before the first switch shows: two clicks still
-    # end on the source diff, in place.
+    # end on the source diff, and the guide never moves on the way.
     cdp = page.context.new_cdp_session(page)
     cdp.send("Emulation.setCPUThrottlingRate", {"rate": 6})
     try:
+        _watch_guide_top(page)
         page.evaluate(_SWITCH_GUIDE_TWICE)
         # custom-lint: disable=sleep-then-assert -- lets any late switch show before the checks
         page.wait_for_timeout(1_500)
         expect(preview).to_have_count(0)
         expect(toggle).to_have_attribute("aria-pressed", "false")
         _wait_for_guide_at(page, top)
+        seen = _guide_tops_since_the_press(page)
+        assert all(abs(each - top) <= 2 for each in seen), (top, seen)
     finally:
         cdp.send("Emulation.setCPUThrottlingRate", {"rate": 1})
 
@@ -219,18 +227,20 @@ _CURRENT_MATCH = """() => {
   const range = highlight && [...highlight][0];
   if (!range) return null;
   const bounds = range.getBoundingClientRect();
+  const view = document.querySelector("[data-perf-scroller]").getBoundingClientRect();
   const element = range.startContainer.parentElement;
   return {
     section: element
       ?.closest("[data-markdown-diff-section]")
       ?.getAttribute("data-markdown-diff-section"),
-    visible: bounds.height > 0 && bounds.top >= 0 && bounds.bottom <= window.innerHeight,
+    visible: bounds.height > 0 && bounds.top >= view.top && bounds.bottom <= view.bottom,
   };
 }"""
 
 
 def _wait_for_match_shown_in(page: Page, section: str | None) -> None:
-    """Wait until find's current match is drawn in the window, in ``section`` when given."""
+    """Wait until find's current match is drawn inside the review's scroller, in ``section``
+    when given."""
     page.wait_for_function(
         f"""(section) => {{
           const match = ({_CURRENT_MATCH})();
