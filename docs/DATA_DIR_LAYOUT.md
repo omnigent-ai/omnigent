@@ -17,6 +17,11 @@ use this so they never touch your real `~/.omnigent`. Config resolution is
 separate: `OMNIGENT_CONFIG_HOME` overrides where `config.yaml` is read from
 (see `omnigent/config.py`).
 
+Gateway setup keeps its pinned credential helper under `tools/<helper>-<source>/`
+beside `config.yaml`, honoring `OMNIGENT_CONFIG_HOME`. Its executable and copied
+tool environment survive download cache cleanup. Reconfigure the same workspace
+and profile to replace older generated helper paths, then relaunch the session.
+
 Two related resolvers exist for narrower scopes:
 
 - The server resolves its operator-editable state via
