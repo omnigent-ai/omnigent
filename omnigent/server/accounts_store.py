@@ -59,10 +59,12 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.gadgets.access import workspace_registration
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.stores.permission_store.sqlalchemy_store import (
+    delete_deleted_account_gadget_grants,
     delete_deleted_account_grants,
     delete_deleted_account_workflow_grants,
     delete_deleted_task_grants,
     delete_grants_on_workflows,
+    holds_gadget_grants,
     holds_scheduled_task_grants,
     holds_workflow_grants,
 )
@@ -301,7 +303,7 @@ class SqlAlchemyAccountStore:
         :returns: The created :class:`Account`.
         :raises ValueError: If a user with this id already exists.
         :raises OmnigentError: ``CONFLICT`` while a deleted account's automation or
-            workflow grants, workflows or Inbox items under this name remain;
+            workflow or gadget grants, workflows or Inbox items under this name remain;
             retrying can succeed.
         """
         now = int(time.time())
@@ -310,6 +312,9 @@ class SqlAlchemyAccountStore:
             self._session_immediate, user_id, batch_size=self._cleanup_batch_size
         )
         delete_deleted_account_workflow_grants(
+            self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+        )
+        delete_deleted_account_gadget_grants(
             self._session_immediate, user_id, batch_size=self._cleanup_batch_size
         )
         self._delete_deleted_workflows(user_id)
@@ -332,6 +337,11 @@ class SqlAlchemyAccountStore:
             if holds_workflow_grants(session, user_id):
                 raise OmnigentError(
                     "A deleted account's workflow grants are still being removed. Try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+            if holds_gadget_grants(session, user_id):
+                raise OmnigentError(
+                    "A deleted account's gadget grants are still being removed. Try again.",
                     code=ErrorCode.CONFLICT,
                 )
             if existing is not None and self._owned_workflow_ids(session, user_id, limit=1):
@@ -622,6 +632,12 @@ class SqlAlchemyAccountStore:
                 )
             except Exception:
                 _logger.exception("Workflow grant cleanup deferred for a deleted account")
+            try:
+                delete_deleted_account_gadget_grants(
+                    self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+                )
+            except Exception:
+                _logger.exception("Gadget grant cleanup deferred for a deleted account")
             try:
                 self._delete_deleted_workflows(user_id)
             except Exception:

@@ -836,10 +836,9 @@ class PermissionStore(ABC):
     # Gadgets live in a GadgetStore, not in this database, so these grants name a
     # gadget ID the store cannot check: callers authorize against the gadget first,
     # and grants left on a deleted gadget are inert because IDs are never reused.
-    # A grant names a username, not one registration of it: a store that keeps grants
-    # must make sure a username registered again after its account was deleted does
-    # not inherit them, for example by removing them with the account and refusing the
-    # new registration while any remain.
+    # Grants name a username, not a registration; a re-registered username must not
+    # inherit them. Grantee IDs follow the same case rules as session and workflow shares
+    # (the database's collation: on MySQL, IDs that differ only in case are one grantee).
 
     @property
     def supports_gadget_grants(self) -> bool:

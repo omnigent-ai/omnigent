@@ -22,12 +22,12 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ
 from omnigent.server.session_sharing import LEVEL_GADGET_TEMPLATE
 from omnigent.stores.gadget_store import NotFound
 from omnigent.stores.gadget_store.local import LocalGadgetStore
-from tests.gadgets.grant_store import GadgetGrantStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 ALICE, BOB, CAROL = "alice@example.com", "bob@example.com", "carol@example.com"
 
 
-class _GroupStore(GadgetGrantStore):
+class _GroupStore(SqlAlchemyPermissionStore):
     """Carol belongs to ``team``; a deployment's directory would answer this."""
 
     deleted: frozenset[str] = frozenset()

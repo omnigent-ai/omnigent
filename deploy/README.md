@@ -235,9 +235,10 @@ when it is deleted and refuses to register that username again until they are
 gone. So:
 
 1. Upgrade every server replica first, then turn on `gadgets`. If it is already
-   on, finish the rolling upgrade before anyone shares a gadget: an older
-   replica can delete an account and register its username again without
-   removing the grants, and the new account inherits them.
+   on, turn it off for the rolling upgrade and back on once every replica runs
+   the new release: an older replica can delete an account and register its
+   username again without removing the grants, and the new account inherits
+   them. Asking people not to share meanwhile is not enough.
 2. Once anyone has shared a gadget, don't run a release without gadget sharing
    against that store, even with `gadgets` turned off: turning the feature off
    leaves the grants in place, and that release's account deletion and
