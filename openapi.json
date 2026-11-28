@@ -2545,6 +2545,14 @@
             ],
             "title": "Max Cost Usd"
           },
+          "max_retries": {
+            "default": 0,
+            "format": "int64",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Max Retries",
+            "type": "integer"
+          },
           "mcp_services": {
             "items": {
               "type": "string"
@@ -2566,6 +2574,16 @@
           },
           "name": {
             "title": "Name",
+            "type": "string"
+          },
+          "overlap_mode": {
+            "default": "allow",
+            "enum": [
+              "allow",
+              "skip",
+              "queue"
+            ],
+            "title": "Overlap Mode",
             "type": "string"
           },
           "permission_mode": {
@@ -2611,6 +2629,14 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "retry_delay_seconds": {
+            "default": 300,
+            "format": "int64",
+            "maximum": 3600.0,
+            "minimum": 60.0,
+            "title": "Retry Delay Seconds",
+            "type": "integer"
           },
           "rrule": {
             "title": "Rrule",
@@ -8075,6 +8101,76 @@
         "title": "ScheduledTaskPermissionObject",
         "type": "object"
       },
+      "ScheduledTaskRunStats": {
+        "description": "A scheduled task's runs per day over a range of days ending today.",
+        "properties": {
+          "days": {
+            "description": "One entry per day, oldest first, including days without runs",
+            "items": {
+              "$ref": "#/components/schemas/ScheduledTaskRunStatsDay"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "timezone": {
+            "description": "The IANA timezone the days are in",
+            "title": "Timezone",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "Whether the range holds more runs than one read counts. The days then start at the oldest run counted, and that day is counted in part",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "timezone",
+          "days",
+          "truncated"
+        ],
+        "title": "ScheduledTaskRunStats",
+        "type": "object"
+      },
+      "ScheduledTaskRunStatsDay": {
+        "description": "How many of a scheduled task's runs were scheduled on one day, by outcome.",
+        "properties": {
+          "date": {
+            "description": "The day, as an ISO date in the response's timezone",
+            "title": "Date",
+            "type": "string"
+          },
+          "failed": {
+            "format": "int64",
+            "title": "Failed",
+            "type": "integer"
+          },
+          "in_progress": {
+            "description": "Runs that are queued, starting or running",
+            "format": "int64",
+            "title": "In Progress",
+            "type": "integer"
+          },
+          "skipped": {
+            "format": "int64",
+            "title": "Skipped",
+            "type": "integer"
+          },
+          "succeeded": {
+            "format": "int64",
+            "title": "Succeeded",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "date",
+          "succeeded",
+          "failed",
+          "skipped",
+          "in_progress"
+        ],
+        "title": "ScheduledTaskRunStatsDay",
+        "type": "object"
+      },
       "SendCommentsRequest": {
         "description": "Request body for `POST .../comments/send`.",
         "properties": {
@@ -8358,9 +8454,21 @@
             "title": "Scheduled Task One Time",
             "type": "boolean"
           },
+          "scheduled_task_overlap_modes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scheduled Task Overlap Modes",
+            "type": "array"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
+            "type": "boolean"
+          },
+          "scheduled_task_retries": {
+            "default": false,
+            "title": "Scheduled Task Retries",
             "type": "boolean"
           },
           "scheduled_task_run_pull_requests": {
@@ -16091,6 +16199,20 @@
             ],
             "title": "Max Cost Usd"
           },
+          "max_retries": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 5.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Retries"
+          },
           "mcp_services": {
             "anyOf": [
               {
@@ -16127,6 +16249,22 @@
               }
             ],
             "title": "Name"
+          },
+          "overlap_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "allow",
+                  "skip",
+                  "queue"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overlap Mode"
           },
           "permission_mode": {
             "anyOf": [
@@ -16171,6 +16309,20 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "retry_delay_seconds": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 3600.0,
+                "minimum": 60.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Delay Seconds"
           },
           "rrule": {
             "anyOf": [
@@ -23892,6 +24044,80 @@
           }
         },
         "summary": "List Scheduled Task Run Pull Requests",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/run-stats": {
+      "get": {
+        "description": "Count a scheduled task's runs per day and outcome, for its run history chart.\n\nAuthorizes like `GET /scheduled-tasks/{id}/runs`: the owner and anyone it\nis shared with, who already see each run's time and status. Covers the last\n`days` calendar days (1-90, default 28) in `timezone`, today included,\nand counts every run by the day it was scheduled for, retries and Run now\nrequests included. A run that is queued, starting or running counts as\n`in_progress`.\n\nOne read counts at most the 10,000 runs scheduled latest in the range. If\nthe range holds more, `truncated` is true and `days` starts at the day\nof the oldest run counted.\n\nUnlike the run list, this doesn't fail stale running runs; one counts as\n`in_progress` until a read of the task or its runs fails it.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 for a task the caller can't read; 400 for a timezone that isn't a valid IANA name.\n- `HTTPException` \u2014 501 if the store doesn't serve the chart.",
+        "operationId": "get_scheduled_task_run_stats_v1_scheduled_tasks__scheduled_task_id__run_stats_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 28,
+              "maximum": 90,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "IANA timezone whose calendar days to count in; the task's by default",
+            "in": "query",
+            "name": "timezone",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "IANA timezone whose calendar days to count in; the task's by default",
+              "title": "Timezone"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduledTaskRunStats"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Scheduled Task Run Stats",
         "tags": [
           "scheduled_tasks"
         ]

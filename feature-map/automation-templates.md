@@ -185,7 +185,8 @@ to customize.
   and timezone are separate controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
   opens its searchable dropdown. Custom schedules use the same typed time input.
   Advanced starts collapsed and contains Workspace or
-  Repository, Project, model/effort/permission settings, and Ends. Name remains
+  Repository, Project, model/effort/permission settings, Ends and, for a
+  schedule on a server that supports them, Retries and Overlapping runs. Name remains
   required and editable without opening Advanced; changing instructions preserves
   it. Configured overrides are summarized beside Advanced, and invalid
   settings reveal their controls. Escape closes the active selector or folder browser
@@ -209,6 +210,46 @@ to customize.
   **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
+- **Retries:** when `/v1/info` reports `scheduled_task_retries`, which needs
+  `automations_v2` and the `automation_retries` release feature, Advanced has a
+  Retries row for a schedule: Off, or 1 to 5 retries and the wait before each
+  (1 to 60 minutes). It starts a run again when its startup failed before the
+  prompt reached the agent. A trigger has no Retries row, since it polls again
+  within minutes. The detail page's Configuration lists Retries when they are
+  on, and run history labels each retry **Retry N**.
+- **Overlapping runs:** when `/v1/info` lists more than `allow` in
+  `scheduled_task_overlap_modes`, which needs `automations_v2` and the
+  `automation_overlap_mode` release feature, Advanced has an Overlapping runs
+  row for a schedule. It sets what a scheduled run does while the previous run
+  is still going (its session busy or waiting on an approval): **Start it
+  anyway**, the default, **Skip it**, or **Queue it**, which starts the run once
+  the previous one finishes and keeps at most one waiting. **Queue it** is
+  offered only when the list includes `queue`, which also needs the
+  `automation_overlap_queue` release feature. A skipped run appears
+  in run history with "The previous run was still going.", and one that came due
+  while another was queued with "Another run was already queued behind the
+  previous run." Run now always starts. A trigger has no such row. The detail
+  page's Configuration lists the setting when it isn't the default.
+- **Run history chart:** with the `automation_run_history_chart` release
+  feature, the detail page of an automation that has run shows a chart above
+  its Runs list: one column per day stacked by outcome (Succeeded, Failed,
+  Skipped, In progress), over "N runs · X% success rate" for the range, or
+  the count alone until a run in it has succeeded or failed. The
+  range menu offers Last 7 days, Last 4 weeks (the default) and Last 3 months;
+  while another range loads, the last counts that loaded stay, dimmed, unless
+  they were of a range without runs. Days are the
+  browser's calendar days. Hovering a day, or focusing the chart and moving
+  through its days with the arrow keys, lists its counts, and a range
+  without runs says "No runs in the last 4 weeks." in place of the chart. A
+  range with more than 10,000 runs charts the most recent 10,000 under "Only
+  the most recent 10,000 runs in this range are counted." The
+  chart follows the Runs list, so a run that starts or finishes while the page
+  is open updates it. Someone the automation is shared with sees it too. On a
+  server that doesn't serve the counts, such as an older one, the page shows
+  the Runs list alone, even if counts were on screen. Any other failure says
+  "Couldn’t load the run chart.", or keeps the counts already on screen,
+  dimmed, under "Couldn’t refresh the run chart. These counts may be out of
+  date."
 - **MCP services:** when the server's MCP registry is on and `/v1/info` reports
   `scheduled_task_mcp_services`, Advanced has an MCP services row that opens
   the new-chat service list and its sign-in. A new automation starts with none,
@@ -278,6 +319,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   Prompt coverage includes reopening a trigger from its header, saving edited
   conditions and worker settings into it, and preserving an older trigger's hidden
   template text on instruction-only edits.
+- `web/src/components/scheduled/RunHistoryChart.test.tsx` covers the run history
+  chart: its summary, the stacked columns, a day's counts on hover and with the
+  arrow keys (`moves through the days' counts with the arrow keys`), and the note
+  on a range with more than 10,000 runs. `web/src/pages/TaskDetailPage.test.tsx`
+  (`run history chart`) covers when the page shows it, including a server that
+  doesn't serve the counts.
 - `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
   uses its own built-SPA browser contract, with a synthetic provider catalog,
   to cover repository creation, replacement, clearing, and reopening on desktop

@@ -97,6 +97,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "workspace_content_search": True,
         "grid_sessions_display_ui": True,
         "automations_v2": True,
+        "automation_run_history_chart": False,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
         "chat_composer_codemirror": False,
@@ -146,6 +147,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_subhour_new_sandbox"] is True
     # The one_time_automations release feature is off by default.
     assert data["scheduled_task_one_time"] is False
+    # So is automation_retries.
+    assert data["scheduled_task_retries"] is False
+    # And automation_overlap_mode, which leaves the default mode alone.
+    assert data["scheduled_task_overlap_modes"] == ["allow"]
     # Lets the trigger form save its header; older servers would send it to the model.
     assert data["scheduled_task_trigger_headers"] is True
     assert data["automation_trigger_poll_minutes"] == 10

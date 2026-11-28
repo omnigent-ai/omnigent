@@ -111,6 +111,9 @@ def _build_app(
     *,
     persistent: bool = False,
     one_time: bool = False,
+    retries: bool = False,
+    overlap: bool = False,
+    queue: bool = False,
     timers: bool = False,
     local_single_user: bool = False,
     projects: bool = True,
@@ -143,6 +146,9 @@ def _build_app(
                     ("automations_v2" if persistent else "-automations_v2")
                     + ("" if automations_feature else ",-automations")
                     + (",one_time_automations" if one_time else "")
+                    + (",automation_retries" if retries else "")
+                    + (",automation_overlap_mode" if overlap else "")
+                    + (",automation_overlap_queue" if queue else "")
                     + (",session_timers" if timers else "")
                     + (",workflows" if workflows else "")
                 )
@@ -164,12 +170,27 @@ def auth_app(
     # ``True`` turns on the database scheduler, with timers; ``"one_time"`` also
     # enables one-time automations on it; ``"one_time_without_dispatch"`` enables
     # only that release feature, which needs the database scheduler to take effect.
+    # ``"retries"`` and ``"retries_without_dispatch"`` do the same for retries, and
+    # ``"overlap"`` and ``"overlap_without_dispatch"`` for overlap modes. ``"queue"``
+    # adds queuing to them, and ``"queue_without_overlap"`` enables only its feature.
     param = getattr(request, "param", False)
     app = _build_app(
         db_uri,
         tmp_path,
-        persistent=param in (True, "one_time"),
+        persistent=param
+        in (
+            True,
+            "one_time",
+            "retries",
+            "overlap",
+            "retries_and_overlap",
+            "queue",
+            "queue_without_overlap",
+        ),
         one_time=param in ("one_time", "one_time_without_dispatch"),
+        retries=param in ("retries", "retries_without_dispatch", "retries_and_overlap"),
+        overlap=param in ("overlap", "overlap_without_dispatch", "retries_and_overlap", "queue"),
+        queue=param in ("queue", "queue_without_overlap"),
         timers=param in (True, "one_time"),
     )
     _make_user(db_uri)
@@ -2569,6 +2590,7 @@ async def test_list_runs_returns_history_for_owned_task(
     newest = runs[0]
     assert newest["status"] == "failed"
     assert newest["error_code"] == "incomplete"
+    assert newest["retry_attempt"] == 0
     assert newest["finished_at"] == 2002
     assert newest["conversation_id"] == conv_id
     assert newest["scheduled_task_id"] == task_id
@@ -2898,6 +2920,170 @@ async def test_list_runs_404_for_nonowned_task(
         f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers("bob@example.com")
     )
     assert resp.status_code == 404, resp.text
+
+
+def _run_stats_totals(stats: dict[str, Any]) -> dict[str, int]:
+    """Each outcome's runs over every day of a run-stats response."""
+    return {
+        outcome: sum(day[outcome] for day in stats["days"])
+        for outcome in ("succeeded", "failed", "skipped", "in_progress")
+    }
+
+
+async def test_run_stats_count_a_range_of_runs_per_day_and_outcome(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Every run scheduled in the range counts once, under its outcome, on one day."""
+    from datetime import date, timedelta
+    from itertools import pairwise
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    url = f"/v1/scheduled-tasks/{created['id']}/run-stats"
+    now = int(time.time())
+    day = 86400
+    seeded = [
+        (now - 60, "succeeded"),
+        (now - 120, "failed"),
+        (now - 180, "running"),
+        (now - 240, "starting"),
+        (now - 300, "scheduled"),
+        (now - 3 * day, "skipped"),
+        # Before the default 28 days.
+        (now - 40 * day, "succeeded"),
+    ]
+    for scheduled_at, status in seeded:
+        _seed_run(
+            db_uri,
+            created["id"],
+            uuid.uuid4().hex,
+            scheduled_at=scheduled_at,
+            status=status,
+            conversation_id=None,
+        )
+
+    resp = await auth_client.get(url, params={"timezone": "Asia/Tokyo"}, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    stats = resp.json()
+    assert (stats["timezone"], stats["truncated"]) == ("Asia/Tokyo", False)
+    assert _run_stats_totals(stats) == {
+        "succeeded": 1,
+        "failed": 1,
+        "skipped": 1,
+        "in_progress": 3,
+    }
+    # One entry per day, oldest first, with the days that had no runs.
+    dates = [date.fromisoformat(day["date"]) for day in stats["days"]]
+    assert len(dates) == 28
+    assert all(later - earlier == timedelta(days=1) for earlier, later in pairwise(dates))
+
+    # Without a timezone the days are the automation's, and a shorter range drops older runs.
+    recent = await auth_client.get(url, params={"days": 2}, headers=_headers())
+    assert recent.status_code == 200, recent.text
+    assert recent.json()["timezone"] == created["timezone"]
+    assert len(recent.json()["days"]) == 2
+    assert _run_stats_totals(recent.json()) == {
+        "succeeded": 1,
+        "failed": 1,
+        "skipped": 0,
+        "in_progress": 3,
+    }
+    longest = await auth_client.get(url, params={"days": 90}, headers=_headers())
+    assert _run_stats_totals(longest.json())["succeeded"] == 2
+
+
+async def test_run_stats_count_the_newest_runs_of_a_range_that_holds_more(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A range with more runs than one read counts says so and starts where the counting does."""
+    from datetime import UTC
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    monkeypatch.setattr(scheduled_tasks_routes, "MAX_RUN_STATS_RUNS", 3)
+    now = int(time.time())
+    day = 86400
+    # The read counts the first three; the fourth and the run five days back are left out.
+    seeded = [
+        (now - 60, "succeeded"),
+        (now - 120, "failed"),
+        (now - 2 * day, "succeeded"),
+        (now - 2 * day - 60, "failed"),
+        (now - 5 * day, "succeeded"),
+    ]
+    for scheduled_at, status in seeded:
+        _seed_run(
+            db_uri,
+            created["id"],
+            uuid.uuid4().hex,
+            scheduled_at=scheduled_at,
+            status=status,
+            conversation_id=None,
+        )
+
+    resp = await auth_client.get(
+        f"/v1/scheduled-tasks/{created['id']}/run-stats",
+        params={"days": 7, "timezone": "UTC"},
+        headers=_headers(),
+    )
+
+    assert resp.status_code == 200, resp.text
+    stats = resp.json()
+    assert stats["truncated"] is True
+    assert _run_stats_totals(stats) == {
+        "succeeded": 2,
+        "failed": 1,
+        "skipped": 0,
+        "in_progress": 0,
+    }
+    # The days before the oldest run counted are left out, not reported as empty.
+    oldest_counted = datetime.fromtimestamp(now - 2 * day, UTC).date()
+    assert stats["days"][0]["date"] == oldest_counted.isoformat()
+
+
+async def test_run_stats_report_a_store_that_does_not_serve_them(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    monkeypatch.setattr(
+        auth_app.state.scheduled_task_store,
+        "list_run_statuses",
+        Mock(side_effect=NotImplementedError),
+    )
+
+    resp = await auth_client.get(
+        f"/v1/scheduled-tasks/{created['id']}/run-stats", headers=_headers()
+    )
+
+    assert resp.status_code == 501, resp.text
+    assert resp.json() == {"detail": "run statistics are not supported"}
+
+
+async def test_run_stats_reject_a_bad_range_or_timezone(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    url = f"/v1/scheduled-tasks/{created['id']}/run-stats"
+
+    for days in (0, 91):
+        resp = await auth_client.get(url, params={"days": days}, headers=_headers())
+        assert resp.status_code == 422, resp.text
+    resp = await auth_client.get(url, params={"timezone": "Mars/Olympus"}, headers=_headers())
+    assert resp.status_code == 400, resp.text
+    assert "invalid timezone" in resp.text
 
 
 # ── lazy-on-read orphan backstop ─────────────────────────────────────────────
@@ -6806,7 +6992,13 @@ def _in_groups(monkeypatch: pytest.MonkeyPatch, groups: dict[str, list[str]]) ->
 
 def _read_urls(task_id: str) -> list[str]:
     url = f"/v1/scheduled-tasks/{task_id}"
-    return [url, f"{url}/runs", f"{url}/run-steps", f"{url}/run-pull-requests"]
+    return [
+        url,
+        f"{url}/runs",
+        f"{url}/run-steps",
+        f"{url}/run-pull-requests",
+        f"{url}/run-stats",
+    ]
 
 
 @pytest_asyncio.fixture()
@@ -6880,7 +7072,7 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
         return {user_id: user_id.split("@")[0].title() for user_id in user_ids}
 
     monkeypatch.setattr(SqlAlchemyPermissionStore, "display_names", display_names)
-    owned, owned_runs, owned_steps, _ = [
+    owned, owned_runs, owned_steps, _, _ = [
         (await client.get(url, headers=_headers())).json() for url in _read_urls(task_id)
     ]
     assert (owned["viewer_role"], owned["owner_display_name"]) == ("owner", None)
@@ -6911,8 +7103,8 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
             )
             patched.setattr(SessionJournalStore, "run_start_plans", refuse_session_read)
             responses = [await client.get(url, headers=recipient) for url in _read_urls(task_id)]
-        assert [r.status_code for r in responses] == [200] * 4, responses[-1].text
-        task, runs, steps, run_prs = (r.json() for r in responses)
+        assert [r.status_code for r in responses] == [200] * 5, responses[-1].text
+        task, runs, steps, run_prs, _ = (r.json() for r in responses)
         assert task == {**owned, "viewer_role": "viewer", "owner_display_name": "Alice"}
         assert runs == {
             "runs": [{**run, **without_session} for run in owned_runs["runs"]],
@@ -6936,9 +7128,35 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
     assert revoked.status_code == 204, revoked.text
     assert [(await client.get(url, headers=_BOB)).status_code for url in _read_urls(task_id)] == [
         404
-    ] * 4
+    ] * 5
     assert (await client.delete(_read_urls(task_id)[0], headers=_headers())).status_code == 200
     assert (await client.get(_read_urls(task_id)[0], headers=_CAROL)).status_code == 404
+
+
+async def test_run_stats_answer_a_recipient_as_they_answer_the_owner(
+    workflows_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Run counts are outcomes a recipient already sees in the run list."""
+    client = workflows_client
+    task_id = await _create_task(client)
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        scheduled_at=int(time.time()) - 60,
+        status="failed",
+        conversation_id=None,
+    )
+    assert (await _share(client, task_id, "bob@example.com")).status_code == 200
+    url = f"/v1/scheduled-tasks/{task_id}/run-stats"
+
+    owned = await client.get(url, headers=_headers())
+    shared = await client.get(url, headers=_BOB)
+
+    assert (owned.status_code, shared.status_code) == (200, 200), shared.text
+    counted = {"succeeded": 0, "failed": 1, "skipped": 0, "in_progress": 0}
+    assert _run_stats_totals(owned.json()) == _run_stats_totals(shared.json()) == counted
+    assert shared.json()["timezone"] == owned.json()["timezone"]
 
 
 async def test_each_run_lists_the_prs_it_created_or_worked_on(
@@ -7353,7 +7571,7 @@ async def test_agents_get_no_access_through_a_recipient(
         (await auth_client.get(url, headers=agent)).status_code for url in _read_urls(task_id)
     ]
     # Run steps need workflows, which this server leaves off.
-    assert statuses == [404] * 4
+    assert statuses == [404] * 5
     assert (await auth_client.get(_read_urls(task_id)[0], headers=_BOB)).status_code == 200
     listed = await auth_client.get("/v1/scheduled-tasks/shared", headers=agent)
     assert listed.status_code == 403, listed.text
@@ -7573,7 +7791,7 @@ async def test_a_shared_run_session_lists_with_its_run_labels(
 _ON_DATABASE_SCHEDULER = pytest.mark.parametrize("auth_app", [True], indirect=True)
 
 
-@_ON_DATABASE_SCHEDULER
+@pytest.mark.parametrize("auth_app", ["retries_and_overlap"], indirect=True)
 @pytest.mark.parametrize("state", ["active", "paused"])
 async def test_clone_copies_an_automations_settings_under_a_new_id(
     auth_client: httpx.AsyncClient, db_uri: str, state: str
@@ -7583,6 +7801,9 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
         "/v1/scheduled-tasks",
         json=_create_body(
             max_cost_usd=2.5,
+            max_retries=2,
+            retry_delay_seconds=120,
+            overlap_mode="skip",
             permission_mode="acceptEdits",
             model_override="databricks-claude-sonnet-4-6",
             reasoning_effort="high",
@@ -7616,6 +7837,9 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
         "workspace",
         "host_id",
         "max_cost_usd",
+        "max_retries",
+        "retry_delay_seconds",
+        "overlap_mode",
         "permission_mode",
         "model_override",
         "reasoning_effort",
@@ -7629,6 +7853,9 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
     # Non-default values, so a field the copy drops shows up as a difference.
     seeded = {
         "max_cost_usd": 2.5,
+        "max_retries": 2,
+        "retry_delay_seconds": 120,
+        "overlap_mode": "skip",
         "permission_mode": "acceptEdits",
         "model_override": "databricks-claude-sonnet-4-6",
         "reasoning_effort": "high",
@@ -7731,6 +7958,197 @@ async def test_only_the_owner_can_clone_an_automation(
     assert resp.status_code == 404, resp.text
     listed = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
     assert [task["id"] for task in listed["scheduled_tasks"]] == [original["id"]]
+
+
+# A database scheduler from before retries starts a waiting retry at once, so saving
+# them waits for the release feature, as one-time automations do.
+@pytest.mark.parametrize(
+    ("auth_app", "enabled"),
+    [(False, False), (True, False), ("retries_without_dispatch", False), ("retries", True)],
+    indirect=["auth_app"],
+    ids=["legacy_timer", "no_release_feature", "release_feature_without_dispatch", "enabled"],
+)
+async def test_retries_need_the_database_scheduler_and_the_release_feature(
+    auth_client: httpx.AsyncClient, enabled: bool
+) -> None:
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_retries"] is enabled
+
+    defaults = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    assert (defaults["max_retries"], defaults["retry_delay_seconds"]) == (0, 300)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(max_retries=3, retry_delay_seconds=60),
+        headers=_headers(),
+    )
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{defaults['id']}",
+        json={"max_retries": 1, "retry_delay_seconds": 3600},
+        headers=_headers(),
+    )
+
+    if not enabled:
+        assert created.status_code == 400, created.text
+        assert patched.status_code == 400, patched.text
+        assert "max_retries needs automation retries" in created.text
+        # Turning retries off is never refused.
+        cleared = await auth_client.patch(
+            f"/v1/scheduled-tasks/{defaults['id']}", json={"max_retries": 0}, headers=_headers()
+        )
+        assert cleared.status_code == 200, cleared.text
+        return
+    assert created.status_code == 200, created.text
+    assert (created.json()["max_retries"], created.json()["retry_delay_seconds"]) == (3, 60)
+    assert patched.status_code == 200, patched.text
+    assert (patched.json()["max_retries"], patched.json()["retry_delay_seconds"]) == (1, 3600)
+
+
+@_ON_DATABASE_SCHEDULER
+async def test_clone_copies_no_setting_whose_release_feature_is_off(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    # Saved while the features were on.
+    SqlAlchemyScheduledTaskStore(db_uri).update(created["id"], max_retries=2, overlap_mode="skip")
+
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/clone", headers=_headers())
+
+    assert resp.status_code == 200, resp.text
+    assert (resp.json()["max_retries"], resp.json()["overlap_mode"]) == (0, "allow")
+
+
+@pytest.mark.parametrize("auth_app", ["retries"], indirect=True)
+async def test_run_history_numbers_the_retries_of_an_occurrence(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(max_retries=2, retry_delay_seconds=60),
+            headers=_headers(),
+        )
+    ).json()
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.configure_dispatch(True)
+    task = store.get(created["id"])
+    first = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 86400,
+        host_id=task.host_id,
+        lease_seconds=120,
+    )
+    store.transition_starting_run(
+        first,
+        now=lambda: task.next_run_at + 1,
+        status="failed",
+        error_code="host_offline",
+        retryable=True,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers())
+
+    assert resp.status_code == 200, resp.text
+    assert [(run["status"], run["retry_attempt"]) for run in resp.json()["runs"]] == [
+        ("scheduled", 1),
+        ("failed", 0),
+    ]
+
+    # Turning retries off drops the waiting one at once, as a rollback needs.
+    await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}", json={"max_retries": 0}, headers=_headers()
+    )
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers())
+    assert [(run["status"], run["error_code"]) for run in resp.json()["runs"]] == [
+        ("skipped", "retry_cancelled"),
+        ("failed", "host_offline"),
+    ]
+
+
+# A database scheduler from before overlap modes starts every occurrence, and one
+# from before queuing starts a queued run at once, so saving each waits for its
+# release feature too.
+@pytest.mark.parametrize(
+    ("auth_app", "offered"),
+    [
+        (False, ["allow"]),
+        (True, ["allow"]),
+        ("overlap_without_dispatch", ["allow"]),
+        ("overlap", ["allow", "skip"]),
+        ("queue_without_overlap", ["allow"]),
+        ("queue", ["allow", "skip", "queue"]),
+    ],
+    indirect=["auth_app"],
+    ids=[
+        "legacy_timer",
+        "no_release_feature",
+        "release_feature_without_dispatch",
+        "overlap_modes",
+        "queuing_without_overlap_modes",
+        "queuing",
+    ],
+)
+@pytest.mark.parametrize("mode", ["skip", "queue"])
+async def test_an_overlap_mode_needs_the_database_scheduler_and_its_release_feature(
+    auth_client: httpx.AsyncClient, offered: list[str], mode: str
+) -> None:
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_overlap_modes"] == offered
+
+    defaults = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    assert defaults["overlap_mode"] == "allow"
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(overlap_mode=mode), headers=_headers()
+    )
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{defaults['id']}",
+        json={"overlap_mode": mode},
+        headers=_headers(),
+    )
+    unknown = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(overlap_mode="cancel"), headers=_headers()
+    )
+
+    assert unknown.status_code == 422, unknown.text
+    if mode not in offered:
+        assert created.status_code == 400, created.text
+        assert patched.status_code == 400, patched.text
+        missing = "overlap modes" if "skip" not in offered else "overlap queuing"
+        assert f"needs automation {missing}" in created.text
+        # The default is never refused.
+        default = await auth_client.patch(
+            f"/v1/scheduled-tasks/{defaults['id']}",
+            json={"overlap_mode": "allow"},
+            headers=_headers(),
+        )
+        assert default.status_code == 200, default.text
+        return
+    assert created.status_code == 200, created.text
+    assert created.json()["overlap_mode"] == mode
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["overlap_mode"] == mode
+
+
+@pytest.mark.parametrize("auth_app", ["overlap"], indirect=True)
+async def test_clone_copies_no_queuing_while_its_release_feature_is_off(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    # Saved while queuing was on.
+    SqlAlchemyScheduledTaskStore(db_uri).update(created["id"], overlap_mode="queue")
+
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/clone", headers=_headers())
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["overlap_mode"] == "allow"
 
 
 @pytest.mark.parametrize("auth_app", [False, True], indirect=True, ids=["legacy", "database"])

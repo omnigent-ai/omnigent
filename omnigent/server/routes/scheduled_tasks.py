@@ -25,7 +25,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -35,6 +35,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities.scheduled_task import (
+    DEFAULT_RETRY_DELAY_SECONDS,
+    MAX_RETRY_DELAY_SECONDS,
+    MAX_SCHEDULED_TASK_RETRIES,
+    MIN_RETRY_DELAY_SECONDS,
+    ScheduledTaskOverlapMode,
+)
 from omnigent.entities.workflow import Workflow
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
@@ -88,9 +95,17 @@ from omnigent.server.scheduled.rrule import (
 )
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
+from omnigent.server.scheduled.run_stats import (
+    DEFAULT_RUN_STATS_DAYS,
+    MAX_RUN_STATS_DAYS,
+    MAX_RUN_STATS_RUNS,
+    daily_run_counts,
+    run_stats_days,
+)
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
+    retry_attempt,
     timer_rule,
 )
 from omnigent.server.scheduled.telemetry import log_task_created
@@ -182,6 +197,31 @@ class AutomationFailurePage(BaseModel):
     next_cursor: str | None
 
 
+class ScheduledTaskRunStatsDay(BaseModel):
+    """How many of a scheduled task's runs were scheduled on one day, by outcome."""
+
+    date: str = Field(description="The day, as an ISO date in the response's timezone")
+    succeeded: int
+    failed: int
+    skipped: int
+    in_progress: int = Field(description="Runs that are queued, starting or running")
+
+
+class ScheduledTaskRunStats(BaseModel):
+    """A scheduled task's runs per day over a range of days ending today."""
+
+    timezone: str = Field(description="The IANA timezone the days are in")
+    days: list[ScheduledTaskRunStatsDay] = Field(
+        description="One entry per day, oldest first, including days without runs"
+    )
+    truncated: bool = Field(
+        description=(
+            "Whether the range holds more runs than one read counts. The days then "
+            "start at the oldest run counted, and that day is counted in part"
+        )
+    )
+
+
 # 9999-12-31T23:59:59Z, the last second ``datetime`` can format.
 _MAX_FIRST_RUN_AT = 253402300799
 
@@ -207,6 +247,17 @@ class CreateScheduledTaskRequest(BaseModel):
     # deployment's service names; validated against the owner's connections.
     mcp_services: list[str] = Field(default_factory=list, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)
+    # Retries of a run whose startup failed before its prompt reached the agent;
+    # above 0 needs ``scheduled_task_retries`` in ``/v1/info``.
+    max_retries: int = Field(default=0, ge=0, le=MAX_SCHEDULED_TASK_RETRIES)
+    retry_delay_seconds: int = Field(
+        default=DEFAULT_RETRY_DELAY_SECONDS,
+        ge=MIN_RETRY_DELAY_SECONDS,
+        le=MAX_RETRY_DELAY_SECONDS,
+    )
+    # What a due occurrence does while the previous run is still going; a mode must
+    # be in ``scheduled_task_overlap_modes`` in ``/v1/info``.
+    overlap_mode: ScheduledTaskOverlapMode = "allow"
     # "continue" sends every run's prompt into one session: ``session_id`` when
     # given, else the session the first run creates. A prompt that runs a saved
     # workflow needs "new" (see ``workflow_session_reuse_error``).
@@ -291,6 +342,11 @@ class UpdateScheduledTaskRequest(BaseModel):
     # Replaces the task's MCP services; [] clears them.
     mcp_services: list[str] | None = Field(default=None, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
+    max_retries: int | None = Field(default=None, ge=0, le=MAX_SCHEDULED_TASK_RETRIES)
+    retry_delay_seconds: int | None = Field(
+        default=None, ge=MIN_RETRY_DELAY_SECONDS, le=MAX_RETRY_DELAY_SECONDS
+    )
+    overlap_mode: ScheduledTaskOverlapMode | None = None
     session_mode: Literal["new", "continue"] | None = None
     # Null makes a continue-mode task's next run start a new session.
     session_id: str | None = Field(default=None, min_length=1)
@@ -322,6 +378,55 @@ class UpdateScheduledTaskRequest(BaseModel):
         if "agent_id" in self.model_fields_set and self.agent_id is None:
             raise ValueError("agent_id cannot be null")
         return self
+
+
+def retries_supported(request: Request) -> bool:
+    """Whether tasks may save ``max_retries`` above 0.
+
+    Gated by the ``automation_retries`` release feature, because an older database
+    scheduler polling the same database would start a waiting retry at once.
+    """
+    return bool(getattr(request.app.state, "automation_retries_enabled", False))
+
+
+def _require_retry_support(request: Request, max_retries: int) -> None:
+    if max_retries > 0 and not retries_supported(request):
+        raise OmnigentError(
+            "max_retries needs automation retries, which this server does not enable",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def overlap_modes_supported(request: Request) -> bool:
+    """Whether tasks may save an ``overlap_mode`` other than ``allow``.
+
+    Gated by the ``automation_overlap_mode`` release feature, because an older
+    database scheduler polling the same database would start every occurrence.
+    """
+    return bool(getattr(request.app.state, "automation_overlap_mode_enabled", False))
+
+
+def queue_mode_supported(request: Request) -> bool:
+    """Whether tasks may save the ``queue`` mode.
+
+    Gated by the ``automation_overlap_queue`` release feature as well, because a
+    database scheduler from before queuing would start a queued run at once.
+    """
+    return bool(getattr(request.app.state, "automation_overlap_queue_enabled", False))
+
+
+def _require_overlap_mode_support(request: Request, overlap_mode: str) -> None:
+    if overlap_mode != "allow" and not overlap_modes_supported(request):
+        raise OmnigentError(
+            "overlap_mode needs automation overlap modes, which this server does not enable",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if overlap_mode == "queue" and not queue_mode_supported(request):
+        raise OmnigentError(
+            "overlap_mode 'queue' needs automation overlap queuing, which this server "
+            "does not enable",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _validate_worktree_target(
@@ -408,6 +513,9 @@ def _to_response(
         "permission_mode": task.permission_mode,
         "mcp_services": list(task.mcp_services),
         "max_cost_usd": task.max_cost_usd,
+        "max_retries": task.max_retries,
+        "retry_delay_seconds": task.retry_delay_seconds,
+        "overlap_mode": task.overlap_mode,
         "session_mode": task.session_mode,
         "session_id": task.session_id,
         "source_session_id": task.source_session_id,
@@ -484,6 +592,8 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
+        # 0 for an occurrence's first try, then 1, 2, ... for its automatic retries.
+        "retry_attempt": retry_attempt(run.trigger_key),
         "error_detail": (
             run.error[:_RUN_ERROR_DETAIL_MAX_CHARS] if include_error_detail and run.error else None
         ),
@@ -648,6 +758,10 @@ def _clone_request(task: ScheduledTask) -> CreateScheduledTaskRequest:
         permission_mode=task.permission_mode,
         mcp_services=list(task.mcp_services),
         max_cost_usd=task.max_cost_usd,
+        max_retries=task.max_retries,
+        retry_delay_seconds=task.retry_delay_seconds,
+        # The request model rejects a mode this release doesn't accept.
+        overlap_mode=cast(ScheduledTaskOverlapMode, task.overlap_mode),
         session_mode="continue" if task.session_mode == "continue" else "new",
         workspace=task.workspace,
         base_branch=task.base_branch,
@@ -1430,6 +1544,13 @@ def create_scheduled_tasks_router(
         ):
             # A run files nothing into a deleted project, so the copy starts unfiled.
             create = create.model_copy(update={"project_id": None})
+        # Settings saved before their release feature was turned off are not copied.
+        if not retries_supported(request):
+            create = create.model_copy(update={"max_retries": 0})
+        if not overlap_modes_supported(request) or (
+            create.overlap_mode == "queue" and not queue_mode_supported(request)
+        ):
+            create = create.model_copy(update={"overlap_mode": "allow"})
         return await _create_task(request, create, cloned_from=task)
 
     async def _create_task(
@@ -1469,6 +1590,8 @@ def create_scheduled_tasks_router(
                 "first_run_at needs one-time automations, which this server does not enable",
                 code=ErrorCode.INVALID_INPUT,
             )
+        _require_retry_support(request, body.max_retries)
+        _require_overlap_mode_support(request, body.overlap_mode)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         timezone = await asyncio.to_thread(_resolve_create_timezone, body, store, owner_id)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
@@ -1572,6 +1695,9 @@ def create_scheduled_tasks_router(
                     permission_mode=permission_mode,
                     mcp_services=mcp_services,
                     max_cost_usd=body.max_cost_usd,
+                    max_retries=body.max_retries,
+                    retry_delay_seconds=body.retry_delay_seconds,
+                    overlap_mode=body.overlap_mode,
                     session_mode=body.session_mode,
                     session_id=body.session_id,
                     source_session_id=source_copy.id if source_copy is not None else None,
@@ -2075,6 +2201,61 @@ def create_scheduled_tasks_router(
                 )
         return {"runs": rows, "refresh_pending": refresh_pending, "next_cursor": next_cursor}
 
+    @router.get(
+        "/scheduled-tasks/{scheduled_task_id}/run-stats", response_model=ScheduledTaskRunStats
+    )
+    async def get_scheduled_task_run_stats(
+        request: Request,
+        scheduled_task_id: str,
+        days: int = Query(default=DEFAULT_RUN_STATS_DAYS, ge=1, le=MAX_RUN_STATS_DAYS),
+        timezone: str | None = Query(
+            default=None,
+            max_length=64,
+            description="IANA timezone whose calendar days to count in; the task's by default",
+        ),
+    ) -> ScheduledTaskRunStats:
+        """Count a scheduled task's runs per day and outcome, for its run history chart.
+
+        Authorizes like ``GET /scheduled-tasks/{id}/runs``: the owner and anyone it
+        is shared with, who already see each run's time and status. Covers the last
+        ``days`` calendar days (1-90, default 28) in ``timezone``, today included,
+        and counts every run by the day it was scheduled for, retries and Run now
+        requests included. A run that is queued, starting or running counts as
+        ``in_progress``.
+
+        One read counts at most the 10,000 runs scheduled latest in the range. If
+        the range holds more, ``truncated`` is true and ``days`` starts at the day
+        of the oldest run counted.
+
+        Unlike the run list, this doesn't fail stale running runs; one counts as
+        ``in_progress`` until a read of the task or its runs fails it.
+
+        :raises OmnigentError: 404 for a task the caller can't read; 400 for a
+            timezone that isn't a valid IANA name.
+        :raises HTTPException: 501 if the store doesn't serve the chart.
+        """
+        task, _ = await _require_readable(request, scheduled_task_id)
+        zone_name = timezone or task.timezone
+        _validate_timezone_or_400(zone_name)
+        dates, starts = run_stats_days(time.time(), ZoneInfo(zone_name), days)
+        try:
+            # One run past the limit tells a full range from a truncated one.
+            runs = await asyncio.to_thread(
+                store.list_run_statuses,
+                task.id,
+                since=starts[0],
+                until=starts[-1],
+                limit=MAX_RUN_STATS_RUNS + 1,
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=501, detail="run statistics are not supported"
+            ) from exc
+        day_counts, truncated = daily_run_counts(runs, dates, starts, MAX_RUN_STATS_RUNS)
+        return ScheduledTaskRunStats.model_validate(
+            {"timezone": zone_name, "days": day_counts, "truncated": truncated}
+        )
+
     @router.post("/scheduled-tasks/{scheduled_task_id}/run", status_code=202)
     async def run_scheduled_task_now(
         request: Request,
@@ -2158,10 +2339,17 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
-        if fields.get("session_mode") is None:
-            fields.pop("session_mode", None)
-        if fields.get("mcp_services") is None:
-            fields.pop("mcp_services", None)
+        for name in (
+            "session_mode",
+            "mcp_services",
+            "max_retries",
+            "retry_delay_seconds",
+            "overlap_mode",
+        ):
+            if fields.get(name) is None:
+                fields.pop(name, None)
+        _require_retry_support(request, fields.get("max_retries", 0))
+        _require_overlap_mode_support(request, fields.get("overlap_mode", "allow"))
         derives_workflow_prompt = await _apply_workflow_update(request, existing, fields, owner)
         if await asyncio.to_thread(_align_stored_workflow, existing, fields):
             derives_workflow_prompt = True

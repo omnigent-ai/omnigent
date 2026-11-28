@@ -24,7 +24,10 @@ import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
+  getScheduledTaskRunStats,
+  isRunStatsUnsupported,
   listScheduledTaskRunPullRequests,
+  ScheduledTaskApiError,
   listScheduledTaskRuns,
   listScheduledTaskRunSteps,
   listScheduledTasks,
@@ -37,9 +40,11 @@ import {
   type ScheduledTaskRun,
   type ScheduledTaskRunPullRequests,
   type ScheduledTaskRunPullRequestsPage,
+  type ScheduledTaskRunStats,
   type ScheduledTaskRunSteps,
   type UpdateScheduledTaskInput,
 } from "@/lib/scheduledTasksApi";
+import { localTimezone } from "@/lib/timezones";
 
 /** Query key for the caller's scheduled-tasks list. */
 export const SCHEDULED_TASKS_KEY = ["scheduled-tasks"] as const;
@@ -210,6 +215,54 @@ export function useScheduledTaskRuns(id: string, enabled = true, awaitingRun = f
       awaitingRun || hasUnsettledRun(query.state.data)
         ? RUNS_REFETCH_INTERVAL_MS
         : RUNS_IDLE_REFETCH_INTERVAL_MS,
+  });
+}
+
+/** Whether to ask for run counts again: only a server error or a lost connection may end differently. */
+export function retryRunStats(failureCount: number, error: unknown): boolean {
+  const answered =
+    error instanceof ScheduledTaskApiError && (error.status < 500 || error.status === 501);
+  return failureCount < 3 && !answered;
+}
+
+/**
+ * One task's runs per day and outcome over the last `days` days, in the viewer's
+ * timezone. Counts follow run-list changes instead of polling, and the last
+ * ones that loaded stay while another range loads.
+ *
+ * @param runs - The task's runs from `useScheduledTaskRuns`; `undefined` until they load.
+ * @param enabled - Whether to fetch: the server enables the run history chart.
+ */
+export function useScheduledTaskRunStats(
+  id: string,
+  days: number,
+  runs: readonly ScheduledTaskRun[] | undefined,
+  enabled: boolean,
+) {
+  const timezone = localTimezone();
+  const queryClient = useQueryClient();
+  const activity = runs?.map((run) => `${run.id}:${run.status}`).join(",");
+  const seenActivity = useRef(activity);
+  useEffect(() => {
+    const seen = seenActivity.current;
+    if (seen === activity) return;
+    seenActivity.current = activity;
+    // The first load of the run list is no change; the counts were just fetched too.
+    if (enabled && seen !== undefined) {
+      void queryClient.invalidateQueries({
+        queryKey: ["scheduled-task-run-stats", id],
+        // A server that doesn't count runs is asked when the page opens, not on every change.
+        predicate: (query) => !isRunStatsUnsupported(query.state.error),
+      });
+    }
+  }, [activity, enabled, id, queryClient]);
+  return useQuery<ScheduledTaskRunStats>({
+    queryKey: ["scheduled-task-run-stats", id, days, timezone],
+    queryFn: () => getScheduledTaskRunStats(id, { days, timezone }),
+    enabled,
+    staleTime: 30_000,
+    placeholderData: keepPreviousData,
+    retry: retryRunStats,
   });
 }
 

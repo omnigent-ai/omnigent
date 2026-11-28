@@ -606,6 +606,26 @@ describe("describeRunFailure", () => {
     expect(describeRunFailure("incomplete", "failed").stage).toBe("Running");
   });
 
+  it("says why a retry never started", () => {
+    expect(describeRunFailure("retry_superseded", "skipped")).toEqual({
+      stage: "Retry",
+      reason: "The automation's next run came due before this retry started.",
+    });
+    expect(describeRunFailure("task_paused", "skipped").reason).toContain("paused");
+    expect(describeRunFailure("retry_cancelled", "skipped").reason).toContain("turned off");
+  });
+
+  it("says a skipped run waited on the previous one", () => {
+    expect(describeRunFailure("previous_run_active", "skipped")).toEqual({
+      stage: "Schedule",
+      reason: "The previous run was still going.",
+    });
+    expect(describeRunFailure("queue_full", "skipped")).toEqual({
+      stage: "Schedule",
+      reason: "Another run was already queued behind the previous run.",
+    });
+  });
+
   it("points settings failures at editing the automation", () => {
     const missing = describeRunFailure("missing_host_id", "failed");
     expect(missing.stage).toBe("Settings");

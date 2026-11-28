@@ -2165,6 +2165,478 @@ async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> 
     assert store.get(task.id).next_run_at is None
 
 
+@pytest.mark.parametrize("overlap_mode", ["allow", "skip"])
+async def test_a_failed_startup_retries_on_the_first_poll_after_its_delay(
+    store, monkeypatch, overlap_mode
+) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, max_retries=1, retry_delay_seconds=60, overlap_mode=overlap_mode)
+    clock = FakeClock(task.next_run_at)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run.trigger_key)
+        await lease.finish("failed", error_code="host_offline", retryable=True)
+
+    # The overlap check is for a due occurrence. Idle for this one; a second ask fails.
+    unfinished = Mock(side_effect=store.has_unfinished_run)
+    monkeypatch.setattr(store, "has_unfinished_run", unfinished)
+    session_busy = AsyncMock(side_effect=[False])
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), session_busy=session_busy, now=clock.now
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    clock.advance(59)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == [f"schedule:{task.next_run_at}"]
+
+    clock.advance(1)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == [f"schedule:{task.next_run_at}", f"retry:1:schedule:{task.next_run_at}"]
+    # Its one retry is used up.
+    assert store.list_pending_runs() == []
+    # The retry started without the check, whatever the mode.
+    checks = int(overlap_mode == "skip")
+    assert (unfinished.call_count, session_busy.await_count) == (checks, checks)
+
+
+@pytest.mark.parametrize(("found", "retried"), [("unsent", True), ("failed", False)])
+async def test_recovery_retries_only_a_startup_whose_prompt_was_never_sent(
+    store, monkeypatch, caplog, found, retried
+) -> None:
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, max_retries=1, retry_delay_seconds=60)
+    clock = FakeClock(task.next_run_at)
+
+    async def fire(snapshot, lease):
+        await asyncio.Event().wait()
+
+    async def recover(run):
+        return found
+
+    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now)
+    await scheduler.poll_once()
+    assert scheduler._recovery is not None
+    await scheduler._recovery
+    clock.advance(120)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+
+    runs = {run.trigger_key: run for run in store.list_runs(task.id)[0]}
+    first = runs.pop(f"schedule:{task.next_run_at}")
+    assert (first.status, first.error_code) == ("failed", "startup_expired")
+    # "failed" covers a prompt the agent may have received; retrying could run it twice.
+    assert list(runs) == ([f"retry:1:schedule:{task.next_run_at}"] if retried else [])
+    assert [e["outcome"] for e in _events(caplog, "scheduled_run_recovered")] == ["failed"]
+
+
+async def _start_running(_task, lease) -> None:
+    await lease.finish("running")
+
+
+@pytest.mark.parametrize(
+    ("mode", "going", "starts"),
+    [
+        ("skip", "run", False),
+        ("skip", "session", False),
+        ("skip", "request", False),
+        ("skip", None, True),
+        ("queue", None, True),
+        ("allow", "run", True),
+        # A failed check starts the occurrence, as under ``allow``.
+        ("skip", RuntimeError("activity unavailable"), True),
+        ("queue", RuntimeError("activity unavailable"), True),
+    ],
+    ids=[
+        "skip-run-going",
+        "skip-session-busy",
+        "skip-request-from-before-the-upgrade-waiting",
+        "skip-idle",
+        "queue-idle",
+        "allow-run-going",
+        "skip-check-fails",
+        "queue-check-fails",
+    ],
+)
+async def test_a_due_occurrence_follows_the_overlap_mode(
+    store, monkeypatch, mode, going, starts
+) -> None:
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTaskRun
+
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode=mode)
+    clock = FakeClock(task.next_run_at)
+    # Asked only once no run of the task is unfinished; idle for the first occurrence.
+    session_busy = AsyncMock(side_effect=[False, going if going != "session" else True])
+    fire = AsyncMock(side_effect=_start_running)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), session_busy=session_busy, now=clock.now
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    [first] = store.list_runs(task.id)[0]
+    if going != "run":
+        store.update_run(first.id, status="succeeded", finished_at=int(clock.now()))
+    requested = going == "request"
+    if requested:
+        # Run now, requested before runs recorded what started them: after the upgrade
+        # it still waits to start, with no trigger kind.
+        request = store.request_manual_run(
+            store.get(task.id), now=int(clock.now()), trigger_key="manual:old", host_id=None
+        )
+        with store._session_immediate("test_request_from_before_trigger_kind") as session:
+            session.execute(
+                update(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.id == request.id)
+                .values(trigger_kind=None)
+            )
+    clock.advance(3600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+
+    # The due occurrence is decided before the waiting request starts on the same poll.
+    assert fire.await_count == 1 + int(starts) + int(requested)
+    [second] = [
+        run
+        for run in store.list_runs(task.id)[0]
+        if run.id != first.id and run.trigger_key != "manual:old"
+    ]
+    assert second.trigger_key == f"schedule:{task.next_run_at + 3600}"
+    if starts:
+        assert second.status == "running"
+    else:
+        assert (second.status, second.error_code) == ("skipped", "previous_run_active")
+    # Either way the schedule moves on to its next occurrence.
+    assert store.get(task.id).next_run_at == task.next_run_at + 7200
+    # An unfinished run settles it before the session is asked.
+    asked = 0 if mode == "allow" else 1 if going in ("run", "request") else 2
+    assert session_busy.await_count == asked
+
+
+async def test_stale_runs_do_not_keep_a_skip_automation_from_running(store, monkeypatch) -> None:
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import _RUNNING_RUN_READ_LIMIT
+
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode="skip")
+    clock = FakeClock(task.next_run_at)
+    # Left ``running`` by runners that died, long past the stale-run age.
+    for index in range(2 * _RUNNING_RUN_READ_LIMIT):
+        store.create_run(uuid.uuid4().hex, task.id, "running", task.next_run_at - 30_000 - index)
+    fire = AsyncMock(side_effect=_start_running)
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    # Too many to read past, so the first poll neither skips nor starts the occurrence.
+    assert fire.await_count == 0
+    assert store.get(task.id).next_run_at == task.next_run_at
+    await scheduler.poll_once()
+    await _drain(scheduler)
+
+    # Nobody opened the run history: the checks failed the stale runs themselves.
+    runs = store.list_runs(task.id, limit=100)[0]
+    assert fire.await_count == 1
+    assert [run.status for run in runs if run.trigger_key is not None] == ["running"]
+    assert {run.error_code for run in runs if run.trigger_key is None} == {"incomplete"}
+
+
+async def test_a_run_that_ends_during_the_overlap_check_does_not_skip_its_successor(
+    store, monkeypatch
+) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode="skip", max_retries=1, retry_delay_seconds=60)
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    # A startup that outlasts the schedule's interval, as a sandbox launch can.
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), now=clock.now, lease_seconds=7200
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    [(_, lease)] = [call.args for call in fire.await_args_list]
+    clock.advance(3600)
+    unfinished = store.has_unfinished_run
+
+    def fail_the_first_run_after_the_check(*args, **kwargs):
+        going = unfinished(*args, **kwargs)
+        # No retry: the occurrence now due would start before it.
+        store.transition_starting_run(
+            lease.run, now=clock.now, status="failed", error_code="host_offline", retryable=True
+        )
+        return going
+
+    monkeypatch.setattr(store, "has_unfinished_run", fail_the_first_run_after_the_check)
+    await scheduler.poll_once()
+    monkeypatch.setattr(store, "has_unfinished_run", unfinished)
+
+    # Skipping it too would leave the prompt unrun until the occurrence after it.
+    assert [run.status for run in store.list_runs(task.id)[0]] == ["failed"]
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fire.await_count == 2
+    assert store.get(task.id).next_run_at == task.next_run_at + 7200
+
+
+def _unfinished_run_check(store, monkeypatch) -> Mock:
+    """Make every task look busy, and return the check to see whether it was asked."""
+    check = Mock(return_value=True)
+    monkeypatch.setattr(store, "has_unfinished_run", check)
+    return check
+
+
+async def test_the_final_occurrence_starts_while_the_previous_run_is_going(
+    store, monkeypatch
+) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, rrule="FREQ=HOURLY;COUNT=1", overlap_mode="skip")
+    clock = FakeClock(task.next_run_at)
+    check = _unfinished_run_check(store, monkeypatch)
+    fire = AsyncMock(side_effect=_start_running)
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+
+    # Skipping it would complete the automation without running it.
+    [run] = store.list_runs(task.id)[0]
+    assert run.status == "running"
+    assert store.get(task.id).state == "completed"
+    check.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["trigger", "reminder"])
+async def test_only_a_scheduled_automation_follows_the_overlap_mode(
+    store, monkeypatch, kind
+) -> None:
+    """A trigger has its own busy check, and a reminder fires once."""
+    from datetime import timedelta
+
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    when = (datetime.now(UTC) + timedelta(hours=2)).replace(second=0, microsecond=0)
+    settings = {
+        "trigger": {"prompt": _TRIGGER_PROMPT},
+        "reminder": {"rrule": reminder_rrule(when), "kind": "reminder"},
+    }[kind]
+    task = _task(
+        store,
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        overlap_mode="skip",
+        **settings,
+    )
+    clock = FakeClock(task.next_run_at)
+    check = _unfinished_run_check(store, monkeypatch)
+    fire = AsyncMock(side_effect=_start_running)
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+
+    assert fire.await_count == 1
+    check.assert_not_called()
+
+
+def _queueing_scheduler(store, clock, busy, **kwargs):
+    """A scheduler whose continued-session check answers ``busy()``, and its fire mock.
+
+    With no run of the task unfinished, that check alone says whether the previous
+    run is still going.
+    """
+    fire = AsyncMock(side_effect=_start_running)
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        AsyncMock(),
+        session_busy=AsyncMock(side_effect=lambda _task: busy()),
+        now=clock.now,
+        **kwargs,
+    )
+
+    async def poll() -> None:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+
+    return fire, poll
+
+
+async def test_a_queued_occurrence_starts_once_the_previous_run_finishes(
+    store, monkeypatch
+) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode="queue")
+    clock = FakeClock(task.next_run_at)
+    busy = True
+    fire, poll = _queueing_scheduler(store, clock, lambda: busy)
+
+    await poll()
+    fire.assert_not_awaited()
+    # The next occurrence comes due while one is queued, and is skipped.
+    clock.advance(3600)
+    await poll()
+    fire.assert_not_awaited()
+    runs = {run.trigger_key: run for run in store.list_runs(task.id)[0]}
+    first, second = f"schedule:{task.next_run_at}", f"schedule:{task.next_run_at + 3600}"
+    assert runs[first].status == "scheduled"
+    assert (runs[second].status, runs[second].error_code) == ("skipped", "queue_full")
+
+    # The previous run finished as a third occurrence came due: the queued one goes first,
+    # so the third is skipped rather than starting beside it.
+    busy = False
+    clock.advance(3600)
+    await poll()
+    [(_, lease)] = [call.args for call in fire.await_args_list]
+    assert (lease.run.id, lease.run.trigger_key) == (runs[first].id, first)
+    assert store.get_run(runs[first].id).status == "running"
+    third = next(
+        run
+        for run in store.list_runs(task.id)[0]
+        if run.trigger_key == f"schedule:{task.next_run_at + 7200}"
+    )
+    assert (third.status, third.error_code) == ("skipped", "queue_full")
+
+
+@pytest.mark.parametrize("unblock", ["check-fails", "mode-changed"])
+async def test_a_queued_occurrence_stops_waiting(store, monkeypatch, unblock) -> None:
+    """A failed check starts it, and so does a mode that no longer queues."""
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode="queue")
+    clock = FakeClock(task.next_run_at)
+    fire, poll = _queueing_scheduler(store, clock, lambda: True)
+    await poll()
+    [queued] = store.list_runs(task.id)[0]
+    assert queued.status == "scheduled"
+
+    if unblock == "check-fails":
+        monkeypatch.setattr(
+            store, "has_unfinished_run", Mock(side_effect=RuntimeError("database unavailable"))
+        )
+    else:
+        store.update(task.id, overlap_mode="allow")
+    await poll()
+    [(_, lease)] = [call.args for call in fire.await_args_list]
+    assert lease.run.id == queued.id
+
+
+async def test_a_queued_occurrence_is_checked_only_by_the_replica_that_owns_its_host(
+    store, monkeypatch
+) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode="queue")
+    clock = FakeClock(task.next_run_at)
+    _, poll = _queueing_scheduler(store, clock, lambda: True)
+    await poll()
+    assert len(store.list_pending_runs()) == 1
+
+    read_task = Mock(side_effect=store.get_run_task)
+    monkeypatch.setattr(store, "get_run_task", read_task)
+    fire, poll_elsewhere = _queueing_scheduler(
+        store, clock, lambda: False, owned_hosts=AsyncMock(return_value=[])
+    )
+    await poll_elsewhere()
+    # Another replica's queued runs cost this one no reads each poll.
+    read_task.assert_not_called()
+    fire.assert_not_awaited()
+
+
+async def test_pausing_drops_a_queued_occurrence_for_good(store, monkeypatch) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode="queue")
+    clock = FakeClock(task.next_run_at)
+    fire, poll = _queueing_scheduler(store, clock, lambda: True)
+    await poll()
+    [queued] = store.list_runs(task.id)[0]
+    assert queued.status == "scheduled"
+
+    # The previous run is still going, but a paused automation's queued run doesn't wait.
+    store.update(task.id, state="paused")
+    await poll()
+    assert (store.get_run(queued.id).status, store.get_run(queued.id).error_code) == (
+        "skipped",
+        "task_paused",
+    )
+    store.update(task.id, state="active")
+    await poll()
+    fire.assert_not_awaited()
+
+
+async def test_a_queued_final_occurrence_starts_after_the_task_completes(
+    store, monkeypatch
+) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, rrule="FREQ=HOURLY;COUNT=1", overlap_mode="queue")
+    clock = FakeClock(task.next_run_at)
+    busy = True
+    fire, poll = _queueing_scheduler(store, clock, lambda: busy)
+    await poll()
+    fire.assert_not_awaited()
+    [queued] = store.list_runs(task.id)[0]
+    assert (queued.status, store.get(task.id).state) == ("scheduled", "completed")
+
+    busy = False
+    await poll()
+    [(_, lease)] = [call.args for call in fire.await_args_list]
+    assert lease.run.id == queued.id
+
+
+async def test_a_final_occurrence_finds_the_queue_full_like_any_other(store, monkeypatch) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, rrule="FREQ=HOURLY;COUNT=2", overlap_mode="queue")
+    clock = FakeClock(task.next_run_at)
+    busy = True
+    fire, poll = _queueing_scheduler(store, clock, lambda: busy)
+    await poll()
+    clock.advance(3600)
+    await poll()
+    fire.assert_not_awaited()
+    runs = {run.trigger_key: run for run in store.list_runs(task.id)[0]}
+    queued = runs[f"schedule:{task.next_run_at}"]
+    last = runs[f"schedule:{task.next_run_at + 3600}"]
+    # One run waits at a time, so the queued occurrence is the schedule's last run.
+    assert (queued.status, last.status, last.error_code) == ("scheduled", "skipped", "queue_full")
+    assert store.get(task.id).state == "completed"
+
+    busy = False
+    await poll()
+    [(_, lease)] = [call.args for call in fire.await_args_list]
+    assert lease.run.id == queued.id
+
+
+async def test_a_queued_occurrence_of_a_deleted_task_never_starts(store, monkeypatch) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode="queue")
+    clock = FakeClock(task.next_run_at)
+    fire, poll = _queueing_scheduler(store, clock, lambda: True)
+    await poll()
+    assert len(store.list_pending_runs()) == 1
+
+    # The previous run is still going, but a deleted automation's queued run doesn't wait.
+    store.update(task.id, state="deleted")
+    await poll()
+    fire.assert_not_awaited()
+    assert store.list_pending_runs() == []
+    assert store.list_runs(task.id)[0] == []
+
+
+async def test_run_now_starts_while_the_previous_run_is_going(store, monkeypatch) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, overlap_mode="skip")
+    clock = FakeClock(task.created_at + 60)
+    check = _unfinished_run_check(store, monkeypatch)
+    fire = AsyncMock(side_effect=_start_running)
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    run = await scheduler.run_now(task)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    [(_, lease)] = [call.args for call in fire.await_args_list]
+    assert lease.run.id == run.id
+    check.assert_not_called()
+
+
 async def test_run_now_waits_for_the_host_owner_to_start_it(store, monkeypatch) -> None:
     _create_tasks_half_past_the_hour(monkeypatch)
     task = _task(store)

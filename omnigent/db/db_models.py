@@ -1675,6 +1675,12 @@ class SqlScheduledTask(OmnigentBase):
         own schedule arithmetic and delivery.
     :param smart_routing: Whether the task's runs use Smart Routing instead of
         a fixed model: on (1) or off (2). ``None`` until the owner chooses.
+    :param max_retries: How many times a run whose startup failed is started
+        again. Defaults to ``0``, which never retries.
+    :param retry_delay_seconds: Seconds the scheduler waits before each retry.
+    :param overlap_mode: What a due occurrence does while the task's previous
+        run is still going: start anyway (1, the default), be skipped (2) or
+        wait in a queue (3).
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1765,6 +1771,13 @@ class SqlScheduledTask(OmnigentBase):
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     # Stable int code: on=1, off=2. NULL keeps "never chosen" apart from off.
     smart_routing: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Defaults keep existing tasks, and servers that omit these, on today's behavior.
+    max_retries: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
+    retry_delay_seconds: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default="300"
+    )
+    # Stable int code: allow=1, skip=2, queue=3.
+    overlap_mode: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
@@ -1774,6 +1787,15 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
         CheckConstraint("kind IN (1, 2, 3)", name="ck_scheduled_tasks_task_kind"),
         CheckConstraint("smart_routing IN (1, 2)", name="ck_scheduled_tasks_smart_routing"),
+        CheckConstraint("overlap_mode IN (1, 2, 3)", name="ck_scheduled_tasks_overlap_mode"),
+        # SQLite stores any value in a SMALLINT column, so it could hold a long string.
+        CheckConstraint(
+            "typeof(max_retries) = 'integer'", name="ck_scheduled_tasks_max_retries_integer"
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(retry_delay_seconds) = 'integer'",
+            name="ck_scheduled_tasks_retry_delay_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(
@@ -1828,6 +1850,14 @@ class SqlScheduledTaskRun(OmnigentBase):
     :param error_code: Short failure classification (e.g. ``"timeout"``,
         ``"rate_limited"``) for future retryable-vs-terminal retry logic;
         ``None`` unless ``status = 'failed'``.
+    :param trigger_kind: What started the run, as a stable int code: its
+        schedule (1), a Run now request (2) or a retry of an earlier run (3).
+        It repeats the prefix of ``trigger_key`` as an integer an index can
+        seek. ``None`` on a run recorded by a release without this column.
+    :param prompt_dispatch: Whether the run's prompt has left the executor that
+        claimed it, as a stable int code: not started (1) or started (2).
+        ``None`` on a run claimed by a release that doesn't record it, which
+        proves nothing either way.
     """
 
     __tablename__ = "scheduled_task_runs"
@@ -1867,11 +1897,19 @@ class SqlScheduledTaskRun(OmnigentBase):
     # "rate_limited") for future retry logic. Bounded plain string, not a blob;
     # no CHECK constraint (no code taxonomy defined yet).
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Stable int code: schedule=1, manual=2, retry=3.
+    trigger_kind: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Stable int code: not_started=1, started=2.
+    prompt_dispatch: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
             "status IN (1, 2, 3, 4, 5, 6)",
             name="ck_scheduled_task_runs_dispatch_status",
+        ),
+        CheckConstraint("trigger_kind IN (1, 2, 3)", name="ck_scheduled_task_runs_trigger_kind"),
+        CheckConstraint(
+            "prompt_dispatch IN (1, 2)", name="ck_scheduled_task_runs_prompt_dispatch"
         ),
         UniqueConstraint(
             "workspace_id",
@@ -1910,6 +1948,17 @@ class SqlScheduledTaskRun(OmnigentBase):
             "workspace_id",
             "conversation_id",
             "status",
+            "id",
+        ),
+        # Seeks a task's runs of one status and kind, such as its waiting retry, and
+        # the ones of them scheduled after a given time, without reading its history.
+        Index(
+            "ix_scheduled_task_runs_task_status",
+            "workspace_id",
+            "scheduled_task_id",
+            "status",
+            "trigger_kind",
+            "scheduled_at",
             "id",
         ),
     )

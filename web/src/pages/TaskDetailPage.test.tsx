@@ -66,6 +66,11 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTaskRuns: vi.fn(),
   useScheduledTaskRunSteps: vi.fn(() => new Map()),
   useScheduledTaskRunPullRequests: vi.fn(() => new Map()),
+  useScheduledTaskRunStats: vi.fn(() => ({
+    data: undefined,
+    isError: false,
+    isPlaceholderData: false,
+  })),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
@@ -470,6 +475,9 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("Host home directory");
     expect(screen.getByTestId("task-detail-timezone")).toHaveTextContent("UTC");
     expect(screen.getByTestId("task-detail-cost-limit")).toHaveTextContent("No limit");
+    // Retries are listed only when they are on.
+    expect(screen.queryByTestId("task-detail-retries")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-overlap")).not.toBeInTheDocument();
   });
 
   it("shows saved launch settings and the continued session configuration", () => {
@@ -487,6 +495,9 @@ describe("header, prompt, configuration", () => {
         projectId: "proj_1",
         timezone: "America/Los_Angeles",
         maxCostUsd: 2.5,
+        maxRetries: 2,
+        retryDelaySeconds: 300,
+        overlapMode: "skip",
       }),
     );
     renderPage();
@@ -501,6 +512,10 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-project")).toHaveTextContent("Inbox");
     expect(screen.getByTestId("task-detail-timezone")).toHaveTextContent("America/Los_Angeles");
     expect(screen.getByTestId("task-detail-cost-limit")).toHaveTextContent("$2.50");
+    expect(screen.getByTestId("task-detail-retries")).toHaveTextContent(
+      "2 retries · 5 minutes apart",
+    );
+    expect(screen.getByTestId("task-detail-overlap")).toHaveTextContent("Skip it");
     expect(screen.getByText(/saved launch settings/)).toBeInTheDocument();
   });
 
@@ -1333,6 +1348,18 @@ describe("run history", () => {
     setRuns([]);
     renderPage();
     expect(screen.getByTestId("task-detail-runs-empty")).toHaveTextContent("No runs yet.");
+  });
+
+  it("labels an automatic retry with its attempt", () => {
+    setTask(task());
+    setRuns([
+      run({ id: "run_2", retryAttempt: 2, scheduledAt: 1_700_000_600 }),
+      run({ id: "run_1", status: "failed", errorCode: "host_offline" }),
+    ]);
+    renderPage();
+    const [retry, firstTry] = screen.getAllByTestId("task-detail-run");
+    expect(within(retry).getByTestId("run-retry-attempt")).toHaveTextContent("Retry 2");
+    expect(within(firstTry).queryByTestId("run-retry-attempt")).toBeNull();
   });
 
   it("renders a READ succeeded run with a grey dot ('Completed' tooltip) and a clickable row", async () => {
@@ -2418,5 +2445,134 @@ describe("run pull requests", () => {
       false,
     );
     expect(screen.queryByTestId("run-pull-requests")).toBeNull();
+  });
+});
+
+describe("run history chart", () => {
+  const renderWithChart = (enabled = true) =>
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automation_run_history_chart: enabled },
+        }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+
+  beforeEach(() => {
+    vi.mocked(hooks.useScheduledTaskRunStats).mockReturnValue({
+      data: {
+        timezone: "UTC",
+        days: [
+          { date: "2026-11-03", succeeded: 2, failed: 0, skipped: 1, inProgress: 0 },
+          { date: "2026-11-04", succeeded: 1, failed: 1, skipped: 0, inProgress: 0 },
+        ],
+        truncated: false,
+      },
+      isError: false,
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof hooks.useScheduledTaskRunStats>);
+  });
+
+  it("charts the runs above the run list, for the range the viewer picks", () => {
+    setTask(task());
+    setRuns([run()]);
+    renderWithChart();
+
+    expect(screen.getByTestId("run-history-summary")).toHaveTextContent(
+      "5 runs · 75% success rate",
+    );
+    const chart = screen.getByTestId("run-history-chart");
+    expect(
+      chart.compareDocumentPosition(screen.getByTestId("task-detail-runs")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(hooks.useScheduledTaskRunStats).toHaveBeenLastCalledWith(
+      "st_1",
+      28,
+      [expect.objectContaining({ id: "run_1" })],
+      true,
+    );
+
+    fireEvent.click(screen.getByTestId("run-history-range"));
+    fireEvent.click(screen.getByRole("option", { name: "Last 7 days" }));
+    expect(hooks.useScheduledTaskRunStats).toHaveBeenLastCalledWith(
+      "st_1",
+      7,
+      expect.anything(),
+      true,
+    );
+  });
+
+  it("shows the chart to someone the automation is shared with", () => {
+    setTask(task({ viewerRole: "viewer", ownerDisplayName: "Alice" }));
+    setRuns([run()]);
+    renderWithChart();
+
+    expect(screen.getByTestId("run-history-chart")).toBeInTheDocument();
+  });
+
+  it("leaves the chart out where the server doesn't enable it", () => {
+    setTask(task());
+    setRuns([run()]);
+    renderWithChart(false);
+
+    expect(screen.queryByTestId("run-history-chart")).not.toBeInTheDocument();
+    expect(hooks.useScheduledTaskRunStats).toHaveBeenLastCalledWith(
+      "st_1",
+      28,
+      expect.anything(),
+      false,
+    );
+  });
+
+  it.each([404, 501])(
+    "shows the run list alone when the server answers the counts with %i",
+    (status) => {
+      // The previous counts are still held when a later request finds no route.
+      vi.mocked(hooks.useScheduledTaskRunStats).mockReturnValue({
+        data: { timezone: "UTC", days: [], truncated: false },
+        isError: true,
+        error: new ScheduledTaskApiError("unsupported", status, null),
+        isPlaceholderData: false,
+      } as unknown as ReturnType<typeof hooks.useScheduledTaskRunStats>);
+      setTask(task());
+      setRuns([run()]);
+      renderWithChart();
+
+      expect(screen.queryByTestId("run-history-chart")).not.toBeInTheDocument();
+      expect(
+        within(screen.getByTestId("task-detail-runs")).getAllByTestId("task-detail-run"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("says the counts couldn't load when the server fails", () => {
+    vi.mocked(hooks.useScheduledTaskRunStats).mockReturnValue({
+      data: undefined,
+      isError: true,
+      error: new ScheduledTaskApiError("boom", 500, null),
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof hooks.useScheduledTaskRunStats>);
+    setTask(task());
+    setRuns([run()]);
+    renderWithChart();
+
+    expect(screen.getByTestId("run-history-summary")).toHaveTextContent(
+      "Couldn’t load the run chart.",
+    );
+    expect(screen.getAllByTestId("task-detail-run")).toHaveLength(1);
+  });
+
+  it("leaves the chart out for an automation that has never run", () => {
+    setTask(task());
+    setRuns([]);
+    renderWithChart();
+
+    expect(screen.getByTestId("task-detail-runs-empty")).toBeInTheDocument();
+    expect(screen.queryByTestId("run-history-chart")).not.toBeInTheDocument();
+    expect(hooks.useScheduledTaskRunStats).toHaveBeenLastCalledWith("st_1", 28, [], false);
   });
 });
