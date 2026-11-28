@@ -715,6 +715,23 @@ Cross-harness journeys:
   terminal while a question is pending, send an unrelated Chat message, then
   answer the question and verify that the held message arrives once.
 
+- **`steer`, Claude terminal drafts during delivery:**
+  `tests/e2e/test_claude_native_draft_preservation_e2e.py` runs the real
+  server, a runner, Claude Code in tmux and the person's own attached terminal.
+  While the person has unsent text in Claude's input box, or is still typing
+  it, Omnigent delivers a web message, another session's `sys_session_message`,
+  a message during a running turn, or a web effort change. The delivered input
+  reaches Claude without the person's text, and the text is back in the box as
+  left, including shell mode, collapsed pastes and drafts longer than the box
+  shows. Omnigent waits for a pause in the typing, for at most 15 seconds,
+  then sets the draft aside with Claude Code's own stash, which returns it
+  after the submit. A settings change waits only as long as its request
+  allows, and is refused with nothing typed if the typing goes on. When the
+  stash already holds another draft, the message waits, with a notice in Chat,
+  until the person sends or clears the draft. The tests need Claude Code and
+  tmux. Manually, type a sentence in the terminal without sending it, send a
+  Chat message, and check that the sentence is still in the input box.
+
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
   uses a recorded permission prompt and the real server to check both choices
@@ -1238,13 +1255,15 @@ Cross-harness journeys:
   isolated container for the scripted model endpoint.
   Before typing, Omnigent dismisses shell mode and the prompt-history search
   with Escape. A typed shell command keeps the box in shell mode through
-  Escape, so it is cleared with Ctrl+U instead and never runs;
-  `tests/harnesses/claude_native/test_claude_native_shell_mode_draft.py` covers
-  it with a fake input box (plain `uv run pytest`). If either surface still
-  occupies Claude Code's input box afterwards, the web message is refused with a
-  notice to open the terminal, dismiss it, and resend. No message text is typed
+  Escape, so it is stashed with Claude Code's own stash instead: it never
+  runs, and it returns to the box, still in shell mode, after the message is
+  sent; `tests/harnesses/claude_native/test_claude_native_shell_mode_draft.py`
+  covers it with a fake input box (plain `uv run pytest`). If either surface
+  still occupies Claude Code's input box afterwards, the web message is refused
+  with a notice to open the terminal, dismiss it, and resend; a typed command
+  the stash does not take holds the message instead. No message text is typed
   into the pane.
-  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear`
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_stash`
   covers the refusal with a fake tmux (plain `uv run pytest`);
   `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
   (own environment; a scripted stand-in for the Claude TUI and real tmux) checks

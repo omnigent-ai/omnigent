@@ -47,7 +47,9 @@ def test_delivery_diagnostics(
         secret = "/private-customer-command"
     content = "\n" + secret if scenario == "blank_line" else secret
     elapsed = 0.0
-    pane = "❯ "
+    # The empty input box: no key is sent before a capture shows it.
+    empty_box = "──────\n❯ \n──────\n"
+    pane = empty_box
     enters = 0
     pending_checks = 0
 
@@ -77,7 +79,7 @@ def test_delivery_diagnostics(
             for record in caplog.records
         )
         if args[-1] == "Space":
-            pane = "──────\n❯ \n──────\n"
+            pane = empty_box
         elif args[0] == "send-keys" and "-l" in args:
             pane = "❯ "
         if args[0] == "paste-buffer":
@@ -88,7 +90,12 @@ def test_delivery_diagnostics(
             enters += 1
             if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
                 return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
+            # The plain-text re-delivery after an unknown command types into a shown box.
+            pane = {
+                "empty_capture": "",
+                "missing_glyph": "terminal output",
+                "unknown_command": empty_box,
+            }.get(scenario, "❯ ")
 
     monkeypatch.setattr(
         bridge,
@@ -460,7 +467,7 @@ def test_unreadable_status_snapshot_omits_the_claude_version(
 
 
 @pytest.mark.parametrize(
-    ("pane", "expected"),
+    ("pane", "expected", "error"),
     [
         (
             "scrollback\n──────\n❯ private draft\n  private second row\n──────\n  footer\n",
@@ -473,6 +480,8 @@ def test_unreadable_status_snapshot_omits_the_claude_version(
                 "composer_pane_max_columns": "20",
                 "composer_rule_rows": "2",
             },
+            # A draft the stash key leaves in place refuses the delivery.
+            "ClaudeComposerHoldsDraft",
         ),
         (
             "scrollback\n──────\n❯\n",
@@ -485,6 +494,7 @@ def test_unreadable_status_snapshot_omits_the_claude_version(
                 "composer_pane_max_columns": "10",
                 "composer_rule_rows": "1",
             },
+            "ClaudeComposerNotCleared",
         ),
     ],
     ids=["two-row-draft", "clipped-glyph-row"],
@@ -495,6 +505,7 @@ def test_an_uncleared_composer_logs_its_shape_without_text(
     caplog: pytest.LogCaptureFixture,
     pane: str,
     expected: dict[str, str],
+    error: str,
 ) -> None:
     """A refused clear records the box's shape, so the failing layout can be named later."""
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_args, **_kwargs: pane)
@@ -507,7 +518,9 @@ def test_an_uncleared_composer_logs_its_shape_without_text(
     )
     def deliver(bridge_dir: Path, *, content: str) -> None:
         delivery_diagnostics.start_attempt()
-        bridge._clear_composer("/tmp/sock", "main", bridge_dir=bridge_dir)
+        bridge._clear_composer(
+            "/tmp/sock", "main", bridge_dir=bridge_dir, guard=bridge._DraftGuard()
+        )
 
     with caplog.at_level("INFO", logger=delivery_diagnostics.__name__):
         with pytest.raises(bridge.ClaudeComposerNotCleared):
@@ -522,5 +535,5 @@ def test_an_uncleared_composer_logs_its_shape_without_text(
     assert {key: attrs[key] for key in expected} == expected
     assert attrs["composer_box_found"] == "True"
     assert attrs["composer_capture_empty"] == "False"
-    assert attrs["error_type"] == "ClaudeComposerNotCleared"
+    assert attrs["error_type"] == error
     assert "private" not in json.dumps(row)
