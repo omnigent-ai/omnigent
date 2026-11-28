@@ -85,6 +85,16 @@ provision time, so secrets never live in config files. The server's
 managed-host config (``sandbox.daytona.env``) takes precedence when
 set."""
 
+OUTBOUND_PROXY_URL_ENV_VAR: str = "DAYTONA_OUTBOUND_PROXY_URL"
+"""Server-process environment variable holding the proxy URL that created
+sandboxes route their HTTP(S) traffic through, e.g.
+``https://user:pass@proxy.example.com:28431``. An env var, not config, because
+the URL usually embeds credentials. Daytona sets ``HTTP_PROXY`` and
+``HTTPS_PROXY`` inside the sandbox from this value, so only processes that
+honor those variables are routed through it. The proxy can only be set at
+sandbox creation; a resumed sandbox keeps the proxy it was created with, so
+changing it requires a replacement sandbox."""
+
 # Resources for the sandbox. Matches the Modal launcher's sizing: 2
 # vCPU / 4 GiB is enough for a host running one interactive session
 # (Daytona's Resources units are vCPUs and GiB).
@@ -382,6 +392,7 @@ class DaytonaSandboxLauncher(SandboxLauncher):
                     # would kill the host between turns); the managed-
                     # session machinery owns sandbox termination.
                     auto_stop_interval=_AUTO_STOP_DISABLED,
+                    outbound_proxy_url=os.environ.get(OUTBOUND_PROXY_URL_ENV_VAR) or None,
                     resources=daytona.Resources(cpu=_SANDBOX_CPU, memory=_SANDBOX_MEMORY_GIB),
                 ),
                 timeout=_CREATE_TIMEOUT_S,
