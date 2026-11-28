@@ -77,8 +77,11 @@ elif args[:2] == ["repo", "view"]:
 elif args[:2] == ["auth", "status"]:
     account = {"login": "contributor", "active": True, "state": "success"}
     print(json.dumps({"hosts": {"github.com": [account]}}))
-elif len(args) == 2 and args[0] == "api" and re.fullmatch(
-    r"repos/example/project-dev/commits/[0-9a-f]{40}/pulls", args[1]
+elif (
+    len(args) == 4
+    and args[0] == "api"
+    and args[2:] == ["--hostname", "github.com"]
+    and re.fullmatch(r"repos/example/project-dev/commits/[0-9a-f]{40}/pulls", args[1])
 ):
     print("[]")
 elif args == [
