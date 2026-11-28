@@ -19,8 +19,9 @@ Enumeration is deterministic per provider kind:
 - ``key`` (openai family) / ``gateway`` / ``local`` →
   ``GET <base_url>/v1/models`` with a bearer token (source
   ``"openai-compatible"``).
-- ``subscription`` → live CLI discovery for Cursor; curated static aliases for
-  CLIs without a listing API (source ``"static"``, ``verified: false``).
+- ``subscription`` → live CLI discovery for Cursor and native Antigravity;
+  curated static aliases for CLIs without a listing API (source ``"static"``,
+  ``verified: false``).
 - ``cli-config`` → native Claude/Codex shared probe catalogs (source ``"cli"``)
   when available, otherwise an empty static listing. Credentials are
   resolved by the CLI at launch.
@@ -159,12 +160,6 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # models: map from the resolved entry (see acp_curated_models).
     "acp": "acp",
     "qwen": "qwen",
-    # The native agy TUI bridge resolves its provider via the SDK sibling,
-    # mirroring the claude-native -> claude-sdk rule above.
-    "antigravity-native": "antigravity",
-    "native-antigravity": "antigravity",
-    "agy-native": "antigravity",
-    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -172,6 +167,9 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
 # short-circuits to a subscription-style readout instead of reporting the
 # harness as having "no model-provider resolution".
 _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "native-cursor"})
+_ANTIGRAVITY_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {"antigravity-native", "native-antigravity", "agy-native", "native-agy"}
+)
 
 # devin authenticates through its own ``devin auth login`` (Omnigent stores no
 # Devin credential), so — like cursor-agent — the CLI is the authority on which
@@ -261,6 +259,8 @@ class ResolvedModelProvider:
     :param model_provider: Codex config.toml provider id for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
+    :param credential_fingerprint: Precomputed :func:`_credential_fingerprint`
+        for a provider that does not carry its credential, e.g. native agy.
     """
 
     kind: str
@@ -272,6 +272,7 @@ class ResolvedModelProvider:
     cli: str | None = None
     model_provider: str | None = None
     detail: str = ""
+    credential_fingerprint: str | None = None
 
 
 def _model_configuration_host(base_url: str) -> str | None:
@@ -359,12 +360,17 @@ def _credential_fingerprint(provider: ResolvedModelProvider) -> str:
         ``auth_command`` string), e.g. ``"9f86d081884c7d65"``; ``""``
         when the provider carries no inline credential.
     """
+    if provider.credential_fingerprint is not None:
+        return provider.credential_fingerprint
     if provider.api_key:
-        material = f"key:{provider.api_key}"
-    elif provider.auth_command:
-        material = f"cmd:{provider.auth_command}"
-    else:
-        return ""
+        return _fingerprint_material(f"key:{provider.api_key}")
+    if provider.auth_command:
+        return _fingerprint_material(f"cmd:{provider.auth_command}")
+    return ""
+
+
+def _fingerprint_material(material: str) -> str:
+    """Return the sha256-prefix digest used to fingerprint a credential."""
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
@@ -606,6 +612,40 @@ def resolve_model_provider(spec: object, harness: str | None) -> ResolvedModelPr
         )
 
 
+def _antigravity_native_provider() -> ResolvedModelProvider:
+    """Report the credentials a native agy launch resolves, else agy's own login.
+
+    Native agy ignores spec ``auth`` and reads the setup-configured Gemini
+    provider, a legacy setup key or an ambient key, exactly as its launch does.
+    A configuration needing repair raises, so the caller reports no provider.
+
+    :returns: A provider whose ``cli`` is ``"agy"``; it never carries the key.
+    """
+    from omnigent.harnesses.antigravity_native.credentials import (
+        resolve_antigravity_credentials,
+    )
+
+    credentials = resolve_antigravity_credentials()
+    if credentials is None:
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="agy", detail="agy CLI login")
+    if credentials.profile is not None:
+        return ResolvedModelProvider(
+            kind=DATABRICKS_KIND,
+            profile=credentials.profile,
+            cli="agy",
+            detail="agy Databricks profile gateway",
+        )
+    # Keyed like other key providers so a changed key misses cached listings,
+    # without the provider retaining the key itself.
+    return ResolvedModelProvider(
+        kind=KEY_KIND,
+        base_url=credentials.base_url,
+        cli="agy",
+        detail="agy Gemini API key",
+        credential_fingerprint=_fingerprint_material(f"key:{credentials.api_key}"),
+    )
+
+
 def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> ResolvedModelProvider:
     """Resolve the provider, propagating failures to the catch-all wrapper.
 
@@ -628,6 +668,8 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
         )
+    if (harness or "") in _ANTIGRAVITY_NATIVE_HARNESSES:
+        return _antigravity_native_provider()
     if (harness or "") in _DEVIN_HARNESSES:
         return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="devin", detail="devin CLI login")
 
@@ -1128,7 +1170,8 @@ def list_models_for_worker(
                 note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
             )
     provider = resolve_model_provider(spec, harness)
-    if provider.kind == DATABRICKS_KIND:
+    # Native agy behind a Databricks gateway lists agy's own ids, not UC endpoints.
+    if provider.kind == DATABRICKS_KIND and provider.cli != "agy":
         uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:
             uc_listing = cast(ModelListing | None, _listing_cache.get(uc_key))
@@ -1345,7 +1388,7 @@ def _listing_for_provider(
                 "this worker cannot run here"
             ),
         )
-    if provider.kind == SUBSCRIPTION_KIND and provider.cli not in ("cursor-agent", "devin"):
+    if provider.kind == SUBSCRIPTION_KIND and provider.cli not in ("cursor-agent", "devin", "agy"):
         return _static_subscription_listing(provider)
     if provider.kind == CLI_CONFIG_KIND:
         return _static_cli_config_listing(provider)
@@ -1356,7 +1399,10 @@ def _listing_for_provider(
     if cached is not None:
         return cached
     try:
-        if provider.kind == SUBSCRIPTION_KIND:
+        if provider.cli == "agy":
+            # agy lists its models through the same credentials it launches with.
+            listing = _fetch_antigravity_cli_listing()
+        elif provider.kind == SUBSCRIPTION_KIND:
             listing = (
                 _fetch_devin_cli_listing(provider)
                 if provider.cli == "devin"
@@ -1378,12 +1424,10 @@ def _listing_for_provider(
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
-        if provider.kind == SUBSCRIPTION_KIND:
-            # A failed cursor-agent listing probe says nothing about
-            # dispatchability: the CLI brings its own stored login, so the
-            # worker still runs. Degrade to the usable pre-launch shape the
-            # other subscription CLI logins report, not the dead-worker
-            # "none" that tells orchestrators the worker cannot run here.
+        if provider.kind == SUBSCRIPTION_KIND or provider.cli == "agy":
+            # A failed CLI catalog probe does not prove the worker cannot run.
+            # Keep dispatch available and leave model discovery retryable.
+            launch_auth = "configured credentials" if provider.cli == "agy" else "stored login"
             return ModelListing(
                 source="static",
                 verified=False,
@@ -1391,7 +1435,7 @@ def _listing_for_provider(
                 note=(
                     f"model listing failed for {provider.detail or provider.kind} "
                     f"({_redacted_failure_reason(exc)}); the CLI launches with its "
-                    "own stored login, so dispatches to this worker can still run"
+                    f"own {launch_auth}, so dispatches to this worker can still run"
                 ),
             )
         return ModelListing(
@@ -1443,6 +1487,22 @@ def _fetch_devin_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
             for option in options
         ),
         note=f"live models advertised by the {provider.cli or 'devin'} CLI",
+    )
+
+
+def _fetch_antigravity_cli_listing() -> ModelListing:
+    """Build a live worker listing from the installed Antigravity CLI."""
+    from omnigent.harnesses.antigravity_native.models import list_agy_cli_model_options
+
+    options = list_agy_cli_model_options()
+    return ModelListing(
+        source="cli",
+        verified=True,
+        models=tuple(
+            ModelEntry(id=str(option["id"]), family=model_family_token(str(option["id"])))
+            for option in options
+        ),
+        note="live Antigravity CLI models; select a model when creating a worker",
     )
 
 

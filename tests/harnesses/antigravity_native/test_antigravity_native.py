@@ -856,6 +856,79 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     assert ("Warning:" in warning) is (startup_case != "authored")
 
 
+@pytest.mark.parametrize(
+    ("requested_model", "provider_model", "expected_model"),
+    (
+        (None, "provider-model", "provider-model"),
+        ("session-model", "provider-model", "session-model"),
+        (None, None, None),
+    ),
+    ids=("provider-substituted", "session-model", "agy-default"),
+)
+async def test_launch_and_record_seeds_with_effective_launch_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested_model: str | None,
+    provider_model: str | None,
+    expected_model: str | None,
+) -> None:
+    """The isolated settings drop the saved model whenever agy gets a ``--model``."""
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    real_home = tmp_path / "real-home"
+    (real_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    (real_home / ".gemini" / "antigravity-cli" / "settings.json").write_text(
+        '{"model":"stale-model"}', encoding="utf-8"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
+    # Stands in for saved Gemini credentials that carry a default model.
+    monkeypatch.setattr(
+        launch_mod,
+        "resolve_native_antigravity_launch",
+        lambda *, model: launch_mod.NativeAntigravityLaunch(
+            auth_mode="api-key" if provider_model else "subscription",
+            model=model if model is not None else provider_model,
+        ),
+    )
+    captured_args: list[str] = []
+
+    def _capture_handler(request: httpx.Request) -> httpx.Response:
+        captured_args.extend(json.loads(request.content)["spec"]["args"])
+        return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
+
+    async with _mock_client(_capture_handler) as client:
+        await _mod._launch_and_record(
+            client,
+            session_id="conv_abc123",
+            bridge_id="bridge_effective_model_test",
+            conversation_id=_PLACEHOLDER_ID,
+            resume=False,
+            antigravity_args=(),
+            command="agy",
+            model=requested_model,
+            permission_mode=None,
+            headless=True,
+            startup_progress=None,
+        )
+
+    iso_settings = json.loads(
+        (
+            bridge_mod.agy_gemini_dir(
+                bridge_mod.bridge_dir_for_bridge_id("bridge_effective_model_test")
+            )
+            / "antigravity-cli"
+            / "settings.json"
+        ).read_text(encoding="utf-8")
+    )
+    if expected_model is None:
+        assert "--model" not in captured_args
+        assert iso_settings["model"] == "stale-model"
+    else:
+        assert captured_args[captured_args.index("--model") + 1] == expected_model
+        assert "model" not in iso_settings
+
+
 # ---------------------------------------------------------------------------
 # _attach_terminal teardown: the eager terminal-close decision
 # ---------------------------------------------------------------------------

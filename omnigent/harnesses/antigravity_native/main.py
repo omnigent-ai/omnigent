@@ -112,6 +112,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_tmux_target,
 )
 from omnigent.harnesses.antigravity_native.launch import (
+    agy_argv_model,
     agy_binary_path,
     build_agy_launch,
     resolve_native_antigravity_launch,
@@ -1080,6 +1081,7 @@ async def _launch_and_record(
             seed_isolated_agy_home,
             bridge_dir,
             trusted_workspace=Path.cwd().resolve(),
+            launch_model=agy_argv_model(argv),
         ),
     }
     await _write_cli_startup_instructions(client, session_id, bridge_dir)

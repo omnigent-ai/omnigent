@@ -28,6 +28,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import time
 import uuid
@@ -2057,6 +2058,9 @@ async def _inherited_parent_model(
       parent harness's provider vocabulary, so a foreign harness resolves it
       against its own provider where it may not be servable.
 
+    Native CLI compatibility can be narrower than model-family compatibility;
+    see the native Antigravity contract in ``docs/AGENT_YAML_SPEC.md``.
+
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The parent session id.
     :param sub_agent_name: Name of the sub-agent being dispatched.
@@ -2115,6 +2119,15 @@ async def _inherited_parent_model(
             extra={"session_id": runner_primary_session_id()},
         )
         return None
+    if canonicalize_harness(child_harness) == "antigravity-native":
+        from omnigent.harnesses.antigravity_native.models import list_agy_cli_model_options
+
+        try:
+            options = await asyncio.to_thread(list_agy_cli_model_options)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if not any(option["id"] == parent_model for option in options):
+            return None
     return parent_model
 
 
@@ -2556,8 +2569,9 @@ def _harness_vendor_key(canon: str) -> str:
     ``"claude"`` and ``codex`` / ``codex-native`` to ``"gpt"``. Multi-model
     harnesses have no single family, so they key on the base name with
     ``-native`` dropped (``pi`` ↔ ``pi-native``, ``opencode`` ↔
-    ``opencode-native``). The ``_``→``-`` fold lets the executor-type spelling
-    ``claude_sdk`` resolve to the ``claude-sdk`` capability row.
+    ``opencode-native``), unless their SDK twin has one family
+    (``antigravity-native`` ↔ ``antigravity``). The ``_``→``-`` fold lets the
+    executor-type spelling ``claude_sdk`` resolve to the ``claude-sdk`` row.
 
     :param canon: A canonical harness id, e.g. ``"claude-sdk"``.
     :returns: The vendor key, e.g. ``"claude"``.
@@ -2567,9 +2581,13 @@ def _harness_vendor_key(canon: str) -> str:
 
     caps = harness_capabilities()
     cap = caps.get(canon) or caps.get(canon.replace("_", "-"))
+    base = native_terminal_name(canon)
+    if cap is not None and cap.model_family is ModelFamily.MULTI and base is not None:
+        # A multi-model native CLI keys like its single-vendor SDK twin.
+        cap = caps.get(base, cap)
     if cap is not None and cap.model_family is not ModelFamily.MULTI:
         return cap.model_family.value
-    return native_terminal_name(canon) or canon
+    return base or canon
 
 
 def _child_is_foreign_harness(child_harness: str, parent_harness: object) -> bool:
@@ -2642,6 +2660,10 @@ def _normalize_subagent_model(
     # resolve_model_provider is total — undeterminable providers come
     # back as kind "none", which normalize passes through.
     provider = resolve_model_provider(sub_spec, harness)
+    # Preserve the native CLI catalog's ids instead of applying gateway
+    # spelling rules before agy sees them at terminal creation.
+    if provider.cli == "agy":
+        return model
     normalized = normalize_model_for_provider(model, provider.kind)
     if normalized != model:
         _logger.info(

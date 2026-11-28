@@ -16,13 +16,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
 from omnigent.runner import subagent_work
+
+
+@pytest.fixture(autouse=True)
+def _agy_runs_on_its_own_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep agy catalog probes independent of the host's saved Gemini setup."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.credentials.resolve_antigravity_credentials",
+        lambda: None,
+    )
 
 
 def _spec_with_worker(
@@ -63,6 +74,7 @@ async def _dispatch_without_model(
     conv_id: str,
     parent_snapshot: dict[str, Any] | None,
     explicit_model: str | None = None,
+    rejections: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Drive one fresh-create ``sys_session_send`` and capture create bodies.
@@ -73,6 +85,7 @@ async def _dispatch_without_model(
     :param parent_snapshot: JSON the mock server returns for
         ``GET /v1/sessions/{conv_id}``; ``None`` serves a 404.
     :param explicit_model: Optional ``args.model`` for the dispatch.
+    :param rejections: When given, the dispatch must fail; its error is appended.
     :returns: The captured ``POST /v1/sessions`` bodies.
     """
     from omnigent.runner import app as runner_app
@@ -81,6 +94,10 @@ async def _dispatch_without_model(
     create_bodies: list[dict[str, Any]] = []
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
     monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli",
+        lambda _harness: None,
+    )
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -123,6 +140,10 @@ async def _dispatch_without_model(
         finally:
             subagent_work.unregister_subagent_work("conv_child_inherit")
             subagent_work._session_inboxes_ref.pop(conv_id, None)
+    if rejections is not None:
+        assert output.startswith("Error:"), output
+        rejections.append(output)
+        return create_bodies
     payload = json.loads(output)
     assert payload["status"] == "launching", output
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"
@@ -201,6 +222,260 @@ async def test_explicit_dispatch_model_wins_over_parent_selection(
         explicit_model="databricks-claude-haiku-4-5",
     )
     assert bodies[0]["model_override"] == "databricks-claude-haiku-4-5"
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        pytest.param("gemini-3.1-pro-high", id="gemini"),
+        pytest.param("claude-sonnet-4-6", id="claude"),
+        pytest.param("gpt-oss-120b-medium", id="gpt-oss"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_antigravity_native_child_dispatch_preserves_catalog_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    """An explicit Antigravity child model persists without vendor rewriting."""
+    from omnigent.harnesses.antigravity_native import models
+
+    discovery = Mock(side_effect=AssertionError("explicit models must bypass discovery"))
+    monkeypatch.setattr(models, "list_agy_cli_model_options", discovery)
+    # Session ids allow only letters, digits, underscores and hyphens.
+    conv_id = f"conv_antigravity_child_{model.replace('.', '_')}"
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id=conv_id,
+        parent_snapshot={
+            "id": conv_id,
+            "agent_id": "ag_parent",
+            "model_override": "gemini-3.1-pro-high",
+            "llm_model": None,
+        },
+        explicit_model=model,
+    )
+    assert bodies[0]["model_override"] == model
+    discovery.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_child_dispatch_rejects_gateway_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``databricks-`` id fails before any agy child is created."""
+    rejections: list[str] = []
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_child_gateway_id",
+        parent_snapshot={
+            "id": "conv_antigravity_child_gateway_id",
+            "agent_id": "ag_parent",
+            "model_override": None,
+            "llm_model": None,
+        },
+        explicit_model="databricks-claude-sonnet-4-6",
+        rejections=rejections,
+    )
+    assert bodies == []
+    assert "no Databricks-gateway" in rejections[0]
+
+
+@pytest.mark.asyncio
+async def test_explicit_antigravity_child_model_reaches_agy_launch_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delegated model request reaches the child's native launcher unchanged."""
+    from omnigent.harnesses.antigravity_native import launch
+
+    requested_model = "gemini-3.1-pro-high"
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_child_launch_model",
+        parent_snapshot={
+            "id": "conv_antigravity_child_launch_model",
+            "agent_id": "ag_parent",
+            "model_override": None,
+            "llm_model": None,
+        },
+        explicit_model=requested_model,
+    )
+
+    monkeypatch.setattr(launch, "agy_binary_path", lambda: "/test/agy")
+    argv, _env = launch.build_agy_launch(
+        conversation_id=None,
+        model=bodies[0]["model_override"],
+        resume=False,
+    )
+
+    # Each launch also carries a fresh RPC CSRF token; only the model flag matters here.
+    launch_args = [arg for arg in argv if not arg.startswith("--csrf_token=")]
+    assert launch_args == ["/test/agy", "--model", requested_model]
+
+
+@pytest.mark.parametrize("parent_field", ("model_override", "llm_model"))
+@pytest.mark.parametrize(
+    ("parent_model", "advertised_model", "inherits"),
+    (
+        ("claude-unavailable", "claude-sonnet-4-6", False),
+        ("Claude-Sonnet-4-6", "claude-sonnet-4-6", False),
+        ("claude-sonnet-4-6", "claude-sonnet-4-6", True),
+        ("gemini-3.1-pro-high", "gemini-3.1-pro-high", True),
+        ("gpt-oss-120b-medium", "gpt-oss-120b-medium", True),
+    ),
+)
+@pytest.mark.asyncio
+async def test_antigravity_native_inherits_only_exact_live_catalog_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_field: str,
+    parent_model: str,
+    advertised_model: str,
+    inherits: bool,
+) -> None:
+    from omnigent.harnesses.antigravity_native import models
+
+    monkeypatch.setattr(models, "agy_binary_path", lambda: "/test/agy")
+    probe = Mock(
+        return_value=subprocess.CompletedProcess(
+            ["/test/agy", "models"],
+            0,
+            stdout=f"Fetching available models...\n{advertised_model}\tModel\n",
+        )
+    )
+    monkeypatch.setattr(models, "_run_discovery", probe)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_inherit_catalog",
+        parent_snapshot={"harness": "antigravity-native", parent_field: parent_model},
+    )
+
+    probe.assert_called_once()
+    assert probe.call_args.args[0] == ["/test/agy", "models"]
+    if inherits:
+        assert bodies[0]["model_override"] == parent_model
+    else:
+        assert "model_override" not in bodies[0]
+
+
+@pytest.mark.parametrize("parent_field", ("model_override", "llm_model"))
+@pytest.mark.asyncio
+async def test_antigravity_native_never_inherits_gateway_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_field: str,
+) -> None:
+    """A parent's ``databricks-`` id is not inherited, even if agy advertises it."""
+    from omnigent.harnesses.antigravity_native import models
+
+    gateway_id = "databricks-claude-sonnet-4-6"
+    monkeypatch.setattr(models, "agy_binary_path", lambda: "/test/agy")
+    monkeypatch.setattr(
+        models,
+        "_run_discovery",
+        Mock(
+            return_value=subprocess.CompletedProcess(
+                ["/test/agy", "models"], 0, stdout=f"{gateway_id}\tModel\n"
+            )
+        ),
+    )
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_inherit_gateway_id",
+        parent_snapshot={"harness": "antigravity-native", parent_field: gateway_id},
+    )
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        FileNotFoundError("agy unavailable"),
+        subprocess.TimeoutExpired("agy models", 10),
+        subprocess.CalledProcessError(1, "agy models"),
+        None,
+    ),
+    ids=("missing-cli", "timeout", "command-failed", "invalid-output"),
+)
+@pytest.mark.asyncio
+async def test_antigravity_native_discovery_failure_keeps_worker_default(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception | None,
+) -> None:
+    from omnigent.harnesses.antigravity_native import models
+
+    monkeypatch.setattr(models, "agy_binary_path", lambda: "/test/agy")
+    probe = Mock(
+        side_effect=failure,
+        return_value=subprocess.CompletedProcess(
+            ["/test/agy", "models"], 0, stdout="Fetching available models...\n"
+        ),
+    )
+    monkeypatch.setattr(models, "_run_discovery", probe)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_inherit_discovery_failure",
+        parent_snapshot={"harness": "antigravity-native", "model_override": "claude-sonnet-4-6"},
+    )
+
+    probe.assert_called_once()
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.parametrize(
+    ("parent_harness", "child_harness"),
+    (("antigravity", "antigravity-native"), ("antigravity-native", "antigravity")),
+    ids=("sdk-to-native", "native-to-sdk"),
+)
+@pytest.mark.asyncio
+async def test_antigravity_sdk_native_split_inherits_advertised_model(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_harness: str,
+    child_harness: str,
+) -> None:
+    """SDK and native Antigravity share a vendor, so an advertised id inherits."""
+    from omnigent.harnesses.antigravity_native import models
+
+    monkeypatch.setattr(models, "agy_binary_path", lambda: "/test/agy")
+    probe = Mock(
+        return_value=subprocess.CompletedProcess(
+            ["/test/agy", "models"],
+            0,
+            stdout="Fetching available models...\ngemini-3.5-pro\tGemini 3.5 Pro\n",
+        )
+    )
+    monkeypatch.setattr(models, "_run_discovery", probe)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker(child_harness),
+        conv_id=f"conv_antigravity_split_{parent_harness}",
+        parent_snapshot={"harness": parent_harness, "model_override": "gemini-3.5-pro"},
+    )
+
+    assert bodies[0]["model_override"] == "gemini-3.5-pro"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_child_without_model_keeps_agy_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No child model leaves the native CLI free to choose its own default."""
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_child_default",
+        parent_snapshot={
+            "id": "conv_antigravity_child_default",
+            "agent_id": "ag_parent",
+            "model_override": None,
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
 
 
 @pytest.mark.asyncio

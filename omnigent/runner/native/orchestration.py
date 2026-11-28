@@ -7319,7 +7319,7 @@ async def _auto_create_antigravity_terminal(
         write_mcp_config,
         write_tmux_target,
     )
-    from omnigent.harnesses.antigravity_native.launch import build_agy_launch
+    from omnigent.harnesses.antigravity_native.launch import agy_argv_model, build_agy_launch
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 
     if server_client is None:
@@ -7423,6 +7423,7 @@ async def _auto_create_antigravity_terminal(
             seed_isolated_agy_home,
             bridge_dir,
             trusted_workspace=workspace,
+            launch_model=agy_argv_model(argv),
         ),
     }
     startup_instructions = await _native_startup_instructions(

@@ -2150,6 +2150,58 @@ def test_seed_isolated_agy_home_leaves_malformed_settings_untouched(
     assert iso_settings.read_text(encoding="utf-8") == raw_content
 
 
+@pytest.mark.parametrize("isolated_exists", [False, True], ids=["fresh", "reseed"])
+def test_seed_isolated_agy_home_drops_stale_model_for_launch_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_exists: bool
+) -> None:
+    """A ``--model`` launch drops the seeded ``model`` agy would otherwise report."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(
+        json.dumps({"model": "Real Home Pick", "theme": "dark"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    if isolated_exists:
+        iso_settings.parent.mkdir(parents=True)
+        iso_settings.write_text(
+            json.dumps({"model": "Earlier Session Pick", "theme": "dark"}), encoding="utf-8"
+        )
+
+    seed_isolated_agy_home(bridge_dir, launch_model="gemini-3.1-pro-high")
+
+    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {
+        "permissions": {"allow": ["mcp(omnigent/*)"]},
+        "theme": "dark",
+    }
+    assert json.loads(real_settings.read_text(encoding="utf-8"))["model"] == "Real Home Pick"
+
+
+def test_seed_isolated_agy_home_keeps_seeded_model_without_launch_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``--model`` agy's saved model is the active one, so it is kept."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(json.dumps({"model": "Real Home Pick"}), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir, launch_model=None)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {
+        "model": "Real Home Pick",
+        "permissions": {"allow": ["mcp(omnigent/*)"]},
+    }
+
+
 def test_seed_isolated_agy_home_prefers_real_onboarding_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

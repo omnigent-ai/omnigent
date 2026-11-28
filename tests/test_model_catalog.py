@@ -462,12 +462,13 @@ def test_resolve_provider_databricks_default(
 def test_resolve_provider_antigravity_native_aliases(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
 ) -> None:
-    """Every native agy spelling reaches the same provider resolver."""
-    _isolate_config(monkeypatch, tmp_path, "")
+    """Native agy uses its own catalog instead of the ambient SDK provider."""
+    _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
     spec = _worker_spec(harness, auth=ApiKeyAuth(api_key="gemini-test-key"))
     provider = resolve_model_provider(spec, harness)
-    assert provider.kind == "key"
-    assert provider.api_key == "gemini-test-key"
+    assert provider.kind == "subscription"
+    assert provider.cli == "agy"
+    assert provider.api_key is None
 
 
 def test_resolve_provider_key_kind_resolves_family_credential(
@@ -2070,6 +2071,167 @@ def test_cursor_listing_uses_live_cli_base_models(
     assert listing.verified is True
     assert [m.id for m in listing.models] == ["provider-latest"]
     assert "live models advertised" in listing.note
+
+
+@pytest.mark.parametrize(
+    "harness", ["antigravity-native", "native-antigravity", "agy-native", "native-agy"]
+)
+def test_antigravity_worker_catalog_preserves_cli_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """Delegation sees the live cross-vendor catalog, cached after success."""
+    from omnigent.harnesses.antigravity_native import models as agy_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    ids = ["gemini-3.1-pro-high", "claude-sonnet-4-6", "gpt-oss-120b-medium"]
+    calls = 0
+
+    def list_options() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return [{"id": model, "displayName": model, "isDefault": False} for model in ids]
+
+    monkeypatch.setattr(agy_models, "list_agy_cli_model_options", list_options)
+    spec = _worker_spec(harness)
+    first = catalog_for_spec(spec)["self"]
+    second = catalog_for_spec(spec)["self"]
+    assert first == second
+    assert first["source"] == "cli"
+    assert first["verified"] is True
+    assert first["models"] == [
+        {"id": ids[0], "family": "other"},
+        {"id": ids[1], "family": "claude"},
+        {"id": ids[2], "family": "openai"},
+    ]
+    assert calls == 1
+
+
+def test_antigravity_catalog_failure_is_retryable_and_redacted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed CLI probe gives no invented choices and retries on the next call."""
+    from omnigent.harnesses.antigravity_native import models as agy_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    calls = 0
+
+    def list_options() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("private credential detail")
+        return [{"id": "provider-latest", "displayName": "Latest", "isDefault": False}]
+
+    monkeypatch.setattr(agy_models, "list_agy_cli_model_options", list_options)
+    spec = _worker_spec("antigravity-native")
+    failed = catalog_for_spec(spec)["self"]
+    recovered = catalog_for_spec(spec)["self"]
+    assert failed["verified"] is False
+    assert failed["models"] == []
+    assert "private credential detail" not in str(failed)
+    assert recovered["verified"] is True
+    assert recovered["models"] == [{"id": "provider-latest", "family": "other"}]
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("credentials", "kind", "profile"),
+    (
+        (None, "subscription", None),
+        (("fake-key", "https://gateway.example/gemini", None), "key", None),
+        (("omnigent-adapter-pending", "https://workspace.example", "team"), "databricks", "team"),
+    ),
+    ids=("cli-login", "gemini-key", "databricks-profile"),
+)
+def test_antigravity_native_provider_follows_launch_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    credentials: tuple[str, str, str | None] | None,
+    kind: str,
+    profile: str | None,
+) -> None:
+    """The readout names the credential native agy launches with; agy lists its ids."""
+    from omnigent.harnesses.antigravity_native import credentials as agy_credentials
+    from omnigent.harnesses.antigravity_native import models as agy_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    resolved = (
+        None
+        if credentials is None
+        else agy_credentials.AntigravityCredentials(
+            credentials[0], credentials[1], profile=credentials[2]
+        )
+    )
+    monkeypatch.setattr(agy_credentials, "resolve_antigravity_credentials", lambda: resolved)
+    monkeypatch.setattr(
+        agy_models,
+        "list_agy_cli_model_options",
+        lambda: [{"id": "gemini-x", "displayName": "Gemini X", "isDefault": False}],
+    )
+    spec = _worker_spec("antigravity-native")
+
+    provider = resolve_model_provider(spec, "antigravity-native")
+    assert (provider.kind, provider.cli, provider.profile) == (kind, "agy", profile)
+    assert provider.api_key is None
+    listing = catalog_for_spec(spec)["self"]
+    assert listing["source"] == "cli"
+    assert listing["models"] == [{"id": "gemini-x", "family": "other"}]
+    assert "fake-key" not in str(listing)
+
+
+def test_antigravity_native_catalog_cache_follows_the_configured_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Changing the key at the same endpoint misses the cached verified listing."""
+    from omnigent.harnesses.antigravity_native import credentials as agy_credentials
+    from omnigent.harnesses.antigravity_native import models as agy_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    current = {"key": "first-fake-key"}
+    monkeypatch.setattr(
+        agy_credentials,
+        "resolve_antigravity_credentials",
+        lambda: agy_credentials.AntigravityCredentials(
+            current["key"], "https://gateway.example/gemini"
+        ),
+    )
+    monkeypatch.setattr(
+        agy_models,
+        "list_agy_cli_model_options",
+        lambda: [{"id": f"model-for-{current['key']}", "displayName": "M", "isDefault": False}],
+    )
+    spec = _worker_spec("antigravity-native")
+
+    first = catalog_for_spec(spec)["self"]
+    assert catalog_for_spec(spec)["self"] == first
+    current["key"] = "second-fake-key"
+    second = catalog_for_spec(spec)["self"]
+
+    assert first["models"] == [{"id": "model-for-first-fake-key", "family": "other"}]
+    assert second["models"] == [{"id": "model-for-second-fake-key", "family": "other"}]
+    provider = resolve_model_provider(spec, "antigravity-native")
+    assert provider.api_key is None
+    assert "second-fake-key" not in repr(provider)
+
+
+def test_antigravity_native_provider_needing_repair_reports_no_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A saved agy configuration that a launch would reject is not a CLI login."""
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.harnesses.antigravity_native import credentials as agy_credentials
+
+    _isolate_config(monkeypatch, tmp_path, "")
+
+    def _broken() -> None:
+        raise OmnigentError(
+            "The selected Gemini provider has no usable API key.", code=ErrorCode.INVALID_INPUT
+        )
+
+    monkeypatch.setattr(agy_credentials, "resolve_antigravity_credentials", _broken)
+    provider = resolve_model_provider(_worker_spec("antigravity-native"), "antigravity-native")
+    assert provider.kind == "none"
+    assert "no usable API key" in provider.detail
 
 
 def test_cursor_listing_failure_is_empty_and_retryable(

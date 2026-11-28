@@ -99,15 +99,14 @@ _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
         "antigravity",
         "agy",
         "google-antigravity",
-        # The native agy TUI bridge is equally Gemini-native (it drives the
-        # same Gemini-backed ``agy`` runtime), so it shares the reject-list.
-        "antigravity-native",
-        "native-antigravity",
     }
 )
 # A ``databricks-`` gateway prefix marks an id bound to the Databricks gateway,
-# which antigravity never reaches — a definitive mismatch on its own.
+# which neither antigravity harness reaches — a definitive mismatch on its own.
 _DATABRICKS_GATEWAY_PREFIX = "databricks-"
+# The native agy harness passes the id to ``agy --model``. The signed-in CLI
+# serves Claude/GPT ids too, so only ``databricks-`` gateway ids are rejected.
+_ANTIGRAVITY_NATIVE_HARNESSES: frozenset[str] = frozenset({"antigravity-native"})
 
 
 # Vendor tokens matched anywhere in the id — the long-standing rule for the
@@ -161,7 +160,10 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     The Gemini-native ``antigravity`` harness rejects the Claude/GPT
     families and any ``databricks-`` gateway id (it has no gateway path),
     but accepts Gemini shapes and bare/ambiguous ids the SDK may honor.
-    Multi-model harnesses (pi, openai-agents) accept any validated id.
+    The native ``antigravity-native`` harness rejects only ``databricks-``
+    gateway ids, since the agy CLI serves its account's catalog.
+    Multi-model harnesses have no family restriction here; this helper
+    does not check whether a model appears in a provider catalog.
 
     :param harness: Harness id from the sub-agent spec, alias or
         canonical, e.g. ``"claude-native"``.
@@ -196,6 +198,12 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
             f"harness {canon!r} is Gemini-native and cannot run Claude/GPT or "
             f"Databricks-gateway models; got {model!r}. Use a Gemini id "
             "or the claude_code / codex / pi worker for those families."
+        )
+    if canon in _ANTIGRAVITY_NATIVE_HARNESSES and lower.startswith(_DATABRICKS_GATEWAY_PREFIX):
+        return (
+            f"harness {canon!r} launches the agy CLI, which has no Databricks-gateway "
+            f"model ids; got {model!r}. Use an id that `agy models` lists, or the "
+            "claude_code / codex / pi worker for gateway models."
         )
     return None
 
