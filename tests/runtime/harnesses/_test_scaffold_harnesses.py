@@ -52,10 +52,10 @@ class _EchoHarness(HarnessApp):
 
 class _UsageHarness(HarnessApp):
     """
-    Emits provider usage with ``context_tokens`` and the cache
-    breakdown set.
+    Emits provider usage with ``context_tokens``, the harness-reported
+    ``context_window`` and the cache breakdown set.
 
-    Verifies the scaffold preserves both the context-fill field and
+    Verifies the scaffold preserves the context-fill fields and
     the Anthropic-style cache-read / cache-creation token counts in
     the terminal ``response.completed`` event instead of dropping
     them while converting the inner executor usage dict to the wire
@@ -71,6 +71,7 @@ class _UsageHarness(HarnessApp):
             "output_tokens": 500,
             "total_tokens": 10_800,
             "context_tokens": 5_700,
+            "context_window": 258_400,
             "cache_read_input_tokens": 8_000,
             "cache_creation_input_tokens": 2_000,
         }
