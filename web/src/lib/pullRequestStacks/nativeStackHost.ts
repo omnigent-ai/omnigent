@@ -36,7 +36,7 @@ export function nativeStackMembers(
  * The host method that reads GitHub's own stack for a PR. It's unserved until the host adds it,
  * so until then the page keeps to the description's stack.
  */
-export const NATIVE_STACK_HOST_METHOD = "GetNativePullRequestStack";
+export const NATIVE_STACK_HOST_METHOD = "GetPullRequestNativeStack";
 
 /** The host's answer as the stack model reads it, or undefined when it can't say. */
 export function nativeStackAnswerFromWire(wire: unknown): NativeStackReadAnswer | undefined {

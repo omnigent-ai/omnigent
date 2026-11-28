@@ -16,7 +16,7 @@ const host = vi.hoisted(() => ({ served: true }));
 vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   usePullRequestCapabilityServed: (_sessionId: string, capability: string) =>
-    host.served && capability === "GetNativePullRequestStack",
+    host.served && capability === "GetPullRequestNativeStack",
 }));
 
 import { usePullRequestNativeStack } from "./usePullRequestNativeStack";
@@ -87,7 +87,7 @@ function render(head: string | null = HEAD, enabled = true) {
 
 describe("usePullRequestNativeStack", () => {
   it("names the host method it waits on", () => {
-    expect(NATIVE_STACK_HOST_METHOD).toBe("GetNativePullRequestStack");
+    expect(NATIVE_STACK_HOST_METHOD).toBe("GetPullRequestNativeStack");
   });
 
   it("reads GitHub's stack through the session's host, with its kept entries' members", async () => {
