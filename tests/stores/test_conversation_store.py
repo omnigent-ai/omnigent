@@ -10275,6 +10275,41 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
             assert "TEMP B-TREE" not in plan, plan
 
 
+@pytest.mark.parametrize("page_size", [1, 2, 10])
+def test_spawn_tree_usage_pages_cover_the_full_tree_listing(
+    conversation_store: SqlAlchemyConversationStore, page_size: int
+) -> None:
+    """Single-DB mode: ``after`` pages cover exactly the full listing's rows."""
+    from tests.stores.tree_usage_scenario import assert_paged_tree_usage_matches_full_listing
+
+    assert_paged_tree_usage_matches_full_listing(conversation_store, page_size)
+
+
+def test_spawn_tree_usage_pages_survive_a_delete_between_pages(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting the last row of a page mid-walk cannot drop the rows after it."""
+    import asyncio
+
+    root = conversation_store.create_conversation(conversation_id="00" * 15 + "01")
+    children = [
+        conversation_store.create_conversation(
+            conversation_id="00" * 15 + f"{suffix:02x}",
+            kind="sub_agent",
+            title=f"worker:{suffix}",
+            parent_conversation_id=root.id,
+        )
+        for suffix in (2, 3, 4)
+    ]
+    first = conversation_store.list_spawn_tree_usage(root.id, limit=2)
+    asyncio.run(conversation_store.delete_conversation(first.data[-1].id))
+    rest = conversation_store.list_spawn_tree_usage(root.id, limit=2, after=first.last_id)
+
+    assert [row.id for row in first.data] == [root.id, children[0].id]
+    assert [row.id for row in rest.data] == [children[1].id, children[2].id]
+    assert not rest.has_more
+
+
 def test_spawn_tree_usage_reads_hierarchy_and_usage_without_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

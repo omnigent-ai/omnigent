@@ -313,6 +313,9 @@ async def test_usage_flush_reads_conversation_twice(
         f"reuse the access-check row's root instead of re-reading the row. "
         f"statements={point_reads}"
     )
+    # The session's badge and its ancestors' badges share one tree read.
+    tree_scans = _conversation_tree_scans(statements)
+    assert len(tree_scans) == 1, tree_scans
 
 
 async def test_snapshot_hands_its_row_to_the_runner_router(

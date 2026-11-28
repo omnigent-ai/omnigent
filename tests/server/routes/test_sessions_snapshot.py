@@ -34,6 +34,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.schemas import SessionResponse
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.stores.conversation_store import SpawnTreeUsage
 
 
 async def _drain_model_options(session_id: str) -> None:
@@ -145,43 +146,28 @@ class _ConversationStore:
             agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         )
 
-    def list_conversations(
-        self,
-        *,
-        limit: int = 100,
-        after: str | None = None,
-        kind: str | None = "default",
-        root_conversation_id: str | None = None,
-        include_archived: bool = False,
-    ) -> PagedList[Conversation]:
-        """Return the spawn tree sharing ``root_conversation_id``.
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int, after: str | None = None
+    ) -> PagedList[SpawnTreeUsage]:
+        """Return the spawn tree sharing ``root_conversation_id``, usage only.
 
-        ``load_session_usage`` walks the tree via this method to sum a
-        parent's subtree usage, and passes ``include_archived=True`` —
-        archived conversations still hold spend. With an explicit graph, return every
+        ``load_session_usage`` reads the tree via this method to sum a
+        parent's subtree usage. With an explicit graph, return every
         conversation sharing the root; otherwise synthesize the single
         childless conversation the legacy tests expect.
         """
         if self._conversations is not None:
-            convs = [
-                c
+            nodes = [
+                SpawnTreeUsage(c.id, c.parent_conversation_id, c.session_usage)
                 for c in self._conversations.values()
                 if c.root_conversation_id == root_conversation_id
             ]
         else:
-            convs = [
-                Conversation(
-                    id=root_conversation_id or "",
-                    created_at=1,
-                    updated_at=1,
-                    root_conversation_id=root_conversation_id or "",
-                    agent_id="087b7cb7ac30abf4debfaa578d052ec6",
-                )
-            ]
+            nodes = [SpawnTreeUsage(root_conversation_id, None, {})]
         return PagedList(
-            data=convs,
-            first_id=convs[0].id if convs else None,
-            last_id=convs[-1].id if convs else None,
+            data=nodes,
+            first_id=nodes[0].id if nodes else None,
+            last_id=nodes[-1].id if nodes else None,
             has_more=False,
         )
 

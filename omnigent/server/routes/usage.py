@@ -11,7 +11,7 @@ from fastapi import APIRouter, Request
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.entities import Conversation
 from omnigent.errors import restart_on_stale_cursor
-from omnigent.runtime.policies.builder import load_session_usage_and_tree
+from omnigent.runtime.policies.builder import load_session_usage_and_conversations
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import require_user
@@ -137,7 +137,7 @@ def _build_usage_report(
 
     The per-session detail is a separate view over each top-level session's
     cumulative ``session_usage`` (rolled up across its sub-agent subtree via
-    :func:`load_session_usage_and_tree`), newest activity first, carrying the
+    :func:`load_session_usage_and_conversations`), newest activity first, carrying the
     authoritative session cost and the per-model breakdown.
 
     :param conversation_store: Store to read the rollup and sessions from.
@@ -179,7 +179,7 @@ def _build_usage_report(
             # rows come from ONE tree load: the harness roll-up below needs the
             # same tree the sums came from, and loading it again doubled the tree
             # pages read for every listed session.
-            usage, tree = load_session_usage_and_tree(
+            usage, tree = load_session_usage_and_conversations(
                 conv.id,
                 conversation_store,
                 root_conversation_id=conv.root_conversation_id,
