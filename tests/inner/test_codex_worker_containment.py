@@ -1407,8 +1407,6 @@ async def test_real_bwrap_worker_refreshes_host_login_in_place(
             self.end_headers()
             self.wfile.write(payload)
 
-    token_server = ThreadingHTTPServer(("127.0.0.1", 0), TokenEndpoint)
-    threading.Thread(target=token_server.serve_forever, daemon=True).start()
     home = tmp_path / "home"
     host_codex = home / ".codex"
     host_codex.mkdir(parents=True)
@@ -1418,34 +1416,41 @@ async def test_real_bwrap_worker_refreshes_host_login_in_place(
     workspace.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    token_url = f"http://127.0.0.1:{token_server.server_port}/oauth/token"
-    session = _CodexAppServerSession(
-        codex_path=shutil.which("codex") or "codex",
-        cwd=str(workspace),
-        env={
-            "PATH": os.environ["PATH"],
-            "HOME": str(home),
-            "CODEX_REFRESH_TOKEN_URL_OVERRIDE": token_url,
-        },
-        tool_executor=None,
-        # The worker shares the test's loopback only with network allowed; grants are the same.
-        os_env=OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=True),
-        ),
-    )
+    token_server = ThreadingHTTPServer(("127.0.0.1", 0), TokenEndpoint)
+    threading.Thread(target=token_server.serve_forever, daemon=True).start()
     try:
-        await asyncio.wait_for(session.start(), 120)
-        assert session._worker_launch is not None
-        assert session._worker_launch.sandboxed
-        auth_status = await asyncio.wait_for(
-            session._request("getAuthStatus", {"includeToken": False, "refreshToken": True}),
-            30,
+        token_url = f"http://127.0.0.1:{token_server.server_port}/oauth/token"
+        session = _CodexAppServerSession(
+            codex_path=shutil.which("codex") or "codex",
+            cwd=str(workspace),
+            env={
+                "PATH": os.environ["PATH"],
+                "HOME": str(home),
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE": token_url,
+            },
+            tool_executor=None,
+            # The worker shares the test's loopback only with network allowed; grants are the same.
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(workspace),
+                sandbox=OSEnvSandboxSpec(
+                    type="linux_bwrap", write_paths=["."], allow_network=True
+                ),
+            ),
         )
+        try:
+            await asyncio.wait_for(session.start(), 120)
+            assert session._worker_launch is not None
+            assert session._worker_launch.sandboxed
+            auth_status = await asyncio.wait_for(
+                session._request("getAuthStatus", {"includeToken": False, "refreshToken": True}),
+                30,
+            )
+        finally:
+            await session.close()
     finally:
-        await session.close()
         token_server.shutdown()
+        token_server.server_close()
 
     assert auth_status["result"]["authMethod"] == "chatgpt", auth_status
     assert [request["refresh_token"] for request in refresh_requests] == ["refresh-example"]
