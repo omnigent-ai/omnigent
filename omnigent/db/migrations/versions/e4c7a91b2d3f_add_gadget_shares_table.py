@@ -27,6 +27,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
+from sqlalchemy.dialects.postgresql import VARCHAR as PGVarchar
 
 revision: str = "e4c7a91b2d3f"
 down_revision: str | None = "47d3e8fc3e25"
@@ -64,7 +65,16 @@ def upgrade() -> None:
         "gadget_shares",
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         # The gadget store's ID: up to 64 of [a-z0-9_-], not necessarily a UUID.
-        sa.Column("gadget_id", sa.String(64), nullable=False),
+        # Byte order on every engine, so listing pages continue in the index's order.
+        sa.Column(
+            "gadget_id",
+            sa.String(64)
+            .with_variant(
+                MySQLVarchar(64, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql"
+            )
+            .with_variant(PGVarchar(64, collation="C"), "postgresql"),
+            nullable=False,
+        ),
         # String(128) matches session_permissions.user_id; a user or group ID. Compared
         # exactly on MySQL, whose default collation ignores case and accents and would let
         # two distinct principals match one grant.

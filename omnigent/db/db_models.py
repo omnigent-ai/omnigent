@@ -2203,7 +2203,15 @@ class SqlGadgetShare(OmnigentBase):
         nullable=False,
         default=current_workspace_id,
     )
-    gadget_id: Mapped[str] = mapped_column(String(64), primary_key=True, nullable=False)
+    # Byte order on every engine (like memories.path), so the "shared with me" pages, which
+    # continue after the last ID in Python's order, follow the index in the same order.
+    gadget_id: Mapped[str] = mapped_column(
+        String(64)
+        .with_variant(MySQLVarchar(64, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql")
+        .with_variant(PGVarchar(64, collation="C"), "postgresql"),
+        primary_key=True,
+        nullable=False,
+    )
     # Exact comparison on MySQL (see _MEMORY_ACTOR_ID): its default collation would let
     # "Reader" and "reader" match one grant.
     user_id: Mapped[str] = mapped_column(

@@ -134,9 +134,18 @@ def test_grantees_that_differ_only_in_case_or_accents_are_separate_rows(
     with db_engine.begin() as conn:
         for user_id in ("reader", "Reader", "réader"):
             conn.execute(_share(shares, user_id=user_id))
+        # Gadget IDs compare as bytes too, so "a-b" and "a_b" are two keys in byte order.
+        for gadget_id in ("a_b", "a-b"):
+            conn.execute(_share(shares, gadget_id=gadget_id, user_id="ordered"))
     with db_engine.connect() as conn:
         rows = conn.execute(sa.select(shares.c.user_id).where(shares.c.user_id == "reader"))
         assert [row.user_id for row in rows] == ["reader"]
+        ordered = conn.execute(
+            sa.select(shares.c.gadget_id)
+            .where(shares.c.user_id == "ordered")
+            .order_by(shares.c.gadget_id)
+        )
+        assert [row.gadget_id for row in ordered] == ["a-b", "a_b"]
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)

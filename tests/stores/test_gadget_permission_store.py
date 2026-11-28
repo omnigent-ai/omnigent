@@ -67,6 +67,27 @@ def test_gadget_grants_upsert_page_resolve_and_revoke(store: SqlAlchemyPermissio
     assert store.resolve_gadget_access(["user00@example.com"], other) == LEVEL_MANAGE
 
 
+def test_gadget_ids_with_punctuation_page_once_each_one_at_a_time(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """Collations that order "a-b" and "a_b" differently from Python would skip one; the
+    column compares bytes, so each ID comes back exactly once."""
+    store.ensure_user("alice@example.com")
+    ids = ["a-b", "a_b", "a0b", "ab"]
+    for gadget in ids:
+        store.grant_for_gadget("alice@example.com", gadget, LEVEL_READ)
+    seen: list[str] = []
+    cursor = None
+    while True:
+        page, cursor = store.list_gadgets_shared_with(
+            ["alice@example.com"], limit=1, after_gadget_id=cursor
+        )
+        seen.extend(page)
+        if cursor is None:
+            break
+    assert seen == sorted(ids)
+
+
 def test_gadgets_shared_with_a_caller_page_once_each(store: SqlAlchemyPermissionStore) -> None:
     gadgets = sorted(_gadget() for _ in range(5))
     for user_id in ("alice@example.com", "team", "bob@example.com"):
