@@ -1,8 +1,16 @@
-// Shows the browsed folder, or name-filter matches, with root and reveal controls and
-// the tree's ⋯ menu.
+// Shows the browsed folder, or name-filter matches, with root, reveal and Go to File
+// controls and the tree's ⋯ menu.
 
-import { FolderDotIcon, ListFilterIcon, LocateFixedIcon } from "lucide-react";
-import { type RefObject, useEffect, useId, useMemo, useRef, useState } from "react";
+import { FolderDotIcon, ListFilterIcon, LocateFixedIcon, SearchIcon } from "lucide-react";
+import {
+  type KeyboardEvent,
+  type RefObject,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -14,6 +22,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChangedSort } from "@/lib/changedSort";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { shortcutAriaKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { cn } from "@/lib/utils";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useSession } from "@/hooks/useSession";
@@ -21,6 +30,7 @@ import {
   IgnoredFilesSearchError,
   RunnerOfflineError,
   joinBrowseLocation,
+  finderQueryPrefix,
   relativizeToWorkspace,
   listingCutOff,
   listingIgnoredFiles,
@@ -30,6 +40,7 @@ import {
   useWorkspaceFileSearch,
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { requestFileFinder, useFileFinderAvailable } from "@/store/fileFinder";
 import { usePaletteCommands } from "@/store/paletteCommands";
 import { breadcrumbSegments, workspaceFolderName } from "@/shell/breadcrumbPaths";
 import { useRememberedBrowseLocation } from "@/shell/filesPane/browseLocations";
@@ -46,6 +57,7 @@ import {
 import { FilesTree } from "@/shell/fileTree/FilesTree";
 import { FilesTreeMatches } from "@/shell/fileTree/FilesTreeMatches";
 import { REVEAL_ACTIVE_FILE_LABEL } from "@/shell/fileTree/revealActiveFile";
+import { GO_TO_FILE_LABEL, GO_TO_FILE_UNAVAILABLE } from "@/shell/goToFile/goToFileCommands";
 import {
   BACK_TO_WORKING_FOLDER_LABEL,
   planFolderAsTreeRoot,
@@ -120,14 +132,21 @@ function hiddenListingMessage(entries: readonly WorkspaceFile[], ignoredHidden: 
 function HeaderButton({
   label,
   tooltip,
+  shortcut,
+  ariaKeyShortcuts,
   disabled = false,
   onClick,
+  onKeyDown,
   children,
 }: {
   label: string;
   tooltip: string;
+  /** Keys shown in the tooltip. */
+  shortcut?: readonly string[];
+  ariaKeyShortcuts?: string;
   disabled?: boolean;
   onClick: () => void;
+  onKeyDown?: (event: KeyboardEvent<HTMLButtonElement>) => void;
   children: React.ReactNode;
 }) {
   return (
@@ -140,15 +159,19 @@ function HeaderButton({
           size="icon-xs"
           aria-label={label}
           aria-disabled={disabled || undefined}
+          aria-keyshortcuts={ariaKeyShortcuts}
           className="shrink-0 text-muted-foreground hover:text-foreground aria-disabled:opacity-50 aria-disabled:hover:text-muted-foreground"
           onClick={() => {
             if (!disabled) onClick();
           }}
+          onKeyDown={onKeyDown}
         >
           {children}
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">{tooltip}</TooltipContent>
+      <TooltipContent side="bottom" shortcut={shortcut?.length ? shortcut : undefined}>
+        {tooltip}
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -344,6 +367,14 @@ export function FilesPageTree({
   const treeArea = useRef<HTMLDivElement>(null);
   useFocusTreeAfterRootChange(treeArea, location);
 
+  const fileFinderAvailable = useFileFinderAvailable(conversationId);
+  const goToFileKeys = shortcutKeys("palette.files");
+  // Go to File starts within the browsed folder, plus any letter typed on its button.
+  const goToFile = (typed = "") =>
+    requestFileFinder(conversationId, {
+      query: `${finderQueryPrefix(location)}${typed}` || undefined,
+    });
+
   const header = (
     <div
       className="flex h-8 shrink-0 items-center gap-0.5 border-b border-border pr-1 pl-3"
@@ -392,6 +423,23 @@ export function FilesPageTree({
         onClick={reveal.revealActiveFile}
       >
         <LocateFixedIcon />
+      </HeaderButton>
+      <HeaderButton
+        label={GO_TO_FILE_LABEL}
+        tooltip={fileFinderAvailable ? GO_TO_FILE_LABEL : GO_TO_FILE_UNAVAILABLE}
+        disabled={!fileFinderAvailable}
+        shortcut={fileFinderAvailable ? goToFileKeys : undefined}
+        ariaKeyShortcuts={shortcutAriaKeys("palette.files")}
+        onClick={() => goToFile()}
+        // A letter typed on it starts the finder's query with that letter.
+        onKeyDown={(event) => {
+          if (!fileFinderAvailable || event.key.length !== 1 || event.key === " ") return;
+          if (event.metaKey || event.ctrlKey || event.altKey) return;
+          event.preventDefault();
+          goToFile(event.key);
+        }}
+      >
+        <SearchIcon />
       </HeaderButton>
       <FilesTreeOptionsMenu
         sort={sort}

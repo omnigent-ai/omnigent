@@ -46,10 +46,23 @@ def test_go_to_file_opens_a_match_from_every_entry_point_and_lists_it_next_time(
     sidebar = open_workspace(page, base_url, session_id)
     query = page.get_by_role("combobox", name="Go to a file")
 
-    # A narrow Files tab with no file open is the tree; hidden, the page offers Go to file,
-    # which opens the finder on its query.
+    # A narrow Files tab with no file open is the tree, whose header opens the finder on its
+    # query, empty at the workspace root.
     _open_app(page, sidebar, "Files")
     expect(sidebar.get_by_role("treeitem", name="README.md")).to_be_visible(timeout=30_000)
+    header_button = sidebar.get_by_test_id("files-page-tree-header").get_by_role(
+        "button", name="Go to File in Workspace…"
+    )
+    expect(header_button).not_to_have_attribute("aria-disabled", "true", timeout=30_000)
+    header_button.hover()
+    expect(page.get_by_role("tooltip")).to_contain_text("Go to File in Workspace…")
+    header_button.click()
+    expect(query).to_be_focused()
+    expect(query).to_have_value("")
+    query.press("Escape")
+    expect(query).to_be_hidden()
+
+    # Hidden, the page offers Go to file, which opens the finder on its query.
     sidebar.get_by_role("button", name="Hide Files Tree").click()
     expect(sidebar.get_by_text("Open a file")).to_be_visible()
     button = sidebar.get_by_role("button", name=re.compile(r"^Go to file"))

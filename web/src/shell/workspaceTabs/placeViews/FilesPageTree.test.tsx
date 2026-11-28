@@ -37,6 +37,7 @@ import {
 } from "@/shell/filesPane/useTreeFilters";
 import { useFileActionStore } from "@/shell/fileCommands/fileActionStore";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { useFileFinderStore } from "@/store/fileFinder";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { toast } from "sonner";
@@ -202,6 +203,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   rememberBrowseLocation("conv_1", null);
+  useFileFinderStore.setState({ request: null, availableSessionId: null });
   forgetActiveFileRevealsForTests();
   forgetTreeNameFilterRequestsForTests();
   forgetTreeFiltersForTests();
@@ -630,6 +632,43 @@ describe("FilesPageTree", () => {
       "gone.ts isn’t in the Files tree. It may have moved or been deleted.",
       {},
     );
+  });
+
+  it("opens Go to File from its header, saying why until the session's workspace can be searched", () => {
+    renderTree(listed([entry("src")]));
+    const button = screen.getByRole("button", { name: "Go to File in Workspace…" });
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(button);
+    expect(useFileFinderStore.getState().request).toBeNull();
+
+    act(() => useFileFinderStore.getState().setAvailableSession("conv_1"));
+    expect(button).not.toHaveAttribute("aria-disabled");
+    expect(button).toHaveAttribute("aria-keyshortcuts");
+    fireEvent.click(button);
+    expect(useFileFinderStore.getState().request).toMatchObject({
+      sessionId: "conv_1",
+      kind: "files",
+      query: undefined,
+    });
+  });
+
+  it("starts Go to File within the browsed folder, and with a letter typed on its button", () => {
+    useFileFinderStore.getState().setAvailableSession("conv_1");
+    rememberBrowseLocation("conv_1", "/work/repo/src");
+    renderTree(listed([entry("src/a.ts")]));
+    const button = screen.getByRole("button", { name: "Go to File in Workspace…" });
+
+    fireEvent.click(button);
+    expect(useFileFinderStore.getState().request).toMatchObject({ query: "src/" });
+    fireEvent.keyDown(button, { key: "g" });
+    expect(useFileFinderStore.getState().request).toMatchObject({ query: "src/g" });
+
+    // Space and chords stay the button's and the shell's own.
+    useFileFinderStore.setState({ request: null });
+    fireEvent.keyDown(button, { key: " " });
+    fireEvent.keyDown(button, { key: "k", metaKey: true });
+    fireEvent.keyDown(button, { key: "Enter" });
+    expect(useFileFinderStore.getState().request).toBeNull();
   });
 
   describe("name filter", () => {
