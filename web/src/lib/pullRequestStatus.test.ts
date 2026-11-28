@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  getPullRequestLifecycle,
   getPullRequestStatus,
   hasNewerPullRequestLifecycle,
   sortPullRequestsByStatus,
@@ -140,5 +141,20 @@ describe("sortPullRequestsByStatus", () => {
       "closed",
     ]);
     expect(prs).toEqual(original);
+  });
+});
+
+describe("getPullRequestLifecycle", () => {
+  it.each([
+    { pr: { state: "OPEN", is_draft: false }, expected: "open" },
+    { pr: { state: "open" }, expected: "open" },
+    { pr: { state: "OPEN", is_draft: true }, expected: "draft" },
+    { pr: { state: "MERGED", is_draft: true }, expected: "merged" },
+    { pr: { state: "CLOSED", is_draft: true }, expected: "closed" },
+    { pr: { state: null }, expected: null },
+    { pr: { state: "UNKNOWN" }, expected: null },
+    { pr: undefined, expected: null },
+  ])("maps $pr to $expected", ({ pr, expected }) => {
+    expect(getPullRequestLifecycle(pr)).toBe(expected);
   });
 });

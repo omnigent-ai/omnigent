@@ -29,7 +29,13 @@ import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { skipToken, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import {
+  skipToken,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import {
   ArrowLeftIcon,
   CopyIcon,
@@ -46,6 +52,7 @@ import {
   GitCommitHorizontalIcon,
   GitPullRequestIcon,
   KeyRoundIcon,
+  ListFilterIcon,
   Loader2Icon,
   type LucideIcon,
   PlusIcon,
@@ -63,6 +70,9 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Badge } from "@/components/ui/badge";
@@ -104,6 +114,7 @@ import {
   usePullRequestChangedFiles,
   usePullRequestDiff,
   usePullRequestInfo,
+  usePullRequestInfos,
   usePullRequestReadPriority,
   useSetPullRequestPreference,
   useUpdateSessionPr,
@@ -126,6 +137,12 @@ import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
 import { PanelMessage, PullRequestChangesTab } from "./PullRequestChangesTab";
 import { IconButton } from "./PullRequestFileSection";
+import {
+  getPullRequestLifecycle,
+  PULL_REQUEST_LIFECYCLE_LABELS,
+  PULL_REQUEST_LIFECYCLES,
+  type PullRequestLifecycle,
+} from "@/lib/pullRequestStatus";
 
 export { LARGE_DIFF_THRESHOLD } from "./PullRequestFileSection";
 
@@ -820,9 +837,24 @@ type Associations = Pick<
 >;
 export type PullRequestSubtab = "summary" | "comments" | "changes";
 
+type PullRequestInfoQuery = UseQueryResult<PullRequestInfo>;
+
+/** What a list row knows about its PR: live details unless the host is offline. */
+function listRowDetails(
+  association: PullRequestAssociation,
+  info: PullRequestInfoQuery,
+  hostOffline: boolean,
+) {
+  const data = info.data ? normalizePullRequestInfo(info.data) : undefined;
+  const offline = hostOffline || info.error instanceof RunnerOfflineError;
+  const cachedPr = data?.pr?.url === association.url ? data.pr : undefined;
+  const pr = !offline ? cachedPr : undefined;
+  return { data, offline, cachedPr, pr, summary: pr ?? association };
+}
+
 function PullRequestListRow({
   conversationId,
-  active,
+  info,
   association,
   onSelect,
   onUnlink,
@@ -831,7 +863,7 @@ function PullRequestListRow({
   sandboxAsleep,
 }: {
   conversationId: string;
-  active: boolean;
+  info: PullRequestInfoQuery;
   association: PullRequestAssociation;
   onSelect: () => void;
   onUnlink?: () => void;
@@ -840,16 +872,8 @@ function PullRequestListRow({
   sandboxAsleep: boolean;
 }) {
   const sandboxStarting = useSandboxStarting(conversationId);
-  const info = usePullRequestInfo(conversationId, {
-    poll: active ? "list" : false,
-    prUrl: association.url,
-  });
   const canEdit = useCanEdit(conversationId);
-  const data = info.data ? normalizePullRequestInfo(info.data) : undefined;
-  const offline = hostOffline || info.error instanceof RunnerOfflineError;
-  const cachedPr = data?.pr?.url === association.url ? data.pr : undefined;
-  const pr = !offline ? cachedPr : undefined;
-  const summary = pr ?? association;
+  const { data, offline, cachedPr, pr, summary } = listRowDetails(association, info, hostOffline);
   const checks = pr?.checks;
   const mergeState = pr ? mergeButtonState(pr) : undefined;
   const ready =
@@ -1032,6 +1056,65 @@ interface PullRequestPanelView {
   selected?: string;
   showingDetails: boolean;
   subtab: PullRequestSubtab;
+  /** Unset shows every PR in the list. */
+  statusFilter?: PullRequestLifecycle;
+}
+
+/** Narrows the PR list to one lifecycle status; each option counts its PRs. */
+function PullRequestStatusFilter({
+  value,
+  counts,
+  total,
+  onChange,
+}: {
+  value: PullRequestLifecycle | undefined;
+  counts: Record<PullRequestLifecycle, number>;
+  total: number;
+  onChange: (next: PullRequestLifecycle | undefined) => void;
+}) {
+  const label = value
+    ? `Filter pull requests: ${PULL_REQUEST_LIFECYCLE_LABELS[value]}`
+    : "Filter pull requests by status";
+  const option = (optionValue: string, optionLabel: string, count: number) => (
+    <DropdownMenuRadioItem key={optionValue} value={optionValue} className="mobile-touch-target">
+      {optionLabel}{" "}
+      <span className="ml-auto pl-3 text-xs text-muted-foreground tabular-nums">{count}</span>
+    </DropdownMenuRadioItem>
+  );
+  return (
+    <DropdownMenu>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size={value ? "xs" : "icon-xs"}
+              aria-label={label}
+              className={cn("shrink-0", value ? "text-foreground" : "text-muted-foreground")}
+            >
+              <ListFilterIcon className="size-3.5" aria-hidden="true" />
+              {value && <span>{PULL_REQUEST_LIFECYCLE_LABELS[value]}</span>}
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent>{label}</TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitemradio]]:text-ui">
+        <DropdownMenuLabel className="text-sm text-muted-foreground">Status</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={value ?? "all"}
+          onValueChange={(next) =>
+            onChange(next === "all" ? undefined : (next as PullRequestLifecycle))
+          }
+        >
+          {option("all", "All", total)}
+          {PULL_REQUEST_LIFECYCLES.map((lifecycle) =>
+            option(lifecycle, PULL_REQUEST_LIFECYCLE_LABELS[lifecycle], counts[lifecycle]),
+          )}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 }
 
 const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
@@ -1041,11 +1124,10 @@ export function selectPullRequestInPanel(
   conversationId: string,
   prUrl: string,
 ) {
-  queryClient.setQueryData<PullRequestPanelView>(["pull-request-panel-view", conversationId], {
-    selected: prUrl,
-    showingDetails: true,
-    subtab: "summary",
-  });
+  queryClient.setQueryData<PullRequestPanelView>(
+    ["pull-request-panel-view", conversationId],
+    (current) => ({ ...current, selected: prUrl, showingDetails: true, subtab: "summary" }),
+  );
 }
 
 export function PullRequestPanel({
@@ -1350,10 +1432,48 @@ export function PullRequestPanel({
   const canChangeTracking = showTrackingControls && !ownerOnlyChanges;
   const showsList =
     (listedPrs.length > 1 || (!!onOpenPullRequest && listedPrs.length > 0)) && !showingDetails;
+  // Row details stay polled while filtered out, so a PR moves between filters as its state changes.
+  const listInfos = usePullRequestInfos(
+    conversationId,
+    showsList ? listedPrs.map((pr) => pr.url) : [],
+    { poll: active ? "list" : false },
+  );
+  const listRows = showsList
+    ? listedPrs.map((pr, index) => {
+        const association = {
+          ...pr,
+          provider: pr.provider ?? associations?.provider ?? undefined,
+          provider_display: pr.provider_display ?? associations?.provider_display ?? undefined,
+        };
+        const rowInfo = listInfos[index];
+        const { summary } = listRowDetails(association, rowInfo, hostOffline);
+        return { association, rowInfo, lifecycle: getPullRequestLifecycle(summary) };
+      })
+    : [];
+  // One row needs no filter, so a remembered one must not hide it.
+  const canFilter = listRows.length > 1;
+  const statusFilter = canFilter ? view.statusFilter : undefined;
+  const statusCounts = Object.fromEntries(
+    PULL_REQUEST_LIFECYCLES.map((lifecycle) => [
+      lifecycle,
+      listRows.filter((row) => row.lifecycle === lifecycle).length,
+    ]),
+  ) as Record<PullRequestLifecycle, number>;
+  const visibleRows = statusFilter
+    ? listRows.filter((row) => row.lifecycle === statusFilter)
+    : listRows;
   // A host's list, without tracking controls, still needs the panel's title and Refresh.
   const handsOffList = !!onOpenPullRequest && showsList;
   const headerActions = (
     <TooltipProvider delayDuration={0}>
+      {canFilter && (
+        <PullRequestStatusFilter
+          value={statusFilter}
+          counts={statusCounts}
+          total={listRows.length}
+          onChange={(next) => updateView({ statusFilter: next })}
+        />
+      )}
       <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
         {refreshIcon}
       </IconButton>
@@ -1447,30 +1567,43 @@ export function PullRequestPanel({
         </p>
       ) : null}
       <div className="min-h-0 flex-1">
-        {showsList ? (
+        {statusFilter && visibleRows.length === 0 ? (
+          <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center">
+            <p role="status" className="text-ui text-muted-foreground">
+              No {PULL_REQUEST_LIFECYCLE_LABELS[statusFilter].toLowerCase()} pull requests
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => updateView({ statusFilter: undefined })}
+            >
+              Show all pull requests
+            </Button>
+          </div>
+        ) : showsList ? (
           <ul aria-label="Pull requests" className="h-full overflow-y-auto">
-            {listedPrs.map((pr) => (
+            {visibleRows.map(({ association, rowInfo }) => (
               <PullRequestListRow
-                key={pr.url}
+                key={association.url}
                 conversationId={conversationId}
-                active={active}
-                association={{
-                  ...pr,
-                  provider: pr.provider ?? associations?.provider ?? undefined,
-                  provider_display:
-                    pr.provider_display ?? associations?.provider_display ?? undefined,
-                }}
+                info={rowInfo}
+                association={association}
                 hostOffline={hostOffline}
                 sandboxAsleep={sandboxAsleep}
                 unlinkPending={unlink.isPending}
                 onUnlink={
                   associations?.tracking_available && !branchPr && !ownerOnlyChanges
-                    ? () => unlinkPr(pr.url)
+                    ? () => unlinkPr(association.url)
                     : undefined
                 }
                 onSelect={() => {
-                  if (onOpenPullRequest) onOpenPullRequest(pr.url);
-                  else updateView({ selected: pr.url, showingDetails: true, subtab: "summary" });
+                  if (onOpenPullRequest) onOpenPullRequest(association.url);
+                  else
+                    updateView({
+                      selected: association.url,
+                      showingDetails: true,
+                      subtab: "summary",
+                    });
                 }}
               />
             ))}

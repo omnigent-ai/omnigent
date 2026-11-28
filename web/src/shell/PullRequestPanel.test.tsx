@@ -44,6 +44,8 @@ const state = vi.hoisted(() => ({
     error: unknown;
     isFetching: boolean;
   } | null,
+  // List rows' info by PR URL; rows without an entry read `info`.
+  infoByUrl: {} as Record<string, { data?: PullRequestInfo; isLoading: boolean; error: unknown }>,
   changes: null as {
     data?: {
       available: boolean;
@@ -138,6 +140,11 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     usePullRequestReadPriority: vi.fn(),
     usePullRequestInfo: vi.fn((...args: Parameters<typeof original.usePullRequestInfo>) =>
       state.realPrHooks ? original.usePullRequestInfo(...args) : state.info,
+    ),
+    usePullRequestInfos: vi.fn((...args: Parameters<typeof original.usePullRequestInfos>) =>
+      state.realPrHooks
+        ? original.usePullRequestInfos(...args)
+        : args[1].map((prUrl) => state.infoByUrl[prUrl] ?? state.info),
     ),
     usePullRequestChangedFiles: vi.fn(() => state.changes),
     usePullRequestDiff: () => ({
@@ -237,6 +244,7 @@ vi.mock("@/components/ai-elements/message", () => ({
 
 import {
   usePullRequestInfo,
+  usePullRequestInfos,
   usePullRequestChangedFiles,
   usePullRequestReadPriority,
   usePullRequestRepoLabels,
@@ -372,6 +380,7 @@ beforeEach(() => {
   // The diff-layout toggle seeds from persisted prefs; start each test clean.
   window.localStorage.clear();
   state.realPrHooks = false;
+  state.infoByUrl = {};
   state.stored = {};
   state.unsynced = new Set();
   state.storedFetches = 0;
@@ -799,18 +808,14 @@ describe("PullRequestPanel", () => {
     expect(
       vi.mocked(usePullRequestInfo).mock.calls.every(([, options]) => options?.poll === false),
     ).toBe(true);
-    for (const pr of state.stored.conv_1) {
-      expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: false, prUrl: pr.url });
-    }
+    const rowUrls = state.stored.conv_1.map((pr) => pr.url);
+    expect(usePullRequestInfos).toHaveBeenLastCalledWith("conv_1", rowUrls, { poll: false });
     expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
 
     expect(refetchQueries).not.toHaveBeenCalled();
 
-    vi.mocked(usePullRequestInfo).mockClear();
     rerender(<PullRequestPanel conversationId="conv_1" active />);
-    for (const pr of state.stored.conv_1) {
-      expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: "list", prUrl: pr.url });
-    }
+    expect(usePullRequestInfos).toHaveBeenLastCalledWith("conv_1", rowUrls, { poll: "list" });
     // List rows wait their turn; only an open details view reads ahead of them.
     expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     // Turning the poll back on doesn't fetch by itself.
@@ -823,6 +828,8 @@ describe("PullRequestPanel", () => {
       poll: true,
       prUrl: url,
     });
+    // Details don't poll the list rows.
+    expect(usePullRequestInfos).toHaveBeenLastCalledWith("conv_1", [], { poll: "list" });
     expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
@@ -3275,6 +3282,105 @@ describe("session PR selection", () => {
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_other" />);
     expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+  });
+
+  it("filters the list by each PR's live or last-known status", async () => {
+    const user = userEvent.setup();
+    const base = state.info!.data!;
+    const association = (number: number, title: string, extra = {}) => ({
+      url: `https://github.com/example/repo/pull/${number}`,
+      host: "github.com",
+      repository: "example/repo",
+      number,
+      title,
+      relationship: "attached" as const,
+      ...extra,
+    });
+    const liveInfo = (number: number, title: string, prState: string, isDraft: boolean) => ({
+      isLoading: false,
+      error: null,
+      data: {
+        ...base,
+        pr: {
+          ...base.pr!,
+          url: `https://github.com/example/repo/pull/${number}`,
+          number,
+          title,
+          state: prState,
+          is_draft: isDraft,
+        },
+      },
+    });
+    // Live details override a stale stored state; without them the stored state applies.
+    const prs = [
+      association(1, "Open work", { state: "OPEN" }),
+      association(2, "Draft work", { state: "OPEN", is_draft: false }),
+      association(3, "Shipped work", { state: "MERGED" }),
+      association(4, "Abandoned work", { state: "OPEN" }),
+      association(5, "Unchecked work"),
+    ];
+    state.infoByUrl = {
+      [prs[0].url]: liveInfo(1, "Open work", "OPEN", false),
+      [prs[1].url]: liveInfo(2, "Draft work", "OPEN", true),
+      [prs[3].url]: liveInfo(4, "Abandoned work", "CLOSED", false),
+    };
+    Object.assign(base, { tracking_available: true, selected_pr_url: prs[0].url, prs });
+    const { rerender } = renderPanel();
+    const list = () => screen.getByRole("list", { name: "Pull requests" });
+    const rowNames = () =>
+      within(list())
+        .getAllByRole("button", { name: /^example\/repo #\d+ — / })
+        .map((row) => row.getAttribute("aria-label"));
+
+    await user.click(screen.getByRole("button", { name: "Filter pull requests by status" }));
+    const counts = screen.getAllByRole("menuitemradio").map((option) => option.textContent);
+    expect(counts).toEqual(["All 5", "Open 1", "Draft 1", "Merged 1", "Closed 1"]);
+    expect(screen.getByRole("menuitemradio", { name: "All 5" })).toBeChecked();
+    await user.click(screen.getByRole("menuitemradio", { name: /^Closed/ }));
+    expect(rowNames()).toEqual(["example/repo #4 — Abandoned work"]);
+
+    // The filter survives opening a PR and returning to the list.
+    await user.click(screen.getByRole("button", { name: "example/repo #4 — Abandoned work" }));
+    expect(screen.queryByRole("button", { name: /Filter pull requests/ })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "All pull requests (5)" }));
+    expect(rowNames()).toEqual(["example/repo #4 — Abandoned work"]);
+
+    await user.click(screen.getByRole("button", { name: "Filter pull requests: Closed" }));
+    await user.click(screen.getByRole("menuitemradio", { name: /^Draft/ }));
+    expect(rowNames()).toEqual(["example/repo #2 — Draft work"]);
+
+    // A draft marked ready leaves the Draft filter on its next poll.
+    state.infoByUrl[prs[1].url] = liveInfo(2, "Draft work", "OPEN", false);
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("No draft pull requests");
+    await user.click(screen.getByRole("button", { name: "Show all pull requests" }));
+    expect(rowNames()).toHaveLength(5);
+    expect(screen.getByRole("button", { name: "Filter pull requests by status" })).toBeVisible();
+  });
+
+  it("ignores a remembered filter once a tab's list has one PR left", async () => {
+    const user = userEvent.setup();
+    const pr = (number: number, prState: string) => ({
+      url: `https://github.com/example/repo/pull/${number}`,
+      host: "github.com",
+      repository: "example/repo",
+      number,
+      relationship: "attached" as const,
+      state: prState,
+    });
+    const data = state.info!.data!;
+    data.tracking_available = true;
+    data.prs = [pr(1, "OPEN"), pr(2, "MERGED")];
+    const { rerender } = renderPanel();
+    await user.click(screen.getByRole("button", { name: "Filter pull requests by status" }));
+    await user.click(screen.getByRole("menuitemradio", { name: /^Merged/ }));
+    expect(screen.queryByRole("button", { name: "example/repo #1" })).toBeNull();
+
+    state.info = { ...state.info!, data: { ...data, prs: [pr(1, "OPEN")] } };
+    rerender(<PullRequestPanel conversationId="conv_1" onOpenPullRequest={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "example/repo #1" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Filter pull requests/ })).toBeNull();
   });
 
   it("shows the server's stored PRs and lets them be unlinked while the host is offline", async () => {
