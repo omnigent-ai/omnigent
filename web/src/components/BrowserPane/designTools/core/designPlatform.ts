@@ -18,6 +18,18 @@ export interface DesignPage {
     dy: number,
     modifiers?: readonly string[],
   ) => Promise<string>;
+  /** Live Edit: the text at a viewport point, for session `scope` (JSON, or JSON null). */
+  liveEditPick: (scope: string, x: number, y: number) => Promise<string>;
+  /** Live Edit: show `text` in edit `handle`; "gone" when it isn't on the page any more. */
+  liveEditPreview: (scope: string, handle: number, text: string) => Promise<string>;
+  /** Live Edit: put back everything `scope` changed; "none" when it had nothing there. */
+  liveEditRestore: (scope: string) => Promise<string>;
+  /** Live Edit: show each edit's latest `texts` and keep them, then forget `scope`. */
+  liveEditSettle: (scope: string, texts: [number, string][]) => Promise<string>;
+  /** Live Edit: forget `scope` (Discard already put the page back). */
+  liveEditForget: (scope: string) => Promise<string>;
+  /** Live Edit: put back everything `scope` changed, then forget it (a Discard cut short). */
+  liveEditDiscard: (scope: string) => Promise<string>;
 }
 
 /** Something done in the page, when its turn comes. */

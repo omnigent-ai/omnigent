@@ -7,6 +7,7 @@ import {
   MousePointerClickIcon,
   PencilLineIcon,
   SquareIcon,
+  TypeIcon,
   Undo2Icon,
   XIcon,
   type LucideIcon,
@@ -376,6 +377,116 @@ export function DrawDock({
 export const NOTE_FIELD_CLASS =
   "h-7 w-44 min-w-0 border-0 bg-transparent shadow-none focus-visible:ring-0 dark:bg-transparent";
 export const TEXT_DRAFT_CLASS = "fixed h-8 w-56 bg-popover font-semibold shadow-lg";
+
+/** Live Edit's outline round the text being edited. */
+export function EditOutline({ rect }: { rect: CssRect }) {
+  return (
+    <div
+      className="pointer-events-none absolute rounded-md outline-2 outline-status-blue outline-offset-2"
+      style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}
+    />
+  );
+}
+
+// Opaque in both themes (the text field's own dark background is see-through), so the
+// page's text never shows through what's being typed.
+export const EDITOR_CLASS =
+  "field-sizing-content fixed min-h-0 resize-none bg-popover text-popover-foreground shadow-lg dark:bg-popover";
+
+/** The editor's tallest; it grows with its text up to this. */
+const EDITOR_MAX_HEIGHT = 240;
+/** Room under the text that's enough, though there's more over it. */
+const EDITOR_ENOUGH_ROOM = 80;
+const EDITOR_INSET = 8;
+const EDITOR_MIN_WIDTH = 240;
+
+/**
+ * Where Live Edit's editor goes: under the text, or over it when there's more room there,
+ * and inside the text's own box when it fills the page; never taller than its room.
+ */
+export function editorStyle(rect: LayerRect, edit: { rect: CssRect }): CSSProperties {
+  const text = edit.rect;
+  // As wide as the text, at least EDITOR_MIN_WIDTH, and shifted left to stay on the page.
+  const width = Math.max(
+    0,
+    Math.min(Math.max(text.width, EDITOR_MIN_WIDTH), rect.width - 2 * EDITOR_INSET),
+  );
+  const x = Math.min(Math.max(text.x, EDITOR_INSET), rect.width - EDITOR_INSET - width);
+  const horizontal = { left: rect.left + Math.max(EDITOR_INSET, x), width };
+  const below = rect.height - (text.y + text.height + CARD_GAP) - EDITOR_INSET;
+  const above = text.y - CARD_GAP - EDITOR_INSET;
+  if (below >= EDITOR_ENOUGH_ROOM || (below > 0 && below >= above)) {
+    return {
+      ...horizontal,
+      top: rect.top + text.y + text.height + CARD_GAP,
+      maxHeight: Math.min(EDITOR_MAX_HEIGHT, below),
+    };
+  }
+  if (above > 0) {
+    return {
+      ...horizontal,
+      top: rect.top + text.y - CARD_GAP,
+      transform: "translateY(-100%)",
+      maxHeight: Math.min(EDITOR_MAX_HEIGHT, above),
+    };
+  }
+  return {
+    ...horizontal,
+    top: rect.top + EDITOR_INSET,
+    maxHeight: Math.min(EDITOR_MAX_HEIGHT, rect.height - 2 * EDITOR_INSET),
+  };
+}
+
+/** Live Edit's dock: how many edits, Discard and Send. */
+export function LiveEditDock({
+  rect,
+  ready,
+  discardDisabled,
+  sendDisabled,
+  onDiscard,
+  onSend,
+  onClose,
+}: {
+  rect: LayerRect;
+  ready: number;
+  discardDisabled: boolean;
+  sendDisabled: boolean;
+  onDiscard?: () => void;
+  onSend?: () => void;
+  onClose?: () => void;
+}) {
+  const status =
+    ready === 0
+      ? "Click text on the page to edit it"
+      : `${ready} ${ready === 1 ? "edit" : "edits"} ready`;
+  return (
+    <ToolBar rect={rect} icon={TypeIcon} closeLabel="Close Live Edit" onClose={onClose}>
+      <span className="min-w-0 truncate pr-1">{status}</span>
+      <Button
+        componentId="browserDesignTools.liveEdit.discard"
+        type="button"
+        disabled={discardDisabled}
+        onClick={onDiscard}
+        variant="ghost"
+        size="xs"
+        className="shrink-0 rounded-full"
+      >
+        Discard
+      </Button>
+      <Button
+        componentId="browserDesignTools.liveEdit.send"
+        type="button"
+        disabled={sendDisabled}
+        onClick={onSend}
+        variant="default"
+        size="xs"
+        className="shrink-0 rounded-full"
+      >
+        Send to agent
+      </Button>
+    </ToolBar>
+  );
+}
 
 /** A notice along the bottom of the page (or the window's corner, before it's measured). */
 export function Notice({

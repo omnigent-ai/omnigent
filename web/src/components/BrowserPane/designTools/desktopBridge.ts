@@ -17,6 +17,8 @@ export interface Answer {
   session?: string;
   /** `start`'s frame name, which the opening's overlay opens as. */
   frame?: string;
+  /** `liveEditBegin`'s scope for one Live Edit session's page state. */
+  scope?: string;
   /** A page operation's answer (the page's own data: untrusted). */
   result?: string;
   png?: string;

@@ -4,10 +4,13 @@
 import { create } from "zustand";
 import type { DesignModeElement } from "@/lib/designModePrompt";
 
-export type Tool = "annotate" | "draw";
+export type Tool = "annotate" | "draw" | "edit";
 
-/** `preparing`: a send is being built (a screenshot taken), and the drafts are frozen. */
-export type Phase = "editing" | "preparing";
+/**
+ * `preparing`: a send is being built (a screenshot taken); `discarding`: Live Edit puts the
+ * page back. The drafts are frozen in both.
+ */
+export type Phase = "editing" | "preparing" | "discarding";
 
 /** A rect in the page's CSS pixels. */
 export interface CssRect {
@@ -36,6 +39,16 @@ export interface Shape {
   text?: string;
 }
 
+/** One Live Edit: an element's text before, and as the user has it now. */
+export interface TextEdit {
+  /** The page's id for the element, within its Live Edit session. */
+  handle: number;
+  element: DesignModeElement;
+  rect: CssRect;
+  before: string;
+  after: string;
+}
+
 export interface Drafts {
   /** Annotate: the picked element and the request. */
   picked: Hit | null;
@@ -43,6 +56,10 @@ export interface Drafts {
   /** Draw: the marks and the note. */
   shapes: Shape[];
   note: string;
+  /** Live Edit: the edits, the one whose editor is open, and where its cursor starts (null: end). */
+  edits: TextEdit[];
+  editing: number | null;
+  caret: number | null;
 }
 
 export interface TabTools extends Drafts {
@@ -51,7 +68,15 @@ export interface TabTools extends Drafts {
   session: number;
 }
 
-const EMPTY_DRAFTS: Drafts = { picked: null, request: "", shapes: [], note: "" };
+const EMPTY_DRAFTS: Drafts = {
+  picked: null,
+  request: "",
+  shapes: [],
+  note: "",
+  edits: [],
+  editing: null,
+  caret: null,
+};
 
 const CLOSED: TabTools = { ...EMPTY_DRAFTS, tool: null, phase: "editing", session: 0 };
 

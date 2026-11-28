@@ -1,6 +1,7 @@
 // The design tools' layers over a Browser tab's page: Annotate (pick an element, ask for a
-// change) and Draw (mark up the page, send a screenshot). They draw over `rect` in the
-// overlay document they render in, and turn the pointer and keys into core's actions.
+// change) and Draw (mark up the page, send a screenshot); Live Edit's is liveEditLayer.tsx.
+// They draw over `rect` in the overlay document they render in, and turn the pointer and
+// keys into core's actions.
 import {
   useEffect,
   useLayoutEffect,
@@ -58,7 +59,7 @@ const windowOf = (element: Element): Window => element.ownerDocument.defaultView
 const WHEEL_LINE_PX = 16;
 
 /** Forward a wheel turn over a tool's layer to what's under it in the (inert) page. */
-function scrollPage(session: ToolSession, event: React.WheelEvent, frame: LayerRect): void {
+export function scrollPage(session: ToolSession, event: React.WheelEvent, frame: LayerRect): void {
   const unit = event.deltaMode === 1 ? WHEEL_LINE_PX : event.deltaMode === 2 ? frame.height : 1;
   const [x, y] = [event.clientX - frame.left, event.clientY - frame.top];
   const [dx, dy] = [event.deltaX * unit, event.deltaY * unit];
@@ -83,7 +84,7 @@ export interface LayerProps {
 }
 
 /** A Send's outcome, from its notice: queued, or why not. */
-function sendOutcome(notice: string | null, tool: string): CommandResult {
+export function sendOutcome(notice: string | null, tool: string): CommandResult {
   if (isSendingNotice(notice)) return { ok: true };
   return { ok: false, error: notice ?? `${tool} closed before it sent.` };
 }
@@ -92,7 +93,7 @@ function sendOutcome(notice: string | null, tool: string): CommandResult {
  * The open tool's session (see toolSession.ts). A tool that works in the page (`usesPage`)
  * closes, saying why, when the page can't run it.
  */
-function useToolSession(
+export function useToolSession(
   tabId: string,
   onNotice: (message: string) => void,
   usesPage: boolean,

@@ -30,7 +30,7 @@ import {
 } from "./designOutboxStorage";
 
 export type DesignRequestStatus = "waiting" | "sending" | "sent" | "failed" | "denied";
-export type DesignTool = "annotate" | "draw";
+export type DesignTool = "annotate" | "draw" | "edit";
 
 export interface DesignRequest {
   /** The message's stable id: every attempt posts under it. */

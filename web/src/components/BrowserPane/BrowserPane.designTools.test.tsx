@@ -60,7 +60,7 @@ afterEach(() => {
 });
 
 describe("BrowserPane design tools", () => {
-  it("offers Annotate and Draw instead of design mode where the shell has them", async () => {
+  it("offers Annotate, Draw and Live Edit instead of design mode where the shell has them", async () => {
     installBridge();
     render(<BrowserPane conversationId="conv_dt1" />);
     const tools = await screen.findByRole("group", { name: "Design tools" });
@@ -68,7 +68,7 @@ describe("BrowserPane design tools", () => {
       within(tools)
         .getAllByRole("button")
         .map((button) => button.getAttribute("aria-label")),
-    ).toEqual(["Annotate an element", "Draw on the page"]);
+    ).toEqual(["Annotate an element", "Draw on the page", "Live Edit text"]);
     expect(screen.queryByRole("button", { name: /design mode/i })).toBeNull();
   });
 
