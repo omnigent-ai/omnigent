@@ -58,6 +58,15 @@ def image_omitted_placeholder(media_type: str | None) -> str:
     return _omitted_placeholder(media_type, "image")
 
 
+def document_omitted_placeholder(media_type: str | None) -> str:
+    """Return the placeholder text for a stripped inline document.
+
+    :param media_type: Document MIME type when known, e.g. ``"application/pdf"``.
+    :returns: Human/agent-readable placeholder naming how to recover it.
+    """
+    return _omitted_placeholder(media_type, "document")
+
+
 def _omitted_placeholder(media_type: object, kind: str) -> str:
     """Return the placeholder text for a stripped inline payload.
 
@@ -696,7 +705,11 @@ def _sanitize_document_block(block: JsonObject) -> JsonObject:
         return block
     if _canonical_base64(source.get("data")) is not None:
         return _document_block_from_object(block) or block
-    return {"type": "text", "text": _omitted_placeholder(source.get("media_type"), "document")}
+    media_type = source.get("media_type")
+    return {
+        "type": "text",
+        "text": document_omitted_placeholder(media_type if isinstance(media_type, str) else None),
+    }
 
 
 def image_payloads_in_blocks(blocks: list[JsonObject]) -> list[str]:

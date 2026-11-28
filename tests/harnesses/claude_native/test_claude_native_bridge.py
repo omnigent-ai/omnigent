@@ -80,6 +80,8 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
+from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES, cap_tool_output
+from omnigent.runtime.tool_result_replay import document_omitted_placeholder
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 from tests._helpers.live_server import terminate_process
 from tests._helpers.stdio_jsonrpc import read_json_line, write_json_line
@@ -1492,6 +1494,72 @@ def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) ->
     assert "image/png image omitted from history" in output
     assert "re-run the tool call" in output
     assert len(output) < 300
+
+
+@pytest.mark.parametrize(
+    ("output_bytes", "keeps_document"),
+    [(MAX_TOOL_OUTPUT_BYTES, True), (MAX_TOOL_OUTPUT_BYTES + 1, False)],
+    ids=["at_output_cap", "over_output_cap"],
+)
+def test_read_transcript_items_since_keeps_pdf_document_only_under_output_cap(
+    tmp_path: Path, output_bytes: int, keeps_document: bool
+) -> None:
+    """A PDF result that fits the stored-output cap is kept; a byte over becomes a placeholder."""
+    text_block = {"type": "text", "text": "PDF file read: report.pdf"}
+    source = {"type": "base64", "media_type": "application/pdf", "data": ""}
+    envelope = json.dumps(
+        [text_block, {"type": "document", "source": source}], separators=(",", ":")
+    )
+    document_block = {
+        "type": "document",
+        "source": {**source, "data": "A" * (output_bytes - len(envelope))},
+    }
+    transcript_path = tmp_path / "session.jsonl"
+    _write_transcript_jsonl(
+        transcript_path,
+        [
+            {
+                "type": "assistant",
+                "uuid": "assistant-tool-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_pdf",
+                            "name": "Read",
+                            "input": {"file_path": "report.pdf"},
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "tool-result-1",
+                "parentUuid": "assistant-tool-1",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_pdf",
+                            "content": [text_block, document_block],
+                            "is_error": False,
+                        }
+                    ],
+                },
+            },
+        ],
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    [output] = [item.data["output"] for item in items if item.item_type == "function_call_output"]
+    placeholder = {"type": "text", "text": document_omitted_placeholder("application/pdf")}
+    assert json.loads(output) == [text_block, document_block if keeps_document else placeholder]
+    assert cap_tool_output(output) == output
 
 
 def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Path) -> None:
