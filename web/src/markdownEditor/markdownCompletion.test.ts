@@ -13,8 +13,8 @@ import {
 
 /** The token at the caret, written as `|` in `text`. */
 function tokenIn(text: string) {
-  const caret = text.indexOf("|");
-  return completionTokenAt(text.replace("|", ""), caret);
+  const [before = "", ...after] = text.split("|");
+  return completionTokenAt(before + after.join("|"), before.length);
 }
 
 describe("completionTokenAt", () => {

@@ -22,10 +22,12 @@ afterEach(() => {
 
 /** Text with its selection written as `[` and `]`, or `|` for a caret. */
 function edit(withSelection: string): MarkdownEdit {
-  const caret = withSelection.indexOf("|");
+  const [before = "", ...after] = withSelection.split("|");
   // A caret case keeps its brackets as text, so task lists can be written.
-  if (caret !== -1)
-    return { value: withSelection.replace("|", ""), selectionStart: caret, selectionEnd: caret };
+  if (after.length > 0) {
+    const caret = before.length;
+    return { value: before + after.join("|"), selectionStart: caret, selectionEnd: caret };
+  }
   const value = withSelection.replace(/[[\]]/g, "");
   const start = withSelection.indexOf("[");
   return { value, selectionStart: start, selectionEnd: withSelection.indexOf("]") - 1 };
