@@ -32,6 +32,8 @@ import sqlalchemy as sa
 import zstandard
 from alembic import op
 
+from omnigent.db.dialects import is_sqlite_family
+
 revision: str = "z4a2b3c4d5e6"
 down_revision: str | None = "z3a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
@@ -61,7 +63,7 @@ def _alter_types(to_binary: bool) -> None:
     :param to_binary: ``True`` for ``TEXT`` → ``LargeBinary`` (upgrade),
         ``False`` for the reverse (downgrade).
     """
-    sqlite = op.get_bind().dialect.name == "sqlite"
+    sqlite = is_sqlite_family(op.get_bind())
     old_type = sa.Text() if to_binary else sa.LargeBinary()
     new_type = sa.LargeBinary() if to_binary else sa.Text()
     # PostgreSQL cannot implicitly cast between text and bytea, so spell the
@@ -112,7 +114,7 @@ def _decode(value: object) -> str:
 def downgrade() -> None:
     """Decompress every value, then restore the ``TEXT`` type."""
     bind = op.get_bind()
-    on_sqlite = bind.dialect.name == "sqlite"
+    on_sqlite = is_sqlite_family(bind)
     # Rewrite each value as raw UTF-8 plaintext (bytes on PostgreSQL/MySQL, str
     # on dynamically-typed SQLite) so the binary → text conversion sees valid
     # UTF-8. Untyped text() SQL bypasses the column's binary type processor.

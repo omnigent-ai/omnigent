@@ -34,6 +34,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import CompressedText
+from omnigent.db.dialects import is_sqlite_family
 from omnigent.db.envelope import EnvelopedJSON, EnvelopedText
 from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
@@ -658,7 +659,7 @@ def _on_sqlite_family(
     :returns: ``True`` for those two dialects.
     """
     del ddl, target, bind, tables, state, compiler, checkfirst
-    return dialect.name in ("sqlite", "cloudflare_d1")
+    return is_sqlite_family(dialect)
 
 
 # Largest stored ``memories.content`` and ``memories.description`` envelopes,

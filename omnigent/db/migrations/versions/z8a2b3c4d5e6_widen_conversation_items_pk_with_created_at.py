@@ -41,6 +41,8 @@ from collections.abc import Iterator, Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.dialects import is_sqlite_family
+
 revision: str = "z8a2b3c4d5e6"
 down_revision: str | None = "z7a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
@@ -79,7 +81,7 @@ def _quiet_pk_override() -> Iterator[None]:
 def _rebuild(pk: list[str], index: list[str]) -> None:
     """Install ``pk`` and the ``index`` shape of the unique position index."""
     dialect = op.get_bind().dialect.name
-    sqlite = dialect == "sqlite"
+    sqlite = is_sqlite_family(dialect)
 
     if dialect == "mysql":
         # MySQL PKs are unnamed; raw DDL folds the PK swap and the unique

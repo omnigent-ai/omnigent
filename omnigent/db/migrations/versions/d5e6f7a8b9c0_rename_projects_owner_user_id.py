@@ -58,6 +58,8 @@ from typing import Literal
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.dialects import is_sqlite_family
+
 revision: str = "d5e6f7a8b9c0"
 down_revision: str | None = "c4d5e6f7a8b9"
 branch_labels: str | Sequence[str] | None = None
@@ -65,7 +67,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def _is_sqlite() -> bool:
-    return op.get_bind().dialect.name == "sqlite"
+    return is_sqlite_family(op.get_bind())
 
 
 def upgrade() -> None:

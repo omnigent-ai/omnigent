@@ -17,6 +17,9 @@ URL (or your domain), and the container sleeps when idle.
 > The R2 artifact store, by contrast, already uses a first-class backend
 > (`S3ArtifactStore`) added alongside this directory.
 
+The shim preserves the `cloudflare_d1` dialect name. Schema rebuilds and data
+migrations recognize it as SQLite so upgrades do not execute PostgreSQL-only SQL.
+
 ## How it works
 
 ```

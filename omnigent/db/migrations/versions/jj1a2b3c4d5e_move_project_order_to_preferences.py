@@ -11,6 +11,8 @@ from alembic import op
 from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.sql import Executable
 
+from omnigent.db.dialects import is_cloudflare_d1, is_sqlite_family
+
 revision: str = "jj1a2b3c4d5e"
 down_revision: str | None = "ii1a2b3c4d5e"
 branch_labels: str | Sequence[str] | None = None
@@ -35,8 +37,10 @@ _PREFERENCES = sa.table(
 
 
 def _begin_sqlite_transaction(bind: sa.Connection) -> None:
-    if bind.dialect.name == "sqlite" and not getattr(
-        bind.connection.driver_connection, "in_transaction", False
+    if (
+        is_sqlite_family(bind)
+        and not is_cloudflare_d1(bind)
+        and not getattr(bind.connection.driver_connection, "in_transaction", False)
     ):
         # Legacy sqlite3 transaction control otherwise commits DDL and outermost savepoints.
         bind.exec_driver_sql("BEGIN")
@@ -52,6 +56,12 @@ def _publish_crdb_changes(bind: sa.Connection) -> None:
 def _copy_with_retries(
     bind: sa.Connection, statements: Sequence[Executable], *, operation: str
 ) -> None:
+    if is_cloudflare_d1(bind):
+        # D1 has no savepoints; abort before removing source data if a copy fails.
+        for statement in statements:
+            bind.execute(statement)
+        return
+
     is_crdb = bind.dialect.name == "cockroachdb"
     for attempt in range(3):
         try:

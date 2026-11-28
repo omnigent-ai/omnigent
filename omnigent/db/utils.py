@@ -34,6 +34,7 @@ from omnigent.db.cockroachdb import (
     _prepare_crdb_schema_transaction,
     _verify_crdb_read_committed,
 )
+from omnigent.db.dialects import is_sqlite_family
 from omnigent.db.metrics import record_transaction_retry
 from omnigent.db.query_context import query_name_scope
 from omnigent.entities import NewConversationItem
@@ -1451,14 +1452,9 @@ _CREATE_FTS = text(
     "item_id UNINDEXED, conversation_id UNINDEXED, search_text)"
 )
 
-# Dialects that support SQLite's FTS5 extension. Cloudflare D1 is SQLite
-# served over HTTP, so it gets full-text search too — gate FTS on the dialect
-# *family*, not the literal name "sqlite". (The engine-level WAL/PRAGMA path in
-# ``_create_engine`` stays sqlite-only: those are local-file concerns that D1
-# neither needs nor supports over the wire.)
-_FTS5_DIALECTS = frozenset({"sqlite", "cloudflare_d1"})
 
-
+# FTS5 is gated on the SQLite family so D1 gets search too. (The WAL/PRAGMA path
+# in ``_create_engine`` stays sqlite-only: D1 has no local file to tune.)
 def _supports_fts5(dialect_name: str) -> bool:
     """
     Whether *dialect_name* is a SQLite-family dialect that supports FTS5.
@@ -1468,7 +1464,7 @@ def _supports_fts5(dialect_name: str) -> bool:
     :returns: ``True`` for SQLite and SQLite-over-the-wire dialects (D1),
         ``False`` otherwise.
     """
-    return dialect_name in _FTS5_DIALECTS
+    return is_sqlite_family(dialect_name)
 
 
 def ensure_fts_table(engine: Engine) -> None:

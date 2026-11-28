@@ -112,6 +112,70 @@ def test_no_migration_uses_sqlite_unsafe_raw_ddl() -> None:
     )
 
 
+_SQLITE_FAMILY_NAMES = frozenset({"sqlite", "cloudflare_d1"})
+
+
+def _is_sqlite_family_literal(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return node.value in _SQLITE_FAMILY_NAMES
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return any(_is_sqlite_family_literal(element) for element in node.elts)
+    return False
+
+
+def _literal_dialect_checks(source: str) -> list[int]:
+    """Return line numbers that compare against or list a SQLite-family dialect name.
+
+    :param source: The full source text of one migration module.
+    :returns: Sorted line numbers of offending comparisons, ``match`` cases, or
+        collection literals such as ``("sqlite", "cloudflare_d1")``.
+    """
+    lines: set[int] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+            if any(_is_sqlite_family_literal(operand) for operand in operands):
+                lines.add(node.lineno)
+        elif isinstance(node, (ast.Tuple, ast.List, ast.Set, ast.MatchValue)):
+            target = node.value if isinstance(node, ast.MatchValue) else node
+            if _is_sqlite_family_literal(target):
+                lines.add(node.lineno)
+    return sorted(lines)
+
+
+def test_literal_dialect_check_detection() -> None:
+    """The guard flags each literal form and allows the shared helper."""
+    flagged = (
+        'a = bind.dialect.name == "sqlite"\n'
+        'b = name in ("sqlite", "cloudflare_d1")\n'
+        'C = frozenset({"sqlite"})\n'
+        'match name:\n    case "cloudflare_d1":\n        pass\n'
+    )
+    assert _literal_dialect_checks(flagged) == [1, 2, 3, 5]
+    allowed = 'a = is_sqlite_family(op.get_bind())\nt = sa.Text().with_variant(x, "sqlite")\n'
+    assert _literal_dialect_checks(allowed) == []
+
+
+def test_migrations_use_shared_sqlite_family_check() -> None:
+    """Migrations must branch on SQLite via ``omnigent.db.dialects``.
+
+    Cloudflare D1 runs SQLite under the ``cloudflare_d1`` dialect name, so a
+    literal ``== "sqlite"`` check sends D1 down the PostgreSQL/MySQL path and
+    fails the upgrade with PostgreSQL-only SQL. Use ``is_sqlite_family(bind)``
+    (or ``is_cloudflare_d1`` for D1-only behavior) instead.
+    """
+    offenders = {
+        path.name: lines
+        for path in sorted(_VERSIONS_DIR.glob("*.py"))
+        if (lines := _literal_dialect_checks(path.read_text()))
+    }
+    assert offenders == {}, (
+        "These migrations compare dialect names against SQLite literals; use "
+        "`is_sqlite_family` / `is_cloudflare_d1` from `omnigent.db.dialects` so "
+        f"Cloudflare D1 takes the SQLite path. Offenders: {offenders}"
+    )
+
+
 def test_full_migration_chain_round_trips_on_sqlite() -> None:
     """Upgrade to head, downgrade to base, and re-upgrade on a fresh SQLite DB.
 

@@ -30,6 +30,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.dialects import is_sqlite_family
+
 revision: str = "v1a2b3c4d5e6"
 down_revision: str | None = "u1a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
@@ -98,7 +100,7 @@ def upgrade() -> None:
     """Promote host_id to PK; demote owner+name; swap unique constraints."""
     dialect = _dialect()
 
-    if dialect == "sqlite":
+    if is_sqlite_family(dialect):
         op.execute(sa.text("PRAGMA foreign_keys = OFF"))
         with op.batch_alter_table("hosts", copy_from=_UPGRADED_TABLE, recreate="always"):
             pass
@@ -122,7 +124,7 @@ def downgrade() -> None:
     """Restore (workspace_id, owner, name) PK; restore uq_hosts_host_id."""
     dialect = _dialect()
 
-    if dialect == "sqlite":
+    if is_sqlite_family(dialect):
         op.execute(sa.text("PRAGMA foreign_keys = OFF"))
         with op.batch_alter_table("hosts", copy_from=_DOWNGRADED_TABLE, recreate="always"):
             pass

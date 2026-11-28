@@ -30,19 +30,19 @@ import sqlalchemy as sa
 from alembic import op
 
 from omnigent.db.db_models import Uuid16
+from omnigent.db.dialects import is_sqlite_family
 
 revision: str = "a8be64286ffc"
 down_revision: str | None = "a7d4c2e9f610"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 # Dialects that store a value of any type in any column, and ignore VARCHAR lengths.
-_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
 
 
 def upgrade() -> None:
     """Create the ``scheduled_task_shares`` table."""
     constraints: list[sa.CheckConstraint] = []
-    if op.get_bind().dialect.name in _SQLITE_FAMILY:
+    if is_sqlite_family(op.get_bind()):
         constraints = [
             # 128 characters at up to four bytes each.
             sa.CheckConstraint(
