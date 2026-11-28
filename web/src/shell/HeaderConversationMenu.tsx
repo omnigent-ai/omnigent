@@ -85,7 +85,6 @@ import { leaveSessionView } from "./sessionCommands/archiveNavigation";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { cn } from "@/lib/utils";
-import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
 import { MobileHeaderButton } from "./MobileHeaderButton";
 import { RenameSessionDialog } from "./RenameSessionDialog";
@@ -553,12 +552,9 @@ export function HeaderConversationMenu({
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isMobile ? "end" : "start"}
+          mobileSurface="solid"
           collisionPadding={isMobile ? 16 : undefined}
-          className={cn(
-            "min-w-56",
-            MOBILE_GLASS_SURFACE,
-            isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
-          )}
+          className={cn("min-w-56", isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]")}
         >
           {isMobile && !projectPickerOpen && (
             <SessionMenuHeader title={label} workingDirectory={workingDirectory} />

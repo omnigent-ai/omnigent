@@ -2,7 +2,7 @@ import GlassSurface from "@/components/ui/glass-surface/GlassSurface";
 import { cn } from "@/lib/utils";
 
 interface OmniGlassSurfaceProps {
-  variant?: "default" | "menu" | "composer";
+  variant?: "default" | "menu" | "drawer" | "composer";
   width?: number | string;
   height?: number | string;
   borderRadius?: number;
@@ -12,16 +12,20 @@ interface OmniGlassSurfaceProps {
 const GLASS_VARIANTS = {
   default: {
     blur: 8,
-    background: "hsl(0 0% 100% / 0%)",
+    tintOpacity: "88%",
   },
   menu: {
     blur: 32,
-    background: "hsl(0 0% 100% / 0%)",
+    tintOpacity: "94%",
+  },
+  drawer: {
+    blur: 32,
+    tintOpacity: "94%",
   },
   // Typed text needs a near-opaque palette backing over light or dark transcript content.
   composer: {
     blur: 8,
-    background: "color-mix(in srgb, var(--card-solid) 94%, transparent)",
+    tintOpacity: "94%",
   },
 };
 
@@ -39,7 +43,7 @@ export function OmniGlassSurface({
     <span
       aria-hidden="true"
       className={cn(
-        "pointer-events-none absolute inset-0 [color-scheme:light] dark:[color-scheme:dark]",
+        "omni-glass-layer pointer-events-none absolute inset-0 [color-scheme:light] dark:[color-scheme:dark]",
         className,
       )}
     >
@@ -55,7 +59,7 @@ export function OmniGlassSurface({
         opacity={0.45}
         className="omni-glass-surface border border-black/[0.08] dark:border-0 [&>.glass-surface\_\_sheen]:opacity-0 dark:[&>.glass-surface\_\_rim]:opacity-25 dark:[&>.glass-surface\_\_rim]:p-px!"
         style={{
-          background: `var(--omni-glass-background, ${surface.background})`,
+          background: `var(--omni-glass-background, color-mix(in srgb, var(--card-solid) ${surface.tintOpacity}, transparent))`,
           WebkitBackdropFilter: backdropFilter,
           backdropFilter,
           boxShadow: [
