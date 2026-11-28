@@ -5,6 +5,7 @@ import base64
 import json
 import mimetypes
 import re
+import subprocess
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -189,6 +190,11 @@ async def execute_ticket_tool(
                 },
                 ensure_ascii=False,
             )
+        if name == "sys_project_deploy_status":
+            status = await request("GET", f"/v1/projects/{project_id}/tickets/deploy-status")
+            if status.get("landing") == "unavailable":
+                status = await asyncio.to_thread(_deploy_status_here, status)
+            return json.dumps(status, ensure_ascii=False)
         if name == "sys_project_artifact_list":
             params = dict(body, **({"ticket_id": ticket_id} if ticket_id else {}))
             result = await request("GET", f"/v1/projects/{project_id}/files", params=params)
@@ -306,7 +312,6 @@ async def execute_ticket_tool(
                 "sys_ticket_comment": ("POST", "/comments"),
                 "sys_ticket_land": ("POST", "/land"),
                 "sys_ticket_push_prefix": ("GET", "/push-prefix"),
-                "sys_project_deploy_status": ("GET", "/deploy-status"),
                 "sys_ticket_revert_draft": ("POST", "/revert-draft"),
                 "sys_ticket_import_pr": ("POST", "/import-pr"),
                 "sys_session_link_ticket": ("POST", "/sessions"),
@@ -485,6 +490,36 @@ async def _update_identity(body: dict[str, Any], project_id: str, request: Any) 
         {"identity": {key: updated.get(key) for key in ("id", "name", "instructions", "scope")}},
         ensure_ascii=False,
     )
+
+
+def _deploy_status_here(status: dict[str, Any]) -> dict[str, Any]:
+    """Classify the server's ticket commits against the landing checkout beside this runner.
+
+    The server can't read the checkout when it's deployed elsewhere; the runner can, if it
+    runs from (or is pointed at) the integration checkout.
+    """
+    from omnigent.server.project_deploy_status import classify
+    from omnigent.server.project_landing import GitError, _default_checkout
+
+    checkout = _default_checkout()
+    try:
+        computed = classify(
+            checkout, status["branch"], status.get("running_commit"), status["candidates"]
+        )
+    except (GitError, OSError, subprocess.SubprocessError) as exc:
+        return {
+            "landing": "unavailable",
+            "reason": f"{status.get('reason')} The runner couldn't read `{checkout}` "
+            f"either: {exc}",
+            "running_commit": status.get("running_commit"),
+        }
+    result: dict[str, Any] = {"landing": "read_by_runner", "checkout": str(checkout), **computed}
+    if computed["running_commit"] is None:
+        result["note"] = (
+            "The server doesn't report which commit it runs, so what's deployed is unknown. "
+            "Set OMNIGENT_BUILD_COMMIT when deploying it."
+        )
+    return result
 
 
 async def _open_identity_session(

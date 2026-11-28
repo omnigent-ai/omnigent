@@ -138,3 +138,45 @@ def test_deploy_status_counts_what_waits_for_a_restart_and_landing_drift(repo) -
     assert status["merged_not_deployed"] == 1
     assert [item["ticket_id"] for item in status["not_deployed"]] == ["merged-later", "landed"]
     assert [item["ticket_id"] for item in status["landing_drift"]] == ["drift"]
+
+
+def test_a_server_apart_from_the_checkout_hands_the_comparison_to_the_runner(
+    repo, tmp_path, monkeypatch
+) -> None:
+    """An app server can't read the landing checkout; the runner beside it can."""
+    from types import SimpleNamespace
+
+    from omnigent.runner.project_tickets import _deploy_status_here
+    from omnigent.server.project_deploy_status import deploy_status
+
+    live = git(repo, "rev-parse", "HEAD")
+    merged_later = commit(repo, "merged after the server started")
+    elsewhere = tmp_path / "app"
+    elsewhere.mkdir()
+    board = _Board(
+        [
+            {"id": "live", "title": "live", "stage_id": "merged", **ticket(live)},
+            {"id": "later", "title": "later", "stage_id": "merged", **ticket(merged_later)},
+        ]
+    )
+    project = SimpleNamespace(id="p", config={"landing": {"checkout": str(elsewhere)}})
+    monkeypatch.setenv("OMNIGENT_BUILD_COMMIT", live)
+    running._reset_for_tests()
+
+    status = deploy_status(project, board, None)
+    assert status["landing"] == "unavailable"
+    assert "land by hand from the host" in status["reason"]
+    assert status["running_commit"] == live
+    assert {row["ticket_id"] for row in status["candidates"]} == {"live", "later"}
+
+    # The runner reads its own checkout (here the repo, via the landing env).
+    here = _deploy_status_here(status)
+    assert here["landing"] == "read_by_runner"
+    assert here["merged_not_deployed"] == 1
+    assert [row["ticket_id"] for row in here["not_deployed"]] == ["later"]
+
+    monkeypatch.delenv("OMNIGENT_BUILD_COMMIT")
+    running._reset_for_tests()
+    monkeypatch.setattr(running, "_CODE_DIR", elsewhere)
+    unknown = _deploy_status_here({**status, "running_commit": None})
+    assert "OMNIGENT_BUILD_COMMIT" in unknown["note"]

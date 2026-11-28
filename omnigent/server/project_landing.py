@@ -396,7 +396,12 @@ def resolve_target(config: dict[str, Any]) -> Target:
     except (GitError, OSError, subprocess.SubprocessError):
         same_repo = False
     if not same_repo:
-        raise refuse("The landing checkout must be a worktree of the server's repository")
+        raise refuse(
+            f"The landing checkout `{checkout}` isn't a worktree of this server's repository "
+            f"(`{default}`). A server deployed apart from that checkout, such as an app, can't "
+            "land or read it: land by hand from the host with the checkout, or set "
+            "`landing.checkout` to a worktree of the server's own code."
+        )
     return Target(checkout=checkout, branch=branch, restart=raw.get("restart", True) is not False)
 
 
