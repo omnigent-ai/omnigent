@@ -261,8 +261,8 @@ def configure_ucode_for_sandbox(
     ``omnigent host``'s dial-back path, where a synchronous multi-second run would
     delay the runner connect; the harness launch falls back to its own hand-built
     gateway config until ``state.json`` exists, so the eventual-consistency window
-    is safe. Best-effort: when ucode isn't available (a non-managed image) it
-    no-ops rather than raising.
+    is safe. Best-effort: when the configure command can't be found it logs a
+    warning and returns rather than raising.
 
     Shared by both managed-sandbox callers: the OSS connect flow (this runs it
     from ``omnigent host`` boot with the broker command in ``extra_env``) and the
@@ -273,8 +273,14 @@ def configure_ucode_for_sandbox(
     """
     try:
         ucode_command = find_ucode_command()
-    except click.ClickException:
-        return  # neither uvx nor ucode present → not a managed-sandbox image
+    except click.ClickException as exc:
+        _logger.warning(
+            "Sandbox configure skipped (profile=%s); harnesses will use the built-in "
+            "gateway fallback: %s",
+            profile,
+            exc.format_message(),
+        )
+        return
     argv = build_ucode_configure_command_for_profile(
         ucode_command, profile=profile, agents=agents, use_pat=use_pat
     )
