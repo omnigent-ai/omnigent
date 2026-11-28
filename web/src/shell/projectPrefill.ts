@@ -49,6 +49,8 @@ export function projectRepository(value: unknown): ProjectRepository | undefined
 export interface ProjectPrefillConfig {
   hostId?: string;
   workspace?: string;
+  /** Repositories a sandbox default clones (`<url>[#<branch>]` each). */
+  sandboxWorkspaces?: string[];
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
   useWorktree?: boolean;
@@ -149,6 +151,8 @@ interface ProjectPrefillWrites {
   sandboxProvider?: string;
   /** Repositories the sandbox clones, from the project's saved repository. */
   sandboxRepos?: LastSandboxRepo[];
+  /** Repositories the selected sandbox clones; only written with `selectSandbox`. */
+  sandboxWorkspaces?: string[];
 }
 
 /**
@@ -228,7 +232,10 @@ function locationStep(
     if (inputs.managedSandboxesEnabled && !inputs.sandboxSelected && selectedHostId === null) {
       writes.selectSandbox = true;
       if (config.sandboxProvider !== undefined) writes.sandboxProvider = config.sandboxProvider;
-      if (config.repository !== undefined) {
+      // Repositories saved in project settings win over the one it was created with.
+      if (config.sandboxWorkspaces !== undefined && config.sandboxWorkspaces.length > 0) {
+        writes.sandboxWorkspaces = config.sandboxWorkspaces;
+      } else if (config.repository !== undefined) {
         writes.sandboxRepos = [
           { url: config.repository.url, branch: config.repository.branch ?? "" },
         ];

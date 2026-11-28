@@ -155,6 +155,7 @@ import {
   isValidSandboxBranch,
   isValidSandboxRepoUrl,
   isValidSandboxWorkspaceLength,
+  splitSandboxWorkspace,
 } from "@/lib/sandboxRepositories";
 
 export {
@@ -2508,6 +2509,10 @@ function NewChatLandingContent({
       ? {
           hostId: c.host_id,
           workspace: c.workspace,
+          // Stored config is untyped JSON, so keep only string entries.
+          sandboxWorkspaces: Array.isArray(c.sandbox_workspaces)
+            ? c.sandbox_workspaces.filter((w): w is string => typeof w === "string")
+            : undefined,
           agentId: c.agent_id,
           useWorktree: c.use_worktree,
           model: c.model,
@@ -2963,6 +2968,7 @@ function NewChatLandingContent({
   const [sandboxRepoSelections, setSandboxRepoSelections] = useState<LastSandboxRepo[]>(
     () => restoredDraft?.sandboxRepoSelections ?? readLastSandboxRepos(),
   );
+  const draftHasSandboxRepos = (restoredDraft?.sandboxRepoSelections?.length ?? 0) > 0;
   // Whether the launch provider clones several repos (server-declared per
   // provider via /v1/info). A single-repo provider caps the picker at one, so
   // it reads as a plain single-repo picker and never offers a multi-repo menu.
@@ -5354,6 +5360,11 @@ function NewChatLandingContent({
     if (writes.sandboxRepos !== undefined) {
       setSandboxRepoSelections(writes.sandboxRepos);
     }
+    // The project's repositories replace the app-global last-used ones, but not
+    // repositories restored from this visit's draft, which are the user's picks.
+    if (writes.sandboxWorkspaces !== undefined && !draftHasSandboxRepos) {
+      setSandboxRepoSelections(writes.sandboxWorkspaces.map((w) => splitSandboxWorkspace(w)));
+    }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
@@ -5395,6 +5406,7 @@ function NewChatLandingContent({
     projectLaunch,
     defaultSandboxProvider,
     sandboxProviderRows,
+    draftHasSandboxRepos,
   ]);
 
   // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.
