@@ -41,6 +41,7 @@ from omnigent.inner.os_env import (
     _read_impl,
     _write_impl,
 )
+from omnigent.inner.os_env_upload import STAGING_SUFFIX_PATTERN, is_upload_staging
 from omnigent.inner.sandbox import (
     ReachableRoot,
     contained_realpath,
@@ -370,6 +371,8 @@ def search_indexed_paths(
             root, rel, listed_directory=candidates[rel], describe_link=describe_link
         )
         if entry is None:
+            continue
+        if entry.type == "file" and is_upload_staging(rel):
             continue
         entries.append(entry)
         if len(entries) >= limit:
@@ -919,7 +922,7 @@ class CallerProcessFilesystem:
         # stdout cap, even when names are unusually long or need JSON escaping.
         _script = "\n".join(
             [
-                "import os, json",
+                "import os, json, re",
                 f"d = {_json.dumps(target)}",
                 f"prefix = {_json.dumps(prefix)}",
                 f"after = {after!r}",
@@ -930,7 +933,10 @@ class CallerProcessFilesystem:
                 "def utf8(n):",
                 "    try: return n.encode('utf-8') is not None",
                 "    except UnicodeEncodeError: return False",
-                "names = sorted((n for n in os.listdir(d) if utf8(n)), reverse=order == 'desc')",
+                f"stage_pattern = re.compile({STAGING_SUFFIX_PATTERN!r})",
+                "names = sorted((n for n in os.listdir(d) if utf8(n) and not",
+                "    (stage_pattern.search(n) and not os.path.isdir(os.path.join(d, n)))),",
+                "    reverse=order == 'desc')",
                 "def cursor_index(cursor):",
                 "    if cursor is None: return None",
                 "    if prefix:",
@@ -1082,6 +1088,7 @@ class CallerProcessFilesystem:
                 f"start = {_json.dumps(start)}",
                 f"budget = {_SEARCH_SCAN_BUDGET}",
                 f"depri = set({_json.dumps(list(_DEFAULT_DEPRIORITIZED_DIRS))})",
+                f"stage_pattern = re.compile({STAGING_SUFFIX_PATTERN!r})",
                 f"inc = [re.compile(p, re.IGNORECASE) for p in {_json.dumps(include_regexes)}]",
                 f"exc = [re.compile(p, re.IGNORECASE) for p in {_json.dumps(exclude_regexes)}]",
             ]
@@ -1121,6 +1128,8 @@ def match(dirpath, name, is_dir):
     # re-checking keeps the two entry kinds symmetric so a future refactor of
     # that pre-filter can't silently leak excluded dirs.
     p = rel(dirpath, name)
+    if not is_dir and stage_pattern.search(name):
+        return
     if exc and any(r.match(p) for r in exc):
         return
     if inc and not any(r.match(p) for r in inc):
