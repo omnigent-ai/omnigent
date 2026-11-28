@@ -3,7 +3,7 @@
 
 import { useSyncExternalStore } from "react";
 
-import { type CodeHostPullRequest, parseCodeHostPullRequestUrl } from "@/lib/codeHosts";
+import type { CodeHostPullRequest } from "@/lib/codeHosts";
 import { PullRequestWriteError } from "@/lib/pullRequestWriteAnswers";
 import { draftOwner, useWorkspaceDraftOwner } from "@/lib/workspaceDraftOwner";
 
@@ -198,10 +198,9 @@ const unconfirmedQueueListeners = new Set<() => void>();
 let unconfirmedQueueVersion = 0;
 let unconfirmedQueueRevision = 0;
 
-/** The PR as main tells it apart, so any spelling of its URL shares one hold. */
+/** The PR as main tells it apart, on any host, so any spelling of its URL shares one hold. */
 function unconfirmedQueueKey(owner: string, prUrl: string): string {
-  const target = parseCodeHostPullRequestUrl(prUrl);
-  return `${owner}\n${target ? pullRequestWriteKey(target) : prUrl.toLowerCase()}`;
+  return `${owner}\n${pullRequestIdentity(prUrl)}`;
 }
 
 function unconfirmedQueueChanged(): void {
@@ -352,7 +351,7 @@ export function unconfirmedStateChangesChanged(): void {
 const PULL_REQUEST_PATH = /^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/;
 
 /** A PR's identity from its link alone, whichever route reads it now, or null. */
-function pullRequestUrlKey(url: string): string | null {
+export function pullRequestUrlKey(url: string): string | null {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -405,22 +404,17 @@ export const UNCONFIRMED_STATE_CHANGE_MESSAGE =
 
 // Pull requests whose state is about to change: a close or reopen is posting its comment
 // first, so merging, auto-merge, the queue and other closes wait for it as if it were sent.
-const heldStateChanges = new Map<
-  number,
-  Pick<CodeHostPullRequest, "host" | "repository" | "number">
->();
+const heldStateChanges = new Map<number, string>();
 let lastStateChangeHold = 0;
 
 /**
- * Hold the PR's state changes as in flight until the returned release runs. The release is
- * called once, right before the held change itself is sent, in the same task.
+ * Hold the PR at `prUrl`'s state changes as in flight until the returned release runs. The
+ * release is called once, right before the held change itself is sent, in the same task.
  */
-export function holdPullRequestStateChanges(
-  target: Pick<CodeHostPullRequest, "host" | "repository" | "number">,
-): () => void {
+export function holdPullRequestStateChanges(prUrl: string): () => void {
   lastStateChangeHold += 1;
   const id = lastStateChangeHold;
-  heldStateChanges.set(id, target);
+  heldStateChanges.set(id, pullRequestIdentity(prUrl));
   holdsChanged();
   return () => {
     if (heldStateChanges.delete(id)) holdsChanged();
@@ -455,12 +449,11 @@ export async function sendStateChange<Result>(
   if (unconfirmedStateChangeHolds(prUrl, operation)) {
     throw new PullRequestWriteError("unconfirmed", UNCONFIRMED_STATE_CHANGE_MESSAGE);
   }
-  const target = parseCodeHostPullRequestUrl(prUrl);
-  if (!target || writeGroup(operation) !== "merge") return send();
-  if (pullRequestStateChangesHeld(target)) {
+  if (!pullRequestUrlKey(prUrl) || writeGroup(operation) !== "merge") return send();
+  if (pullRequestStateChangesHeld(prUrl)) {
     throw new PullRequestWriteError("busy", CHANGE_IN_PROGRESS_MESSAGE);
   }
-  const release = holdPullRequestStateChanges(target);
+  const release = holdPullRequestStateChanges(prUrl);
   try {
     return await send();
   } finally {
@@ -468,13 +461,12 @@ export async function sendStateChange<Result>(
   }
 }
 
-/** Whether a merge, auto-merge, queue or state change to `target` waits for a held or unconfirmed one. */
-export function pullRequestStateChangesHeld(
-  target: Pick<CodeHostPullRequest, "host" | "repository" | "number">,
-): boolean {
-  const key = pullRequestWriteKey(target);
+/** Whether a merge, auto-merge, queue or state change to `prUrl` waits for a held or unconfirmed one. */
+export function pullRequestStateChangesHeld(prUrl: string): boolean {
+  const key = pullRequestUrlKey(prUrl);
+  if (key === null) return false;
   for (const held of heldStateChanges.values()) {
-    if (pullRequestWriteKey(held) === key) return true;
+    if (held === key) return true;
   }
   return unconfirmedFor(key);
 }

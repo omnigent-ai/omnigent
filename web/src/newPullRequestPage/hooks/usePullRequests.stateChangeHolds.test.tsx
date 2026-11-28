@@ -57,7 +57,9 @@ import {
 import { useMergePullRequest, usePullRequestLifecycleChange } from "./usePullRequests";
 
 const PR = "https://github.com/acme/app/pull/42";
+const ENTERPRISE_PR = "https://ghe.example.com/acme/app/pull/42";
 const SESSION = "conv_1";
+const OTHER_SESSION = "conv_2";
 
 function renderHooks() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -69,6 +71,7 @@ function renderHooks() {
       merge: useMergePullRequest(SESSION),
       close: usePullRequestLifecycleChange(SESSION, "pull_request_close"),
       send: useStateChangeSend(SESSION),
+      closeFromOtherSession: usePullRequestLifecycleChange(OTHER_SESSION, "pull_request_close"),
     }),
     { wrapper },
   );
@@ -83,38 +86,42 @@ afterEach(() => {
 });
 
 describe("state changes to one pull request", () => {
-  it("refuses a close as busy while a merge is being sent, and sends it once the merge settles", async () => {
-    const { result } = renderHooks();
-    act(() =>
-      result.current.merge.mutate({ prUrl: PR, mergeMethod: "squash", expectedHead: "abc" }),
-    );
-    await vi.waitFor(() =>
-      expect(rpc.sent.map((sent) => sent.method)).toEqual(["mergePullRequest"]),
-    );
+  it.each([
+    ["github.com", PR],
+    ["a GitHub Enterprise host", ENTERPRISE_PR],
+  ])(
+    "refuses a close from another session as busy while a merge on %s is being sent, and sends it once the merge settles",
+    async (_host, prUrl) => {
+      const { result } = renderHooks();
+      act(() => result.current.merge.mutate({ prUrl, mergeMethod: "squash", expectedHead: "abc" }));
+      await vi.waitFor(() =>
+        expect(rpc.sent.map((sent) => sent.method)).toEqual(["mergePullRequest"]),
+      );
 
-    let busy: unknown;
-    await act(async () => {
-      busy = await result.current.close.change(PR);
-    });
-    expect(busy).toMatchObject({ kind: "refused", code: "busy" });
-    expect(rpc.sent).toHaveLength(1);
+      let busy: unknown;
+      await act(async () => {
+        busy = await result.current.closeFromOtherSession.change(prUrl);
+      });
+      expect(busy).toMatchObject({ kind: "refused", code: "busy" });
+      expect(rpc.sent).toHaveLength(1);
 
-    await act(async () => rpc.sent[0]!.resolve({ pr_url: PR }));
-    let closed: Promise<unknown> | undefined;
-    act(() => {
-      closed = result.current.close.change(PR);
-    });
-    await vi.waitFor(() =>
-      expect(rpc.sent.map((sent) => sent.method)).toEqual([
-        "mergePullRequest",
-        "setPullRequestState",
-      ]),
-    );
-    await act(async () =>
-      rpc.sent[1]!.resolve({ object: "session.github.pr_state", pr_url: PR, state: "CLOSED" }),
-    );
-    expect(await closed).toBeDefined();
-  });
+      await act(async () => rpc.sent[0]!.resolve({ pr_url: prUrl }));
+      let closed: Promise<unknown> | undefined;
+      act(() => {
+        closed = result.current.closeFromOtherSession.change(prUrl);
+      });
+      await vi.waitFor(() =>
+        expect(rpc.sent.map((sent) => sent.method)).toEqual([
+          "mergePullRequest",
+          "setPullRequestState",
+        ]),
+      );
+      await act(async () =>
+        rpc.sent[1]!.resolve({ object: "session.github.pr_state", pr_url: prUrl, state: "CLOSED" }),
+      );
+      expect(await closed).toBeDefined();
+    },
+  );
 
   it("holds the PR after a lost merge answer, until a fresh read shows where it stands", async () => {
     const { result, client } = renderHooks();

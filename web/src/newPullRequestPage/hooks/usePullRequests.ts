@@ -104,6 +104,7 @@ import {
   type CommentChangeOperation,
   CHANGE_IN_PROGRESS_MESSAGE,
   pullRequestStateChangesHeld,
+  pullRequestUrlKey,
   writeGroup,
   type CommentReactionWriteOperation,
   type ThreadResolutionWriteOperation,
@@ -3226,9 +3227,9 @@ function useHostMutation<Change extends { prUrl: string }, Result>(options: {
         return;
       }
       // One state change per PR at a time: a merge or a close still going makes this wait.
-      const target = parseCodeHostPullRequestUrl(change.prUrl);
-      const stateChange = !!target && writeGroup(operation) === "merge";
-      if (target && stateChange && pullRequestStateChangesHeld(target)) {
+      const stateChange =
+        writeGroup(operation) === "merge" && pullRequestUrlKey(change.prUrl) !== null;
+      if (stateChange && pullRequestStateChangesHeld(change.prUrl)) {
         callbacks.onError?.(new PullRequestWriteError("busy", CHANGE_IN_PROGRESS_MESSAGE), change);
         return;
       }
@@ -3241,7 +3242,7 @@ function useHostMutation<Change extends { prUrl: string }, Result>(options: {
       }
       setLastPath("host");
       // Held while it's sent, so the PR's other state changes wait for its answer.
-      const release = target && stateChange ? holdPullRequestStateChanges(target) : undefined;
+      const release = stateChange ? holdPullRequestStateChanges(change.prUrl) : undefined;
       hostMutation.mutate({ ...change, callbacks, release });
     },
   };

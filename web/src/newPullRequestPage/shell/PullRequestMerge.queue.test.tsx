@@ -46,15 +46,16 @@ import { mergeQueueKey } from "@/newPullRequestPage/hooks/useMergeQueue";
 import { PullRequestMerge } from "./PullRequestMerge";
 
 const PR_URL = "https://github.com/acme/app/pull/7";
+const ENTERPRISE_PR_URL = "https://ghe.example.com/acme/app/pull/7";
 const HEAD = "a".repeat(40);
 const QUEUE_METHODS = ["getMergeQueue", "enqueuePullRequest", "dequeuePullRequest"];
 
-function pullRequest(): PullRequest {
+function pullRequest(url: string = PR_URL): PullRequest {
   return {
     number: 7,
     title: "Ship the widget",
     state: "OPEN",
-    url: PR_URL,
+    url,
     is_draft: false,
     author: "dev",
     base_ref: "main",
@@ -104,11 +105,11 @@ async function sent(): Promise<[string, unknown][]> {
   return requests;
 }
 
-function renderMerge() {
+function renderMerge(prUrl: string = PR_URL) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
-      <PullRequestMerge conversationId="conv_1" prUrl={PR_URL} pr={pullRequest()} />
+      <PullRequestMerge conversationId="conv_1" prUrl={prUrl} pr={pullRequest(prUrl)} />
     </QueryClientProvider>,
   );
   return client;
@@ -176,22 +177,24 @@ describe("a base that merges through a queue, where the host serves it", () => {
     );
   });
 
-  it("sends nothing while another state change to the PR, such as a close, is in flight", async () => {
-    host.served = new Set(["getMergeOptions", ...QUEUE_METHODS]);
-    answerReads(queueAnswer());
-    const release = holdPullRequestStateChanges({
-      host: "github.com",
-      repository: "acme/app",
-      number: 7,
-    });
-    renderMerge();
-    const dialog = await addAndConfirm();
-    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-      "This pull request is already being changed. Wait for it to finish.",
-    );
-    expect(host.write).not.toHaveBeenCalled();
-    release();
-  });
+  it.each([
+    ["github.com", PR_URL],
+    ["a GitHub Enterprise host", ENTERPRISE_PR_URL],
+  ])(
+    "sends nothing while another state change to the PR on %s, such as a close, is in flight",
+    async (_host, prUrl) => {
+      host.served = new Set(["getMergeOptions", ...QUEUE_METHODS]);
+      answerReads(queueAnswer({ pr_url: prUrl }));
+      const release = holdPullRequestStateChanges(prUrl);
+      renderMerge(prUrl);
+      const dialog = await addAndConfirm();
+      expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+        "This pull request is already being changed. Wait for it to finish.",
+      );
+      expect(host.write).not.toHaveBeenCalled();
+      release();
+    },
+  );
 
   it("removes a queued PR from the queue", async () => {
     host.served = new Set(["getMergeOptions", ...QUEUE_METHODS]);
