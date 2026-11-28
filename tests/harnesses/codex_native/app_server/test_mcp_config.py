@@ -202,6 +202,54 @@ async def test_cold_start_refreshes_mcps_across_profile_changes(
         )
 
 
+@pytest.mark.parametrize("version", [(0, 133, 0), (0, 154, 0)])
+@pytest.mark.parametrize("remote_profile", [False, True], ids=["http-to-stdio", "stdio-to-http"])
+async def test_profile_switches_mcp_transport_without_inheriting_endpoint_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int, int],
+    remote_profile: bool,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    local = {"command": "local-tool", "args": ["serve"], "env": {"TOKEN": "local"}}
+    remote = {
+        "url": "https://example.test/mcp",
+        "http_headers": {"Authorization": "remote"},
+        "bearer_token_env_var": "REMOTE_TOKEN",
+    }
+    base, selected = (local, remote) if remote_profile else (remote, local)
+    shared = {"required": True, "enabled_tools": ["read"], "tool_timeout_sec": 45}
+    original = tomlkit.dumps({"mcp_servers": {"fixture": {**base, **shared}}})
+    overlay = {"mcp_servers": {"fixture": selected}}
+    if version < (0, 134, 0):
+        original = tomlkit.dumps(
+            {"mcp_servers": {"fixture": {**base, **shared}}, "profiles": {"work": overlay}}
+        )
+    (source / "config.toml").write_text(original)
+    (source / "work.config.toml").write_text(tomlkit.dumps(overlay))
+    materialized = tmp_path / "materialized"
+    materialized.mkdir()
+    (materialized / "config.toml").write_text(original)
+    private = tmp_path / "private"
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=version))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+    for profile, expected in (("work", selected), (None, base), ("work", selected)):
+        launch_args.materialize_codex_config_profile(
+            materialized, source, profile, codex_version=version
+        )
+        config = tomllib.loads((materialized / "config.toml").read_text())
+        assert config["mcp_servers"]["fixture"] == {**expected, **shared}
+        server.config_profile = profile
+        await server.start()
+        await server.close()
+        config = tomllib.loads((private / "config.toml").read_text())
+        assert config["mcp_servers"]["fixture"] == {**expected, **shared}
+    assert (source / "config.toml").read_text() == original
+
+
 @pytest.mark.parametrize(
     ("invalid", "profile", "diagnostic"),
     [
