@@ -6,6 +6,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import type { PullRequestActionOrigin } from "@/lib/pullRequestActionOrigin";
 import type { PullRequest } from "@/newPullRequestPage/hooks/usePullRequests";
 import { approvalHeld } from "@/pullRequestReviews/approveEligibility";
+import { hostPendingIdentity, hostPendingRoute } from "@/pullRequestReviews/hostPendingRoute";
 import { hostReviewRoute } from "@/pullRequestReviews/hostReviews";
 import { reviewSubmitKey, unsettledReviewEntry } from "@/pullRequestReviews/reviewSubmit";
 import { sendReviewOnHost } from "@/pullRequestReviews/sendReview";
@@ -38,9 +39,14 @@ export function approveRowOnHost(options: {
 }): boolean {
   const route = hostReviewRoute(options.conversationId, options.prUrl, options.login);
   if (!route) return false;
-  // A review being written, sent or left unconfirmed goes first: the Review menu says why.
-  const held = unsettledReviewEntry(options.owner, options.prUrl, options.login);
-  if (approvalHeld(held, "no-comment")) return false;
+  // A review being written, sent or left unconfirmed goes first: the Review menu says why. A
+  // pending review's submit is kept under the session host's identity, not the account's login.
+  const pending = hostPendingRoute(options.conversationId, options.prUrl);
+  const logins = [options.login, ...(pending ? [hostPendingIdentity(pending)] : [])];
+  const held = logins.some((login) =>
+    approvalHeld(unsettledReviewEntry(options.owner, options.prUrl, login), "no-comment"),
+  );
+  if (held) return false;
   return sendReviewOnHost({
     key: reviewSubmitKey(options.owner, options.prUrl, options.login),
     route,

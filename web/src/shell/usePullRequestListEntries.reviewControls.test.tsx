@@ -18,6 +18,7 @@ import { resetControlRequestsForTests, waitingControlFor } from "@/pullRequestPa
 import { PullRequestRowDestinationContext } from "@/pullRequestPage/pullRequestDestination";
 import { draftOwner } from "@/lib/workspaceDraftOwner";
 import {
+  pendingSubmitKey,
   readReviewSubmit,
   resetReviewSubmitForTests,
   reviewSubmitKey,
@@ -320,6 +321,41 @@ describe("a row's Approve", () => {
     expect(readReviewSubmit(key).status).toBe(held);
     expect(onSelect).toHaveBeenCalledWith(PR, "here");
     expect(waitingControlFor("page-detail", PR)).toBe("review");
+  });
+
+  it("sends nothing after a pending review's Request Changes lost its answer, and opens the Review menu", () => {
+    host.served = new Set(["submitReview", "submitReviewVerdict", "getPendingReview"]);
+    // Finish keeps a pending review's submit under the session host's identity.
+    const key = pendingSubmitKey(
+      draftOwner(),
+      GITHUB_PR,
+      { login: `host:${SCOPE}@route-1` },
+      "PRR_1",
+    );
+    updateReviewSubmit(key, (stored) => ({
+      ...stored,
+      event: "REQUEST_CHANGES",
+      body: "Fix it",
+      status: {
+        kind: "uncertain",
+        sent: {
+          event: "REQUEST_CHANGES",
+          body: "Fix it",
+          head: "a".repeat(40),
+          knownReviewIds: [],
+          sentAt: 1,
+        },
+        message: "lost",
+        checking: false,
+        checked: "never",
+      },
+    }));
+    const { action, onSelect, commands } = rowFor("OPEN", undefined, ASKED);
+    act(() => action("approve")!.run());
+    act(() => commands.find((command) => command.id === `approve:${PR}`)!.run());
+    expect(host.write).not.toHaveBeenCalled();
+    expect(readReviewSubmit(key).status.kind).toBe("uncertain");
+    expect(onSelect).toHaveBeenCalledWith(PR, "here");
   });
 
   it("keeps a review being written in the Review menu, sending nothing over it", () => {
