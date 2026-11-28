@@ -124,3 +124,82 @@ def test_resolve_preserves_extra_connection_keys() -> None:
     result = _resolve_vertex_params(params)
     assert result["extra_key"] == "value"
     assert "base_url" in result
+
+
+@pytest.mark.parametrize("location", ["global", "GLOBAL", " global "])
+def test_build_vertex_url_global_location_uses_bare_host(location: str) -> None:
+    """Vertex AI's ``global`` endpoint omits the ``<region>-`` host prefix regardless of casing."""
+    url = _build_vertex_url("my-proj", location)
+    assert url == (
+        "https://aiplatform.googleapis.com"
+        "/v1/projects/my-proj"
+        "/locations/global"
+        "/publishers/google/models"
+    )
+
+
+@pytest.mark.asyncio
+async def test_vertex_adapter_gemini3_global_url_thinking_and_signatures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VertexAdapter inherits Gemini 3 thinkingConfig, thoughtSignature echo, and valid URLs."""
+    from omnigent.llms.adapters.vertex import VertexAdapter
+
+    adapter = VertexAdapter()
+    captured: dict[str, object] = {}
+
+    async def fake_headers(api_key_override: str | None = None) -> dict[str, str]:
+        del api_key_override
+        return {"Content-Type": "application/json", "Authorization": "Bearer test-token"}
+
+    async def fake_send_request(
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object],
+        model: str,
+        timeout: int = 120,
+    ) -> dict[str, object]:
+        captured["url"] = url
+        captured["payload"] = payload
+        return {"ok": True, "model": model}
+
+    monkeypatch.setattr(adapter, "_get_headers", fake_headers)
+    monkeypatch.setattr(adapter, "_send_request", fake_send_request)
+
+    await adapter.chat_completions(
+        messages=[
+            {"role": "user", "content": "Weather in London?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city": "London"}'},
+                        "thoughtSignature": "sig_vertex_1",
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "Rainy, 15C"},
+        ],
+        model="gemini-3-pro-preview",
+        tools=None,
+        stream=False,
+        extra={"reasoning_effort": "high"},
+        connection_params={"project": "my-proj", "location": "global"},
+    )
+
+    assert captured["url"] == (
+        "https://aiplatform.googleapis.com"
+        "/v1/projects/my-proj"
+        "/locations/global"
+        "/publishers/google/models/gemini-3-pro-preview:generateContent"
+    )
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["generationConfig"] == {
+        "thinkingConfig": {"thinkingLevel": "HIGH", "includeThoughts": True}
+    }
+    assert payload["contents"][1]["parts"][0]["thoughtSignature"] == "sig_vertex_1"
+    assert payload["contents"][2]["parts"][0]["functionResponse"]["name"] == "get_weather"

@@ -56,12 +56,16 @@ class FunctionCallOutput:
     :param arguments: JSON-encoded arguments string, e.g.
         ``'{"city": "London"}'``.
     :param type: Always ``"function_call"``.
+    :param thought_signature: Optional provider-issued opaque signature
+        (e.g. Gemini 3 ``thoughtSignature``) that must be echoed back
+        with the function call on follow-up turns.
     """
 
     call_id: str
     name: str
     arguments: str
     type: str = "function_call"
+    thought_signature: str | None = None
 
 
 # OpenAI-native tool types that are executed server-side and
