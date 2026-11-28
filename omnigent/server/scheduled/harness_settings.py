@@ -21,7 +21,12 @@ from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
 )
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -220,6 +225,40 @@ def session_permission_mode(session: Conversation, harness: str) -> str | None:
     ):
         return reported
     return _launch_permission_mode(session, harness)
+
+
+def session_skips_scheduled_task_review(session: Conversation, harness: str | None) -> bool:
+    """Whether *session* may change scheduled tasks without Omnigent's review.
+
+    A session a person started, in a mode that skips approval or in Claude Code's auto
+    mode, may: it runs its other tools without asking a person either. A session that
+    another session or an automation started keeps the review, since the agent that
+    started it picked its mode. The mode comes from the launch settings, which only the
+    owner or runner set, and where a confirmed switch is pinned. A reported mode, which
+    editors can write too, can only keep the review: one that keeps approval wins over
+    stale launch flags, as :func:`session_permission_mode` reads it.
+
+    :param session: The calling session, freshly read.
+    :param harness: The harness it runs, e.g. ``"claude-native"``.
+    :returns: Whether the scheduled-task review gives way to its check.
+    """
+    started_by_an_agent = session.parent_conversation_id is not None or any(
+        key in session.labels
+        for key in (
+            CREATED_BY_SESSION_LABEL_KEY,
+            SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+            SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+        )
+    )
+    harness = canonicalize_harness(harness)
+    if started_by_an_agent or harness is None:
+        return False
+    mode = _launch_permission_mode(session, harness)
+    if session_permission_mode(session, harness) != mode:
+        return False
+    return mode in APPROVAL_SKIPPING_PERMISSION_MODES or (
+        harness == "claude-native" and mode == "auto"
+    )
 
 
 def creator_session_launch_options(

@@ -31,8 +31,10 @@ from pathlib import Path
 
 import pytest
 
+from omnigent._wrapper_labels import CLAUDE_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.entities import Conversation
 from omnigent.entities.pagination import PagedList, paginate_in_memory
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runtime.policies.builder import build_policy_engine, load_verified_session_tree
 from omnigent.spec.parser import parse
 from omnigent.spec.types import (
@@ -42,7 +44,13 @@ from omnigent.spec.types import (
     Phase,
     PhaseSelector,
 )
-from omnigent.stores.conversation_store import SPAWN_TREE_READ_CAP
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SPAWN_TREE_READ_CAP,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -117,6 +125,137 @@ name: no-guardrails
     ]
     assert engine.label_defs == {}
     assert engine.labels == {}
+
+
+_CLAUDE_MODE_LABEL = "omnigent.claude_native.permission_mode"
+_CODEX_MODE_LABEL = "omnigent.codex_native.approval_mode"
+_CLAUDE = "claude-native"
+_CODEX = "codex-native"
+
+
+@pytest.mark.parametrize(
+    ("harness", "labels", "launch_args", "reviewed"),
+    [
+        (_CLAUDE, {}, [], True),
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "default"}, [], True),
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "auto"}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"], False),
+        (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"], False),
+        # A reported mode, which editors can write, can only keep the review.
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "auto"}, [], True),
+        (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["bypassPermissions"], False),
+        (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["dontAsk"], False),
+        # A reported mode that skips approval counts only from the launch settings.
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "bypassPermissions"}, [], True),
+        # A live mode that keeps approval wins over the launch flags it replaced.
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "default"}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"], True),
+        (_CODEX, {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, [], False),
+        (_CODEX, {}, PERMISSION_LAUNCH_ARGS[_CODEX]["full-access"], False),
+        (
+            _CODEX,
+            {_CODEX_MODE_LABEL: "ask-for-approval"},
+            PERMISSION_LAUNCH_ARGS[_CODEX]["full-access"],
+            True,
+        ),
+        (_CODEX, {}, PERMISSION_LAUNCH_ARGS[_CODEX]["approve-for-me"], True),
+        # A session another session or an automation started: the starting agent
+        # picked its mode, so it keeps the review.
+        (
+            _CLAUDE,
+            {
+                _CLAUDE_MODE_LABEL: "auto",
+                CREATED_BY_SESSION_LABEL_KEY: "0123456789abcdef0123456789abcdef",
+            },
+            [],
+            True,
+        ),
+        (
+            _CLAUDE,
+            {_CLAUDE_MODE_LABEL: "auto", SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1"},
+            [],
+            True,
+        ),
+        (
+            _CODEX,
+            {SCHEDULED_TASK_LAUNCH_LABEL_KEY: "task_1"},
+            PERMISSION_LAUNCH_ARGS[_CODEX]["full-access"],
+            True,
+        ),
+    ],
+)
+def test_scheduled_task_review_follows_the_session_mode(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    harness: str,
+    labels: dict[str, str],
+    launch_args: list[str],
+    reviewed: bool,
+) -> None:
+    """The scheduled-task review gives way to its check when the session's mode doesn't ask.
+
+    That is a mode that skips approval, or Claude Code's auto mode, in a session a
+    person started; any other mode, including Codex's approve-for-me reviewer, keeps
+    the review. Adding a policy always asks.
+    """
+    agent_dir = _write_spec(tmp_path, "spec_version: 1\nname: no-guardrails\n")
+    conv = conversation_store.create_conversation(
+        harness_override=harness,
+        labels=labels or None,
+        terminal_launch_args=launch_args or None,
+    )
+    engine = build_policy_engine(
+        spec=parse(agent_dir),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+    scheduled = "__ask_on_scheduled_task_change" if reviewed else "__check_scheduled_task_change"
+    assert [p.spec.name for p in engine.policies] == ["__ask_on_add_policy", scheduled]
+
+
+@pytest.mark.parametrize(("wrapped", "reviewed"), [(True, False), (False, True)])
+def test_a_wrapper_only_claude_session_follows_its_live_mode(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    wrapped: bool,
+    reviewed: bool,
+) -> None:
+    """A Claude wrapper session with a non-native agent declaration counts as Claude Code."""
+    agent_dir = _write_spec(tmp_path, "spec_version: 1\nname: no-guardrails\n")
+    labels = {_CLAUDE_MODE_LABEL: "auto"}
+    if wrapped:
+        labels[WRAPPER_LABEL_KEY] = CLAUDE_NATIVE_WRAPPER_VALUE
+    conv = conversation_store.create_conversation(
+        labels=labels, terminal_launch_args=PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"]
+    )
+    engine = build_policy_engine(
+        spec=parse(agent_dir),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+    scheduled = "__ask_on_scheduled_task_change" if reviewed else "__check_scheduled_task_change"
+    assert [p.spec.name for p in engine.policies] == ["__ask_on_add_policy", scheduled]
+
+
+def test_a_sub_agent_in_auto_mode_keeps_the_scheduled_task_review(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A sub-agent's mode was picked by its parent agent, so its scheduling still asks."""
+    agent_dir = _write_spec(tmp_path, "spec_version: 1\nname: no-guardrails\n")
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        parent_conversation_id=parent.id,
+        harness_override=_CLAUDE,
+        labels={_CLAUDE_MODE_LABEL: "auto"},
+    )
+    engine = build_policy_engine(
+        spec=parse(agent_dir),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_build_with_empty_guardrails_block(

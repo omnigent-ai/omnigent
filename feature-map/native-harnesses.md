@@ -1563,7 +1563,9 @@ they do not launch a vendor CLI. The same module checks concurrent calls,
 approval expiry, and uncertain completion after a write. Execution-budget
 accounting is covered by `tests/runtime/test_tool_call_deadline.py`.
 
-For a human check in an isolated instance, use a native session in Chat to ask
+For a human check in an isolated instance, use a native session in Chat, in a mode
+that asks for approval (in a session you started, auto and modes that skip approval
+create it unreviewed), to ask
 for an automation named "Approval deadline check" with harmless instructions
 and a first run well after the test. Leave its create approval pending for
 more than five minutes:
@@ -1597,7 +1599,8 @@ and `::test_ask_on_scheduled_task_change_denies_a_reminder_without_message` cove
 the denies. For a human check in an isolated instance
 started with `OMNIGENT_FEATURES=one_time_automations` (one-time automations are
 off by default; the database scheduler, `automations_v2`, is on by default; without
-either the tool refuses), ask a native session to remind it in 15 minutes. Reject the approval and
+either the tool refuses), ask a native session in a mode that asks for approval to
+remind it in 15 minutes. Reject the approval and
 confirm `sys_scheduled_task_list` shows no `Reminder: ...` task. Ask again,
 approve, and confirm the list shows one while the Automations page does not, that
 the message arrives as a new turn about 15 minutes later, and that

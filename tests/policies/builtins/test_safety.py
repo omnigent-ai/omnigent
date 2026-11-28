@@ -709,12 +709,16 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
     assert "Task permission setting: agent default (no task override)" in result["reason"]
 
 
-def _reminder_review(arguments: dict[str, object]):
-    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+def _reminder_review(arguments: dict[str, object], policy: str = "ask_on_scheduled_task_change"):
+    from omnigent.policies.builtins import safety
 
-    return ask_on_scheduled_task_change(
+    return getattr(safety, policy)(
         {"type": "tool_call", "target": "sys_reminder_set", "data": {"arguments": arguments}}
     )
+
+
+# The review, and the check that replaces it where the session's mode doesn't ask.
+_REMINDER_POLICIES = ["ask_on_scheduled_task_change", "check_scheduled_task_change"]
 
 
 def _resolved_minute(local: datetime) -> str:
@@ -779,16 +783,18 @@ def test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text() -> No
     assert shown not in other["reason"]
 
 
-def test_reminder_approval_denies_a_time_the_tool_would_reject() -> None:
+@pytest.mark.parametrize("policy", _REMINDER_POLICIES)
+def test_reminder_approval_denies_a_time_the_tool_would_reject(policy: str) -> None:
     # The resolver's own tests cover each invalid time; one shows the policy denies.
-    result = _reminder_review({"message": "ping", "at": "tomorrow"})
+    result = _reminder_review({"message": "ping", "at": "tomorrow"}, policy)
     assert result["result"] == "DENY"
     assert "not an ISO-8601" in result["reason"]
 
 
+@pytest.mark.parametrize("policy", _REMINDER_POLICIES)
 @pytest.mark.parametrize("message", [None, "", "   ", 5])
-def test_ask_on_scheduled_task_change_denies_a_reminder_without_message(message) -> None:
-    result = _reminder_review({"message": message, "delay_seconds": 60})
+def test_ask_on_scheduled_task_change_denies_a_reminder_without_message(message, policy) -> None:
+    result = _reminder_review({"message": message, "delay_seconds": 60}, policy)
     assert result["result"] == "DENY"
     assert "reminder message" in result["reason"]
 
@@ -1245,6 +1251,7 @@ def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
     assert "scheduled_task_id" in result["reason"]
 
 
+@pytest.mark.parametrize("policy", ["ask_on_scheduled_task_change", "check_scheduled_task_change"])
 @pytest.mark.parametrize("action", ["create", "update"])
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -1252,12 +1259,16 @@ def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
     + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"], "null", " NULL "]],
 )
 def test_scheduled_task_approval_denies_invalid_review_values(
-    action: str, field: str, value: object
+    policy: str, action: str, field: str, value: object
 ) -> None:
-    """The string "null" is refused before approval, with the hint the runner gives."""
-    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+    """The string "null" is refused before approval, with the hint the runner gives.
 
-    result = ask_on_scheduled_task_change(
+    The check that replaces the review where the session's mode doesn't ask refuses
+    the same values.
+    """
+    from omnigent.policies.builtins import safety
+
+    result = getattr(safety, policy)(
         {
             "type": "tool_call",
             "target": f"sys_scheduled_task_{action}",
@@ -1280,6 +1291,91 @@ def test_scheduled_task_approval_denies_invalid_review_values(
         ),
     }[field]
     assert expected in result["reason"]
+
+
+def test_check_scheduled_task_change_allows_a_valid_reminder_without_asking() -> None:
+    from omnigent.policies.builtins.safety import check_scheduled_task_change
+
+    result = check_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_reminder_set",
+            "data": {"arguments": {"message": "Check the deploy.", "delay_seconds": 1800}},
+        }
+    )
+    assert result["result"] == "ALLOW"
+
+
+_OMITTED = object()
+_CALLER = "conv_caller"
+
+
+def _check_task_change(tool: str, arguments: dict[str, object]):
+    from omnigent.policies.builtins.safety import check_scheduled_task_change
+
+    return check_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": tool,
+            "data": {"arguments": arguments},
+            "context": {"conversation_id": _CALLER},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("permission_mode", "result"),
+    [
+        ("bypassPermissions", "ASK"),
+        ("full-access", "ASK"),
+        # An older runner may leave the mode out; it is filled in later.
+        (_OMITTED, "ASK"),
+        ("auto", "ALLOW"),
+        (None, "ALLOW"),
+    ],
+)
+def test_check_scheduled_task_change_still_asks_for_a_task_mode_that_skips_approval(
+    permission_mode: object, result: str
+) -> None:
+    """A new-session task that may run without any reviewer is shown to a person."""
+    arguments: dict[str, object] = {"name": "nightly triage", "prompt": "Triage new issues."}
+    if permission_mode is not _OMITTED:
+        arguments["permission_mode"] = permission_mode
+    assert _check_task_change("sys_scheduled_task_create", arguments)["result"] == result
+
+
+@pytest.mark.parametrize(
+    ("continuation", "result"),
+    [
+        ({"session_mode": "continue", "session_id": _CALLER}, "ALLOW"),
+        ({"session_mode": "continue", "session_id": "conv_other"}, "ASK"),
+        ({"session_mode": "continue"}, "ASK"),
+        ({"session_id": "conv_other"}, "ASK"),
+    ],
+)
+def test_check_scheduled_task_change_lets_a_task_continue_only_the_calling_session(
+    continuation: dict[str, object], result: str
+) -> None:
+    """A continued run takes the continued session's mode, known only for the caller."""
+    arguments = {
+        "name": "nightly triage",
+        "prompt": "Triage new issues.",
+        "permission_mode": None,
+        **continuation,
+    }
+    assert _check_task_change("sys_scheduled_task_create", arguments)["result"] == result
+
+
+@pytest.mark.parametrize("permission_mode", [None, "auto", _OMITTED])
+def test_check_scheduled_task_change_asks_for_every_update(permission_mode: object) -> None:
+    """An update keeps stored settings, such as a continued session, this call can't see."""
+    arguments: dict[str, object] = {
+        "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+        "prompt": "Triage new issues.",
+    }
+    if permission_mode is not _OMITTED:
+        arguments["permission_mode"] = permission_mode
+    assert _check_task_change("sys_scheduled_task_update", arguments)["result"] == "ASK"
 
 
 @pytest.mark.parametrize(

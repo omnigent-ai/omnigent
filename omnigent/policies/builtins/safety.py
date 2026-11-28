@@ -594,8 +594,12 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     )
 
 
-def _reminder_review(args: dict[str, object]) -> PolicyResponse:
-    """ASK to set a reminder, showing when it fires and its full message."""
+def _reminder_review(args: dict[str, object], *, ask: bool) -> PolicyResponse:
+    """ASK to set a reminder, showing when it fires and its full message.
+
+    With *ask* false, a valid reminder is allowed without asking; an invalid one is
+    still refused.
+    """
     message = args.get("message")
     if not isinstance(message, str) or not message.strip():
         return {
@@ -611,6 +615,8 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
     resolved = resolve_reminder_time(args, datetime.now(UTC))
     if isinstance(resolved, str):
         return {"result": "DENY", "reason": f"Cannot set a reminder. {resolved}"}
+    if not ask:
+        return _ALLOW
     if args.get("at") is not None:
         when = f"at {resolved:%Y-%m-%d %H:%M} UTC"
     else:
@@ -642,6 +648,62 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     :returns: ASK if a scheduled task is being created or updated, ALLOW
         otherwise.
     """
+    return _scheduled_task_change_verdict(event, ask=True)
+
+
+def check_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
+    """Refuse a malformed scheduled-task change or reminder, and allow most valid ones.
+
+    The policy builder uses it instead of :func:`ask_on_scheduled_task_change` in a
+    session whose own mode doesn't ask a person, so the same requests are refused
+    there. A change still asks when its unattended runs could skip approval in a mode
+    no person picked: every update, and a create that :func:`_create_may_skip_review`
+    doesn't clear.
+
+    :param event: Policy event dict.
+    :returns: DENY for a malformed change, ASK for one whose runs could skip approval
+        in a mode no person picked, ALLOW otherwise.
+    """
+    return _scheduled_task_change_verdict(event, ask=False)
+
+
+def _create_may_skip_review(args: dict[str, object], event: PolicyEvent) -> bool:
+    """Whether a create's runs can skip approval only in a mode a person picked.
+
+    A run in a new session takes the request's mode, which must be stated and keep
+    approval; ``null`` is the agent default, which a task can't inherit when it skips
+    approval. Like a mode with no launch flags, such as Codex ``default``, it can still
+    follow the host's own harness settings, which Omnigent can't see. A run that
+    continues a session takes that session's own mode, so only continuing the calling
+    session qualifies: a person picked its mode, even one that skips approval. An
+    update keeps stored settings this call can't see, so it never qualifies.
+
+    :param args: The create request's arguments.
+    :param event: Policy event dict, whose context names the calling session.
+    :returns: ``True`` when the task may be created without the review.
+    """
+    if (
+        "permission_mode" not in args
+        or args["permission_mode"] in APPROVAL_SKIPPING_PERMISSION_MODES
+    ):
+        return False
+    target = args.get("session_id")
+    if args.get("session_mode") != "continue" and target is None:
+        return True
+    context = event.get("context")
+    caller = context.get("conversation_id") if isinstance(context, dict) else None
+    return target is not None and target == caller
+
+
+def _scheduled_task_change_verdict(event: PolicyEvent, *, ask: bool) -> PolicyResponse:
+    """The verdict on a scheduled-task change or reminder.
+
+    :param event: Policy event dict.
+    :param ask: Whether every valid change asks (``True``), or only one whose unattended
+        runs could skip approval in a mode no person picked (``False``): every update,
+        and a create that :func:`_create_may_skip_review` doesn't clear.
+    :returns: DENY for a malformed change, ASK or ALLOW for a valid one, ALLOW otherwise.
+    """
     if event.get("type") != "tool_call":
         return _ALLOW
     tool = event.get("target")
@@ -652,13 +714,15 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     if not isinstance(args, dict):
         args = {}
     if tool == "sys_reminder_set":
-        return _reminder_review(args)
+        return _reminder_review(args, ask=ask)
     action = "create" if tool == "sys_scheduled_task_create" else "update"
     # Older runners expose optional review fields. Current runners enforce the
     # complete contract before dispatch, including when paired with an old server.
     error = scheduled_task_review_error(args, action=action, require_complete=False)
     if error:
         return {"result": "DENY", "reason": f"Cannot {action} a scheduled task. {error}"}
+    if not ask and action == "create" and _create_may_skip_review(args, event):
+        return _ALLOW
     if action == "create":
         name = _clip(str(args.get("name") or "(unnamed)"))
         review = _scheduled_task_review(

@@ -33,6 +33,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.routes import sessions as sessions_routes
@@ -844,6 +845,51 @@ async def test_scheduled_changes_require_explicit_approval_without_custom_polici
             if not task.done():
                 task.cancel()
         await asyncio.gather(drain, evaluate, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "sys_scheduled_task_create",
+            {"name": "triage", "prompt": "Review every issue.", "permission_mode": None},
+        ),
+        ("sys_reminder_set", {"message": "Check the deploy.", "delay_seconds": 1800}),
+    ],
+)
+async def test_scheduled_changes_skip_the_review_in_a_session_whose_mode_does_not_ask(
+    client: httpx.AsyncClient,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> None:
+    """A Claude Code session in auto mode schedules work as it runs its other tools.
+
+    Its launch settings reach the policy builder from the session row; no approval parks.
+    """
+    from omnigent.runtime import get_conversation_store
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    store = get_conversation_store()
+    await asyncio.to_thread(
+        store.update_conversation,
+        session_id,
+        harness_override="claude-native",
+        terminal_launch_args=PERMISSION_LAUNCH_ARGS["claude-native"]["auto"],
+    )
+    await asyncio.to_thread(
+        store.set_labels, session_id, {"omnigent.claude_native.permission_mode": "auto"}
+    )
+    # A regression that still asks would park the request; fail fast instead.
+    response = await asyncio.wait_for(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name, arguments),
+        ),
+        timeout=5,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["result"] == "POLICY_ACTION_ALLOW"
 
 
 @pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_scheduled_task_delete"])
