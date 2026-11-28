@@ -101,10 +101,16 @@ def is_wrong_replica(response: httpx.Response) -> bool:
 
 
 def address_request(request: httpx.Request, base_url: str, host_id: str) -> None:
-    """Key one request to a host, or send it keyless when host_id is empty."""
+    """Key one request to a host, or send it keyless when host_id is empty.
+
+    Only the routing key changes: headers the caller already set, such as an
+    explicit workspace selector or the client's User-Agent, are kept.
+    """
     request.url = request.url.copy_remove_param(_SLICE_KEY_QUERY_PARAM)
     request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
-    request.headers.update(databricks_request_headers(base_url, host_id=host_id))
+    for name, value in databricks_request_headers(base_url, host_id=host_id).items():
+        if name.lower() == OMNIGENT_SLICE_KEY_HEADER.lower() or name not in request.headers:
+            request.headers[name] = value
     request.extensions[REQUEST_HOST_EXTENSION] = host_id
 
 
@@ -194,7 +200,8 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
       and cached, and retried once if it differs from the cached host. Whatever
       remains is one keyless attempt, and nothing else is retried.
 
-    A create whose JSON body names a ``host_id`` is keyed by it and never retried.
+    A create whose JSON body or ``REQUEST_HOST_EXTENSION`` names a host id is keyed
+    by it and never retried.
     Timeouts and other failures propagate unchanged, because delivery is uncertain.
     Established event streams are never inspected or replayed; JSON routing
     refusals before stream establishment may recover like other requests.
@@ -227,7 +234,10 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
             address_request(request, base_url, "")
             return await self._send(request)
         if route in _CREATE_ROUTES:
-            create_host = _create_body_host(request)
+            # A multipart create names its new host in the request extension, not a JSON body.
+            create_host = _create_body_host(request) or request.extensions.get(
+                REQUEST_HOST_EXTENSION
+            )
             if create_host is not None:
                 address_request(request, base_url, create_host)
             return await self._send(request)

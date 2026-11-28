@@ -24,6 +24,7 @@ from __future__ import annotations
 import builtins
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -33,6 +34,7 @@ from pydantic import TypeAdapter
 
 from omnigent.harness_availability import harness_launch_availability
 from omnigent.server.schemas import ServerStreamEvent
+from omnigent.session_host import REQUEST_HOST_EXTENSION, set_session_host
 
 from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
 from ._child_status import child_summary_busy
@@ -482,6 +484,8 @@ class SessionsNamespace:
         :param sandbox_provider: With ``host_type="managed"``, which
             configured sandbox provider to provision (e.g. ``"lakebox"``);
             ``None`` takes the server's first. Ignored for external hosts.
+            A managed create names its new host's id (see
+            :meth:`_new_managed_host_id`), so the session routes by it.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status.
@@ -499,15 +503,43 @@ class SessionsNamespace:
             metadata["host_type"] = host_type
         if sandbox_provider is not None:
             metadata["sandbox_provider"] = sandbox_provider
+        requested_host_id = await self._new_managed_host_id() if host_type == "managed" else None
+        extensions: dict[str, Any] = {}
+        if requested_host_id is not None:
+            metadata["host_id"] = requested_host_id
+            extensions[REQUEST_HOST_EXTENSION] = requested_host_id
         resp = await self._http.post(
             f"{self._base}/v1/sessions",
             data={"metadata": json.dumps(metadata)},
             files={"bundle": (filename, bundle, "application/gzip")},
+            extensions=extensions,
         )
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
         session_id = str(created["session_id"])
+        if requested_host_id is not None:
+            set_session_host(session_id, requested_host_id)
         return await self.get(session_id)
+
+    async def _new_managed_host_id(self) -> str | None:
+        """
+        A fresh id for a managed create's new sandbox host, as the web client mints.
+
+        The create and every request after it then route by the host's id from the
+        start. Sent only when ``GET /v1/info`` reports
+        ``request_managed_sandbox_host_id``, since older servers reject it; an
+        unreadable report sends none, leaving the server to mint one.
+
+        :returns: A 32-hex host id, or ``None``.
+        """
+        try:
+            resp = await self._http.get(f"{self._base}/v1/info")
+            info = resp.json() if resp.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
+        if not isinstance(info, dict) or info.get("request_managed_sandbox_host_id") is not True:
+            return None
+        return uuid.uuid4().hex
 
     async def create_from_agent_id(
         self,
@@ -544,6 +576,8 @@ class SessionsNamespace:
             3660 seconds. Longer or unlimited client timeouts are retained.
         :param host_type: Use ``managed`` to provision a fresh sandbox host.
             Its optional workspace is a repository URL instead of a host path.
+            With no *host_id*, the create names the new host's id (see
+            :meth:`_new_managed_host_id`), so the session routes by it.
         :param sandbox_provider: Explicit managed sandbox provider, e.g. ``modal``.
             Only valid with ``host_type="managed"``; validated by the server.
         :returns: The newly created :class:`Session` snapshot.
@@ -565,6 +599,14 @@ class SessionsNamespace:
             body["host_type"] = host_type
         if sandbox_provider is not None:
             body["sandbox_provider"] = sandbox_provider
+        requested_host_id = (
+            await self._new_managed_host_id()
+            if host_type == "managed" and host_id is None
+            else None
+        )
+        if requested_host_id is not None:
+            # The routing transport keys a JSON create by its body's host_id.
+            body["host_id"] = requested_host_id
         timeout = httpx.Timeout(self._http.timeout)
         if host_id is not None and timeout.read is not None:
             timeout.read = max(timeout.read, _HOST_LAUNCH_READ_TIMEOUT_S)
@@ -586,7 +628,10 @@ class SessionsNamespace:
             ) from exc
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
-        return Session.from_dict(created)
+        session = Session.from_dict(created)
+        if requested_host_id is not None:
+            set_session_host(session.id, requested_host_id)
+        return session
 
     async def resolve_agent(self, agent_name: str) -> RegisteredAgent:
         """
