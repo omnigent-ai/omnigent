@@ -162,7 +162,7 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runner.native.interrupt import NativeInterruptRunner, forwarder_retires_with_pane
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
@@ -2549,14 +2549,20 @@ def create_runner_app(
         # Codex app-server alongside it; this is a no-op for other harnesses.
         exit_turn_epoch = _turn_bind_epoch.get(event.session_id)
         exited_app_server = _native_runtime._AUTO_CODEX_APP_SERVERS.get(event.session_id)
+        exited_forwarder = _native_runtime._AUTO_FORWARDER_TASKS.get(event.session_id)
 
         async def _teardown_after_exit() -> None:
-            if (
-                _terminal_exit_still_owns_session(event, exit_turn_epoch)
-                and _native_runtime._AUTO_CODEX_APP_SERVERS.get(event.session_id)
-                is exited_app_server
-            ):
+            if not _terminal_exit_still_owns_session(event, exit_turn_epoch):
+                return
+            if _native_runtime._AUTO_CODEX_APP_SERVERS.get(event.session_id) is exited_app_server:
                 await _native_runtime.teardown_codex_native_app_server(event.session_id)
+            # A forwarder that outlives its pane keeps its chat claim fresh and
+            # can adopt the next same-cwd session's chat, silencing that session.
+            if (
+                forwarder_retires_with_pane(event.terminal_name)
+                and _native_runtime._AUTO_FORWARDER_TASKS.get(event.session_id) is exited_forwarder
+            ):
+                await _cancel_auto_forwarder_task(event.session_id)
 
         _teardown_task = asyncio.create_task(_teardown_after_exit())
         _teardown_task.add_done_callback(_background_tasks.discard)
