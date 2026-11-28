@@ -57,6 +57,18 @@ def test_session_share_is_revoked_in_the_spelling_it_was_granted_in(setup_app, g
     assert alice.get(f"/v1/sessions/{session_id}").status_code == 404
 
 
+@pytest.mark.parametrize("spelling", _GRANTEE_SPELLINGS)
+def test_read_only_grantee_leaves_a_session_in_any_spelling_of_their_name(setup_app, spelling):  # noqa: F811
+    admin, alice, _, _ = setup_app
+    session_id = create_session(admin).json()["session_id"]
+    path = f"/v1/sessions/{session_id}/permissions"
+    assert admin.put(path, json={"user_id": "alice", "level": 1}).status_code == 200
+    left = alice.delete(f"{path}/{quote(spelling)}")
+    assert left.status_code == 204, left.text
+    assert [grant["user_id"] for grant in admin.get(path).json()["permissions"]] == ["admin"]
+    assert alice.get(f"/v1/sessions/{session_id}").status_code == 404
+
+
 @pytest.mark.parametrize("setup_app", [True], indirect=True)
 @pytest.mark.parametrize("grantee", _GRANTEE_SPELLINGS)
 def test_automation_share_is_revoked_in_the_spelling_it_was_granted_in(setup_app, grantee):  # noqa: F811
