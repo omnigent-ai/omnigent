@@ -1679,6 +1679,38 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
     number = reference.number if reference else _pr_number(root, token=token)
     if number is None:
         return empty
+    data: list[dict[str, Any]] = []
+    for entry in _pr_file_entries(root, reference, number, token=token):
+        # ``filename`` is the current path (the new name for a rename) — the one
+        # the diff endpoint reads at HEAD, matching the whole-PR patch.
+        path = entry.get("filename")
+        if not path:
+            continue
+        data.append(
+            {
+                "object": "session.github.changed_file",
+                "path": path,
+                "name": str(path).split("/")[-1],
+                "status": _GH_STATUS_MAP.get(str(entry.get("status")), "modified"),
+                "lines_added": entry.get("additions"),
+                "lines_removed": entry.get("deletions"),
+                "previous_path": entry.get("previous_filename"),
+            }
+        )
+    return {"object": "list", "data": data, "has_more": False}
+
+
+def _pr_file_entries(
+    root: str, reference: PullRequestRef | None, number: int, *, token: str | None
+) -> list[dict[str, Any]]:
+    """Return the PR's ``gh api .../pulls/<n>/files`` entries, across all pages.
+
+    :param root: Absolute workspace path.
+    :param reference: The tracked PR, or ``None`` for the workspace branch's PR.
+    :param number: The PR number.
+    :param token: Optional GH_TOKEN to run ``gh`` as the selected account.
+    :raises ValueError: When GitHub can't list the files or returns invalid JSON.
+    """
     repository = reference.repository if reference else "{owner}/{repo}"
     host_args = _host_args(root, reference) if reference else []
     rc, out, _ = _gh(
@@ -1707,27 +1739,7 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
         entries = [
             entry for page in entries for entry in (page if isinstance(page, list) else [page])
         ]
-    data: list[dict[str, Any]] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        # ``filename`` is the current path (the new name for a rename) — the one
-        # the diff endpoint reads at HEAD, matching the whole-PR patch.
-        path = entry.get("filename")
-        if not path:
-            continue
-        data.append(
-            {
-                "object": "session.github.changed_file",
-                "path": path,
-                "name": str(path).split("/")[-1],
-                "status": _GH_STATUS_MAP.get(str(entry.get("status")), "modified"),
-                "lines_added": entry.get("additions"),
-                "lines_removed": entry.get("deletions"),
-                "previous_path": entry.get("previous_filename"),
-            }
-        )
-    return {"object": "list", "data": data, "has_more": False}
+    return [entry for entry in entries if isinstance(entry, dict)]
 
 
 def _pr_changed_files_at_revision(
@@ -1848,10 +1860,68 @@ def _pr_patch(root: str, reference: PullRequestRef | None) -> dict[str, Any]:
     if reference:
         _host_args(root, reference)
     repo_args = ["-R", _repo_argument(reference)] if reference else []
-    rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
-    if rc != 0:
-        raise ValueError("GitHub could not load the PR diff. Refresh or open the PR on GitHub.")
-    return {"object": "session.github.pr_diff", "patch": out}
+    rc, out, err = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
+    if rc == 0:
+        return {"object": "session.github.pr_diff", "patch": out}
+    message = "GitHub could not load the PR diff. Refresh or open the PR on GitHub."
+    if not _PR_DIFF_TOO_LARGE.search(err):
+        raise ValueError(message)
+    # GitHub refuses a whole-PR diff past its size limit (HTTP 406, ``too_large``),
+    # but still serves each file's patch, so rebuild the PR patch from those.
+    try:
+        entries = _pr_file_entries(root, reference, number, token=token)
+    except ValueError:
+        raise ValueError(message) from None
+    return {"object": "session.github.pr_diff", "patch": _patch_from_file_entries(entries)}
+
+
+# ``gh pr diff`` stderr when GitHub refuses a whole-PR diff for its size.
+_PR_DIFF_TOO_LARGE = re.compile(r"too_large|HTTP 406")
+
+
+def _patch_from_file_entries(entries: list[dict[str, Any]]) -> str:
+    """Join ``pulls/<n>/files`` entries into one git-style unified patch.
+
+    Each entry's ``patch`` holds only hunks, so this adds the git headers the web
+    parser reads for a file's name, rename, and added or deleted status. GitHub
+    omits ``patch`` for binary files and files whose diff is too large; those get a
+    ``Binary files`` line so they still appear, without hunks.
+
+    :param entries: Entries from :func:`_pr_file_entries`.
+    :returns: The unified patch text, empty when there are no entries.
+    """
+    sections: list[str] = []
+    for entry in entries:
+        path = entry.get("filename")
+        if not isinstance(path, str) or not path:
+            continue
+        status = entry.get("status")
+        previous = entry.get("previous_filename")
+        old_path = previous if isinstance(previous, str) and previous else path
+        hunks = entry.get("patch")
+        has_hunks = isinstance(hunks, str) and bool(hunks)
+        lines = [f"diff --git a/{old_path} b/{path}"]
+        if status == "added":
+            lines.append("new file mode 100644")
+        elif status == "removed":
+            lines.append("deleted file mode 100644")
+        elif status == "renamed" and old_path != path:
+            # The web parser reads a rename only from a similarity line. GitHub doesn't
+            # report the score, so a changed rename uses git's 50% detection threshold.
+            changed = has_hunks or bool(entry.get("changes"))
+            lines += [
+                f"similarity index {50 if changed else 100}%",
+                f"rename from {old_path}",
+                f"rename to {path}",
+            ]
+        old_side = "/dev/null" if status == "added" else f"a/{old_path}"
+        new_side = "/dev/null" if status == "removed" else f"b/{path}"
+        if has_hunks:
+            lines += [f"--- {old_side}", f"+++ {new_side}", str(hunks).rstrip("\n")]
+        elif status != "renamed" or entry.get("changes"):
+            lines.append(f"Binary files {old_side} and {new_side} differ")
+        sections.append("\n".join(lines) + "\n")
+    return "".join(sections)
 
 
 def _pr_patch_at_revision(
