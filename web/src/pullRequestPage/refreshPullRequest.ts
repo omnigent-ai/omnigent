@@ -98,7 +98,10 @@ export function pullRequestRefreshRoot(
   if (pending.every((part, index) => queryKey[index] === part)) return "pending-review";
   const readiness = mergeReadinessReadOf(queryKey, prUrl);
   if (readiness) return readiness === "checks" ? "merge-checks" : "merge-readiness";
-  if (root === NATIVE_STACK_QUERY && queryKey[1] === prUrl) return "native-stack";
+  // The stack is read through the session's host, keyed by the session as well as the PR.
+  if (root === NATIVE_STACK_QUERY && queryKey[1] === prUrl && queryKey[3] === conversationId) {
+    return "native-stack";
+  }
   // The Commits tab reads through the account's fast track, keyed by host, repository and number.
   if (root === "github-fast-track") {
     const pr = pullRequestIdentity(prUrl);

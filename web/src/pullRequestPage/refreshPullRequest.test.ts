@@ -22,6 +22,7 @@ import {
   pullRequestCommitsQueryKey,
   showCommitDiff,
 } from "@/hooks/usePullRequestCommits";
+import { pullRequestNativeStackQueryKey } from "@/hooks/usePullRequestNativeStack";
 
 import {
   onPullRequestRefreshRequested,
@@ -171,11 +172,31 @@ describe("what a refresh reads", () => {
     mount(client, ["pull-requests-page", "inbox"], reader("inbox", []));
     mountReadiness(client, PR, reader("readiness", { ok: true }));
     mountReadiness(client, OTHER_PR, reader("other readiness", { ok: true }));
+    mount(
+      client,
+      pullRequestNativeStackQueryKey(PR, SESSION, "h1"),
+      reader("native stack", { read: null, members: null }),
+    );
+    // Another session's stack read fails: a refresh here must neither read it nor wait for it.
+    mount(client, pullRequestNativeStackQueryKey(PR, "conv_2", "h1"), async () => {
+      reads.push("other session's native stack");
+      throw new Error("other host unavailable");
+    });
+    mount(client, pullRequestNativeStackQueryKey(OTHER_PR, SESSION, "h9"), async () => {
+      reads.push("other PR's native stack");
+      return { read: null, members: null };
+    });
     await settle();
     reads.length = 0;
 
     expect(await refreshPullRequest(client, TARGET)).toEqual({ kind: "ok" });
-    expect(reads.sort()).toEqual(["merge-options", "overview", "readiness", "threads"]);
+    expect(reads.sort()).toEqual([
+      "merge-options",
+      "native stack",
+      "overview",
+      "readiness",
+      "threads",
+    ]);
   });
 
   it("reads its PR fresh while it runs, past what this Mac kept, and not after", async () => {
