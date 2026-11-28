@@ -12,23 +12,24 @@ const URL_PATTERN = /(https?|HTTPS?):[/]{2}[^\s"'!*(){}|\\^<>`]*[^\s"':,.!?{}|\\
 // Rows joined above and below the hovered row are each capped at this many characters.
 const MAX_JOINED_LENGTH = 2048;
 
-export type TerminalLinkActivate = (event: MouseEvent, uri: string) => void;
+/** Callbacks shared by every detected link; hover and leave track the pointer over it. */
+export type TerminalLinkHandler = Pick<ILink, "activate" | "hover" | "leave">;
 
 export class TerminalLinkProvider implements ILinkProvider {
   private readonly term: Terminal;
-  private readonly activate: TerminalLinkActivate;
+  private readonly handler: TerminalLinkHandler;
 
-  constructor(term: Terminal, activate: TerminalLinkActivate) {
+  constructor(term: Terminal, handler: TerminalLinkHandler) {
     this.term = term;
-    this.activate = activate;
+    this.handler = handler;
   }
 
   provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void): void {
-    callback(computeLinks(this.term, bufferLineNumber - 1, this.activate));
+    callback(computeLinks(this.term, bufferLineNumber - 1, this.handler));
   }
 }
 
-function computeLinks(term: Terminal, lineIndex: number, activate: TerminalLinkActivate): ILink[] {
+function computeLinks(term: Terminal, lineIndex: number, handler: TerminalLinkHandler): ILink[] {
   const [lines, startLineIndex] = logicalLine(term, lineIndex);
   const text = lines.join("");
   const pattern = new RegExp(URL_PATTERN.source, "g");
@@ -46,7 +47,9 @@ function computeLinks(term: Terminal, lineIndex: number, activate: TerminalLinkA
     links.push({
       range: { start: { x: startX + 1, y: startY + 1 }, end: { x: endX, y: endY + 1 } },
       text: uri,
-      activate,
+      activate: handler.activate,
+      hover: handler.hover,
+      leave: handler.leave,
     });
   }
   return links;
