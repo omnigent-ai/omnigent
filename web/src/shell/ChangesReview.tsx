@@ -427,7 +427,7 @@ function ComparisonNotes({
   );
 }
 
-/** The toolbar while no review is shown: the tree icon and any file count. */
+/** The toolbar while no review is shown: any file count, and the tree icon where its toggle goes. */
 function ToolbarSkeleton({ fileCount }: { fileCount: number | null }) {
   return (
     <div
@@ -435,17 +435,18 @@ function ToolbarSkeleton({ fileCount }: { fileCount: number | null }) {
       aria-label="Diff review"
       className="flex min-h-9 shrink-0 items-center gap-x-1 border-b border-border px-2 py-0.5 text-ui"
     >
-      <span
-        className="flex size-7 items-center justify-center text-muted-foreground"
-        aria-hidden="true"
-      >
-        <ListTreeIcon className="size-4" />
-      </span>
       {fileCount !== null && (
-        <span className="text-muted-foreground" data-testid="diff-review-file-count">
+        <span className="pl-1 text-muted-foreground" data-testid="diff-review-file-count">
           {fileCount} {fileCount === 1 ? "file" : "files"}
         </span>
       )}
+      <span
+        className="ml-auto flex size-7 items-center justify-center text-muted-foreground"
+        aria-hidden="true"
+        data-testid="diff-review-tree-placeholder"
+      >
+        <ListTreeIcon className="size-4" />
+      </span>
     </div>
   );
 }

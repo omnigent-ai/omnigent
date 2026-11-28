@@ -50,4 +50,21 @@ describe("DiffReviewBaseMenu", () => {
       "Compares with main.",
     );
   });
+
+  it("wraps why a choice is unavailable within the menu, as it does a description", () => {
+    const why = "Not available on this host yet. Update Omnigent on the session's machine.";
+    openMenu({
+      ...base,
+      choices: [
+        choice("head", "Last commit"),
+        { ...choice("branch", "Branch"), unavailableReason: why },
+      ],
+    });
+    const reason = screen.getByText(why);
+    expect(screen.getByRole("menuitemradio", { name: /Branch/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(reason).toHaveClass("whitespace-normal");
+  });
 });

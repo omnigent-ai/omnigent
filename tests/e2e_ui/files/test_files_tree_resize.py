@@ -1,5 +1,7 @@
 """E2E: the tabs sidebar's Files tree resizes beside a file, and shows or hides.
 
+The Diffs review's tree, docked at its right, keeps its share in full screen the same way.
+
 With ``workspace_sidebar_v2`` on, the docked tree's edge drags or steps with the arrow
 keys, keeps its width across a reload, and returns to its default on a double-click.
 ⇧⌘E (Ctrl+Shift+E elsewhere), ⌘K's Show Files Tree / Hide Files Tree and the toolbar
@@ -23,7 +25,10 @@ from tests.e2e_ui.files._files_page import (
     seeded_workspace,
     set_rail_width,
 )
-from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
+from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import (
+    _open_app,
+    git_session,  # noqa: F401 — shared real-host fixture
+)
 
 _HANDLE = "Resize the file tree"
 
@@ -139,6 +144,43 @@ def test_the_tree_keeps_its_share_in_full_screen(
         timeout_s=10,
         interval_s=0.1,
     )
+
+
+def test_the_diffs_tree_keeps_its_share_in_full_screen(
+    page: Page,
+    git_session: tuple[str, str],  # noqa: F811 — pytest injects the imported fixture
+) -> None:
+    """A Diffs tree widened from its left edge keeps that share in full screen, past 360px."""
+    base_url, session_id = git_session
+    sidebar = open_workspace(page, base_url, session_id)
+    page.set_viewport_size({"width": 1920, "height": 1000})
+    _open_app(page, sidebar, "Diffs")
+    expect(sidebar.get_by_role("button", name="Copy path feature_last.txt")).to_be_visible(
+        timeout=30_000
+    )
+    review = sidebar.locator('[data-testid="diff-review"]:visible').first
+    tree = sidebar.locator("[data-diff-review-tree-column]:visible").first
+    set_rail_width(page, sidebar, 820)
+    edge = sidebar.get_by_role("separator", name="Resize changed files")
+    expect(edge).to_have_count(1, timeout=10_000)
+    # The tree docks at the review's right, so its left edge widens it leftward.
+    edge.focus()
+    for _ in range(3):
+        page.keyboard.press("ArrowLeft")
+    docked_review = _box_width(review)
+    chosen_share = _box_width(tree) / docked_review
+
+    def keeps_share() -> bool:
+        return abs(_box_width(tree) / _box_width(review) - chosen_share) < 0.01
+
+    sidebar.get_by_role("button", name="Full screen", exact=True).click()
+    poll_until(lambda: _box_width(review) > docked_review + 600, timeout_s=10, interval_s=0.1)
+    poll_until(keeps_share, timeout_s=10, interval_s=0.1)
+    assert _box_width(tree) > 360, _box_width(tree)
+
+    page.get_by_role("button", name="Exit full screen", exact=True).click()
+    poll_until(lambda: _box_width(review) < docked_review + 5, timeout_s=10, interval_s=0.1)
+    poll_until(keeps_share, timeout_s=10, interval_s=0.1)
 
 
 def test_the_tree_shows_and_hides_from_the_chord_the_palette_and_the_toolbar(
