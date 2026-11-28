@@ -274,7 +274,7 @@ def test_startup_preserves_an_incompatible_existing_pricing_reference(
 ) -> None:
     engine = get_or_create_engine(db_uri)
     head = _get_head_db_revision(db_uri)
-    _migrate(db_uri, engine, "downgrade", _PREVIOUS)
+    _migrate(db_uri, engine, "downgrade", _REVISION)
     value = 17 if incompatible == "wrong-type" else _SESSION_ID
     statements: list[str] = []
 
@@ -286,15 +286,26 @@ def test_startup_preserves_an_incompatible_existing_pricing_reference(
             if engine.dialect.name == "cockroachdb":
                 _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
             operation = Operations(MigrationContext.configure(connection))
-            operation.add_column(
-                _TABLE,
-                sa.Column(
+            with operation.batch_alter_table(_TABLE) as batch:
+                batch.alter_column(
                     _COLUMN,
-                    sa.Integer() if incompatible == "wrong-type" else Uuid16(),
+                    existing_type=Uuid16(),
+                    existing_nullable=True,
+                    type_=sa.Integer() if incompatible == "wrong-type" else Uuid16(),
                     nullable=incompatible != "not-null",
-                ),
-            )
+                    postgresql_using="NULL",
+                )
             connection.commit()
+        column = next(
+            column
+            for column in sa.inspect(engine).get_columns(_TABLE)
+            if column["name"] == _COLUMN
+        )
+        assert column["nullable"] is (incompatible != "not-null")
+        if incompatible == "wrong-type":
+            assert isinstance(column["type"], sa.Integer)
+        _migrate(db_uri, engine, "stamp", _PREVIOUS)
+        assert _get_current_db_revision(engine) == _PREVIOUS
         with engine.begin() as connection:
             connection.execute(
                 sa.text(
@@ -347,4 +358,5 @@ def test_startup_preserves_an_incompatible_existing_pricing_reference(
                 with operation.batch_alter_table(_TABLE) as batch:
                     batch.drop_column(_COLUMN)
                 connection.commit()
+        _migrate(db_uri, engine, "stamp", _PREVIOUS)
         _migrate(db_uri, engine, "upgrade", head)
