@@ -75,6 +75,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
@@ -303,8 +304,9 @@ _SPEC_FETCH_HTTP_STATUS = re.compile(r"failed with HTTP (\d{3})$")
 def _spec_resolve_error_detail(exc: BaseException) -> str:
     """Name a failed agent-spec load's structured cause in the client detail.
 
-    Only the exception type, its direct cause's type, and the server's HTTP
-    status appear; the free-form text stays in the runner log.
+    Only the exception type, its direct cause's type, the server's HTTP status
+    and a credential failure's user-facing remedy appear; other free-form text
+    stays in the runner log.
 
     :param exc: The spec resolver failure, e.g. ``httpx.ConnectError(...)`` or
         ``RuntimeError("spec_resolver: GET /v1/... failed with HTTP 503")``.
@@ -316,7 +318,22 @@ def _spec_resolve_error_detail(exc: BaseException) -> str:
     if status is not None:
         cause = f"{cause} HTTP {status.group(1)}"
     detail = _client_safe_error_detail(exc, context="spec resolve")
+    auth_error = next(
+        (error for error in (exc, exc.__cause__) if isinstance(error, DatabricksAuthError)), None
+    )
+    if auth_error is not None:
+        detail = _with_credential_remedy(auth_error, detail)
     return f"Could not load the agent spec ({cause}). {detail}"
+
+
+def _with_credential_remedy(error: DatabricksAuthError, detail: str) -> str:
+    """Prefix a client detail with a credential failure's message, written for the user.
+
+    :param error: e.g. ``DatabricksAuthError("... Run: databricks auth login -p dev")``.
+    :param detail: Client-safe detail from :func:`_client_safe_error_detail`.
+    :returns: e.g. ``"... Run: databricks auth login -p dev. Request failed on the runner; ..."``.
+    """
+    return f"{str(error).rstrip('.')}. {detail}"
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -8373,6 +8390,7 @@ def create_runner_app(
             async with _cond:
                 while _ingest_now_serving.get(conversation_id, 0) != _seq:
                     await _cond.wait()
+            turn_started = False
             try:
                 if _message_already_taken(conversation_id, message_body):
                     _logger.info(
@@ -8507,6 +8525,7 @@ def create_runner_app(
                     _session_histories[conversation_id] = loaded
 
                 _begin_turn_slot(conversation_id, message_body)
+                turn_started = True
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -8541,6 +8560,21 @@ def create_runner_app(
                         "detail": "Turn started.",
                     },
                 )
+            except DatabricksAuthError as exc:
+                # Without server credentials no history, attachment or spec request can succeed.
+                detail = _client_safe_error_detail(exc, context="message intake")
+                refusal = JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "runner_credentials_unavailable",
+                        "detail": _with_credential_remedy(exc, detail),
+                    },
+                )
+                if turn_started:
+                    _on_proxy_stream_end(
+                        conversation_id, error=_harness_error_response_error(refusal)
+                    )
+                return refusal
             finally:
                 async with _cond:
                     _ingest_now_serving[conversation_id] = _seq + 1

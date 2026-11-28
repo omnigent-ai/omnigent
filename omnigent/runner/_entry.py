@@ -1710,13 +1710,15 @@ async def _resolve_agent_spec_from_server(
     :returns: The parsed :class:`AgentSpec` plus its extracted bundle
         directory, or ``None`` when the server returns 404 for the
         requested agent.
-    :raises AgentSpecFetchError: For transport errors, 5xx responses or exhausted throttling.
+    :raises AgentSpecFetchError: For transport errors, credential failures, 5xx
+        responses or exhausted throttling.
     :raises RuntimeError: For other non-200 responses except 404.
     """
     from omnigent.automations_availability import (
         ACCEPTED_TOOL_GROUPS_HEADER,
         NEGOTIATED_TOOL_GROUPS,
     )
+    from omnigent.inner.databricks_executor import DatabricksAuthError
     from omnigent.mcp_selection import MCP_SELECTION_HEADER
     from omnigent.native.native_terminal import request_with_429_retry
 
@@ -1743,7 +1745,7 @@ async def _resolve_agent_spec_from_server(
             delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
             max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
         )
-    except httpx.TransportError as error:
+    except (httpx.TransportError, DatabricksAuthError) as error:
         raise AgentSpecFetchError(
             f"spec_resolver: GET {path} failed ({type(error).__name__})"
         ) from error

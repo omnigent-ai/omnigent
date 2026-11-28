@@ -1521,11 +1521,42 @@ def test_spec_resolve_error_detail_names_structured_cause(
     assert "internal-host" not in detail and "conv_x" not in detail
 
 
+@pytest.mark.parametrize(
+    "remedy",
+    [
+        "Databricks profile 'dev' is not authenticated. Run: databricks auth login -p dev",
+        "Host credential service could not supply workspace credentials.",
+    ],
+    ids=["command-remedy", "sentence-remedy"],
+)
+def test_spec_resolve_error_detail_relays_credential_remedy(
+    remedy: str, pinned_runner_log: Path
+) -> None:
+    """A credential failure's user-facing remedy reaches the client; the request path does not."""
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+    from omnigent.runner._entry import AgentSpecFetchError
+    from omnigent.runner.app import _spec_resolve_error_detail
+
+    error = AgentSpecFetchError("spec_resolver: GET /v1/sessions/conv_x/agent/contents failed")
+    error.__cause__ = DatabricksAuthError(remedy)
+
+    detail = _spec_resolve_error_detail(error)
+
+    assert detail == (
+        "Could not load the agent spec (AgentSpecFetchError (cause DatabricksAuthError)). "
+        f"{remedy.rstrip('.')}. "
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert "conv_x" not in detail
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
     [
         "outage",
+        "host-credential",
+        "credential-after-turn-start",
         "unsupported-policy",
         "codex-policy",
         "invalid-spec",
@@ -1544,22 +1575,45 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
 
     from unittest.mock import AsyncMock
 
+    from omnigent.inner.databricks_executor import DatabricksAuthError
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import (
         HarnessSandboxValidationError,
         UnsupportedHarnessSandboxError,
     )
+    from omnigent.runner._entry import (
+        _AgentSpecCache,
+        _resolve_agent_spec_from_server,
+        _RunnerDatabricksAuth,
+    )
+    from omnigent.runner.native.orchestration import ResolvedSpec
 
     session_id = f"conv_spec_resolver_failed_{failure}"
+    outage = failure in ("outage", "host-credential", "credential-after-turn-start")
     corrected = False
-    if failure == "codex-policy":
+    retried = failure in ("codex-policy", "credential-after-turn-start")
+    if retried:
         isolate_provider_resolution(monkeypatch, tmp_path / "config")
+
+    def _host_credential_service() -> str:
+        raise DatabricksAuthError("Host credential service could not supply workspace credentials")
 
     async def _failing_spec_resolver(
         agent_id: str, session_id: str | None = None
-    ) -> AgentSpec | None:
+    ) -> AgentSpec | ResolvedSpec | None:
         """Return an unsupported policy or raise a resolver outage."""
-        if failure == "codex-policy":
+        if failure == "host-credential":
+            async with httpx.AsyncClient(
+                base_url="http://server",
+                auth=_RunnerDatabricksAuth(_host_credential_service),
+                transport=httpx.MockTransport(lambda request: httpx.Response(503)),
+            ) as server_client:
+                return await _resolve_agent_spec_from_server(
+                    server_client, _AgentSpecCache(tmp_path / "spec-cache"), agent_id, session_id
+                )
+        if failure == "credential-after-turn-start" and not corrected:
+            _host_credential_service()
+        if retried:
             return AgentSpec(
                 spec_version=1,
                 name="restricted-agent",
@@ -1604,7 +1658,7 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                         "content": [],
                     },
                 )
-                assert response.status_code == (503 if failure == "outage" else 400)
+                assert response.status_code == (503 if outage else 400)
                 assert session_id not in app.state.active_turns
                 assert not app.state.session_message_buffers.get(session_id)
                 events = await _drain_turn_events(
@@ -1617,12 +1671,12 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                     event["status"] for event in events if event["type"] == "session.status"
                 ]
                 assert statuses == ["running", "failed"]
-                if failure != "outage":
+                if not outage:
                     failed = next(event for event in events if event.get("status") == "failed")
                     assert failed["error"] == response.json()["error"]
 
             get_client.assert_not_called()
-            if failure == "codex-policy":
+            if retried:
                 corrected = True
                 get_client.side_effect = None
                 get_client.return_value = _FakeHarnessClient(
@@ -1646,7 +1700,22 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                 assert not app.state.session_message_buffers.get(session_id)
 
     body = response.json()
-    if failure != "outage":
+    credential_message = "Host credential service could not supply workspace credentials"
+    runner_log_detail = (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    if failure == "host-credential":
+        assert body["error"] == "spec_resolver_failed"
+        assert body["detail"] == (
+            "Could not load the agent spec (AgentSpecFetchError (cause DatabricksAuthError)). "
+            f"{credential_message}. {runner_log_detail}"
+        )
+        return
+    if failure == "credential-after-turn-start":
+        assert body["error"] == "runner_credentials_unavailable"
+        assert body["detail"] == f"{credential_message}. {runner_log_detail}"
+        return
+    if not outage:
         assert body["error"]["code"] == "invalid_input"
         # Older servers read the flat detail instead of the structured error.
         assert body["detail"] == body["error"]["message"]
@@ -1684,6 +1753,96 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
     # If this fails, log-and-genericize logged nothing and the detail is the
     # only record of the failure — defeating the diagnostic path.
     assert "spec resolver unavailable for ag_missing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_runner_post_refuses_message_when_history_load_lacks_credentials(
+    pinned_runner_log: Path,
+) -> None:
+    """Credentials failing between history pages refuse the message and cache no history."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+    from omnigent.runner import app as runner_app
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+
+    remedy = "Host credential service could not supply workspace credentials"
+    session_id = "conv_history_without_credentials"
+    credentials_available = True
+    history_cursors: list[str | None] = []
+    first_item = {
+        "id": "item_1",
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "first"}],
+    }
+    second_item = {
+        "id": "item_2",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "second"}],
+    }
+    history_pages = {
+        None: {"data": [first_item], "has_more": True},
+        "item_1": {"data": [second_item], "has_more": False},
+    }
+
+    def _host_credential_service() -> str:
+        if not credentials_available:
+            raise DatabricksAuthError(remedy)
+        return "workspace-token"
+
+    def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal credentials_available
+        if request.url.path != f"/v1/sessions/{session_id}/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        cursor = request.url.params.get("after")
+        history_cursors.append(cursor)
+        if len(history_cursors) == 1:
+            credentials_available = False
+        return httpx.Response(200, json=history_pages[cursor])
+
+    spec_resolver = AsyncMock(side_effect=RuntimeError("spec resolver unavailable"))
+    message = {"type": "message", "role": "user", "agent_id": "ag_x", "model": "x", "content": []}
+    runner_app._session_histories_ref.pop(session_id, None)
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://server",
+            auth=_RunnerDatabricksAuth(_host_credential_service),
+            transport=httpx.MockTransport(_server_handler),
+        ) as server_client:
+            app = create_runner_app(
+                process_manager=cast(HarnessProcessManager, _FakeProcessManager()),
+                spec_resolver=spec_resolver,
+                server_client=server_client,
+            )
+            async with _runner_test_client(app) as http:
+                refused = await http.post(
+                    f"/v1/sessions/{session_id}/events?stream=true", json=message
+                )
+                assert session_id not in app.state.active_turns
+                assert session_id not in runner_app._session_histories_ref
+                spec_resolver.assert_not_called()
+
+                credentials_available = True
+                retried = await http.post(
+                    f"/v1/sessions/{session_id}/events?stream=true", json=message
+                )
+                cached = runner_app._session_histories_ref.get(session_id, [])
+    finally:
+        runner_app._session_histories_ref.pop(session_id, None)
+
+    assert refused.status_code == 503
+    assert refused.json() == {
+        "error": "runner_credentials_unavailable",
+        "detail": (
+            f"{remedy}. Request failed on the runner; see the runner log for details: "
+            f"{pinned_runner_log}"
+        ),
+    }
+    assert history_cursors == [None, None, "item_1"]
+    assert retried.json()["error"] == "spec_resolver_failed"
+    assert [item["id"] for item in cached] == ["item_1", "item_2", None]
 
 
 @pytest.mark.asyncio
