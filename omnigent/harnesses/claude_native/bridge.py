@@ -264,6 +264,7 @@ _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
 _FORKED_FROM_LINE_LIMIT = 200
 _TOOL_RELAY_FILE = "tool_relay.json"
+_RELAY_UNAVAILABLE_NOTICE_KEY = "unavailable_notice"
 # Shell-sourceable sibling of tool_relay.json so the curl-based hook
 # commands can discover the live relay without a JSON parser. Re-written
 # on every relay start, so hooks survive runner restarts (new port).
@@ -1493,17 +1494,28 @@ class ClaudeNativeToolRelay:
         self._tool_executor = tool_executor
         self._closed = closed
 
-    def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
+    def update_tools(
+        self,
+        tools: list[_JsonObject],
+        tool_executor: ToolExecutor,
+        *,
+        unavailable_notice: str | None = None,
+    ) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
 
         :param tools: Replacement tool schemas.
         :param tool_executor: Callback dispatching against the updated spec.
+        :param unavailable_notice: Agent-facing notice for configured tools that
+            could not be loaded; ``None`` clears a previous notice.
         """
         relay_info = {
             **self._relay_info,
             "tools": _normalize_relay_tool_specs(tools),
             "updated_at": time.time(),
         }
+        relay_info.pop(_RELAY_UNAVAILABLE_NOTICE_KEY, None)
+        if unavailable_notice:
+            relay_info[_RELAY_UNAVAILABLE_NOTICE_KEY] = unavailable_notice
         _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
         self._relay_info = relay_info
         self._advertised_tool_names = _relay_info_tool_names(relay_info)
@@ -8541,6 +8553,7 @@ def start_tool_relay(
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
+    unavailable_notice: str | None = None,
 ) -> ClaudeNativeToolRelay:
     """
     Start the shared relay for native-harness Omnigent tool calls.
@@ -8567,6 +8580,8 @@ def start_tool_relay(
         for each ``/hook/observe-tool`` payload; the runner uses it to
         record native file-mutating tool calls in the session's filesystem
         registry.
+    :param unavailable_notice: Agent-facing notice for configured tools that
+        could not be loaded, read back by :func:`read_relay_unavailable_notice`.
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
@@ -8607,6 +8622,8 @@ def start_tool_relay(
     }
     if session_id is not None:
         relay_info["session_id"] = session_id
+    if unavailable_notice:
+        relay_info[_RELAY_UNAVAILABLE_NOTICE_KEY] = unavailable_notice
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
     # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
     # Hooks source this file whenever they run, so it is replaced whole.
@@ -9788,6 +9805,17 @@ def _read_relay_tool_specs(bridge_dir: Path) -> list[_JsonObject]:
     if not isinstance(raw_tools, list):
         return []
     return [tool for tool in raw_tools if isinstance(tool, dict)]
+
+
+def read_relay_unavailable_notice(bridge_dir: Path) -> str | None:
+    """
+    Return the active relay's notice about configured tools it could not load.
+
+    :param bridge_dir: Bridge directory path used to read ``tool_relay.json``.
+    :returns: Notice text, or ``None`` when the relay has none.
+    """
+    notice = _read_json_file(bridge_dir / _TOOL_RELAY_FILE).get(_RELAY_UNAVAILABLE_NOTICE_KEY)
+    return notice if isinstance(notice, str) and notice else None
 
 
 def _call_relay_tool(

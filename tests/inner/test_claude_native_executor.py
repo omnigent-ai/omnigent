@@ -814,6 +814,57 @@ async def test_resize_notice_uses_hidden_hook_context(
 
 
 @pytest.mark.asyncio
+async def test_unloaded_relay_tools_are_named_in_hidden_context_until_they_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every prompt names configured tools the relay could not load, until they load."""
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+
+    async def _relay_executor(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        del name, arguments
+        return {}
+
+    contexts: list[str | None] = []
+
+    def _consume_context(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del content, timeout_s
+        context_path = bridge_dir_arg / "pending_framework_context.txt"
+        contexts.append(context_path.read_text() if context_path.exists() else None)
+        context_path.unlink(missing_ok=True)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _consume_context)
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = claude_bridge.prepare_bridge_dir("conv_unloaded_tools", workspace=tmp_path)
+    notice = "These MCP services are unavailable:\n- slack: MCP service returned HTTP 500."
+    dimensions = {"width": 6000, "height": 4000}
+    relay = claude_bridge.start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=_relay_executor,
+        loop=asyncio.get_running_loop(),
+        unavailable_notice=notice,
+    )
+    executor = ClaudeNativeExecutor(bridge_dir)
+    try:
+        first = [
+            {"type": "input_text", "text": "inspect this"},
+            framework_notice_block(dimensions),
+        ]
+        async for _ in executor.run_turn([{"role": "user", "content": first}], [], ""):
+            pass
+        assert await executor.enqueue_session_message("session", "is Slack configured?")
+        relay.update_tools([], _relay_executor)
+        async for _ in executor.run_turn([{"role": "user", "content": "and now?"}], [], ""):
+            pass
+    finally:
+        relay.close()
+
+    assert contexts == [f"{resize_notice(dimensions)}\n\n{notice}", notice, None]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error", [RuntimeError("injection failed"), ClaudePromptTimeout("timeout")]
 )

@@ -1493,7 +1493,7 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
     transport: Literal["registry", "http"],
     fail_once: bool,
 ) -> None:
-    """Native relays recover discovery on turns and withdraw tools on agent changes."""
+    """Native relays report and recover failed discovery and withdraw tools on agent changes."""
     requests: list[str] = []
 
     class GatewayClient(_SwitchableServerClient):
@@ -1561,6 +1561,8 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
                 names = _relay_tool_names(relay_file)
                 assert ("github__get_me" in names) is not fail_once
                 assert "list_comments" in names
+                notice = bridge.read_relay_unavailable_notice(bridge_dir)
+                assert (notice is not None and "gateway unavailable" in notice) is fail_once
                 assert requests == [
                     "/v1/mcp/github"
                     if transport == "registry"
@@ -1584,6 +1586,7 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
                 await asyncio.wait_for(turn_finished.wait(), timeout=5.0)
                 assert len(harness_client.posted_bodies) == 1
                 assert {"github__get_me", "list_comments"} <= _relay_tool_names(relay_file)
+                assert bridge.read_relay_unavailable_notice(bridge_dir) is None
                 discovery_count = len(requests)
                 assert discovery_count > 1
 
