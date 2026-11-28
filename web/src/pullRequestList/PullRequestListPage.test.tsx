@@ -1,6 +1,7 @@
 import { listRemovalOf } from "./subAgentRemoval";
 import { createRef } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type * as ReactVirtual from "@tanstack/react-virtual";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { CheckIcon, ExternalLinkIcon, XIcon } from "lucide-react";
@@ -804,6 +805,79 @@ describe("PullRequestListPage", () => {
       view.rerender(tree());
       expect(scrolledTo).toEqual([34, 0]);
     } finally {
+      vi.mocked(useVirtualizer).mockImplementation(passThrough);
+    }
+  });
+
+  it("scrolls a narrow list's revealed row into view at the rows' stacked height", async () => {
+    const { useVirtualizer } = await import("@tanstack/react-virtual");
+    const actual = await vi.importActual<typeof ReactVirtual>("@tanstack/react-virtual");
+    const passThrough = vi.mocked(useVirtualizer).getMockImplementation()!;
+    vi.mocked(useVirtualizer).mockImplementation(actual.useVirtualizer);
+    // A 400px-wide sidebar list, 300px tall, where the stylesheet draws each row 52px tall.
+    const viewport = { width: 400, height: 300 };
+    const narrowRow = 52;
+    const scrolls: number[] = [];
+    const restorers: (() => void)[] = [];
+    // jsdom does no layout: the list alone gets a box; every other element keeps jsdom's.
+    const stub = (key: string, descriptor: PropertyDescriptor) => {
+      const own = Object.getOwnPropertyDescriptor(HTMLElement.prototype, key);
+      Object.defineProperty(HTMLElement.prototype, key, { configurable: true, ...descriptor });
+      restorers.push(() => {
+        if (own) Object.defineProperty(HTMLElement.prototype, key, own);
+        else Reflect.deleteProperty(HTMLElement.prototype, key);
+      });
+    };
+    const listBox: Record<string, number> = {
+      clientWidth: viewport.width,
+      offsetWidth: viewport.width,
+      clientHeight: viewport.height,
+      offsetHeight: viewport.height,
+      scrollHeight: 100_000,
+    };
+    for (const [key, size] of Object.entries(listBox)) {
+      stub(key, {
+        get(this: HTMLElement) {
+          return this.classList.contains("pr-list-list") ? size : 0;
+        },
+      });
+    }
+    stub("scrollTo", {
+      writable: true,
+      value(this: HTMLElement, options: ScrollToOptions) {
+        if (options.top === undefined) return;
+        scrolls.push(options.top);
+        this.scrollTop = options.top;
+      },
+    });
+    fixture.rows = Array.from({ length: 40 }, (_, index) => row({ number: index + 1 }));
+    try {
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <PullRequestListPage
+            conversationId="conv_1"
+            active
+            associations={[]}
+            hostOffline={false}
+            sandboxAsleep={false}
+            onSelect={vi.fn()}
+            unlinkPending={false}
+            selectedUrl={fixture.rows[34]!.url}
+          />
+        </QueryClientProvider>,
+      );
+      // One group draws no header, so #35's top is 34 stacked rows down.
+      const rowTop = 34 * narrowRow;
+      // Every scroll away from the top lands the row in view, never at a wide row's offset first.
+      const reveals = () => scrolls.filter((top) => top !== 0);
+      await waitFor(() => expect(reveals().length).toBeGreaterThan(0));
+      for (const scrollTop of reveals()) {
+        expect(scrollTop).toBeLessThanOrEqual(rowTop);
+        expect(scrollTop + viewport.height).toBeGreaterThanOrEqual(rowTop + narrowRow);
+      }
+      expect(rowFor(fixture.rows[34]!.url)).toHaveAttribute("aria-current", "true");
+    } finally {
+      for (const restore of restorers) restore();
       vi.mocked(useVirtualizer).mockImplementation(passThrough);
     }
   });

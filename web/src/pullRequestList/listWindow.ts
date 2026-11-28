@@ -1,14 +1,29 @@
 // The Pull Requests list as one column of fixed-height items, so only the rows near the
 // viewport render: each group's header, then its rows. Rows and headers never wrap, so every
-// item's offset is known without measuring it.
+// item's offset follows from the list's width without measuring it.
 
 /** Rollback switch: off, the list draws and reads every row, as before windowing. */
 export const PULL_REQUEST_LIST_PAGES_FLAG = "pull-request-list-pages";
 
-/** A PR row's height, as `.pr-list-row` draws it. */
-export const LIST_ROW_HEIGHT = 36;
-/** A group header's height, as `.pr-list-group-header` draws it. */
-export const LIST_GROUP_HEADER_HEIGHT = 32;
+/** The items' heights at one list width, as `.pr-list-row` and `.pr-list-group-header` draw them. */
+export interface ListMetrics {
+  rowHeight: number;
+  headerHeight: number;
+}
+
+/** The widest list that stacks a row's metadata beneath its title, as the CSS container query. */
+export const NARROW_LIST_MAX_WIDTH = 620;
+export const WIDE_LIST_METRICS: ListMetrics = { rowHeight: 36, headerHeight: 32 };
+export const NARROW_LIST_METRICS: ListMetrics = { rowHeight: 52, headerHeight: 32 };
+/** A wide list's row height, for placeholders that don't follow the width. */
+export const LIST_ROW_HEIGHT = WIDE_LIST_METRICS.rowHeight;
+
+/** The heights a list of content width `width` draws; a list not laid out yet reads as wide. */
+export function listMetrics(width: number | undefined): ListMetrics {
+  return width !== undefined && width > 0 && width <= NARROW_LIST_MAX_WIDTH
+    ? NARROW_LIST_METRICS
+    : WIDE_LIST_METRICS;
+}
 
 export type ListItem =
   { kind: "header"; groupId: string } | { kind: "row"; groupId: string; url: string };
@@ -28,12 +43,17 @@ export interface ListLayout {
   /** Each row's item index, by URL. */
   rowIndex: ReadonlyMap<string, number>;
   totalHeight: number;
+  /** The heights the offsets and spacers use. */
+  metrics: ListMetrics;
 }
 
-export const itemHeight = (item: ListItem) =>
-  item.kind === "header" ? LIST_GROUP_HEADER_HEIGHT : LIST_ROW_HEIGHT;
+export const itemHeight = (item: ListItem, metrics: ListMetrics) =>
+  item.kind === "header" ? metrics.headerHeight : metrics.rowHeight;
 
-export function listLayout(groups: readonly ListGroupLayout[]): ListLayout {
+export function listLayout(
+  groups: readonly ListGroupLayout[],
+  metrics: ListMetrics = WIDE_LIST_METRICS,
+): ListLayout {
   const items: ListItem[] = [];
   const offsets: number[] = [];
   const rowIndex = new Map<string, number>();
@@ -42,13 +62,13 @@ export function listLayout(groups: readonly ListGroupLayout[]): ListLayout {
     if (item.kind === "row") rowIndex.set(item.url, items.length);
     items.push(item);
     offsets.push(offset);
-    offset += itemHeight(item);
+    offset += itemHeight(item, metrics);
   };
   for (const group of groups) {
     if (group.header) push({ kind: "header", groupId: group.id });
     for (const url of group.urls) push({ kind: "row", groupId: group.id, url });
   }
-  return { items, offsets, rowIndex, totalHeight: offset };
+  return { items, offsets, rowIndex, totalHeight: offset, metrics };
 }
 
 /** A group's part of the rendered window: the rows drawn, and the space left for the others. */
@@ -77,6 +97,7 @@ export function windowSlices(
   if (!drawn || drawn.length === 0 || layout.items.length === 0) {
     return { slices, before: 0, after: layout.totalHeight };
   }
+  const { rowHeight, headerHeight } = layout.metrics;
   const drawnIndices = new Set(drawn);
   let index = 0;
   let before: number | null = null;
@@ -91,22 +112,21 @@ export function windowSlices(
       if (drawnIndices.has(rowsStart + place)) drawnRows.push(place);
     });
     if (!(group.header && drawnIndices.has(first)) && drawnRows.length === 0) {
-      skipped +=
-        (group.header ? LIST_GROUP_HEADER_HEIGHT : 0) + group.urls.length * LIST_ROW_HEIGHT;
+      skipped += (group.header ? headerHeight : 0) + group.urls.length * rowHeight;
       continue;
     }
     if (before === null) before = skipped;
     const spaceAbove: number[] = [];
     let previous = -1;
     for (const place of drawnRows) {
-      spaceAbove.push((place - previous - 1) * LIST_ROW_HEIGHT);
+      spaceAbove.push((place - previous - 1) * rowHeight);
       previous = place;
     }
     slices.set(group.id, {
       above: slices.size === 0 ? 0 : skipped,
       urls: drawnRows.map((place) => group.urls[place]!),
       spaceAbove,
-      after: (group.urls.length - 1 - previous) * LIST_ROW_HEIGHT,
+      after: (group.urls.length - 1 - previous) * rowHeight,
     });
     skipped = 0;
   }

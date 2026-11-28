@@ -131,8 +131,10 @@ import {
 import { FILTER_FIELD_BY_ID } from "./pullRequestListFields";
 import type { ListFilter } from "./pullRequestListFilterModel";
 import { usePullRequestListFilters } from "./usePullRequestListFilters";
+import { useListMetrics } from "./useListMetrics";
 import {
   PULL_REQUEST_LIST_PAGES_FLAG,
+  type ListMetrics,
   itemHeight,
   listLayout,
   rowsIn,
@@ -1067,7 +1069,11 @@ export function PullRequestListPage(props: PullRequestListPageProps) {
       })),
     [groupFacts, shownRows],
   );
-  const layout = useMemo(() => listLayout(layoutGroups), [layoutGroups]);
+  const listMetrics = useListMetrics(listRef);
+  const layout = useMemo(
+    () => listLayout(layoutGroups, listMetrics.metrics),
+    [layoutGroups, listMetrics.metrics],
+  );
   const groupsRef = useRef<HTMLDivElement>(null);
   const groupsTop = useListGroupsTop(groupsRef, {
     nothingMatches: visible.length === 0,
@@ -1117,10 +1123,14 @@ export function PullRequestListPage(props: PullRequestListPageProps) {
     (range: Parameters<typeof drawnItems>[0]) => drawnItems(range, keptIndex),
     [keptIndex],
   );
+  // Keys name the row height, so a width change re-estimates every item at its new height.
+  const rowHeight = layout.metrics.rowHeight;
+  const getItemKey = useCallback((index: number) => `${rowHeight}:${index}`, [rowHeight]);
   const virtualizer = useVirtualizer({
     count: windowing ? layout.items.length : 0,
     getScrollElement: () => listRef.current,
-    estimateSize: (index) => itemHeight(layout.items[index]!),
+    getItemKey,
+    estimateSize: (index) => itemHeight(layout.items[index]!, layout.metrics),
     overscan: LIST_OVERSCAN,
     scrollMargin: groupsTop,
     rangeExtractor,
@@ -1138,18 +1148,26 @@ export function PullRequestListPage(props: PullRequestListPageProps) {
   revealRef.current = (url: string) => {
     const index = layout.rowIndex.get(url);
     if (windowing) {
-      if (index !== undefined) virtualizer.scrollToIndex(index, { align: "auto" });
+      // A width the list hasn't been laid out at yet reveals once it has, at the new offsets.
+      if (listMetrics.measured.current !== layout.metrics) pendingReveal.current = url;
+      else if (index !== undefined) virtualizer.scrollToIndex(index, { align: "auto" });
       return;
     }
     listRef.current
       ?.querySelector<HTMLElement>(`[data-pull-request-row="${CSS.escape(url)}"]`)
       ?.scrollIntoView({ block: "nearest" });
   };
-  // Rows a page brings in above the viewport, grouped or sorted in, leave the rows in view where
-  // they were; a change of order, grouping or filter moves the list as it always did.
-  const scrollAnchor = useRef<{ url: string; offset: number; order: string; count: number } | null>(
-    null,
-  );
+  const pendingReveal = useRef<string | null>(null);
+  // Rows a page brings in above the viewport, grouped or sorted in, and a width change that
+  // resizes the rows, leave the first row in view where it was; a change of order, grouping or
+  // filter moves the list as it always did.
+  const scrollAnchor = useRef<{
+    url: string;
+    offset: number;
+    order: string;
+    count: number;
+    metrics: ListMetrics;
+  } | null>(null);
   const orderKey = `${sort.key}:${sort.direction}|${display.grouping}|${effectiveFilter}|${query}`;
   useLayoutEffect(() => {
     if (!windowing) return;
@@ -1161,7 +1179,7 @@ export function PullRequestListPage(props: PullRequestListPageProps) {
       kept &&
       index !== undefined &&
       kept.order === orderKey &&
-      visible.length > kept.count
+      (visible.length > kept.count || kept.metrics !== layout.metrics)
     ) {
       const moved = layout.offsets[index]! - kept.offset;
       if (moved !== 0) element.scrollTop += moved;
@@ -1175,8 +1193,15 @@ export function PullRequestListPage(props: PullRequestListPageProps) {
             offset: layout.offsets[firstIndex]!,
             order: orderKey,
             count: visible.length,
+            metrics: layout.metrics,
           }
         : null;
+  });
+  useLayoutEffect(() => {
+    const url = pendingReveal.current;
+    if (url === null || listMetrics.measured.current !== layout.metrics) return;
+    pendingReveal.current = null;
+    revealRef.current(url);
   });
   // The rows in view, and the active and open rows wherever they are, read on the next render.
   const inViewKey = inView.join("\n");
