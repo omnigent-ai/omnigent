@@ -7304,13 +7304,13 @@ export async function startStreamPump(
     backfill: async (settleStatus) => {
       backfillRuns += 1;
       const run = backfillRuns;
-      const outcome = await reconcileOnReconnect(
-        id,
-        set,
-        get,
-        ignoredNativeMessageIds,
-        settleStatus,
-      );
+      const reconcile = () =>
+        reconcileOnReconnect(id, set, get, ignoredNativeMessageIds, settleStatus);
+      let outcome = await reconcile();
+      // A window reset during the reads, such as the first bind's snapshot, can predate the gap.
+      if (outcome === "skipped" && !controller.signal.aborted && !isConversationDisposed(id)) {
+        outcome = await reconcile();
+      }
       // A slower earlier run must not overwrite the latest run's outcome.
       if (run === backfillRuns) missedEventRecovery.backfillOwed = outcome === "failed";
     },
