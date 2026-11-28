@@ -16,7 +16,11 @@ from typing import Any
 from starlette.requests import HTTPConnection
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.uuid import normalize_uuid
@@ -44,30 +48,60 @@ def _project_of(lineage: list[Any]) -> str | None:
     return next((item.project_id for item in lineage if item.project_id), None)
 
 
+def is_agent_connection(connection: HTTPConnection) -> bool:
+    """Whether an agent's runner made the call: it names a source session or carries a token."""
+    return (
+        ORCHESTRATION_SOURCE_HEADER in connection.headers
+        or RUNNER_TUNNEL_TOKEN_HEADER in connection.headers
+    )
+
+
+def _calling_sessions(connection: HTTPConnection, conversations: ConversationStore) -> list[Any]:
+    """The agent session a call names, else the sessions bound to its runner token."""
+    named = _conversation(conversations, connection.headers.get(ORCHESTRATION_SOURCE_HEADER))
+    if named is not None:
+        return [named]
+    token = connection.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
+    if not token:
+        return []
+    return list(conversations.list_conversations_by_runner_id(token_bound_runner_id(token)))
+
+
 def agent_source(
     connection: HTTPConnection, conversations: ConversationStore
-) -> tuple[str, str] | None:
-    """The calling agent session and its project; ``None`` for a person or non-project agent."""
-    source = _conversation(conversations, connection.headers.get(ORCHESTRATION_SOURCE_HEADER))
-    if source is None:
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    """The calling agent's sessions and their projects; ``None`` for a person or non-project agent.
+
+    A call without a source header that carries a runner token counts as every session
+    bound to that runner, so leaving the header off reaches no further.
+    """
+    sessions = _calling_sessions(connection, conversations)
+    projects = {
+        project
+        for session in sessions
+        if (project := _project_of(_lineage(conversations, session)))
+    }
+    if not projects:
         return None
-    project = _project_of(_lineage(conversations, source))
-    return (source.id, project) if project else None
+    return frozenset(session.id for session in sessions), frozenset(projects)
 
 
 def hidden_from_agent(
-    conversations: ConversationStore, target: Any, source: tuple[str, str]
+    conversations: ConversationStore,
+    target: Any,
+    source: tuple[frozenset[str], frozenset[str]],
 ) -> bool:
     """Whether *target* is filed in another project and wasn't started by the calling agent."""
-    source_id, source_project = source
-    if target.project_id == source_project:
+    source_ids, source_projects = source
+    if target.project_id in source_projects:
         return False
     lineage = _lineage(conversations, target)
     project = target.project_id or _project_of(lineage)
-    if not project or project == source_project:
+    if not project or project in source_projects:
         return False
     started_by_source = any(
-        item.id == source_id or (item.labels or {}).get(CREATED_BY_SESSION_LABEL_KEY) == source_id
+        item.id in source_ids
+        or (item.labels or {}).get(CREATED_BY_SESSION_LABEL_KEY) in source_ids
         for item in lineage
     )
     return not started_by_source
@@ -90,7 +124,7 @@ def agent_session_scope(conversations: ConversationStore):
         )
         if not isinstance(session_id, str):
             return
-        if ORCHESTRATION_SOURCE_HEADER not in connection.headers:
+        if not is_agent_connection(connection):
             return
         if connection.scope.get("method") == "POST" and connection.url.path.endswith("/events"):
             # Session messages keep their own same-owner rule.

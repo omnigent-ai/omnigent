@@ -29,6 +29,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.requests import HTTPConnection
 
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
@@ -3386,6 +3387,7 @@ def register_core_routes(
     async def _fetch_watched_items(
         watched: list[str],
         user_id: str | None,
+        connection: HTTPConnection | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build current list-item payloads for the watched ids.
@@ -3447,6 +3449,16 @@ def register_core_routes(
             ]
 
         convs = await asyncio.to_thread(_load_sessions, accessible)
+        source = (
+            await asyncio.to_thread(agent_source, connection, conversation_store)
+            if connection is not None
+            else None
+        )
+        if source is not None:
+            # An agent watches only sessions it may read, as in the list.
+            convs = [
+                conv for conv in convs if not hidden_from_agent(conversation_store, conv, source)
+            ]
         if not convs:
             return []
         from omnigent.server.session_families import project_families
@@ -3600,7 +3612,7 @@ def register_core_routes(
         async def _emit_snapshot() -> None:
             """Send a full snapshot for the current watch-set and reset the
             diff baseline to it."""
-            items = await _fetch_watched_items(watched, user_id)
+            items = await _fetch_watched_items(watched, user_id, websocket)
             dumps = {item["id"]: item for item in items}
             last_sent.clear()
             last_sent.update(dumps)
@@ -3612,7 +3624,7 @@ def register_core_routes(
             been idle."""
             nonlocal last_send_monotonic
             if watched:
-                items = await _fetch_watched_items(watched, user_id)
+                items = await _fetch_watched_items(watched, user_id, websocket)
                 current = {item["id"]: item for item in items}
                 changed = [dump for cid, dump in current.items() if last_sent.get(cid) != dump]
                 # Removed = a still-watched id that no longer resolves (lost
@@ -3738,7 +3750,7 @@ def register_core_routes(
                         continue
                     async with emit_lock:
                         try:
-                            items = await _fetch_watched_items([sid], user_id)
+                            items = await _fetch_watched_items([sid], user_id, websocket)
                             if items and sid in watched:
                                 # The interval diff covers the row, but a grant
                                 # that leaves the row unchanged (e.g. a direct

@@ -73,6 +73,45 @@ async def test_an_agent_reads_only_its_own_project_and_unfiled_sessions(multi_us
     assert (await client.get(f"/v1/sessions/{other_lead}", headers=spoofed)).status_code == 404
 
 
+async def test_a_runner_token_call_without_a_source_header_is_scoped_too(
+    multi_user_client, db_uri
+):
+    """Leaving the source header off doesn't widen an agent's reach: its runner's sessions
+    stand in for it, on reads, on the session list and for a sub-agent's calls."""
+    client = multi_user_client
+    own = await _project(client, ALICE, "Own factory")
+    other = await _project(client, BOB, "Other factory")
+    await client.post(
+        f"/v1/projects/{other['id']}/shares", json={"user_id": ALICE}, headers=_as_user(BOB)
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    other_lead = other["main_session_id"]
+    agent = _agent_headers(db_uri, own["id"], ALICE)
+    token_only = {key: value for key, value in agent.items() if key != ORCHESTRATION_SOURCE_HEADER}
+
+    path = f"/v1/sessions/{other_lead}"
+    assert (await client.get(path, headers=_as_user(ALICE))).status_code == 200
+    for suffix in ("", "/items", "/comments"):
+        refused = await client.get(path + suffix, headers=token_only)
+        assert refused.status_code == 404, (suffix, refused.text)
+    own_lead = await client.get(f"/v1/sessions/{own['main_session_id']}", headers=token_only)
+    assert own_lead.status_code == 200, own_lead.text
+
+    listed = await client.get("/v1/sessions?kind=any&limit=100", headers=token_only)
+    assert listed.status_code == 200, listed.text
+    assert other_lead not in {row["id"] for row in listed.json()["data"]}
+
+    # A sub-agent of the calling session reaches no further than its parent.
+    source_id = agent[ORCHESTRATION_SOURCE_HEADER]
+    child = conversations.create_conversation(
+        parent_conversation_id=source_id,
+        agent_id=conversations.get_conversation(other_lead).agent_id,
+    )
+    SqlAlchemyPermissionStore(db_uri).grant(ALICE, child.id, LEVEL_OWNER)
+    as_child = {**token_only, ORCHESTRATION_SOURCE_HEADER: child.id}
+    assert (await client.get(path, headers=as_child)).status_code == 404
+
+
 def test_every_route_naming_a_session_carries_the_scope(multi_user_app):
     """Session routes on any router, websockets included, refuse other projects' sessions."""
     from fastapi.routing import APIWebSocketRoute
