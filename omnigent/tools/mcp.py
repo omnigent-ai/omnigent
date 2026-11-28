@@ -1793,4 +1793,4 @@ def _format_content_block(block: ContentBlock) -> str:
     if isinstance(block, TextContent):
         return block.text
     # All ContentBlock variants are Pydantic BaseModels.
-    return json.dumps(block.model_dump())
+    return json.dumps(block.model_dump(mode="json"))
