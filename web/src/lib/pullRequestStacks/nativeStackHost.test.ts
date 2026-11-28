@@ -1,6 +1,31 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { nativeStackMembers, type NativeStackReadAnswer } from "./nativeStackHost";
+const rpc = vi.hoisted(() => ({ answer: undefined as unknown, calls: [] as unknown[][] }));
+vi.mock("@/lib/pullRequestRpc", () => ({
+  readPullRequestRpc: async (
+    sessionId: string,
+    method: string,
+    read: (client: unknown) => Promise<{ payload?: unknown }>,
+    signal?: AbortSignal,
+  ) => {
+    const asked: unknown[] = [];
+    const client = {
+      getPullRequestNativeStack: async (request: unknown) => {
+        asked.push(request);
+        return { payload: rpc.answer };
+      },
+    };
+    const { payload } = await read(client);
+    rpc.calls.push([sessionId, method, asked, signal]);
+    return payload;
+  },
+}));
+
+import {
+  fetchNativeStackOnHost,
+  nativeStackMembers,
+  type NativeStackReadAnswer,
+} from "./nativeStackHost";
 import { memberFromWire, nativeStackFromWire } from "./nativeStackWire";
 
 /** A stack read as another member's record gives one, with its members' details. */
@@ -140,5 +165,55 @@ describe("nativeStackMembers", () => {
       native_stack: { stackEntry: null, stack: null },
     })!;
     expect(nativeStackMembers(read, SELF).members).toEqual([]);
+  });
+});
+
+describe("fetchNativeStackOnHost", () => {
+  it("reads the PR's stack through the session's host, by the PR's URL", async () => {
+    rpc.answer = WIRE;
+    rpc.calls = [];
+    const signal = new AbortController().signal;
+
+    const read = await fetchNativeStackOnHost("s1", "https://github.com/acme/app/pull/102", signal);
+
+    expect(rpc.calls).toEqual([
+      [
+        "s1",
+        "getPullRequestNativeStack",
+        [{ prUrl: "https://github.com/acme/app/pull/102" }],
+        signal,
+      ],
+    ]);
+    expect(read?.viewer).toBe("octo");
+    expect(read?.answer.stack?.entries.nodes.map(({ position }) => position)).toEqual([1, 2]);
+  });
+
+  it("reads a member the host blanked as outside the repository as a gap", async () => {
+    const outside = { position: 1, pullRequest: null, outside_repository: true };
+    rpc.answer = {
+      ...WIRE,
+      native_stack: {
+        ...WIRE.native_stack,
+        stack: {
+          ...WIRE.native_stack.stack,
+          entries: {
+            hasNextPage: false,
+            nodes: [outside, WIRE.native_stack.stack.entries.nodes[1]],
+          },
+        },
+      },
+    };
+
+    const read = await fetchNativeStackOnHost("s1", "https://github.com/acme/app/pull/102");
+
+    expect(read?.answer.stack?.entries.nodes[0]).toEqual({ position: 1, pullRequest: null });
+  });
+
+  it("can't say for a host without stacks, which answers with no viewer", async () => {
+    rpc.answer = { object: "pull_request_native_stack", supported: false, viewer: null };
+
+    expect(
+      await fetchNativeStackOnHost("s1", "https://github.com/acme/app/pull/102"),
+    ).toBeUndefined();
   });
 });

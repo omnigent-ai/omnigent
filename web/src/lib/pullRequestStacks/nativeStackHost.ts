@@ -1,6 +1,8 @@
 // GitHub's own record of a PR's stack, read through the session's host, and the members it
 // names. Where the host can't say, the page keeps to the PR's description.
 
+import { readPullRequestRpc } from "@/lib/pullRequestRpc";
+
 import { type NativeStackAnswer, readNativeStack } from "./nativeStack";
 import { memberFromWire, nativeStackFromWire } from "./nativeStackWire";
 import type { StackSelf } from "./stackModel";
@@ -33,8 +35,8 @@ export function nativeStackMembers(
 }
 
 /**
- * The host method that reads GitHub's own stack for a PR. It's unserved until the host adds it,
- * so until then the page keeps to the description's stack.
+ * The host method that reads GitHub's own stack for a PR. A host that doesn't serve it, such as
+ * an older one, leaves the page to the description's stack.
  */
 export const NATIVE_STACK_HOST_METHOD = "GetPullRequestNativeStack";
 
@@ -54,14 +56,19 @@ export type NativeStackHostRead = (
   signal?: AbortSignal,
 ) => Promise<unknown>;
 
-// No client binding exists until the host serves the method; nothing calls this while unserved.
-const unboundRead: NativeStackHostRead = () =>
-  Promise.reject(new Error(`${NATIVE_STACK_HOST_METHOD} has no client binding yet`));
-let hostRead: NativeStackHostRead = unboundRead;
+// The session's host answers in the shape the Mac shell gives, which the stack model parses.
+const workspaceRead: NativeStackHostRead = (sessionId, prUrl, signal) =>
+  readPullRequestRpc<unknown>(
+    sessionId,
+    "getPullRequestNativeStack",
+    (client) => client.getPullRequestNativeStack({ prUrl }),
+    signal,
+  );
+let hostRead: NativeStackHostRead = workspaceRead;
 
-/** Stand in for the host's answer in a test; null restores the unbound read. */
+/** Stand in for the host's answer in a test; null restores the workspace read. */
 export function setNativeStackHostReadForTests(read: NativeStackHostRead | null): void {
-  hostRead = read ?? unboundRead;
+  hostRead = read ?? workspaceRead;
 }
 
 /** GitHub's stack for `prUrl` as `sessionId`'s host reads it, or undefined when it can't say. */
