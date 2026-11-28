@@ -1424,6 +1424,18 @@ class GetPullRequestStackResponse(_message.Message):
     payload: _struct_pb2.Struct
     def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
 
+class GetPullRequestNativeStackRequest(_message.Message):
+    __slots__ = ("pr_url",)
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    def __init__(self, pr_url: _Optional[str] = ...) -> None: ...
+
+class GetPullRequestNativeStackResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
 class ReadPullRequestImageRequest(_message.Message):
     __slots__ = ("pr_url", "image_url")
     PR_URL_FIELD_NUMBER: _ClassVar[int]

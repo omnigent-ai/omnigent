@@ -31,6 +31,7 @@ import {
   RunnerOfflineError,
   browseLocationBase,
   browseLocationSegment,
+  finderQueryPrefix,
   isRunnerUnavailable503,
   listingCutOff,
   looksLikeWorkspaceFilePath,
@@ -2722,6 +2723,19 @@ describe("browse-location wire form (survives a slash-merging proxy)", () => {
       const seg = browseLocationSegment(location);
       expect(seg, expected).toBe(expected);
       expect(seg.includes("%2F"), "no %2F leading marker").toBe(false);
+    });
+  });
+
+  describe("finderQueryPrefix", () => {
+    it("starts within a workspace folder, and empty at the root or outside the workspace", () => {
+      expect(finderQueryPrefix("")).toBe("");
+      expect(finderQueryPrefix("src")).toBe("src/");
+      expect(finderQueryPrefix("src/shell/")).toBe("src/shell/");
+      // A POSIX folder may end in a literal backslash, which stays part of its name.
+      expect(finderQueryPrefix("src\\")).toBe("src\\/");
+      expect(finderQueryPrefix("/etc")).toBe("");
+      expect(finderQueryPrefix("C:\\Users")).toBe("");
+      expect(finderQueryPrefix("c:/Users")).toBe("");
     });
   });
 

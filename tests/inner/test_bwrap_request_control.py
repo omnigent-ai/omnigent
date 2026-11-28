@@ -28,9 +28,11 @@ import pytest
 
 from omnigent.inner import _bwrap_request_control as request_control
 from omnigent.inner import _bwrap_request_init as request_init
+from omnigent.inner._bounded_output import CapturedOutput
 from omnigent.inner.bwrap_sandbox import BwrapRequestFds, BwrapSandboxBackend
 from omnigent.inner.sandbox import SandboxPolicy
 from tests._helpers.polling import poll_until
+from tests._helpers.shell_lifecycle import detached_output_command
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="Linux pidfd and credential metadata"
@@ -100,14 +102,25 @@ def readiness(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock, Ma
     return control, process, close
 
 
+@pytest.mark.parametrize("encoding", [None, b"utf-8", b"ISO-8859-1"])
 def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
     readiness: tuple[MagicMock, MagicMock, MagicMock],
+    encoding: bytes | None,
 ) -> None:
     control, process, close = readiness
+    if encoding is not None:
+        payload, metadata, flags, address = control.recvmsg.return_value
+        control.recvmsg.return_value = (payload + b":" + encoding, metadata, flags, address)
     owner = request_control.BwrapRequestControl.receive(
-        control, process, _TOKEN, expected_init_pid=73, launcher_pidfd=_LAUNCHER_FD
+        control,
+        process,
+        _TOKEN,
+        expected_init_pid=73,
+        launcher_pidfd=_LAUNCHER_FD,
+        encoding_required=encoding is not None,
     )
     assert not owner.admitted and not owner.done.is_set()
+    assert owner._encoding == (encoding.decode("ascii") if encoding is not None else None)
     request_control.os.set_inheritable.assert_called_once_with(_INIT_FD, False)
     assert control.recvmsg.call_args.args[2] == socket.MSG_CMSG_CLOEXEC
     control.send.assert_not_called()
@@ -115,26 +128,35 @@ def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
 
 
 @pytest.mark.parametrize(
-    "problem",
+    "problem, encoding_required",
     [
-        "token",
-        "missing-credentials",
-        "sender",
-        "uid",
-        "not-pid-one",
-        "dead-pidfd",
-        "foreign-pidfd",
-        "extra-handle",
-        "truncated",
-        "unexpected-before-rights",
-        "family",
-        "launcher",
+        (problem, False)
+        for problem in (
+            "token",
+            "missing-credentials",
+            "sender",
+            "uid",
+            "not-pid-one",
+            "dead-pidfd",
+            "foreign-pidfd",
+            "extra-handle",
+            "truncated",
+            "unexpected-before-rights",
+            "family",
+            "launcher",
+        )
+    ]
+    + [(problem, True) for problem in ("token", "sender", "truncated", "payload-truncated")]
+    + [
+        ("encoding-" + problem, True)
+        for problem in ("missing", "empty", "unknown", "oversized", "non-ascii")
     ],
 )
 def test_invalid_readiness_never_admits_and_releases_every_received_handle(
     monkeypatch: pytest.MonkeyPatch,
     readiness: tuple[MagicMock, MagicMock, MagicMock],
     problem: str,
+    encoding_required: bool,
 ) -> None:
     control, process, close = readiness
     payload, metadata, flags, address = control.recvmsg.return_value
@@ -175,12 +197,28 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
         metadata[0] = (socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", handles).tobytes())
     elif problem == "truncated":
         flags = socket.MSG_CTRUNC
-    else:
+    elif problem == "payload-truncated":
+        flags = socket.MSG_TRUNC
+    elif problem == "unexpected-before-rights":
         metadata.insert(0, (socket.SOL_SOCKET, -1, b"unknown"))
+    encoding = {
+        "encoding-missing": None,
+        "encoding-empty": b"",
+        "encoding-unknown": b"unknown-encoding",
+        "encoding-oversized": b"x" * 129,
+        "encoding-non-ascii": b"\xff",
+    }.get(problem, b"utf-8")
+    if encoding_required and encoding is not None:
+        payload += b":" + encoding
     control.recvmsg.return_value = (payload, metadata, flags, address)
     with pytest.raises((OSError, ValueError)):
         request_control.BwrapRequestControl.receive(
-            control, process, _TOKEN, expected_init_pid=73, launcher_pidfd=_LAUNCHER_FD
+            control,
+            process,
+            _TOKEN,
+            expected_init_pid=73,
+            launcher_pidfd=_LAUNCHER_FD,
+            encoding_required=encoding_required,
         )
     assert sorted(call.args[0] for call in close.call_args_list) == sorted(handles)
     control.send.assert_not_called()
@@ -313,6 +351,74 @@ def test_completion_waits_for_each_pinned_lifetime_and_output(
     assert set(kills) == ({_INIT_FD, _LAUNCHER_FD} if timed_out else set())
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
     assert case.owner.admitted and case.owner.done.is_set()
+
+
+@pytest.mark.parametrize(
+    "ending", ["complete", "timeout", "cancel", "read-error", "drain-error", "wait-error"]
+)
+def test_encoded_requests_bound_capture_and_never_accumulate_output_through_communicate(
+    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase, ending: str
+) -> None:
+    case = request_case
+    case.owner._encoding = "utf-8"
+    capture = MagicMock()
+    capture.result.return_value = (
+        CapturedOutput("out", 1000, nonblank=True),
+        CapturedOutput("err", 2000, nonblank=True),
+    )
+
+    def poll(_timeout: float) -> bool:
+        assert not case.owner.done.is_set()
+        case.exited.update({_INIT_FD: True, _LAUNCHER_FD: True})
+        if ending == "cancel":
+            case.owner.cancel()
+        if ending == "read-error":
+            raise OSError("pipe read failed")
+        return True
+
+    capture.poll.side_effect = poll
+    if ending == "drain-error":
+        capture.drain.side_effect = OSError("capture drain failed")
+    elif ending == "wait-error":
+        case.process.wait.side_effect = OSError("process wait failed")
+    construct = MagicMock(return_value=capture)
+    monkeypatch.setattr(request_control, "BoundedPipeCapture", construct)
+    if ending == "timeout":
+        clock = iter([0.0])
+        monkeypatch.setattr(request_control, "monotonic", lambda: next(clock, 2.0))
+    if ending == "cancel":
+        with pytest.raises(request_control.RequestCancelled):
+            case.owner.run(deadline=1.0, max_output=3)
+    elif ending in {"read-error", "drain-error", "wait-error"}:
+        message = {
+            "read-error": "pipe read failed",
+            "drain-error": "capture drain failed",
+            "wait-error": "process wait failed",
+        }[ending]
+        with pytest.raises(OSError, match=message):
+            case.owner.run(deadline=1.0, max_output=3)
+    else:
+        result = case.owner.run(deadline=1.0, max_output=3)
+        assert result.stdout == CapturedOutput("out", 1000, nonblank=True)
+        assert result.timed_out == (ending == "timeout")
+    construct.assert_called_once_with(
+        case.process.stdout, case.process.stderr, encoding="utf-8", max_chars=3
+    )
+    case.process.communicate.assert_not_called()
+    capture.drain.assert_called_once()
+    capture.close.assert_called_once()
+    case.process.wait.assert_called_once()
+    assert case.owner.done.is_set()
+    assert sorted(fd for action, fd in case.events if action == "close") == [
+        _INIT_FD,
+        _LAUNCHER_FD,
+    ]
+    case.control.close.assert_called_once()
+    for stream in (case.process.stdin, case.process.stdout, case.process.stderr):
+        stream.close.assert_called_once()
+    retired_events = list(case.events)
+    case.owner.cancel()
+    assert case.events == retired_events
 
 
 @pytest.mark.parametrize("refusal", ["cancelled", "deadline", "init-exited", "launcher-exited"])
@@ -672,32 +778,6 @@ class _LiveBwrapRequest:
 @pytest.fixture
 def live_bwrap_request(tmp_path: Path, ending: str) -> Iterator[_LiveBwrapRequest]:
     descendant_ready = tmp_path / "descendant-ready"
-    descendant = """
-import signal, sys
-from pathlib import Path
-print("descendant-ready", flush=True)
-print("descendant-stderr", file=sys.stderr, flush=True)
-Path(sys.argv[1]).write_text("ready")
-signal.pause()
-"""
-    command = """
-import signal, subprocess, sys, time
-from pathlib import Path
-subprocess.Popen(
-    [sys.executable, "-I", "-S", "-c", sys.argv[3], sys.argv[1]],
-    start_new_session=True,
-)
-ready = Path(sys.argv[1])
-deadline = time.monotonic() + 5
-while not ready.exists():
-    if time.monotonic() >= deadline:
-        raise RuntimeError("Descendant did not start")
-    time.sleep(0.01)
-if sys.argv[2] == "complete":
-    print("command-complete", flush=True)
-    raise SystemExit(7)
-signal.pause()
-"""
     policy = SandboxPolicy(
         backend_type="linux_bwrap",
         active=True,
@@ -724,16 +804,9 @@ signal.pause()
             json.dumps(
                 {
                     "token": _TOKEN.decode("ascii"),
-                    "argv": [
-                        sys.executable,
-                        "-I",
-                        "-S",
-                        "-c",
-                        command,
-                        str(descendant_ready),
-                        ending,
-                        descendant,
-                    ],
+                    "argv": detached_output_command(
+                        descendant_ready, ending, exit_code=7, ready_timeout=5
+                    ),
                     "cwd": str(tmp_path),
                     "env": {"PATH": os.defpath, "LANG": "C.UTF-8"},
                 }

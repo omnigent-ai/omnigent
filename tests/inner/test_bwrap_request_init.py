@@ -6,10 +6,14 @@ import array
 import errno
 import io
 import json
+import logging
 import signal
 import socket
 import subprocess
-from unittest.mock import MagicMock
+import sys
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -33,7 +37,12 @@ def _control_socket() -> MagicMock:
 def init_calls(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
     protection = MagicMock()
     monkeypatch.setattr(request_init, "_protect_init", protection)
-    monkeypatch.setattr(request_init.os, "pidfd_open", MagicMock(return_value=41), raising=False)
+    monkeypatch.setattr(
+        request_init.os,
+        "pidfd_open",
+        MagicMock(side_effect=lambda pid: 41 if pid == 1 else 42),
+        raising=False,
+    )
     monkeypatch.setattr(request_init.os, "close", MagicMock())
     process = MagicMock(spec=subprocess.Popen)
     process.pid = 73
@@ -82,7 +91,7 @@ def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_re
     control = _control_socket()
     control.fileno.return_value = control_fd
     poller = MagicMock()
-    poller.poll.return_value = []
+    poller.poll.return_value = [(42, request_init.select.POLLIN)]
     monkeypatch.setattr(request_init.select, "poll", lambda: poller, raising=False)
 
     def limited_select(channels: list[MagicMock], *_args: object) -> tuple[list, list, list]:
@@ -129,8 +138,12 @@ def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_re
     control.set_inheritable.assert_called_once_with(False)
     control.send.assert_called_once_with(result)
     assert launch.return_value.returncode == expected_exit
-    poller.register.assert_called_once_with(control_fd, request_init.select.POLLIN)
+    assert poller.register.call_args_list == [
+        call(control_fd, request_init.select.POLLIN),
+        call(42, request_init.select.POLLIN),
+    ]
     poller.poll.assert_called_once_with(50)
+    assert request_init.os.close.call_args_list == [call(41), call(42)]
 
 
 def test_child_interrupt_cannot_replace_the_commands_exact_result(
@@ -225,7 +238,7 @@ def test_control_transport_must_frame_messages_and_report_owner_loss(
 
 @pytest.mark.parametrize("frame", [b"", b"admit:" + _TOKEN])
 def test_owner_channel_loss_or_repeated_admission_exits_the_init(
-    monkeypatch: pytest.MonkeyPatch, frame: bytes
+    monkeypatch: pytest.MonkeyPatch, init_calls: tuple[MagicMock, MagicMock], frame: bytes
 ) -> None:
     control = _control_socket()
     control.recv.return_value = frame
@@ -236,11 +249,42 @@ def test_owner_channel_loss_or_repeated_admission_exits_the_init(
     with pytest.raises(ConnectionError, match="owner channel ended"):
         request_init._wait_for_command(control, 73)
     control.send.assert_not_called()
+    request_init.os.close.assert_called_once_with(42)
+
+
+def test_invalid_command_handle_is_closed_without_inventing_a_command_result(
+    monkeypatch: pytest.MonkeyPatch, init_calls: tuple[MagicMock, MagicMock]
+) -> None:
+    control = _control_socket()
+    monkeypatch.setattr(request_init.os, "waitpid", lambda *_: (0, 0))
+    poller = MagicMock()
+    poller.poll.return_value = [(42, request_init.select.POLLNVAL)]
+    monkeypatch.setattr(request_init.select, "poll", lambda: poller, raising=False)
+    with pytest.raises(OSError, match="Command lifetime descriptor is invalid"):
+        request_init._wait_for_command(control, 73)
+    request_init.os.close.assert_called_once_with(42)
+    control.send.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "change",
-    [{"token": "z" * 64}, {"argv": []}, {"cwd": "relative"}, {"env": {"BAD=KEY": "x"}}],
+    [
+        {"token": "z" * 64},
+        {"argv": []},
+        {"cwd": "relative"},
+        {"env": {"BAD=KEY": "x"}},
+        {"relay": []},
+        {"relay": {"source": "relative", "port": 1234, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": True, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": 65536, "socket_path": "/broker"}},
+        {"relay": {"source": "/relay.py", "port": 1234, "socket_path": "relative"}},
+        {"report_encoding": "yes"},
+        {"output_encoding": ""},
+        {"output_encoding": 123},
+        {"output_encoding": "not-a-codec"},
+        {"output_encoding": "utf-8" * 26},
+        {"output_encoding": "utf-8\u2603"},
+    ],
 )
 def test_config_is_validated_before_readiness(
     monkeypatch: pytest.MonkeyPatch, change: dict[str, object]
@@ -267,6 +311,89 @@ def test_config_preserves_exact_command_and_environment(monkeypatch: pytest.Monk
     result = request_init._read_request_config(41)
     assert result.argv == tuple(config["argv"])
     assert result.cwd == config["cwd"] and result.env == config["env"]
+
+
+@pytest.mark.parametrize(
+    ("utf8_mode", "output_encoding"),
+    [(False, None), (True, None), (True, "ascii"), (False, "utf-8")],
+)
+def test_request_starts_its_own_relay_after_protection_and_reports_the_child_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    init_calls: tuple[MagicMock, MagicMock],
+    utf8_mode: bool,
+    output_encoding: str | None,
+) -> None:
+    control = _control_socket()
+    control.recv.return_value = b"admit:" + _TOKEN
+    control.sendmsg.side_effect = lambda buffers, _metadata: len(buffers[0])
+    control.send.side_effect = len
+    monkeypatch.setattr(request_init, "_wait_for_command", lambda *_: 0)
+    monkeypatch.setattr(
+        request_init, "sys", SimpleNamespace(flags=SimpleNamespace(utf8_mode=utf8_mode))
+    )
+    monkeypatch.setattr(request_init.locale, "getencoding", lambda: "ISO-8859-1")
+    relay_logger = logging.getLogger(request_init._RELAY_MODULE)
+    monkeypatch.setattr(relay_logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(relay_logger, "propagate", False)
+
+    def launch_command(*_args: object, **_kwargs: object) -> MagicMock:
+        print("command stdout")
+        print("command stderr", file=sys.stderr)
+        return init_calls[1].return_value
+
+    init_calls[1].side_effect = launch_command
+
+    def start_relay(port: int, path: str) -> SimpleNamespace:
+        init_calls[0].assert_called_once()
+        init_calls[1].assert_not_called()
+        control.sendmsg.assert_not_called()
+        assert (port, path) == (1234, "/private/broker.sock")
+        relay_logger.warning("Internal relay connection diagnostic")
+        return SimpleNamespace(wait=lambda _timeout: True)
+
+    load = MagicMock(return_value={"start_relay": start_relay})
+    monkeypatch.setattr(request_init.runpy, "run_path", load)
+    config = replace(
+        _CONFIG,
+        relay=request_init._RelayConfig("/runtime/relay.py", 1234, "/private/broker.sock"),
+        report_encoding=True,
+        output_encoding=output_encoding,
+    )
+    request_init._run_request(control, config)
+    load.assert_called_once_with("/runtime/relay.py", run_name=request_init._RELAY_MODULE)
+    captured = capsys.readouterr()
+    assert captured.out == "command stdout\n"
+    assert captured.err == "command stderr\n"
+    expected = (
+        config.output_encoding.encode("ascii")
+        if config.output_encoding is not None
+        else b"utf-8"
+        if utf8_mode
+        else b"ISO-8859-1"
+    )
+    assert control.sendmsg.call_args.args[0] == [b"ready:" + _TOKEN + b":" + expected]
+    init_calls[1].assert_called_once()
+
+
+@pytest.mark.parametrize("failure", ["bind", "readiness"])
+def test_relay_start_failure_never_publishes_readiness_or_runs_a_command(
+    monkeypatch: pytest.MonkeyPatch, init_calls: tuple[MagicMock, MagicMock], failure: str
+) -> None:
+    control = _control_socket()
+    start = MagicMock(return_value=SimpleNamespace(wait=lambda _timeout: False))
+    if failure == "bind":
+        start.side_effect = OSError("relay bind failed")
+    monkeypatch.setattr(
+        request_init.runpy, "run_path", MagicMock(return_value={"start_relay": start})
+    )
+    config = replace(
+        _CONFIG, relay=request_init._RelayConfig("/runtime/relay.py", 1234, "/broker.sock")
+    )
+    with pytest.raises(OSError, match=r"relay bind failed|relay did not become ready"):
+        request_init._run_request(control, config)
+    control.sendmsg.assert_not_called()
+    init_calls[1].assert_not_called()
 
 
 @pytest.mark.parametrize(

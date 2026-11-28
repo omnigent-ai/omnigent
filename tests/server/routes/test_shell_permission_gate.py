@@ -1393,6 +1393,7 @@ _PR_OWNER_METHODS = {
     "EnqueuePullRequest": {"expectedHeadOid": "a" * 40},
     "DequeuePullRequest": {},
     "GetPullRequestStack": {},
+    "GetPullRequestNativeStack": {},
     "SearchReviewers": {"text": "al", "pageSize": 5},
     "SearchCompletions": {"kind": "COMPLETION_KIND_MENTION", "text": "al"},
     "LookupPullRequest": {},

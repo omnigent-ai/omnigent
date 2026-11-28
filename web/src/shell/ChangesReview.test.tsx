@@ -471,6 +471,10 @@ describe("ChangesReview", () => {
     renderReview();
     expect(screen.getByText("Comparing with the branch point…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Change compared revisions" })).toBeInTheDocument();
+    // The loading toolbar draws the tree's icon at the right, where its toggle will be.
+    const toolbar = screen.getByRole("toolbar", { name: "Diff review" });
+    expect(toolbar.lastElementChild).toBe(screen.getByTestId("diff-review-tree-placeholder"));
+    expect(screen.getByTestId("diff-review-tree-placeholder")).toHaveClass("ml-auto");
   });
 
   it("offers Resume while the sandbox sleeps, never calling an unread working copy clean", () => {

@@ -13,6 +13,7 @@ import {
 } from "@/hooks/useFileContent";
 import type { CodeMirrorFileEditor } from "@/shell/codeMirror/CodeMirrorFileEditor";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { readFileViewPreferences, writeStickyScroll } from "@/lib/fileViewPreferences";
 import type { FileViewer } from "@/shell/FileViewer";
 import { useFileFinderStore } from "@/store/fileFinder";
 
@@ -143,10 +144,10 @@ describe("FilesPageViewer", () => {
     expect(useFileContent).toHaveBeenCalledWith("conv_1", "a.ts", { visible: false });
   });
 
-  it("edits text in CodeMirror at the cited position, with Show changes and Close in its toolbar", async () => {
+  it("edits text in CodeMirror at the cited position, with Show changes and no Close in its toolbar", async () => {
     const onShowChanges = vi.fn();
     const position = { line: 3 };
-    const { onClose } = renderViewer(
+    renderViewer(
       "src/a.ts",
       { data: file("src/a.ts", "const a = 1;", { truncated: true }) },
       { onShowChanges, position },
@@ -155,8 +156,21 @@ describe("FilesPageViewer", () => {
     expect(captured.editor).toMatchObject({ path: "src/a.ts", truncated: true, position });
     await userEvent.click(screen.getByRole("button", { name: "Show changes" }));
     expect(onShowChanges).toHaveBeenCalledTimes(1);
-    await userEvent.click(screen.getByRole("button", { name: "Close file" }));
-    expect(onClose).toHaveBeenCalledTimes(1);
+    // The tab's own close button closes the file, so the toolbar has no Close.
+    expect(screen.queryByRole("button", { name: "Close file" })).toBeNull();
+  });
+
+  it("ends a text file's toolbar with the tree's toggle, after the file's actions", () => {
+    renderViewer(
+      "src/a.ts",
+      { data: file("src/a.ts", "const a = 1;") },
+      { toolbarTrailing: <button type="button">Hide tree</button>, onShowChanges: vi.fn() },
+    );
+    const toggle = screen.getByRole("button", { name: "Hide tree" });
+    const toolbar = toggle.parentElement!;
+    expect(toolbar.lastElementChild).toBe(toggle);
+    const actions = within(toolbar).getByRole("button", { name: "File actions" });
+    expect(actions.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("offers no Show changes button where the file has no changes view", () => {
@@ -164,7 +178,7 @@ describe("FilesPageViewer", () => {
     expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
   });
 
-  it("puts find, the file's paths, its download and the finders in File actions", async () => {
+  it("puts find, the file's paths, its download and view settings, and the finders in File actions", async () => {
     useFileFinderStore.getState().setAvailableSession("conv_1", { textSearch: true });
     renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
     await userEvent.click(screen.getByRole("button", { name: "File actions" }));
@@ -176,6 +190,7 @@ describe("FilesPageViewer", () => {
       "Copy path",
       "Copy link to file",
       "Download file",
+      "Sticky scroll",
       "Go to File in Workspace…",
       "Search Text in Workspace…",
     ]);
@@ -199,6 +214,23 @@ describe("FilesPageViewer", () => {
     expect(captured.editor!.searchFocusNonce).not.toBe(firstRequest);
     act(() => captured.editor!.onSearchHandled!());
     expect(captured.editor!.searchOpen).toBe(false);
+  });
+
+  it("turns sticky scroll off and on from File actions, keeping the menu open", async () => {
+    writeStickyScroll(true);
+    renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
+    await userEvent.click(screen.getByRole("button", { name: "File actions" }));
+    const row = screen.getByRole("menuitemcheckbox", { name: "Sticky scroll" });
+    expect(row).toHaveAttribute("aria-checked", "true");
+    await userEvent.click(row);
+    expect(readFileViewPreferences().stickyScroll).toBe(false);
+    expect(screen.getByRole("menuitemcheckbox", { name: "Sticky scroll" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(captured.editor!.stickyScroll).toBe(false);
+    await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sticky scroll" }));
+    expect(readFileViewPreferences().stickyScroll).toBe(true);
   });
 
   it.each([
@@ -337,22 +369,24 @@ describe("FilesPageViewer", () => {
     expect(captured.viewer!.permissionLevel).toBe(1);
   });
 
-  it("keeps the tree toggle, Show changes and Close above a rich file, without repeating its path", async () => {
+  it("hands a rich file's one toolbar row to the app's viewer, with the tree's toggle and Show changes", () => {
     const onShowChanges = vi.fn();
-    const { onClose } = renderViewer(
+    const toggle = <button type="button">Show tree</button>;
+    renderViewer(
       "docs/guide.md",
       { data: file("docs/guide.md", "# Guide") },
-      { toolbarLeading: <button type="button">Show tree</button>, onShowChanges },
+      { toolbarTrailing: toggle, onShowChanges },
     );
-    expect(screen.getByRole("button", { name: "Show tree" })).toBeInTheDocument();
-    // The app's viewer has its own actions, so the toolbar adds no File actions.
+    // The viewer draws the row beside the tree, so the page draws none of its own.
+    expect(captured.viewer).toMatchObject({
+      besideSidebar: true,
+      frameless: true,
+      toolbarTrailing: toggle,
+      onShowChanges,
+    });
+    expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
     expect(screen.queryByRole("button", { name: "File actions" })).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Show changes" }));
-    expect(onShowChanges).toHaveBeenCalledTimes(1);
-    await userEvent.click(screen.getByRole("button", { name: "Close file" }));
-    expect(onClose).toHaveBeenCalledTimes(1);
-    // The viewer's own header names the file.
-    expect(screen.getAllByText("docs/guide.md")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Close file" })).toBeNull();
   });
 
   it("shows a spinner while loading, and why a file couldn't open", () => {

@@ -118,6 +118,11 @@ def refuse_unserved_request(method: str, request: Any) -> None:
         reason = _list_stats_refusal(request.pr_urls)
     elif method == "ListBranchPullRequests":
         reason = _branch_refusal(request.branch)
+    elif (
+        method == "GetPullRequestNativeStack"
+        and len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS
+    ):
+        reason = _LONG_PULL_REQUEST_URL
     elif method == "EnableAutoMerge":
         reason = _auto_merge_refusal(request)
     elif method == "ReadPullRequestImage":

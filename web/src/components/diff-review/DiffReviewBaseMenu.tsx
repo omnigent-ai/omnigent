@@ -115,7 +115,9 @@ export function DiffReviewBaseMenu({
                   </span>
                 )}
                 {choice.unavailableReason && (
-                  <span className="text-xs text-muted-foreground">{choice.unavailableReason}</span>
+                  <span className="whitespace-normal text-xs text-muted-foreground">
+                    {choice.unavailableReason}
+                  </span>
                 )}
               </span>
             </DropdownMenuRadioItem>

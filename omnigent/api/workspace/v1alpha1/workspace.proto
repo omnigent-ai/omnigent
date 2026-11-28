@@ -239,6 +239,11 @@ service WorkspaceService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
 
+  // GitHub's own record of the stack this pull request is in, where its host has stacks.
+  rpc GetPullRequestNativeStack(GetPullRequestNativeStackRequest) returns (GetPullRequestNativeStackResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
   // The pull requests for a branch of the workspace's own repository.
   rpc ListBranchPullRequests(ListBranchPullRequestsRequest) returns (ListBranchPullRequestsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
@@ -1532,6 +1537,14 @@ message GetPullRequestStackRequest {
 }
 
 message GetPullRequestStackResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetPullRequestNativeStackRequest {
+  string pr_url = 1;
+}
+
+message GetPullRequestNativeStackResponse {
   google.protobuf.Struct payload = 1;
 }
 

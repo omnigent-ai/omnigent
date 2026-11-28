@@ -60,6 +60,7 @@ export function useShortcutPageContext(): ShortcutPageContext {
     splitTerminal: !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
     desktopCommands: supportsDesktopCommands(),
     siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
+    quickPick: isFeatureEnabled(serverInfo, "quick_pick_palette"),
   };
 }
 
