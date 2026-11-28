@@ -139,7 +139,7 @@ async def terminate_direct_subprocess(
         close_subprocess_transport(proc)
 
 
-async def await_cleanup_task(task: asyncio.Task[Any]) -> None:  # type: ignore[explicit-any]
+async def await_cleanup_task(task: asyncio.Future[Any]) -> None:  # type: ignore[explicit-any]
     """Await cleanup despite repeated caller cancellation, then propagate errors."""
     while not task.done():
         try:

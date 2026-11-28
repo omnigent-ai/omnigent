@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -73,6 +74,7 @@ from omnigent.runner.app import (
 from omnigent.runner.native.orchestration import (
     _build_pi_native_args,
     _codex_own_memory_launch,
+    _native_terminal_start_error_response,
 )
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -121,10 +123,12 @@ class _RecordingClaudeRegistry(SessionResourceRegistry):
         spec: Any,
         resource_role: str | None = None,
         parent_os_env: Any = None,
+        prepare_terminal: Any = None,
     ) -> SessionResourceView:
         """Record the spec and return a terminal resource view."""
         del terminal_name, session_key
         self.captured["spec"] = spec
+        self.captured["settings"] = _load_claude_invocation_settings(spec.args)
         return SessionResourceView(
             id="terminal_claude_main",
             type="terminal",
@@ -2457,6 +2461,7 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key
             captured["spec"] = spec
@@ -2549,6 +2554,7 @@ async def test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigen
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key
             captured["spec"] = spec
@@ -2921,6 +2927,7 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec + parent_os_env and return a resource view."""
             del terminal_name, session_key
@@ -3027,7 +3034,7 @@ async def test_auto_create_claude_terminal_subscription_ignores_inherited_api_cr
     assert {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"} <= set(spec.env_unset)
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in spec.env_unset
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in spec.env
-    assert "apiKeyHelper" not in _load_claude_invocation_settings(spec.args)
+    assert "apiKeyHelper" not in captured["settings"]
     assert "ANTHROPIC_CUSTOM_MODEL_OPTION" not in spec.env
     assert spec.args[spec.args.index("--model") + 1] == model
 
@@ -3259,7 +3266,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     assert spec.args[spec.args.index("--model") + 1] == expected_launch
     # The apiKeyHelper is registered in private settings, not subprocess argv.
     assert all("sk-sentinel-do-not-use" not in arg for arg in spec.args)
-    settings = _load_claude_invocation_settings(spec.args)
+    settings = captured["settings"]
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert settings["modelOverrides"] == {
         model.removeprefix("databricks-"): model,
@@ -3301,6 +3308,7 @@ async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_fai
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key, spec, resource_role, parent_os_env
             return SessionResourceView(
@@ -3753,6 +3761,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view without spawning a TTY."""
             del terminal_name, session_key
@@ -4190,6 +4199,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key, spec
             return SessionResourceView(
@@ -4274,6 +4284,7 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return the terminal resource view the runner would launch."""
             del spec
@@ -4347,77 +4358,54 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
     assert all(p.session_id == "7cef62c6518d5591cc7991974e33ec4c" for p in published)
 
 
-def test_publish_native_terminal_start_error_emits_failed_status_only(
-    caplog: pytest.LogCaptureFixture,
-    pinned_runner_log: Path,
+@pytest.mark.parametrize("surface", ["publish", "ensure"])
+def test_native_terminal_start_error_publication_envelope(
+    monkeypatch: pytest.MonkeyPatch, surface: str
 ) -> None:
-    """
-    Native terminal startup failure publishes a generic ``failed`` status.
-
-    The runner must stay alive when terminal auto-create fails, but the
-    affected session should only receive ``session.status: failed`` from
-    this startup path. A bare ``response.error`` is turn-scoped; if the
-    runner publishes one here, Omnigent can persist an orphan transcript error
-    and then publish/persist a second error when the user message
-    fast-fails against the same terminal.
-
-    The published/returned message names the runner's log file — the raw
-    exception text (which can embed paths/CLI details) is logged there for
-    operators, not surfaced on the session stream.
-
-    :param caplog: Pytest log capture fixture, used to confirm the raw
-        cause is logged server-side.
-    :param pinned_runner_log: The log path the message must name.
-    """
+    """Both startup adapters preserve the formatted payload and failure context."""
     published: list[_PublishedEvent] = []
-
-    def _capture(session_id: str, event: dict[str, Any]) -> None:
-        published.append(_PublishedEvent(session_id=session_id, event=event))
-
-    with caplog.at_level(logging.WARNING):
-        error = _publish_native_terminal_start_error(
-            _capture,
-            "415c9954e2fe4b9276083a4d2c66f689",
-            "Codex",
-            ImportError("Native Codex requires the 'codex' CLI on PATH."),
-        )
-
-    # Client-safe payload pointing at the runner log — no raw exception text.
-    error_id = error["error_id"]
-    assert error_id.startswith("err_")
-    assert len(error_id) == 36
-    int(error_id.removeprefix("err_"), 16)
-    assert error == {
+    raised = RuntimeError("synthetic startup failure")
+    session_id = "415c9954e2fe4b9276083a4d2c66f689"
+    payload = {
         "code": "native_terminal_start_failed",
-        "error_id": error_id,
-        "message": (
-            "Native Codex terminal failed to start (ImportError); "
-            f"see the runner log for details: {pinned_runner_log} "
-            f"Error ID: {error_id}."
-        ),
+        "error_id": "err_" + "1" * 32,
+        "message": "Safe startup guidance",
     }
-    # The raw cause must NOT leak into the surfaced message, but MUST be
-    # logged for operators. If this fails, the redaction regressed (raw
-    # text back in the payload) or the server-side log was dropped.
-    assert "requires the 'codex' CLI" not in error["message"]
-    # The structured, non-sensitive cause (exception type only, here) still
-    # names the failure kind without the free-form message.
-    assert "(ImportError)" in error["message"]
-    assert "requires the 'codex' CLI on PATH." in caplog.text
-    assert error_id in caplog.text
-    assert [p.event for p in published] == [
-        {
-            "type": "session.status",
-            "status": "failed",
-            "error": error,
-            "failure_context": {
-                "failure_source": "native_terminal_start",
-                "failure_id": error_id,
-                "exception_type": "ImportError",
-            },
-        },
-    ]
-    assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
+    format_payload = Mock(return_value=payload)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._native_terminal_start_error_payload",
+        format_payload,
+    )
+
+    def capture(target: str, event: dict[str, Any]) -> None:
+        published.append(_PublishedEvent(session_id=target, event=event))
+
+    failure_context = {
+        "failure_source": "native_terminal_start",
+        "failure_id": payload["error_id"],
+        "exception_type": "RuntimeError",
+    }
+    if surface == "publish":
+        assert (
+            _publish_native_terminal_start_error(capture, session_id, "Claude", raised) is payload
+        )
+        assert published == [
+            _PublishedEvent(
+                session_id=session_id,
+                event={
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": payload,
+                    "failure_context": failure_context,
+                },
+            )
+        ]
+    else:
+        response = _native_terminal_start_error_response(raised, "Claude", session_id=session_id)
+        assert response.status_code == 500
+        assert json.loads(response.body) == {"error": payload, "failure_context": failure_context}
+        assert not published
+    format_payload.assert_called_once_with(raised, "Claude", session_id=session_id)
 
 
 def test_publish_native_terminal_start_error_redacts_mismatch_path(
@@ -4556,6 +4544,7 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return a minimal terminal view so the launch doesn't error."""
             del spec
@@ -4680,6 +4669,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return a minimal terminal view so the launch doesn't error."""
             del spec, resource_role
@@ -4781,6 +4771,7 @@ class _LiveClaudeResourceRegistry(SessionResourceRegistry):
         spec: Any,
         resource_role: str | None = None,
         parent_os_env: Any = None,
+        prepare_terminal: Any = None,
     ) -> SessionResourceView:
         """Return a running terminal view."""
         del spec, resource_role, parent_os_env
@@ -6785,10 +6776,12 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
             del terminal_name, session_key
             captured["spec"] = spec
+            captured["settings"] = _load_claude_invocation_settings(spec.args)
             return SessionResourceView(
                 id="terminal_claude_main",
                 type="terminal",
@@ -6814,7 +6807,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     assert spec.keep_alive_after_exit is True
     args = spec.args
     assert args[args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
-    settings = _load_claude_invocation_settings(args)
+    settings = captured["settings"]
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
     assert permission_hook["type"] == "command"
@@ -6861,8 +6854,8 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     routed: bool,
     auto_harness: bool = False,
     custom_slot: str = "workspace-picker-row",
-) -> Any:
-    """Drive the claude-native launch and return the captured terminal spec.
+) -> tuple[Any, dict[str, Any]]:
+    """Drive the claude-native launch and capture its spec and owned settings.
 
     :param routed: Stamp ``cost_control_mode_override="on"``, as the create
         path does for a session launched on Smart Routing.
@@ -6919,9 +6912,11 @@ async def _run_auto_create_claude_terminal_for_routing_class(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key
             captured["spec"] = spec
+            captured["settings"] = _load_claude_invocation_settings(spec.args)
             return SessionResourceView(
                 id="terminal_claude_main",
                 type="terminal",
@@ -6955,16 +6950,14 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         subagent_routing.shutdown_session_router(session_id)
         turn_routing.shutdown_session_turn_router(session_id)
         await fake_client.aclose()
-    return captured["spec"]
+    return captured["spec"], captured["settings"]
 
 
-def _claude_pretooluse_matchers(spec: Any) -> list[str | None]:
-    settings = _load_claude_invocation_settings(spec.args)
+def _claude_pretooluse_matchers(settings: dict[str, Any]) -> list[str | None]:
     return [entry.get("matcher") for entry in settings["hooks"].get("PreToolUse", [])]
 
 
-def _claude_hook_commands(spec: Any) -> list[str]:
-    settings = _load_claude_invocation_settings(spec.args)
+def _claude_hook_commands(settings: dict[str, Any]) -> list[str]:
     return [
         hook.get("command", "")
         for entries in settings["hooks"].values()
@@ -6983,7 +6976,7 @@ async def test_auto_create_claude_terminal_loads_workspace_agents_skills(
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
-    spec = await _run_auto_create_claude_terminal_for_routing_class(
+    spec, _settings = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f604",
@@ -6999,7 +6992,7 @@ async def test_auto_create_claude_terminal_loads_workspace_agents_skills(
 async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = await _run_auto_create_claude_terminal_for_routing_class(
+    spec, settings = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f601",
@@ -7007,9 +7000,9 @@ async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     )
 
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER not in _claude_pretooluse_matchers(
-        spec
+        settings
     )
-    assert all("claude_router_hook" not in command for command in _claude_hook_commands(spec))
+    assert all("claude_router_hook" not in command for command in _claude_hook_commands(settings))
     # The workspace's own picker row survives untouched.
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "workspace-picker-row"
 
@@ -7020,7 +7013,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
 ) -> None:
     from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
-    spec = await _run_auto_create_claude_terminal_for_routing_class(
+    spec, settings = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f602",
@@ -7028,8 +7021,10 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
         custom_slot=custom_slot,
     )
 
-    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
-    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(
+        settings
+    )
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(settings))
     # The custom-slot pin tracks the launched 1M-capable Opus, so it carries the
     # same [1m] window marker the launch model does.
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
@@ -7054,7 +7049,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     and pinning no arms — an argv that tells Claude to route spawns through a
     hook nothing answers.
     """
-    spec = await _run_auto_create_claude_terminal_for_routing_class(
+    spec, settings = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f603",
@@ -7063,8 +7058,10 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     )
 
     # The whole routed apparatus, not just the spawn note.
-    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
-    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(
+        settings
+    )
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(settings))
     # The custom-slot pin tracks the launched 1M-capable Opus and carries [1m].
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
     # And the auto-harness extras, which only make sense alongside the router.

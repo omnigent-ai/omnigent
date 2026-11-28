@@ -107,6 +107,7 @@ def prune_orphaned_dirs(
     bridge_root: Path,
     *,
     should_prune: Callable[[Path], bool] | None = None,
+    on_dead_owner: Callable[[Path], None] | None = None,
 ) -> int:
     """
     Remove per-session bridge dirs under *bridge_root* whose owner is dead.
@@ -135,6 +136,8 @@ def prune_orphaned_dirs(
     :param should_prune: Optional harness-specific eligibility predicate called
         once the owner is proven dead or the marker is missing. ``None`` removes
         every dead-owner directory and keeps every unmarked one.
+    :param on_dead_owner: Retire dead activations after the final owner check,
+        including when the retention predicate keeps their directory.
     :returns: The number of orphaned bridge dirs removed.
     """
     if not bridge_root.exists():
@@ -144,7 +147,7 @@ def prune_orphaned_dirs(
 
     pruned = 0
     for entry in bridge_root.iterdir():
-        if not entry.is_dir() or entry.name == _LOCK_DIR_NAME:
+        if not entry.is_dir() or entry.is_symlink() or entry.name == _LOCK_DIR_NAME:
             continue
         with _try_bridge_dir_cleanup_lock(entry) as acquired:
             if not acquired:
@@ -161,14 +164,13 @@ def prune_orphaned_dirs(
                 continue
             if pid is not None and _process_alive(pid):
                 continue
+            eligible = should_prune is None
             if should_prune is not None:
                 try:
                     eligible = should_prune(entry)
                 except Exception:
                     _logger.exception("Error checking orphaned bridge dir %s", entry)
-                    continue
-                if not eligible:
-                    continue
+                    eligible = False
             confirmed_pid: int | None
             try:
                 confirmed_pid = int(marker.read_text(encoding="utf-8").strip())
@@ -179,6 +181,14 @@ def prune_orphaned_dirs(
             if confirmed_pid != pid or (
                 confirmed_pid is not None and _process_alive(confirmed_pid)
             ):
+                continue
+            if confirmed_pid is not None and on_dead_owner is not None:
+                try:
+                    on_dead_owner(entry)
+                except Exception:
+                    _logger.exception("Error retiring orphaned bridge dir %s", entry)
+                    continue
+            if not eligible:
                 continue
             cache_dir = attachment_cache_dir(entry)
             shutil.rmtree(entry, ignore_errors=True)

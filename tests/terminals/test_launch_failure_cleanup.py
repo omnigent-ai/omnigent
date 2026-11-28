@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -171,23 +172,75 @@ async def test_cancelled_shared_environment_resolution_keeps_loop_responsive(
         release.set()
 
 
-@requires_tmux
+@pytest.mark.parametrize(
+    "settings_protocol",
+    [
+        pytest.param(None, marks=requires_tmux, id="no-settings"),
+        pytest.param(1, id="legacy"),
+        pytest.param(2, id="fenced"),
+    ],
+)
 async def test_missing_tmux_during_spawn_releases_private_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    settings_protocol: int | None,
 ) -> None:
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        settings_generation_path,
+    )
+
     created = _capture_instances(monkeypatch)
     terminal_registry = TerminalRegistry()
     empty_bin = tmp_path / "empty-bin"
     empty_bin.mkdir()
+    released = []
+    request = None
+    if settings_protocol is not None:
+        bridge_root = tmp_path / "claude-native"
+        monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", bridge_root)
+        bridge_dir = bridge_root / "prepared"
+        request = ClaudeSettingsRequest.create(bridge_dir, protocol=settings_protocol)
+        augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
+        baseline = settings_generation_path(bridge_dir, request.generation)
+        monkeypatch.setattr("omnigent.inner.terminal._require_supported_tmux", lambda: None)
+        monkeypatch.setattr(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=FileNotFoundError(errno.ENOENT, "cannot spawn", "tmux")),
+        )
+
+    async def prepare(instance: TerminalInstance) -> None:
+        assert request is not None
+        assert settings_protocol is not None
+        with acquire_claude_settings_request(
+            bridge_dir, request.generation, protocol=settings_protocol
+        ) as lease:
+            lease.attach(instance)
+        instance.add_resource_cleanup(lambda: released.append(instance))
+        (instance.private_dir / "prepared-settings.json").write_text("{}")
+        request.close()
+        assert baseline.exists()
+
     caplog.set_level(logging.WARNING, logger=registry.__name__)
     try:
         with pytest.raises(FileNotFoundError) as raised:
             await terminal_registry.launch(
-                "owned-session", "shell", "main", _spec(tmp_path, env={"PATH": str(empty_bin)})
+                "owned-session",
+                "shell",
+                "main",
+                _spec(tmp_path, env={"PATH": str(empty_bin)}),
+                prepare_terminal=prepare if settings_protocol is not None else None,
             )
         assert raised.value.filename == "tmux"
         assert len(created) == 1
         assert not created[0].private_dir.exists()
+        if request is not None:
+            assert released == created
+            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
         assert terminal_registry.list_for_conversation("owned-session") == []
         assert terminal_registry.active_conversation_ids() == []
         record = _launch_failed_event(caplog)
@@ -197,7 +250,11 @@ async def test_missing_tmux_during_spawn_releases_private_resources(
         assert str(empty_bin) not in json.dumps(record.attributes)
     finally:
         for instance in created:
+            monkeypatch.setattr(instance, "_tmux", AsyncMock())
             await instance.close()
+        if request is not None:
+            request.close()
+    assert released == (created if settings_protocol is not None else [])
 
 
 @pytest.mark.parametrize(
@@ -351,6 +408,170 @@ async def test_caller_cancellation_during_cleanup_finishes_close_then_propagates
     assert record.attributes["cancelled_during_cleanup"] is True
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    ["reaped-success", "reaped-target-gone", "unreaped", "cleanup-error", "prior-unknown"],
+)
+async def test_interrupted_tmux_client_drains_before_unregistered_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+) -> None:
+    from omnigent.inner import terminal as terminal_mod
+    from omnigent.inner._subprocess_lifecycle import terminate_direct_subprocess
+
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    instance = _stub_instance(private_dir)
+    output = private_dir / "prepared-settings.json"
+    released = []
+    communicating = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    commands = []
+    original_cancellation = "launch interrupted"
+
+    class LaunchClient:
+        returncode: int | None = None
+        terminate_calls = 0
+        wait_calls = 0
+
+        async def communicate(self):
+            communicating.set()
+            await asyncio.Event().wait()
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        async def wait(self):
+            self.wait_calls += 1
+            self.returncode = -15
+            return self.returncode
+
+    process = LaunchClient()
+    if outcome == "prior-unknown":
+        with monkeypatch.context() as prior:
+            prior.setattr(
+                terminal_mod,
+                "asyncio",
+                SimpleNamespace(
+                    **{
+                        **vars(asyncio),
+                        "create_subprocess_exec": AsyncMock(side_effect=asyncio.CancelledError),
+                    }
+                ),
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await instance.launch()
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            **{**vars(asyncio), "create_subprocess_exec": AsyncMock(return_value=process)}
+        ),
+    )
+
+    async def cleanup_client(client, **kwargs):
+        assert client is process
+        cleanup_started.set()
+        await release_cleanup.wait()
+        if outcome == "unreaped":
+            return False
+        if outcome == "cleanup-error":
+            raise OSError("client reap failed")
+        return await terminate_direct_subprocess(client, **kwargs)
+
+    monkeypatch.setattr(terminal_mod, "terminate_direct_subprocess", cleanup_client, raising=False)
+
+    async def tmux(*args):
+        commands.append(args)
+        if outcome.startswith("reaped-") and len(commands) == 1:
+            raise RuntimeError("server termination unconfirmed")
+        if outcome == "reaped-target-gone":
+            raise terminal_mod._tmux_command_failed_error(
+                ["tmux", *args], 1, b"no server running on example socket"
+            )
+
+    async def prepare(created):
+        assert created is instance
+        output.write_text("{}")
+        instance.add_resource_cleanup(lambda: released.append(instance))
+
+    monkeypatch.setattr(instance, "_tmux", tmux)
+    monkeypatch.setattr(
+        registry,
+        "create_terminal_instance",
+        lambda *_args, **_kwargs: TerminalCreateResult(instance, tmp_path),
+    )
+    terminals = TerminalRegistry()
+    task = asyncio.create_task(
+        terminals.launch(
+            "owned-session", "shell", "main", _spec(tmp_path), prepare_terminal=prepare
+        )
+    )
+    try:
+        await asyncio.wait_for(communicating.wait(), timeout=5)
+        task.cancel(original_cancellation)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        for _ in range(3):
+            task.cancel("cleanup interrupted")
+            checkpoint = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(checkpoint.set_result, None)
+            await checkpoint
+            assert not task.done()
+            assert process.returncode is None
+            assert output.exists()
+            assert released == []
+            assert commands == []
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+        assert cancelled.value.args == (original_cancellation,)
+        assert instance._launch_started
+        assert output.exists()
+        assert released == []
+        assert commands == [("kill-server",)]
+        assert terminals.get("owned-session", "shell", "main") is None
+        assert instance._launch_incomplete == (not outcome.startswith("reaped-"))
+        if outcome not in {"unreaped", "cleanup-error"}:
+            assert process.returncode == -15
+            assert process.terminate_calls == process.wait_calls == 1
+        else:
+            assert process.returncode is None
+            assert "client" in caplog.text.lower()
+        await instance.close()
+        assert commands == [("kill-server",), ("kill-server",)]
+        if outcome.startswith("reaped-"):
+            assert released == [instance]
+            assert not private_dir.exists()
+            await instance.close()
+            assert released == [instance]
+        else:
+            assert output.exists()
+            assert released == []
+            if outcome == "prior-unknown":
+                completed = SimpleNamespace(
+                    returncode=0, communicate=AsyncMock(return_value=(b"", b""))
+                )
+                monkeypatch.setattr(
+                    terminal_mod.asyncio,
+                    "create_subprocess_exec",
+                    AsyncMock(return_value=completed),
+                )
+                await instance.launch()
+                assert instance._launch_incomplete
+                await instance.close()
+                assert output.exists()
+                assert released == []
+    finally:
+        release_cleanup.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await instance.close()
+
+
 async def test_immediate_exit_closes_once_and_keeps_exit_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -468,3 +689,169 @@ async def test_cancelled_launch_reaps_real_tmux(
             await task
         for instance in created:
             await instance.close()
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancelled"])
+async def test_preparation_uses_new_instance_once_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    monkeypatch.setattr("omnigent.inner.terminal._require_supported_tmux", lambda: None)
+    monkeypatch.setattr(TerminalInstance, "_tmux", AsyncMock(return_value=""))
+    created = _capture_instances(monkeypatch)
+    calls = []
+    released = []
+
+    async def launch(instance, *, cwd=None):
+        assert calls == [instance]
+        instance.running = True
+
+    async def prepare(instance):
+        assert instance is created[0]
+        assert instance.os_env is not None
+        assert instance.os_env.cwd == tmp_path
+        assert not instance.running
+        calls.append(instance)
+        instance.add_resource_cleanup(lambda: released.append(instance))
+        if outcome == "error":
+            raise ValueError("settings rejected")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(TerminalInstance, "launch", launch)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    terminal_registry = TerminalRegistry()
+    try:
+        if outcome == "success":
+            first = await terminal_registry.launch(
+                "settings", "shell", "main", _spec(tmp_path), prepare_terminal=prepare
+            )
+            second = await terminal_registry.launch(
+                "settings", "shell", "main", _spec(tmp_path), prepare_terminal=prepare
+            )
+            assert first is second
+            assert calls == [first]
+            assert released == []
+            assert terminal_registry.transfer("settings", "moved", "shell", "main")
+            assert released == []
+        else:
+            error = ValueError if outcome == "error" else asyncio.CancelledError
+            with pytest.raises(error):
+                await terminal_registry.launch(
+                    "settings", "shell", "main", _spec(tmp_path), prepare_terminal=prepare
+                )
+            assert len(calls) == 1
+            assert not created[0].private_dir.exists()
+            assert terminal_registry.list_for_conversation("settings") == []
+            assert released == calls
+    finally:
+        await terminal_registry.shutdown()
+    assert released == calls
+
+
+async def test_model_access_protection_precedes_settings_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    instance = _stub_instance(private_dir)
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    instance.sandbox_policy = policy
+    protected = SandboxPolicy("linux_bwrap", True, [tmp_path], [], [], False)
+    events = []
+
+    def protect_sources(selected_policy, cwd):
+        assert selected_policy is policy and cwd == tmp_path
+        events.append("model-access")
+        return protected
+
+    access = cast(ClaudeModelAccess, SimpleNamespace(protect_sources=protect_sources))
+    monkeypatch.setattr(
+        registry,
+        "create_terminal_instance",
+        lambda *_args, **_kwargs: TerminalCreateResult(instance, tmp_path),
+    )
+
+    async def prepare(prepared):
+        assert prepared is instance
+        assert prepared.sandbox_policy is protected
+        assert prepared.model_access is access
+        assert events == ["model-access"]
+        events.append("settings")
+
+    async def launch(launched, *, cwd=None):
+        assert launched is instance and events == ["model-access", "settings"]
+        instance.running = True
+
+    monkeypatch.setattr(TerminalInstance, "launch", launch)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    monkeypatch.setattr(TerminalInstance, "_tmux", AsyncMock(return_value=""))
+    terminals = TerminalRegistry()
+    spec = _spec(tmp_path)
+    spec.os_env.sandbox = OSEnvSandboxSpec(type="linux_bwrap")
+    try:
+        assert (
+            await terminals.launch(
+                "settings",
+                "claude",
+                "main",
+                spec,
+                model_access_factory=lambda: access,
+                prepare_terminal=prepare,
+            )
+            is instance
+        )
+    finally:
+        await terminals.shutdown()
+
+
+async def test_overlapping_preparations_close_loser_and_keep_winner_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.inner.terminal._require_supported_tmux", lambda: None)
+    monkeypatch.setattr(TerminalInstance, "_tmux", AsyncMock(return_value=""))
+    spec = _spec(tmp_path)
+    created = _capture_instances(monkeypatch)
+    first_spawning = asyncio.Event()
+    release_first = asyncio.Event()
+    prepared = []
+    released = []
+
+    async def prepare(instance):
+        assert not instance.running
+        prepared.append(instance)
+        instance.add_resource_cleanup(lambda: released.append(instance))
+
+    async def launch(instance, *, cwd=None):
+        instance.running = True
+        if instance is created[0]:
+            first_spawning.set()
+            await release_first.wait()
+
+    monkeypatch.setattr(TerminalInstance, "launch", launch)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    terminal_registry = TerminalRegistry()
+    first = asyncio.create_task(
+        terminal_registry.launch("settings", "claude", "main", spec, prepare_terminal=prepare)
+    )
+    try:
+        await asyncio.wait_for(first_spawning.wait(), timeout=5)
+        winner = await terminal_registry.launch(
+            "settings", "claude", "main", spec, prepare_terminal=prepare
+        )
+        release_first.set()
+        assert await first is winner
+        assert winner is created[1]
+        assert prepared == created
+        assert not created[0].private_dir.exists()
+        assert released == [created[0]]
+        assert winner.private_dir.exists()
+        assert terminal_registry.get("settings", "claude", "main") is winner
+    finally:
+        release_first.set()
+        if not first.done():
+            first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+        await terminal_registry.shutdown()
+    assert all(not instance.private_dir.exists() for instance in created)
+    assert released == created

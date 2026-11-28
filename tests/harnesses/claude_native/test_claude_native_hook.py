@@ -1544,6 +1544,59 @@ def test_permission_hook_reauth_takes_only_a_matching_unsent_snapshot(
     assert reauth() == {"Authorization": "Bearer minted"}, "an unchanged snapshot mints"
 
 
+@pytest.mark.parametrize("during_mint", [False, True])
+@pytest.mark.parametrize("reactivate", [False, True])
+def test_permission_hook_reauth_stays_with_its_original_bridge_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, during_mint: bool, reactivate: bool
+) -> None:
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        request_claude_bridge_deletion,
+    )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_retired")
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    minted = []
+
+    def retire() -> None:
+        request_claude_bridge_deletion(bridge_dir, "conv_retired")
+        if reactivate:
+            prepare_bridge_dir("conv_retired", bridge_id="bridge_retry", workspace=tmp_path)
+            build_hook_settings(
+                bridge_dir,
+                ap_server_url="https://example.com",
+                ap_auth_headers={"Authorization": "Bearer synthetic-new-launch"},
+            )
+
+    def mint() -> dict[str, str]:
+        minted.append(True)
+        if during_mint:
+            retire()
+        return {"Authorization": "Bearer synthetic-minted"}
+
+    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", lambda *_args: mint)
+    reauth = claude_native_hook._permission_hook_reauth(
+        bridge_dir, "https://example.com", {}, None
+    )
+    try:
+        if not during_mint:
+            retire()
+        assert reauth() is None
+        assert minted == ([True] if during_mint else [])
+        assert reauth() is None
+        assert minted == ([True] if during_mint else [])
+        if reactivate:
+            assert claude_native_hook.read_permission_hook_config(bridge_dir)[
+                "ap_auth_headers"
+            ] == {"Authorization": "Bearer synthetic-new-launch"}
+        else:
+            assert not (bridge_dir / "permission_hook.json").exists()
+    finally:
+        request.close()
+
+
 def _assert_chat_fallback(stdout: str) -> None:
     """
     Assert the hook denied a question with the ask-in-chat hint.

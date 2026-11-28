@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.types import Message, Receive, Scope, Send
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, TerminalLaunchError
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.host.workspace_tokens import TOKEN_TTL_S, WorkspaceGrant, verify_token
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
@@ -541,9 +541,12 @@ def _sessions_app(conversation_store: _ConversationStore, **router_options: Any)
         exc: OmnigentError,
     ) -> JSONResponse:
         del request
+        content: dict[str, Any] = {"error": {"code": exc.code, "message": exc.message}}
+        if isinstance(exc, TerminalLaunchError):
+            content["claude_settings_request_ack"] = exc.claude_settings_request_ack
         return JSONResponse(
             status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            content=content,
         )
 
     class _StubAgentStore:
@@ -1194,8 +1197,10 @@ async def test_list_environments_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_path", ["terminals", "claude-settings-v2/terminals"])
 async def test_list_terminals_forwards_pagination_params_to_runner(
     client: httpx.AsyncClient,
+    terminal_path: str,
 ) -> None:
     """GET /resources/terminals forwards order/limit to the runner.
 
@@ -1208,14 +1213,11 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": []})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals?order=asc&limit=1000&bogus=1",
-    )
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/{terminal_path}"
+    resp = await client.get(f"{path}?order=asc&limit=1000&bogus=1")
 
     assert resp.status_code == 200
-    assert fake_runner.calls == [
-        ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
-    ]
+    assert fake_runner.calls == [("GET", path)]
     # Exactly the runner endpoint's supported pagination params are
     # forwarded; an unknown param (``bogus``) must be dropped so the
     # proxy can't be used to smuggle arbitrary query strings. A ``None``
@@ -1891,8 +1893,27 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "runner_status,runner_payload,expected_status,expected_code,expected_message",
+    (
+        "runner_status,runner_payload,expected_status,expected_code,expected_message,"
+        "settings_request_ack,expected_ack"
+    ),
     [
+        (
+            200,
+            {
+                "id": "terminal_claude_main",
+                "object": "session.resource",
+                "type": "terminal",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+                "name": "claude:main",
+                "metadata": {"terminal_name": "claude", "session_key": "main", "running": True},
+            },
+            200,
+            None,
+            None,
+            "1" * 32,
+            "1" * 32,
+        ),
         # Runner returns its own error body (the common case: tunnel
         # dropped mid-launch, runner reports offline). The runner's code
         # drives the HTTP status, and its message is surfaced verbatim.
@@ -1907,6 +1928,36 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
             503,
             ErrorCode.RUNNER_UNAVAILABLE,
             "tunnel closed before request completed",
+            None,
+            None,
+        ),
+        (
+            409,
+            {
+                "error": {
+                    "code": ErrorCode.CONFLICT,
+                    "message": "Claude settings request expired; rebuild the request",
+                }
+            },
+            409,
+            ErrorCode.CONFLICT,
+            "Claude settings request expired; rebuild the request",
+            None,
+            None,
+        ),
+        (
+            400,
+            {
+                "error": {
+                    "code": ErrorCode.INVALID_INPUT,
+                    "message": "Fenced Claude settings require native bridge injection",
+                }
+            },
+            400,
+            ErrorCode.INVALID_INPUT,
+            "Fenced Claude settings require native bridge injection",
+            None,
+            None,
         ),
         # Runner returns an error with no body — fall back to
         # INTERNAL_ERROR (→500) and a message carrying the raw status.
@@ -1916,19 +1967,45 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
             500,
             ErrorCode.INTERNAL_ERROR,
             "Terminal launch failed (runner returned HTTP 500)",
+            None,
+            None,
         ),
+        *[
+            (
+                503,
+                {
+                    "error": {
+                        "code": ErrorCode.RUNNER_UNAVAILABLE,
+                        "message": "tunnel closed before request completed",
+                    }
+                },
+                503,
+                ErrorCode.RUNNER_UNAVAILABLE,
+                "tunnel closed before request completed",
+                acknowledgement,
+                expected_ack,
+            )
+            for acknowledgement, expected_ack in [
+                ("settings-generation", "settings-generation"),
+                (42, None),
+            ]
+        ],
     ],
 )
+@pytest.mark.parametrize("terminal_path", ["terminals", "claude-settings-v2/terminals"])
 async def test_create_terminal_surfaces_runner_error_without_crashing(
     client: httpx.AsyncClient,
     bash_terminal_spec: None,
+    terminal_path: str,
     runner_status: int,
     runner_payload: dict[str, Any],
     expected_status: int,
-    expected_code: str,
-    expected_message: str,
+    expected_code: str | None,
+    expected_message: str | None,
+    settings_request_ack: str | int | None,
+    expected_ack: str | None,
 ) -> None:
-    """A runner ``>=400`` on terminal launch yields a clean error, not a 500 crash.
+    """Runner statuses, successful resources and typed acknowledgements survive proxying.
 
     Regression for the masking bug at ``create_session_terminal``: it built
     ``OmnigentError(..., http_status=status)``, but ``OmnigentError``
@@ -1947,18 +2024,32 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
         surface, e.g. ``"runner_unavailable"``.
     :param expected_message: The human-readable message the route should
         surface.
+    :param settings_request_ack: The admitted request acknowledgement to preserve,
+        or a malformed value that must not enter the public envelope.
+    :param expected_ack: The acknowledgement expected in the public response, if any.
     :returns: None.
     """
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    path = f"/v1/sessions/{session_id}/resources/{terminal_path}"
+    request_body: dict[str, Any] = {"terminal": "bash", "session_key": "s1"}
+    if runner_status < 400:
+        request_body = {"terminal": "claude", "session_key": "main", "bridge_inject_dir": True}
+        if terminal_path == "claude-settings-v2/terminals":
+            request_body.update(
+                claude_settings_request="1" * 32,
+                claude_settings_request_protocol=2,
+            )
+    if settings_request_ack is not None:
+        runner_payload = {**runner_payload, "claude_settings_request_ack": settings_request_ack}
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     with capture_debug_rows("server") as rows:
-        resp = await client.post(path, json={"terminal": "bash", "session_key": "s1"})
+        resp = await client.post(path, json=request_body)
 
-    # A failed launch still records its timing, with the runner's status.
+    # Every launch records its timing, with the runner's status.
     (finished,) = [row for row in rows if row["event_name"] == "terminal_create_finished"]
-    assert int(cast(dict[str, str], finished["attributes"])["status_code"]) >= 400
+    assert int(cast(dict[str, str], finished["attributes"])["status_code"]) == runner_status
     # http_status is derived from the surfaced code; 503 here proves the
     # runner's ``runner_unavailable`` propagated (a 500 would mean it was
     # masked by the old TypeError path or a generic internal error).
@@ -1966,10 +2057,16 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     body = resp.json()
     # The runner's own code/message reach the client unchanged — proves the
     # error was surfaced, not swallowed or replaced by a generic 500.
-    assert body["error"]["code"] == expected_code
-    assert body["error"]["message"] == expected_message
-    # The launch failed, so no resource-created event/resource is returned.
-    assert "id" not in body
+    if expected_status >= 400:
+        assert body["error"]["code"] == expected_code
+        assert body["error"]["message"] == expected_message
+        assert "id" not in body
+    else:
+        assert body == runner_payload
+    if expected_ack is None:
+        assert "claude_settings_request_ack" not in body
+    else:
+        assert body["claude_settings_request_ack"] == expected_ack
     # The proxy POST was actually attempted before the error was raised.
     assert fake_runner.calls == [("POST", path)]
 

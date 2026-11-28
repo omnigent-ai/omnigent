@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import psutil
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import (
@@ -311,11 +312,18 @@ os_env:
                     timeout=5,
                 )
             )
-            # With OSC status enabled, the relay owns the pane and Claude is its child.
+            # The OSC relay and resource guard can both precede the native CLI.
             status_reader = ProgramStatusReader(
                 Path(pane["socket_path"]).parent / "program-status.json"
             )
-            claude_pid = status_reader.child_pid or pane_pid
+            root = psutil.Process(status_reader.child_pid or pane_pid)
+            native = [
+                process
+                for process in [root, *root.children(recursive=True)]
+                if process.name() == "claude" and process.cwd() == str(workspace)
+            ]
+            assert len(native) == 1, "The owned pane must have one live Claude CLI"
+            claude_pid = native[0].pid
             assert Path(f"/proc/{claude_pid}/comm").read_text().strip() == "claude"
             assert os.readlink(f"/proc/{claude_pid}/cwd") == str(workspace)
             assert os.readlink(f"/proc/{runner.pid}/cwd") == str(runner_cwd)

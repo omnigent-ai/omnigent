@@ -1,0 +1,119 @@
+{
+  "provenance": {
+    "captured_at_utc": "2026-11-14T18:56:47.607037+00:00",
+    "cli_version": "2.1.323 (Claude Code)",
+    "cli_commit": "66b1ade1dce6",
+    "cli_binary_sha256": "604d29a6869409106b6a1110bdadcc8b72e8654a5a865d23258f938a696e348e",
+    "cli_binary_bytes": 362435088,
+    "platform": "linux-x64",
+    "container_image": "mcr.microsoft.com/playwright/python@sha256:8ff591d613b01c884cc488339ed4318b4513eaf0c57a164a878ba49e70e3f384",
+    "container_image_id": "sha256:61d4bdcb63596f3530ad7a3594217c79a237128025c0a9da2fdb5b256b1c8dc1",
+    "capture_mode": "Production-style supervisor; vendor stdin DEVNULL, stdout/stderr PIPE",
+    "supervisor_sha256": "2b46764b9e2165432ac6994c6e43987c611bdee13be31123757f49a3eaef3957",
+    "network": "none",
+    "root_filesystem": "read-only",
+    "configuration": "Fresh owned HOME, USERPROFILE, XDG paths, CLAUDE_CONFIG_DIR and TMPDIR per invocation; --setting-sources empty. No real user files mounted.",
+    "authentication": "Synthetic dummy ANTHROPIC_API_KEY; ANTHROPIC_BASE_URL=http://127.0.0.1:9. No provider invocation.",
+    "traffic": "Auto-updates, telemetry, error reporting and nonessential traffic disabled.",
+    "normalization": "Only /owned/settings.json is replaced with <settings-file> in argv/stdout/stderr. All other captured bytes, including synthetic HOME paths and installation warnings, are retained. raw_*_sha256 identifies the unmodified streams.",
+    "bounds": "12 seconds and 512 KiB per stream per command; owned process-group cleanup after each invocation.",
+    "scope": "Observed Claude Code 2.1.323 doctor protocol only; no claim about other versions, wrappers, provider or browser behavior."
+  },
+  "settings_placeholder": "<settings-file>",
+  "runs": {
+    "version": {
+      "argv": [
+        "/opt/claude",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "2.1.323 (Claude Code)\n",
+      "raw_stdout_sha256": "6ed611782bb054b29144b6975023a2729b4fa967ef871fc679e712686473e31b",
+      "stderr": "",
+      "raw_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "help": {
+      "argv": [
+        "/opt/claude",
+        "--bare",
+        "--setting-sources",
+        "",
+        "doctor",
+        "--help"
+      ],
+      "returncode": 0,
+      "stdout": "Usage: claude doctor [options]\n\nCheck the health of your Claude Code installation. Reads settings files in the\ncurrent directory without a trust prompt. For a full checkup that can also fix\nissues, run /doctor in a session.\n\nOptions:\n  -h, --help  Display help for command\n",
+      "raw_stdout_sha256": "6975b99fb1910a7fbb1cf9977bbaeca33d9530cc59422788bbb2a200982955ea",
+      "stderr": "",
+      "raw_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "empty": {
+      "argv": [
+        "/opt/claude",
+        "--bare",
+        "--setting-sources",
+        "",
+        "--settings",
+        "<settings-file>",
+        "doctor"
+      ],
+      "returncode": 0,
+      "stdout": "Claude Code doctor\n\nRunning: native (2.1.323)\nCommit: 66b1ade1dce6\nPlatform: linux-x64\nPath: /opt/claude\nConfig install method: not set\nSearch: OK (bundled)\nAuto-updates: disabled (set by env: DISABLE_AUTOUPDATER)\nAuto-update channel: latest\nLast update attempt: none recorded\nManaged settings (remote): not fetched — not available with a custom ANTHROPIC_BASE_URL\nOrganization policy: not fetched with a custom ANTHROPIC_BASE_URL\n\nRemote Control\nRemote Control is only available when using Claude via api.anthropic.com. ANTHROPIC_BASE_URL is set and does not point at api.anthropic.com, so this session is using a custom endpoint — unset it (or run in a shell without it) to use Remote Control.\n- Not connected to the Anthropic API (api.anthropic.com)\n- Not signed in to claude.ai\n- claude.ai subscription auth not active\n- Sign-in is missing the user:profile scope\n- Organization not resolved\n- Feature-flag evaluation disabled (disabled by CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)\n- Remote Control availability could not be verified (no server response this session)\n\n4 warnings found\n- Native installation exists but ~/.local/bin is not in your PATH\n  Fix: Run: echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> your shell config file then open a new terminal or run: source your shell config file\n- Running native installation but config install method is 'not set'\n  Fix: Run claude install to update configuration\n- claude command at /owned/2/home/.local/bin/claude missing or broken (/owned/2/home/.local/bin does not exist)\n  Fix: Run claude install to repair the installation.\n- claude command at /owned/2/home/.local/bin/claude missing or broken\n  Fix: Run claude install to repair the installation.\n\nFor a full setup checkup that can also fix issues, run /doctor in a Claude Code session.\n",
+      "raw_stdout_sha256": "3430c576b459a20b0b608e2a34f80f7bfb90e72ca67400d6526a931cfeca4b7a",
+      "stderr": "",
+      "raw_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "settings": {}
+    },
+    "invalid": {
+      "argv": [
+        "/opt/claude",
+        "--bare",
+        "--setting-sources",
+        "",
+        "--settings",
+        "<settings-file>",
+        "doctor"
+      ],
+      "returncode": 0,
+      "stdout": "Claude Code doctor\n\nRunning: native (2.1.323)\nCommit: 66b1ade1dce6\nPlatform: linux-x64\nPath: /opt/claude\nConfig install method: not set\nSearch: OK (bundled)\nAuto-updates: disabled (set by env: DISABLE_AUTOUPDATER)\nAuto-update channel: latest\nLast update attempt: none recorded\nManaged settings (remote): not fetched — not available with a custom ANTHROPIC_BASE_URL\nOrganization policy: not fetched with a custom ANTHROPIC_BASE_URL\n\nInvalid settings\n- <settings-file> › hooks.PreToolUse.0: Hook matcher must be an object; received null — a PreToolUse/PermissionRequest hook that cannot be loaded may be what guards the permissions declared beside it, so nothing it sits in is applied until the entry is fixed or removed.\n- <settings-file> › hooks.PreToolUse.0: Expected object, but received null\n  Suggested fix: Hooks use a matcher + hooks array. The matcher is a string: a tool name (\"Bash\"), pipe-separated list (\"Edit|Write\"), or empty to match all. Example: {\"PostToolUse\": [{\"matcher\": \"Edit|Write\", \"hooks\": [{\"type\": \"command\", \"command\": \"echo Done\"}]}]}\n\nRemote Control\nRemote Control is only available when using Claude via api.anthropic.com. ANTHROPIC_BASE_URL is set and does not point at api.anthropic.com, so this session is using a custom endpoint — unset it (or run in a shell without it) to use Remote Control.\n- Not connected to the Anthropic API (api.anthropic.com)\n- Not signed in to claude.ai\n- claude.ai subscription auth not active\n- Sign-in is missing the user:profile scope\n- Organization not resolved\n- Feature-flag evaluation disabled (disabled by CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)\n- Remote Control availability could not be verified (no server response this session)\n\n4 warnings found\n- Native installation exists but ~/.local/bin is not in your PATH\n  Fix: Run: echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> your shell config file then open a new terminal or run: source your shell config file\n- Running native installation but config install method is 'not set'\n  Fix: Run claude install to update configuration\n- claude command at /owned/3/home/.local/bin/claude missing or broken (/owned/3/home/.local/bin does not exist)\n  Fix: Run claude install to repair the installation.\n- claude command at /owned/3/home/.local/bin/claude missing or broken\n  Fix: Run claude install to repair the installation.\n\nFor a full setup checkup that can also fix issues, run /doctor in a Claude Code session.\n",
+      "raw_stdout_sha256": "1895f5ede1c90cb4af748278174c0e83b86e1812cc2a017812a187fa98250c8c",
+      "stderr": "",
+      "raw_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "settings": {
+        "hooks": {
+          "PreToolUse": [
+            null
+          ]
+        }
+      }
+    },
+    "full": {
+      "argv": [
+        "/opt/claude",
+        "--bare",
+        "--setting-sources",
+        "",
+        "--settings",
+        "<settings-file>",
+        "doctor"
+      ],
+      "returncode": 0,
+      "stdout": "Claude Code doctor\n\nRunning: native (2.1.323)\nCommit: 66b1ade1dce6\nPlatform: linux-x64\nPath: /opt/claude\nConfig install method: not set\nSearch: OK (bundled)\nAuto-updates: disabled (set by env: DISABLE_AUTOUPDATER)\nAuto-update channel: latest\nLast update attempt: none recorded\nManaged settings (remote): not fetched — not available with a custom ANTHROPIC_BASE_URL\nOrganization policy: not fetched with a custom ANTHROPIC_BASE_URL\n\nRemote Control\nRemote Control is only available when using Claude via api.anthropic.com. ANTHROPIC_BASE_URL is set and does not point at api.anthropic.com, so this session is using a custom endpoint — unset it (or run in a shell without it) to use Remote Control.\n- Not connected to the Anthropic API (api.anthropic.com)\n- Not signed in to claude.ai\n- claude.ai subscription auth not active\n- Sign-in is missing the user:profile scope\n- Organization not resolved\n- Feature-flag evaluation disabled (disabled by CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)\n- Remote Control availability could not be verified (no server response this session)\n\n4 warnings found\n- Native installation exists but ~/.local/bin is not in your PATH\n  Fix: Run: echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> your shell config file then open a new terminal or run: source your shell config file\n- Running native installation but config install method is 'not set'\n  Fix: Run claude install to update configuration\n- claude command at /owned/4/home/.local/bin/claude missing or broken (/owned/4/home/.local/bin does not exist)\n  Fix: Run claude install to repair the installation.\n- claude command at /owned/4/home/.local/bin/claude missing or broken\n  Fix: Run claude install to repair the installation.\n\nFor a full setup checkup that can also fix issues, run /doctor in a Claude Code session.\n",
+      "raw_stdout_sha256": "a46ee0d02a2062ccf8f95b40706082fd6104ee2553dc5d1158f45fe86efc522a",
+      "stderr": "",
+      "raw_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "settings": {
+        "attribution": false,
+        "customOptions": {
+          "future": "synthetic-caller-value"
+        },
+        "remoteTools": {
+          "allowUnattendedServing": false
+        },
+        "env": {
+          "EXAMPLE_KEY": "synthetic-caller-value"
+        }
+      }
+    }
+  }
+}

@@ -5948,6 +5948,9 @@ def create_runner_app(
             post_tools_changed,
             start_tool_relay,
         )
+        from omnigent.harnesses.claude_native.settings_generation import (
+            ClaudeSettingsRequestExpired,
+        )
 
         workflows_enabled = await server_workflows_enabled(server_client)
 
@@ -5965,7 +5968,11 @@ def create_runner_app(
             # Keep it: once resolution recovers, the resolved spec differs
             # from the stored one and the relay rebuilds then.
             binding = _session_comment_relays.get(session_id)
-            if binding is not None and binding.workflows_enabled == workflows_enabled:
+            if (
+                binding is not None
+                and binding.workflows_enabled == workflows_enabled
+                and binding.relay.is_current()
+            ):
                 return
             spec_entry = binding.spec_entry if binding is not None else None
 
@@ -5996,6 +6003,7 @@ def create_runner_app(
             and current.workflows_enabled == workflows_enabled
             and current.routing_available == routing_stamp()
             and known_bridge_dir is None
+            and current.relay.is_current()
         ):
             return
 
@@ -6019,6 +6027,7 @@ def create_runner_app(
             and current.workflows_enabled == workflows_enabled
             and current.routing_available == routing_stamp()
             and current.bridge_dir == bridge_dir
+            and current.relay.is_current()
         ):
             return
 
@@ -6059,6 +6068,7 @@ def create_runner_app(
                 and current.workflows_enabled == workflows_enabled
                 and current.routing_available == routing_stamp()
                 and current.bridge_dir == bridge_dir
+                and current.relay.is_current()
             ):
                 return
 
@@ -6174,7 +6184,11 @@ def create_runner_app(
                 )
 
         try:
-            if current is not None and current.bridge_dir == bridge_dir:
+            if (
+                current is not None
+                and current.bridge_dir == bridge_dir
+                and current.relay.is_current()
+            ):
                 # Native policy hooks can cache the relay URL/token at startup.
                 relay = current.relay
                 relay.update_tools(relay_schemas, _relay_tool_executor)
@@ -6189,7 +6203,7 @@ def create_runner_app(
                         session_id=session_id,
                         file_change_observer=_observe_native_file_changes,
                     )
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ClaudeSettingsRequestExpired):
             _logger.warning(
                 "Failed to start comment relay for session=%s",
                 session_id,

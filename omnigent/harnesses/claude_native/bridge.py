@@ -57,7 +57,7 @@ import time
 import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -80,6 +80,11 @@ from omnigent.harnesses.claude_native import (
 )
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.harnesses.claude_native.settings_generation import (
+    ClaudeSettingsRequestExpired,
+    prepare_claude_settings_lifecycle,
+    settings_generation_path,
+)
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
@@ -106,6 +111,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
 
@@ -601,6 +607,8 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+_GENERATED_SETTINGS_FILE = re.compile(r"claude-settings-([0-9a-f]{32})(?:-[0-9a-f]{32})?\.json")
+_CALLER_SETTINGS_MAX_BYTES = 1024 * 1024
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -1470,6 +1478,8 @@ class ClaudeNativeToolRelay:
         relay_info: _JsonObject,
         tool_executor: ToolExecutor,
         closed: threading.Event,
+        credential_binding: ClaudeBridgeCredentialBinding | None = None,
+        require_activation_binding: bool = True,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1480,6 +1490,8 @@ class ClaudeNativeToolRelay:
         :param advertised_url: Base URL advertised in ``tool_relay.json``.
         :param relay_info: Current relay advertisement, including its stable token.
         :param tool_executor: Callback for the current tool surface.
+        :param credential_binding: Bridge activation owned by this relay.
+        :param require_activation_binding: Whether this relay uses Claude's activation metadata.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
@@ -1492,22 +1504,36 @@ class ClaudeNativeToolRelay:
         self._advertised_tool_names = _relay_info_tool_names(relay_info)
         self._tool_executor = tool_executor
         self._closed = closed
+        self._credential_binding = credential_binding or read_bridge_credential_binding(bridge_dir)
+        self._require_activation_binding = require_activation_binding
+
+    def is_current(self) -> bool:
+        """Whether this relay still belongs to the directory's live activation."""
+        return not self._closed.is_set() and _bridge_endpoint_is_current(
+            self._bridge_dir,
+            self._credential_binding,
+            require_binding=self._require_activation_binding,
+        )
 
     def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
 
         :param tools: Replacement tool schemas.
         :param tool_executor: Callback dispatching against the updated spec.
+        :raises RuntimeError: When this relay's activation has ended.
         """
         relay_info = {
             **self._relay_info,
             "tools": _normalize_relay_tool_specs(tools),
             "updated_at": time.time(),
         }
-        _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
-        self._relay_info = relay_info
-        self._advertised_tool_names = _relay_info_tool_names(relay_info)
-        self._tool_executor = tool_executor
+        with _bridge_metadata_write_lock(self._bridge_dir):
+            if not self.is_current():
+                raise RuntimeError("Native tool relay activation has ended")
+            _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
+            self._relay_info = relay_info
+            self._advertised_tool_names = _relay_info_tool_names(relay_info)
+            self._tool_executor = tool_executor
 
     def close(self) -> None:
         """
@@ -1528,9 +1554,13 @@ class ClaudeNativeToolRelay:
         # A newer relay that overwrote the file advertises a different url
         # (this relay's socket is still bound, so its port is unique), so the
         # file is left for that relay to own.
-        if _read_json_file(relay_file).get("url") == self._advertised_url:
-            with contextlib.suppress(FileNotFoundError):
-                relay_file.unlink()
+        with _bridge_metadata_write_lock(self._bridge_dir):
+            current = _read_json_file(relay_file)
+            if current.get("url") == self._advertised_url and current.get(
+                "token"
+            ) == self._relay_info.get("token"):
+                with contextlib.suppress(FileNotFoundError):
+                    relay_file.unlink()
         self._closed.set()
         self._httpd.shutdown()
         self._httpd.server_close()
@@ -1926,6 +1956,7 @@ def prepare_bridge_dir(
     bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
     with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
         _ensure_secure_dir(bridge_dir)
+        prepare_claude_settings_lifecycle(bridge_dir, reactivate=True, session_id=conversation_id)
         # A parked permission hook only touches files in this root, so the runner
         # owns creating and validating it before any hook can fire. Derived from the
         # bridge dir just validated rather than read from the module global, so it
@@ -1990,7 +2021,26 @@ def prune_orphaned_bridge_dirs() -> int:
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
+    from omnigent.harnesses.claude_native.settings_generation import (
+        has_live_claude_settings_owners,
+        prune_unused_claude_settings,
+    )
+
+    completed = 0
+    if _BRIDGE_ROOT.exists():
+        for path in _BRIDGE_ROOT.iterdir():
+            if path.name != ".locks" and path.is_dir() and not path.is_symlink():
+                with contextlib.suppress(OSError, ValueError):
+                    prune_unused_claude_settings(path)
+                    completed += not path.exists()
+    return completed + native_bridge_common.prune_orphaned_dirs(
+        _BRIDGE_ROOT,
+        should_prune=lambda path: (
+            (path / native_bridge_common.OWNER_PID_FILENAME).is_file()
+            and not has_live_claude_settings_owners(path)
+        ),
+        on_dead_owner=retire_bridge_credentials,
+    )
 
 
 def claude_global_config_path(
@@ -2195,16 +2245,100 @@ def read_active_session_id(bridge_dir: Path) -> str | None:
 
     :param bridge_dir: Bridge directory path.
     :returns: Active Omnigent session id, e.g. ``"conv_abc123"``, or
-        ``None`` when the bridge config is absent or malformed.
+        ``None`` when the bridge is deleted or its config is absent or malformed.
     """
     config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not isinstance(config, dict):
+    if not isinstance(config, dict) or config.get("deleted") is True:
         return None
     active = config.get("active_session_id")
     if isinstance(active, str) and active:
         return active
     legacy = config.get("conversation_id")
     return legacy if isinstance(legacy, str) and legacy else None
+
+
+@dataclass(frozen=True)
+class ClaudeBridgeCredentialBinding:
+    """Identify one bridge activation without retaining its credential."""
+
+    directory_identity: tuple[int, int]
+    token_digest: str
+
+
+def read_bridge_credential_binding(bridge_dir: Path) -> ClaudeBridgeCredentialBinding | None:
+    """Return an activation binding that changes after deletion or replacement."""
+    try:
+        info = bridge_dir.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            return None
+        config = json.loads(_read_caller_settings(bridge_dir / _CONFIG_FILE, nofollow=True))
+        if not isinstance(config, dict) or config.get("deleted") is True:
+            return None
+        token = config.get("token")
+        if not isinstance(token, str) or not token:
+            return None
+        current = bridge_dir.stat(follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            return None
+        return ClaudeBridgeCredentialBinding(
+            (info.st_dev, info.st_ino), hashlib.sha256(token.encode()).hexdigest()
+        )
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return None
+
+
+def _bridge_credentials_current(
+    bridge_dir: Path, binding: ClaudeBridgeCredentialBinding | None
+) -> bool:
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    return config.get("deleted") is not True and (
+        binding is None or read_bridge_credential_binding(bridge_dir) == binding
+    )
+
+
+def _bridge_endpoint_is_current(
+    bridge_dir: Path,
+    binding: ClaudeBridgeCredentialBinding | None,
+    *,
+    require_binding: bool = True,
+) -> bool:
+    """Require a concrete activation for endpoints tied to Claude's settings lifecycle."""
+    return (binding is not None or not require_binding) and _bridge_credentials_current(
+        bridge_dir, binding
+    )
+
+
+def retire_bridge_credentials(bridge_dir: Path, session_id: str | None = None) -> None:
+    """Remove auth snapshots under the preparation lock, retaining only deletion identity."""
+    try:
+        config = json.loads(_read_caller_settings(bridge_dir / _CONFIG_FILE, nofollow=True))
+    except (OSError, ValueError, RecursionError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    if session_id is None:
+        for name in ("active_session_id", "conversation_id"):
+            value = config.get(name)
+            if isinstance(value, str) and value:
+                session_id = value
+                break
+    tombstone: _JsonObject = {"deleted": True}
+    if session_id is not None:
+        tombstone.update(active_session_id=session_id, conversation_id=session_id)
+    if isinstance(config.get("bridge_id"), str):
+        tombstone["bridge_id"] = config["bridge_id"]
+    first_error: OSError | None = None
+    try:
+        _write_json_file(bridge_dir / _CONFIG_FILE, tombstone)
+    except OSError as exc:
+        first_error = exc
+    for filename in (_PERMISSION_HOOK_FILE, _SERVER_FILE, _TOOL_RELAY_FILE, _TOOL_RELAY_ENV_FILE):
+        try:
+            (bridge_dir / filename).unlink(missing_ok=True)
+        except OSError as exc:
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
 
 
 def read_launch_model(bridge_dir: Path) -> str | None:
@@ -2294,7 +2428,7 @@ def record_model_vocabulary(
     # with its own stale read.
     with _bridge_metadata_write_lock(bridge_dir):
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
-        if not isinstance(config, dict) or not config:
+        if not isinstance(config, dict) or not config or config.get("deleted") is True:
             # No prepared bridge config yet (missing/malformed reads as {}):
             # recording would materialize an incomplete bridge dir that has
             # no owner.pid, which orphan pruning then skips forever.
@@ -2358,6 +2492,10 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
         if not config:
             raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
+        if config.get("deleted") is True:
+            raise ClaudeSettingsRequestExpired()
+        if (config.get("active_session_id") or config.get("conversation_id")) != session_id:
+            prepare_claude_settings_lifecycle(bridge_dir, reactivate=True, session_id=session_id)
         config["active_session_id"] = session_id
         config["conversation_id"] = session_id
         config["updated_at"] = time.time()
@@ -2374,8 +2512,10 @@ def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
     :returns: Permission hook config, e.g.
         ``{"ap_server_url": "http://127.0.0.1:8787",
         "ap_auth_headers": {"Authorization": "Bearer token"}}``.
-        Empty dict when the file is absent or malformed.
+        Empty dict when the bridge is deleted or the file is absent or malformed.
     """
+    if _read_json_file(bridge_dir / _CONFIG_FILE).get("deleted") is True:
+        return {}
     payload = _read_json_file(bridge_dir / _PERMISSION_HOOK_FILE)
     return payload if isinstance(payload, dict) else {}
 
@@ -2383,21 +2523,27 @@ def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
 def update_permission_hook_auth_headers(
     bridge_dir: Path,
     headers: dict[str, str],
+    *,
+    credential_binding: ClaudeBridgeCredentialBinding | None = None,
 ) -> bool:
     """Atomically replace the permission hook's server auth headers.
 
     :param bridge_dir: Native Claude bridge directory.
     :param headers: Fresh server request headers.
-    :returns: ``True`` when the hook config existed and was updated.
+    :param credential_binding: Activation owned by the refreshing task, when known.
+    :returns: ``True`` when the current activation's hook config was updated.
     """
-    path = bridge_dir / _PERMISSION_HOOK_FILE
-    payload = _read_json_file(path)
-    if not payload:
-        return False
-    payload["ap_auth_headers"] = dict(headers)
-    payload["updated_at"] = time.time()
-    _write_json_file(path, payload)
-    return True
+    with _bridge_metadata_write_lock(bridge_dir):
+        if not _bridge_credentials_current(bridge_dir, credential_binding):
+            return False
+        path = bridge_dir / _PERMISSION_HOOK_FILE
+        payload = _read_json_file(path)
+        if not payload:
+            return False
+        payload["ap_auth_headers"] = dict(headers)
+        payload["updated_at"] = time.time()
+        _write_json_file(path, payload)
+        return True
 
 
 def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> _JsonObject:
@@ -2683,6 +2829,7 @@ def build_hook_settings(
         session does not route.
     :returns: JSON-serializable Claude settings fragment.
     """
+    credential_binding = read_bridge_credential_binding(bridge_dir)
     python = python_executable or sys.executable
     # -I (isolated mode) prevents Python from adding the session's
     # working directory to sys.path, which would shadow the installed
@@ -2812,14 +2959,17 @@ def build_hook_settings(
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
-        _write_json_file(
-            bridge_dir / _PERMISSION_HOOK_FILE,
-            {
-                "ap_server_url": ap_server_url,
-                "ap_auth_headers": ap_auth_headers or {},
-                "updated_at": time.time(),
-            },
-        )
+        with _bridge_metadata_write_lock(bridge_dir):
+            if not _bridge_credentials_current(bridge_dir, credential_binding):
+                raise ClaudeSettingsRequestExpired()
+            _write_json_file(
+                bridge_dir / _PERMISSION_HOOK_FILE,
+                {
+                    "ap_server_url": ap_server_url,
+                    "ap_auth_headers": ap_auth_headers or {},
+                    "updated_at": time.time(),
+                },
+            )
         # ``PermissionRequest`` fires only when Claude is about to
         # show its TUI permission prompt — that's exactly the
         # interception point we want for routing to the web UI.
@@ -2997,16 +3147,31 @@ def build_hook_settings(
     # blocking statusLine path — the forwarder normalizes it into
     # ``context.json``) and chains to whatever the user had globally so
     # claude-hud / their bar still renders.
+    settings["statusLine"] = {
+        "type": "command",
+        "command": _status_line_command(bridge_dir, read_user_status_line_command()),
+    }
+    return settings
+
+
+def _status_line_command(bridge_dir: Path, chain_command: str | None) -> str:
+    """
+    Build the statusLine shell command that captures Claude's payload.
+
+    :param bridge_dir: Bridge directory receiving ``CONTEXT_RAW_FILE``.
+    :param chain_command: Status-line command to pipe the same payload to
+        afterwards so its bar still renders, e.g. ``"claude-hud"``; ``None``
+        captures only.
+    :returns: The ``/bin/sh`` command for ``statusLine.command``.
+    """
     raw_quoted = shlex.quote(str(bridge_dir / CONTEXT_RAW_FILE))
-    status_command = (
+    command = (
         f"p=$(cat); printf '%s' \"$p\" > {raw_quoted}.$$.tmp"
         f" && mv -f {raw_quoted}.$$.tmp {raw_quoted}"
     )
-    chain_command = read_user_status_line_command()
     if chain_command is not None:
-        status_command += f"; printf '%s' \"$p\" | ( {chain_command} )"
-    settings["statusLine"] = {"type": "command", "command": status_command}
-    return settings
+        command += f"; printf '%s' \"$p\" | (\n{chain_command}\n)"
+    return command
 
 
 def _claude_read_rule(directory: PurePath) -> str | None:
@@ -3113,6 +3278,9 @@ def augment_claude_args(
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
     active_harnesses: Collection[str] | None = None,
+    legacy_bridge_identity: bool = False,
+    legacy_peer: bool = False,
+    settings_request: ClaudeSettingsRequest | None = None,
     defer_inherited_mcp_discovery: bool = False,
 ) -> list[str]:
     """
@@ -3120,6 +3288,8 @@ def augment_claude_args(
 
     Invocation settings are written into the owner-only bridge directory so
     credential-bearing ``apiKeyHelper`` commands never appear in child argv.
+    Caller settings stay in argv until finalization can read them through the
+    terminal's selected filesystem, working directory and environment.
 
     :param claude_args: User-provided Claude Code args, e.g.
         ``("--resume", "abc")``.
@@ -3167,11 +3337,14 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param legacy_bridge_identity: Include the canonical settings operand so older
+        runners can discover a CLI launch's bridge. The generated settings win.
+    :param legacy_peer: Use the historical single settings file for an unfenced peer.
+    :param settings_request: Explicit owner for a deferred launch generation.
     :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
     :param defer_inherited_mcp_discovery: ``True`` when the caller resolves the
-        launch cwd and environment later and then calls
-        :func:`apply_claude_launch_mcp_policy`; otherwise strict MCP mode reads
-        inherited settings for *workspace* and this process's environment.
+        launch cwd and environment during receiver-side settings finalization. Otherwise strict
+        MCP mode reads inherited settings for *workspace* and this process's environment.
     :returns: Augmented argument list for the terminal resource.
     """
     hook_settings = build_hook_settings(
@@ -3199,8 +3372,16 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
-    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
-    _write_json_file(settings_path, hook_settings)
+    if legacy_peer and settings_request is not None:
+        raise ValueError("Legacy Claude launch cannot expose an owned generation")
+    settings_path = (
+        bridge_dir / _INVOCATION_SETTINGS_FILE
+        if legacy_peer
+        else settings_request.settings_path(bridge_dir)
+        if settings_request is not None
+        else _generation_settings_path(bridge_dir, secrets.token_hex(16))
+    )
+    _write_json_file(settings_path, hook_settings, exclusive=settings_request is not None)
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     if claude_code_managed_mcp_present():
@@ -3211,6 +3392,16 @@ def augment_claude_args(
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
+    if legacy_bridge_identity and not legacy_peer:
+        identity_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+        try:
+            fd = os.open(identity_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+        args.extend(["--settings", str(identity_path)])
     args.extend(["--settings", str(settings_path)])
     args = _merge_append_system_prompt(args, append_system_prompt, bridge_dir=bridge_dir)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
@@ -3242,9 +3433,9 @@ def apply_claude_launch_mcp_policy(
     """
     Apply strict MCP discovery to the invocation settings for Claude's launch context.
 
-    Completes :func:`augment_claude_args` called with
-    ``defer_inherited_mcp_discovery=True``, reading the settings files the launched
-    CLI reads from *cwd* and *env*.
+    Supports explicit finalization of legacy single-file settings. Receiver-side
+    finalization uses :func:`finalize_claude_caller_settings` for owned generations,
+    preserving the immutable baseline while reading the terminal's launch context.
 
     :param bridge_dir: Bridge directory holding the invocation settings.
     :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
@@ -3446,6 +3637,527 @@ def _merge_append_system_prompt(
     existing = args[value_idx][offset:]
     args[value_idx] = args[value_idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
     return args
+
+
+# Required operands may start with "--"; optional operands stop at the next option.
+_CLAUDE_REQUIRED_VALUE_FLAGS = frozenset(
+    {
+        "--add-dir",
+        "--agent",
+        "--agent-name",
+        "--agents",
+        "--allowedTools",
+        "--allowed-tools",
+        "--append-subagent-system-prompt",
+        "--append-system-prompt",
+        "--append-system-prompt-file",
+        "--autocompact",
+        "--betas",
+        "--debug-file",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--effort",
+        "--environment",
+        "--fallback-model",
+        "--file",
+        "--input-format",
+        "--json-schema",
+        "--max-budget-usd",
+        "--mcp-config",
+        "--model",
+        "--name",
+        "-n",
+        "--output-format",
+        "--permission-mode",
+        "--permission-prompts",
+        "--plan-mode-instructions",
+        "--plugin-dir",
+        "--plugin-url",
+        "--prefill",
+        "--remote-control-session-name-prefix",
+        "--session-id",
+        "--setting-sources",
+        "--system-prompt",
+        "--system-prompt-file",
+        "--system-prompt-snapshot",
+        "--tools",
+    }
+)
+
+
+def _read_caller_settings(path: Path, *, nofollow: bool = False) -> str:
+    """Read at most 1 MiB from a regular file without blocking on a FIFO."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if nofollow:
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _CALLER_SETTINGS_MAX_BYTES:
+            raise ValueError("caller settings require a regular file of at most 1 MiB")
+        data = bytearray()
+        while len(data) <= _CALLER_SETTINGS_MAX_BYTES:
+            chunk = os.read(fd, _CALLER_SETTINGS_MAX_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > _CALLER_SETTINGS_MAX_BYTES:
+            raise ValueError("caller settings exceed 1 MiB")
+        return data.decode("utf-8")
+    finally:
+        os.close(fd)
+
+
+def _finite_settings_number(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("caller settings require finite JSON numbers")
+    return number
+
+
+def _pop_caller_settings(
+    args: list[str],
+    *,
+    workspace: Path | None,
+    read_file: Callable[[Path], str] | None = None,
+    warn_unapplied: bool = False,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """
+    Remove caller ``--settings`` flags from ``args`` and return their parsed values.
+
+    Claude Code honours only the LAST ``--settings`` flag, so a caller's flag would
+    be silently replaced by the invocation settings Omnigent appends. Each value
+    is a JSON object or a regular file of at most 1 MiB. Unsupported or unreadable
+    values stay in ``args`` untouched.
+
+    :param args: Claude CLI argument list.
+    :param workspace: Terminal workspace for relative settings paths.
+    :param read_file: Reader authorized by the terminal's resolved policy.
+        Without one, file flags remain untouched.
+    :param warn_unapplied: Report parsing refusals during the final composition pass.
+    :returns: ``(args without the merged flags, parsed settings in flag order)``.
+    """
+    kept: list[str] = []
+    found: list[dict[str, Any]] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            kept.extend(args[i:])
+            break
+        if arg in _CLAUDE_REQUIRED_VALUE_FLAGS:
+            kept.extend(args[i : i + 2])
+            i += 2
+            continue
+        if arg == "--settings" and i + 1 < len(args):
+            value, step = args[i + 1], 2
+        elif arg.startswith("--settings="):
+            value, step = arg.partition("=")[2], 1
+        else:
+            kept.append(arg)
+            i += 1
+            continue
+        parsed: object = None
+        payload: str | None = None
+        try:
+            inline = value.lstrip().startswith("{")
+            settings_path = Path(value)
+            if not inline and not settings_path.is_absolute() and workspace is not None:
+                settings_path = workspace / settings_path
+            if inline:
+                payload = value
+            else:
+                if read_file is None:
+                    raise ValueError("caller settings files require the terminal read policy")
+                payload = read_file(settings_path)
+        except (OSError, ValueError, RecursionError):
+            pass
+        if payload is not None:
+            reason = "non_object"
+            try:
+                parsed = json.loads(
+                    payload,
+                    parse_float=_finite_settings_number,
+                    parse_constant=_finite_settings_number,
+                )
+            except (ValueError, RecursionError):
+                reason = "invalid_json"
+            if not isinstance(parsed, dict) and warn_unapplied:
+                _warn_unapplied_caller_settings(reason)
+        if isinstance(parsed, dict):
+            found.append(parsed)
+        else:
+            kept.extend(args[i : i + step])
+        i += step
+    return kept, found
+
+
+def _warn_unapplied_caller_settings(reason: str) -> None:
+    _logger.warning(
+        "Claude caller settings input was not applied: reason=%s; "
+        "preserving its original argument, which Claude may ignore",
+        reason,
+    )
+
+
+def _generation_settings_path(bridge_dir: Path, generation: str) -> Path:
+    """Constrain launch metadata to generated names in the trusted bridge directory."""
+    return settings_generation_path(bridge_dir, generation)
+
+
+def record_claude_settings_boundary(
+    bridge_dir: Path,
+    args: list[str],
+    *,
+    claude_args_start: int,
+    settings_request: ClaudeSettingsRequest | None = None,
+) -> str:
+    """Record the framework-resolved Claude boundary without persisting argument values."""
+    generation = None
+    for arg in reversed(args):
+        path = Path(arg)
+        match = _GENERATED_SETTINGS_FILE.fullmatch(path.name)
+        if match and path == _generation_settings_path(bridge_dir, match[1]):
+            generation = match[1]
+            break
+    if generation is None:
+        raise ValueError("Claude settings launch baseline is missing")
+    settings_path = _generation_settings_path(bridge_dir, generation)
+    if settings_request is not None and settings_path != settings_request.settings_path(
+        bridge_dir
+    ):
+        raise ValueError("Claude settings request and boundary do not match")
+    _write_json_file(
+        settings_path.with_suffix(".boundary.json"),
+        {
+            "start": claude_args_start,
+            "digest": hashlib.sha256(json.dumps(args).encode()).hexdigest(),
+        },
+        exclusive=settings_request is not None,
+    )
+    return generation
+
+
+def _claude_settings_boundary(bridge_dir: Path, args: list[str], generation: str) -> int:
+    """Require a recorded launch boundary to match the actual terminal arguments."""
+    _ensure_secure_dir(bridge_dir)
+    boundary = json.loads(
+        _read_caller_settings(
+            _generation_settings_path(bridge_dir, generation).with_suffix(".boundary.json"),
+            nofollow=True,
+        )
+    )
+    if not isinstance(boundary, dict):
+        raise ValueError("Claude settings launch boundary is invalid")
+    start = boundary.get("start")
+    if (
+        type(start) is not int
+        or not 0 <= start <= len(args)
+        or boundary.get("digest") != hashlib.sha256(json.dumps(args).encode()).hexdigest()
+    ):
+        raise ValueError("Claude settings launch boundary does not match terminal arguments")
+    return start
+
+
+def _replace_framework_settings(
+    args: list[str], baseline: Path, output: Path, *, retain_baseline: bool = False
+) -> None:
+    """Rewrite framework flag operands while leaving settings-shaped prompt values literal."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg in _CLAUDE_REQUIRED_VALUE_FLAGS:
+            index += 2
+        elif arg == "--settings" and index + 1 < len(args):
+            if args[index + 1] == str(baseline):
+                if retain_baseline:
+                    args[index + 1 : index + 2] = [str(baseline), "--settings", str(output)]
+                    index += 2
+                else:
+                    args[index + 1] = str(output)
+            index += 2
+        else:
+            index += 1
+
+
+async def _run_claude_settings_step[Result](
+    operation: Callable[[], Result], *, dispose: Callable[[Result], None] | None = None
+) -> Result:
+    """Drain cancelled work and dispose any result the caller could not adopt."""
+    from omnigent.inner._subprocess_lifecycle import await_cleanup_task
+
+    # Loop shutdown must not cancel the completion signal before the thread finishes.
+    loop = asyncio.get_running_loop()
+    worker = loop.run_in_executor(None, copy_context().run, operation)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await await_cleanup_task(worker)
+            if dispose is not None:
+                cleanup = loop.run_in_executor(
+                    None, copy_context().run, functools.partial(dispose, worker.result())
+                )
+                await await_cleanup_task(cleanup)
+        raise
+
+
+async def finalize_claude_caller_settings(
+    instance: TerminalInstance,
+    *,
+    bridge_dir: Path,
+    generation: str | None = None,
+    active_harnesses: Collection[str] | None = None,
+    private_output: bool = False,
+) -> None:
+    """Merge deferred settings using the new terminal's actual filesystem view.
+
+    ``bridge_dir`` must be framework-derived. Caller files use the instance's
+    existing helper under an active sandbox; unsandboxed panes use bounded reads.
+    A supplied generation binds immutable baseline and boundary metadata. Older
+    clients omit it and keep their argv unchanged, without consulting old metadata.
+    """
+    from omnigent.host.harness_startup import env_wrapper_launch
+    from omnigent.inner.terminal import terminal_pane_environment
+
+    if generation is None:
+        return
+    settings_path = _generation_settings_path(bridge_dir, generation)
+    start = await _run_claude_settings_step(
+        functools.partial(_claude_settings_boundary, bridge_dir, instance.args, generation)
+    )
+    prefix, args = instance.args[:start], instance.args[start:]
+    environment = instance.os_env
+    if environment is None:
+        raise ValueError("caller settings require the terminal filesystem environment")
+    launch_env = terminal_pane_environment(
+        inherit_env=instance.inherit_env,
+        env=instance.env,
+        env_unset=instance.env_unset,
+        sandbox_policy=instance.sandbox_policy,
+    )
+    wrapper = env_wrapper_launch(instance.command, instance.args, launch_env)
+    if wrapper is not None:
+        if not wrapper.environment.inherit:
+            launch_env = {}
+        for name in wrapper.environment.unset:
+            launch_env.pop(name, None)
+        launch_env.update(wrapper.environment.variables)
+    workspace: Path | None = environment.cwd
+    if Path(instance.command).name == "env" and wrapper is None:
+        workspace = None
+    elif wrapper is not None and wrapper.chdir is not None:
+        # Resolve wrapper paths through the terminal view, including overlay symlinks.
+        workspace = environment.cwd / wrapper.chdir
+    paths: set[Path] = set()
+    has_bridge_settings = False
+
+    def collect(path: Path) -> str:
+        nonlocal has_bridge_settings
+        if path == settings_path:
+            has_bridge_settings = True
+        elif path != bridge_dir / _INVOCATION_SETTINGS_FILE:
+            paths.add(path)
+        raise ValueError("settings read is deferred")
+
+    await _run_claude_settings_step(
+        functools.partial(_pop_caller_settings, args, workspace=workspace, read_file=collect)
+    )
+    if not has_bridge_settings:
+        return
+    if workspace is None:
+        from omnigent.config import global_config_path
+        from omnigent.mcp_disabled_servers import McpStrictModeError
+        from omnigent.mcp_inheritance import resolve_mcp_inheritance
+
+        if not resolve_mcp_inheritance("claude-native").inherit:
+            raise McpStrictModeError(
+                "claude-native", global_config_path(), "unresolved env wrapper"
+            )
+    contents: dict[Path, str] = {}
+    for path in paths:
+        unavailable_reason: str | None = None
+        try:
+            if not path.is_absolute():
+                unavailable_reason = "unsupported_wrapper_directory"
+            elif instance.sandbox_policy is None or not instance.sandbox_policy.active:
+                contents[path] = await _run_claude_settings_step(
+                    functools.partial(_read_caller_settings, path)
+                )
+            else:
+                result = await environment.read(
+                    str(path), max_bytes=_CALLER_SETTINGS_MAX_BYTES, regular_only=True
+                )
+                content = result.get("content")
+                if (
+                    not result.get("error")
+                    and not result.get("truncated")
+                    and result.get("encoding") == "utf-8"
+                    and isinstance(content, str)
+                ):
+                    contents[path] = content
+                elif result.get("error"):
+                    unavailable_reason = "terminal_read_error"
+                elif result.get("truncated"):
+                    unavailable_reason = "truncated"
+                else:
+                    unavailable_reason = "unsupported_content"
+        except (OSError, ValueError) as exc:
+            unavailable_reason = type(exc).__name__
+        if unavailable_reason is not None:
+            # Settings operands and read errors can contain credential-bearing text.
+            _warn_unapplied_caller_settings(unavailable_reason)
+
+    def read_file(path: Path) -> str:
+        if path == settings_path or path not in contents:
+            raise ValueError("settings file is unavailable under the terminal policy")
+        return contents[path]
+
+    def merge_settings() -> tuple[list[str], dict[str, Any] | None, bool]:
+        kept, callers = _pop_caller_settings(
+            args, workspace=workspace, read_file=read_file, warn_unapplied=True
+        )
+        _ensure_secure_dir(bridge_dir)
+        baseline = json.loads(
+            _read_caller_settings(settings_path, nofollow=True),
+            parse_float=_finite_settings_number,
+            parse_constant=_finite_settings_number,
+        )
+        if not isinstance(baseline, dict):
+            raise ValueError("required bridge settings are unavailable under the terminal policy")
+        settings = _merge_caller_settings(baseline, callers, bridge_dir) if callers else baseline
+        actual_args = wrapper.args if wrapper is not None else instance.args
+        settings = _apply_native_mcp_settings(
+            settings,
+            active_harnesses=active_harnesses,
+            cwd=workspace,
+            env=launch_env,
+            discover_inherited=workspace is not None,
+            setting_sources=_claude_setting_sources(actual_args),
+            claude_args=[*actual_args[: len(actual_args) - len(args)], *kept],
+        )
+        return kept, settings if callers or settings != baseline else None, bool(callers)
+
+    kept, settings, needs_validation = await _run_claude_settings_step(merge_settings)
+    if settings is not None:
+        from omnigent.harnesses.claude_native.settings_validation import validate_caller_settings
+
+        if needs_validation:
+            await validate_caller_settings(instance, settings, wrapper_prefix=prefix)
+        output_path = (
+            instance.private_dir / f"claude-finalized-settings-{generation}.json"
+            if private_output
+            else bridge_dir / f"claude-settings-{generation}-{secrets.token_hex(16)}.json"
+        )
+        writer = _atomic_write_user_json if private_output else _write_json_file
+        try:
+            await _run_claude_settings_step(functools.partial(writer, output_path, settings))
+        except asyncio.CancelledError:
+            # The drained writer cannot recreate this unreferenced output after cleanup.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await _run_claude_settings_step(
+                    functools.partial(output_path.unlink, missing_ok=True)
+                )
+            raise
+        _replace_framework_settings(
+            kept, settings_path, output_path, retain_baseline=private_output
+        )
+        if not private_output:
+            instance.add_resource_cleanup(functools.partial(output_path.unlink, missing_ok=True))
+    instance.args = [*prefix, *kept]
+
+
+def _merge_caller_settings(
+    settings: dict[str, Any], callers: list[dict[str, Any]], bridge_dir: Path
+) -> dict[str, Any]:
+    """
+    Compose callers in flag order, then apply bridge precedence.
+
+    Hooks require an object of event lists; caller entries precede bridge entries.
+    Env and other maps merge direct members, replacing nested values; permission
+    lists merge. The last caller MCP-denial list wins; saved denials append later.
+    Chain a caller statusLine command after bridge context capture, replacing
+    the global command. Local hook guards reject effective disableAllHooks=true
+    or allowManagedHooksOnly=true; other CLI controls pass through. The finalizer
+    validates the complete document with the selected CLI.
+
+    :param settings: Omnigent's invocation settings.
+    :param callers: Parsed caller settings, in flag order.
+    :param bridge_dir: Bridge directory the statusLine capture writes into.
+    :returns: The merged settings.
+    :raises ValueError: Caller hooks cannot merge or disable required bridge hooks.
+    """
+    from omnigent.harnesses.claude_native.settings_validation import (
+        CallerSettingsError,
+        CallerSettingsErrorReason,
+    )
+
+    caller_status: object = None
+    merged: dict[str, Any] = {}
+    for index, source in enumerate([*callers, settings]):
+        if index == len(callers):
+            caller_status = merged.get("statusLine")
+        for key, value in source.items():
+            previous = merged.get(key)
+            if key == "hooks":
+                if not isinstance(value, dict) or any(
+                    not isinstance(entries, list) for entries in value.values()
+                ):
+                    raise CallerSettingsError(CallerSettingsErrorReason.INVALID_HOOKS)
+                hooks = dict(previous) if isinstance(previous, dict) else {}
+                for event, entries in value.items():
+                    existing = hooks.get(event)
+                    hooks[event] = [
+                        *(existing if isinstance(existing, list) else []),
+                        *entries,
+                    ]
+                merged[key] = hooks
+            elif key == "permissions" and isinstance(value, dict):
+                permissions = dict(previous) if isinstance(previous, dict) else {}
+                for name, rules in value.items():
+                    existing = permissions.get(name)
+                    if isinstance(rules, list) and isinstance(existing, list):
+                        permissions[name] = [
+                            *existing,
+                            *(rule for rule in rules if rule not in existing),
+                        ]
+                    else:
+                        permissions[name] = rules
+                merged[key] = permissions
+            elif (
+                key == "deniedMcpServers"
+                and index == len(callers)
+                and isinstance(value, list)
+                and isinstance(previous, list)
+            ):
+                merged[key] = [*previous, *(entry for entry in value if entry not in previous)]
+            elif isinstance(value, dict) and isinstance(previous, dict):
+                merged[key] = {**previous, **value}
+            else:
+                merged[key] = value
+    for flag in ("disableAllHooks", "allowManagedHooksOnly"):
+        if merged.get(flag) is True:
+            raise CallerSettingsError(CallerSettingsErrorReason.BRIDGE_HOOKS_DISABLED)
+    if "cleanupPeriodDays" in merged:
+        retention = merged["cleanupPeriodDays"]
+        if (
+            isinstance(retention, bool)
+            or not isinstance(retention, (int, float))
+            or retention <= 0
+            or (isinstance(retention, float) and not retention.is_integer())
+        ):
+            raise CallerSettingsError(CallerSettingsErrorReason.INVALID_RETENTION)
+    if isinstance(caller_status, dict):
+        command = caller_status.get("command")
+        if isinstance(command, str) and command.strip():
+            merged["statusLine"] = {
+                **caller_status,
+                "type": "command",
+                "command": _status_line_command(bridge_dir, command),
+            }
+    return merged
 
 
 def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -7156,6 +7868,14 @@ def _acknowledge_auto_mode_billing_notice(socket_path: str, tmux_target: str) ->
     return last_enter is not None
 
 
+def has_claude_invocation_settings(bridge_dir: Path) -> bool:
+    """Check diagnostic presence of legacy or generated settings without reading contents."""
+    return (bridge_dir / _INVOCATION_SETTINGS_FILE).is_file() or any(
+        _GENERATED_SETTINGS_FILE.fullmatch(path.name) and path.is_file()
+        for path in bridge_dir.glob("claude-settings-*.json")
+    )
+
+
 def bridge_dir_from_launch_args(args: Sequence[str]) -> Path | None:
     """Read the stable bridge identity from the generated invocation settings path."""
     found: Path | None = None
@@ -7167,7 +7887,9 @@ def bridge_dir_from_launch_args(args: Sequence[str]) -> Path | None:
         else:
             continue
         path = Path(value)
-        if path.is_absolute() and path.name == _INVOCATION_SETTINGS_FILE:
+        if path.is_absolute() and (
+            path.name == _INVOCATION_SETTINGS_FILE or _GENERATED_SETTINGS_FILE.fullmatch(path.name)
+        ):
             found = path.parent
     return found
 
@@ -8569,6 +9291,10 @@ def start_tool_relay(
         registry.
     :returns: Started relay handle. Call :meth:`close` when done.
     """
+    require_activation_binding = _absolute_syntactic_path(bridge_dir).is_relative_to(
+        _absolute_syntactic_path(_BRIDGE_ROOT)
+    )
+    credential_binding = read_bridge_credential_binding(bridge_dir)
     token = secrets.token_urlsafe(32)
     closed = threading.Event()
 
@@ -8596,6 +9322,7 @@ def start_tool_relay(
         session_id=session_id,
         bridge_dir=bridge_dir,
         file_change_observer=file_change_observer,
+        require_activation_binding=require_activation_binding,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
@@ -8607,13 +9334,21 @@ def start_tool_relay(
     }
     if session_id is not None:
         relay_info["session_id"] = session_id
-    _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
-    # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
-    # Hooks source this file whenever they run, so it is replaced whole.
-    _write_private_file(
-        bridge_dir / _TOOL_RELAY_ENV_FILE,
-        f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
-    )
+    try:
+        with _bridge_metadata_write_lock(bridge_dir):
+            if not _bridge_endpoint_is_current(
+                bridge_dir, credential_binding, require_binding=require_activation_binding
+            ):
+                raise ClaudeSettingsRequestExpired()
+            _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
+            # Hooks source this file whenever they run, so replace it whole.
+            _write_private_file(
+                bridge_dir / _TOOL_RELAY_ENV_FILE,
+                f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
+            )
+    except BaseException:
+        httpd.server_close()
+        raise
     relay = ClaudeNativeToolRelay(
         bridge_dir=bridge_dir,
         httpd=httpd,
@@ -8621,6 +9356,8 @@ def start_tool_relay(
         relay_info=relay_info,
         tool_executor=tool_executor,
         closed=closed,
+        credential_binding=credential_binding,
+        require_activation_binding=require_activation_binding,
     )
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -8716,7 +9453,8 @@ def _start_http_ingress(
         writer thread.
     :returns: Started server; ``shutdown`` and ``server_close`` end it.
     """
-    handler_cls = _handler_factory(token, notification_queue)
+    credential_binding = read_bridge_credential_binding(bridge_dir)
+    handler_cls = _handler_factory(token, notification_queue, bridge_dir=bridge_dir)
     server_info: _JsonObject = {
         "token": token,
         "pid": os.getpid(),
@@ -8729,7 +9467,14 @@ def _start_http_ingress(
     else:
         httpd, socket_path = _start_unix_control_server(handler_cls)
         server_info["socket"] = str(socket_path)
-    _write_json_file(bridge_dir / _SERVER_FILE, server_info)
+    try:
+        with _bridge_metadata_write_lock(bridge_dir):
+            if not _bridge_endpoint_is_current(bridge_dir, credential_binding):
+                raise ClaudeSettingsRequestExpired()
+            _write_json_file(bridge_dir / _SERVER_FILE, server_info)
+    except BaseException:
+        httpd.server_close()
+        raise
     thread = threading.Thread(
         target=httpd.serve_forever,
         name="claude-native-mcp-http",
@@ -8792,6 +9537,8 @@ def _start_unix_control_server(
 def _handler_factory(
     token: str,
     notification_queue: queue.Queue[_JsonObject | None],
+    *,
+    bridge_dir: Path | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class bound to the MCP notification queue.
@@ -8799,8 +9546,11 @@ def _handler_factory(
     :param token: Bearer token expected in ``Authorization``.
     :param notification_queue: Queue receiving MCP notification
         payloads.
+    :param bridge_dir: Activation whose deletion retires this endpoint's token.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
+
+    credential_binding = read_bridge_credential_binding(bridge_dir) if bridge_dir else None
 
     class _ControlHandler(BaseHTTPRequestHandler):
         """HTTP handler for the local MCP control endpoint."""
@@ -8836,7 +9586,10 @@ def _handler_factory(
             if self.path != "/tools-changed":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            if self.headers.get("Authorization") != f"Bearer {token}":
+            if self.headers.get("Authorization") != f"Bearer {token}" or (
+                bridge_dir is not None
+                and not _bridge_endpoint_is_current(bridge_dir, credential_binding)
+            ):
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
             length = int(self.headers.get("Content-Length") or 0)
@@ -8895,6 +9648,7 @@ def _tool_relay_handler_factory(
     session_id: str | None = None,
     bridge_dir: Path | None = None,
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
+    require_activation_binding: bool = True,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -8910,8 +9664,11 @@ def _tool_relay_handler_factory(
         for each ``/hook/observe-tool`` payload, so the runner can record
         native file-mutating tool calls in the session's filesystem
         registry.
+    :param require_activation_binding: Whether the relay uses Claude activation metadata.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
+
+    credential_binding = read_bridge_credential_binding(bridge_dir) if bridge_dir else None
 
     class _ToolRelayHandler(BaseHTTPRequestHandler):
         """HTTP handler for active Omnigent tool relay calls."""
@@ -8943,7 +9700,12 @@ def _tool_relay_handler_factory(
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            if self.headers.get("Authorization") != f"Bearer {token}":
+            if self.headers.get("Authorization") != f"Bearer {token}" or (
+                bridge_dir is not None
+                and not _bridge_endpoint_is_current(
+                    bridge_dir, credential_binding, require_binding=require_activation_binding
+                )
+            ):
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
             payload = self._read_json_body()
@@ -12265,7 +13027,7 @@ def _read_json_file(path: Path) -> _JsonObject:
     """
     try:
         raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, UnicodeDecodeError):
         return {}
     try:
         payload = json.loads(raw)
@@ -12274,7 +13036,7 @@ def _read_json_file(path: Path) -> _JsonObject:
     return payload if isinstance(payload, dict) else {}
 
 
-def _write_json_file(path: Path, payload: _JsonObject) -> None:
+def _write_json_file(path: Path, payload: _JsonObject, *, exclusive: bool = False) -> None:
     """
     Atomically write a JSON object file with owner-only permissions.
 
@@ -12282,10 +13044,10 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
     :param payload: JSON-compatible object.
     :returns: None.
     """
-    _write_private_file(path, json.dumps(payload, separators=(",", ":")))
+    _write_private_file(path, json.dumps(payload, separators=(",", ":")), exclusive=exclusive)
 
 
-def _write_private_file(path: Path, text: str) -> None:
+def _write_private_file(path: Path, text: str, *, exclusive: bool = False) -> None:
     """Atomically write *text* to *path* with owner-only permissions."""
     _ensure_secure_dir(path.parent)
     tmp_path: Path | None = None
@@ -12303,7 +13065,10 @@ def _write_private_file(path: Path, text: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, path)
+        if exclusive:
+            os.link(tmp_path, path)
+        else:
+            os.replace(tmp_path, path)
     finally:
         if tmp_path is not None:
             with contextlib.suppress(FileNotFoundError):
