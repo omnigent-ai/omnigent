@@ -191,3 +191,20 @@ def test_each_command_the_panel_runs_names_the_host_gh_sends_to(
 def test_anything_the_panel_doesnt_run_or_cant_classify_is_refused(argv: list[str]) -> None:
     with pytest.raises(GhArgvRefused):
         classify(argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # gh uses the last of a repeated flag; even the same value twice is refused.
+        ["api", "--hostname", HOST, "--hostname", OTHER, "x"],
+        ["api", "--hostname", HOST, f"--hostname={HOST}", "x"],
+        ["auth", "token", "-h", HOST, "--hostname", HOST],
+        ["pr", "view", "7", "-R", f"{HOST}/o/r", "-R", f"{OTHER}/o/r"],
+        ["pr", "view", "7", "-R", "o/r", f"--repo={HOST}/o/r"],
+        ["label", "list", f"-R{HOST}/o/r", "--repo", f"{HOST}/o/r"],
+    ],
+)
+def test_a_repeated_host_or_repository_flag_is_refused(argv: list[str]) -> None:
+    with pytest.raises(GhArgvRefused):
+        classify(argv)

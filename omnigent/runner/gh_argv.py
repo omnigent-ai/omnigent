@@ -183,8 +183,9 @@ def classify(argv: list[str]) -> GhTarget:
     """Read which host ``argv`` (the arguments after ``gh``) sends to.
 
     :raises GhArgvRefused: For a command or flag the panel doesn't run, a missing flag
-        value, more than one positional argument, an argument that looks like a host or a
-        URL but can't be read as one, or two arguments that name different hosts.
+        value, a repeated host or repository flag, more than one positional argument, an
+        argument that looks like a host or a URL but can't be read as one, or two arguments
+        that name different hosts.
     """
     command = next(
         (words for words in _COMMANDS if tuple(argv[: len(words)]) == words),
@@ -194,6 +195,8 @@ def classify(argv: list[str]) -> GhTarget:
         raise GhArgvRefused("This gh command isn't one the pull request panel runs")
     spec = _COMMANDS[command]
     hosts: set[str] = set()
+    # gh keeps the last of a repeated flag, so a second one is refused rather than merged.
+    named_flags: set[str] = set()
     named_repository = False
     from_checkout = False
     positionals: list[str] = []
@@ -221,6 +224,17 @@ def classify(argv: list[str]) -> GhTarget:
                 raise GhArgvRefused(f"gh's {name} needs a value")
             attached = rest[index]
             index += 1
+        group = (
+            "host"
+            if name in spec.host_flags
+            else "repository"
+            if name in spec.repository_flags
+            else None
+        )
+        if group is not None:
+            if group in named_flags:
+                raise GhArgvRefused(f"gh {' '.join(command)} names its {group} more than once")
+            named_flags.add(group)
         if name in spec.host_flags:
             hosts.add(_hostname(attached))
         elif name in spec.repository_flags:
