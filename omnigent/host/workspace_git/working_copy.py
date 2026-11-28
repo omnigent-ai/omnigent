@@ -339,8 +339,16 @@ async def _remote_start_point(
     count = first_line(counted.stdout) if counted.success else ""
     if not count.isdecimal() or int(count) == 0:
         return None
+    # Through ``log``, which the runner keeps from running a signature helper.
     entry = await repository.run_unchecked(
-        ["reflog", "show", "-1", "--format=%gs", f"{branch_ref}@{{{int(count) - 1}}}", "--"],
+        [
+            "log",
+            "--walk-reflogs",
+            "-1",
+            "--format=%gs",
+            f"{branch_ref}@{{{int(count) - 1}}}",
+            "--",
+        ],
         deadline=deadline,
     )
     oldest = first_line(entry.stdout) if entry.success else ""

@@ -831,6 +831,40 @@ async def test_a_long_lived_branch_still_compares_with_the_branch_it_started_fro
     assert response.base.base == fork_next
 
 
+async def test_reading_where_a_branch_started_runs_no_signature_helper(tmp_path: Path) -> None:
+    """A repository's ``log.showSignature`` can't make the reflog read run its ``gpg.program``."""
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    tree = _git(root, "rev-parse", f"{fork_next}^{{tree}}").strip()
+    signed_commit = (
+        f"tree {tree}\nparent {fork_next}\n"
+        "author Dev <dev@example.com> 1700000000 +0000\n"
+        "committer Dev <dev@example.com> 1700000000 +0000\n"
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n"
+        "\nsigned\n"
+    )
+    signed = subprocess.run(
+        ["git", "-C", str(root), "hash-object", "-t", "commit", "-w", "--stdin"],
+        input=signed_commit,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(root, "update-ref", "refs/remotes/fork/next", signed)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _push_upstream(root, "fork", "feature")
+    marker = tmp_path / "helper-ran"
+    helper = tmp_path / "signature-helper"
+    helper.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+    helper.chmod(0o755)
+    _git(root, "config", "log.showSignature", "true")
+    _git(root, "config", "gpg.program", str(helper))
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "fork/next"
+    assert not marker.exists()
+
+
 async def test_a_pushed_worktree_branch_still_compares_with_the_branch_it_started_from(
     tmp_path: Path,
 ) -> None:
