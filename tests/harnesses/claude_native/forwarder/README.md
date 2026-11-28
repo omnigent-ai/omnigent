@@ -17,7 +17,7 @@ name with `rg 'def test_name' tests/harnesses/claude_native/forwarder`.
 | Child registration, parent graphs and parked checkpoints | `test_subagent_discovery.py` |
 | Child batches, retries, concurrent draining and dead letters | `test_subagent_delivery.py` |
 | Child hook filtering, idle observations and parent progress | `test_subagent_status.py` |
-| Auth refresh, item delivery retries and response parsing | `test_transport.py` |
+| Auth refresh, durable receipt retention across rejected credentials/restart, item delivery retries and response parsing | `test_transport.py` |
 | Loop supervision, deadlines and retry budgets | `test_supervision.py` |
 | Missing transcripts, hook stderr and degraded sync logging | `test_diagnostics.py` |
 | Model, title, permission, effort and pane signals | `test_metadata.py` |
