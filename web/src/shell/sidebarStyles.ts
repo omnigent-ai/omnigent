@@ -20,6 +20,10 @@ export const SIDEBAR_OPEN_MENU_HIGHLIGHT =
 // background and flash when the mouse enters them.
 export const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
+// A pressed session row shows the active highlight at once (no color fade), so the
+// click paints feedback before the session switch's synchronous render.
+export const SIDEBAR_PRESSED_HIGHLIGHT =
+  "active:transition-none active:bg-[var(--sidebar-active)] active:text-[var(--sidebar-active-foreground)] dark:active:bg-[var(--sidebar-active)] dark:active:text-[var(--sidebar-active-foreground)]";
 // Sessions shown in the displayed grid get half the active highlight.
 export const SIDEBAR_GRID_MEMBER_HIGHLIGHT =
   "bg-[var(--sidebar-active)]/50 hover:bg-[var(--sidebar-active)]/50 dark:hover:bg-[var(--sidebar-active)]/50";
