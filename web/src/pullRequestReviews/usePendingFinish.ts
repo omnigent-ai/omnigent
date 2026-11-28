@@ -58,6 +58,8 @@ export interface PendingFinish {
     { kind: "submit" } | { kind: "discarding" } | { kind: "discard"; hold: HeldDiscard } | null;
   summaryKey: string;
   summaryText: string;
+  /** The summary GitHub has for the review; null until it's read. */
+  githubBody: string | null;
   /** GitHub's summary changed after the person edited theirs. */
   conflict: boolean;
   takeGitHubs: () => void;
@@ -265,6 +267,7 @@ export function usePendingFinish({
           : null,
     summaryKey,
     summaryText: summary?.text ?? githubBody ?? "",
+    githubBody,
     submittable: !!hostRoute && hostPendingOffers(hostRoute, "submit"),
     discardable: !!hostRoute && hostPendingOffers(hostRoute, "discard"),
     conflict: !!conflict && conflict.key === summaryKey,

@@ -40,10 +40,12 @@ import {
   usePullRequestPageRoute,
 } from "@/pullRequestPage/pullRequestPageRoute";
 
-import { draftThread, pendingAnswer, REVIEW_ID } from "@/test/pendingReviewAnswers";
+import { draftThread, noReviewAnswer, pendingAnswer, REVIEW_ID } from "@/test/pendingReviewAnswers";
 
 import { resetHostReviewsForTests } from "./hostReviews";
 import { resetPendingReviewChangesForTests } from "./pendingReviewChanges";
+import { resetPendingSummariesForTests } from "./pendingReviewSummary";
+import { invalidatePendingReview } from "./usePendingReview";
 import { reviewCommandRows } from "./reviewCommands";
 import { resetReviewSubmitForTests, type ReviewEvent } from "./reviewSubmit";
 import {
@@ -100,7 +102,7 @@ async function renderMenu(
   );
   await waitFor(() => expect(view.result.current.route).not.toBe("loading"));
   view.rerender();
-  return view;
+  return Object.assign(view, { queryClient });
 }
 
 type View = Awaited<ReturnType<typeof renderMenu>>;
@@ -146,6 +148,7 @@ afterEach(() => {
   resetReviewSubmitForTests();
   resetHostReviewsForTests();
   resetPendingReviewChangesForTests();
+  resetPendingSummariesForTests();
 });
 
 describe("reviews through the session's host, as the owner", () => {
@@ -307,6 +310,31 @@ describe("finishing a pending review through the session's host", () => {
     const [[method, request]] = await sent();
     expect(method).toBe("submitPendingReview");
     expect(request).toMatchObject({ prUrl: PR, event: "COMMENT", pendingReviewId: REVIEW_ID });
+  });
+
+  it("carries the summary and verdict written before the first inline comment into the review", async () => {
+    host.write.mockResolvedValue({ ...answer("REQUEST_CHANGES"), state: "CHANGES_REQUESTED" });
+    let started = false;
+    host.read.mockImplementation(async (_session: string, method: string) =>
+      method !== "getPendingReview"
+        ? reviewers("COMMENTED")
+        : started
+          ? pending()
+          : noReviewAnswer(HEAD),
+    );
+    const view = await renderMenu([...OWNER, ...PENDING_READS, "SubmitPendingReview"]);
+    choose(view, "REQUEST_CHANGES", "Please split this");
+    expect(view.result.current.review.finish).toBeNull();
+    started = true;
+    act(() => invalidatePendingReview(view.queryClient, PR));
+    await waitFor(() => expect(view.result.current.review.finish?.reviewId).toBe(REVIEW_ID));
+    await waitFor(() => expect(view.result.current.review.body).toBe("Please split this"));
+    expect(view.result.current.review.entry.event).toBe("REQUEST_CHANGES");
+    act(() => view.result.current.review.submit());
+    await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1));
+    const [[method, request]] = await sent();
+    expect(method).toBe("submitPendingReview");
+    expect(request).toMatchObject({ event: "REQUEST_CHANGES", body: "Please split this" });
   });
 
   it("tells an editor the submit is the owner's and sends nothing", async () => {

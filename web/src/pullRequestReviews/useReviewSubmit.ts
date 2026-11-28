@@ -32,7 +32,11 @@ import { checkHostReviewAgain } from "./hostReviewCheck";
 import { hostPendingIdentity, hostPendingRoute } from "./hostPendingRoute";
 import { type HostReviewRoute, hostReviewRoute } from "./hostReviews";
 import { REVIEW_UNCONFIRMED, sendReviewOnHost } from "./sendReview";
-import { editPendingSummary, pendingSummarySubmitted } from "./pendingReviewSummary";
+import {
+  carryRegularSummary,
+  editPendingSummary,
+  pendingSummarySubmitted,
+} from "./pendingReviewSummary";
 import { type PendingFinish, pendingSubmitBlocked, usePendingFinish } from "./usePendingFinish";
 import { invalidatePendingReview } from "./usePendingReview";
 
@@ -232,6 +236,23 @@ export function useReviewSubmit({
       : reviewSubmitKey(owner, pr.url, hostRoute.actor.login)
     : null;
   const entry = useReviewSubmitEntry(key);
+  // The summary and verdict written before the first inline comment started a pending review
+  // move into it, once it's read, so Finish submits them.
+  const regularKey = hostRoute ? reviewSubmitKey(owner, pr.url, hostRoute.actor.login) : null;
+  const carryInto =
+    finish && !finish.unresolved && finish.githubBody !== null && key && regularKey
+      ? {
+          regularKey,
+          pendingKey: key,
+          summaryKey: finish.summaryKey,
+          githubBody: finish.githubBody,
+        }
+      : null;
+  useEffect(() => {
+    if (carryInto) carryRegularSummary(carryInto);
+    // Carried again only when the review, its scope or GitHub's summary changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [carryInto?.regularKey, carryInto?.pendingKey, carryInto?.summaryKey, carryInto?.githubBody]);
   const locked = entry.status.kind === "submitting" || entry.status.kind === "uncertain";
   const body = finish && !locked ? finish.summaryText : entry.body;
   const viewer = hostRoute?.actor.login || null;
