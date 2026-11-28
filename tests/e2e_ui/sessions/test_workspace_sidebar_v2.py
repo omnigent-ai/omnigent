@@ -83,16 +83,20 @@ def _start_with_no_pinned_pages(page: Page) -> None:
     page.add_init_script(f"window.localStorage.setItem({_PINNED_PAGES_KEY!r}, JSON.stringify([]))")
 
 
-def _set_flag(page: Page, enabled: bool, *, settings_pins: bool = False) -> None:
+def _set_flag(
+    page: Page, enabled: bool, *, settings_pins: bool = False, answer_after: float = 0
+) -> None:
     """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``.
 
     With the flag on, a journey opens the tabs it needs, so its strips start with nothing
-    pinned unless ``settings_pins`` keeps Settings as shipped.
+    pinned unless ``settings_pins`` keeps Settings as shipped. ``answer_after`` holds each
+    answer for that many seconds, as a slow server does while the app starts.
     """
     if enabled and not settings_pins:
         _start_with_no_pinned_pages(page)
 
     def answer(route: Route) -> None:
+        time.sleep(answer_after)
         response = route.fetch()
         info = response.json()
         info["features"] = {**(info.get("features") or {}), "workspace_sidebar_v2": enabled}
@@ -1039,13 +1043,23 @@ def test_back_and_reload_bring_diffs_back_to_a_visits_worktree(
     expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
 
 
+@pytest.mark.parametrize("slow_server", [False, True], ids=["prompt-server", "slow-server"])
 def test_diff_file_link_opens_its_diff_in_diffs(
-    page: Page, git_session: tuple[str, str], tmp_path: Path
+    page: Page, git_session: tuple[str, str], tmp_path: Path, slow_server: bool
 ) -> None:
-    """A ``?file=`` link with ``diff=1`` to a changed file opens Diffs on that file's diff."""
+    """A ``?file=`` link with ``diff=1`` to a changed file opens Diffs on that file's diff,
+    also when the server says the tabs sidebar is on only after the page has loaded."""
     base_url, session_id = git_session
     (tmp_path / "repository" / "base.txt").write_text("Add the base\nedited for the link\n")
-    _set_flag(page, True)
+    _set_flag(page, True, answer_after=2.0 if slow_server else 0)
+    if slow_server:
+        # Until the server answers, the classic sidebar shows the file, and its viewer takes
+        # ``diff`` off the URL while the file's changes load; hold them past the answer.
+        def hold_changes(route: Route) -> None:
+            time.sleep(3.0)
+            route.continue_()
+
+        page.route("**/resources/environments/default/changes", hold_changes)
     page.set_viewport_size(_VIEWPORTS["desktop"])
     page.goto(f"{base_url}/c/{session_id}?file=base.txt&diff=1")
 
