@@ -2765,3 +2765,25 @@ def test_a_viewer_write_that_lands_after_deletion_and_then_fails_is_still_cleane
     files = store.user_files("alice", owner_registration=old_alice.registration)
     with pytest.raises(GadgetNotFound):
         files.list_page("viewer-data", after=None, limit=1)
+
+
+def test_an_account_alias_doesnt_carry_gadget_grants_into_a_new_registration(
+    db_uri: str, tmp_path
+) -> None:
+    """Where account IDs compare without case (MySQL), deleting and registering a name spelt
+    differently from the stored ID still removes the gadget grants the stored ID holds."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    if permissions._engine.dialect.name != "mysql":
+        pytest.skip("only MySQL's account key folds case")
+    _, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("CaseUser", "case-hash")
+    permissions.ensure_user("bob")
+    board = service("bob").create("Bob's board")
+    permissions.grant_for_gadget("CaseUser", board["id"], 1)
+
+    assert accounts.delete_user("caseuser") is True
+    assert permissions.resolve_gadget_access(["CaseUser"], board["id"]) is None
+    revived = accounts.create_user_with_password("caseuser", "replacement-hash")
+
+    assert permissions.resolve_gadget_access([revived.id], board["id"]) is None

@@ -314,8 +314,12 @@ class SqlAlchemyAccountStore:
         delete_deleted_account_workflow_grants(
             self._session_immediate, user_id, batch_size=self._cleanup_batch_size
         )
+        # Gadget grants name the account's stored ID exactly, which can differ from the spelling
+        # given here where the database compares account IDs without case (MySQL).
         delete_deleted_account_gadget_grants(
-            self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+            self._session_immediate,
+            self._stored_account_id(user_id),
+            batch_size=self._cleanup_batch_size,
         )
         self._delete_deleted_workflows(user_id)
         self._delete_deleted_inbox_items(user_id)
@@ -339,7 +343,7 @@ class SqlAlchemyAccountStore:
                     "A deleted account's workflow grants are still being removed. Try again.",
                     code=ErrorCode.CONFLICT,
                 )
-            if holds_gadget_grants(session, user_id):
+            if holds_gadget_grants(session, existing.id if existing is not None else user_id):
                 raise OmnigentError(
                     "A deleted account's gadget grants are still being removed. Try again.",
                     code=ErrorCode.CONFLICT,
@@ -584,6 +588,9 @@ class SqlAlchemyAccountStore:
             user exists.
         """
 
+        # The account row it deleted, with its stored ID (see create_user_with_password).
+        deleted_ids: list[str] = []
+
         def write(session: Session) -> bool | None:
             # Acquire the complete lock set in username order, including the
             # actor and target, before checking the last-admin invariant.
@@ -611,6 +618,7 @@ class SqlAlchemyAccountStore:
                     SqlPreference.user_id == user_id,
                 )
             )
+            deleted_ids.append(target.id)
             target.deleted_at = int(time.time())
             target.password_hash = None
             target.is_admin = False
@@ -633,8 +641,11 @@ class SqlAlchemyAccountStore:
             except Exception:
                 _logger.exception("Workflow grant cleanup deferred for a deleted account")
             try:
+                # The stored ID, which gadget grants name exactly (see create_user_with_password).
                 delete_deleted_account_gadget_grants(
-                    self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+                    self._session_immediate,
+                    deleted_ids[0] if deleted_ids else user_id,
+                    batch_size=self._cleanup_batch_size,
                 )
             except Exception:
                 _logger.exception("Gadget grant cleanup deferred for a deleted account")
@@ -768,6 +779,18 @@ class SqlAlchemyAccountStore:
             == self._cleanup_batch_size
         ):
             pass
+
+    def _stored_account_id(self, user_id: str) -> str:
+        """The ID the account row named *user_id* is stored under, live or deleted, or
+        *user_id* itself when there is none. The two differ only in spelling, where the
+        database compares account IDs without case (MySQL)."""
+        with self._session("select_stored_account_id") as session:
+            stored = session.execute(
+                select(SqlUser.id).where(
+                    SqlUser.workspace_id == current_workspace_id(), SqlUser.id == user_id
+                )
+            ).scalar_one_or_none()
+        return stored if stored is not None else user_id
 
     def _delete_scheduled_task_grants(self, user_id: str) -> None:
         """Delete a deleted account's automation grants once its deletion has committed.
