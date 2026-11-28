@@ -31,6 +31,7 @@ import httpx
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 from omnigent.cli_invocation import cli_invocation
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.native_dispatch import resolve_hook_for_key
@@ -351,9 +352,10 @@ def _read_wrapper_label_remote(
             timeout=10.0,
         )
     except httpx.HTTPError as exc:
-        raise click.ClickException(
-            f"Failed to reach {base_url!r}: {exc}",
-        ) from exc
+        unreachable = click.ClickException(f"Failed to reach {base_url!r}: {exc}")
+        # A failed request is not a runner-tunnel rejection, so skip the 401 hint.
+        setattr(unreachable, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise unreachable from exc
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {conv_id!r} not found on {base_url!r}.",

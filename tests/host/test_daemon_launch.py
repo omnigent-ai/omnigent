@@ -17,7 +17,9 @@ import pytest
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+from omnigent.cli_diagnostics import suppresses_recovery_hint
 from omnigent.host import daemon_launch
+from omnigent.host.connect import _RUNNER_CONNECT_DEADLINE_S
 from omnigent.host.daemon_launch import (
     launch_or_reuse_daemon_runner,
     open_daemon_client,
@@ -25,6 +27,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native.native_terminal import DAEMON_RUNNER_ONLINE_TIMEOUT_S
 
 
 @pytest.mark.parametrize("online", [True, False])
@@ -287,6 +290,8 @@ async def test_wait_for_runner_online_fails_fast_on_exit_report(
     # Exactly one poll: the first response already carried the death
     # report. More polls mean the error field was ignored at least once.
     assert handler.requests_seen == 1
+    # A reported exit may be a stale host's auth rejection, so keep the hint.
+    assert suppresses_recovery_hint(excinfo.value) is False
 
 
 async def test_wait_for_runner_online_keeps_polling_without_exit_report(
@@ -296,8 +301,9 @@ async def test_wait_for_runner_online_keeps_polling_without_exit_report(
 
     A runner that is merely still starting reports offline with no
     ``error`` field — the wait must NOT fail fast on that (it would
-    break every normal launch), and the deadline failure keeps the
-    generic guidance message.
+    break every normal launch). A live runner at the deadline is still
+    retrying its tunnel, not rejected with HTTP 401, so the error names
+    the server and omits the CLI's stale-host recovery hint.
     """
     handler = _FlakyThenOnline(failures=0, body={"runner_id": "runner_abc123", "online": False})
     async with httpx.AsyncClient(
@@ -309,7 +315,19 @@ async def test_wait_for_runner_online_keeps_polling_without_exit_report(
     # trigger the fail-fast path; 1 would mean a plain "starting"
     # runner is being treated as dead.
     assert handler.requests_seen > 1
-    assert "did not connect within" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "did not connect to http://test within" in message
+    assert "may still be retrying its tunnel handshake" in message
+    assert suppresses_recovery_hint(excinfo.value) is True
+
+
+def test_native_runner_wait_outlasts_the_hosts_connect_deadline() -> None:
+    """Native wrappers keep waiting while the host still treats the launch as healthy.
+
+    A runner retrying a slow tunnel handshake is alive until the host's
+    never-connected deadline, so the CLI must not give up before it.
+    """
+    assert DAEMON_RUNNER_ONLINE_TIMEOUT_S >= _RUNNER_CONNECT_DEADLINE_S
 
 
 async def test_wait_for_runner_online_deadline_reports_last_connect_error(

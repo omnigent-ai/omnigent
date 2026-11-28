@@ -20,6 +20,7 @@ from collections.abc import Iterator
 import click
 import httpx
 
+from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.host.launch_audit import launch_audit_headers
 from omnigent.host.session_env import (
@@ -218,12 +219,14 @@ async def wait_for_runner_online(
     Transient transport errors are treated as "not online yet" and
     polled through (same rationale as :func:`wait_for_host_online`);
     only the deadline fails the wait, with the last transport error
-    included in the message.
+    included in the message. That error omits the CLI's HTTP 401 recovery
+    hint: an auth-rejected runner exits and fails fast instead, so a live
+    runner at the deadline is usually still retrying a slow tunnel handshake.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param runner_id: Runner id the host was asked to spawn, e.g.
         ``"runner_abc123"``.
-    :param timeout_s: Max seconds to wait, e.g. ``60.0``.
+    :param timeout_s: Max seconds to wait, e.g. ``180.0``.
     :returns: None once the runner is online.
     :raises click.ClickException: If the runner process died, or if it
         does not connect in time.
@@ -250,11 +253,17 @@ async def wait_for_runner_online(
                         f"Runner {runner_id!r} failed to start: {exit_error}"
                     )
         await asyncio.sleep(next(intervals))
-    message = f"Runner {runner_id!r} did not connect within {timeout_s:.0f}s."
+    message = (
+        f"Runner {runner_id!r} did not connect to {client.base_url} within {timeout_s:.0f}s."
+        " No runner exit was reported, so it may still be retrying its tunnel"
+        " handshake; a slow server or network path can delay it."
+    )
     if last_error is not None:
         message += f" Last connection error: {last_error!r}."
     message += f" Check the runner logs under {display_log_path(process_log_dir('runner'))}/."
-    raise click.ClickException(message)
+    timeout_error = click.ClickException(message)
+    setattr(timeout_error, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    raise timeout_error
 
 
 async def launch_or_reuse_daemon_runner(
