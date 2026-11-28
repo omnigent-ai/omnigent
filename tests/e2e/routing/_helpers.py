@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -464,29 +465,65 @@ def rollout_turn_contexts(session_id: str) -> list[dict[str, Any]]:
 # ── Isolation guards ────────────────────────────────────────────────────────
 
 
-def claude_settings_apart_from_the_model() -> str | None:
-    """Return the developer's ``~/.claude/settings.json`` minus its ``model`` key.
+def claude_user_settings_path(cwd: Path, env: Mapping[str, str]) -> Path:
+    """Resolve the launched Claude's saved settings for preservation checks.
 
-    Routing writes nothing into the user's global Claude settings — hook
-    registration lives in the per-session bridge dir. Claude Code's own
-    response to ``/model <id>`` does rewrite the file's ``model`` key, which
-    is the accepted trade-off for the switch, so that one key is excluded and
-    everything else is compared before and after each claude CUJ.
-
-    :returns: A canonical rendering of the remaining settings, or ``None``
-        when the file does not exist.
+    :param cwd: Claude's working directory.
+    :param env: Claude's explicit launch environment.
+    :returns: The settings file resolved with Claude's path-joining rules.
     """
-    path = Path.home() / ".claude" / "settings.json"
+    from omnigent.harnesses.claude_native.bridge import _account_home_dir, _claude_joined_path
+
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    if config_dir is None:
+        config_dir = os.path.join(env.get("HOME") or str(_account_home_dir()), ".claude")
+    return _claude_joined_path(cwd, config_dir, "settings.json")
+
+
+def claude_settings_snapshot(path: Path) -> str:
+    """Snapshot the launched Claude settings file, including its saved model.
+
+    Hook registration lives in the per-session bridge dir. Session-only
+    selection leaves the saved default unchanged, which is checked alongside
+    the other settings.
+
+    :param path: Settings path resolved from the launch environment and workspace.
+
+    :returns: Canonical settings, treating a missing file as an empty object.
+    """
     if not path.exists():
-        return None
+        return "{}"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         # Unreadable is still comparable — hash the bytes.
         return hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest()
-    if isinstance(payload, dict):
-        payload = {key: value for key, value in payload.items() if key != "model"}
     return json.dumps(payload, sort_keys=True)
+
+
+def claude_settings_unchanged(path: Path, before: str, session_id: str) -> bool:
+    """Compare settings using the CLI version reported by the routed session."""
+    from omnigent.harnesses.claude_native.bridge import CONTEXT_RAW_FILE
+    from omnigent.harnesses.claude_native.model_switch import supports_session_only_model_switch
+
+    after = claude_settings_snapshot(path)
+    try:
+        context = json.loads((claude_bridge_dir(session_id) / CONTEXT_RAW_FILE).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AssertionError("Could not read running-session Claude metadata") from exc
+    assert isinstance(context, dict), "Invalid running-session Claude metadata"
+    version = context.get("version")
+    if supports_session_only_model_switch(version):
+        return before == after
+    try:
+        previous, current = json.loads(before), json.loads(after)
+    except json.JSONDecodeError:
+        return before == after
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return before == after
+    return {key: value for key, value in previous.items() if key != "model"} == {
+        key: value for key, value in current.items() if key != "model"
+    }
 
 
 def grep_log(path: Path, needles: Sequence[str]) -> list[str]:

@@ -141,6 +141,9 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    claude_picker_model_key,
+    picker_model_options,
+    public_claude_model_id,
     served_canonical_overrides,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
@@ -1375,6 +1378,14 @@ def _parse_claude_legacy_models(stdout: str) -> list[dict[str, Any]]:
     return []
 
 
+def _claude_alias_pins(configured_env: Mapping[str, str]) -> dict[str, str]:
+    """Read alias pins with configured values overriding inherited ones."""
+    return {
+        alias: configured_env.get(env_var, os.environ.get(env_var, ""))
+        for alias, env_var in ALIAS_MODEL_ENV_VARS.items()
+    }
+
+
 async def probe_claude_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> ClaudeModelProbe | None:
@@ -1387,8 +1398,10 @@ async def probe_claude_model_options(
     :param claude_config: The resolved native launch config, or ``None``.
     :returns: The probe result, or ``None`` when both discovery methods fail.
     """
+    launch_pins = _claude_alias_pins(claude_config.env if claude_config is not None else {})
     text = await _run_claude_model_probe(claude_config, stream_input=True)
     models = _parse_claude_picker_models(text) if text is not None else None
+    structured = models is not None
     empty_picker = models is not None and not any(
         model.get("disabled") is not True for model in models
     )
@@ -1409,6 +1422,7 @@ async def probe_claude_model_options(
         for value in (model["value"], model.get("resolvedModel"))
         if isinstance(value, str) and value
     )
+    disabled_keys = {claude_picker_model_key(value) for value in disabled_models}
     enabled = [
         model
         for model in models
@@ -1424,13 +1438,38 @@ async def probe_claude_model_options(
         resolution = dict(resolutions.get(alias, {}))
         resolved = model.get("resolvedModel")
         if isinstance(resolved, str) and resolved:
+            if claude_picker_model_key(resolved) in disabled_keys:
+                continue
             resolution["model"] = resolved
+            # Resolved IDs can omit context carried by the picker value or its launch pin.
+            context_value = launch_pins.get(alias.lower()) or alias
+            if (
+                structured
+                and context_value.lower().endswith("[1m]")
+                and public_claude_model_id(context_value) is not None
+                and context_value[:-4].lower() == resolved.lower()
+            ):
+                resolution["model"] = f"{resolved}[1m]"
         label = model.get("displayName")
         if isinstance(label, str) and label:
             resolution["label"] = label
         row = _claude_alias_row(alias, resolution)
-        if row["model"] in disabled_models or row["model"] in seen_models:
+        descriptor = {
+            "value": alias,
+            "model": row["model"],
+            "display_name": label if isinstance(label, str) and label else None,
+            "enabled": model.get("disabled") is not True,
+            "provenance": "structured" if structured else "legacy",
+        }
+        if claude_picker_model_key(str(row["model"])) in disabled_keys:
             continue
+        if row["model"] in seen_models:
+            existing = next(item for item in alias_rows if item["model"] == row["model"])
+            descriptors = existing["_claude_picker_options"]
+            assert isinstance(descriptors, list)
+            descriptors.append(descriptor)
+            continue
+        row["_claude_picker_options"] = [descriptor]
         seen_models.add(row["model"])
         alias_rows.append(row)
     return ClaudeModelProbe(
@@ -1466,7 +1505,8 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_transport = claude_ambient_transport() if uses_cli_settings else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v3",
+        "control-picker-v6",
+        sorted(_claude_alias_pins(claude_config.env if claude_config is not None else {}).items()),
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1507,6 +1547,7 @@ async def claude_model_catalog(
     if probe.empty_picker:
         return []
     rows = list(probe.alias_rows)
+    disabled_keys = {claude_picker_model_key(value) for value in probe.disabled_models}
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
@@ -1534,7 +1575,11 @@ async def claude_model_catalog(
             out.append({**row, "isDefault": True})
         else:
             out.append({key: value for key, value in row.items() if key != "isDefault"})
-    if default_model and not marked and default_model not in probe.disabled_models:
+    if (
+        default_model
+        and not marked
+        and claude_picker_model_key(default_model) not in disabled_keys
+    ):
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
@@ -5537,13 +5582,17 @@ async def _prepare_claude_terminal(
                 "session runner bound",
                 startup_progress=startup_progress,
             )
+        picker_catalog = stored_claude_catalog_rows(claude_config)
         bridge_dir = prepare_bridge_dir(
             session_id,
             bridge_id=bridge_id,
             workspace=Path.cwd(),
             launch_model=claude_config.model if claude_config else None,
             launch_env=claude_config.env if claude_config else None,
-            picker_values=stored_claude_picker_values(claude_config),
+            picker_values=stored_claude_picker_values(claude_config, picker_catalog or ()),
+            picker_options=(
+                picker_model_options(picker_catalog) if picker_catalog is not None else None
+            ),
         )
         _mark_startup_step(
             startup_profiler,

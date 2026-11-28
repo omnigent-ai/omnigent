@@ -1,0 +1,14 @@
+{
+  "source_run": "https://github.com/omnigent-ai/omnigent/actions/runs/45375030759",
+  "cli_version": "2.1.323",
+  "provider": "mock",
+  "scope": "Actual status panel during a held conversation; surrounding transcript omitted; session ID, socket, cwd and provider port anonymized",
+  "pane": "─────────────────────────────────────────────────────────────────────────────────────────────────────────\n  Settings  Status   Config   Usage   Stats\n\n  Version:                    2.1.323\n  Session name:               /rename to add a name\n  Session ID:                 native-session\n  Session kind:               interactive\n  Peer address:               uds:/tmp/example/claude.sock\n  cwd:                        /tmp/example/workspace\n  Auth token:                 apiKeyHelper\n  API key:                    apiKeyHelper\n  Anthropic base URL:         http://127.0.0.1:8000\n\n  Model:                      sonnet (claude-sonnet-4-20250514)\n  MCP servers:                1 connected · /mcp\n  Setting sources:            Command line arguments\n  Managed settings (remote):  not fetched — not available with a custom ANTHROPIC_BASE_URL\n  Organization policy:        not fetched with a custom ANTHROPIC_BASE_URL\n  Auto mode server:           Disabled\n\n  Esc to cancel\n\n\n\n\n\n\n\n\n\n\n\n─────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────────────────────\n  ⏸ manual mode on · gh auth login for PR status                  ✔ Update installed · Restart to apply\n\n",
+  "cache_cost": {
+    "source_run": "https://github.com/omnigent-ai/omnigent/actions/runs/45377843847",
+    "cli_version": "2.1.323",
+    "provider": "mock",
+    "scope": "Actual active-turn cache-cost panel; surrounding synthetic transcript omitted",
+    "pane": "─────────────────────────────────────────────────────────────────────────────────────────────────────────\n  Switch model?\n  Your next response will be slower and use more tokens\n\n  This conversation is cached for the current model. Switching to Opus 4.8 means the full history gets\n  re-read.\n\n  ❯ 1. Yes, switch to Opus 4.8\n    2. No, go back\n\n\n─────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────────────────────\n  ⏸ manual mode on · gh auth login for PR status                  ✔ Update installed · Restart to apply\n                                                                              Settings dialog dismissed\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+  }
+}

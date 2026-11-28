@@ -16,31 +16,37 @@ import pytest
 
 from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner_impl,
+    _RunnerForwardResult,
 )
 
 
 class _RefusingClient:
     """Stand-in runner client whose POST always fails at the transport layer."""
 
+    def __init__(self, error: httpx.HTTPError) -> None:
+        self.error = error
+
     async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
-        raise httpx.ConnectError("connection refused")
+        raise self.error
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError])
+@pytest.mark.parametrize("uncertain", [False, True])
 async def test_transport_miss_warns_and_falls_back(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    error: type[httpx.HTTPError],
+    uncertain: bool,
 ) -> None:
-    """A refused forward returns None at WARNING, not ERROR.
-
-    :param monkeypatch: Fixture used to inject the refusing runner client.
-    :param caplog: Pytest log capture fixture.
-    :returns: None.
-    """
+    """Connection failure precedes dispatch; a lost reply retains caller uncertainty."""
     helpers = "omnigent.server.routes._sessions.helpers"
     monkeypatch.setattr(
         f"{helpers}._get_runner_client",
-        lambda *a, **k: _async_return(_RefusingClient()),
+        lambda *a, **k: _async_return(_RefusingClient(error("synthetic transport failure"))),
+    )
+    transport_error_result = (
+        _RunnerForwardResult(status_code=503, body="unconfirmed") if uncertain else None
     )
 
     logger_name = "omnigent.server.routes.sessions"
@@ -48,10 +54,11 @@ async def test_transport_miss_warns_and_falls_back(
         result = await _forward_session_change_to_runner_impl(
             "conv_abc123",
             None,
-            {"type": "goal_get"},
+            {"type": "model_change" if uncertain else "goal_get"},
+            transport_error_result=transport_error_result,
         )
 
-    assert result is None, "a transport miss must fall back, not raise"
+    assert result is (transport_error_result if error is httpx.ReadError else None)
     records = [r for r in caplog.records if r.name == logger_name]
     assert len(records) == 1, f"expected one record, got {records}"
     assert records[0].levelno == logging.WARNING

@@ -14,9 +14,10 @@ The stack each CUJ runs against:
   logins cannot be relocated) but an isolated ``OMNIGENT_CONFIG_HOME`` /
   ``OMNIGENT_DATA_DIR``. It never reads or writes ``~/.omnigent``.
 
-The panes launched by these tests do real inference on the gateway, so no CUJ
-asserts on answer content — only on routing artifacts. That is deliberate: a
+Gateway-backed cases do not assert on answer content — only on routing artifacts.
+That is deliberate: a
 slow or failed generation must not be able to redden a routing test.
+Explicit mock-only cases own a loopback provider and can check exact replies.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -72,14 +74,19 @@ MODEL_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
 _server_log_path: list[Path] = []
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _require_opt_in() -> None:
-    """Skip the whole suite unless it was asked for explicitly."""
+def _require_gateway_opt_in() -> None:
     if os.environ.get(_RUN_GATE_ENV) != "1":
         pytest.skip(
             f"set {_RUN_GATE_ENV}=1 to run the Smart Routing e2e CUJs "
             "(they launch real claude/codex TUIs and a real host daemon)"
         )
+
+
+@pytest.fixture(autouse=True)
+def _require_opt_in(request: pytest.FixtureRequest) -> None:
+    """Require opt-in for gateway cases; mock-only cases own isolated providers."""
+    if request.node.get_closest_marker("mock_only") is None:
+        _require_gateway_opt_in()
 
 
 @pytest.fixture(scope="session")
@@ -89,16 +96,21 @@ def mock_router() -> Iterator[MockRouter]:
     :yields: The router handle; ``base_url`` goes into the server's
         ``routing.base_url``.
     """
+    _require_gateway_opt_in()
     yield from serve_mock_router()
 
 
 @pytest.fixture(autouse=True)
-def _reset_mock_router(mock_router: MockRouter) -> Iterator[None]:
+def _reset_mock_router(request: pytest.FixtureRequest) -> Iterator[None]:
     """Clear the mock's served-request log between tests.
 
     Several CUJs count routing calls ("turn 2 must issue zero"), which only
     means anything against a per-test baseline.
     """
+    if request.node.get_closest_marker("mock_only") is not None:
+        yield
+        return
+    mock_router: MockRouter = request.getfixturevalue("mock_router")
     mock_router.reset()
     yield
 
@@ -259,13 +271,35 @@ def routing_client(routing_server: str) -> Iterator[httpx.Client]:
         yield client
 
 
+@dataclass(frozen=True)
+class _RoutingHostContext:
+    host_id: str
+    claude_settings_env: dict[str, str]
+
+
 @pytest.fixture(scope="session")
 def routing_host(
+    _routing_host_context: _RoutingHostContext,
+) -> str:
+    """The registered routing host's id."""
+    return _routing_host_context.host_id
+
+
+@pytest.fixture(scope="session")
+def routing_claude_settings_env(
+    _routing_host_context: _RoutingHostContext,
+) -> dict[str, str]:
+    """Only the launched host's HOME and CLAUDE_CONFIG_DIR, when present."""
+    return _routing_host_context.claude_settings_env
+
+
+@pytest.fixture(scope="session")
+def _routing_host_context(
     routing_server: str,
     routing_client: httpx.Client,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[str]:
-    """Spawn an ``omnigent host`` against the routing server; yield its host id.
+) -> Iterator[_RoutingHostContext]:
+    """Spawn a routing host and expose its id and Claude settings-path inputs.
 
     The daemon inherits the real ``$HOME`` — the ``claude`` and ``codex``
     logins live there and cannot be relocated — but its omnigent config home
@@ -275,7 +309,7 @@ def routing_host(
     :param routing_server: Server URL the daemon registers with.
     :param routing_client: Used to poll ``GET /v1/hosts``.
     :param tmp_path_factory: Pytest temp path factory.
-    :yields: The registered host's ``host_id``.
+    :yields: The registered host id and scoped settings-path environment.
     """
     providers = _provider_block()
     root = tmp_path_factory.mktemp("routing_e2e_host")
@@ -332,7 +366,12 @@ def routing_host(
                 "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT",
                 root / "data" / "codex-native",
             )
-            yield host_id
+            yield _RoutingHostContext(
+                host_id=host_id,
+                claude_settings_env={
+                    key: env[key] for key in ("HOME", "CLAUDE_CONFIG_DIR") if key in env
+                },
+            )
     finally:
         proc.send_signal(signal.SIGTERM)
         try:

@@ -14,24 +14,45 @@ The web UI's "Claude Code + Model = Smart Routing" path, driven over the API:
    spawn produces. A ``cc`` session offers Claude arms only, so the spawn must
    land on a Claude arm — never a Codex one.
 
-**Spawns are asserted, never awaited.** The bar is that the spawn was issued
+**Gateway spawns are asserted, never awaited.** The bar is that the spawn was issued
 and routed; the subagent's own answer is out of scope, so nothing here waits on
 child output or an inbox return. Nor does anything assert on answer content:
 the pane does real inference, and a slow generation must not be able to redden
-a routing test.
+a routing test. The isolated mock-provider variant also checks two complete
+native/provider turns, exact-once public delivery and an unchanged saved default.
 """
 
 from __future__ import annotations
 
+import json
+import uuid
 from pathlib import Path
 
 import httpx
 import pytest
 
 from omnigent.server.smart_routing import models_in_family
+from tests._helpers.native_claude import (
+    _PINNED_CLAUDE_MODELS,
+    _assert_mock_claude_turn,
+    _assert_native_claude_turn,
+    _live_claude_snapshot,
+    _require_session_only_claude,
+    isolated_claude_mock_routing_stack,
+)
+from tests._helpers.polling import poll_until
+from tests._helpers.session import (
+    marker_turn_prompt,
+    message_item_text,
+    ordered_message_items,
+    send_user_text,
+)
+from tests.e2e.conftest import get_mock_requests, set_fallback_mock_llm
 from tests.e2e.routing._helpers import (
     arm_in,
-    claude_settings_apart_from_the_model,
+    claude_settings_snapshot,
+    claude_settings_unchanged,
+    claude_user_settings_path,
     decisions,
     same_arm,
     session_snapshot,
@@ -51,6 +72,7 @@ from tests.e2e.routing.conftest import (
     trusted_workspace,
     unique_trivial_prompt,
 )
+from tests.harnesses.claude_native._model_status_oracle import native_claude_wire_model
 
 # The suite's default per-test cap is 300s; this CUJ's own waits (launch, a real
 # turn, the spawn or the replay) can legitimately exceed it end to end. The budget
@@ -64,17 +86,124 @@ pytestmark = [pytest.mark.smart_routing, pytest.mark.timeout(900)]
 _SPAWN_TIMEOUT_S = 300.0
 
 
+def _assert_mock_created_session_preserves_default(mock_url: str, tmp_path: Path) -> None:
+    judge_model = "mock-claude-routing-judge"
+    target_model = _PINNED_CLAUDE_MODELS["opus"]
+    with isolated_claude_mock_routing_stack(
+        tmp_path,
+        mock_url,
+        models=_PINNED_CLAUDE_MODELS,
+        judge_model=judge_model,
+    ) as (base_url, client, host_id, workspace, settings_path):
+        saved_settings = claude_settings_snapshot(settings_path)
+        set_fallback_mock_llm(
+            mock_url,
+            judge_model,
+            json.dumps(
+                {
+                    "harness": "claude-native",
+                    "model": target_model,
+                    "rationale": "Use the exact configured Opus model for this complex task.",
+                }
+            ),
+        )
+        nonce = uuid.uuid4().hex[:8]
+        turns = [
+            (f"route-user-{index}-{nonce}", f"route-reply-{index}-{nonce}") for index in (1, 2)
+        ]
+        agents = client.get("/v1/agents")
+        agents.raise_for_status()
+        agent_id = next(
+            row["id"] for row in agents.json()["data"] if row["name"] == "claude-native-ui"
+        )
+        created = client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": host_id,
+                "workspace": str(workspace),
+                "cost_control_mode_override": "on",
+                "smart_routing_message": marker_turn_prompt(1, *turns[0]),
+            },
+            timeout=120,
+        )
+        created.raise_for_status()
+        session_id = str(created.json()["id"])
+        try:
+            _require_session_only_claude(base_url, session_id)
+            assert (
+                _live_claude_snapshot(base_url, session_id)["cost_control_mode_override"] == "on"
+            )
+            assert claude_settings_snapshot(settings_path) == saved_settings
+            native_sessions = []
+            for index, (marker, reply) in enumerate(turns, start=1):
+                set_fallback_mock_llm(mock_url, "default", reply)
+                set_fallback_mock_llm(mock_url, native_claude_wire_model(target_model), reply)
+                send_user_text(
+                    client,
+                    session_id=session_id,
+                    text=marker_turn_prompt(index, marker, reply),
+                )
+                poll_until(
+                    lambda reply=reply: any(
+                        item.get("role") == "assistant" and message_item_text(item) == reply
+                        for item in ordered_message_items(base_url, session_id)
+                    ),
+                    timeout_s=30,
+                )
+                messages = ordered_message_items(base_url, session_id)
+                assert len([item for item in messages if item.get("role") == "assistant"]) == index
+                native_session, user_text = _assert_native_claude_turn(
+                    base_url, session_id, marker, reply, target_model
+                )
+                _assert_mock_claude_turn(
+                    mock_url,
+                    marker,
+                    target_model,
+                    native_session=native_session,
+                    user_text=user_text,
+                )
+                native_sessions.append(native_session)
+                routed = decisions(client, session_id)
+                assert routed and all(
+                    row.get("applied") is True
+                    and row.get("model") == target_model
+                    and row.get("router_source") == "oss-llm"
+                    for row in routed
+                ), routed
+                assert len(get_mock_requests(mock_url, key=judge_model)) == 1
+                assert claude_settings_snapshot(settings_path) == saved_settings
+                assert not _live_claude_snapshot(base_url, session_id).get("last_task_error")
+            assert native_sessions[0] == native_sessions[1]
+        finally:
+            client.delete(f"/v1/sessions/{session_id}").raise_for_status()
+
+
+@pytest.mark.parametrize(
+    "creation_case",
+    ["gateway-spawn", pytest.param("mock-provider", marks=pytest.mark.mock_only)],
+)
 def test_claude_session_create_routes_the_model_and_then_the_spawn(
-    routing_client: httpx.Client,
-    routing_host: str,
-    routing_arms: object,
-    mock_router: MockRouter,
+    request: pytest.FixtureRequest,
     tmp_path: Path,
+    creation_case: str,
+    claude_managed_settings: None,
 ) -> None:
     require_tmux()
+    if creation_case == "mock-provider":
+        _assert_mock_created_session_preserves_default(
+            request.getfixturevalue("isolated_mock_llm_server_url"), tmp_path
+        )
+        return
+    routing_client: httpx.Client = request.getfixturevalue("routing_client")
+    routing_host: str = request.getfixturevalue("routing_host")
+    routing_claude_settings_env = request.getfixturevalue("routing_claude_settings_env")
+    routing_arms = request.getfixturevalue("routing_arms")
+    mock_router: MockRouter = request.getfixturevalue("mock_router")
     routing_arms("claude-native")  # type: ignore[operator]
-    settings_before = claude_settings_apart_from_the_model()
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
+    settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
+    settings_before = claude_settings_snapshot(settings_path)
 
     # ── 1. The routed create ────────────────────────────────────────────────
     # Unique but still rule-0 (short, no error/code markers), so the mock's
@@ -167,8 +296,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
         "the spawn's task text never reached the router"
     )
 
-    # ── 4. Isolation: only Claude Code's own `model` key may have moved ──────
-    assert claude_settings_apart_from_the_model() == settings_before, (
-        "~/.claude/settings.json changed beyond its `model` key — routing must "
-        "confine its hook wiring to the session's bridge dir"
+    # Only newer CLIs promise to preserve the saved model default.
+    assert claude_settings_unchanged(settings_path, settings_before, session_id), (
+        "Claude settings changed fields promised by the running CLI version"
     )

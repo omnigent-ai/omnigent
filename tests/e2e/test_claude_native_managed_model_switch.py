@@ -1,4 +1,10 @@
-"""Switch a real Claude terminal to a managed picker model through the runner."""
+"""Switch a real Claude terminal to a managed picker model through the runner.
+
+Model overrides can declare the exact native status ID with
+``OMNIGENT_E2E_CLAUDE_INITIAL_STATUS_MODEL`` and
+``OMNIGENT_E2E_CLAUDE_TARGET_STATUS_MODEL``. A markerless 1M spelling needs
+the same literal ID and a reported million-token window.
+"""
 
 from __future__ import annotations
 
@@ -18,9 +24,12 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.claude_native.model_switch import supports_session_only_model_switch
 from omnigent.models import model_catalog_store
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
+from tests.harnesses.claude_native._model_status_oracle import _status_model_matches
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -34,13 +43,25 @@ pytestmark = [
     pytest.mark.timeout(180),
 ]
 
-_INITIAL_MODEL = "system.ai.claude-opus-4-8[1m]"
-_TARGET_MODEL = "system.ai.glm-5-3"
+_INITIAL_MODEL = os.environ.get(
+    "OMNIGENT_E2E_CLAUDE_INITIAL_MODEL", "system.ai.claude-opus-4-8[1m]"
+)
+_TARGET_MODEL = os.environ.get("OMNIGENT_E2E_CLAUDE_TARGET_MODEL", "system.ai.glm-5-3")
+_EXPECTED_STATUS_MODELS = {
+    _INITIAL_MODEL: os.environ.get("OMNIGENT_E2E_CLAUDE_INITIAL_STATUS_MODEL"),
+    _TARGET_MODEL: os.environ.get("OMNIGENT_E2E_CLAUDE_TARGET_STATUS_MODEL"),
+}
 
 
-def _capture_pane(socket_path: Path) -> str:
+def _configured_status_matches(bridge_dir: Path, expected: str) -> bool:
+    return _status_model_matches(
+        bridge_dir, expected, expected_status=_EXPECTED_STATUS_MODELS.get(expected)
+    )
+
+
+def _capture_pane(socket_path: Path, target: str = "model-switch:0.0") -> str:
     return subprocess.run(
-        ["tmux", "-S", str(socket_path), "capture-pane", "-p", "-t", "model-switch:0.0"],
+        ["tmux", "-S", str(socket_path), "capture-pane", "-p", "-t", target],
         capture_output=True,
         text=True,
         timeout=5,
@@ -58,14 +79,29 @@ async def _wait_for_picker(socket_path: Path) -> str:
     pytest.fail(f"Claude did not open its model picker:\n{_capture_pane(socket_path)[-3000:]}")
 
 
-async def _wait_for_model(bridge_dir: Path, expected: str, socket_path: Path) -> None:
+async def _wait_for_model(
+    bridge_dir: Path, expected: str, socket_path: Path, target: str = "model-switch:0.0"
+) -> None:
     deadline = asyncio.get_running_loop().time() + 30
     while asyncio.get_running_loop().time() < deadline:
-        if bridge.read_claude_status_model(bridge_dir) == expected:
+        if _configured_status_matches(bridge_dir, expected):
+            native_session = bridge.read_claude_session_id(bridge_dir)
+            assert any(
+                record.event_name == "SessionStart" and record.claude_session_id == native_session
+                for record in bridge.read_hook_events_since_with_position(bridge_dir, 0).records
+            ), "the terminal did not record a matching real SessionStart hook"
             return
         await asyncio.sleep(0.1)
-    pane = _capture_pane(socket_path)
+    pane = _capture_pane(socket_path, target)
     pytest.fail(f"Claude did not report {expected!r}; terminal contents:\n{pane[-3000:]}")
+
+
+def _saved_model_matches(settings_path: Path, expected: str) -> bool:
+    try:
+        settings = json.loads(settings_path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(settings, dict) and settings.get("model") == expected
 
 
 async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
@@ -76,7 +112,9 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     config_dir.mkdir()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_root = tmp_path / bridge._BRIDGE_ROOT.relative_to(bridge._TRUSTED_PARENT)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", bridge_root)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     for key in tuple(os.environ):
@@ -100,6 +138,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     # This models an existing terminal whose launch predates picker metadata.
     assert bridge.read_model_picker_values(bridge_dir) == []
+    assert bridge.read_claude_session_id(bridge_dir) is None
     (config_dir / ".claude.json").write_text(
         json.dumps(
             {
@@ -118,27 +157,16 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                     "replaceBuiltInOptions": True,
                     "options": [
                         {"model": _INITIAL_MODEL, "label": "Opus"},
-                        {"model": _TARGET_MODEL, "label": "GLM 5.3"},
+                        {"model": _TARGET_MODEL, "label": "Managed target"},
                     ],
-                },
-                "statusLine": {
-                    "type": "command",
-                    "command": shlex.join(
-                        [
-                            sys.executable,
-                            "-m",
-                            "omnigent.harnesses.claude_native.status",
-                            "--bridge-dir",
-                            str(bridge_dir),
-                        ]
-                    ),
                 },
             }
         )
     )
     rows = await claude_native.claude_model_catalog(None)
     assert rows is not None
-    assert {_INITIAL_MODEL, _TARGET_MODEL} <= {row["id"] for row in rows}
+    available_models = {row["id"] for row in rows}
+    assert {_INITIAL_MODEL, _TARGET_MODEL} <= available_models, sorted(available_models)
     model_catalog_store.write_catalog(
         "claude-native", claude_native.claude_catalog_fingerprint(None), rows
     )
@@ -168,15 +196,20 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     socket_path = tmp_path / "tmux.sock"
     bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="model-switch:0.0")
+    augmented = bridge.augment_claude_args(
+        ("--model", _INITIAL_MODEL),
+        bridge_dir=bridge_dir,
+        python_executable=sys.executable,
+    )
+    settings_index = augmented.index("--settings")
+    mcp_args = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+    # Use production hooks and status capture without starting the MCP relay.
     command = [
         "claude",
         "--model",
         _INITIAL_MODEL,
-        "--settings",
-        str(settings_path),
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
+        *augmented[settings_index : settings_index + 2],
+        *mcp_args,
     ]
     subprocess.run(
         [
@@ -202,6 +235,22 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     try:
         await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
+        try:
+            context = json.loads((bridge_dir / bridge.CONTEXT_RAW_FILE).read_text())
+        except (OSError, json.JSONDecodeError):
+            context = None
+        version = context.get("version") if isinstance(context, dict) else None
+        if not supports_session_only_model_switch(version):
+            pytest.skip(
+                "saved-default preservation requires stable Claude Code 2.1.323+; "
+                f"the running session reports {version!r}"
+            )
+        native_session_id = bridge.read_claude_session_id(bridge_dir)
+        assert native_session_id
+        (tmp_path / "before-switch.txt").write_text(_capture_pane(socket_path))
+        (tmp_path / "saved-default-before.json").write_text(
+            json.dumps({"model": json.loads(settings_path.read_text())["model"]})
+        )
         app = create_runner_app(
             process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
             spec_resolver=resolve_spec,
@@ -215,28 +264,125 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             for alias in ("opus", "opus[1m]"):
                 response = await client.post(
                     f"/v1/sessions/{session_id}/events",
-                    json={"type": "model_change", "model": alias},
+                    json={
+                        "type": "model_change",
+                        "model": alias,
+                    },
                 )
                 assert response.status_code == 204, response.text
                 await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
             catalog = await client.get(f"/v1/sessions/{session_id}/claude-model-options")
             assert catalog.status_code == 200, catalog.text
             assert _TARGET_MODEL in {row["id"] for row in catalog.json()["models"]}
+            assert all(not key.startswith("_") for row in catalog.json()["models"] for key in row)
+            assert _TARGET_MODEL in bridge.read_model_picker_values(bridge_dir)
             for model in (_TARGET_MODEL, _INITIAL_MODEL):
                 response = await client.post(
                     f"/v1/sessions/{session_id}/events",
-                    json={"type": "model_change", "model": model},
+                    json={
+                        "type": "model_change",
+                        "model": model,
+                    },
                 )
                 assert response.status_code == 204, response.text
                 await _wait_for_model(bridge_dir, model, socket_path)
+                await poll_until_async(lambda: _saved_model_matches(settings_path, _INITIAL_MODEL))
+                assert _configured_status_matches(bridge_dir, model)
+                if model.lower().endswith("[1m]"):
+                    context = bridge.read_claude_context_state(bridge_dir)
+                    assert context is not None and context["context_window_size"] == 1_000_000, (
+                        context
+                    )
             await asyncio.to_thread(bridge.inject_slash_command, bridge_dir, command="/model")
-            (tmp_path / "open-model-picker.txt").write_text(await _wait_for_picker(socket_path))
+            open_picker = await _wait_for_picker(socket_path)
+            (tmp_path / "open-model-picker.txt").write_text(open_picker)
+            saved_settings = settings_path.read_bytes()
+            refused = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "model_change",
+                    "model": _TARGET_MODEL,
+                },
+            )
+            assert refused.status_code == 503, refused.text
+            assert refused.json()["error"] == "claude_native_model_failed"
+            refused_picker = _capture_pane(socket_path)
+            assert "Select model" in refused_picker
+            assert (
+                refused_picker.split("Select model", 1)[1]
+                == open_picker.split("Select model", 1)[1]
+            )
+            assert _configured_status_matches(bridge_dir, _INITIAL_MODEL)
+            assert settings_path.read_bytes() == saved_settings
+            (tmp_path / "refused-model-picker.txt").write_text(refused_picker)
+            # The person dismisses their picker before retrying the web selection.
+            subprocess.run(
+                ["tmux", "-S", str(socket_path), "send-keys", "-t", "model-switch:0.0", "Escape"],
+                check=True,
+                timeout=5,
+            )
+            await poll_until_async(
+                lambda: bridge._claude_prompt_rendered(_capture_pane(socket_path))
+            )
             recovered = await client.post(
                 f"/v1/sessions/{session_id}/events",
-                json={"type": "model_change", "model": _TARGET_MODEL},
+                json={
+                    "type": "model_change",
+                    "model": _TARGET_MODEL,
+                },
             )
             assert recovered.status_code == 204, recovered.text
             await _wait_for_model(bridge_dir, _TARGET_MODEL, socket_path)
+            await poll_until_async(lambda: _saved_model_matches(settings_path, _INITIAL_MODEL))
+            assert _configured_status_matches(bridge_dir, _TARGET_MODEL)
+            (tmp_path / "after-switch.txt").write_text(_capture_pane(socket_path))
+            (tmp_path / "live-model.json").write_text(
+                json.dumps({"model": bridge.read_claude_status_model(bridge_dir)})
+            )
+            (tmp_path / "saved-default.json").write_text(
+                json.dumps({"model": json.loads(settings_path.read_text())["model"]})
+            )
+
+        # No invocation model leaves the saved model as the fresh pane's default.
+        fresh_bridge_dir = bridge.prepare_bridge_dir(uuid.uuid4().hex, workspace=workspace)
+        fresh_augmented = bridge.augment_claude_args(
+            (), bridge_dir=fresh_bridge_dir, python_executable=sys.executable
+        )
+        fresh_settings_index = fresh_augmented.index("--settings")
+        standalone = [
+            "claude",
+            *fresh_augmented[fresh_settings_index : fresh_settings_index + 2],
+            *mcp_args,
+        ]
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "new-window",
+                "-d",
+                "-t",
+                "model-switch",
+                "-n",
+                "fresh-default",
+                "-c",
+                str(workspace),
+                shlex.join(standalone),
+            ],
+            check=True,
+            timeout=10,
+        )
+        await _wait_for_model(
+            fresh_bridge_dir, _INITIAL_MODEL, socket_path, "model-switch:fresh-default"
+        )
+        assert bridge.read_claude_session_id(fresh_bridge_dir) != native_session_id
+        fresh_pane = _capture_pane(socket_path, "model-switch:fresh-default")
+        (tmp_path / "fresh-session.txt").write_text(fresh_pane)
+        (tmp_path / "fresh-model.json").write_text(
+            json.dumps({"model": bridge.read_claude_status_model(fresh_bridge_dir)})
+        )
+        assert _configured_status_matches(bridge_dir, _TARGET_MODEL)
+        assert json.loads(settings_path.read_text())["model"] == _INITIAL_MODEL
     finally:
         subprocess.run(
             ["tmux", "-S", str(socket_path), "kill-server"], capture_output=True, timeout=10

@@ -4636,6 +4636,8 @@ def register_core_routes(
         negotiation: dict[str, object] = (
             {"rollback_on_refusal": True, "cold_start_settings": True} if codex_native else {}
         )
+        native_agent = _native_coding_agent_for_session(updated)
+        claude_native = native_agent is not None and native_agent.harness == "claude-native"
         settings_forward_timeout = (
             _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
         )
@@ -4726,11 +4728,24 @@ def register_core_routes(
                 )
         if live_model_change:
             if not combined_model_forward:
+                model_event: dict[str, object] = {
+                    "type": "model_change",
+                    "model": updated.model_override,
+                    **negotiation,
+                }
                 _model_forward = await _forward_session_change_to_runner(
                     session_id,
                     runner_router,
-                    {"type": "model_change", "model": updated.model_override, **negotiation},
+                    model_event,
                     timeout_s=settings_forward_timeout,
+                    transport_error_result=(
+                        _RunnerForwardResult(
+                            status_code=503,
+                            body=json.dumps({"error": "claude_native_model_unconfirmed"}),
+                        )
+                        if claude_native
+                        else None
+                    ),
                 )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -4739,6 +4754,42 @@ def register_core_routes(
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
+                # Keep Claude intent when forwarding or confirmation fails.
+                if (_model_forward is None and wake_for_model_change and claude_native) or (
+                    _model_forward is not None
+                    and _runner_reply_field(_model_forward.body, "error")
+                    == "claude_native_model_unconfirmed"
+                ):
+                    from omnigent.server.routes.sessions.routes_events import (
+                        _raise_if_runner_re_tunnelled_to_another_replica,
+                    )
+
+                    await _raise_if_runner_re_tunnelled_to_another_replica(
+                        session_id, updated.runner_id, conversation_store
+                    )
+                    if _model_forward is None:
+                        uncertainty_detail = (
+                            "Could not reach the terminal, so the model change was not sent. "
+                            "Your requested model is saved. Reconnect the terminal before retrying."
+                        )
+                    elif (
+                        _runner_reply_field(_model_forward.body, "uncertainty_scope")
+                        != "session_only"
+                    ):
+                        uncertainty_detail = (
+                            "Claude may have changed the session model and the saved default for "
+                            "future terminals, but the selection could not be confirmed. "
+                            "Check the terminal's current model before retrying."
+                        )
+                    else:
+                        uncertainty_detail = (
+                            "Claude may have changed the session model, but the selection could "
+                            "not be confirmed. Check the terminal's current model before retrying."
+                        )
+                    raise OmnigentError(
+                        uncertainty_detail,
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 # Neither a lost request nor a refusal confirms a model switch, but an
                 # unconfirmed Codex update may still apply; the next turn re-applies it.
                 unconfirmed = _model_forward is not None and _codex_update_unconfirmed(

@@ -10270,7 +10270,15 @@ async def _auto_create_claude_terminal(
     # ambient env (the CLI path records these at prepare time; the runner
     # resolves its config only after the bridge exists).
     from omnigent.harnesses.claude_native.bridge import record_model_vocabulary
-    from omnigent.harnesses.claude_native.main import stored_claude_picker_values
+    from omnigent.harnesses.claude_native.main import (
+        stored_claude_catalog_rows,
+        stored_claude_picker_values,
+    )
+    from omnigent.models.claude_model_vocabulary import picker_model_options
+
+    picker_catalog = (
+        launch_catalog if launch_catalog is not None else stored_claude_catalog_rows(claude_config)
+    )
 
     await asyncio.to_thread(
         record_model_vocabulary,
@@ -10280,7 +10288,10 @@ async def _auto_create_claude_terminal(
         # The catalog rows are the CLI's own picker, so their ids are the
         # spellings a later ``/model`` can type — a managed picker names
         # rows no pin covers.
-        picker_values=stored_claude_picker_values(claude_config, launch_catalog),
+        picker_values=stored_claude_picker_values(claude_config, picker_catalog or ()),
+        picker_options=(
+            picker_model_options(picker_catalog) if picker_catalog is not None else None
+        ),
     )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "

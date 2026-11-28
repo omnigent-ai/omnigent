@@ -177,47 +177,17 @@ def test_terminal_dialog_pending_without_a_pane_is_false(tmp_path: Path) -> None
     assert claude_native_bridge.terminal_dialog_pending(tmp_path / "missing") is False
 
 
-_MODEL_ACK = "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions"
-
-
-@pytest.mark.parametrize(
-    ("pane", "expected"),
-    [
-        (f"❯ /model opus[1m]\n{_MODEL_ACK}\n{_RULE}\n❯ \n{_RULE}\n", True),
-        (f"❯ /model opus[1m]\n{_RULE}\n❯ \n{_RULE}\n", False),
-        (f"{_MODEL_ACK}\n❯ /model opus[1m]\n{_RULE}\n❯ \n{_RULE}\n", False),
-        (f"{_MODEL_ACK}\n{_RULE}\n❯ \n{_RULE}\n", False),
-        ("", False),
-    ],
-    ids=["acknowledged", "no-acknowledgement", "older-acknowledgement", "no-echo", "torn"],
-)
-def test_model_switch_acknowledged_reads_the_pane(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: bool
-) -> None:
-    """Only an acknowledgement printed under the command's last echo confirms it."""
-    _show(monkeypatch, pane)
-
-    assert (
-        claude_native_bridge.model_switch_acknowledged(bridge_dir, command="/model opus[1m]")
-        is expected
-    )
-
-
-def test_model_switch_acknowledged_without_a_pane_is_false(tmp_path: Path) -> None:
-    assert (
-        claude_native_bridge.model_switch_acknowledged(tmp_path / "missing", command="/model x")
-        is False
-    )
-
-
 def test_the_settings_pre_check_refuses_before_typing(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A routed ``/model`` refused up front can be retried as is once the prompt is answered."""
+    """An effort change refused before typing can be retried once the prompt is answered."""
     _show(monkeypatch, f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n")
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _dir: True)
+    sent: list[tuple[str, ...]] = []
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: sent.append(args))
 
     with pytest.raises(ClaudeUserPromptPending, match="before changing settings") as raised:
-        claude_native_bridge.inject_slash_command(bridge_dir, command="/model opus")
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert raised.value.nothing_typed is True
+    assert sent == []

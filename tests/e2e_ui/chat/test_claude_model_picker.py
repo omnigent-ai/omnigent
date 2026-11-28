@@ -15,27 +15,32 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from omnigent.harnesses.claude_native.bridge import (
-    BRIDGE_ID_LABEL_KEY,
-    bridge_dir_for_bridge_id,
-    read_claude_status_model,
-    read_transcript_path,
-)
 from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     claude_native_model_options,
 )
 from tests._helpers.host import isolated_host
+from tests._helpers.native_claude import (
+    _PINNED_CLAUDE_MODELS,
+    _assert_mock_claude_turn,
+    _assert_native_claude_turn,
+    _live_claude_snapshot,
+    _require_session_only_claude,
+)
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
-from tests.e2e.conftest import get_mock_message_requests
+from tests.e2e.routing._helpers import claude_settings_snapshot, claude_user_settings_path
 from tests.e2e_ui.conftest import (
     fetch_with_retry,
     reset_mock_llm,
     seed_committed_turn,
     set_fallback_mock_llm,
 )
-from tests.e2e_ui.messages.test_message_render_parity import _ASSISTANT, _WORKING
+from tests.e2e_ui.messages.test_message_render_parity import (
+    _ASSISTANT,
+    _USER,
+    _WORKING,
+)
 from tests.e2e_ui.messages.test_native_claude_render_parity import (
     _ensure_chat_view,
     _open_terminal_view,
@@ -45,6 +50,9 @@ from tests.e2e_ui.messages.test_native_claude_render_parity import (
     _tmux_advert,
     _wait_for_transcript_message,
     _wait_terminal_connected,
+)
+from tests.harnesses.claude_native._model_status_oracle import (
+    native_claude_wire_model as _native_claude_wire_model,
 )
 from tests.helpers.ui_configuration import validate_native_claude_mock_routing
 
@@ -1005,12 +1013,6 @@ def test_claude_native_permission_mode_switch_persists(
     expect(perm).to_contain_text("Auto")
 
 
-_PINNED_CLAUDE_MODELS = {
-    "sonnet": "claude-sonnet-4-20250514",
-    "opus": "system.ai.claude-opus-4-8[1m]",
-}
-
-
 @pytest.fixture
 def native_claude_pinned_mock_session(
     live_server: str,
@@ -1060,12 +1062,6 @@ def native_claude_pinned_mock_session(
             client.delete(f"/v1/sessions/{session_id}").raise_for_status()
 
 
-def _live_claude_snapshot(base_url: str, session_id: str) -> dict:
-    response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-    response.raise_for_status()
-    return response.json()
-
-
 def _open_live_claude_model_menu(page: Page, entry: str = "gear") -> None:
     if entry == "hotkey":
         page.get_by_placeholder("Send a message…").focus()
@@ -1077,56 +1073,13 @@ def _open_live_claude_model_menu(page: Page, entry: str = "gear") -> None:
     expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
 
 
-def _assert_mock_claude_turn(mock_url: str, marker: str, model: str) -> None:
-    """Check the request Claude sent for this turn: its wire model and, for ``[1m]``, the beta."""
-    wire_model = model.removesuffix("[1m]")
-    requests = get_mock_message_requests(mock_url, key=wire_model)
-    turn_requests = [
-        request
-        for request in requests
-        if any(
-            marker in json.dumps(message.get("content"))
-            for message in request["body"].get("messages", [])
-            if message.get("role") == "user"
-        )
-    ]
-    assert turn_requests, (
-        f"The mock received no {wire_model!r} request containing {marker!r}: {requests!r}"
-    )
-    if model.endswith("[1m]"):
-        assert any(
-            beta.startswith("context-1m-")
-            for request in turn_requests
-            for beta in request["betas"]
-        ), f"No {wire_model!r} request for {marker!r} sent the 1M-context beta: {turn_requests!r}"
-
-
-def _assert_native_claude_turn(base_url: str, session_id: str, reply: str, model: str) -> None:
-    """Read Claude's own record of the reply: the alias it requested and the wire model."""
-    snapshot = _live_claude_snapshot(base_url, session_id)
-    bridge_id = snapshot["labels"].get(BRIDGE_ID_LABEL_KEY) or session_id
-    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-    assert read_claude_status_model(bridge_dir) == model
-    transcript = read_transcript_path(bridge_dir)
-    assert transcript is not None, "The native Claude process reported no transcript"
-    records = [json.loads(line) for line in transcript.read_text().splitlines() if line.strip()]
-    assistant = next(
-        record
-        for record in records
-        if record.get("type") == "assistant"
-        and reply in json.dumps(record.get("message", {}).get("content"))
-    )
-    wire_model = model.removesuffix("[1m]")
-    assert assistant["requestedModel"] == model
-    assert assistant["message"]["model"] == wire_model
-
-
 @pytest.mark.nightly
 @pytest.mark.timeout(420)
 def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     page: Page,
     native_claude_pinned_mock_session: tuple[str, str],
     mock_llm_server_url: str,
+    tmp_path: Path,
 ) -> None:
     """Repeated alias picks retain their generation and context on subsequent turns."""
     base_url, session_id = native_claude_pinned_mock_session
@@ -1134,11 +1087,12 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     page.goto(f"{base_url}/c/{session_id}")
     _open_terminal_view(page)
     _wait_terminal_connected(page)
+    _require_session_only_claude(base_url, session_id)
     _ensure_chat_view(page)
     poll_until(
         lambda: (
             _live_claude_snapshot(base_url, session_id).get("llm_model")
-            == _PINNED_CLAUDE_MODELS["sonnet"]
+            == f"{_PINNED_CLAUDE_MODELS['sonnet']}[1m]"
         ),
         timeout_s=120,
     )
@@ -1147,6 +1101,10 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     assert all(catalog.get(alias) == model for alias, model in _PINNED_CLAUDE_MODELS.items()), (
         f"The native catalog did not preserve its configured pins: {catalog!r}"
     )
+    saved_settings_path = claude_user_settings_path(
+        tmp_path / "workspace", {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config")}
+    )
+    saved_settings = claude_settings_snapshot(saved_settings_path)
     reset_mock_llm(mock_llm_server_url)
 
     # The second Opus pick keeps the same resolved model; the following Sonnet
@@ -1172,7 +1130,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
         }
         model = _PINNED_CLAUDE_MODELS[alias]
         poll_until(
-            lambda expected=model: (
+            lambda expected=_native_claude_wire_model(model): (
                 _live_claude_snapshot(base_url, session_id).get("llm_model") == expected
             ),
             timeout_s=30,
@@ -1181,7 +1139,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
         page.keyboard.press("Escape")
         nonce = uuid.uuid4().hex[:8]
         marker, reply = f"pin-user-{nonce}", f"pin-reply-{nonce}"
-        set_fallback_mock_llm(mock_llm_server_url, model.removesuffix("[1m]"), reply)
+        set_fallback_mock_llm(mock_llm_server_url, _native_claude_wire_model(model), reply)
         _send_turn_and_settle(
             page,
             mock_llm_server_url,
@@ -1192,11 +1150,17 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             assistant_token=reply,
             expected_assistant_bubbles=index,
         )
+        expect(page.locator(_USER, has_text=marker)).to_have_count(1)
         expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1)
         _wait_for_transcript_message(page, base_url, session_id, reply, role="assistant")
-        _assert_mock_claude_turn(mock_llm_server_url, marker, model)
-        _assert_native_claude_turn(base_url, session_id, reply, model)
+        native_session, user_text = _assert_native_claude_turn(
+            base_url, session_id, marker, reply, model
+        )
+        _assert_mock_claude_turn(
+            mock_llm_server_url, marker, model, native_session=native_session, user_text=user_text
+        )
         expect(page.get_by_test_id("error-headline")).to_have_count(0)
+        assert claude_settings_snapshot(saved_settings_path) == saved_settings
 
     _open_terminal_view(page)
     _wait_terminal_connected(page)
@@ -1218,6 +1182,7 @@ def test_claude_native_refusal_preserves_a_newer_same_model_selection(
             page.goto(f"{live_server}/c/{session_id}")
             _open_terminal_view(page)
             _wait_terminal_connected(page)
+            _require_session_only_claude(live_server, session_id)
             _ensure_chat_view(page)
             reset_mock_llm(mock_llm_server_url)
             nonce = uuid.uuid4().hex[:8]
@@ -1232,11 +1197,18 @@ def test_claude_native_refusal_preserves_a_newer_same_model_selection(
                 assistant_token=reply,
                 expected_assistant_bubbles=1,
             )
+            expect(page.locator(_USER, has_text=marker)).to_have_count(1)
             expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1)
             _wait_for_transcript_message(page, live_server, session_id, reply, role="assistant")
-            _assert_mock_claude_turn(mock_llm_server_url, marker, _PINNED_CLAUDE_MODELS["sonnet"])
-            _assert_native_claude_turn(
-                live_server, session_id, reply, _PINNED_CLAUDE_MODELS["sonnet"]
+            native_session, user_text = _assert_native_claude_turn(
+                live_server, session_id, marker, reply, _PINNED_CLAUDE_MODELS["sonnet"]
+            )
+            _assert_mock_claude_turn(
+                mock_llm_server_url,
+                marker,
+                _PINNED_CLAUDE_MODELS["sonnet"],
+                native_session=native_session,
+                user_text=user_text,
             )
             expect(page.locator(_WORKING)).to_have_count(0)
             client.patch(

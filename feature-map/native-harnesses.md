@@ -108,8 +108,10 @@ implements them separately, so a fix for one harness does not reach the others.
   drops rows that cannot launch.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
-- `smart-routing`: Pi applies the chosen route before inference from the
-  composer or native terminal; a tool turn and follow-up retain history.
+- `smart-routing`: Claude Code and Pi apply the chosen route before inference
+  from Chat or the native terminal. The first message is delivered once; a
+  tool turn and follow-up retain history. A refused Claude selection keeps
+  the first message saved but unsent for explicit resubmission.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
   the answer reaches the harness. Shared relay calls exclude their own human
   approval waits from the five-minute execution budget. A pending approval
@@ -310,9 +312,15 @@ card within about a second. A dialog the user opens during a turn, such as
 shows "May need input" in Needs attention until the dialog closes. Claude
 reports done after the turn, so a dialog opened then leaves the row unchanged.
 
-**Pi Smart Routing:** enable Smart Routing for the session, then send a task
-from Chat or type it into the native Pi terminal. Follow a completed tool call
-with a question about its result; verify the routed model and retained history.
+**Claude Code and Pi Smart Routing:** enable Smart Routing for the session,
+then submit its first task from Chat. Repeat in a fresh session by typing the
+first task into Terminal and pressing Enter. Verify the routed model before
+inference and exactly one delivered turn for each submission. With Claude Code
+2.1.323+, record the saved default first and confirm it remains unchanged in
+a fresh independent Claude terminal. If a long wrapped first message cannot
+be safely replayed, use the saved-text notice for copying and explicit
+resubmission. With Pi, follow a completed tool call with a question about its
+result and verify retained history.
 
 **Pi model and effort changes:** in an existing session, select Medium, switch
 to a non-reasoning model, then to a reasoning model from another family. Send
@@ -862,29 +870,130 @@ Cross-harness journeys:
   and the "did not respond" cases in
   `web/src/pages/settings/SettingsHarnessesSection.test.tsx` and
   `web/src/shell/NewChatDialog.test.tsx`.
+- **`smart-routing`, `model-and-effort`, Claude (own environment):**
+  `tests/e2e_ui/chat/test_claude_native_routing_preserves_default.py::test_claude_routing_preserves_default_and_delivers_once`
+  drives a first Chat message and a first message typed into the embedded
+  Terminal. It starts an isolated server and host, with a
+  loopback judge and provider and a distinct saved Claude default. Each path
+  checks two delivered turns against the native transcript, fresh same-session
+  status and provider requests, one judge call, unchanged saved settings and
+  exactly one browser copy per message. It requires Claude Code 2.1.323+ and
+  tmux. This covers OSS routing integration with a scripted judge; it does not
+  establish live gateway decisions or other-platform acceptance.
+  API create-time routing uses the mock-provider case in
+  `tests/e2e/routing/test_claude_ui_smart_routing_e2e.py::test_claude_session_create_routes_the_model_and_then_the_spawn`.
+  It retains the two native/provider turns, exact-once public delivery, one
+  routing call and unchanged saved-default checks without a browser journey.
+  If model selection is refused, the first message stays saved but unsent.
+  The informational notice offers the saved text for copying and explicit
+  resubmission. Notice delivery may retry once while it still owns that saved
+  message; it does not automatically retry model selection or send the prompt.
 - **`model-and-effort`, Claude runtime selection (own environment):**
   `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
-  uses real Claude catalog discovery, tmux, statusLine and the runner event
-  endpoint. With the per-session options cache still cold, repeated `opus` and
-  `opus[1m]` selections retain the exact launch-pinned generation and context.
-  It then switches to a managed GLM picker ID and back, opens Claude's model
-  picker, and confirms another switch reclaims that surface successfully.
+  uses real Claude catalog discovery, production invocation settings, a real
+  SessionStart identity matching statusLine, tmux and the runner event endpoint.
+  After discovering and saving its launch catalog, it posts `opus` and `opus[1m]`
+  before requesting the session model-options endpoint. It then selects the
+  configured target and initial model IDs. A model picker opened in the
+  terminal causes a refusal and stays open with the applied model and saved
+  default unchanged; dismiss it with Escape, then retry the model request.
+  If cancellation leaves a model picker, status view or cache-cost decision
+  open, the next routed Chat prompt waits up to eight minutes for the person
+  to dismiss that control in Terminal. The cancelled request stays cancelled.
+  The subsequent prompt resumes once after the person returns to an empty
+  composer and a fresh model receipt is obtained. An unrelated draft is
+  preserved and causes a refusal. Cancellation sends no key to an unobserved
+  control. Caller cancellation and fresh-receipt resume are covered by
+  `tests/inner/test_claude_native_executor.py::test_cancelled_model_switch_cleans_only_observed_owned_controls`;
+  No-selected confirmation, changed picker/draft preservation, cancellation
+  and hold expiry are covered by
+  `tests/inner/test_claude_native_executor.py::test_model_control_hold_preserves_user_changes_until_dismissal`.
+  A fresh terminal still starts on the saved default.
   Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
-  Requires Claude Code and tmux; use a clean container if machine-managed
-  settings override the fixture's picker. It makes no model calls and does not
-  verify browser rendering or live gateway servability.
+  This switching journey requires stable Claude Code 2.1.323 or newer and tmux;
+  older or unverified running versions skip before switching. Use a clean
+  container if machine-managed settings override the fixture's picker.
+  It makes no model calls and does not verify browser rendering or live gateway
+  servability.
+  Older CLIs and CLIs with unavailable or unverified version metadata retain
+  legacy `/model MODEL` submission, including its possible saved-default change.
+  A matching status bound to the same native session needs no command, preserving
+  a separately saved default. Pinned aliases must match the recorded concrete
+  generation and context; an unpinned alias still uses legacy submission.
+  Legacy confirmations use the concrete target and unique label captured when
+  the command was submitted. Completed requests stop watching, and a changed
+  dialog receives no Enter. Without a proven label, the command is still
+  submitted and any terminal confirmation is left for the person to answer.
+  Missing or mismatched session identity still uses
+  legacy submission; the newer fresh-status guarantee does not apply.
+  Legacy web model changes can return HTTP 204 after command submission, before
+  the switch is observed, with confirmation continuing in a delayed watcher.
+  That response acknowledges submission; session-only selection requires a
+  confirmed switch.
+  Existing bridge metadata works without re-registration. Upgrading Claude Code
+  is optional; default preservation and fresh native receipts apply only when
+  the running terminal reports a stable version of 2.1.323 or newer. A failure on
+  that supported path never falls back to a persistent model command.
+  Version boundaries and legacy bridge/control behavior are covered by
+  `tests/harnesses/claude_native/test_claude_native_model_switch_compatibility.py`
+  and `tests/runner/test_claude_model_controls_compatibility.py`.
+  Same-model confirmation and stale-status refusal on supported versions are covered by
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_model_command_uses_a_fresh_status_for_same_model_requests`
+  and `tests/inner/test_claude_native_executor.py::test_run_turn_requires_a_matching_model_selection_result`.
+  Each switch keeps its initially resolved target descriptor; later catalog
+  refreshes do not invalidate that selection. The live picker and fresh status
+  must still confirm that target. Live changes keep the original `type`/`model`
+  event shape. New runners choose the actuator from the running CLI's version,
+  including for older servers; an uncertain selection returns 503 and preserves the pane.
+  Current servers preserve intent on uncertainty replies and retain newer
+  metadata. When a current runner reports an uncertain legacy submission,
+  the public warning also names the possible saved-default change. Older
+  runners without that optional detail keep the generic warning.
+  A native child using an inherited host can retain the existing HTTP 200
+  saved-intent response when no model request reaches a runner. This confirms
+  stored intent only; the live terminal selection is unconfirmed. The fresh
+  receipt requirement applies to forwarded live selections and excludes these
+  saved-intent responses. A direct-host dispatch miss returns 503 and also
+  preserves intent. These outcomes are covered by
+  `tests/server/integration/test_native_model_change_failures.py::test_claude_model_change_without_a_runner_saves_intent_without_forwarding`.
+  Older servers may roll back intent or report the prior
+  model after uncertainty. Older runners retain their existing CLI actuator and
+  saved-default behavior. Legacy requests and both peer directions are covered by
+  `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_requires_the_same_immediate_picker_receipt`,
+  `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_serializes_a_refused_dialog_without_session_events`,
+  `tests/runner/test_claude_model_controls_compatibility.py::test_model_control_names_the_step_a_blocked_terminal_needs`,
+  `tests/server/integration/test_native_model_change_failures.py::test_claude_model_confirmation_controls_public_patch_and_rollback`,
+  `tests/server/integration/test_native_model_change_failures.py::test_refused_model_change_preserves_newer_silent_selection`,
+  and `tests/server/integration/test_native_model_change_failures.py::test_new_server_accepts_legacy_runner_replies_without_losing_newer_metadata`.
 - **`model-and-effort`, Claude browser selection and refusal (nightly):**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
-  proves alias picks through the gear, model pill and Ctrl+Shift+M using
+  checks alias picks through the gear, model pill and Ctrl+Shift+M using
   the real browser, server, owned isolated host, runner and CLI. Subsequent
-  mock requests preserve the wire model's generation; native status and
-  `requestedModel` retain `[1m]`, with a correlated `context-1m` request beta.
-  Chat and the transcript each contain the reply once.
+  turns require exactly one matching streaming provider request and one user
+  message/reply pair in Chat, persisted history and the native transcript.
+  Requests, native `requestedModel` and fresh status must name the exact
+  concrete generation. Claude Code 2.1.323 treats Opus 4.8 as native 1M: its
+  public wire and status IDs omit `[1m]` without requiring a `context-1m` beta.
+  Each Opus turn must instead report a fresh 1,000,000-token context matching
+  its unique prompt ID, native session and transcript path. This normalization
+  applies only to that exact public model spelling; private IDs stay literal.
+  Every pick still requires success before the next prompt.
+  Terminal checks preserve naturally wrapped and explicitly multiline drafts
+  during a refused model change, retaining raw and joined pane captures.
+  Each draft is then explicitly submitted and its complete text must match in
+  the native transcript and exactly one conversation request. Screen rows alone
+  do not establish logical newline boundaries or ownership for automated clearing.
+  `tests/e2e/test_claude_native_model_drafts.py::test_claude_model_control_during_an_active_turn_preserves_delivery`
+  covers an API model change while a native provider response is held: the
+  session stays running, that turn finishes once on its original model, and
+  the next turn uses the new model without changing saved defaults. It uses
+  the same isolated native stack as draft preservation, without a browser.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
   pauses its owned CLI to force a real unconfirmed switch; a late 503 preserves
   a newer same-value model write and its effort while the applied model stays
   unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
-  These cases do not cover live providers or a post-refusal retry.
+  These cases do not cover live providers, inference beyond 200K tokens or a
+  post-refusal retry.
 - **`picker-entry-visibility`:**
   `web/src/shell/AgentHarnessPicker.test.tsx` covers the picker rows a hidden
   entry drops and when the picker points at Settings,
