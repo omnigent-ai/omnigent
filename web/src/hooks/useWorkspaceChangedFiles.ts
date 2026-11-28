@@ -709,6 +709,16 @@ export function browseLocationBase(location: string): "host" | null {
 }
 
 /**
+ * The Go to File query a tree rooted at ``location`` starts with: the folder's
+ * workspace-relative path, e.g. ``src/shell/``. The workspace root and a folder
+ * outside the workspace, which the finder doesn't search, start empty.
+ */
+export function finderQueryPrefix(location: string): string {
+  if (location === "" || location.startsWith("/") || /^[A-Za-z]:[\\/]/.test(location)) return "";
+  return `${location.replace(/\/+$/, "")}/`;
+}
+
+/**
  * Join a browse location with a path relative to it.
  *
  * @param location Current browse location, ``""`` for the workspace root.
