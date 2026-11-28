@@ -707,25 +707,46 @@ async def test_session_delete_removes_comment_relay(relay_env: _RelayEnv) -> Non
 
 
 @pytest.mark.asyncio
-async def test_repeated_terminal_launch_keeps_single_relay(relay_env: _RelayEnv) -> None:
-    """A second bridge_inject_dir launch reuses the relay instead of rebinding."""
+@pytest.mark.parametrize("damaged", [False, True], ids=["same-activation", "repaired-activation"])
+async def test_repeated_terminal_launch_keeps_single_relay(
+    relay_env: _RelayEnv, tmp_path: Path, damaged: bool
+) -> None:
+    """Reuse current relays; replace a stale activation after same-session repair."""
     first = await _launch_terminal(relay_env.client, relay_env.session_id, bridge_inject_dir=True)
     assert first.status_code == 200
     relay_file = relay_env.bridge_dir / _TOOL_RELAY_FILE
-    first_url = json.loads(relay_file.read_text())["url"]
+    first_info = json.loads(relay_file.read_text())
+    if damaged:
+        (relay_env.bridge_dir / "bridge.json").write_text("{broken")
+        assert prepare_bridge_dir(relay_env.session_id, workspace=tmp_path) == relay_env.bridge_dir
+        async with httpx.AsyncClient() as client:
+            stale = await client.post(
+                f"{first_info['url']}/tool",
+                json={"name": "list_comments", "arguments": {}},
+                headers={"Authorization": f"Bearer {first_info['token']}"},
+                timeout=5.0,
+            )
+        assert stale.status_code == 401
 
     second = await _launch_terminal(relay_env.client, relay_env.session_id, bridge_inject_dir=True)
     assert second.status_code == 200
-    second_url = json.loads(relay_file.read_text())["url"]
-
-    # The relay URL (its bound port) must be unchanged. A different port means
-    # _ensure_comment_relay_started bound a second relay instead of
-    # short-circuiting on the _session_comment_relays guard — which would leak
-    # the first relay's HTTP server and socket.
-    assert second_url == first_url, (
-        f"second launch rebound the relay ({first_url!r} -> {second_url!r}); "
-        f"the idempotency guard did not hold"
-    )
+    second_info = json.loads(relay_file.read_text())
+    discovery = bridge._handle_mcp_request("tools/list", {}, relay_env.bridge_dir)
+    assert "list_comments" in {tool["name"] for tool in discovery["tools"]}
+    if damaged:
+        assert second_info["url"] != first_info["url"]
+        assert second_info["token"] != first_info["token"]
+        async with httpx.AsyncClient() as client:
+            stale = await client.post(
+                f"{second_info['url']}/tool",
+                json={"name": "list_comments", "arguments": {}},
+                headers={"Authorization": f"Bearer {first_info['token']}"},
+                timeout=5.0,
+            )
+        assert stale.status_code == 401
+    else:
+        assert second_info["url"] == first_info["url"]
+        assert second_info["token"] == first_info["token"]
 
 
 class _ReapableStubResourceRegistry(_StubResourceRegistry):

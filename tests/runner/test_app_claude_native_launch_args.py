@@ -1414,23 +1414,31 @@ async def _auto_create_claude_terminal_for_test(
 
 
 @pytest.mark.parametrize(
-    ("args", "expected"),
+    ("command", "args", "expected"),
     [
-        (["-C", "sub", "--", "claude", "--settings", "caller.json"], 4),
-        (["--", "claude", "--", "--settings", "literal"], 2),
-        (["-S", "-C sub claude", "--settings", "caller.json"], 2),
-        (["-S", "claude --name embedded", "--settings", "caller.json"], None),
-        (["-C", "sub", "claude"], 3),
-        (["-u", "EXAMPLE_UNUSED", "env", "-C", "sub", "claude", "--settings", "caller.json"], 6),
-        (["env", "-v", "claude", "--settings", "caller.json"], None),
-        ([*(["env"] * 33), "claude"], None),
+        ("env", ["-C", "sub", "--", "claude", "--settings", "caller.json"], 4),
+        ("env", ["--", "claude", "--", "--settings", "literal"], 2),
+        ("env", ["-S", "-C sub claude", "--settings", "caller.json"], 2),
+        ("env", ["-S", "claude --name embedded", "--settings", "caller.json"], None),
+        ("env", ["-C", "sub", "claude"], 3),
+        (
+            "env",
+            ["-u", "EXAMPLE_UNUSED", "env", "-C", "sub", "claude", "--settings", "caller.json"],
+            6,
+        ),
+        ("env", ["-v", "-C", "sub", "claude", "--settings", "caller.json"], None),
+        ("env", ["env", "-v", "claude", "--settings", "caller.json"], None),
+        ("env", [*(["env"] * 33), "claude"], None),
+        ("claude-wrapper", ["--"], 1),
+        ("claude-wrapper", ["claude", "--"], 2),
+        ("claude-wrapper", ["--profile", "work", "--"], 3),
     ],
 )
-def test_claude_terminal_env_boundary_preserves_original_suffix(args, expected):
+def test_claude_terminal_argument_boundary_preserves_original_suffix(command, args, expected):
     from omnigent.inner.datamodel import TerminalEnvSpec
     from omnigent.runner.native.orchestration import _claude_terminal_args_start
 
-    spec = TerminalEnvSpec(command="env", args=args, inherit_env=False)
+    spec = TerminalEnvSpec(command=command, args=args, inherit_env=False)
     assert _claude_terminal_args_start(spec, len(args)) == (
         expected if expected is not None else len(args)
     )
@@ -1439,9 +1447,6 @@ def test_claude_terminal_env_boundary_preserves_original_suffix(args, expected):
 @pytest.mark.parametrize(
     "command,prefix",
     [
-        ("claude-wrapper", ["--"]),
-        ("claude-wrapper", ["claude", "--"]),
-        ("claude-wrapper", ["--profile", "work", "--"]),
         ("claude-wrapper", ["--settings", '{"wrapperOption":true}', "claude"]),
         ("claude-wrapper", ["--settings", '{"disableAllHooks":true}', "claude"]),
         ("sh", ["-c", 'shift; exec claude "$@"', "shell-name", "--"]),
@@ -1450,36 +1455,18 @@ def test_claude_terminal_env_boundary_preserves_original_suffix(args, expected):
             ["--", "--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}'],
         ),
         ("claude", ["--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}']),
-        ("env", ["-C", "sub", "claude", "--settings", "caller.json"]),
-        ("env", ["-C", "sub", "--", "claude", "--settings", "caller.json"]),
-        ("env", ["-S", "-C sub claude", "--settings", "caller.json"]),
-        (
-            "env",
-            ["-u", "EXAMPLE_UNUSED", "env", "-C", "sub", "claude", "--settings", "caller.json"],
-        ),
         (
             "env",
             ["FOO=1", "claude-wrapper", "--", "--settings", '{"env":{"CONFIG_ONLY":"yes"}}'],
         ),
-        ("env", ["-v", "-C", "sub", "claude", "--settings", "caller.json"]),
-        ("env", ["env", "-v", "claude", "--settings", '{"disableAllHooks":true}']),
     ],
     ids=[
-        "configured-wrapper",
-        "configured-subcommand-wrapper",
-        "configured-wrapper-options",
         "configured-wrapper-owned-settings",
         "configured-wrapper-owned-hook-control",
         "configured-shell-payload",
         "wrapper-claude-settings",
         "configured-claude-settings",
-        "configured-env-chdir-settings",
-        "configured-env-delimiter-settings",
-        "configured-env-split-settings",
-        "configured-nested-env-settings",
         "configured-env-wrapper-settings",
-        "opaque-env-verbose-settings",
-        "opaque-nested-env-settings",
     ],
 )
 async def test_auto_create_claude_settings_preserve_configured_argument_boundary(
@@ -1529,7 +1516,6 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
             settings = json.loads(Path(created.instance.args[settings_index]).read_text())
             assert settings["env"]["ORDER"] == "caller"
             assert settings["hooks"]["UserPromptSubmit"]
-            opaque_env = command == "env" and "-v" in prefix
             if command == "claude-wrapper":
                 boundary = prefix.index("--") + 1 if "--" in prefix else len(prefix)
                 assert created.instance.args[:boundary] == prefix[:boundary]
@@ -1538,10 +1524,10 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
             if command == "sh":
                 assert created.instance.args[: len(prefix)] == prefix
             if command == "env":
-                boundary = len(prefix) if opaque_env else prefix.index("--settings")
+                boundary = prefix.index("--settings")
                 assert created.instance.args[:boundary] == prefix[:boundary]
                 assert "disableAllHooks" not in settings
-            wrapper_settings = (command == "claude-wrapper" and "--" not in prefix) or opaque_env
+            wrapper_settings = command == "claude-wrapper" and "--" not in prefix
             if "--settings" in prefix and not wrapper_settings:
                 assert settings["env"]["CONFIG_ONLY"] == "yes"
             assert created.instance.args.count("--settings") == (3 if wrapper_settings else 2)

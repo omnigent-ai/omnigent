@@ -1507,6 +1507,14 @@ class ClaudeNativeToolRelay:
         self._credential_binding = credential_binding or read_bridge_credential_binding(bridge_dir)
         self._require_activation_binding = require_activation_binding
 
+    def is_current(self) -> bool:
+        """Whether this relay still belongs to the directory's live activation."""
+        return not self._closed.is_set() and _bridge_endpoint_is_current(
+            self._bridge_dir,
+            self._credential_binding,
+            require_binding=self._require_activation_binding,
+        )
+
     def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
 
@@ -1520,11 +1528,7 @@ class ClaudeNativeToolRelay:
             "updated_at": time.time(),
         }
         with _bridge_metadata_write_lock(self._bridge_dir):
-            if self._closed.is_set() or not _bridge_endpoint_is_current(
-                self._bridge_dir,
-                self._credential_binding,
-                require_binding=self._require_activation_binding,
-            ):
+            if not self.is_current():
                 raise RuntimeError("Native tool relay activation has ended")
             _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
             self._relay_info = relay_info
@@ -2035,6 +2039,7 @@ def prune_orphaned_bridge_dirs() -> int:
             (path / native_bridge_common.OWNER_PID_FILENAME).is_file()
             and not has_live_claude_settings_owners(path)
         ),
+        on_dead_owner=retire_bridge_credentials,
     )
 
 
@@ -2303,7 +2308,7 @@ def _bridge_endpoint_is_current(
     )
 
 
-def retire_bridge_credentials(bridge_dir: Path, session_id: str) -> None:
+def retire_bridge_credentials(bridge_dir: Path, session_id: str | None = None) -> None:
     """Remove auth snapshots under the preparation lock, retaining only deletion identity."""
     try:
         config = json.loads(_read_caller_settings(bridge_dir / _CONFIG_FILE, nofollow=True))
@@ -2311,11 +2316,15 @@ def retire_bridge_credentials(bridge_dir: Path, session_id: str) -> None:
         config = {}
     if not isinstance(config, dict):
         config = {}
-    tombstone: _JsonObject = {
-        "active_session_id": session_id,
-        "conversation_id": session_id,
-        "deleted": True,
-    }
+    if session_id is None:
+        for name in ("active_session_id", "conversation_id"):
+            value = config.get(name)
+            if isinstance(value, str) and value:
+                session_id = value
+                break
+    tombstone: _JsonObject = {"deleted": True}
+    if session_id is not None:
+        tombstone.update(active_session_id=session_id, conversation_id=session_id)
     if isinstance(config.get("bridge_id"), str):
         tombstone["bridge_id"] = config["bridge_id"]
     first_error: OSError | None = None

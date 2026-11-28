@@ -693,8 +693,13 @@ async def test_legacy_launches_reuse_historical_file_without_untracked_generatio
 ) -> None:
     monkeypatch.setattr(main, "resolve_claude_launch", lambda cmd, args: (cmd, args))
     posted = []
+    requests: list[httpx.Request] = []
+    create_request = Mock(side_effect=AssertionError("unsupported probe created an owned request"))
+    if peer == "v1":
+        monkeypatch.setattr(ClaudeSettingsRequest, "create", create_request)
 
     def respond(request):
+        requests.append(request)
         if request.method == "GET":
             capabilities = {} if peer == "legacy" else {"claude_settings_request_protocol": 1}
             if peer == "old-server":
@@ -736,6 +741,9 @@ async def test_legacy_launches_reuse_historical_file_without_untracked_generatio
             assert not list(bridge_dir.glob("claude-settings-*"))
     assert len(posted) == 6
     assert (bridge_dir / "claude-settings.json").stat().st_mode & 0o777 == 0o600
+    if peer == "v1":
+        assert [request.method for request in requests] == ["GET", "POST"] * 6
+        create_request.assert_not_called()
 
 
 def test_legacy_receiver_cannot_consume_a_fenced_record(bridge_dir: Path) -> None:

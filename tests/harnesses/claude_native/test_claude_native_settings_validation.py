@@ -172,30 +172,29 @@ async def test_validator_requires_complete_controls_and_keeps_the_full_document(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("sandboxed", "env_wrapped", "fork_executable"),
+    ("env_wrapped", "fork_executable"),
     [
-        pytest.param(True, False, None, id="different-paths"),
-        pytest.param(True, True, "bin", id="fork-bin"),
-        pytest.param(True, True, "opt", id="fork-opt"),
-        pytest.param(True, True, "shallow-symlink", id="fork-shallow-symlink"),
-        pytest.param(True, True, "private-parent", id="fork-private-parent"),
-        pytest.param(True, True, "private-symlink", id="fork-private-symlink"),
-        pytest.param(True, True, "policy-root", id="fork-policy-root"),
-        pytest.param(True, True, "private-read", id="fork-private-read"),
+        pytest.param(False, None, id="different-paths"),
+        pytest.param(True, "bin", id="fork-bin"),
+        pytest.param(True, "opt", id="fork-opt"),
+        pytest.param(True, "shallow-symlink", id="fork-shallow-symlink"),
+        pytest.param(True, "private-parent", id="fork-private-parent"),
+        pytest.param(True, "private-symlink", id="fork-private-symlink"),
+        pytest.param(True, "policy-root", id="fork-policy-root"),
+        pytest.param(True, "private-read", id="fork-private-read"),
     ],
 )
 async def test_validator_preserves_selected_environment_wrapper_and_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    sandboxed: bool,
     env_wrapped: bool,
     fork_executable: str | None,
 ) -> None:
     monkeypatch.setattr(terminal_module, "tmux_unavailable_reason", lambda: None)
     instance = _instance(tmp_path)
     instance.command = "env" if env_wrapped else "claude"
-    selected_command = "selected-wrapper" if sandboxed and env_wrapped else "claude"
-    selected_prefix = ["claude", "--"] if sandboxed and env_wrapped else []
+    selected_command = "selected-wrapper" if env_wrapped else "claude"
+    selected_prefix = ["claude", "--"] if env_wrapped else []
     if env_wrapped:
         which = Mock(return_value=selected_command)
         monkeypatch.setattr(validation.shutil, "which", which)
@@ -218,13 +217,12 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         which = Mock(return_value=selected_command)
         monkeypatch.setattr(validation.shutil, "which", which)
     namespace_env = str(Path(os.defpath.split(os.pathsep)[0]) / "env")
-    if sandboxed and env_wrapped:
+    if env_wrapped:
         which.side_effect = lambda command, *, path: (
             namespace_env if command == "env" and path == os.defpath else selected_command
         )
     prefix = (
         [
-            *([] if sandboxed else ["-i"]),
             "-C",
             "subdir",
             "PATH=/selected/bin",
@@ -259,8 +257,7 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         ),
         spawn_env_allowlist=["PATH"],
     )
-    if sandboxed:
-        instance.sandbox_policy = policy
+    instance.sandbox_policy = policy
     if not env_wrapped:
         startup_targets = []
 
@@ -289,16 +286,12 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         return str(tmp_path / "launcher")
 
     async def doctor(command, args, *, cwd, env):
-        assert command == (
-            str(tmp_path / "launcher") if sandboxed or env_wrapped else selected_command
-        )
+        assert command == str(tmp_path / "launcher")
         expected_prefix = (
-            ["--", selected_command, *selected_prefix]
-            if sandboxed and env_wrapped
-            else selected_prefix
+            ["--", selected_command, *selected_prefix] if env_wrapped else selected_prefix
         )
         assert args[: len(expected_prefix)] == expected_prefix
-        assert cwd == (Path("/") if sandboxed else selected_cwd)
+        assert cwd == Path("/")
         assert env["PATH"] == selected_path
         if env_wrapped:
             assert "PRIVATE_KEY" not in env
@@ -313,7 +306,7 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
             assert "EXCLUDED" not in selected_env
         else:
             assert "PRIVATE_KEY" not in env
-        assert ("EXCLUDED" not in env) is sandboxed
+        assert "EXCLUDED" not in env
         assert env["CLAUDE_CONFIG_DIR"] != "/caller-config"
         if "--help" in args:
             return _HELP, ""
@@ -345,18 +338,11 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         assert doctor_mock.await_count == 4
     if fork_executable is not None:
         assert which.call_args == call(selected_command, path=selected_path)
-    assert len(launches) == (4 if (sandboxed or env_wrapped) and not rejected else 0)
+    assert len(launches) == (4 if not rejected else 0)
     assert [command for command, _ in launches] == (
-        [namespace_env if sandboxed and env_wrapped else selected_command] * 4
-        if (sandboxed or env_wrapped) and not rejected
-        else []
+        [namespace_env if env_wrapped else selected_command] * 4 if not rejected else []
     )
     for _, cloned in launches:
-        if not sandboxed:
-            assert not cloned.active
-            assert cloned.backend_type == "none"
-            assert "PRIVATE_KEY" not in cloned.spawn_env_allowlist
-            continue
         assert not cloned.allow_network
         assert len(cloned.write_roots) == 1 and not cloned.write_files
         assert cloned.mask_paths == (

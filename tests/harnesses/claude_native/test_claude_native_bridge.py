@@ -19768,9 +19768,11 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
     assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
 
 
+@pytest.mark.parametrize("identity", ["current", "legacy", "malformed", "missing"])
 def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    identity: str,
 ) -> None:
     """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
     from omnigent.harnesses.claude_native.bridge import prune_orphaned_bridge_dirs
@@ -19798,7 +19800,25 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
 
     retained_dir = root / "retained-settings"
     request = ClaudeSettingsRequest.create(retained_dir)
-    augment_claude_args((), bridge_dir=retained_dir, settings_request=request)
+    args = augment_claude_args((), bridge_dir=retained_dir, settings_request=request)
+    output = Path(args[args.index("--settings") + 1])
+    original_settings = output.read_bytes()
+    credentials = (
+        claude_native_bridge._PERMISSION_HOOK_FILE,
+        claude_native_bridge._SERVER_FILE,
+        claude_native_bridge._TOOL_RELAY_FILE,
+        claude_native_bridge._TOOL_RELAY_ENV_FILE,
+    )
+    config = {"token": "orphan-bearer", "bridge_id": "retained-bridge"}
+    if identity in {"current", "legacy"}:
+        config["active_session_id" if identity == "current" else "conversation_id"] = "conv_orphan"
+    if identity != "missing":
+        (retained_dir / "bridge.json").write_text(
+            "{broken" if identity == "malformed" else json.dumps(config)
+        )
+    for directory in (retained_dir, live_dir, unmarked_dir):
+        for filename in credentials:
+            (directory / filename).write_text("credential-snapshot")
     (retained_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
     lease = acquire_claude_settings_request(retained_dir, request.generation)
     try:
@@ -19809,6 +19829,18 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
         assert live_dir.exists()
         assert unmarked_dir.exists()
         assert retained_dir.exists()
+        assert output.read_bytes() == original_settings
+        assert all(not (retained_dir / filename).exists() for filename in credentials)
+        tombstone = json.loads((retained_dir / "bridge.json").read_text())
+        assert tombstone["deleted"] is True and "token" not in tombstone
+        expected_session = "conv_orphan" if identity in {"current", "legacy"} else None
+        assert tombstone.get("active_session_id") == expected_session
+        assert tombstone.get("conversation_id") == expected_session
+        for directory in (live_dir, unmarked_dir):
+            assert all(
+                (directory / filename).read_text() == "credential-snapshot"
+                for filename in credentials
+            )
         request.close()
         assert prune_orphaned_bridge_dirs() == 0
         assert retained_dir.exists()

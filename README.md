@@ -397,6 +397,8 @@ already-exposed state conservatively; the current client still uses the single
 file for protocol-1-only peers. This does not establish that a production
 deployment needs the intermediate protocol. Removing its readers requires an
 inventory of affected state and a compatible transition.
+That inventory is currently unavailable, so protocol-1/schema-1 readers and
+their regression coverage remain supported for existing candidate installations.
 
 Caller composition needs terminal-context reads, an immutable baseline, private
 finalized output and cancellation-safe ownership transfer. The process guard,
@@ -404,8 +406,8 @@ deferred bridge deletion and uncertain-consumer records serve the broader
 reclamation contract: completed launches must stop accumulating unused files,
 while live, overlapping, resumed and transferred consumers keep their inputs.
 The positive completion/recovery transition is still missing. Explicit deletion
-removes framework credential snapshots immediately, leaving an identity-only
-bridge tombstone while uncertain consumers retain their inputs. Cached local
+and verified dead-owner pruning remove framework credential snapshots, leaving
+an identity-only bridge tombstone while uncertain consumers retain their inputs. Cached local
 endpoints and auth refreshes are bound to the deleted activation; preparing the
 bridge again issues a fresh token. Server and provider bearers retain their
 issuers' existing validity rules.

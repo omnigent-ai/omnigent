@@ -77,10 +77,17 @@ def test_prune_ignores_non_dir_entries_and_bad_markers(tmp_path: Path) -> None:
     bad = root / "badmarker"
     bad.mkdir()
     (bad / native_bridge_common.OWNER_PID_FILENAME).write_text("not-an-int", encoding="utf-8")
+    if os.name != "nt":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / native_bridge_common.OWNER_PID_FILENAME).write_text("999999")
+        (root / "linked").symlink_to(outside, target_is_directory=True)
+    retired: list[Path] = []
 
-    assert native_bridge_common.prune_orphaned_dirs(root) == 0
+    assert native_bridge_common.prune_orphaned_dirs(root, on_dead_owner=retired.append) == 0
     assert (root / "stray-file").exists()
     assert bad.exists()
+    assert retired == []
 
 
 def test_prune_missing_root_returns_zero(tmp_path: Path) -> None:
@@ -88,11 +95,13 @@ def test_prune_missing_root_returns_zero(tmp_path: Path) -> None:
     assert native_bridge_common.prune_orphaned_dirs(tmp_path / "never-created") == 0
 
 
+@pytest.mark.parametrize("fault", ["eligibility", "retirement"])
 def test_prune_retains_entry_when_eligibility_check_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fault: str,
 ) -> None:
-    """A failing retention check keeps that dir and does not stop the sweep."""
+    """Failing retention or retirement keeps that dir without stopping the sweep."""
     root = tmp_path / "bridge-root"
     failing_dir = root / "failing"
     eligible_dir = root / "eligible"
@@ -102,20 +111,34 @@ def test_prune_retains_entry_when_eligibility_check_fails(
             "999999", encoding="utf-8"
         )
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    retired: list[Path] = []
 
     def _should_prune(bridge_dir: Path) -> bool:
-        if bridge_dir == failing_dir:
+        if bridge_dir == failing_dir and fault == "eligibility":
             raise OSError("unreadable activity timestamp")
         return True
 
-    assert native_bridge_common.prune_orphaned_dirs(root, should_prune=_should_prune) == 1
+    def _retire(bridge_dir: Path) -> None:
+        retired.append(bridge_dir)
+        if bridge_dir == failing_dir and fault == "retirement":
+            raise OSError("unwritable credential tombstone")
+
+    assert (
+        native_bridge_common.prune_orphaned_dirs(
+            root, should_prune=_should_prune, on_dead_owner=_retire
+        )
+        == 1
+    )
     assert failing_dir.exists()
     assert not eligible_dir.exists()
+    assert set(retired) == {failing_dir, eligible_dir}
 
 
+@pytest.mark.parametrize("eligible", [False, True])
 def test_prune_retains_entry_reclaimed_during_eligibility_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    eligible: bool,
 ) -> None:
     """A replacement runner refreshing owner.pid wins over an in-flight sweep."""
     root = tmp_path / "bridge-root"
@@ -124,13 +147,20 @@ def test_prune_retains_entry_reclaimed_during_eligibility_check(
     marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
     marker.write_text("999999", encoding="utf-8")
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    retired: list[Path] = []
 
     def _reclaim(_bridge_dir: Path) -> bool:
         marker.write_text(str(os.getpid()), encoding="utf-8")
-        return True
+        return eligible
 
-    assert native_bridge_common.prune_orphaned_dirs(root, should_prune=_reclaim) == 0
+    assert (
+        native_bridge_common.prune_orphaned_dirs(
+            root, should_prune=_reclaim, on_dead_owner=retired.append
+        )
+        == 0
+    )
     assert bridge_dir.exists()
+    assert retired == []
 
 
 def test_prune_unmarked_dirs_follow_the_retention_policy(tmp_path: Path) -> None:

@@ -592,7 +592,7 @@ run the relevant node IDs below with `uv run --no-sync pytest --reruns 0`:
   checks ordered file/inline composition with required hooks, and
   `tests/harnesses/claude_native/test_claude_native_bridge.py::test_caller_settings_validation_preserves_baseline_and_arguments`
   checks rejection before arguments or baseline settings change.
-- `tests/harnesses/claude_native/test_claude_native.py::test_cli_settings_probe_falls_back_without_creating_owned_request`
+- `tests/harnesses/claude_native/test_settings_fenced_lifecycle.py::test_legacy_launches_reuse_historical_file_without_untracked_generations`
   checks legacy fallback for failed or unsupported ownership probes.
   A successful probe selects the [Claude launch API](./terminals.md) route
   `POST /v1/sessions/{session_id}/resources/claude-settings-v2/terminals` only

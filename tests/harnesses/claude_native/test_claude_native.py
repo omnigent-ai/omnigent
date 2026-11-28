@@ -170,41 +170,6 @@ async def test_claude_terminal_request_preserves_legacy_bridge_identity(
             await created.instance.close()
 
 
-async def test_cli_settings_probe_falls_back_without_creating_owned_request(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from unittest.mock import Mock
-
-    from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
-
-    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
-    create_request = Mock(side_effect=AssertionError("unsupported probe created an owned request"))
-    monkeypatch.setattr(ClaudeSettingsRequest, "create", create_request)
-    monkeypatch.setattr(
-        claude_native, "resolve_claude_launch", lambda command, args: (command, args)
-    )
-    requests: list[httpx.Request] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.method == "GET":
-            return httpx.Response(200, json={"claude_settings_request_protocol": 1})
-        return httpx.Response(200, json={"id": "legacy-terminal"})
-
-    async with httpx.AsyncClient(
-        base_url="http://unused.invalid", transport=httpx.MockTransport(respond)
-    ) as client:
-        terminal_id = await claude_native._launch_claude_terminal(
-            client, "probe-session", (), command="claude", bridge_dir=bridge_dir
-        )
-
-    assert terminal_id == "legacy-terminal"
-    assert [request.method for request in requests] == ["GET", "POST"]
-    assert "claude_settings_request" not in json.loads(requests[1].content)
-    create_request.assert_not_called()
-
-
 def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     """
     The terminal launch body pins ``cwd`` to the user's launch dir.
