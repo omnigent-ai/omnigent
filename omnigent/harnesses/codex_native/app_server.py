@@ -4289,6 +4289,7 @@ def build_codex_native_server(
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
     active_harnesses: Collection[str] | None = None,
+    env_passthrough: Iterable[str] = (),
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -4347,6 +4348,10 @@ def build_codex_native_server(
     :param terminal_launch_args: Original CLI options used to select the Codex
         config-file profile (distinct from the Databricks routing profile)
         and the ``--add-dir`` roots the app-server owns.
+    :param env_passthrough: Variable names the agent spec declares in
+        ``os_env.sandbox.env_passthrough``, e.g. ``("GH_TOKEN",)``. They pass
+        the deny-by-default env filter so the agent's tools can read them,
+        matching the in-process ``codex`` harness.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -4361,7 +4366,7 @@ def build_codex_native_server(
             "installed on a PATH the host daemon didn't inherit (e.g. an "
             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
         )
-    env = _clean_codex_env()
+    env = _clean_codex_env(env_passthrough)
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
