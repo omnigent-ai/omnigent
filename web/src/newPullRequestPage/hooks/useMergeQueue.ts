@@ -41,13 +41,15 @@ function sendQueueChange(
   operation: MergeQueueWriteOperation,
   send: () => Promise<MergeQueueState>,
 ): Promise<MergeQueueState> {
+  // The user who sends it owns a lost answer's hold, though another signs in before it's lost.
+  const owner = draftOwner();
   return sendStateChange(prUrl, operation, async () => {
     try {
       return await send();
     } catch (error) {
       // The host makes it as its own account, so no login of ours names who made it.
       if (error instanceof PullRequestWriteError && error.outcomeUnknown)
-        markQueueChangeUnconfirmed(draftOwner(), prUrl, operation, { login: "" });
+        markQueueChangeUnconfirmed(owner, prUrl, operation, { login: "" });
       throw error;
     }
   });

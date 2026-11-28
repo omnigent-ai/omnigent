@@ -6,6 +6,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type * as IdentityModule from "@/lib/identity";
 import type * as PageRouteModule from "@/pullRequestPage/pullRequestPageRoute";
 import type { WorkspaceClient } from "@/lib/workspaceApi";
 import type { PullRequest } from "@/newPullRequestPage/hooks/usePullRequests";
@@ -20,6 +21,12 @@ vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => ({
   usePullRequestMethodServed: (_sessionId: string, method: string) => host.served.has(method),
   hostChangeRoute: (conversationId: string, method: string) =>
     host.served.has(method) ? { conversationId, key: "route-1" } : null,
+}));
+// The workspace user, which a test switches while a change's answer is outstanding.
+const workspaceUser = vi.hoisted(() => ({ id: "user-a" }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => workspaceUser.id,
 }));
 vi.mock("@/lib/pullRequestRpc", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -116,6 +123,7 @@ async function addAndConfirm() {
 }
 
 beforeEach(() => {
+  workspaceUser.id = "user-a";
   host.served = new Set(["getMergeOptions"]);
   host.read.mockReset();
   host.write.mockReset();
@@ -256,6 +264,29 @@ describe("a base that merges through a queue, where the host serves it", () => {
       expect(unconfirmedStateChangeHolds(PR_URL, "pull_request_close")).toBe(false),
     );
     await expect(sendStateChange(PR_URL, "pull_request_merge", merge)).resolves.toBe("merged");
+  });
+
+  it("keeps a lost add's hold with the user who sent it, though another signed in meanwhile", async () => {
+    host.served = new Set(["getMergeOptions", ...QUEUE_METHODS]);
+    answerReads(queueAnswer());
+    renderMerge();
+    await screen.findByRole("button", { name: "Add to Merge Queue" });
+    let loseAnswer: (error: Error) => void = () => {};
+    host.write.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          loseAnswer = reject;
+        }),
+    );
+    await addAndConfirm();
+    await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1));
+
+    // User A sent the add; B is signed in by the time its answer is lost.
+    workspaceUser.id = "user-b";
+    await act(async () => loseAnswer(new PullRequestMaybeSentError(new TypeError("dropped"))));
+    expect(unconfirmedStateChangeHolds(PR_URL, "pull_request_close")).toBe(false);
+    workspaceUser.id = "user-a";
+    expect(unconfirmedStateChangeHolds(PR_URL, "pull_request_close")).toBe(true);
   });
 
   it("shows a queued PR without Remove where the host serves only the read", async () => {
