@@ -12,7 +12,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -1381,54 +1383,72 @@ async def test_real_bwrap_network_denied_worker_starts_with_host_chatgpt_login(
     assert auth_status["result"]["authMethod"] == "chatgpt", auth_status
 
 
+@pytest.mark.timeout(150)
 async def test_real_bwrap_worker_refreshes_host_login_in_place(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A login refresh inside the contained worker reaches the host Codex home."""
+    """A real Codex token refresh inside the contained worker rotates the host login in place."""
+    if (reason := cli_unavailable_reason("codex")) is not None:
+        pytest.skip(f"requires a runnable 'codex' CLI; {reason}")
     if (reason := bwrap_namespace_unavailable_reason()) is not None:
         pytest.skip(f"cannot execute bwrap namespaces here: {reason}")
-    host_home = tmp_path / "host-home"
-    host_codex = host_home / ".codex"
+    refresh_requests: list[dict[str, object]] = []
+
+    class TokenEndpoint(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            refresh_requests.append(json.loads(body))
+            token = _fake_jwt({"email": "user@example.com", "exp": 4102444800})
+            reply = {"id_token": token, "access_token": token, "refresh_token": "refresh-rotated"}
+            payload = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    token_server = ThreadingHTTPServer(("127.0.0.1", 0), TokenEndpoint)
+    threading.Thread(target=token_server.serve_forever, daemon=True).start()
+    home = tmp_path / "home"
+    host_codex = home / ".codex"
     host_codex.mkdir(parents=True)
-    (host_codex / "auth.json").write_text('{"auth_mode": "chatgpt"}')
-    monkeypatch.setenv("HOME", str(host_home))
-    monkeypatch.setenv("CODEX_HOME", str(host_codex))
-    workspace = tmp_path / "workspace"
+    _write_chatgpt_login(host_codex)
+    host_inode = (host_codex / "auth.json").stat().st_ino
+    workspace = home / "project"
     workspace.mkdir()
-    codex = tmp_path / "bin" / "codex"
-    codex.parent.mkdir()
-    # Like Codex: rewrite the login in place before serving requests.
-    codex.write_text(
-        "#!/usr/bin/python3\n"
-        "import json, os, pathlib, sys\n"
-        "login = pathlib.Path(os.environ['CODEX_HOME']) / 'auth.json'\n"
-        "login.write_text(json.dumps({**json.loads(login.read_text()), 'refreshed': True}))\n"
-        "for line in sys.stdin:\n"
-        "    request = json.loads(line)\n"
-        "    if 'id' in request:\n"
-        "        print(json.dumps({'id': request['id'], 'result': {}}), flush=True)\n",
-        encoding="utf-8",
-    )
-    codex.chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    token_url = f"http://127.0.0.1:{token_server.server_port}/oauth/token"
     session = _CodexAppServerSession(
-        codex_path=str(codex),
+        codex_path=shutil.which("codex") or "codex",
         cwd=str(workspace),
-        env={"PATH": os.environ["PATH"], "HOME": str(host_home)},
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(home),
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE": token_url,
+        },
         tool_executor=None,
+        # The worker shares the test's loopback only with network allowed; grants are the same.
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=False),
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=True),
         ),
     )
     try:
-        await asyncio.wait_for(session.start(), timeout=60)
+        await asyncio.wait_for(session.start(), 120)
         assert session._worker_launch is not None
         assert session._worker_launch.sandboxed
+        auth_status = await asyncio.wait_for(
+            session._request("getAuthStatus", {"includeToken": False, "refreshToken": True}),
+            30,
+        )
     finally:
         await session.close()
+        token_server.shutdown()
 
-    assert json.loads((host_codex / "auth.json").read_text()) == {
-        "auth_mode": "chatgpt",
-        "refreshed": True,
-    }
+    assert auth_status["result"]["authMethod"] == "chatgpt", auth_status
+    assert [request["refresh_token"] for request in refresh_requests] == ["refresh-example"]
+    host_login = json.loads((host_codex / "auth.json").read_text())
+    assert host_login["tokens"]["refresh_token"] == "refresh-rotated"
+    assert (host_codex / "auth.json").stat().st_ino == host_inode

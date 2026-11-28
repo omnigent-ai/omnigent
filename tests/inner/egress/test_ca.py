@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import datetime
 import ssl
+import stat
 import threading
 import time
 from pathlib import Path
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -160,10 +162,17 @@ def test_ensure_ca_bundle_rewrite_never_exposes_partial_bundle(tmp_path: Path) -
     bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
     expected = bundle_path.read_bytes()
     stop = threading.Event()
+    rewrites = 0
+    writer_errors: list[BaseException] = []
 
     def rewrite_until_stopped() -> None:
-        while not stop.is_set():
-            ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+        nonlocal rewrites
+        try:
+            while not stop.is_set():
+                ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+                rewrites += 1
+        except BaseException as error:
+            writer_errors.append(error)
 
     writer = threading.Thread(target=rewrite_until_stopped)
     writer.start()
@@ -177,4 +186,25 @@ def test_ensure_ca_bundle_rewrite_never_exposes_partial_bundle(tmp_path: Path) -
         stop.set()
         writer.join()
 
+    assert writer_errors == []
+    assert rewrites > 0
     assert partial_reads == 0, f"{partial_reads} of {reads} reads saw a partial bundle"
+
+
+def test_ensure_ca_bundle_keeps_published_bundle_when_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cert_path, _key_path = ensure_ca(cache_dir=tmp_path)
+    bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    published = bundle_path.read_bytes()
+    assert stat.S_IMODE(bundle_path.stat().st_mode) == 0o644
+
+    def fail_replace(source: str, destination: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(ca_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+
+    assert bundle_path.read_bytes() == published
+    assert list(tmp_path.glob(f".{bundle_path.name}.*")) == []
