@@ -31,6 +31,8 @@ import {
   forwardRef,
   useCallback,
   useContext,
+  useLayoutEffect,
+  useMemo,
   useRef,
 } from "react";
 import {
@@ -191,6 +193,25 @@ export function RoutingProvider({ value, children }: RoutingProviderProps) {
 /** The active implementation — provider value, or react-router-dom fallback. */
 function useRouting(): RoutingApi {
   return useContext(RoutingContext) ?? reactRouterRouting;
+}
+
+/** Share event navigation among consumers in the same route scope. */
+export function ScopedStableNavigation({ children }: { children: ReactNode }) {
+  const routing = useRouting();
+  const navigate = routing.useNavigate();
+  const committedNavigate = useRef(navigate);
+  useLayoutEffect(() => {
+    committedNavigate.current = navigate;
+  }, [navigate]);
+  const stableNavigate = useCallback((to: To | number, options?: NavigateOptions) => {
+    if (typeof to === "number") return committedNavigate.current(to);
+    return committedNavigate.current(to, options);
+  }, []);
+  const value = useMemo(
+    () => ({ ...routing, useNavigate: () => stableNavigate }),
+    [routing, stableNavigate],
+  );
+  return <RoutingProvider value={value}>{children}</RoutingProvider>;
 }
 
 export const useNavigate: typeof useRRNavigate = () => useRouting().useNavigate();

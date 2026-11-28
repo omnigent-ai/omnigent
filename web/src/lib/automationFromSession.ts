@@ -128,10 +128,12 @@ export function automationDeletedWith(
  * resolves `false` so the caller keeps the sessions. Once the deletes finish,
  * it leaves the page the user is on then if that is one of *sessionIds* (all
  * deleted) or a deleted automation's.
+ * An optional caller lifetime guard suppresses navigation without skipping deletion.
  */
 export function useDeleteSourceAutomations(): (
   taskIds: string[],
   sessionIds: string[],
+  shouldNavigate?: () => boolean,
 ) => Promise<boolean> {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -146,7 +148,7 @@ export function useDeleteSourceAutomations(): (
     };
   }, [pathname, openSessionId]);
   return useCallback(
-    async (taskIds: string[], sessionIds: string[]) => {
+    async (taskIds: string[], sessionIds: string[], shouldNavigate = () => true) => {
       const results = await Promise.allSettled(
         taskIds.map(async (taskId) => {
           try {
@@ -164,7 +166,7 @@ export function useDeleteSourceAutomations(): (
       );
       const deleted = taskIds.filter((_, index) => results[index]?.status === "fulfilled");
       const allDeleted = deleted.length === taskIds.length;
-      const route = routeRef.current;
+      const route = shouldNavigate() ? routeRef.current : null;
       if (allDeleted && route?.openSessionId && sessionIds.includes(route.openSessionId)) {
         // The caller deletes this session next, so leave it now, as any session delete does.
         navigate("/", { replace: true });

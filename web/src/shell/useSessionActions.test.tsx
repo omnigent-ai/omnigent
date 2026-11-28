@@ -8,7 +8,7 @@ import type * as ConversationsModule from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 
 import { usePublishOpenSession } from "./openSession";
-import { useSessionActions } from "./useSessionActions";
+import { SessionActionsProvider, useSessionActions } from "./useSessionActions";
 
 const leave = { mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false };
 const idle = { mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false };
@@ -82,12 +82,14 @@ function renderAt(path: string, onLeave: () => void) {
   return render(
     <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter initialEntries={[path]}>
-        <Shell />
-        <Routes>
-          <Route path="/c/conv_a" element={<ListedRow onLeave={onLeave} />} />
-          <Route path="/" element={<ListedRow onLeave={onLeave} />} />
-          <Route path="*" element={null} />
-        </Routes>
+        <SessionActionsProvider>
+          <Shell />
+          <Routes>
+            <Route path="/c/conv_a" element={<ListedRow onLeave={onLeave} />} />
+            <Route path="/" element={<ListedRow onLeave={onLeave} />} />
+            <Route path="*" element={null} />
+          </Routes>
+        </SessionActionsProvider>
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -157,7 +159,9 @@ describe("useSessionActions Leave, by default", () => {
     render(
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter initialEntries={["/c/conv_a"]}>
-          <Row onLeave={goHome} reportsAfterUnmount={false} />
+          <SessionActionsProvider>
+            <Row onLeave={goHome} reportsAfterUnmount={false} />
+          </SessionActionsProvider>
         </MemoryRouter>
       </QueryClientProvider>,
     );
@@ -199,7 +203,9 @@ describe("useSessionActions Stop, reporting after its caller unmounts", () => {
     const view = render(
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter>
-          <StopRow />
+          <SessionActionsProvider>
+            <StopRow />
+          </SessionActionsProvider>
         </MemoryRouter>
       </QueryClientProvider>,
     );

@@ -349,6 +349,11 @@ def test_session_grid_drag_persist_live_updates_and_close(
         move_title = first_cell.get_by_role("button", name="Move Grid session 0", exact=True)
         move_title.focus()
         page.keyboard.press("Space")
+        expect(move_title).to_have_attribute("aria-pressed", "true")
+        # The keyboard sensor attaches its listener on the next timer turn.
+        page.evaluate(
+            "() => new Promise(resolve => setTimeout(() => requestAnimationFrame(resolve)))"
+        )
         page.keyboard.press("ArrowLeft")
         expect(page.get_by_test_id("grid-move-ghost")).to_be_visible()
         page.keyboard.press("Space")

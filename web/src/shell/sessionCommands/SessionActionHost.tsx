@@ -22,7 +22,7 @@ import { isOpenSession } from "../openSession";
 import { RenameSessionDialog } from "../RenameSessionDialog";
 import { conversationDisplayLabel } from "../sidebarNav";
 import { unpinWithUndo } from "../unpinUndoToast";
-import { useSessionActions } from "../useSessionActions";
+import { SessionActionsProvider, useSessionActions } from "../useSessionActions";
 import { leaveSessionView } from "./archiveNavigation";
 import { currentSessionRow } from "./currentSession";
 import { sessionCommand } from "./model";
@@ -57,7 +57,9 @@ function SessionActionResolver({ request }: { request: SessionActionRequest }) {
     return row;
   });
   return conversation ? (
-    <SessionActionRunner conversation={conversation} request={request} />
+    <SessionActionsProvider>
+      <SessionActionRunner conversation={conversation} request={request} />
+    </SessionActionsProvider>
   ) : null;
 }
 

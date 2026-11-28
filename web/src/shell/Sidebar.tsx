@@ -145,7 +145,14 @@ import {
   showsUnreadFor,
   useMutedProjects,
 } from "@/lib/sessionMute";
-import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+import {
+  Link,
+  ScopedStableNavigation,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRebasePath,
+} from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSearchButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -254,7 +261,7 @@ import {
 } from "./sidebarViewCommands";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
-import { useSessionActions } from "./useSessionActions";
+import { SessionActionsProvider, useSessionActions } from "./useSessionActions";
 import {
   useBulkSessionPaletteCommands,
   useSessionSelectionPaletteCommands,
@@ -578,7 +585,9 @@ function SidebarRowDataProvider({
                   <RowActivationContext.Provider value={onActivate}>
                     <SessionReorderContext.Provider value={onReorder}>
                       <NestMoveContext.Provider value={nestMoves}>
-                        {children}
+                        <ScopedStableNavigation>
+                          <SessionActionsProvider>{children}</SessionActionsProvider>
+                        </ScopedStableNavigation>
                       </NestMoveContext.Provider>
                     </SessionReorderContext.Provider>
                   </RowActivationContext.Provider>
