@@ -1471,6 +1471,10 @@ def create_runner_app(
     mcp_execution_registry = McpExecutionRegistry()
     app.state.mcp_execution_registry = mcp_execution_registry
 
+    def _server_tunnel_connected() -> bool:
+        dispatcher = getattr(app.state, "runner_event_dispatcher", None)
+        return dispatcher is not None and bool(dispatcher.is_connected)
+
     # Set as soon as SIGINT/SIGTERM is handled, so a required terminal that
     # dies with the runner's process group is not reported as a crash.
     _shutting_down = asyncio.Event()
@@ -6076,6 +6080,7 @@ def create_runner_app(
                 publish_event=_publish_event,
                 execution_registry=mcp_execution_registry,
                 reattach_client_factory=mcp_reattach_client_factory,
+                server_connected=_server_tunnel_connected,
             ).call_tool(relay_spec, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
@@ -6675,6 +6680,7 @@ def create_runner_app(
                     server_client,
                     execution_registry=mcp_execution_registry,
                     reattach_client_factory=mcp_reattach_client_factory,
+                    server_connected=_server_tunnel_connected,
                 )
                 try:
                     mcp_result = await _session_mcp_proxy.schemas_for(
@@ -7180,6 +7186,7 @@ def create_runner_app(
                 server_client,
                 execution_registry=mcp_execution_registry,
                 reattach_client_factory=mcp_reattach_client_factory,
+                server_connected=_server_tunnel_connected,
             )
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
@@ -7795,6 +7802,7 @@ def create_runner_app(
                                             publish_event=_publish_event,
                                             execution_registry=mcp_execution_registry,
                                             reattach_client_factory=mcp_reattach_client_factory,
+                                            server_connected=_server_tunnel_connected,
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(

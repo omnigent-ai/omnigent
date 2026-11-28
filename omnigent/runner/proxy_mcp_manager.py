@@ -48,6 +48,11 @@ _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
+# A request dropped while the tunnel stays up is retried promptly against the
+# same retained operation; a reconnect that never comes is not worth waiting for.
+_LIVE_TUNNEL_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+# Transport failures raised before the request reached the server.
+_REQUEST_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -161,6 +166,7 @@ class ProxyMcpManager:
         publish_event: _EventPublisher | None = None,
         execution_registry: McpExecutionRegistry | None = None,
         reattach_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        server_connected: Callable[[], bool] | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -176,12 +182,16 @@ class ProxyMcpManager:
             server generation can reattach to after a tunnel replacement.
         :param reattach_client_factory: Open an isolated server connection for
             reattachment without disturbing requests on the shared client.
+        :param server_connected: Whether the runner's server tunnel is open.
+            Lets a dropped request on a live tunnel retry promptly instead of
+            waiting for a reconnect. ``None`` always waits for a reconnect.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
         self._reattach_client_factory = reattach_client_factory
+        self._server_connected = server_connected
         self._registry_services: set[str] = set()
 
     @property
@@ -421,14 +431,19 @@ class ProxyMcpManager:
             }
 
         reattaching = False
+        live_tunnel_retries = 0
+
+        def _tunnel_connected() -> bool:
+            return self._server_connected is not None and self._server_connected()
 
         async def _wait_to_reattach(
             request_generation: int,
             cause: BaseException | None = None,
             *,
             response: httpx.Response | None = None,
+            request_dropped: bool = False,
         ) -> None:
-            nonlocal reattaching
+            nonlocal reattaching, live_tunnel_retries
             started = monotonic()
             trigger = type(cause).__name__ if cause is not None else "detached_response"
             registry = self._execution_registry
@@ -446,6 +461,34 @@ class ProxyMcpManager:
                     f"{self._session_id!r} lost its server without a reserved "
                     "runner operation"
                 ) from cause
+            if (
+                request_dropped
+                and live_tunnel_retries < len(_LIVE_TUNNEL_RETRY_DELAYS_S)
+                and _tunnel_connected()
+            ):
+                # Only this request failed: back off briefly, then retry the
+                # same operation unless the tunnel dropped in the meantime.
+                delay = _LIVE_TUNNEL_RETRY_DELAYS_S[live_tunnel_retries]
+                live_tunnel_retries += 1
+                _logger.info(
+                    "MCP proxy request for tool %r dropped on a live tunnel; "
+                    "retrying in %.1fs (attempt %d)",
+                    tool_name,
+                    delay,
+                    live_tunnel_retries,
+                    extra={"session_id": self._session_id},
+                )
+                # The dropped request may have used a dead pooled connection.
+                reattaching = True
+                try:
+                    await pending_approvals.wait_for_server_reconnect(
+                        request_generation,
+                        timeout_seconds=delay,
+                    )
+                    return
+                except TimeoutError:
+                    if _tunnel_connected():
+                        return
             try:
                 await pending_approvals.wait_for_server_reconnect(
                     request_generation,
@@ -515,10 +558,28 @@ class ProxyMcpManager:
                         "MCP gateway transport failed; completion is unknown. "
                         "Call was not retried."
                     ) from exc
-                await _wait_to_reattach(request_generation, exc)
-                # Reattach the new server generation to the same runner-owned
-                # operation. A fresh JSON-RPC id distinguishes this transport
-                # attempt; the operation id prevents external work from replaying.
+                if (
+                    approval_retries
+                    and not isinstance(exc, _REQUEST_NOT_SENT_ERRORS)
+                    and _tunnel_connected()
+                ):
+                    # The server consumes an approval before executing it, so
+                    # resending it cannot reattach to the retained result.
+                    _record_failure(
+                        exc,
+                        phase=failure_phase,
+                        request_generation=request_generation,
+                        started=started,
+                    )
+                    raise RuntimeError(
+                        f"MCP proxy call for approved tool {tool_name!r} dropped "
+                        "after it was sent; completion is unknown. Call was not retried."
+                    ) from exc
+                await _wait_to_reattach(request_generation, exc, request_dropped=True)
+                # Retry, or reattach a new server generation, on the same
+                # runner-owned operation. A fresh JSON-RPC id distinguishes this
+                # transport attempt; the operation id prevents external work
+                # from replaying.
                 request_id += 1
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
