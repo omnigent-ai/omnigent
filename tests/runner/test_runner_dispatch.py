@@ -1556,6 +1556,7 @@ def test_spec_resolve_error_detail_relays_credential_remedy(
     [
         "outage",
         "host-credential",
+        "credential-after-turn-start",
         "unsupported-policy",
         "codex-policy",
         "invalid-spec",
@@ -1588,9 +1589,10 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
     from omnigent.runner.native.orchestration import ResolvedSpec
 
     session_id = f"conv_spec_resolver_failed_{failure}"
-    outage = failure in ("outage", "host-credential")
+    outage = failure in ("outage", "host-credential", "credential-after-turn-start")
     corrected = False
-    if failure == "codex-policy":
+    retried = failure in ("codex-policy", "credential-after-turn-start")
+    if retried:
         isolate_provider_resolution(monkeypatch, tmp_path / "config")
 
     def _host_credential_service() -> str:
@@ -1609,7 +1611,9 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                 return await _resolve_agent_spec_from_server(
                     server_client, _AgentSpecCache(tmp_path / "spec-cache"), agent_id, session_id
                 )
-        if failure == "codex-policy":
+        if failure == "credential-after-turn-start" and not corrected:
+            _host_credential_service()
+        if retried:
             return AgentSpec(
                 spec_version=1,
                 name="restricted-agent",
@@ -1672,7 +1676,7 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                     assert failed["error"] == response.json()["error"]
 
             get_client.assert_not_called()
-            if failure == "codex-policy":
+            if retried:
                 corrected = True
                 get_client.side_effect = None
                 get_client.return_value = _FakeHarnessClient(
@@ -1696,8 +1700,20 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                 assert not app.state.session_message_buffers.get(session_id)
 
     body = response.json()
+    credential_message = "Host credential service could not supply workspace credentials"
+    runner_log_detail = (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
     if failure == "host-credential":
-        assert "credential" in json.dumps(body).lower(), body
+        assert body["error"] == "spec_resolver_failed"
+        assert body["detail"] == (
+            "Could not load the agent spec (AgentSpecFetchError (cause DatabricksAuthError)). "
+            f"{credential_message}. {runner_log_detail}"
+        )
+        return
+    if failure == "credential-after-turn-start":
+        assert body["error"] == "runner_credentials_unavailable"
+        assert body["detail"] == f"{credential_message}. {runner_log_detail}"
         return
     if not outage:
         assert body["error"]["code"] == "invalid_input"

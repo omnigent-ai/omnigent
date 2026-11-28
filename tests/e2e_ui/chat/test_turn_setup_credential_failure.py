@@ -74,7 +74,9 @@ class CredentialStack:
 
 
 @pytest.fixture
-def credential_stack(tmp_path: Path, mock_llm_server_url: str) -> Iterator[CredentialStack]:
+def credential_stack(
+    built_spa: None, tmp_path: Path, mock_llm_server_url: str
+) -> Iterator[CredentialStack]:
     provider_env = {"OPENAI_BASE_URL": f"{mock_llm_server_url}/v1", "OPENAI_API_KEY": "mock-key"}
     marker = tmp_path / "credential-fault.marker"
     with server_runner(tmp_path / "stack", server_env=provider_env) as stack:
