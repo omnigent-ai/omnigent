@@ -27,6 +27,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         resolve_native_codex_launch,
     )
     from omnigent.inner import _proc
+    from omnigent.inner._subprocess_lifecycle import await_cleanup_task
     from omnigent.inner.codex_executor import (
         _codex_home_config_source_from_env,
         _populate_codex_home_config,
@@ -123,10 +124,15 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             async with asyncio.timeout(BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS):
                 _stdout, stderr = await process.communicate()
         except (TimeoutError, asyncio.CancelledError):
-            if process.returncode is None:
-                _proc.kill_tree(process)
-            with contextlib.suppress(Exception):
-                await process.wait()
+
+            async def kill_and_wait() -> None:
+                if process.returncode is None:
+                    await asyncio.to_thread(_proc.kill_tree, process)
+                with contextlib.suppress(Exception):
+                    await process.wait()
+
+            # Keep the private home until its process has stopped, even on repeated cancellation.
+            await await_cleanup_task(asyncio.create_task(kill_and_wait()))
             raise
 
         if process.returncode != 0:
