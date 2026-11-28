@@ -437,12 +437,15 @@ def _scope_digest(schema: Any, scope: str) -> str:
     return hashlib.sha256(canonical_bytes({"scope": scope, "schema": schema})).hexdigest()
 
 
-def _starter_collections(value: Any, collections: dict, scopes: dict[str, str]) -> list[str]:
+def _starter_collections(
+    value: Any, collections: dict, scopes: dict[str, str], constraints: list[dict]
+) -> list[str]:
     """The shared collections whose records a gadget made from this one as a template starts
     with; the rest start empty.
 
-    :raises InvalidInput: For an undeclared or ``viewer`` collection: a viewer's records are
-        their own and never copied.
+    :raises InvalidInput: For an undeclared or ``viewer`` collection (a viewer's records are
+        their own and never copied), or a starter collection with a ``reference`` rule to a
+        collection that isn't one: its records would point at records the copy doesn't have.
     """
     if value is None:
         return []
@@ -453,7 +456,16 @@ def _starter_collections(value: Any, collections: dict, scopes: dict[str, str]) 
             raise InvalidInput(f"starter_collections names {name!r}, which is not declared")
         if name in scopes:
             raise InvalidInput(f"Collection {name} is per viewer, so it has no starter data")
-    return sorted(set(value))
+    chosen = set(value)
+    for rule in constraints:
+        if rule["kind"] == "reference" and rule["collection"] in chosen:
+            if rule["target"] not in chosen:
+                raise InvalidInput(
+                    f"Starter collection {rule['collection']} references {rule['target']} "
+                    f"(rule {rule['name']}); make {rule['target']} a starter collection too",
+                    details={"constraint": rule["name"]},
+                )
+    return sorted(chosen)
 
 
 # A revision derived from another carries these from it unless the request gives them.
@@ -1317,7 +1329,9 @@ class GadgetService:
         scopes = _collection_scopes(body.get("collection_scopes"), collections, constraints)
         if scopes:
             value["collection_scopes"] = scopes
-        starters = _starter_collections(body.get("starter_collections"), collections, scopes)
+        starters = _starter_collections(
+            body.get("starter_collections"), collections, scopes, constraints
+        )
         if starters:
             value["starter_collections"] = starters
         files = self._files(gadget)

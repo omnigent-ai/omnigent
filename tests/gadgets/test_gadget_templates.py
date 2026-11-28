@@ -178,3 +178,44 @@ def test_starter_collections_must_be_declared_and_shared(gadgets: Fixture) -> No
         publish_template(owner, starters=["missing"])
     with pytest.raises(InvalidInput, match="per viewer"):
         publish_template(owner, starters=["progress"])
+
+
+def test_starter_data_keeps_its_references_whole(gadgets: Fixture) -> None:
+    owner = gadgets.service(1)
+    rule = {
+        "name": "lesson_course",
+        "kind": "reference",
+        "collection": "lessons",
+        "field": "course",
+        "target": "courses",
+    }
+
+    def course_revision(app, starters):
+        return owner.create_revision(
+            app["id"],
+            {
+                "html": "<main>Course</main>",
+                "sdk_version": 1,
+                "capabilities": ["data.read", "data.write"],
+                "collections": {
+                    "courses": {"type": "object"},
+                    "lessons": {"type": "object", "properties": {"course": {"type": "string"}}},
+                },
+                "constraints": [rule],
+                "starter_collections": starters,
+            },
+        )
+
+    app = owner.create("Synthetic course")
+    with pytest.raises(InvalidInput, match="make courses a starter collection too"):
+        course_revision(app, ["lessons"])
+    created = course_revision(app, ["lessons", "courses"])
+    app = owner.publish(app["id"], {"revision_id": created["id"], "if_version": None})
+    call(owner, app, "create", "courses", id="c1", value={}, operation_id="c1")
+    call(owner, app, "create", "lessons", id="l1", value={"course": "c1"}, operation_id="l1")
+    gadgets.access.share(app, 2, TEMPLATE_ONLY)
+
+    made = gadgets.service(2).create_from_template(app["id"], {})
+
+    assert ids(gadgets.service(2), made, "lessons") == ["l1"]
+    assert ids(gadgets.service(2), made, "courses") == ["c1"]
