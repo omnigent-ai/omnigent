@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -29,8 +29,9 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 #: Which router produced a decision. ``"databricks-aigw"`` is the external
-#: ``task_v1`` service; ``"oss-llm"`` is the built-in judge.
-RouterSource = Literal["databricks-aigw", "oss-llm"]
+#: ``task_v1`` service; ``"oss-llm"`` is the built-in judge; ``"decision-model"``
+#: is a System One decision model routing in front of the judge.
+RouterSource = Literal["databricks-aigw", "oss-llm", "decision-model"]
 
 
 @dataclass(frozen=True)
@@ -107,8 +108,22 @@ def select_router(
     if gateway_backed and external is not None:
         return RouterChoice(client=external, source="databricks-aigw")
     if backends.local is not None:
-        return RouterChoice(client=backends.local, source="oss-llm")
+        return RouterChoice(client=backends.local, source=_local_source(backends.local))
     return None
+
+
+def _local_source(client: RoutingClient) -> RouterSource:
+    """The source a local client declares, defaulting to the built-in judge."""
+    source = getattr(client, "router_source", None)
+    return "decision-model" if source == "decision-model" else "oss-llm"
+
+
+def _answered_by(client: RoutingClient, default: RouterSource) -> RouterSource:
+    """Who answered *client*'s last call: a client that defers says so itself."""
+    source = getattr(client, "last_source", None)
+    if source in ("databricks-aigw", "oss-llm", "decision-model"):
+        return cast("RouterSource", source)
+    return default
 
 
 @dataclass(frozen=True)
@@ -155,9 +170,10 @@ async def route_with_fallback(
     if choice is None:
         return None
     if choice.source != "databricks-aigw" or backends.local is None:
+        result = await choice.client.route(message, available_models)
         return RoutedCall(
-            result=await choice.client.route(message, available_models),
-            source=choice.source,
+            result=result,
+            source=_answered_by(choice.client, choice.source),
             client=choice.client,
         )
     try:
@@ -175,9 +191,10 @@ async def route_with_fallback(
             "falling back to the built-in judge",
             getattr(choice.client, "last_error", None),
         )
+    result = await backends.local.route(message, available_models)
     return RoutedCall(
-        result=await backends.local.route(message, available_models),
-        source="oss-llm",
+        result=result,
+        source=_answered_by(backends.local, _local_source(backends.local)),
         client=backends.local,
     )
 
