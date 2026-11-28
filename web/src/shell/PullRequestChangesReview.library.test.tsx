@@ -418,7 +418,8 @@ describe("the Changes tree beside a pull request's diff", () => {
     expect(edge).toHaveAttribute("aria-valuemin", "160");
     expect(edge).toHaveAttribute("aria-valuemax", "432");
 
-    fireEvent.keyDown(edge, { key: "ArrowRight" });
+    // The tree docks at the right, so its edge is its left one: ArrowLeft widens it.
+    fireEvent.keyDown(edge, { key: "ArrowLeft" });
     expect(column().style.width).toBe("312px");
     expect(readPanelSharePreference("pullRequestReviewTreeShare")).toBeCloseTo(312 / 900, 4);
     act(() => resize(1200));
