@@ -1508,7 +1508,9 @@ export function InboxPage() {
             )}
             <h2 className="text-lg font-semibold tracking-tight text-balance">
               {caughtUp
-                ? "All caught up"
+                ? filter === "all" && !selectedProject
+                  ? "All caught up"
+                  : "Caught up here"
                 : selectedProject
                   ? `Nothing here from ${selectedProject.name}`
                   : moreToLoad

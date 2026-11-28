@@ -339,6 +339,15 @@ describe("InboxPage states", () => {
     expect(screen.queryByText("Nothing waiting on you")).toBeNull();
   });
 
+  it("scopes Otto's headline on a narrower tab", async () => {
+    // WHY: "All caught up" on the Unread tab could read as global while other tabs have items.
+    writePlayfulTouches(true);
+    window.localStorage.setItem("omnigent:inbox-filter", "unread");
+    renderPage();
+    expect(await screen.findByText("Caught up here")).toBeInTheDocument();
+    expect(screen.queryByText("All caught up")).toBeNull();
+  });
+
   it("keeps the plain empty state when Playful touches is off", async () => {
     renderPage();
     expect(await screen.findByText("Nothing waiting on you")).toBeInTheDocument();
