@@ -56,6 +56,8 @@ _SHARES_REVISION = "a8be64286ffc"
 _SMART_ROUTING_PREVIOUS = "d3bda6dbade3"
 _SMART_ROUTING_REVISION = "5ab01aaca219"
 _TIMER_KIND_REVISION = "bf30d7cbda61"
+_RUN_SETTINGS_PREVIOUS = "47d3e8fc3e25"
+_RUN_SETTINGS_REVISION = "130b0e8d0e13"
 _TIMER_KIND_MIGRATION = "omnigent.db.migrations.versions.bf30d7cbda61_allow_scheduled_task_timers"
 _SCHEMA_PATHS = [
     "migration",
@@ -114,6 +116,8 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["mcp_services"]["nullable"] is True
     assert columns["kind"]["nullable"] is False
     assert columns["smart_routing"]["nullable"] is True
+    for name in ("max_retries", "retry_delay_seconds", "overlap_mode"):
+        assert columns[name]["nullable"] is False
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -148,6 +152,9 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "workflow_id",
         "kind",
         "smart_routing",
+        "max_retries",
+        "retry_delay_seconds",
+        "overlap_mode",
     }
 
 
@@ -160,6 +167,8 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         timestamp_type = sa.Integer if db_engine.dialect.name == "cockroachdb" else sa.BigInteger
         assert isinstance(columns[name]["type"], timestamp_type)
         assert columns[name]["nullable"] is (name != "scheduled_at")
+    for name in ("trigger_kind", "prompt_dispatch"):
+        assert columns[name]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -175,6 +184,8 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         "trigger_key",
         "host_id",
         "lease_expires_at",
+        "trigger_kind",
+        "prompt_dispatch",
     }
 
 
@@ -359,6 +370,14 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "status",
         "id",
     ]
+    assert runs_idx_cols["ix_scheduled_task_runs_task_status"] == [
+        "workspace_id",
+        "scheduled_task_id",
+        "status",
+        "trigger_kind",
+        "scheduled_at",
+        "id",
+    ]
     unique_keys = {
         key["name"]: key["column_names"]
         for key in insp.get_unique_constraints("scheduled_task_runs")
@@ -373,12 +392,12 @@ def test_expected_indexes(db_engine: Engine) -> None:
 @pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
     """A raw insert omitting ``state`` / ``workspace_id`` / ``execution_target``
-    / ``session_mode`` / ``kind`` picks up their defaults.
+    / ``session_mode`` / ``kind`` and the retry and overlap settings picks up
+    their defaults.
 
-    Only the integer server_defaults (``state`` / ``workspace_id`` /
-    ``execution_target`` / ``session_mode`` / ``kind``) are exercised here — all are
-    omitted from the insert and must fall back to their defaults, on both the
-    migrated and the model-built schema.
+    Only the integer server_defaults are exercised here — all are omitted from
+    the insert and must fall back to their defaults, on both the migrated and
+    the model-built schema.
     """
     with db_engine.begin() as conn:
         conn.execute(
@@ -396,12 +415,19 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
                 "FROM scheduled_tasks WHERE id = X'00000000000000000000000000000de1'"
             )
         ).one()
+        run_settings = conn.execute(
+            sa.text(
+                "SELECT max_retries, retry_delay_seconds, overlap_mode "
+                "FROM scheduled_tasks WHERE id = X'00000000000000000000000000000de1'"
+            )
+        ).one()
     assert state == 1  # 1 = 'active'
     assert workspace_id == 0
     assert execution_target == 1  # 1 = 'connected_host'
     assert session_mode == 1  # 1 = 'new'
     assert session_id is None
     assert kind == 1  # 1 = 'automation'
+    assert tuple(run_settings) == (0, 300, 1)  # no retries, five minutes, 1 = 'allow'
 
 
 def test_execution_target_check_rejects_bad_code(db_engine: Engine) -> None:
@@ -481,6 +507,68 @@ def test_smart_routing_check_rejects_bad_code(db_engine: Engine) -> None:
                 created_at=1,
             )
         )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_overlap_mode_check_rejects_bad_code(db_engine: Engine) -> None:
+    """Migrated and model-built ``overlap_mode`` CHECKs both reject codes outside 1-3."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"o" * 16,
+                name="bad overlap mode",
+                prompt=b"p",
+                rrule="FREQ=DAILY;BYHOUR=9",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                overlap_mode=4,
+                created_at=1,
+            )
+        )
+
+
+@pytest.mark.parametrize("column", ["max_retries", "retry_delay_seconds"])
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_retry_settings_reject_non_integers(db_engine: Engine, column: str) -> None:
+    """A non-integer retry setting is rejected, even where SQLite would store it."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    row = {
+        "id": b"n" * 16,
+        "name": "bad retry setting",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+        column: "not-a-number",
+    }
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(tasks.insert().values(**row))
+
+
+@pytest.mark.parametrize(
+    ("column", "codes", "bad_code"),
+    [("trigger_kind", (1, 2, 3), 4), ("prompt_dispatch", (1, 2), 3)],
+)
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_run_code_columns_accept_only_their_codes(
+    db_engine: Engine, column: str, codes: tuple[int, ...], bad_code: int
+) -> None:
+    """A run stores no code, or one of the column's codes; any other value is rejected."""
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
+    row = {"scheduled_task_id": b"a" * 16, "status": 1, "scheduled_at": 1}
+    with db_engine.begin() as conn:
+        conn.execute(runs.insert().values(id=b"0" * 16, **row))
+        for code in codes:
+            conn.execute(runs.insert().values(id=bytes([code]) * 16, **row, **{column: code}))
+        stored = conn.execute(sa.select(runs.c[column]).order_by(runs.c.id)).scalars().all()
+        assert stored == [*codes, None]
+    for value in (bad_code, "not-a-number"):
+        # MySQL reports CHECK violations as OperationalError (3819).
+        with pytest.raises(DBAPIError), db_engine.begin() as conn:
+            conn.execute(runs.insert().values(id=b"b" * 16, **row, **{column: value}))
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
@@ -1247,6 +1335,76 @@ def test_smart_routing_migration_leaves_existing_tasks_unset_and_round_trips(
         command.upgrade(config, _SMART_ROUTING_REVISION)
     with engine.begin() as conn:
         assert conn.execute(sa.select(tasks.c.smart_routing)).scalars().all() == [None] * 3
+
+
+@pytest.mark.parametrize("dispatch_migration_engine", [_RUN_SETTINGS_PREVIOUS], indirect=True)
+def test_retry_and_overlap_migration_defaults_existing_tasks_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+
+    def run_index_names() -> set[str]:
+        return {index["name"] for index in sa.inspect(engine).get_indexes("scheduled_task_runs")}
+
+    def run_column_names() -> set[str]:
+        return {c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")}
+
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    runs_before = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **values))
+        # 4 = 'failed'
+        conn.execute(
+            runs_before.insert().values(
+                id=b"r" * 16, scheduled_task_id=b"a" * 16, status=4, scheduled_at=7
+            )
+        )
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _RUN_SETTINGS_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    settings = (tasks.c.max_retries, tasks.c.retry_delay_seconds, tasks.c.overlap_mode)
+    history = (runs.c.status, runs.c.scheduled_at, runs.c.trigger_kind, runs.c.prompt_dispatch)
+    with engine.begin() as conn:
+        # A task saved before the migration never retries and starts every occurrence.
+        assert conn.execute(sa.select(*settings)).one() == (0, 300, 1)
+        # Its run keeps its history, with neither marker recorded.
+        assert conn.execute(sa.select(*history)).all() == [(4, 7, None, None)]
+        conn.execute(
+            tasks.insert().values(
+                id=b"b" * 16, max_retries=3, retry_delay_seconds=60, overlap_mode=3, **values
+            )
+        )
+        saved = conn.execute(sa.select(*settings).order_by(tasks.c.max_retries)).all()
+        assert saved == [(0, 300, 1), (3, 60, 3)]
+    assert "ix_scheduled_task_runs_task_status" in run_index_names()
+    assert {"trigger_kind", "prompt_dispatch"} <= run_column_names()
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _RUN_SETTINGS_PREVIOUS)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
+    assert not columns & {"max_retries", "retry_delay_seconds", "overlap_mode"}
+    assert "ix_scheduled_task_runs_task_status" not in run_index_names()
+    assert not run_column_names() & {"trigger_kind", "prompt_dispatch"}
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
+        assert conn.execute(sa.select(sa.func.count()).select_from(runs_before)).scalar_one() == 1
+        config.attributes["connection"] = conn
+        command.upgrade(config, _RUN_SETTINGS_REVISION)
+    # The downgrade dropped the saved settings, so both rows come back on the defaults.
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(*settings)).all() == [(0, 300, 1)] * 2
+        assert conn.execute(sa.select(*history)).all() == [(4, 7, None, None)]
 
 
 @pytest.mark.parametrize(
