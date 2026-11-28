@@ -8,7 +8,7 @@ import {
   listGadgetTemplateShares,
 } from "@/gadgets/api/gadgetApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { gadgetSharingAvailable } from "@/lib/permissionsApi";
+import { gadgetTemplatesAvailable } from "@/lib/permissionsApi";
 import { cn } from "@/lib/utils";
 import { GadgetErrorNotice } from "./GadgetErrorNotice";
 import { GADGETS_KEY, invalidateGadgets } from "./gadgetQueries";
@@ -28,7 +28,7 @@ export function SharedGadgetTemplates({
   minCardWidth?: number;
 }) {
   const info = useServerInfo();
-  const enabled = gadgetSharingAvailable(info);
+  const enabled = gadgetTemplatesAvailable(info);
   const queryClient = useQueryClient();
   const shares = useQuery({
     queryKey: TEMPLATE_SHARES_KEY,

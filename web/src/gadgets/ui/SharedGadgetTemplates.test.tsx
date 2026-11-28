@@ -42,12 +42,18 @@ describe("templates shared with the viewer", () => {
 
   it("isn't shown where the server doesn't share gadgets, or nothing is shared", async () => {
     vi.mocked(listGadgetTemplateShares).mockResolvedValue([COURSE]);
-    const { unmount } = renderWithGadgets(<SharedGadgetTemplates onCreated={vi.fn()} />, {
-      info: { ...GADGETS_INFO, gadget_sharing: false },
-    });
-    expect(screen.queryByText("Shared with you")).toBeNull();
+    for (const info of [
+      { ...GADGETS_INFO, gadget_sharing: false },
+      // A server that shares gadgets but predates templates.
+      { ...GADGETS_INFO, gadget_templates: undefined },
+    ]) {
+      const { unmount } = renderWithGadgets(<SharedGadgetTemplates onCreated={vi.fn()} />, {
+        info,
+      });
+      expect(screen.queryByText("Shared with you")).toBeNull();
+      unmount();
+    }
     expect(listGadgetTemplateShares).not.toHaveBeenCalled();
-    unmount();
 
     vi.mocked(listGadgetTemplateShares).mockResolvedValue([]);
     renderWithGadgets(<SharedGadgetTemplates onCreated={vi.fn()} />);

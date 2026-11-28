@@ -8207,6 +8207,11 @@
             "title": "Gadget Sharing",
             "type": "boolean"
           },
+          "gadget_templates": {
+            "default": false,
+            "title": "Gadget Templates",
+            "type": "boolean"
+          },
           "gadgets": {
             "default": false,
             "title": "Gadgets",
