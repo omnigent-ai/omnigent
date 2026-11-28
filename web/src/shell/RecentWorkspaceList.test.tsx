@@ -162,6 +162,7 @@ describe("RecentWorkspaceList", () => {
     await waitFor(() =>
       expect(authenticatedFetchMock).toHaveBeenLastCalledWith(
         "/v1/hosts/host_1/worktrees?path=%2Fordinary",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
     );
   });

@@ -15,7 +15,7 @@ import {
 
 const authenticatedFetchMock = vi.fn();
 vi.mock("@/lib/identity", () => ({
-  authenticatedFetch: (url: string) => authenticatedFetchMock(url),
+  authenticatedFetch: (url: string, init?: RequestInit) => authenticatedFetchMock(url, init),
 }));
 
 const worktrees = [{ path: "/repo", branch: "main", is_main: true, detached: false }];
@@ -44,6 +44,7 @@ describe("useHostWorktrees", () => {
     expect(result.current.data).toEqual(worktrees);
     expect(authenticatedFetchMock).toHaveBeenCalledWith(
       "/v1/hosts/host%2Fone/worktrees?path=%2Frepo",
+      { signal: expect.any(AbortSignal) },
     );
   });
 
@@ -108,7 +109,19 @@ describe("useHostWorktrees", () => {
     expect(result.current.error?.message).toBe("host worktrees fetch failed: HTTP 400");
   });
 
-  it("keeps retrying when the host could not be reached", async () => {
+  it.each([
+    [409, "host 'host' did not respond to worktree listing within 150s"],
+    [504, "gateway timeout"],
+  ] as const)("does not retry an exhausted host timeout (%s)", async (status, detail) => {
+    authenticatedFetchMock.mockResolvedValue(response(status, { detail }));
+    const { result } = renderHook(() => useHostWorktrees("host", "/repo"), {
+      wrapper: wrapper(),
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps retrying a fast host-unavailable response", async () => {
     authenticatedFetchMock.mockResolvedValue(response(409, { detail: "host did not respond" }));
     const { result } = renderHook(() => useHostWorktrees("host", "/repo"), {
       wrapper: wrapper(),
