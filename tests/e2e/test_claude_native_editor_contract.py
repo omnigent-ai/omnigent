@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import mmap
 import os
@@ -38,6 +39,64 @@ from tests.e2e.conftest import get_mock_message_requests
 pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
 
 
+def _native_history_snapshot(config: Path) -> dict[str, object]:
+    """Observe bounded synthetic native history; it grants no input authority."""
+    import stat
+    import time
+
+    result: dict[str, object] = {"observed_at_ns": time.time_ns(), "rows": []}
+    try:
+        descriptor = os.open(
+            config / "history.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        )
+    except OSError as exc:
+        return {**result, "read_error": type(exc).__name__}
+    try:
+        metadata = os.fstat(descriptor)
+        result.update(
+            size=metadata.st_size,
+            inode=metadata.st_ino,
+            mode=oct(stat.S_IMODE(metadata.st_mode)),
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            return {**result, "read_error": "Unsupported history file"}
+        start = max(0, metadata.st_size - 128 * 1024)
+        os.lseek(descriptor, start, os.SEEK_SET)
+        remaining = metadata.st_size - start
+        content = b""
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            content += chunk
+            remaining -= len(chunk)
+        if start:
+            content = content.partition(b"\n")[2]
+        rows, invalid = [], 0
+        for line in content.splitlines():
+            try:
+                row = json.loads(line)
+            except (UnicodeError, ValueError):
+                invalid += 1
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        return {
+            **result,
+            "rows": rows[-8:],
+            "invalid_rows": invalid,
+            "scanned_bytes": len(content),
+        }
+    except OSError as exc:
+        return {**result, "read_error": type(exc).__name__}
+    finally:
+        os.close(descriptor)
+
+
 @pytest.mark.parametrize(
     "draft_mode",
     [
@@ -48,6 +107,7 @@ pytestmark = [pytest.mark.mock_only, pytest.mark.timeout(120)]
         "launch-controller-clear",
         "launch-paste-diagnostic",
         "launch-framed-paste-diagnostic",
+        "launch-framed-history-diagnostic",
     ],
 )
 @pytest.mark.parametrize("editor_source", ["configured", "configured-code", "default"])
@@ -62,10 +122,11 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
 ) -> None:
     claude, tmux_binary = shutil.which("claude"), shutil.which("tmux")
     assert claude is not None and tmux_binary is not None
-    paste_diagnostic = draft_mode in {
-        "launch-paste-diagnostic",
+    framed_diagnostic = draft_mode in {
         "launch-framed-paste-diagnostic",
+        "launch-framed-history-diagnostic",
     }
+    paste_diagnostic = draft_mode == "launch-paste-diagnostic" or framed_diagnostic
     launch_model = (
         "draft-initial-model" if draft_mode != "editor" else _PINNED_CLAUDE_MODELS["sonnet"]
     )
@@ -121,6 +182,15 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "'path_head': os.environ.get('PATH', '').split(os.pathsep)[0], "
         "'code': shutil.which('code')}}\n"
     )
+    if draft_mode == "launch-framed-history-diagnostic":
+        process_context += (
+            "\n"
+            + inspect.getsource(_native_history_snapshot)
+            + "\n_original_native_context = native_context\n"
+            "def native_context():\n"
+            "    return {**_original_native_context(), 'native_history': "
+            f"_native_history_snapshot(Path({str(config)!r}))}}\n"
+        )
     hook = tmp_path / "block-prompt.py"
     hook.write_text(
         "import io, json, sys\n"
@@ -369,7 +439,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         manifest.chmod(0o600)
     bridge.ensure_claude_workspace_trusted(workspace, env)
     native_feature_profile: dict[str, object] | None = None
-    if draft_mode == "launch-framed-paste-diagnostic":
+    if framed_diagnostic:
         flag = "tengu_virtual_pancake"
         native_binary = Path(claude).resolve()
         with (
@@ -559,7 +629,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                 command("send-keys", "-t", target, "C-g")
                 poll_until(lambda: len(observations()) == count + 1, timeout_s=15)
                 assert observations()[-1]["observe_only"] is True
-                if draft_mode == "launch-framed-paste-diagnostic":
+                if framed_diagnostic:
                     poll_until(lambda: model_switch._draft(pane()) is not None, timeout_s=10)
                     assert json.loads(hook_record.read_text()) == payload
                     current_binding = editor_handoff.read_controller_editor_binding(bridge_dir)
