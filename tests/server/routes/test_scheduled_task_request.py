@@ -1,4 +1,4 @@
-"""Field bounds on the scheduled-task create request, checked before any route logic."""
+"""Field bounds on the scheduled-task requests, checked before any route logic."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from omnigent.server.routes.scheduled_tasks import (
     _PROMPT_OR_WORKFLOW_MSG,
     _PROMPT_WITH_WORKFLOW_MSG,
     CreateScheduledTaskRequest,
+    UpdateScheduledTaskRequest,
     _resolve_create_timezone,
 )
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
@@ -68,6 +69,37 @@ def test_last_formattable_first_run_at_is_accepted() -> None:
     assert CreateScheduledTaskRequest(**_BODY, first_run_at=253402300799).first_run_at == (
         253402300799
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_retries", -1),
+        ("max_retries", 6),
+        ("retry_delay_seconds", 59),
+        ("retry_delay_seconds", 3601),
+    ],
+)
+def test_retry_settings_outside_their_bounds_are_rejected(field: str, value: int) -> None:
+    with pytest.raises(ValidationError, match=field):
+        CreateScheduledTaskRequest(**_BODY, **{field: value})
+    with pytest.raises(ValidationError, match=field):
+        UpdateScheduledTaskRequest(**{field: value})
+
+
+def test_retry_settings_at_their_bounds_are_accepted() -> None:
+    for max_retries, retry_delay_seconds in ((0, 60), (5, 3600)):
+        fields = {"max_retries": max_retries, "retry_delay_seconds": retry_delay_seconds}
+        created = CreateScheduledTaskRequest(**_BODY, **fields)
+        updated = UpdateScheduledTaskRequest(**fields)
+        assert (created.max_retries, created.retry_delay_seconds) == (
+            max_retries,
+            retry_delay_seconds,
+        )
+        assert (updated.max_retries, updated.retry_delay_seconds) == (
+            max_retries,
+            retry_delay_seconds,
+        )
 
 
 _ONE_TIME = "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=14;BYHOUR=15;BYMINUTE=0;BYSECOND=0;COUNT=1"
