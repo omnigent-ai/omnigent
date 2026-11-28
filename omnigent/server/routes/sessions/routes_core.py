@@ -2204,6 +2204,7 @@ def register_core_routes(
         # (mirroring the JSON path — a bad workspace never produces a
         # session) and persist the canonical path the host returned.
         if parsed_metadata.host_id is not None:
+            from omnigent.server.routes._host_launch import joined_managed_host_labels
             from omnigent.server.routes._session_create_validation import (
                 validate_uploaded_bundle_host_workspace,
             )
@@ -2217,7 +2218,15 @@ def register_core_routes(
                 host_store=getattr(request.app.state, "host_store", None),
                 host_registry=getattr(request.app.state, "host_registry", None),
             )
-            parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
+            parsed_metadata = parsed_metadata.model_copy(
+                update={
+                    "workspace": canonical_workspace,
+                    "labels": {
+                        **parsed_metadata.labels,
+                        **joined_managed_host_labels(request, parsed_metadata.host_id),
+                    },
+                }
+            )
 
         from omnigent.server.runtime_compatibility import (
             registry_services,

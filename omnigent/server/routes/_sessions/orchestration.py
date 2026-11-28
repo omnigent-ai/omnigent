@@ -13773,6 +13773,9 @@ async def _create_session_from_existing_agent(
     # racing the create must never return the row without it.
     if body.host_type == "managed" and body.requested_host_id is not None:
         initial_labels[REQUESTED_HOST_ID_LABEL_KEY] = body.requested_host_id
+    from omnigent.server.routes._host_launch import joined_managed_host_labels
+
+    initial_labels.update(joined_managed_host_labels(request, body.host_id))
 
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
