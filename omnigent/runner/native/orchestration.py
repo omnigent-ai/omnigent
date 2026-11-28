@@ -2673,6 +2673,27 @@ def _pi_args_have_session_control(args: list[str]) -> bool:
     return False
 
 
+def _pi_args_have_thinking(args: list[str]) -> bool:
+    """Return whether user Pi args set thinking via ``--thinking`` or a ``--model`` suffix.
+
+    Pi lets ``--thinking`` override a suffix, so the user's explicit suffix is kept by
+    not adding the session ``--thinking``.
+    """
+    from omnigent.util.reasoning_effort import PI_THINKING_LADDER
+
+    for index, arg in enumerate(args):
+        if arg == "--thinking" or arg.startswith("--thinking="):
+            return True
+        model = args[index + 1] if arg == "--model" and index + 1 < len(args) else None
+        if arg.startswith("--model="):
+            model = arg.removeprefix("--model=")
+        if model is not None:
+            _, separator, suffix = model.rpartition(":")
+            if separator and suffix in PI_THINKING_LADDER:
+                return True
+    return False
+
+
 def _pi_args_have_provider(args: list[str]) -> bool:
     """Return whether user Pi args already pin a provider/model/key.
 
@@ -3098,6 +3119,7 @@ async def _auto_create_pi_terminal(
             "This session has a configured Pi provider. Select its model in the composer "
             "and remove --provider, --model, and --api-key from terminal arguments."
         )
+    managed_launch = False
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.harnesses.pi_native.credentials import (
             pi_native_provider_launch,
@@ -3127,6 +3149,7 @@ async def _auto_create_pi_terminal(
                     inherit_env=True, env=pi_env, env_unset=pi_env_unset
                 ),
             )
+            managed_launch = True
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
             # An unroutable model leaves Pi unable to select it, which looks
@@ -3146,6 +3169,15 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 provider_args.extend(["--model", own_login_model])
+    if not managed_launch and not _pi_args_have_thinking(
+        [*(launch_config.terminal_launch_args or []), *provider_args]
+    ):
+        # Pi's own login or a terminal-pinned model still honours the session effort.
+        from omnigent.harnesses.pi_native.credentials import pi_thinking_launch_args
+
+        thinking_args, own_effort_warning = pi_thinking_launch_args(launch_config.reasoning_effort)
+        provider_args.extend(thinking_args)
+        effort_notice = own_effort_warning
     agent_dir = Path(pi_env.get(PI_CODING_AGENT_DIR_ENV_VAR) or global_pi_agent_dir()).expanduser()
     if not agent_dir.is_absolute():
         agent_dir = launch_config.workspace / agent_dir

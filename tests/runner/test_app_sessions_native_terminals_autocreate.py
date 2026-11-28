@@ -710,6 +710,109 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_args", "model_override", "effort", "expected_levels", "expected_notices"),
+    [
+        (None, None, "high", ["high"], []),
+        (None, "anthropic/m:low", "high", [], []),
+        (["--provider", "p", "--model", "m"], None, "high", ["high"], []),
+        (["--thinking", "low"], None, "high", ["low"], []),
+        (["--thinking=low"], None, "high", [], []),
+        (["--model", "p/m:low"], None, "high", [], []),
+        (None, None, "bogus", [], ["pi_native_effort_ignored"]),
+    ],
+)
+async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_args: list[str] | None,
+    model_override: str | None,
+    effort: str,
+    expected_levels: list[str],
+    expected_notices: list[str],
+) -> None:
+    """Own-login and terminal-pinned launches still pass session effort as --thinking."""
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=terminal_args,
+            external_session_id=None,
+            reasoning_effort=effort,
+            model_override=model_override,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    notice_codes: list[str] = []
+
+    async def _record_notice(**kwargs: Any) -> None:
+        notice_codes.append(kwargs["code"])
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._post_native_launch_notice", _record_notice
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry(SessionResourceRegistry):
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, spec: Any, **_kwargs: Any
+        ) -> SessionResourceView:
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_pi_terminal(
+        _PI_SESSION_ID,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    args = captured["spec"].args
+    levels = [args[i + 1] for i, arg in enumerate(args) if arg == "--thinking"]
+    assert levels == expected_levels
+    assert notice_codes == expected_notices
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--model", "p/m:low"], True),
+        (["--model=p/m:xhigh"], True),
+        (["--model", "high"], False),
+        (["--model", "p/m:0"], False),
+        (["--thinking=low"], True),
+        ([], False),
+    ],
+)
+def test_pi_args_have_thinking(args: list[str], expected: bool) -> None:
+    """Only an explicit --thinking or a --model ':level' suffix counts as user thinking."""
+    from omnigent.runner.native.orchestration import _pi_args_have_thinking
+
+    assert _pi_args_have_thinking(args) is expected
+
+
+@pytest.mark.asyncio
 async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
