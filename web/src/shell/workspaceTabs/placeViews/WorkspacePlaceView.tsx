@@ -20,6 +20,7 @@ import { isFilePositionPending } from "@/shell/filePositionState";
 import type { FilePosition } from "@/shell/FileViewerContext";
 import { PullRequestPanel } from "@/shell/PullRequestPanel";
 import { PullRequestPageBody } from "@/pullRequestPage/PullRequestPageBody";
+import { usePullRequestsV2 } from "@/lib/workspaceSurfaces";
 
 import type { OpenOptions } from "../planOpen";
 import type { TabLanding } from "../workspaceTabsStore";
@@ -60,6 +61,9 @@ import {
   SHOW_FILES_TREE_LABEL,
   useFilesTreeToggleCommand,
 } from "./useFilesTreeToggleCommand";
+
+// Loaded only with Pull Requests v2 on, so the new page's code never reaches a client without it.
+const RoutedPullRequestPlaceView = lazy(() => import("./RoutedPullRequestPlaceView"));
 
 // Loaded only where the Diffs tab setting picks Changes review, with the review it shares.
 const ChangesReview = lazy(() =>
@@ -155,6 +159,26 @@ export function WorkspacePlaceView(props: WorkspacePlaceViewProps) {
     default:
       return <PullRequestPlaceView {...props} place={props.place} />;
   }
+}
+
+/**
+ * The new PR page with Pull Requests v2 on, where the session's route serves the PR methods;
+ * else the classic one. Neither shows while the route is asked, so nothing flashes.
+ */
+function PullRequestPlaceView(props: WorkspacePlaceViewProps & { place: PullRequestPlace }) {
+  if (!usePullRequestsV2()) return <ClassicPullRequestPlaceView {...props} />;
+  const pending = (
+    <div className="flex min-h-0 flex-1" data-testid="workspace-pull-request-place" />
+  );
+  return (
+    <Suspense fallback={pending}>
+      <RoutedPullRequestPlaceView
+        {...props}
+        classic={ClassicPullRequestPlaceView}
+        pending={pending}
+      />
+    </Suspense>
+  );
 }
 
 function FilesPlaceView({
@@ -347,7 +371,7 @@ function ChangesPlaceView({
   );
 }
 
-function PullRequestPlaceView({
+function ClassicPullRequestPlaceView({
   conversationId,
   place,
   active,
