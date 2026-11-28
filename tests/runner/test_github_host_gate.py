@@ -443,6 +443,32 @@ def test_each_environment_token_reaches_only_the_host_its_for(
     assert _passed_tokens(destination, ["api", "--hostname", destination, "x"]) == passed
 
 
+@pytest.mark.parametrize(
+    ("logins", "passed"),
+    [
+        # GH_HOST's enterprise token stays off another configured host with its own login.
+        ([KNOWN], {OTHER_KNOWN: True, KNOWN: False}),
+        # A configured host with no stored login has only the environment's token to use.
+        ([], {OTHER_KNOWN: True, KNOWN: True}),
+        # GH_HOST keeps the enterprise token, as gh itself ranks it above a stored login.
+        ([OTHER_KNOWN, KNOWN], {OTHER_KNOWN: True, KNOWN: False}),
+    ],
+)
+def test_a_configured_host_with_its_own_login_never_gets_the_enterprise_token(
+    environment: Path, monkeypatch: pytest.MonkeyPatch, logins: list[str], passed: dict[str, bool]
+) -> None:
+    (environment / "hosts.yml").write_text(
+        "".join(f"{host}:\n    user: octo\n" for host in logins), encoding="utf-8"
+    )
+    monkeypatch.setenv("GH_HOST", OTHER_KNOWN)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", f"{OTHER_KNOWN},{KNOWN}")
+    enterprise = {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+
+    for host, gets_it in passed.items():
+        tokens = _passed_tokens(host, ["api", "--hostname", host, "x"])
+        assert tokens == (enterprise if gets_it else set()), host
+
+
 def test_a_call_naming_no_host_gets_the_tokens_of_where_it_goes(
     environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

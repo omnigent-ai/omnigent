@@ -325,16 +325,20 @@ def _environment_tokens_for(destination: str) -> frozenset[str]:
     ``gh`` sends ``GH_TOKEN`` to github.com and every host it treats as GitHub's own, and
     an enterprise token to every other host, so each is kept only for the host it's for:
     ``GH_TOKEN`` for github.com, or a GHE.com host that is ``GH_HOST``; an enterprise token
-    for ``GH_HOST`` or a configured GitHub host. Anywhere else, ``gh`` uses that host's own
-    stored sign-in.
+    for ``GH_HOST``, or a configured GitHub host with no stored sign-in of its own. Anywhere
+    else, ``gh`` uses that host's own stored sign-in.
     """
     gh_host = (os.environ.get("GH_HOST") or "").strip().lower()
     if destination == "github.com" or (
         destination == gh_host and destination.endswith(".ghe.com")
     ):
         return _GITHUB_COM_TOKENS
-    configured = EnvInstances().hosts_for("github")
-    if not _github_family(destination) and (destination == gh_host or destination in configured):
+    if _github_family(destination):
+        return frozenset()
+    if destination == gh_host or (
+        destination in EnvInstances().hosts_for("github")
+        and destination not in _gh_signed_in_hosts()
+    ):
         return _ENTERPRISE_TOKENS
     return frozenset()
 
