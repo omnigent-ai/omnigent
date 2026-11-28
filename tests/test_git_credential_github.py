@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 import pytest
@@ -87,6 +89,42 @@ def test_configure_host_git_resets_then_adds_broker_helper(
     flat = [" ".join(c) for c in calls]
     assert any("user.email alice@example.com" in c for c in flat)
     assert any("user.name octo" in c for c in flat)
+
+
+def test_broker_helper_runs_under_the_host_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interpreter = tmp_path / "host python" / "python3"
+    interpreter.parent.mkdir()
+    interpreter.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+    interpreter.chmod(0o755)
+    monkeypatch.setattr(h.sys, "executable", str(interpreter))
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(h, "_git_config", lambda *args: calls.append(args))
+
+    h._install_broker_helper("http://srv", "host1", "launch-tok")
+
+    # Git runs a ``!`` helper through the shell with the operation appended.
+    helper = calls[-1][2].removeprefix("!")
+    result = subprocess.run(
+        ["sh", "-c", f"{helper} get"],
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [
+        "-m",
+        "omnigent.git_credential_github",
+        "--server",
+        "http://srv",
+        "--host-id",
+        "host1",
+        "--host-token",
+        "launch-tok",
+        "get",
+    ]
 
 
 def test_configure_host_git_noop_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
