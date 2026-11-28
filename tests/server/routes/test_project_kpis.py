@@ -59,6 +59,31 @@ def _window(series: MetricSeries, period) -> float | None:
     return series_value(series, period.since_epoch, period.until_epoch + 1).value
 
 
+def test_rolling_24h_spend_takes_both_days_it_touches() -> None:
+    # Spend is per UTC day; a 24h window starting mid-yesterday must keep yesterday's.
+    spend = [
+        SeriesItem(None, "root", "session", value=5_000_000, day_utc="2026-03-08"),
+        SeriesItem(None, "root", "session", value=8_000_000, day_utc="2026-03-09"),
+        SeriesItem(None, "root", "session", value=4_000_000, day_utc="2026-03-10"),
+    ]
+    shipped = [
+        SeriesItem(_epoch("2026-03-09T15:00:00"), "t1", "ticket"),
+        SeriesItem(_epoch("2026-03-10T01:00:00"), "t2", "ticket"),
+    ]
+    day = status_period("24h", NOW)
+    assert _window(MetricSeries("daily_sum", items=spend), day) == 12.0
+    assert _window(MetricSeries("ratio", items=[*spend, *shipped]), day) == 6.0
+    week = status_period("7d", NOW)
+    assert _window(MetricSeries("daily_sum", items=spend), week) == 17.0
+    # A day-aligned bucket still takes only its own day.
+    assert (
+        series_value(
+            MetricSeries("daily_sum", items=spend), NOW - 12 * HOUR, NOW - 12 * HOUR + DAY
+        ).value
+        == 4.0
+    )
+
+
 def test_rework_counts_backward_moves_and_reopens_in_the_window() -> None:
     period = status_period("7d", NOW)
     recent = NOW - HOUR

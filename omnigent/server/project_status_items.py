@@ -18,10 +18,10 @@ from omnigent.server.project_kpis import (
     MetricSeries,
     SeriesItem,
     _day_start,
-    _in_range,
     aggregate,
     item_day,
     item_epoch,
+    item_in_range,
     trend_since_day,
     weekday_mean,
 )
@@ -78,7 +78,7 @@ def drilldown(
     """
     since, since_day = range_bounds(range_id, period)
     until = period.until_epoch + 1
-    in_range = [item for item in series.items if _in_range(item_epoch(item), since, until)]
+    in_range = [item for item in series.items if item_in_range(item, since, until)]
     if series.kind == "distinct":
         # A key counts once, for whoever made its latest move in the range.
         credited = _latest_per_key(in_range)
@@ -108,7 +108,7 @@ def drilldown(
         day_items = [
             item
             for item in by_day.get(iso, [])
-            if _in_range(item_epoch(item), start, min(start + DAY, until))
+            if item_in_range(item, start, min(start + DAY, until))
         ]
         days.append(
             {
@@ -149,7 +149,7 @@ def drilldown(
         {**_row(entry.item, series.kind), "reason": entry.reason}
         for entry in series.excluded
         if (not entry.only_when_bounded or since is not None)
-        and (entry.only_when_bounded or _in_range(item_epoch(entry.item), since, until))
+        and (entry.only_when_bounded or item_in_range(entry.item, since, until))
         and (member is None or entry.item.member == member)
     ]
     weekend.sort(key=lambda row: (row["day_utc"] or "", row["at"] or 0), reverse=True)

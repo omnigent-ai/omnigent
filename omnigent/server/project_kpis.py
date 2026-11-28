@@ -19,6 +19,7 @@ the on-target check uses (today is still in progress, so it's left out).
   session. Agents' actions don't count. Over 7 days it's the weekday 7-day rolling average.
 - ``spend_per_finished_ticket_usd`` is the range's spend divided by distinct tickets
   moved into a completed stage in it; no spend is counted twice (see the spend source).
+  Spend is per UTC day, so a rolling 24h range takes the spend of both days it touches.
 - ``changes_landed`` counts distinct commits: each ticket now at or past the landed
   stage contributes its ``verified`` (else ``approved``) SHA once, dated by its latest
   move from before that stage to it or later. Tickets sharing a SHA count once.
@@ -183,8 +184,20 @@ def item_day(item: SeriesItem) -> str | None:
     return datetime.fromtimestamp(item.at, tz=UTC).date().isoformat()
 
 
+def item_in_range(item: SeriesItem, since: int | None, until: int) -> bool:
+    """Whether *item* counts in ``[since, until)``.
+
+    A day-granular item (spend) counts when its UTC day overlaps the range, so a
+    rolling 24h window takes both days it touches, like the Summary's spend.
+    """
+    if item.day_utc is None:
+        return _in_range(item.at, since, until)
+    start = _day_start(item.day_utc)
+    return (since is None or start + DAY > since) and start < until
+
+
 def items_in_range(series: MetricSeries, since: int | None, until: int) -> list[SeriesItem]:
-    return [item for item in series.items if _in_range(item_epoch(item), since, until)]
+    return [item for item in series.items if item_in_range(item, since, until)]
 
 
 def nearest_rank(values: Iterable[float], percentile: float) -> float:
