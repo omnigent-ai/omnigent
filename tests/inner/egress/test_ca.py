@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import datetime
 import ssl
+import threading
+import time
 from pathlib import Path
 
 from cryptography import x509
@@ -150,3 +152,29 @@ def test_system_ca_bundle_skips_non_pem_in_capath(tmp_path: Path, monkeypatch) -
 
     assert real_ca in bundle
     assert b"not a certificate" not in bundle
+
+
+def test_ensure_ca_bundle_rewrite_never_exposes_partial_bundle(tmp_path: Path) -> None:
+    """Proxy starts rewrite the shared bundle while other processes load it."""
+    cert_path, _key_path = ensure_ca(cache_dir=tmp_path)
+    bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    expected = bundle_path.read_bytes()
+    stop = threading.Event()
+
+    def rewrite_until_stopped() -> None:
+        while not stop.is_set():
+            ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+
+    writer = threading.Thread(target=rewrite_until_stopped)
+    writer.start()
+    reads = partial_reads = 0
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            reads += 1
+            partial_reads += bundle_path.read_bytes() != expected
+    finally:
+        stop.set()
+        writer.join()
+
+    assert partial_reads == 0, f"{partial_reads} of {reads} reads saw a partial bundle"
