@@ -1341,6 +1341,105 @@ def test_failed_edit_rows_show_their_error(
     expect(body.get_by_test_id("tool-error-box")).not_to_be_visible()
 
 
+_SOURCES_SQL = "SELECT region, sum(amount) AS total\nFROM main.sales.orders\nGROUP BY region"
+
+
+def _seed_data_answer(chat: ChatSessionContract) -> str:
+    """A settled data answer backed by a SQL call, a shell command and a file read."""
+    response_id = "sources-response"
+    chronological = [
+        message_item("sources-user", "user", "Which region sold most?", response_id=response_id),
+        *tool_call_items(
+            "sources-sql",
+            "mcp__databricks__execute_sql",
+            {"statement": _SOURCES_SQL, "warehouse_id": "wh-42"},
+            json.dumps([{"region": "west", "total": 10}, {"region": "east", "total": 7}]),
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "sources-shell",
+            "Bash",
+            {"command": "wc -l exports/orders.csv"},
+            "17 exports/orders.csv",
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "sources-read",
+            "Read",
+            {"file_path": "/browser-workspace/notes/method.md"},
+            "# Method",
+            response_id=response_id,
+        ),
+        message_item(
+            "sources-answer", "assistant", "West sold the most (10).", response_id=response_id
+        ),
+        # A later turn, so the data answer's actions stay hidden until revealed.
+        message_item("sources-thanks", "user", "Thanks!", response_id="sources-later"),
+        message_item("sources-reply", "assistant", "You're welcome.", response_id="sources-later"),
+    ]
+    chat.set_items(list(reversed(chronological)))
+    environment_api = f"/v1/sessions/{chat.session_id}/resources/environments/default"
+    chat.contract.json(environment_api, {"metadata": {"root": "/browser-workspace"}})
+    for resource in ("changes", "filesystem"):
+        chat.contract.json(f"{environment_api}/{resource}", list_payload([]))
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/comments", [])
+    return environment_api
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_sources_panel_lists_the_answers_queries_and_files(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """An answer's Sources button lists its queries and opens a file it read."""
+    chat = chat_session_contract
+    environment_api = _seed_data_answer(chat)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+
+    answer = page.locator('[data-testid="message-bubble"][data-role="assistant"]').filter(
+        has_text="West sold the most (10)."
+    )
+    expect(answer).to_be_visible(timeout=20_000)
+    # A later reply that ran no queries offers no Sources.
+    reply = page.locator('[data-testid="message-bubble"]').filter(has_text="You're welcome.")
+    expect(reply.get_by_role("button", name="Sources")).to_have_count(0)
+    sources = answer.get_by_role("button", name="Sources")
+    if width < 768:
+        # Phone widths reveal a message's actions with a tap on the message.
+        expect(sources).to_be_hidden()
+        answer.get_by_text("West sold the most (10).").click()
+    else:
+        answer.hover()
+    sources.click()
+    panel = page.get_by_role("region", name="Show your work")
+    expect(panel).to_contain_text("2 queries · 1 source")
+    queries = panel.get_by_test_id("turn-work-query")
+    expect(queries).to_have_count(2)
+    expect(queries.first).to_contain_text("Execute SQL")
+    expect(queries.first).to_contain_text("2 rows")
+    expect(queries.first).to_contain_text("Source: warehouse wh-42")
+    expect(queries.first.locator("pre")).to_contain_text("FROM main.sales.orders")
+    expect(queries.nth(1).locator("pre")).to_contain_text("wc -l exports/orders.csv")
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+    file_content = "# Method"
+    chat.contract.json(
+        f"{environment_api}/filesystem/notes/method.md",
+        {
+            "object": "session.environment.filesystem.file_content",
+            "path": "notes/method.md",
+            "content": file_content,
+            "content_type": "text/markdown",
+            "encoding": "utf-8",
+            "bytes": len(file_content),
+        },
+    )
+    panel.get_by_role("button", name="notes/method.md", exact=True).click()
+    expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text("Method")
+
+
 def test_automation_context_is_hidden_from_transcript(
     page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
