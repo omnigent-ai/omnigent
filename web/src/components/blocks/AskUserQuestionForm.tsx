@@ -62,6 +62,12 @@ interface AskUserQuestionFormProps {
    * is answering sets this; other forms respond only while focus is inside them.
    */
   keyboardActive?: boolean;
+  /**
+   * Requires a deliberate answer, as a workflow question does: the card opens with no
+   * option selected, and Enter pressed outside the form never submits it. Without this,
+   * a stray Enter in an open chat sent the preselected first option, which nobody chose.
+   */
+  deliberateAnswer?: boolean;
 }
 
 /**
@@ -112,7 +118,10 @@ const DICTATION_ACTIVE = "[data-dictating]";
 // Buttons and links inside the form, which Enter activates natively.
 const NATIVE_CLICK_SELECTOR = "button, a[href], [role='button'], [role='link']";
 /** Answers on a freshly opened card, before the user touches it. */
-function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft, "currentIndex"> {
+function initialAnswers(
+  questions: ClaudeQuestion[],
+  preselect: boolean,
+): Omit<AskUserQuestionDraft, "currentIndex"> {
   const answers: Omit<AskUserQuestionDraft, "currentIndex"> = {
     selections: {},
     customSelected: {},
@@ -121,7 +130,8 @@ function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft,
   };
   for (const q of questions) {
     const key = questionKey(q);
-    answers.selections[key] = q.multiSelect ? [] : (q.options[0]?.label ?? "");
+    if (q.multiSelect) answers.selections[key] = [];
+    else answers.selections[key] = preselect ? (q.options[0]?.label ?? "") : "";
     answers.customSelected[key] = q.textInput !== undefined;
     answers.customInputs[key] = q.textInput?.default ?? "";
   }
@@ -134,12 +144,13 @@ export function AskUserQuestionForm({
   onSubmit,
   onReject,
   keyboardActive = false,
+  deliberateAnswer = false,
 }: AskUserQuestionFormProps) {
   // Form state belongs to the first questions; ApprovalCard remounts the form for new ones.
   const [draftQuestions] = useState(questions);
   const [signature] = useState(() => askUserQuestionSignature(questions));
   const [draft] = useState(() => getAskUserQuestionDraft(elicitationId, signature));
-  const [initial] = useState(() => initialAnswers(questions));
+  const [initial] = useState(() => initialAnswers(questions, !deliberateAnswer));
   const rootRef = useRef<HTMLDivElement>(null);
   const questionRef = useRef<HTMLFieldSetElement>(null);
   const customInputRef = useRef<ComposerTextTarget | null>(null);
@@ -398,6 +409,8 @@ export function AskUserQuestionForm({
 
     if (event.key === "Enter") {
       if (event.shiftKey || preventsKeyboardSubmit) return;
+      // A deliberate answer is given in the form itself, never by an Enter from elsewhere.
+      if (deliberateAnswer && !inside) return;
       if (inside) {
         if (target.matches(NATIVE_CLICK_SELECTOR)) return;
       } else if (composer) {

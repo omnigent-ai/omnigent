@@ -1055,6 +1055,7 @@ export function ApprovalCard({
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
             keyboardActive={keyboardActive}
+            deliberateAnswer={phase === WORKFLOW_QUESTION_PHASE}
           />
         ) : isCodexCommandApproval ? (
           <>
