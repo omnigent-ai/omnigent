@@ -79,6 +79,31 @@ record_action() {
   fi
 }
 
+# Mirror terminal.py's _tmux_reports_target_gone: a kill-server failure proves
+# the server stopped only when stderr positively names an absent target.
+tmux_reports_target_gone() {
+  gone=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$gone" in
+    "no server running on"* | "server exited"* | "lost server"* | \
+      "can't find session"* | "can't find window"* | "can't find pane"* | \
+      "no current target"* | "session not found"* | "no such session"*) return 0 ;;
+    "error connecting to "*"(no such file or directory)") return 0 ;;
+  esac
+  return 1
+}
+
+# tmux kill-server only SIGHUPs panes, so a harness CLI that traps SIGHUP (e.g.
+# claude) survives it; SIGKILL the pane's process group to take its descendants.
+kill_pane_group() {
+  # Reject empty, non-numeric, and zero/leading-zero pids: kill -KILL -0 would
+  # signal the script's own process group. $1 is then a positive integer, so
+  # -$1 names its process group unambiguously (dash's kill rejects a -- guard).
+  case "$1" in
+    '' | *[!0-9]* | 0*) return 0 ;;
+  esac
+  kill -KILL "-$1" 2>/dev/null || kill -KILL "$1" 2>/dev/null || true
+}
+
 has_target() {
   case " $TARGETS " in
     *" $1 "*) return 0 ;;
@@ -216,6 +241,50 @@ stop_processes() {
       esac
     done <"$sessions_file"
     rm -f "$sessions_file"
+    # Managed session terminals run on private per-instance sockets
+    # ($TMPDIR/omnigent-terminal-*/tmux.sock) that the default-socket sweep never
+    # sees. A symlinked socket is left alone: it could redirect the kill elsewhere.
+    for terminal_dir in "${TMPDIR:-/tmp}"/omnigent-terminal-*; do
+      [ -d "$terminal_dir" ] && [ ! -L "$terminal_dir" ] || continue
+      [ -n "$(find "$terminal_dir" -prune -user "$(id -u)" 2>/dev/null)" ] || continue
+      terminal_socket="$terminal_dir/tmux.sock"
+      if [ -L "$terminal_socket" ]; then
+        record_action tmux "$terminal_dir" stop skipped "" "tmux socket is a symlink; left in place"
+        continue
+      fi
+      if [ "$DRY_RUN" = true ]; then
+        if [ -S "$terminal_socket" ]; then
+          record_action tmux "$terminal_dir" stop reported "" "would kill managed terminal tmux server"
+        else
+          record_action tmux "$terminal_dir" stop reported "" "would remove stale managed terminal dir"
+        fi
+        continue
+      fi
+      terminal_detail="removed stale managed terminal dir"
+      if [ -S "$terminal_socket" ]; then
+        # Snapshot panes before kill-server so SIGHUP-ignoring harness children
+        # can be force-killed once the server is down.
+        terminal_panes=$(tmux -S "$terminal_socket" list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
+        kill_err=$(tmux -S "$terminal_socket" kill-server 2>&1 >/dev/null)
+        kill_rc=$?
+        if [ "$kill_rc" -ne 0 ] && [ -S "$terminal_socket" ] && ! tmux_reports_target_gone "$kill_err"; then
+          # kill-server failed without proving the target gone (client/protocol
+          # mismatch), so the server may still be live. Keep the socket for a
+          # later retry; probing it on the same failing channel proves nothing.
+          record_action tmux "$terminal_dir" stop failed "" "tmux kill-server left the managed terminal running"
+          continue
+        fi
+        for terminal_pane in $terminal_panes; do
+          kill_pane_group "$terminal_pane"
+        done
+        terminal_detail="killed managed terminal tmux server"
+      fi
+      if rm -rf "$terminal_dir" 2>/dev/null; then
+        record_action tmux "$terminal_dir" stop done "" "$terminal_detail"
+      else
+        record_action tmux "$terminal_dir" stop failed "" "failed to remove managed terminal dir"
+      fi
+    done
   fi
   rm -f "$pidfiles"
   if [ "$EXIT_CODE" = 2 ]; then
