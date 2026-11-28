@@ -142,6 +142,7 @@ export function SharingPage() {
         maxWidthClassName="max-w-4xl"
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
+        className="settings-page-scroll"
       >
         <h1 className="mb-2 text-2xl font-medium">Session sharing</h1>
         <p className="text-ui text-muted-foreground">
@@ -197,7 +198,12 @@ export function SharingPage() {
   }
 
   return (
-    <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+    <PageScroll
+      maxWidthClassName="max-w-4xl"
+      contentClassName="px-4 md:px-8"
+      extraBottom="2.5rem"
+      className="settings-page-scroll"
+    >
       <div>
         <div className="mb-6">
           <h1 className="text-2xl font-medium">Session sharing</h1>
