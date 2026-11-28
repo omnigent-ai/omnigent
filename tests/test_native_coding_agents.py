@@ -47,6 +47,7 @@ def test_canonical_native_harnesses_resolve() -> None:
         "codex-native",
         "pi-native",
         "cursor-native",
+        "cline-native",
         "kimi-native",
         "kiro-native",
     ):

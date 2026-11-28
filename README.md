@@ -324,6 +324,7 @@ omnigent goose                       # Goose
 omnigent kiro                        # Kiro
 omnigent qwen                        # Qwen Code
 omnigent kimi                        # Kimi Code
+omnigent cline                       # Cline
 omnigent devin                       # Devin
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
@@ -796,7 +797,8 @@ executor:
                                # cursor-native, opencode-native, goose,
                                # goose-native, kiro-native, antigravity,
                                # antigravity-native, copilot, devin-native,
-                               # qwen, qwen-native, kimi, kimi-native, hermes,
+                               # cline, cline-native, qwen, qwen-native, kimi,
+                               # kimi-native, hermes,
                                # hermes-native, pi, pi-native, grok, jcode,
                                # openai-agents, open-responses, acp:<slug>
 

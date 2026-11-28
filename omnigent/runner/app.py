@@ -1661,6 +1661,7 @@ def create_runner_app(
     _kiro_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _goose_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _cline_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -1681,6 +1682,7 @@ def create_runner_app(
             "goose": _goose_terminal_ensure_locks,
             "hermes": _hermes_terminal_ensure_locks,
             "qwen": _qwen_terminal_ensure_locks,
+            "cline": _cline_terminal_ensure_locks,
             "kimi": _kimi_terminal_ensure_locks,
             "devin": _devin_terminal_ensure_locks,
         }
@@ -3723,6 +3725,7 @@ def create_runner_app(
             elif harness_name in (
                 "cursor-native",
                 "opencode-native",
+                "cline-native",
                 "kimi-native",
                 "devin-native",
                 "goose-native",
@@ -4295,6 +4298,7 @@ def create_runner_app(
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
+        _cline_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
@@ -4496,6 +4500,7 @@ def create_runner_app(
             "kiro-native",
             "goose-native",
             "qwen-native",
+            "cline-native",
             "kimi-native",
             "hermes-native",
         }:
@@ -9258,6 +9263,7 @@ def create_runner_app(
         app,
         _antigravity_terminal_ensure_locks=_antigravity_terminal_ensure_locks,
         _claude_terminal_ensure_locks=_claude_terminal_ensure_locks,
+        _cline_terminal_ensure_locks=_cline_terminal_ensure_locks,
         _codex_terminal_ensure_locks=_codex_terminal_ensure_locks,
         _cursor_terminal_ensure_locks=_cursor_terminal_ensure_locks,
         _devin_terminal_ensure_locks=_devin_terminal_ensure_locks,
@@ -9565,6 +9571,7 @@ def create_runner_app(
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
+        _cline_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
@@ -9596,6 +9603,7 @@ def create_runner_app(
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
+        _cline_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)

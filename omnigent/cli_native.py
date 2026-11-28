@@ -1499,3 +1499,99 @@ def register_native_commands(cli: click.Group) -> None:
             extra_args=_resolve_harness_startup_args(cfg, "kimi-native", kimi_args),
             auto_open_conversation=auto_open_conversation,
         )
+
+    @cli.command(
+        context_settings={
+            "ignore_unknown_options": True,
+            "allow_extra_args": True,
+        }
+    )
+    @click.option(
+        "--server",
+        default=None,
+        help=(
+            "Remote omnigent URL. Ensures the host daemon, asks the "
+            "daemon-spawned runner to launch the Cline session, and attaches this TTY. "
+            'Pass --server "" to auto-spawn a persistent local server in the '
+            "background and use that instead of a remote one."
+        ),
+    )
+    @click.option(
+        "-r",
+        "--resume",
+        "resume",
+        is_flag=False,
+        flag_value=_RESUME_PICKER_SENTINEL,
+        default=None,
+        help=(
+            "Resume a prior Omnigent conversation. With a conversation id "
+            "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+            "opens an interactive picker scoped to cline-native sessions."
+        ),
+    )
+    @click.option(
+        "--session",
+        "session_id",
+        metavar="SESSION_ID",
+        default=None,
+        hidden=True,
+        help="Deprecated alias for ``--resume <id>``; kept for one release.",
+    )
+    @click.argument("cline_args", nargs=-1, type=click.UNPROCESSED)
+    def cline(
+        server: str | None,
+        resume: str | None,
+        session_id: str | None,
+        cline_args: tuple[str, ...],
+    ) -> None:
+        """Launch Cline with Omnigent.
+
+        Starts ``cline agent serve`` WebSocket session in a runner-owned
+        terminal and attaches your TTY — the native experience, embedded in the
+        Omnigent web UI with policies, approvals, and transcript mirroring. No
+        Omnigent provider config is needed: cline authenticates against its own
+        backend (``cline login`` for OAuth, or ``XAI_API_KEY``).
+
+        For the headless ACP harness (``cline agent stdio`` behind the Omnigent
+        REPL) use ``omnigent run --harness cline`` instead.
+
+        \b
+        Examples:
+          omnigent cline
+          omnigent cline --resume conv_abc123
+          omnigent cline --resume                   # interactive picker
+        """
+        choice = _split_resume_value(resume)
+        if session_id is not None and (choice.picker or choice.conversation_id is not None):
+            raise click.UsageError(
+                "--session and --resume are mutually exclusive; "
+                "prefer --resume (--session is deprecated).",
+            )
+
+        from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.cline_native.main import run_cline_native
+
+        cfg = _load_effective_config()
+        # Thread ``--command`` / ``harness.cline-native.command`` config into the
+        # runner via the canonical ``OMNIGENT_CLINE_PATH`` env var (set before
+        # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
+        # ``--server`` runner reads its own host env, so set the var there).
+        _resolved = resolve_harness_command("cline-native", default="", explicit=None, cfg=cfg)
+        if _resolved:
+            os.environ["OMNIGENT_CLINE_PATH"] = _resolved
+        if server is None:
+            server = cfg.get("server")
+        auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+        server = _ensure_backend(server)
+        resolved_session_id = (
+            choice.conversation_id if choice.conversation_id is not None else session_id
+        )
+
+        run_cline_native(
+            server=server,
+            session_id=resolved_session_id,
+            resume_picker=choice.picker,
+            extra_args=_resolve_harness_startup_args(cfg, "cline-native", cline_args),
+            auto_open_conversation=auto_open_conversation,
+        )

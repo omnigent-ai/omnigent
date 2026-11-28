@@ -283,6 +283,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "goose",
         "goose-native",
         "kiro-native",
+        "cline-native",
         "kimi",
         "kimi-native",
         "hermes",
