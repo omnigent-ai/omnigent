@@ -75,16 +75,9 @@ def upgrade() -> None:
             .with_variant(PGVarchar(64, collation="C"), "postgresql"),
             nullable=False,
         ),
-        # String(128) matches session_permissions.user_id; a user or group ID. Compared
-        # exactly on MySQL, whose default collation ignores case and accents and would let
-        # two distinct principals match one grant.
-        sa.Column(
-            "user_id",
-            sa.String(128).with_variant(
-                MySQLVarchar(128, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql"
-            ),
-            nullable=False,
-        ),
+        # String(128) matches session_permissions.user_id and workflow_shares.user_id, with
+        # their collation, so grantee IDs compare as every other share's do.
+        sa.Column("user_id", sa.String(128), nullable=False),
         sa.Column("level", sa.SmallInteger(), nullable=False),
         # Leads with workspace_id; the prefix serves per-gadget reads and deletes.
         sa.PrimaryKeyConstraint("workspace_id", "gadget_id", "user_id"),

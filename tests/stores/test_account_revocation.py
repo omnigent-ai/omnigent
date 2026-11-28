@@ -2770,8 +2770,9 @@ def test_a_viewer_write_that_lands_after_deletion_and_then_fails_is_still_cleane
 def test_an_account_alias_doesnt_carry_gadget_grants_into_a_new_registration(
     db_uri: str, tmp_path
 ) -> None:
-    """Where account IDs compare without case (MySQL), deleting and registering a name spelt
-    differently from the stored ID still removes the gadget grants the stored ID holds."""
+    """Where account IDs compare without case (MySQL), gadget grants do too, as session and
+    workflow shares do: a deletion spelt differently from the stored ID removes them, and the
+    name registered again doesn't inherit them."""
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     if permissions._engine.dialect.name != "mysql":
@@ -2787,3 +2788,4 @@ def test_an_account_alias_doesnt_carry_gadget_grants_into_a_new_registration(
     revived = accounts.create_user_with_password("caseuser", "replacement-hash")
 
     assert permissions.resolve_gadget_access([revived.id], board["id"]) is None
+    assert permissions.resolve_gadget_access(["caseuser", "CASEUSER"], board["id"]) is None

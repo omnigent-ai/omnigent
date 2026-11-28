@@ -2212,15 +2212,7 @@ class SqlGadgetShare(OmnigentBase):
         primary_key=True,
         nullable=False,
     )
-    # Exact comparison on MySQL (see _MEMORY_ACTOR_ID): its default collation would let
-    # "Reader" and "reader" match one grant.
-    user_id: Mapped[str] = mapped_column(
-        String(128).with_variant(
-            MySQLVarchar(128, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql"
-        ),
-        primary_key=True,
-        nullable=False,
-    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
     # Permission level code, stored as a small integer like workflow_shares.level.
     level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 

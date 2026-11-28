@@ -125,21 +125,14 @@ def test_rows_are_unique_per_grantee_and_bounded(db_engine: Engine) -> None:
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
-def test_grantees_that_differ_only_in_case_or_accents_are_separate_rows(
-    db_engine: Engine,
-) -> None:
-    """Grantee IDs compare exactly, so one grant never matches another principal's ID
-    (MySQL's default collation would treat these as one key)."""
+def test_gadget_ids_are_keys_in_byte_order(db_engine: Engine) -> None:
+    """Gadget IDs compare as bytes on every engine, so "a-b" and "a_b" are two keys in byte
+    order. Grantee IDs keep the database's collation, as every other share's do."""
     shares = sa.Table(_TABLE, sa.MetaData(), autoload_with=db_engine)
     with db_engine.begin() as conn:
-        for user_id in ("reader", "Reader", "réader"):
-            conn.execute(_share(shares, user_id=user_id))
-        # Gadget IDs compare as bytes too, so "a-b" and "a_b" are two keys in byte order.
         for gadget_id in ("a_b", "a-b"):
             conn.execute(_share(shares, gadget_id=gadget_id, user_id="ordered"))
     with db_engine.connect() as conn:
-        rows = conn.execute(sa.select(shares.c.user_id).where(shares.c.user_id == "reader"))
-        assert [row.user_id for row in rows] == ["reader"]
         ordered = conn.execute(
             sa.select(shares.c.gadget_id)
             .where(shares.c.user_id == "ordered")
