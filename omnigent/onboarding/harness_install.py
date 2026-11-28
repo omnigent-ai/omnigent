@@ -1405,7 +1405,65 @@ def install_harness_cli(key: str) -> bool:
     return try_install_harness_cli(key).installed
 
 
-def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S) -> bool:
+# Login-probe budget for a launcher's first (cold) answer; see harness_cli_logged_in.
+LAUNCHER_PROBE_TIMEOUT_S = 30.0
+# Launchers that have answered a status probe once; later probes use the caller's budget.
+_WARM_LAUNCHERS: set[str] = set()
+
+
+def _claude_launcher_override(key: str) -> str | None:
+    """Return the ``OMNIGENT_CLAUDE_PATH`` launcher for Claude's login probe, if set.
+
+    Sessions start Claude through ``OMNIGENT_CLAUDE_PATH`` when it is set (a
+    wrapper that may supply credentials per launch, e.g. an enterprise gateway).
+    The login probe must ask the same launcher, or a host whose credentials come
+    only from that wrapper reads "needs-auth" although every launch would work.
+
+    :param key: A harness family, e.g. ``"anthropic"``.
+    :returns: The absolute launcher path when *key* is Claude's family and the
+        variable resolves to an executable other than the plain CLI, else ``None``.
+    """
+    if key != ANTHROPIC_FAMILY:
+        return None
+    if not os.environ.get("OMNIGENT_CLAUDE_PATH", "").strip():
+        return None
+    # Same resolution sessions use, so a bare launcher name on PATH also counts.
+    resolved = resolve_cli_binary("claude", env_var="OMNIGENT_CLAUDE_PATH")
+    if resolved is None or resolved == shutil.which("claude"):
+        return None
+    return os.path.abspath(resolved)
+
+
+def _status_json(stdout: str) -> object:
+    """Parse a CLI status JSON object, skipping any banner lines printed before it.
+
+    A launcher wrapper may print its own lines before the CLI's JSON, so when the
+    whole output is not JSON, parse from the first line that starts with ``{``.
+
+    :param stdout: The status command's standard output.
+    :returns: The parsed value, or ``None`` when no JSON object is found.
+    """
+    try:
+        return json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    decoder = json.JSONDecoder()
+    lines = stdout.splitlines()
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("{"):
+            try:
+                return decoder.raw_decode("\n".join(lines[i:]).lstrip())[0]
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return None
+
+
+def harness_cli_logged_in(
+    key: str,
+    timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
+    *,
+    via_launcher: bool = False,
+) -> bool:
     """Return whether the harness CLI itself reports a usable login.
 
     Asks the CLI's own status command (``claude auth status`` /
@@ -1432,6 +1490,10 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
         ``"openai"`` (Codex), or ``"gemini"`` (Antigravity, via ``agy models``).
     :param timeout: Seconds to wait for the status subprocess, e.g. ``10.0`` on
         the readiness path where a hung CLI must not stall the refresh.
+    :param via_launcher: Ask the ``OMNIGENT_CLAUDE_PATH`` launcher instead of the
+        plain CLI (Claude only), i.e. "would a launched session be logged in?".
+        Readiness passes ``True``; login, logout and ambient detection keep the
+        default, because they are about the plain CLI's own stored login.
     :returns: ``True`` when the CLI reports a usable login; ``False`` when the
         key has no status command, the CLI binary is missing, the status
         process failed to spawn, or the CLI reports no login.
@@ -1439,9 +1501,18 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
-    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    launcher = _claude_launcher_override(key) if via_launcher else None
+    binary = launcher or (
+        resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    )
     if binary is None:
         return False
+    if launcher is not None and launcher not in _WARM_LAUNCHERS:
+        # A launcher may do its own startup (auth refresh, local proxy) before
+        # Claude answers, so a cold first probe can outlast the plain-CLI budget
+        # and read as "needs-auth" until the next refresh. Only the first answer
+        # gets the longer budget, so a hung launcher cannot stall every refresh.
+        timeout = max(timeout, LAUNCHER_PROBE_TIMEOUT_S)
     probe_cwd = _cli_probe_cwd()
     if probe_cwd is not None and not os.path.isabs(binary):
         # The daemon's starting cwd is gone, so the probe would run under a
@@ -1468,6 +1539,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
+    if launcher is not None:
+        _WARM_LAUNCHERS.add(launcher)
     # Dispatch is explicit per spec: a harness that publishes a JSON status
     # object names its boolean field in ``login_status_key`` (Claude
     # ``loggedIn`` / Cursor ``isAuthenticated``). When that key is unset the
@@ -1477,10 +1550,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     status_key = spec.login_status_key
     logged_in = result.returncode == 0
     if status_key is not None:
-        try:
-            payload = json.loads(result.stdout)
-        except (json.JSONDecodeError, ValueError):
-            payload = None
+        payload = _status_json(result.stdout)
         if isinstance(payload, dict) and status_key in payload:
             logged_in = bool(payload[status_key])
     if logged_in:
