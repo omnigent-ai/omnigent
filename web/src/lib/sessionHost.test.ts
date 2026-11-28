@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  clearHostKeyless,
   getSessionHostRouting,
+  markHostKeyless,
   parentIdFromLabels,
   setSessionHost,
   setSessionParent,
+  subscribeSessionHostChanges,
 } from "./sessionHost";
 
 describe("getSessionHostRouting", () => {
@@ -24,6 +27,22 @@ describe("getSessionHostRouting", () => {
     const bound = getSessionHostRouting("routing-child");
     expect(bound).toMatchObject({ ownerId: "routing-child", hostId: "host-a" });
     expect(bound.revision).toBeGreaterThan(refreshed.revision);
+  });
+});
+
+describe("keyless host demotion", () => {
+  it("notifies route subscribers only when a host's keyless routing changes", () => {
+    let notifications = 0;
+    const unsubscribe = subscribeSessionHostChanges(() => {
+      notifications += 1;
+    });
+    markHostKeyless("keyless-host");
+    markHostKeyless("keyless-host");
+    expect(notifications).toBe(1);
+    clearHostKeyless("keyless-host");
+    clearHostKeyless("keyless-host");
+    expect(notifications).toBe(2);
+    unsubscribe();
   });
 });
 

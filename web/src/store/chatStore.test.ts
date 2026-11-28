@@ -89,7 +89,12 @@ import {
 } from "@/lib/sessionDrafts";
 import { getCurrentAuthorId, getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
-import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import {
+  clearHostKeyless,
+  getSessionHost,
+  setSessionHost,
+  setSessionParent,
+} from "@/lib/sessionHost";
 import {
   setOmnigentHostConfig,
   type OmnigentAnalyticsEvent,
@@ -20610,6 +20615,87 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
       expect(useChatStore.getState().sandboxStatus?.stage).toBe("provisioning");
       expect(route.opens.map((open) => open.headers.get(SLICE_KEY))).toEqual(["host_b"]);
+      setSessionHost(id, null);
+    });
+
+    it("shows a pending approval after the first stream open falls back to keyless routing", async () => {
+      workspaceMode();
+      const id = "conv_keyless_approval";
+      const host = "host_keyless";
+      seedSession(id, []);
+      const route = routeKeyedStreamOpens({ snapshotExtras: new Map([[id, { host_id: host }]]) });
+      const routed = fetchMock.getMockImplementation()!;
+      const approval = {
+        type: "response.elicitation_request",
+        elicitation_id: "elic_keyless",
+        params: {
+          mode: "form",
+          message: "Codex wants to run **date**",
+          requestedSchema: null,
+          phase: "codex_command_approval",
+          policy_name: "codex_native_command_approval",
+          content_preview: "date",
+          command: "date",
+          cwd: "/tmp/workspace",
+        },
+      };
+      let releaseKeyedOpen: (() => void) | null = null;
+      // The host's tunnel connected without a key, so only the default replica
+      // holds the approval; the host's keyed replica serves an empty snapshot.
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        const key = new Headers(init?.headers).get(SLICE_KEY);
+        if (path === `/v1/sessions/${id}/stream` && key === host) {
+          route.log.push(`open:${host}`);
+          return new Promise<Response>((resolve) => {
+            releaseKeyedOpen = () =>
+              resolve(
+                Response.json(
+                  { error: { code: "wrong_replica", slice_key: null } },
+                  { status: 400 },
+                ),
+              );
+          });
+        }
+        if (path === `/v1/sessions/${id}` && key === null && (init?.method ?? "GET") === "GET") {
+          route.log.push(`snapshot:${id}:keyless`);
+          return Promise.resolve(
+            mockResponse({
+              id,
+              agent_id: "agent_xyz",
+              status: "idle",
+              created_at: 0,
+              items: [],
+              labels: {},
+              pending_elicitations: [approval],
+              pending_inputs: [],
+              host_id: host,
+            }),
+          );
+        }
+        return routed(input, init);
+      });
+
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      expect(route.log).toContain(`open:${host}`);
+      expect(route.log).not.toContain(`snapshot:${id}:keyless`);
+      expect(useChatStore.getState().blocks.some((b) => b.type === "elicitation")).toBe(false);
+
+      releaseKeyedOpen!();
+      await drainAsync(50);
+
+      const card = useChatStore
+        .getState()
+        .blocks.find(
+          (b): b is ElicitationBlock =>
+            b.type === "elicitation" && b.elicitationId === "elic_keyless",
+        );
+      expect(card?.status).toBe("pending");
+      const openedAt = route.log.indexOf("open:none");
+      expect(openedAt).toBeGreaterThan(route.log.indexOf(`open:${host}`));
+      expect(route.log.indexOf(`snapshot:${id}:keyless`)).toBeGreaterThan(openedAt);
+      clearHostKeyless(host);
       setSessionHost(id, null);
     });
   });
