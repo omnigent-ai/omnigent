@@ -3820,6 +3820,7 @@ function AppShellImpl() {
                     mobile={mobileViewport}
                     mobileTarget={tabsDrawerTarget}
                     layout="contents"
+                    keepsScroll
                   >
                     <Suspense fallback={null}>
                       <LazyWorkspaceTabsHost

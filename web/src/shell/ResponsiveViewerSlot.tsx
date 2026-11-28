@@ -6,21 +6,27 @@ const FILL_TARGET = "flex min-h-0 flex-1 flex-col";
 
 /**
  * Move one portal host between layouts without remounting its editor or drafts. `contents`
- * gives the host and its desktop place no box, for children that size themselves.
+ * gives the host and its desktop place no box, for children that size themselves. With
+ * `keepsScroll`, what was scrolled inside the host stays where it was across a move.
  */
 export function ResponsiveViewerSlot({
   mobile,
   mobileTarget,
   layout = "fill",
+  keepsScroll = false,
   children,
 }: {
   mobile: boolean;
   mobileTarget: HTMLElement | null;
   layout?: "fill" | "contents";
+  keepsScroll?: boolean;
   children: ReactNode;
 }) {
   const desktopTarget = useRef<HTMLDivElement>(null);
   const focusedElement = useRef<HTMLElement | null>(null);
+  // Each scrolled element's last offset, read as it scrolls: by the move, CSS may have
+  // hidden the old layout and reset it already.
+  const scrollOffsets = useRef(new Map<Element, { top: number; left: number }>());
   // The layout is fixed for the slot's life, as the host is.
   const [host] = useState(() => {
     const element = document.createElement("div");
@@ -50,6 +56,31 @@ export function ResponsiveViewerSlot({
       host.removeEventListener("focusout", forgetFocus, true);
     };
   }, [host]);
+
+  useLayoutEffect(() => {
+    if (!keepsScroll) return;
+    const offsets = scrollOffsets.current;
+    // Scroll events don't bubble, but the capture phase sees every one inside the host.
+    const rememberScroll = (event: Event) => {
+      const element = event.target;
+      if (!(element instanceof Element)) return;
+      if (element.scrollTop === 0 && element.scrollLeft === 0) offsets.delete(element);
+      else offsets.set(element, { top: element.scrollTop, left: element.scrollLeft });
+    };
+    host.addEventListener("scroll", rememberScroll, true);
+    // Forget removed elements at once, so a closed tab's subtree isn't kept alive.
+    const forgetRemoved = new MutationObserver(() => {
+      for (const element of offsets.keys()) {
+        if (!host.contains(element)) offsets.delete(element);
+      }
+    });
+    forgetRemoved.observe(host, { childList: true, subtree: true });
+    return () => {
+      host.removeEventListener("scroll", rememberScroll, true);
+      forgetRemoved.disconnect();
+      offsets.clear();
+    };
+  }, [host, keepsScroll]);
 
   useLayoutEffect(() => {
     const target = mobile && mobileTarget ? mobileTarget : desktopTarget.current;
@@ -86,6 +117,15 @@ export function ResponsiveViewerSlot({
           }
         : null;
     target.appendChild(host);
+    // Moving a node resets the scroll of everything inside it, without a scroll event.
+    for (const [element, offset] of scrollOffsets.current) {
+      if (!host.contains(element)) {
+        scrollOffsets.current.delete(element);
+        continue;
+      }
+      element.scrollTop = offset.top;
+      element.scrollLeft = offset.left;
+    }
     active?.focus({ preventScroll: true });
     if (input && inputSelection) {
       input.setSelectionRange(inputSelection.start, inputSelection.end, inputSelection.direction);
