@@ -40,7 +40,6 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 cwsandbox = "2026-06-12T00:00:00Z"
-google-antigravity = "2026-06-12T00:00:00Z"
 nimble-python = "2026-07-29T00:00:00Z"
 
 [manifest]
@@ -1697,7 +1696,7 @@ wheels = [
 
 [[package]]
 name = "google-antigravity"
-version = "0.1.2"
+version = "0.1.23"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
@@ -1709,11 +1708,12 @@ dependencies = [
     { name = "websockets" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/d5/c6dc9b06d8248059c4ebba3489f620be1e53b03528f822c0fcf9b2dcc1bf/google_antigravity-0.1.2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:129f370b44320aefc00999ccf7c97418cd40252c5d3c07c3569843224500ffc5", size = 30044136, upload-time = "2026-06-04T21:19:14.18Z" },
-    { url = "https://files.pythonhosted.org/packages/ca/b0/a2cd625471f365601f45315b21ec02c4f9499180c00a88544bb88be567ec/google_antigravity-0.1.2-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:e888b2aa0b39d4526eb4add020c6bd5c1a2bfc8e4a3e5c228fc1698af2de4011", size = 32525913, upload-time = "2026-06-04T21:19:17.176Z" },
-    { url = "https://files.pythonhosted.org/packages/73/af/36b933c23f9114c58185ea18c7c12ab40e862f06a3074bdcc6ab6208fcc6/google_antigravity-0.1.2-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:5e7a7d88f3f6401b8efbf45477184874c60e387990e9ddb52686aad0da0be5f2", size = 35584793, upload-time = "2026-06-04T21:19:20.61Z" },
-    { url = "https://files.pythonhosted.org/packages/77/e4/d51b1003c03a2acb35919bf1e681974ec584f4354d3529bcaa79856d3c1c/google_antigravity-0.1.2-py3-none-win_amd64.whl", hash = "sha256:000fc0d3c0ef35551c7fc683a090ff2a61a20c5fedaad4d5e482239499d63207", size = 34671491, upload-time = "2026-06-04T21:19:23.747Z" },
-    { url = "https://files.pythonhosted.org/packages/4f/c4/0acbd66d9150f25ab693c3bfa14d440c48fa1e6dd32cdfe243f901cc1b61/google_antigravity-0.1.2-py3-none-win_arm64.whl", hash = "sha256:40cc33c30469008ee3f78e6cc8130cff9ad4e1d66c0a82b59740965a901d8b62", size = 31367318, upload-time = "2026-06-04T21:19:26.763Z" },
+    { url = "https://files.pythonhosted.org/packages/78/1e/71a0db889bdc339ae2ddbf7875366959660dc108c803c6b17242fcca41bc/google_antigravity-0.1.23-py3-none-macosx_11_0_arm64.whl", hash = "sha256:92dc71a52afde0ff8424534e728cc6e168489773b61457b88dcd1c634af4ff6c", size = 40142117, upload-time = "2026-10-28T16:50:40.579Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/8d/2f489370d5c47c887ba5c9107f009f428eb6b7b9e2e5e96df0f4c8ace29c/google_antigravity-0.1.23-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:5a99fd8993f13f03e43a7da9ba62b4114c05d952f6f933e86f33c3fc79e80b8e", size = 42390102, upload-time = "2026-10-28T16:50:44.189Z" },
+    { url = "https://files.pythonhosted.org/packages/55/74/fe20c9b0301c9fd3fdaf4f4f92ed43fd3f1ab59c7c6b64ebbc793ec04578/google_antigravity-0.1.23-py3-none-manylinux_2_17_aarch64.musllinux_1_1_aarch64.whl", hash = "sha256:17b2d26575ef168bb3ccd74ddf39ebfe4c528ea426e4bedee8621ea7a41cf527", size = 41215880, upload-time = "2026-10-28T16:50:48.235Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/53/ea087398e44a3deb216a7a87bb88832b182a4a66489ec6cb43db22b5abda/google_antigravity-0.1.23-py3-none-manylinux_2_17_x86_64.musllinux_1_1_x86_64.whl", hash = "sha256:6b1dfa14090ce8cf10395074eecab2bf20cb49ceed3a2603d39803951c9884e2", size = 45219152, upload-time = "2026-10-28T16:50:56.987Z" },
+    { url = "https://files.pythonhosted.org/packages/47/77/53b2c4bd11df1ace856fd67ad2e378151193eb2f99e10dc6e6f46087fb82/google_antigravity-0.1.23-py3-none-win_amd64.whl", hash = "sha256:e587980e3e220b7f24fcddbaa8af55a7b46a9e59443c13e782458718a67c2fba", size = 46149708, upload-time = "2026-10-28T16:51:09.079Z" },
+    { url = "https://files.pythonhosted.org/packages/48/c1/af3a1354977e8d16fd3bbd2e4c9a5bd55f5963578d33eaa37b61965a7e66/google_antigravity-0.1.23-py3-none-win_arm64.whl", hash = "sha256:cbbcbf920b433b2c6db7ea9ed5b4b234a72f574647effa5e3e67f0d97c1793df", size = 42115847, upload-time = "2026-10-28T16:51:24.113Z" },
 ]
 
 [[package]]

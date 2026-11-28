@@ -19,7 +19,9 @@ Streaming model:
 
 - ``agent.conversation.receive_steps()`` yields :class:`Step` objects as the
   turn runs (``content_delta``, ``thinking_delta``, ``tool_calls``,
-  ``status``, ``usage_metadata``), ending once the turn goes idle. A producer
+  ``status``), ending once the turn goes idle. Token usage comes from
+  ``conversation.last_turn_usage``, or ``Step.usage_metadata`` on SDKs that
+  still set it. A producer
   task drives ``send()`` + ``receive_steps()`` and feeds a per-turn
   :class:`asyncio.Queue`; :meth:`run_turn` drains it and yields mapped events.
 - Tool *requests* derive from ``Step.tool_calls`` (deduped by call id); tool
@@ -647,6 +649,11 @@ class AntigravityExecutor(Executor):
                     )
                     queue.put_nowait(ExecutorError(message=message, retryable=(status == "ERROR")))
                     return
+            # Newer SDKs leave ``Step.usage_metadata`` unset and track usage on
+            # the conversation, so prefer its per-turn total when it exposes one.
+            turn_usage = getattr(conversation, "last_turn_usage", None)
+            if turn_usage is not None:
+                state.last_usage = turn_usage
         except asyncio.CancelledError:
             # Consumer teardown; conversation.cancel() already requested by
             # interrupt_session, nothing to emit.

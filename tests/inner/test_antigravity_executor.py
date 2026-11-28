@@ -168,11 +168,17 @@ _TurnAction = _YieldStep | _FireToolResult | _RaiseCancelled | _RaiseGeneric
 class _FakeConversation:
     """Mirror of ``google.antigravity.conversation.Conversation`` (read paths)."""
 
-    def __init__(self, hooks: list[Any], scripts: collections.deque[list[_TurnAction]]) -> None:
+    def __init__(
+        self,
+        hooks: list[Any],
+        scripts: collections.deque[list[_TurnAction]],
+        turn_usage: _FakeUsage | None = None,
+    ) -> None:
         self._hooks = hooks
         self._scripts = scripts
         self.sends: list[str] = []
         self.cancel_called = 0
+        self.last_turn_usage = turn_usage
 
     async def send(self, prompt: Any, **_kwargs: Any) -> None:
         self.sends.append(prompt)
@@ -195,9 +201,16 @@ class _FakeConversation:
 
 
 class _FakeAgent:
-    def __init__(self, config: Any, scripts: collections.deque[list[_TurnAction]]) -> None:
+    def __init__(
+        self,
+        config: Any,
+        scripts: collections.deque[list[_TurnAction]],
+        turn_usage: _FakeUsage | None = None,
+    ) -> None:
         self.config = config
-        self._conversation = _FakeConversation(list(getattr(config, "hooks", []) or []), scripts)
+        self._conversation = _FakeConversation(
+            list(getattr(config, "hooks", []) or []), scripts, turn_usage
+        )
         self.closed = False
 
     @property
@@ -251,12 +264,15 @@ def _install_fake_sdk(
     monkeypatch: pytest.MonkeyPatch,
     *,
     scripts: list[list[_TurnAction]],
+    turn_usage: _FakeUsage | None = None,
 ) -> dict[str, Any]:
     """Patch ``_ensure_antigravity_sdk`` to return a fake module.
 
     :param monkeypatch: pytest monkeypatch fixture.
     :param scripts: One turn-script (list of actions) per ``receive_steps`` call,
         consumed front-to-back across turns / agent rebuilds.
+    :param turn_usage: The conversation's ``last_turn_usage``, or ``None`` for an
+        SDK that reports usage only on steps.
     :returns: A ``captured`` dict exposing the agents / configs built, so tests
         can assert on what the executor passed to the SDK.
     """
@@ -276,7 +292,7 @@ def _install_fake_sdk(
 
         @staticmethod
         def Agent(config: Any) -> _FakeAgent:
-            agent = _FakeAgent(config, queue)
+            agent = _FakeAgent(config, queue, turn_usage)
             captured["agents"].append(agent)
             captured["configs"].append(config)
             return agent
@@ -360,6 +376,31 @@ async def test_streaming_maps_text_reasoning_and_usage(monkeypatch: pytest.Monke
     # is inclusive of cached_content_token_count (2), and compute_llm_cost
     # prices cache_read_input_tokens additively, so input must be 11 - 2 = 9 to
     # avoid double-billing the cached tokens.
+    assert completes[0].usage == {
+        "input_tokens": 9,
+        "output_tokens": 7,
+        "total_tokens": 18,
+        "cache_read_input_tokens": 2,
+        "model": "gemini-3-pro",
+    }
+
+
+@pytest.mark.asyncio
+async def test_turn_usage_comes_from_conversation_when_steps_carry_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDKs that leave ``Step.usage_metadata`` unset still report the turn's usage."""
+    script: list[_TurnAction] = [
+        _text_step("Hello"),
+        _YieldStep(_FakeStep(step_type=_StepType.FINISH, status=_StepStatus.DONE)),
+    ]
+    _install_fake_sdk(monkeypatch, scripts=[script], turn_usage=_FakeUsage())
+    executor = AntigravityExecutor(model="gemini-3-pro", api_key="k")
+
+    events = await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
+
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
     assert completes[0].usage == {
         "input_tokens": 9,
         "output_tokens": 7,
