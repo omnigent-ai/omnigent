@@ -251,7 +251,8 @@ function triggerLabel(review: ReviewSubmitController): string {
   const { finish } = review;
   if (!finish) return "Review";
   if (finish.unresolved?.kind === "discarding") return "Discarding review…";
-  if (finish.unresolved || review.entry.status.kind === "uncertain") return "Review unconfirmed";
+  const reviewHeld = !!finish.unresolved && finish.unresolved.kind !== "drafts";
+  if (reviewHeld || review.entry.status.kind === "uncertain") return "Review unconfirmed";
   return finish.total === null ? "Finish review" : `Finish review · ${finish.total}`;
 }
 

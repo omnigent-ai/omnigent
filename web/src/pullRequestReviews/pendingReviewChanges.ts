@@ -15,11 +15,13 @@ import {
 } from "@/lib/hostPullRequestWrites";
 import type { PendingDraftBaseline, PendingReviewStart } from "@/lib/nativeBridge";
 import type { ReviewComment, ReviewThread } from "@/lib/pullRequestReviewThreads";
+import { listCommentEdits } from "@/pullRequestComments/commentEditStore";
 
 import {
   type HostPendingRoute,
   type HostPendingScope,
   type HostPendingStep,
+  hostPendingIdentity,
   hostPendingOffers,
   hostPendingRoute,
   hostPendingScopeCurrent,
@@ -37,7 +39,7 @@ import {
   draftEditVerdict,
   reviewStartVerdict,
 } from "./pendingReviewEvidence";
-import { PENDING_REVIEWS_UNAVAILABLE } from "./reviewSubmit";
+import { PENDING_REVIEWS_UNAVAILABLE, pendingSubmitsOf } from "./reviewSubmit";
 import { readPendingReviewOnHost } from "./usePendingReview";
 
 export type { DraftPlace } from "./pendingReview";
@@ -122,6 +124,10 @@ export type PendingChangeOutcome =
 export const PENDING_CHANGE_BUSY =
   "A review or comment on this pull request is still being sent. Wait for it to finish.";
 export const PENDING_CHANGE_UNCONFIRMED = "Couldn’t confirm whether GitHub saved this.";
+export const PENDING_REVIEW_END_UNRESOLVED =
+  "Your review is being submitted or discarded, or GitHub didn’t confirm it. Check your review first.";
+export const PENDING_DRAFTS_UNRESOLVED =
+  "A comment in your review is still being saved, or GitHub didn’t confirm it. Check it first.";
 
 // Held changes, by id; each shows only to its owner.
 const holds = new Map<string, PendingHold>();
@@ -294,6 +300,14 @@ export async function sendPendingReviewChange(
     return { kind: "refused", code: "busy", message: PENDING_CHANGE_BUSY };
   }
   const owner = draftOwner();
+  // No draft goes into a review being ended, and no review is discarded over a draft change.
+  const identity = hostPendingIdentity(route);
+  if (pendingReviewEndUnresolved(owner, prUrl, identity)) {
+    return { kind: "refused", code: "review_unresolved", message: PENDING_REVIEW_END_UNRESOLVED };
+  }
+  if (change.kind === "discard" && pendingDraftChangeUnresolved(owner, prUrl, identity)) {
+    return { kind: "refused", code: "drafts_unresolved", message: PENDING_DRAFTS_UNRESOLVED };
+  }
   const sentAs: PendingSentAs = {
     login: route.actor.login,
     host: hostPendingScopeOf(route),
@@ -550,6 +564,51 @@ export function pendingDiscardHeld(owner: string, prUrl: string, login: string):
     pendingDiscardsSending(owner, prUrl).some(
       (sending) => sending.sentAs.login.toLowerCase() === wanted,
     )
+  );
+}
+
+const sameIdentity = (scope: HostPendingScope | undefined, identity: string) =>
+  !!scope && hostPendingIdentity(scope) === identity;
+
+/**
+ * Whether a draft add, edit or delete in `identity`'s pending review on `prUrl` is out, or GitHub
+ * didn't confirm it: the review isn't submitted or discarded until that's settled.
+ */
+export function pendingDraftChangeUnresolved(
+  owner: string,
+  prUrl: string,
+  identity: string,
+): boolean {
+  if (hostPendingChangeInFlight(prUrl)) return true;
+  const held = pendingHoldsOf(owner, prUrl).some(
+    (hold) => hold.kind !== "discard" && sameIdentity(hold.sentAs.host, identity),
+  );
+  return (
+    held ||
+    listCommentEdits(owner, prUrl).some(
+      ({ entry }) =>
+        (entry.pending !== null || entry.unknown !== null) &&
+        sameIdentity(entry.privateScope?.host, identity),
+    )
+  );
+}
+
+/**
+ * Whether a submit or discard of `identity`'s pending review on `prUrl` is out, or GitHub didn't
+ * confirm it: no draft goes into the review until that's settled.
+ */
+export function pendingReviewEndUnresolved(
+  owner: string,
+  prUrl: string,
+  identity: string,
+): boolean {
+  const login = identity.toLowerCase();
+  return (
+    pendingSubmitsOf(owner, prUrl).some((each) => each.login === login) ||
+    pendingHoldsOf(owner, prUrl).some(
+      (hold) => hold.kind === "discard" && sameIdentity(hold.sentAs.host, identity),
+    ) ||
+    pendingDiscardsSending(owner, prUrl).some((each) => sameIdentity(each.sentAs.host, identity))
   );
 }
 

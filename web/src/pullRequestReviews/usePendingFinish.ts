@@ -14,11 +14,13 @@ import { showToast } from "@/components/ui/toast";
 import type { PullRequestCommitsResult } from "@/newPullRequestPage/hooks/usePullRequests";
 import { useWorkspaceDraftOwner } from "@/lib/workspaceDraftOwner";
 import { pendingScopeCurrent } from "@/pullRequestComments/commentEditScope";
+import { useCommentEditsFor } from "@/pullRequestComments/commentEditStore";
 
 import { composerViewCurrent, mountComposerView, noteComposerView } from "./pendingComposer";
 import {
   checkPendingHold,
   pendingDiscardsSending,
+  pendingDraftChangeUnresolved,
   type PendingHold,
   sendPendingReviewChange,
   usePendingHolds,
@@ -55,7 +57,12 @@ export interface PendingFinish {
   outdated: FinishOutdated | null;
   /** A submit or discard of this review GitHub didn't confirm, which comes before anything else. */
   unresolved:
-    { kind: "submit" } | { kind: "discarding" } | { kind: "discard"; hold: HeldDiscard } | null;
+    | { kind: "submit" }
+    | { kind: "discarding" }
+    | { kind: "discard"; hold: HeldDiscard }
+    /** A draft add, edit or delete that's out, or GitHub didn't confirm. */
+    | { kind: "drafts" }
+    | null;
   summaryKey: string;
   summaryText: string;
   /** The summary GitHub has for the review; null until it's read. */
@@ -123,6 +130,8 @@ export function usePendingFinish({
   const owner = useWorkspaceDraftOwner();
   useReviewSubmitsVersion();
   const holds = usePendingHolds(prUrl);
+  // Re-read as a draft's edit or delete is sent and answered.
+  useCommentEditsFor(owner, prUrl);
   const offered = !!hostRoute;
   const { state } = usePendingReview(prUrl, offered, conversationId);
   // The session and route stand for the account the host doesn't name.
@@ -147,6 +156,7 @@ export function usePendingFinish({
     ) as HeldDiscard | undefined) ?? null;
   const sendingDiscard =
     pendingDiscardsSending(owner, prUrl).find((each) => sentInScope(each.sentAs)) ?? null;
+  const draftsUnresolved = !!scope && pendingDraftChangeUnresolved(owner, prUrl, scope.login);
   const pendingNow = state.kind === "pending" ? state.review : null;
   const reviewId =
     unresolvedSubmit?.scope.reviewId ??
@@ -264,7 +274,9 @@ export function usePendingFinish({
         ? { kind: "discarding" }
         : heldDiscard
           ? { kind: "discard", hold: heldDiscard }
-          : null,
+          : draftsUnresolved
+            ? { kind: "drafts" }
+            : null,
     summaryKey,
     summaryText: summary?.text ?? githubBody ?? "",
     githubBody,
@@ -284,7 +296,9 @@ export function usePendingFinish({
     discard: {
       asked: pinnedHere(asked),
       ask: () => {
-        if (unresolvedSubmit || sendingDiscard || heldDiscard || !review) return;
+        if (unresolvedSubmit || sendingDiscard || heldDiscard || draftsUnresolved || !review) {
+          return;
+        }
         setAsked({ reviewId, scopeKey });
       },
       cancel: () => setAsked(null),
@@ -292,9 +306,8 @@ export function usePendingFinish({
         // Pinned to what it opened on: another review or scope now refuses rather than retargets.
         const pin = asked;
         setAsked(null);
-        if (!pinnedHere(pin) || !hostRoute || unresolvedSubmit || sendingDiscard || heldDiscard) {
-          return;
-        }
+        const blocked = unresolvedSubmit || sendingDiscard || heldDiscard || draftsUnresolved;
+        if (!pinnedHere(pin) || !hostRoute || blocked) return;
         const token = viewToken;
         const forSummary = summaryKey;
         void sendPendingReviewChange(prUrl, hostRoute, { kind: "discard", reviewId }).then(

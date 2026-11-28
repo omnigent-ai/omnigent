@@ -22,6 +22,11 @@ import {
 } from "@/pullRequestPage/pullRequestPageRoute";
 import type { Method } from "@/lib/workspaceApi";
 import { HOST_ACTOR } from "@/pullRequestPage/usePullRequestStateAction";
+import { hostPendingIdentity } from "@/pullRequestReviews/hostPendingRoute";
+import {
+  PENDING_REVIEW_END_UNRESOLVED,
+  pendingReviewEndUnresolved,
+} from "@/pullRequestReviews/pendingReviewChanges";
 import type { CommentEditActions } from "./commentActions";
 import { checkCommentChange, commentCheckReady } from "./commentChangeCheck";
 import { commentEditVisible } from "./commentEditScope";
@@ -201,6 +206,11 @@ export function usePullRequestCommentEditing(
         ...stored,
         message: "Edit and delete this comment on GitHub.",
       }));
+      return;
+    }
+    // A draft's review being submitted or discarded, or left unconfirmed, takes no change to it.
+    if (pendingReviewId && pendingReviewEndUnresolved(owner, prUrl, hostPendingIdentity(host))) {
+      updateCommentEdit(key, (stored) => ({ ...stored, message: PENDING_REVIEW_END_UNRESOLVED }));
       return;
     }
     const requestId = newRequestId();

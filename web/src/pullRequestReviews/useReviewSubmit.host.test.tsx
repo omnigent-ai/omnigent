@@ -42,8 +42,15 @@ import {
 
 import { draftThread, noReviewAnswer, pendingAnswer, REVIEW_ID } from "@/test/pendingReviewAnswers";
 
+import { resetCommentChangeRetirementForTests } from "@/pullRequestComments/commentChangeRetirement";
+import { resetCommentEditsForTests } from "@/pullRequestComments/commentEditStore";
+import { usePullRequestCommentEditing } from "@/pullRequestComments/usePullRequestCommentEditing";
+
 import { resetHostReviewsForTests } from "./hostReviews";
-import { resetPendingReviewChangesForTests } from "./pendingReviewChanges";
+import {
+  PENDING_REVIEW_END_UNRESOLVED,
+  resetPendingReviewChangesForTests,
+} from "./pendingReviewChanges";
 import { resetPendingSummariesForTests } from "./pendingReviewSummary";
 import { invalidatePendingReview } from "./usePendingReview";
 import { reviewCommandRows } from "./reviewCommands";
@@ -71,6 +78,17 @@ const READS = [
 const EDITOR = [...READS, "SubmitReview"];
 const OWNER = [...EDITOR, "SubmitReviewVerdict"];
 
+const DRAFT = {
+  conversationId: SESSION,
+  prUrl: PR,
+  commentId: "PRRC_1",
+  threadId: "PRRT_1",
+  body: "Why strip?",
+  canUpdate: true,
+  canDelete: true,
+  pendingReviewId: REVIEW_ID,
+};
+
 /** The Review menu's controller on a page whose route was decided as `served`. */
 async function renderMenu(
   served: readonly string[],
@@ -96,7 +114,10 @@ async function renderMenu(
     () => {
       const route = usePullRequestPageRoute(SESSION);
       const offer = useReviewOffer(pr, "GitHub", { conversationId: SESSION, account });
-      return { route, offer, review: useReviewSubmit({ conversationId: SESSION, pr, offer }) };
+      const review = useReviewSubmit({ conversationId: SESSION, pr, offer });
+      // The pending review's draft, as its card edits and deletes it.
+      const draft = usePullRequestCommentEditing(DRAFT);
+      return { route, offer, review, draft };
     },
     { wrapper },
   );
@@ -149,6 +170,8 @@ afterEach(() => {
   resetHostReviewsForTests();
   resetPendingReviewChangesForTests();
   resetPendingSummariesForTests();
+  resetCommentEditsForTests();
+  resetCommentChangeRetirementForTests();
 });
 
 describe("reviews through the session's host, as the owner", () => {
@@ -335,6 +358,50 @@ describe("finishing a pending review through the session's host", () => {
     const [[method, request]] = await sent();
     expect(method).toBe("submitPendingReview");
     expect(request).toMatchObject({ event: "REQUEST_CHANGES", body: "Please split this" });
+  });
+
+  const DRAFT_CHANGES = [
+    ...OWNER,
+    ...PENDING_READS,
+    "SubmitPendingReview",
+    "DeletePendingReviewComment",
+  ];
+  const methodsSent = () => host.write.mock.calls.map(([, rpc]) => rpc.method);
+
+  it("doesn't submit while a draft's delete is out, nor after GitHub didn't confirm it", async () => {
+    let failDelete: (error: unknown) => void = () => {};
+    host.write.mockImplementation((_session: string, rpc: { method: string }) =>
+      rpc.method === "deletePendingReviewComment"
+        ? new Promise((_resolve, reject) => {
+            failDelete = reject;
+          })
+        : Promise.resolve({ ...answer("COMMENT"), state: "COMMENTED" }),
+    );
+    const view = await renderPendingMenu(DRAFT_CHANGES);
+    choose(view, "COMMENT", "Two notes");
+    act(() => view.result.current.draft.setDeleteAsked(true));
+    act(() => view.result.current.draft.confirmDelete());
+    await waitFor(() =>
+      expect(view.result.current.review.finish?.unresolved).toEqual({ kind: "drafts" }),
+    );
+    act(() => view.result.current.review.submit());
+    act(() => failDelete(new PullRequestMaybeSentError("lost")));
+    await waitFor(() => expect(view.result.current.draft.entry.unknown).not.toBeNull());
+    expect(view.result.current.review.finish?.unresolved).toEqual({ kind: "drafts" });
+    act(() => view.result.current.review.submit());
+    expect(methodsSent()).toEqual(["deletePendingReviewComment"]);
+  });
+
+  it("sends no draft change into a review whose submit GitHub didn't confirm", async () => {
+    host.write.mockRejectedValue(new PullRequestMaybeSentError("lost"));
+    const view = await renderPendingMenu(DRAFT_CHANGES);
+    choose(view, "COMMENT", "Two notes");
+    act(() => view.result.current.review.submit());
+    await waitFor(() => expect(view.result.current.review.entry.status.kind).toBe("uncertain"));
+    act(() => view.result.current.draft.setDeleteAsked(true));
+    act(() => view.result.current.draft.confirmDelete());
+    expect(methodsSent()).toEqual(["submitPendingReview"]);
+    expect(view.result.current.draft.entry.message).toBe(PENDING_REVIEW_END_UNRESOLVED);
   });
 
   it("tells an editor the submit is the owner's and sends nothing", async () => {

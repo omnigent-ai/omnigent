@@ -39,6 +39,7 @@ import {
 } from "./pendingReviewSummary";
 import { type PendingFinish, pendingSubmitBlocked, usePendingFinish } from "./usePendingFinish";
 import { invalidatePendingReview } from "./usePendingReview";
+import { PENDING_DRAFTS_UNRESOLVED, pendingDraftChangeUnresolved } from "./pendingReviewChanges";
 
 export type ReviewOffer =
   | { kind: "none" }
@@ -112,6 +113,7 @@ export function pendingFinishUnavailableReason(
   if (entry.status.kind === "submitting") return "Your review is being submitted.";
   if (!finish.submittable) return PENDING_SUBMIT_OWNERS;
   if (finish.unresolved?.kind === "discarding") return "Your review is being discarded.";
+  if (finish.unresolved?.kind === "drafts") return PENDING_DRAFTS_UNRESOLVED;
   if (finish.unresolved) return PENDING_CHANGE_UNRESOLVED;
   if (!headSha || !finish.reviewCommit) return NO_HEAD;
   const verdict = verdictUnavailableReason(entry.event, viewer, author);
@@ -338,6 +340,9 @@ export function useReviewSubmit({
       headSha: pr.headSha,
     });
     if (reason || !pr.headSha) return;
+    // Decided again at the click: a draft change sent since keeps the review from going.
+    const identity = pendingHostRoute ? hostPendingIdentity(pendingHostRoute) : null;
+    if (!identity || pendingDraftChangeUnresolved(owner, pr.url, identity)) return;
     const token = pending.viewToken;
     const sentSummary = pending.summaryText;
     const summaryKey = pending.summaryKey;
