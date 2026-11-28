@@ -95,6 +95,8 @@ import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
   type MacWriteOperation,
   holdPullRequestStateChanges,
+  markMergeUnconfirmed,
+  readSettlingMerge,
   type LifecycleStoreOperation,
   type StateChangeOperation,
   UNCONFIRMED_STATE_CHANGE_MESSAGE,
@@ -107,7 +109,7 @@ import {
   type ThreadResolutionWriteOperation,
 } from "@/lib/pullRequestStateHolds";
 import { PullRequestWriteError, type PullRequestState } from "@/lib/pullRequestWriteAnswers";
-import { useWorkspaceDraftOwner } from "@/lib/workspaceDraftOwner";
+import { draftOwner, useWorkspaceDraftOwner } from "@/lib/workspaceDraftOwner";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import {
   type BranchDiscoveryNotice,
@@ -148,7 +150,7 @@ import {
   readPullRequestRpc,
   writePullRequestRpc,
 } from "@/lib/pullRequestRpc";
-import type { Method, WorkspaceClient } from "@/lib/workspaceApi";
+import { PullRequestMaybeSentError, type Method, type WorkspaceClient } from "@/lib/workspaceApi";
 import type { JsonObject } from "@bufbuild/protobuf";
 import { invalidatePendingReview } from "@/pullRequestReviews/usePendingReview";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -903,14 +905,16 @@ export function pullRequestInfoQueryOptions(
     queryFn: async ({ signal, client }): Promise<PullRequestInfo> => {
       // Taken before the read goes out, so a slow answer stays older than a later read.
       const dispatchedAt = Date.now();
-      const info = await readAtObservedPriority(client, queryKey, (priority) =>
-        fetchPullRequestInfo(readSession!, options?.prUrl, {
-          hostServeable: () => mayAskHost && hostReadGateOpen(readSession!),
-          signal,
-          recovery: { key: recoveryKey, sessionId: readSession! },
-          priority,
-        }),
-      );
+      const info = await readAtObservedPriority(client, queryKey, (priority) => {
+        const read = () =>
+          fetchPullRequestInfo(readSession!, options?.prUrl, {
+            hostServeable: () => mayAskHost && hostReadGateOpen(readSession!),
+            signal,
+            recovery: { key: recoveryKey, sessionId: readSession! },
+            priority,
+          });
+        return options?.prUrl ? readSettlingMerge(options.prUrl, read) : read();
+      });
       return { ...info, dispatched_at: dispatchedAt };
     },
     enabled: readable && !!readSession && mayAskHost,
@@ -2232,7 +2236,18 @@ export function useMergePullRequest(conversationId: string) {
     mutationKey: ["pr-page-github-merge", conversationId],
     hostScope: `github-merge-${conversationId}`,
     operation: "pull_request_merge",
-    host: (request) => mergeOnHost(conversationId, request),
+    host: (request) => {
+      const owner = draftOwner();
+      return mergeOnHost(conversationId, request).catch((error: unknown) => {
+        // The merge may have landed; hold the PR until a read shows where it stands. Never resent.
+        if (
+          error instanceof PullRequestMaybeSentError ||
+          (error instanceof PullRequestWriteError && error.outcomeUnknown)
+        )
+          markMergeUnconfirmed(owner, request.prUrl);
+        throw error;
+      });
+    },
     onSuccess: (_result, request) =>
       refreshAfterMergeChange(queryClient, conversationId, request.prUrl),
     onError: (_error, request) =>

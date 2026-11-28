@@ -269,9 +269,67 @@ export function useUnconfirmedQueueChange(prUrl: string): UnconfirmedQueueChange
 export type UnconfirmedStateChanges = () => Iterable<
   { owner: string; prUrl: string } | { owner: string; identity: string }
 >;
-// A queue change GitHub may have made holds the PR's other state changes too.
+// A merge whose answer was lost, by workspace user and PR. Held until a read begun after it
+// shows where the PR stands; nothing is sent again meanwhile.
+interface UnconfirmedMerge {
+  owner: string;
+  prUrl: string;
+  revision: number;
+}
+const unconfirmedMerges = new Map<string, UnconfirmedMerge>();
+let unconfirmedMergeRevision = 0;
+
+/** The PR as its lock sees it, for `owner`: one key per user and pull request. */
+function unconfirmedMergeKey(owner: string, prUrl: string): string {
+  return `${owner}\n${pullRequestIdentity(prUrl)}`;
+}
+
+/** Hold `owner`'s merge of `prUrl`, whose answer was lost, until a read settles it; its revision. */
+export function markMergeUnconfirmed(owner: string, prUrl: string): number {
+  unconfirmedMergeRevision += 1;
+  unconfirmedMerges.set(unconfirmedMergeKey(owner, prUrl), {
+    owner,
+    prUrl,
+    revision: unconfirmedMergeRevision,
+  });
+  holdsChanged();
+  return unconfirmedMergeRevision;
+}
+
+/** The part of a PR read that says where the PR stands. */
+interface PullRequestStateAnswer {
+  selected_pr_url?: string | null;
+  pr?: { state?: string | null } | null;
+}
+
+/**
+ * Run `read` for `prUrl`. An answer that shows the PR's state settles a merge held when the read
+ * began; one that fails leaves the hold in place.
+ */
+export async function readSettlingMerge<Answer extends PullRequestStateAnswer>(
+  prUrl: string,
+  read: () => Promise<Answer>,
+): Promise<Answer> {
+  const key = unconfirmedMergeKey(draftOwner(), prUrl);
+  const marker = unconfirmedMerges.get(key);
+  const answer = await read();
+  const state = answer.pr?.state?.toUpperCase();
+  const shows =
+    answer.selected_pr_url != null &&
+    pullRequestIdentity(answer.selected_pr_url) === pullRequestIdentity(prUrl) &&
+    (state === "OPEN" || state === "CLOSED" || state === "MERGED");
+  if (marker && shows && unconfirmedMerges.get(key)?.revision === marker.revision) {
+    unconfirmedMerges.delete(key);
+    holdsChanged();
+  }
+  return answer;
+}
+
+// A queue change GitHub may have made holds the PR's other state changes too; so may a merge
+// whose answer was lost.
 const unconfirmedStateChangeSources = new Set<UnconfirmedStateChanges>([
   () => unconfirmedQueueChanges.values(),
+  () => unconfirmedMerges.values(),
 ]);
 
 /**
@@ -428,4 +486,6 @@ export function resetPullRequestStateHoldsForTests(): void {
   unconfirmedQueueListeners.clear();
   unconfirmedQueueVersion = 0;
   unconfirmedQueueRevision = 0;
+  unconfirmedMerges.clear();
+  unconfirmedMergeRevision = 0;
 }

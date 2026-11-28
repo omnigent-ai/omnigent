@@ -11,14 +11,18 @@ import type * as PullRequestRpcModule from "@/lib/pullRequestRpc";
 import type * as PageRouteModule from "@/pullRequestPage/pullRequestPageRoute";
 
 const rpc = vi.hoisted(() => ({
-  sent: [] as { method: string; resolve: (answer: unknown) => void }[],
+  sent: [] as {
+    method: string;
+    resolve: (answer: unknown) => void;
+    reject: (error: Error) => void;
+  }[],
   infoReads: [] as { resolve: (info: unknown) => void; reject: (error: Error) => void }[],
 }));
 vi.mock("@/lib/pullRequestRpc", async (importOriginal) => ({
   ...(await importOriginal<typeof PullRequestRpcModule>()),
   writePullRequestRpc: (_conversationId: string, request: { method: string }) =>
-    new Promise((resolve) => {
-      rpc.sent.push({ method: request.method, resolve });
+    new Promise((resolve, reject) => {
+      rpc.sent.push({ method: request.method, resolve, reject });
     }),
 }));
 vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => ({
@@ -34,7 +38,9 @@ vi.mock("./usePullRequests", async (importOriginal) => ({
     }),
 }));
 
+import { PullRequestMaybeSentError } from "@/lib/workspaceApi";
 import { resetPullRequestStateHoldsForTests } from "@/lib/pullRequestStateHolds";
+import { readFreshPullRequest } from "@/pullRequestPage/freshPullRequestRead";
 import { draftOwner } from "@/lib/workspaceDraftOwner";
 import {
   resetStateChainsForTests,
@@ -108,6 +114,64 @@ describe("state changes to one pull request", () => {
       rpc.sent[1]!.resolve({ object: "session.github.pr_state", pr_url: PR, state: "CLOSED" }),
     );
     expect(await closed).toBeDefined();
+  });
+
+  it("holds the PR after a lost merge answer, until a fresh read shows where it stands", async () => {
+    const { result, client } = renderHooks();
+    act(() =>
+      result.current.merge.mutate({ prUrl: PR, mergeMethod: "squash", expectedHead: "abc" }),
+    );
+    await vi.waitFor(() =>
+      expect(rpc.sent.map((sent) => sent.method)).toEqual(["mergePullRequest"]),
+    );
+    // The merge may have landed: its answer is lost.
+    await act(async () => rpc.sent[0]!.reject(new PullRequestMaybeSentError(new Error("dropped"))));
+    await vi.waitFor(() => expect(client.isMutating()).toBe(0));
+
+    // Another merge or a close is refused, with nothing sent, while the hold stands.
+    const refusedWhileHeld = async () => {
+      const onError = vi.fn();
+      act(() =>
+        result.current.merge.mutate(
+          { prUrl: PR, mergeMethod: "squash", expectedHead: "abc" },
+          { onError },
+        ),
+      );
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.stringMatching(/Check it again/) }),
+        expect.anything(),
+      );
+      let closed: unknown;
+      await act(async () => {
+        closed = await result.current.close.change(PR);
+      });
+      expect(closed).toMatchObject({
+        kind: "refused",
+        message: expect.stringMatching(/Check it again/),
+      });
+      expect(rpc.sent).toHaveLength(1);
+    };
+    await refusedWhileHeld();
+
+    // While the confirming read is pending, and after it fails, the hold stays.
+    const checking = readFreshPullRequest(client, SESSION, PR);
+    await vi.waitFor(() => expect(rpc.infoReads).toHaveLength(1));
+    await refusedWhileHeld();
+    rpc.infoReads[0]!.reject(new Error("offline"));
+    await expect(checking).resolves.toMatchObject({ result: "failed" });
+    await refusedWhileHeld();
+
+    // A read that shows the PR's state settles the lost merge; the merge is not sent again.
+    const confirmed = readFreshPullRequest(client, SESSION, PR);
+    await vi.waitFor(() => expect(rpc.infoReads).toHaveLength(2));
+    rpc.infoReads[1]!.resolve({ selected_pr_url: PR, pr: { url: PR, state: "OPEN" } });
+    await expect(confirmed).resolves.toMatchObject({ result: "confirmed" });
+    act(() =>
+      result.current.merge.mutate({ prUrl: PR, mergeMethod: "squash", expectedHead: "abc" }),
+    );
+    await vi.waitFor(() =>
+      expect(rpc.sent.map((sent) => sent.method)).toEqual(["mergePullRequest", "mergePullRequest"]),
+    );
   });
 
   it("holds a merge after a close GitHub may have made, until Check Again confirms it", async () => {

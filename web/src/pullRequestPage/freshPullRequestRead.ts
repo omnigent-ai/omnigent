@@ -8,6 +8,7 @@ import {
   fetchPullRequestInfo,
   type PullRequestAutoMerge,
 } from "@/newPullRequestPage/hooks/usePullRequests";
+import { readSettlingMerge } from "@/lib/pullRequestStateHolds";
 import type { FreshPullRequestFacts } from "./changeAttempts";
 import { autoMergeKnown } from "@/lib/pullRequestAutoMerge";
 import { currentWorkspaceAuthGeneration } from "@/lib/workspaceDraftOwner";
@@ -74,7 +75,9 @@ async function readFreshPullRequestOnHost(
   const generation = currentWorkspaceAuthGeneration();
   let info: ReadPullRequestInfo;
   try {
-    info = (await fetchPullRequestInfo(conversationId, prUrl)) as ReadPullRequestInfo;
+    info = (await readSettlingMerge(prUrl, () =>
+      fetchPullRequestInfo(conversationId, prUrl),
+    )) as ReadPullRequestInfo;
   } catch {
     return FAILED;
   }
