@@ -36,6 +36,7 @@ from omnigent.llms.errors import is_context_length_exceeded as _is_context_lengt
 from omnigent.models import model_catalog
 from omnigent.models.model_override import is_databricks_model_id
 from omnigent.process_logging import redact_log_text
+from omnigent.runtime.tool_result_replay import envelope_as_text
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
@@ -1664,7 +1665,8 @@ class OpenAIAgentsSDKExecutor(Executor):
                 result = self._tool_executor(_tool_name, args)
                 if hasattr(result, "__await__"):
                     result = await result  # type: ignore[assignment]
-                return result
+                # FunctionTool output is stringified; drop envelope image bytes.
+                return envelope_as_text(result) or result
 
             sdk_tools.append(
                 agents_sdk.FunctionTool(

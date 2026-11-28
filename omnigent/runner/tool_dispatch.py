@@ -100,6 +100,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsReadTool,
     SysOsShellTool,
     SysOsWriteTool,
+    read_for_agent,
 )
 from omnigent.tools.builtins.scheduled_tasks import (
     reminder_name,
@@ -9173,7 +9174,6 @@ async def _execute_os_env_tool(
     :returns: Serialized tool result string.
     """
     from omnigent.inner.os_env import (
-        _DEFAULT_READ_LIMIT,
         create_os_environment,
         validate_shell_arguments,
     )
@@ -9298,19 +9298,7 @@ async def _execute_os_env_tool(
             await asyncio.to_thread(os_env.isolate_model_credentials, model_access)
 
         if tool_name == SysOsReadTool.name():
-            result = await os_env.read(
-                path=cast("str", args.get("path", "")),
-                offset=cast("int", args.get("offset", 1)),
-                # Unspecified limit → agent-tool default (2 000 lines).
-                # None is now "unlimited" in _read_impl, so we must be explicit.
-                # Use is-None check (not `or`) so that invalid values like 0 are
-                # forwarded to os_env.read for validation rather than silently
-                # replaced with the default.
-                limit=cast(
-                    "int | None",
-                    lv if (lv := args.get("limit")) is not None else _DEFAULT_READ_LIMIT,
-                ),
-            )
+            result = await read_for_agent(os_env, {"path": "", **args})
         elif tool_name == SysOsWriteTool.name():
             _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:

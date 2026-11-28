@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, TextIO, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent.inner.os_env_pdf import is_pdf_file, read_pdf_pages
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -355,6 +356,8 @@ class OSEnvironment(ABC):
         max_bytes: int | None = None,
         *,
         regular_only: bool = False,
+        pdf: bool = False,
+        pages: str | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -1326,6 +1329,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
         max_bytes: int | None = None,
         *,
         regular_only: bool = False,
+        pdf: bool = False,
+        pages: str | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -1340,6 +1345,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "limit": limit,
                 "max_bytes": max_bytes,
                 "regular_only": regular_only,
+                "pdf": pdf,
+                "pages": pages,
             },
         )
         return cast(OpResult, result)
@@ -1675,11 +1682,14 @@ def _handle_helper_request(
                 return {"content": content.decode("utf-8"), "encoding": "utf-8"}
             except (OSError, UnicodeError) as exc:
                 return {"error": str(exc)}
+        pages_raw = request.get("pages")
         return _read_impl(
             path,
             offset,
             request.get("limit"),
             max_bytes=max_bytes,
+            pdf=request.get("pdf") is True,
+            pages=pages_raw if isinstance(pages_raw, str) else None,
         )
 
     if op == "write":
@@ -2140,6 +2150,8 @@ def _read_impl(
     offset: int,
     limit: JsonValue,
     max_bytes: int | None = None,
+    pdf: bool = False,
+    pages: str | None = None,
 ) -> OpResult:
     """
     Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
@@ -2169,6 +2181,10 @@ def _read_impl(
         :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
     :param max_bytes: Byte cap applied before text line-windowing. ``None``
         leaves text uncapped and returns a descriptor only for binary files.
+    :param pdf: Render PDFs as page text plus images (the agent ``sys_os_read``
+        path); other callers keep the binary descriptor.
+    :param pages: PDF page range for the agent path (see
+        :func:`omnigent.inner.os_env_pdf.read_pdf_pages`); an error for other files.
     :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
         ``content``, ``offset``, ``limit``, ``returned_lines``, and
         ``total_lines`` (unknown when byte-truncated), and ``truncated``.
@@ -2184,6 +2200,10 @@ def _read_impl(
     if max_bytes is not None and max_bytes < 1:
         return {"error": "max_bytes must be >= 1"}
 
+    if pdf and max_bytes is None and is_pdf_file(path):
+        return read_pdf_pages(path, pages)
+    if pages is not None:
+        return {"error": "pages applies only to PDF files"}
     if _is_binary_file(path):
         return _read_binary_impl(path, max_bytes)
 

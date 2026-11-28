@@ -3713,8 +3713,8 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
     from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
     class _SurrogatePathEnvironment:
-        async def read(self, *, path: str, offset: int, limit: object) -> dict[str, object]:
-            del offset, limit
+        async def read(self, *, path: str, **options: object) -> dict[str, object]:
+            del options
             return {"path": path, "content": "Привет", "encoding": "utf-8"}
 
         def close(self) -> None:
@@ -3907,8 +3907,8 @@ async def test_runner_os_env_error_is_httpx_transport_safe(
             self.cwd = tmp_path.resolve()
             self.close_count = 0
 
-        async def read(self, *, path: str, offset: int, limit: object) -> dict[str, object]:
-            del path, offset, limit
+        async def read(self, **options: object) -> dict[str, object]:
+            del options
             if self is environments[0]:
                 raise RuntimeError("ошибка для recording-\udcff.txt")
             return {"content": "recovered"}

@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Protocol, TypeAlias, TypedDict
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.runtime.tool_result_replay import envelope_as_text
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 from .datamodel import OSEnvSpec
@@ -526,6 +527,8 @@ def _encode_tool_result(result: object) -> object:
         return _tool_error_payload(encoded)
     if isinstance(result, str):
         return result
+    if (flattened := envelope_as_text(result)) is not None:
+        return flattened
     try:
         return json.dumps(result, default=str)
     except (TypeError, ValueError):

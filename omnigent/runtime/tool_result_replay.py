@@ -58,6 +58,27 @@ def image_omitted_placeholder(media_type: str | None) -> str:
     return _omitted_placeholder(media_type, "image")
 
 
+def envelope_as_text(value: object) -> str | None:
+    """Flatten an MCP image envelope to text for harnesses whose tool results are text.
+
+    :param value: Parsed tool result, e.g. a ``sys_os_read`` PDF result.
+    :returns: Text blocks joined by newlines with images as placeholders, or
+        ``None`` when *value* is not an image envelope.
+    """
+    image_result = decode_mcp_image_result(value)
+    if image_result is None:
+        return None
+    lines = [
+        str(block["text"])
+        if block["type"] == "text"
+        else image_omitted_placeholder(str(block["mimeType"]))
+        for block in image_result.content
+    ]
+    if image_result.is_error:
+        lines.insert(0, "Error:")
+    return "\n".join(lines)
+
+
 def _omitted_placeholder(media_type: object, kind: str) -> str:
     """Return the placeholder text for a stripped inline payload.
 
