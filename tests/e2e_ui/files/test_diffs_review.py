@@ -15,6 +15,7 @@ from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 from tests.e2e_ui.files._diffs_review import (
+    DESKTOP,
     WIDE,
     choose_in_tree,
     commit_then_edit,
@@ -261,6 +262,52 @@ def test_the_review_keeps_the_readers_place_and_a_line_it_expanded_across_a_visi
     expect(review).to_be_hidden()
     workspace_tab(sidebar, "Diffs").click()
     _expect_in_review(review, "line 150 marker")
+
+
+# Below the 1181px breakpoint the sidebar moves into the narrow layout's drawer.
+_NARROW = {"width": 900, "height": 900}
+
+
+def test_crossing_into_the_narrow_layout_and_back_keeps_the_readers_place(
+    page: Page,
+    git_session: tuple[str, str],  # noqa: F811 — pytest injects the imported fixture
+    tmp_path: Path,
+) -> None:
+    """Narrowing the window into the narrow layout and widening it again keeps the review
+    where the reader scrolled it, though the sidebar moves between the drawer and the rail."""
+    base_url, session_id = git_session
+    files = {
+        f"src/file{index:02}.py": (
+            "".join(f"value_{index}_{line} = 0\n" for line in range(60)),
+            "".join(f"value_{index}_{line} = 1\n" for line in range(60)),
+        )
+        for index in range(8)
+    }
+    commit_then_edit(_repository(tmp_path), files)
+    _sidebar, review = open_diffs(page, base_url, session_id)
+    expect(review.get_by_test_id("diff-review-file-count")).to_have_text("8 files", timeout=30_000)
+    target = review.get_by_text("value_5_10 = 1", exact=True)
+    scroller = review.locator(".diff-review-scroll")
+    scroller.hover()
+    for _ in range(80):
+        if _in_view(target, scroller):
+            break
+        page.mouse.wheel(0, 400)
+        page.wait_for_timeout(50)
+    expect(target).to_be_in_viewport()
+    _wait_until_still(target)
+    scrolled = scroller.evaluate("(element) => element.scrollTop")
+    assert scrolled > 1_000, scrolled
+
+    # The narrow layout keeps the sidebar in its drawer, closed until the person opens it.
+    page.set_viewport_size(_NARROW)
+    expect(page.locator("aside.mobile-panel-drawer .diff-review-scroll")).to_have_count(1)
+    page.set_viewport_size(DESKTOP)
+    expect(page.locator("aside.mobile-panel-drawer .diff-review-scroll")).to_have_count(0)
+    _expect_in_review(review, "value_5_10 = 1")
+    _wait_until_still(target)
+    # Back at the same width, the same lines: where the reader left the review.
+    assert abs(scroller.evaluate("(element) => element.scrollTop") - scrolled) <= 2
 
 
 def test_file_headers_copy_the_path_mark_it_viewed_and_expand_context(

@@ -142,3 +142,49 @@ it("gives the host and its desktop place no box in the contents layout", () => {
   cleanup();
   mobileTarget.remove();
 });
+
+it.each([true, false])(
+  "puts what was scrolled back after a layout change only when it keeps scroll (%s)",
+  (keepsScroll) => {
+    const mobileTarget = document.createElement("div");
+    document.body.appendChild(mobileTarget);
+    const slot = (mobile: boolean) => (
+      <ResponsiveViewerSlot mobile={mobile} mobileTarget={mobileTarget} keepsScroll={keepsScroll}>
+        <div data-testid="scroller">Long review</div>
+      </ResponsiveViewerSlot>
+    );
+    const { rerender, unmount } = render(slot(false));
+    const scroller = screen.getByTestId("scroller");
+    // jsdom has no layout; model a browser, where a move clears the moved node's scroll.
+    const offset = { top: 0, left: 0 };
+    Object.defineProperty(scroller, "scrollTop", {
+      get: () => offset.top,
+      set: (value: number) => (offset.top = value),
+    });
+    Object.defineProperty(scroller, "scrollLeft", {
+      get: () => offset.left,
+      set: (value: number) => (offset.left = value),
+    });
+    const appendChild = Node.prototype.appendChild;
+    const moves = vi.spyOn(Node.prototype, "appendChild").mockImplementation(function <
+      T extends Node,
+    >(this: Node, node: T) {
+      if (node.contains(scroller)) Object.assign(offset, { top: 0, left: 0 });
+      return appendChild.call(this, node) as T;
+    });
+    try {
+      Object.assign(offset, { top: 2400, left: 30 });
+      fireEvent.scroll(scroller);
+
+      for (const mobile of [true, false]) {
+        rerender(slot(mobile));
+        expect(mobileTarget.contains(scroller)).toBe(mobile);
+        expect(offset).toEqual(keepsScroll ? { top: 2400, left: 30 } : { top: 0, left: 0 });
+      }
+    } finally {
+      moves.mockRestore();
+      unmount();
+      mobileTarget.remove();
+    }
+  },
+);
