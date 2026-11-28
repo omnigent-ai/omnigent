@@ -231,18 +231,6 @@ def gh_target_host_scope(host: str | None) -> Iterator[None]:
         _gh_target_host.reset(token)
 
 
-def _default_github_host() -> str:
-    """Where ``gh`` sends a call that names no host and reads no checkout.
-
-    As ``gh`` picks it: ``GH_HOST``, else the host ``hosts.yml`` lists when it lists just
-    one, else github.com.
-    """
-    if gh_host := (os.environ.get("GH_HOST") or "").strip().lower():
-        return gh_host
-    stored = _gh_signed_in_hosts()
-    return next(iter(stored)) if len(stored) == 1 else "github.com"
-
-
 def checkout_github_host(root: str) -> str | None:
     """The GitHub host ``gh`` reads the checkout's pull requests from, if it's just one.
 
@@ -313,8 +301,8 @@ def _gate(argv: list[str], scope: str | None, cwd: str | None) -> str:
 
     Every call runs in a host scope, on a host the user set up for GitHub: a pull request
     URL can name any host, and ``gh`` would send it a token. The host the call goes to must
-    be the scope's, whether the argv names it, ``gh`` reads it from the checkout's remotes,
-    or it's ``GH_HOST`` or github.com.
+    be the scope's, whether the argv names it or ``gh`` reads it from the checkout's remotes.
+    A call that does neither is refused, since ``gh`` would pick its host.
 
     :returns: The host the call goes to.
     :raises gh_argv.GhArgvRefused: For a call that mustn't run.
@@ -328,12 +316,10 @@ def _gate(argv: list[str], scope: str | None, cwd: str | None) -> str:
             raise gh_argv.GhArgvRefused("The checkout has no single GitHub host to read")
     if not _known_github_host(scope):
         raise gh_argv.GhArgvRefused(f"{scope} isn't a host set up for GitHub")
-    if target.host is not None:
-        goes_to = target.host
-    elif target.from_checkout:
-        goes_to = checkout_github_host(cwd) if cwd else None
-    else:
-        goes_to = _default_github_host()
+    if target.host is None and not target.from_checkout:
+        # gh would pick GH_HOST or a hosts.yml host for it, which the gate doesn't predict.
+        raise gh_argv.GhArgvRefused("A gh call that reads no checkout must name its host")
+    goes_to = target.host or (checkout_github_host(cwd) if cwd else None)
     if goes_to is None or goes_to != scope:
         raise gh_argv.GhArgvRefused(
             f"A gh call for {scope} goes to {goes_to or 'no single GitHub host'}"
@@ -552,11 +538,11 @@ def _sign_in_hosts() -> list[str]:
     """github.com, ``GH_HOST``, configured hosts, then hosts.yml's, each once, up to the cap."""
     hosts = [
         "github.com",
-        _default_github_host(),
+        (os.environ.get("GH_HOST") or "").strip().lower(),
         *sorted(EnvInstances().hosts_for("github")),
         *sorted(_gh_signed_in_hosts()),
     ]
-    known = [host for host in dict.fromkeys(hosts) if _known_github_host(host)]
+    known = [host for host in dict.fromkeys(hosts) if host and _known_github_host(host)]
     if len(known) > _MAX_SIGN_IN_HOSTS:
         _logger.warning(
             "Listed GitHub sign-ins for the first %d hosts set up and skipped %d more",

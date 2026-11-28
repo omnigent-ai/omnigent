@@ -137,9 +137,13 @@ def test_gh_keeps_a_callers_timeout_and_starts_nothing_past_its_deadline(
     monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
 
     with github_resource.gh_target_host_scope("github.com"):
-        github_resource._gh(["api", "user"], cwd="/workspace", timeout=90.0)
+        github_resource._gh(
+            ["api", "--hostname", "github.com", "user"], cwd="/workspace", timeout=90.0
+        )
         with github_resource._gh_deadline_scope(0.0):
-            late = github_resource._gh(["api", "user"], cwd="/workspace")
+            late = github_resource._gh(
+                ["api", "--hostname", "github.com", "user"], cwd="/workspace"
+            )
 
     assert late == (None, "", "gh deadline exceeded")
     # github.com gets GH_TOKEN, never an enterprise token.
@@ -149,7 +153,12 @@ def test_gh_keeps_a_callers_timeout_and_starts_nothing_past_its_deadline(
         if name not in {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
     }
     assert gh_starts == [
-        {"argv": ["gh", "api", "user"], "cwd": "/workspace", "timeout": 90.0, "env": env}
+        {
+            "argv": ["gh", "api", "--hostname", "github.com", "user"],
+            "cwd": "/workspace",
+            "timeout": 90.0,
+            "env": env,
+        }
     ]
 
 
@@ -2022,8 +2031,8 @@ def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(github_resource, "_run", fake_run)
     with github_resource.gh_target_host_scope("github.com"):
-        github_resource._gh(["api", "user"], cwd="/tmp")
-    assert captured["argv"] == ["gh", "api", "user"]
+        github_resource._gh(["api", "--hostname", "github.com", "user"], cwd="/tmp")
+    assert captured["argv"] == ["gh", "api", "--hostname", "github.com", "user"]
     env = captured["env"]
     assert isinstance(env, dict)
     assert "GH_TOKEN" not in env
