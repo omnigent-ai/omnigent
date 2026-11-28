@@ -89,7 +89,12 @@ import {
 } from "@/lib/sessionDrafts";
 import { getCurrentAuthorId, getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
-import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import {
+  clearHostKeyless,
+  getSessionHost,
+  setSessionHost,
+  setSessionParent,
+} from "@/lib/sessionHost";
 import {
   setOmnigentHostConfig,
   type OmnigentAnalyticsEvent,
@@ -20610,6 +20615,162 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
       expect(useChatStore.getState().sandboxStatus?.stage).toBe("provisioning");
       expect(route.opens.map((open) => open.headers.get(SLICE_KEY))).toEqual(["host_b"]);
+      setSessionHost(id, null);
+    });
+
+    /** The default replica's snapshot: it alone holds the approval a keyless tunnel parked. */
+    function keylessApprovalSnapshot(id: string, host: string): Response {
+      return mockResponse({
+        id,
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        items: [],
+        labels: {},
+        pending_elicitations: [
+          {
+            type: "response.elicitation_request",
+            elicitation_id: "elic_keyless",
+            params: {
+              mode: "form",
+              message: "Codex wants to run **date**",
+              requestedSchema: null,
+              phase: "codex_command_approval",
+              policy_name: "codex_native_command_approval",
+              content_preview: "date",
+              command: "date",
+              cwd: "/tmp/workspace",
+            },
+          },
+        ],
+        pending_inputs: [],
+        host_id: host,
+      });
+    }
+
+    function keylessApprovalCard(): ElicitationBlock | undefined {
+      return useChatStore
+        .getState()
+        .blocks.find(
+          (b): b is ElicitationBlock =>
+            b.type === "elicitation" && b.elicitationId === "elic_keyless",
+        );
+    }
+
+    it("shows a pending approval after the first stream open falls back to keyless routing", async () => {
+      workspaceMode();
+      const id = "conv_keyless_approval";
+      const host = "host_keyless";
+      seedSession(id, []);
+      const route = routeKeyedStreamOpens({ snapshotExtras: new Map([[id, { host_id: host }]]) });
+      const routed = fetchMock.getMockImplementation()!;
+      let releaseKeyedOpen: (() => void) | null = null;
+      // The host's tunnel connected without a key, so only the default replica
+      // holds the approval; the host's keyed replica serves an empty snapshot.
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        const key = new Headers(init?.headers).get(SLICE_KEY);
+        if (path === `/v1/sessions/${id}/stream` && key === host) {
+          route.log.push(`open:${host}`);
+          return new Promise<Response>((resolve) => {
+            releaseKeyedOpen = () =>
+              resolve(
+                Response.json(
+                  { error: { code: "wrong_replica", slice_key: null } },
+                  { status: 400 },
+                ),
+              );
+          });
+        }
+        if (path === `/v1/sessions/${id}` && key === null && (init?.method ?? "GET") === "GET") {
+          route.log.push(`snapshot:${id}:keyless`);
+          return Promise.resolve(keylessApprovalSnapshot(id, host));
+        }
+        return routed(input, init);
+      });
+
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      expect(route.log).toContain(`open:${host}`);
+      expect(route.log).not.toContain(`snapshot:${id}:keyless`);
+      expect(useChatStore.getState().blocks.some((b) => b.type === "elicitation")).toBe(false);
+
+      releaseKeyedOpen!();
+      await drainAsync(50);
+
+      expect(keylessApprovalCard()?.status).toBe("pending");
+      const openedAt = route.log.indexOf("open:none");
+      expect(openedAt).toBeGreaterThan(route.log.indexOf(`open:${host}`));
+      expect(route.log.indexOf(`snapshot:${id}:keyless`)).toBeGreaterThan(openedAt);
+      expect(route.opens.map((open) => [open.headers.get(SLICE_KEY), open.aborted])).toEqual([
+        [null, false],
+      ]);
+      clearHostKeyless(host);
+      setSessionHost(id, null);
+    });
+
+    it("shows a pending approval when the keyed bind snapshot lands during the keyless backfill", async () => {
+      workspaceMode();
+      const id = "conv_keyless_approval_race";
+      const host = "host_keyless_race";
+      seedSession(id, []);
+      const route = routeKeyedStreamOpens({ snapshotExtras: new Map([[id, { host_id: host }]]) });
+      const routed = fetchMock.getMockImplementation()!;
+      let releaseKeyedOpen: (() => void) | null = null;
+      let releaseBindSnapshot: (() => void) | null = null;
+      let releaseBackfillSnapshot: (() => void) | null = null;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        const key = new Headers(init?.headers).get(SLICE_KEY);
+        if (path === `/v1/sessions/${id}/stream` && key === host) {
+          route.log.push(`open:${host}`);
+          return new Promise<Response>((resolve) => {
+            releaseKeyedOpen = () =>
+              resolve(
+                Response.json(
+                  { error: { code: "wrong_replica", slice_key: null } },
+                  { status: 400 },
+                ),
+              );
+          });
+        }
+        if (path === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+          if (key === host && releaseBindSnapshot === null) {
+            const keyedSnapshot = routed(input, init);
+            return new Promise<Response>((resolve) => {
+              releaseBindSnapshot = () => resolve(keyedSnapshot);
+            });
+          }
+          if (key === null) {
+            route.log.push(`snapshot:${id}:keyless`);
+            if (releaseBackfillSnapshot === null) {
+              return new Promise<Response>((resolve) => {
+                releaseBackfillSnapshot = () => resolve(keylessApprovalSnapshot(id, host));
+              });
+            }
+            return Promise.resolve(keylessApprovalSnapshot(id, host));
+          }
+        }
+        return routed(input, init);
+      });
+
+      const switching = useChatStore.getState().switchTo(id);
+      await drainAsync();
+      expect(route.log).toContain(`open:${host}`);
+      expect(releaseBindSnapshot).not.toBeNull();
+
+      releaseKeyedOpen!();
+      await drainAsync();
+      expect(releaseBackfillSnapshot).not.toBeNull();
+      // The empty keyed snapshot resets the transcript window while the backfill reads.
+      releaseBindSnapshot!();
+      await drainAsync();
+      releaseBackfillSnapshot!();
+      await drainAsync(50);
+      await switching;
+
+      expect(keylessApprovalCard()?.status).toBe("pending");
+      clearHostKeyless(host);
       setSessionHost(id, null);
     });
   });

@@ -223,7 +223,7 @@ import {
   noteSessionCreationFailed,
   noteFirstInputAccepted,
 } from "@/lib/sessionCreations";
-import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
+import { getSessionHost, isHostKeyless, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
@@ -7304,13 +7304,13 @@ export async function startStreamPump(
     backfill: async (settleStatus) => {
       backfillRuns += 1;
       const run = backfillRuns;
-      const outcome = await reconcileOnReconnect(
-        id,
-        set,
-        get,
-        ignoredNativeMessageIds,
-        settleStatus,
-      );
+      const reconcile = () =>
+        reconcileOnReconnect(id, set, get, ignoredNativeMessageIds, settleStatus);
+      let outcome = await reconcile();
+      // A window reset during the reads, such as the first bind's snapshot, can predate the gap.
+      if (outcome === "skipped" && !controller.signal.aborted && !isConversationDisposed(id)) {
+        outcome = await reconcile();
+      }
       // A slower earlier run must not overwrite the latest run's outcome.
       if (run === backfillRuns) missedEventRecovery.backfillOwed = outcome === "failed";
     },
@@ -7364,14 +7364,19 @@ export async function startStreamPump(
   // A host can be learned while an open is pending or backing off; the bind
   // snapshot may predate that gap even without a successful open.
   let hostReaddressed = false;
-  // The host the latest open was addressed to.
+  // The host the latest open was addressed to, and whether it was sent keyless.
   let openedHost = getSessionHost(id);
+  let openedKeyless = openedHost !== null && isHostKeyless(openedHost);
   const unsubscribeHost = isDatabricksWorkspace()
     ? subscribeSessionHostChanges(() => {
         const host = getSessionHost(id);
         if (host !== null && host !== openedHost) {
           hostReaddressed = true;
           liveAttempt?.abort();
+        } else if (host !== null && isHostKeyless(host) !== openedKeyless) {
+          // The open itself re-addressed, so earlier keyed reads may have hit another replica.
+          openedKeyless = !openedKeyless;
+          hostReaddressed = true;
         }
       })
     : undefined;
@@ -7406,6 +7411,7 @@ export async function startStreamPump(
       // an open that has hung past the stale window, not just a dead body.
       streamAttemptActivity.set(attempt, Date.now());
       openedHost = getSessionHost(id);
+      openedKeyless = openedHost !== null && isHostKeyless(openedHost);
       liveAttempt = attempt;
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
       // Whether this attempt opened, so its close is signaled exactly once.
