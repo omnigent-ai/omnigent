@@ -5,8 +5,9 @@ import type { QueryClient } from "@tanstack/react-query";
 
 import type { PullRequestActionOrigin } from "@/lib/pullRequestActionOrigin";
 import type { PullRequest } from "@/newPullRequestPage/hooks/usePullRequests";
+import { approvalHeld } from "@/pullRequestReviews/approveEligibility";
 import { hostReviewRoute } from "@/pullRequestReviews/hostReviews";
-import { reviewSubmitKey } from "@/pullRequestReviews/reviewSubmit";
+import { reviewSubmitKey, unsettledReviewEntry } from "@/pullRequestReviews/reviewSubmit";
 import { sendReviewOnHost } from "@/pullRequestReviews/sendReview";
 
 import { reviewRequestedFrom } from "./pullRequestListModel";
@@ -37,6 +38,9 @@ export function approveRowOnHost(options: {
 }): boolean {
   const route = hostReviewRoute(options.conversationId, options.prUrl, options.login);
   if (!route) return false;
+  // A review being written, sent or left unconfirmed goes first: the Review menu says why.
+  const held = unsettledReviewEntry(options.owner, options.prUrl, options.login);
+  if (approvalHeld(held, "no-comment")) return false;
   return sendReviewOnHost({
     key: reviewSubmitKey(options.owner, options.prUrl, options.login),
     route,

@@ -20,6 +20,7 @@ import {
   EMPTY_REVIEW,
   type ReviewEvent,
   forgetKeptReview,
+  readReviewSubmit,
   updateReviewSubmit,
   type SentReview,
 } from "./reviewSubmit";
@@ -122,6 +123,11 @@ export function sendReviewOnHost({
   onApplied,
   onRefused,
 }: SendReviewOnHostOptions): boolean {
+  // A review GitHub didn't confirm stays held until a check settles it, whoever sends next.
+  if (readReviewSubmit(key).status.kind === "uncertain") {
+    onRefused?.("unconfirmed", REVIEW_UNCONFIRMED);
+    return false;
+  }
   if (hostSends.has(key)) {
     updateReviewSubmit(key, (stored) => ({
       ...stored,

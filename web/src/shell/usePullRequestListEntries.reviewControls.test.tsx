@@ -15,6 +15,13 @@ import type { PullRequestAssociation } from "@/newPullRequestPage/hooks/usePullR
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { resetControlRequestsForTests, waitingControlFor } from "@/pullRequestPage/controlRequests";
 import { PullRequestRowDestinationContext } from "@/pullRequestPage/pullRequestDestination";
+import { draftOwner } from "@/lib/workspaceDraftOwner";
+import {
+  readReviewSubmit,
+  resetReviewSubmitForTests,
+  reviewSubmitKey,
+  updateReviewSubmit,
+} from "@/pullRequestReviews/reviewSubmit";
 
 import { usePullRequestListEntries } from "./usePullRequestListEntries";
 
@@ -143,7 +150,10 @@ beforeEach(() => {
   shell.canEdit = true;
   opened.length = 0;
 });
-afterEach(() => resetControlRequestsForTests());
+afterEach(() => {
+  resetControlRequestsForTests();
+  resetReviewSubmitForTests();
+});
 
 describe("a row's Review…", () => {
   it("is Review on GitHub, opening GitHub and sending nothing", () => {
@@ -277,6 +287,34 @@ describe("a row's Approve", () => {
     const [message, options] = host.toastError.mock.calls[0]!;
     expect(message).toBe("Couldn’t approve #7 Build: Reviews are locked.");
     expect(options.action.label).toBe("Open Review");
+  });
+
+  it("sends nothing after an unconfirmed approval, from the row or ⌘K, and opens the Review menu", async () => {
+    const { PullRequestMaybeSentError } = await import("@/lib/workspaceApi");
+    host.served = new Set(["submitReview", "submitReviewVerdict"]);
+    host.write.mockRejectedValue(new PullRequestMaybeSentError("lost"));
+    const { action, onSelect, commands } = rowFor("OPEN", undefined, ASKED);
+    const key = reviewSubmitKey(draftOwner(), PR, "dana");
+    act(() => action("approve")!.run());
+    await waitFor(() => expect(readReviewSubmit(key).status.kind).toBe("uncertain"));
+    const held = readReviewSubmit(key).status;
+    act(() => action("approve")!.run());
+    act(() => commands.find((command) => command.id === `approve:${PR}`)!.run());
+    expect(host.write).toHaveBeenCalledTimes(1);
+    expect(readReviewSubmit(key).status).toBe(held);
+    expect(onSelect).toHaveBeenCalledWith(PR, "here");
+    expect(waitingControlFor("page-detail", PR)).toBe("review");
+  });
+
+  it("keeps a review being written in the Review menu, sending nothing over it", () => {
+    host.served = new Set(["submitReview", "submitReviewVerdict"]);
+    const key = reviewSubmitKey(draftOwner(), PR, "dana");
+    updateReviewSubmit(key, (stored) => ({ ...stored, event: "REQUEST_CHANGES", body: "Fix it" }));
+    const { action, onSelect } = rowFor("OPEN", undefined, ASKED);
+    act(() => action("approve")!.run());
+    expect(host.write).not.toHaveBeenCalled();
+    expect(readReviewSubmit(key)).toMatchObject({ event: "REQUEST_CHANGES", body: "Fix it" });
+    expect(onSelect).toHaveBeenCalledWith(PR, "here");
   });
 
   it("isn't offered where the host doesn't serve verdicts", () => {
