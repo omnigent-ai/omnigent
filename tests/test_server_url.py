@@ -2,7 +2,7 @@
 
 The one representation of an Omnigent server URL: requests target
 ``api_base``, user-facing messages show ``display``. These tests pin the
-mapping between the two and the ``?o=`` (SPOG workspace selector)
+mapping between the two and the ``?o=`` workspace selector
 threading, so a regression can't leak the internal API mount back into
 user-facing text or drop the selector from copy-pasteable URLs.
 """
