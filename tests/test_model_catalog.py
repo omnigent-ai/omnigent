@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3268,3 +3268,232 @@ def test_acp_provider_resolution_failure_does_not_become_empty_catalog(
     unbound = _worker_spec("acp:custom")
     assert model_catalog.acp_curated_models(unbound) == ()
     model_catalog.validate_acp_model(unbound, "another-model")
+
+
+_OLLAMA_PROVIDER = ResolvedModelProvider(
+    kind="local", family="openai", base_url="http://ollama.example.test:11434/v1", api_key="local"
+)
+
+
+@pytest.fixture
+def ollama_probe(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[float]]:
+    """Enable the Ollama probe with fresh caches and a controllable clock."""
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    clock = [1_000.0]
+    monkeypatch.setattr(model_catalog, "_ollama_now", lambda: clock[0])
+    model_catalog._ollama_metadata_cache.clear()
+    model_catalog._ollama_probe_failed_at.clear()
+    yield clock
+    model_catalog._ollama_metadata_cache.clear()
+    model_catalog._ollama_probe_failed_at.clear()
+
+
+def _ollama_transport(
+    handler: Callable[[httpx.Request], httpx.Response], requests: list[httpx.Request]
+) -> httpx.MockTransport:
+    def _record(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return handler(request)
+
+    return httpx.MockTransport(_record)
+
+
+def _show_response(request: httpx.Request) -> httpx.Response:
+    model = json.loads(request.content)["model"]
+    if model == "missing:1b":
+        return httpx.Response(404, json={"error": f"model '{model}' not found"})
+    return httpx.Response(
+        200,
+        json={
+            "capabilities": ["completion", "thinking"],
+            "thinking": {"values": [False, "low", "medium"], "default": "medium"},
+        },
+    )
+
+
+def test_ollama_probe_describes_each_model_from_api_show(ollama_probe: list[float]) -> None:
+    requests: list[httpx.Request] = []
+
+    found = model_catalog.fetch_ollama_model_metadata(
+        _OLLAMA_PROVIDER,
+        ["thinker:8b", "missing:1b", "thinker:8b"],
+        transport=_ollama_transport(_show_response, requests),
+    )
+
+    assert set(found) == {"thinker:8b"}
+    assert found["thinker:8b"].supports(ModelCapability.REASONING) is True
+    assert [str(request.url) for request in requests] == [
+        "http://ollama.example.test:11434/api/show",
+        "http://ollama.example.test:11434/api/show",
+    ]
+    assert requests[0].method == "POST"
+    assert requests[0].headers["Authorization"] == "Bearer local"
+    # A missing model is not a reason to stop asking this endpoint.
+    assert model_catalog._ollama_probe_failed_at == {}
+
+
+def test_ollama_probe_reuses_cached_answers(ollama_probe: list[float]) -> None:
+    requests: list[httpx.Request] = []
+    transport = _ollama_transport(_show_response, requests)
+
+    model_catalog.fetch_ollama_model_metadata(
+        _OLLAMA_PROVIDER, ["thinker:8b"], transport=transport
+    )
+    again = model_catalog.fetch_ollama_model_metadata(
+        _OLLAMA_PROVIDER, ["thinker:8b"], transport=transport
+    )
+
+    assert "thinker:8b" in again
+    assert len(requests) == 1
+
+
+def _refuse_connection(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("connection refused", request=request)
+
+
+def _time_out(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("no response", request=request)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        pytest.param(
+            lambda _request: httpx.Response(404, text="404 page not found"), id="no-route"
+        ),
+        pytest.param(lambda _request: httpx.Response(405, text="Method Not Allowed"), id="method"),
+        pytest.param(lambda _request: httpx.Response(200, text="<html>hi</html>"), id="html-200"),
+        pytest.param(
+            lambda _request: httpx.Response(200, json={"object": "list"}), id="not-ollama"
+        ),
+        pytest.param(_refuse_connection, id="unreachable"),
+        pytest.param(_time_out, id="timeout"),
+    ],
+)
+def test_non_ollama_or_unreachable_endpoint_backs_off_and_returns_nothing(
+    ollama_probe: list[float], handler: Callable[[httpx.Request], httpx.Response]
+) -> None:
+    requests: list[httpx.Request] = []
+    transport = _ollama_transport(handler, requests)
+
+    first = model_catalog.fetch_ollama_model_metadata(
+        _OLLAMA_PROVIDER, ["a:1b", "b:1b"], transport=transport
+    )
+    during_backoff = model_catalog.fetch_ollama_model_metadata(
+        _OLLAMA_PROVIDER, ["a:1b"], transport=transport
+    )
+    ollama_probe[0] += model_catalog._OLLAMA_PROBE_BACKOFF_S
+    model_catalog.fetch_ollama_model_metadata(_OLLAMA_PROVIDER, ["a:1b"], transport=transport)
+
+    assert first == {} and during_backoff == {}
+    # One request before backing off, none during it, one after it expires.
+    assert len(requests) == 2
+
+
+def test_ollama_probe_gives_each_request_only_the_remaining_budget(
+    ollama_probe: list[float],
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def _slow_show(request: httpx.Request) -> httpx.Response:
+        ollama_probe[0] += 1.0
+        return _show_response(request)
+
+    found = model_catalog.fetch_ollama_model_metadata(
+        _OLLAMA_PROVIDER,
+        ["a:1b", "b:1b", "c:1b"],
+        transport=_ollama_transport(_slow_show, requests),
+    )
+
+    assert set(found) == {"a:1b", "b:1b"}
+    read_timeouts = [request.extensions["timeout"]["read"] for request in requests]
+    assert read_timeouts == pytest.approx([model_catalog._OLLAMA_SHOW_BUDGET_S, 0.5])
+
+
+def test_malformed_base_url_never_breaks_the_caller(ollama_probe: list[float]) -> None:
+    provider = ResolvedModelProvider(kind="local", family="openai", base_url="http://[::1/v1")
+
+    found = model_catalog.fetch_ollama_model_metadata(
+        provider, ["a:1b"], transport=_ollama_transport(_show_response, [])
+    )
+
+    assert found == {}
+
+
+def test_ollama_probe_respects_the_lookup_kill_switch(
+    ollama_probe: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
+    requests: list[httpx.Request] = []
+
+    found = model_catalog.fetch_ollama_model_metadata(
+        _OLLAMA_PROVIDER, ["a:1b"], transport=_ollama_transport(_show_response, requests)
+    )
+
+    assert found == {} and requests == []
+
+
+def test_cached_answers_survive_another_models_failed_probe(ollama_probe: list[float]) -> None:
+    def _first_ok_then_timeout(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content)["model"] == "cached:8b":
+            return _show_response(request)
+        return _time_out(request)
+
+    requests: list[httpx.Request] = []
+    transport = _ollama_transport(_first_ok_then_timeout, requests)
+    model_catalog.fetch_ollama_model_metadata(_OLLAMA_PROVIDER, ["cached:8b"], transport=transport)
+    model_catalog.fetch_ollama_model_metadata(_OLLAMA_PROVIDER, ["slow:8b"], transport=transport)
+
+    during_backoff = model_catalog.fetch_ollama_model_metadata(
+        _OLLAMA_PROVIDER, ["cached:8b", "slow:8b"], transport=transport
+    )
+
+    assert set(during_backoff) == {"cached:8b"}
+    # The backed-off endpoint is not asked again.
+    assert len(requests) == 2
+
+
+def test_each_credential_gets_its_own_cached_answer(ollama_probe: list[float]) -> None:
+    requests: list[httpx.Request] = []
+    transport = _ollama_transport(_show_response, requests)
+    other_key = ResolvedModelProvider(
+        kind="local", family="openai", base_url=_OLLAMA_PROVIDER.base_url, api_key="other"
+    )
+
+    model_catalog.fetch_ollama_model_metadata(_OLLAMA_PROVIDER, ["a:1b"], transport=transport)
+    model_catalog.fetch_ollama_model_metadata(other_key, ["a:1b"], transport=transport)
+
+    assert [request.headers["Authorization"] for request in requests] == [
+        "Bearer local",
+        "Bearer other",
+    ]
+
+
+def test_auth_command_is_never_run_for_the_probe(ollama_probe: list[float]) -> None:
+    requests: list[httpx.Request] = []
+    provider = ResolvedModelProvider(
+        kind="local",
+        family="openai",
+        base_url=_OLLAMA_PROVIDER.base_url,
+        auth_command="exit 1",
+    )
+
+    found = model_catalog.fetch_ollama_model_metadata(
+        provider, ["a:1b"], transport=_ollama_transport(_show_response, requests)
+    )
+
+    assert "a:1b" in found
+    assert "Authorization" not in requests[0].headers
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("http://localhost:11434/v1", "http://localhost:11434"),
+        ("http://localhost:11434/v1/", "http://localhost:11434"),
+        ("http://localhost:11434", "http://localhost:11434"),
+        ("http://gpu-box.example.test/ollama/v1", "http://gpu-box.example.test/ollama"),
+    ],
+)
+def test_ollama_api_root_strips_only_the_openai_suffix(base_url: str, expected: str) -> None:
+    assert model_catalog._ollama_api_root(base_url) == expected

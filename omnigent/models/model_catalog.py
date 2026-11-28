@@ -37,6 +37,8 @@ import os
 import re
 import subprocess
 import threading
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
@@ -48,6 +50,10 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.llms.ollama_model_metadata import (
+    looks_like_ollama_show,
+    parse_ollama_model_metadata,
+)
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -2105,6 +2111,110 @@ def _fetch_openai_compatible_listing(
         models=tuple(models),
         note=f"models reported by {_models_url(provider.base_url)}",
     )
+
+
+# Session launch waits on these probes, so they stay short and an endpoint that
+# fails one (unreachable, or not Ollama) is skipped for a while.
+_OLLAMA_SHOW_CONNECT_TIMEOUT_S = 0.5
+_OLLAMA_SHOW_BUDGET_S = 1.5
+_OLLAMA_PROBE_BACKOFF_S = 60.0
+_ollama_metadata_cache: TTLCache[tuple[str, str, str], ModelMetadata] = TTLCache(
+    maxsize=256, ttl=_CATALOG_TTL_S
+)
+_ollama_probe_failed_at: dict[str, float] = {}
+_ollama_cache_lock = threading.Lock()
+
+
+def _ollama_now() -> float:
+    """Return a monotonic clock reading through a test-local patch seam."""
+    return time.monotonic()
+
+
+def _ollama_api_root(base_url: str) -> str:
+    """Return Ollama's native API root for an OpenAI-compatible base URL.
+
+    :param base_url: e.g. ``"http://localhost:11434/v1"``.
+    :returns: e.g. ``"http://localhost:11434"``.
+    """
+    return base_url.rstrip("/").removesuffix("/v1")
+
+
+def fetch_ollama_model_metadata(
+    provider: ResolvedModelProvider,
+    model_ids: Sequence[str],
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, ModelMetadata]:
+    """Ask an Ollama endpoint what each model supports, best-effort.
+
+    Sends one ``POST /api/show`` per uncached model within a short total
+    budget. Any failure, or a response without Ollama's shape, returns what is
+    known so far and stops probing that endpoint for a while; cached answers are
+    still returned meanwhile. Models it cannot describe are left out of the result.
+
+    :param provider: A ``kind="local"`` provider descriptor with a ``base_url``.
+    :param model_ids: Model ids to describe, e.g. ``["qwen3:8b"]``.
+    :param transport: Optional httpx transport override for tests.
+    :returns: Metadata for each model the endpoint described.
+    """
+    if not provider.base_url or os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
+        return {}
+    root = _ollama_api_root(provider.base_url)
+    fingerprint = _credential_fingerprint(provider)
+    found: dict[str, ModelMetadata] = {}
+    pending: list[str] = []
+    with _ollama_cache_lock:
+        for model_id in dict.fromkeys(model_ids):
+            cached = _ollama_metadata_cache.get((root, model_id, fingerprint))
+            if cached is None:
+                pending.append(model_id)
+            else:
+                found[model_id] = cached
+        failed_at = _ollama_probe_failed_at.get(root)
+        backing_off = failed_at is not None and _ollama_now() - failed_at < _OLLAMA_PROBE_BACKOFF_S
+    if not pending or backing_off:
+        return found
+    # Only an inline key is sent; running an auth_command could stall a launch.
+    headers = {"Authorization": f"Bearer {provider.api_key}"} if provider.api_key else {}
+    deadline = _ollama_now() + _OLLAMA_SHOW_BUDGET_S
+    try:
+        with httpx.Client(transport=transport) as client:
+            for model_id in pending:
+                remaining = deadline - _ollama_now()
+                if remaining <= 0:
+                    break
+                resp = client.post(
+                    f"{root}/api/show",
+                    json={"model": model_id},
+                    headers=headers,
+                    timeout=httpx.Timeout(
+                        remaining, connect=min(remaining, _OLLAMA_SHOW_CONNECT_TIMEOUT_S)
+                    ),
+                )
+                if resp.status_code == 404 and _is_ollama_missing_model(resp):
+                    continue
+                resp.raise_for_status()
+                payload = resp.json()
+                if not looks_like_ollama_show(payload):
+                    raise ValueError("response is not an Ollama /api/show body")
+                metadata = parse_ollama_model_metadata(payload)
+                found[model_id] = metadata
+                with _ollama_cache_lock:
+                    _ollama_metadata_cache[(root, model_id, fingerprint)] = metadata
+    except Exception:  # a failed probe must not affect the launch
+        _logger.info("Ollama model details unavailable from %s", root, exc_info=True)
+        with _ollama_cache_lock:
+            _ollama_probe_failed_at[root] = _ollama_now()
+    return found
+
+
+def _is_ollama_missing_model(resp: httpx.Response) -> bool:
+    """Whether a 404 is Ollama reporting an unknown model, not a missing route."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and isinstance(payload.get("error"), str)
 
 
 def _fetch_anthropic_listing(
