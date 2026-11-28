@@ -20,6 +20,7 @@ simply knows nothing about them until the host reconnects and re-reports.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import threading
@@ -98,6 +99,12 @@ def _canonical_host_id(host_id: str) -> str:
         return uuid_to_bytes(host_id).hex()
     except InvalidUuidError:
         return host_id
+
+
+def _resolve_host_waiter(waiter: asyncio.Future[HostConnection], conn: HostConnection) -> None:
+    """Deliver a registered connection to a still-active ``wait_for_host`` caller."""
+    if not waiter.done():
+        waiter.set_result(conn)
 
 
 def _fail_pending_harness_startup(conn: HostConnection) -> None:
@@ -679,6 +686,7 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        self._host_waits: dict[tuple[int, str], set[asyncio.Future[HostConnection]]] = {}
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
@@ -808,13 +816,58 @@ class HostRegistry:
                 _fail_pending_clones(old)
                 _fail_pending_harness_rpcs(old)
             self._hosts[key] = conn
+            waiters = self._host_waits.pop(key, set())
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
                     hello.interactive_shells
                 )
             else:
                 self._interactive_shells.pop(host_id, None)
+        for waiter in waiters:
+            # A waiter whose event loop already closed has nobody left to wake.
+            with contextlib.suppress(RuntimeError):
+                waiter.get_loop().call_soon_threadsafe(_resolve_host_waiter, waiter, conn)
         return conn
+
+    async def wait_for_host(
+        self,
+        host_id: str,
+        *,
+        timeout_s: float,
+        workspace_id: int | None = None,
+        replacing: HostConnection | None = None,
+    ) -> HostConnection | None:
+        """Wait until a host registers on this replica or the timeout expires.
+
+        :param host_id: Host identifier, in any accepted spelling
+            (see :func:`_canonical_host_id`).
+        :param timeout_s: Maximum seconds to wait, e.g. ``60.0``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :param replacing: A connection the caller already handled; while it
+            is still registered, wait for the next registration instead.
+        :returns: The registered :class:`HostConnection`, or ``None`` if the
+            host did not connect here before the timeout.
+        """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        key = (ws_id, _canonical_host_id(host_id))
+        waiter: asyncio.Future[HostConnection] = asyncio.get_running_loop().create_future()
+        with self._lock:
+            current = self._hosts.get(key)
+            if current is not None and current is not replacing:
+                return current
+            self._host_waits.setdefault(key, set()).add(waiter)
+        try:
+            return await asyncio.wait_for(waiter, timeout=max(0.0, timeout_s))
+        except TimeoutError:
+            return None
+        finally:
+            with self._lock:
+                waiters = self._host_waits.get(key)
+                if waiters is not None:
+                    waiters.discard(waiter)
+                    if not waiters:
+                        del self._host_waits[key]
 
     def deregister(
         self,

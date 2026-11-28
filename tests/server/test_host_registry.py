@@ -285,6 +285,37 @@ async def test_inventory_waiters_on_closed_owner_loop_are_ignored() -> None:
     closed_enabled.cancel()
 
 
+async def test_wait_for_host_wakes_on_register_in_its_workspace() -> None:
+    """A waiter wakes when its host registers in its workspace and leaves no waiter behind.
+
+    A caller that already handled the current connection waits for its replacement.
+    """
+    registry = HostRegistry()
+    host_id = "00112233445566778899aabbccddeeff"
+    with workspace_scope(111):
+        waiting = asyncio.ensure_future(registry.wait_for_host(host_id, timeout_s=5.0))
+        await asyncio.sleep(0)
+    with workspace_scope(222):
+        registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+    await asyncio.sleep(0)
+    assert not waiting.done()
+
+    with workspace_scope(111):
+        conn = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+        assert await asyncio.wait_for(waiting, timeout=1.0) is conn
+        assert await registry.wait_for_host(host_id, timeout_s=0.0) is conn
+        assert await registry.wait_for_host(host_id, timeout_s=0.01, replacing=conn) is None
+        replaced = asyncio.ensure_future(
+            registry.wait_for_host(host_id, timeout_s=5.0, replacing=conn)
+        )
+        await asyncio.sleep(0)
+        replacement = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+        assert await asyncio.wait_for(replaced, timeout=1.0) is replacement
+        registry.deregister(host_id)
+        assert await registry.wait_for_host(host_id, timeout_s=0.01) is None
+    assert registry._host_waits == {}
+
+
 def test_deregister_returns_false_for_unknown() -> None:
     """
     Verify that deregister reports whether it removed an entry.

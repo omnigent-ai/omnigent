@@ -578,6 +578,19 @@ class Lab:
         with self.server_down(graceful=graceful):
             time.sleep(downtime_s)
 
+    def stop_host(self) -> None:
+        """Quit the host daemon as Ctrl-C in its terminal does; its runners exit with it."""
+        assert self._host is not None
+        self.events.emit("lab", "host_down")
+        self._host.stop(graceful_signal=signal.SIGINT, timeout=45.0)
+
+    def start_host(self) -> None:
+        """Start the host daemon again with the same identity; wait until it is online."""
+        assert self._host is not None
+        self._host.start()
+        self._wait_host_online()
+        self.events.emit("lab", "host_up")
+
     def runner_processes(self) -> list[psutil.Process]:
         """Live runner processes (host-launched or direct)."""
         if self._runner is not None:
@@ -1004,7 +1017,10 @@ class Lab:
             self.proxies.host.url,
         ]
         self._host = self._spawn("host", argv, env)
-        assert self.observer is not None
+        self._wait_host_online()
+
+    def _wait_host_online(self) -> None:
+        assert self.observer is not None and self._host is not None
         observer, host = self.observer, self._host
         deadline = time.monotonic() + _STARTUP_TIMEOUT_S
         timeout_detail = (

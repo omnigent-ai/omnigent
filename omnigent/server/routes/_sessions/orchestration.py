@@ -9735,6 +9735,9 @@ _MID_TURN_STATUSES = ("running", "waiting")
 HOST_OFFLINE_HOLD_S: float = 72 * 3600.0
 # How often a host-offline hold re-checks whether the host came back.
 HOST_OFFLINE_RECHECK_S: float = 60.0
+# A host that reconnects without listing the held runner restarted and lost it,
+# so the turn settles after this short grace instead of the full runner grace.
+HOST_BACK_WITHOUT_RUNNER_S: float = 5.0
 
 # Set at app startup: whether a lost relay's turn is being held by the
 # runner's disconnect task because its host went offline too.

@@ -36,6 +36,7 @@ during an outage is best-effort.
 | S6 | Client offline | Browser link half-open or refused while a real page is open | [`test_s6_client_offline.py`](../tests/e2e/resilience/scenarios/test_s6_client_offline.py) |
 | S7 | Model or gateway outage | Model link refused, before the first model call or mid-stream | [`test_s7_model_loss.py`](../tests/e2e/resilience/scenarios/test_s7_model_loss.py) |
 | S8 | Credentials expire during the outage | Not yet: needs an authenticated lab mode | — |
+| S9 | Host restarted after an outage | Host and model links refused mid-turn; the host is stopped and started again | [`test_s9_host_restart_after_offline.py`](../tests/e2e/resilience/scenarios/test_s9_host_restart_after_offline.py) |
 
 ## Matrix
 
@@ -71,6 +72,7 @@ runs at 120 s because it must outlast Claude Code's request timeout.
 | S7 | before the first call, mid-stream | 10 s / 60 s | pass | pass |
 | S7 | before the first call | 180 s | pass | pass |
 | S7 | mid-stream | 180 s | gap: [R7](#r7-a-turn-that-lost-the-model-has-no-retry) | pass |
+| S9 | tool running | 120 s | pass | not covered |
 
 Native Claude terminals retry a model request that gets no response headers
 within `RetryPolicy`'s 120 s per-request timeout. To give a slower gateway more
