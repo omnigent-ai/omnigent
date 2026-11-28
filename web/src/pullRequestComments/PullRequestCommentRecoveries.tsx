@@ -46,8 +46,12 @@ function copyKept(text: string) {
   );
 }
 
-/** The workspace user's changes to `prUrl`'s comments that none of `listedIds` names. */
+/**
+ * The workspace user's changes to `prUrl`'s comments that none of `listedIds` names, as
+ * `sessionId`'s view may show them.
+ */
 export function useUnlistedCommentEdits(
+  sessionId: string,
   prUrl: string | null,
   listedIds: ReadonlySet<string>,
 ): ListedCommentEdit[] {
@@ -57,9 +61,11 @@ export function useUnlistedCommentEdits(
     () =>
       edits.filter(
         ({ commentId, entry }) =>
-          needsRecovery(entry) && !listedIds.has(commentId) && commentEditVisible(entry, prUrl),
+          needsRecovery(entry) &&
+          !listedIds.has(commentId) &&
+          commentEditVisible(entry, prUrl, sessionId),
       ),
-    [edits, listedIds, prUrl],
+    [edits, listedIds, prUrl, sessionId],
   );
 }
 
@@ -80,7 +86,7 @@ export function PullRequestCommentRecoveries({
 }) {
   const queryClient = useQueryClient();
   const owner = useWorkspaceDraftOwner();
-  const unlisted = useUnlistedCommentEdits(prUrl, listedIds);
+  const unlisted = useUnlistedCommentEdits(conversationId, prUrl, listedIds);
   // The entry Discard was opened for, with the workspace user and PR it belongs to: once
   // either changes, the dialog closes, and its confirmation never reaches another's text.
   const [asked, setAsked] = useState<{ key: string; owner: string; prUrl: string | null } | null>(

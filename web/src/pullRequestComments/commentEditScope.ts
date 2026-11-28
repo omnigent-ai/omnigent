@@ -21,9 +21,16 @@ export function pendingScopeCurrent(
 }
 
 /**
- * Whether `entry` may show on `prUrl`: a published comment's always, a private draft's only while
- * its route is current. Another route's text stays kept.
+ * Whether `entry` may show on `prUrl` in `sessionId`'s view: a published comment's always, a
+ * private draft's only in the session it was read in, while its route is current. Another
+ * session's or route's text stays kept for it.
  */
-export function commentEditVisible(entry: CommentEditEntry, prUrl: string | null): boolean {
-  return !entry.privateScope || pendingScopeCurrent(entry.privateScope, prUrl);
+export function commentEditVisible(
+  entry: CommentEditEntry,
+  prUrl: string | null,
+  sessionId: string,
+): boolean {
+  const scope = entry.privateScope;
+  if (!scope) return true;
+  return scope.host?.conversationId === sessionId && pendingScopeCurrent(scope, prUrl);
 }

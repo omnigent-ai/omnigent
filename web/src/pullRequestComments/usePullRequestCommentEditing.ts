@@ -145,7 +145,7 @@ export function usePullRequestCommentEditing(
   const keptEntry = useCommentEdit(key);
   // Another route's private draft text under this comment stays theirs: nothing of it shows
   // here, and nothing here may change it, until that route is back.
-  const othersPrivate = !commentEditVisible(keptEntry, prUrl);
+  const othersPrivate = !commentEditVisible(keptEntry, prUrl, conversationId);
   const entry = othersPrivate ? EMPTY_ENTRY : keptEntry;
   const editWrite = usePullRequestCommentEditWrite(conversationId, operations.edit);
   const deleteWrite = usePullRequestCommentEditWrite(conversationId, operations.delete);
@@ -174,7 +174,7 @@ export function usePullRequestCommentEditing(
   const canDelete = !othersPrivate && !!commentId && subject.canDelete === true && offers("delete");
   const shown = canEdit || canDelete || entry !== EMPTY_ENTRY;
   const update = (change: (current: CommentEditEntry) => CommentEditEntry) => {
-    if (key && commentEditVisible(readCommentEdit(key), prUrl)) {
+    if (key && commentEditVisible(readCommentEdit(key), prUrl, conversationId)) {
       updateCommentEdit(key, change);
     }
   };
@@ -197,7 +197,7 @@ export function usePullRequestCommentEditing(
   ) => {
     if (!key || !commentId) return;
     const current = readCommentEdit(key);
-    if (commentChangeHeld(current) || !commentEditVisible(current, prUrl)) return;
+    if (commentChangeHeld(current) || !commentEditVisible(current, prUrl, conversationId)) return;
     // Decided again now: the route the render saw may have changed since.
     const host = hostRouteFor(change);
     const hostTarget = host ? parseCodeHostPullRequestUrl(prUrl) : null;
@@ -319,9 +319,13 @@ export function usePullRequestCommentEditing(
         hasKeptText: kept !== null,
         start: () => {
           if (!canEdit || blockedReason) return;
+          // A draft's text is this session's from the first keystroke, not only once it's sent.
+          const host = hostRouteFor("edit");
+          if (pendingReviewId && !host) return;
           update((current) => ({
             ...startEditing(current, subject.body),
             kind: threadId ? "review" : "issue",
+            ...(host ? privateScopeOf(host) : {}),
           }));
         },
         save,
