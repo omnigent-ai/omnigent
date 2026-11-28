@@ -82,7 +82,7 @@ def _transport(ids=("gateway/main", "gateway/fast", "gateway/noisy"), requests=N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["lakebox", "kubernetes", "agent_sandbox", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "kubernetes", "agent_sandbox", "modal"])
 @pytest.mark.parametrize("inference", [None, {}, {"harnesses": {}}])
 async def test_unconfigured_sandboxes_preserve_legacy_credentials(provider, inference):
     config = copy.deepcopy(_state().sandbox_config.default.host_config)

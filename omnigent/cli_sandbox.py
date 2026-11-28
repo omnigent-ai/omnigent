@@ -201,9 +201,7 @@ def sandbox() -> None:
     "--sandbox-id",
     "sandbox_id",
     default=None,
-    # Lakebox-flow option (re-ship code into a long-lived sandbox, dodging
-    # its slow provisioning + per-sandbox OAuth dance) — hidden from --help
-    # pending removal. Disposable-sandbox providers just create a new one.
+    # Existing sandboxes can skip provisioning when the provider supports it.
     hidden=True,
     help="Attach to an existing sandbox by id (skip provisioning).",
 )
@@ -218,9 +216,7 @@ def sandbox() -> None:
     "server_url",
     required=True,
     help=(
-        "Server URL the sandbox will register with. Determines the "
-        "Databricks workspace the sandbox is created in (same "
-        f"inference as `{cli_invocation()} login`), and the bootstrap finishes "
+        "Server URL the sandbox will register with. The bootstrap finishes "
         f"by logging the sandbox in to it (`{cli_invocation()} login` inside the "
         "sandbox — one browser step)."
     ),
@@ -255,15 +251,13 @@ def sandbox_create(
     """
     Provision a sandbox and ship Omnigent into it.
 
-    The server's workspace is derived from ``--server`` (the same
-    unauthenticated probe ``omnigent login`` uses), and for lakebox
-    the sandbox is created IN that workspace — so the sandbox always
-    lives where the server lives, regardless of the local default
-    profile. Builds the Omnigent wheels from your local checkout,
-    installs them into the fresh sandbox, and finishes by logging the
-    sandbox in to the server (``omnigent login`` runs inside the
-    sandbox; the browser step is driven from this machine). Sandboxes
-    are disposable — when your code changes, just create a new one.
+    The server's workspace is derived from ``--server`` using the same
+    unauthenticated probe as ``omnigent login``. Builds the Omnigent
+    wheels from your local checkout, installs them into the fresh
+    sandbox, and finishes by logging the sandbox in to the server
+    (``omnigent login`` runs inside the sandbox; the browser step is
+    driven from this machine). Sandboxes are disposable — when your
+    code changes, just create a new one.
 
     After this finishes, run ``omnigent sandbox connect`` to register
     the sandbox as a host with your server.
@@ -279,7 +273,6 @@ def sandbox_create(
     launcher = _require_cli_bootstrap(
         get_launcher(
             provider,
-            workspace_host=workspace.host if workspace is not None else None,
             server_url=app_url,
         )
     )
@@ -300,8 +293,7 @@ def sandbox_create(
     _print_ready_banner(provider, sandbox_id, app_url)
 
 
-# The auth flow is Databricks-specific (in-sandbox server login) —
-# hidden from --help pending removal; still invocable for lakebox users.
+# Re-authenticate an existing sandbox without provisioning a replacement.
 @sandbox.command("auth", hidden=True)
 @click.option(
     "--provider",
@@ -342,7 +334,6 @@ def sandbox_auth(
     launcher = _require_cli_bootstrap(
         get_launcher(
             provider,
-            workspace_host=workspace.host if workspace is not None else None,
             server_url=app_url,
         )
     )
@@ -391,9 +382,8 @@ def sandbox_connect(
     Register the sandbox as a host with your server.
 
     Runs ``omnigent host --server <url>`` inside the sandbox — the
-    host resolves its own credentials (a stored ``omnigent login``
-    token, or the sandbox's ambient Databricks credentials such as the
-    Lakebox image's baked workspace PAT). The remote command holds a
+    host resolves its own credentials (for example, a stored
+    ``omnigent login`` token). The remote command holds a
     WebSocket open until interrupted — Ctrl-C tears down the
     foreground transport and the remote process.
 
@@ -401,17 +391,12 @@ def sandbox_connect(
     sandboxes that share a hostname collide on the server's
     (owner, name) primary key.
     """
-    from omnigent.onboarding.sandboxes import connect_sandbox_host, derive_workspace
+    from omnigent.onboarding.sandboxes import connect_sandbox_host
 
     app_url = _normalize_server_url(server_url)
-    # The sandbox lives in the server's workspace (create pinned it
-    # there) — the local `lakebox ssh` transport must resolve through
-    # the same workspace to find it.
-    workspace = derive_workspace(app_url)
     launcher = _require_cli_bootstrap(
         get_launcher(
             provider,
-            workspace_host=workspace.host if workspace is not None else None,
             server_url=app_url,
         )
     )
@@ -421,33 +406,3 @@ def sandbox_connect(
         server_url=app_url,
         host_name=host_name,
     )
-
-
-# Hidden lakebox alias; still fully invocable.
-@click.group("lakebox", hidden=True)
-@click.pass_context
-def lakebox(ctx: click.Context) -> None:
-    """
-    Alias for ``omnigent sandbox … --provider lakebox``.
-
-    Kept so existing muscle memory and scripts keep working. The
-    subcommands (``create`` / ``auth`` / ``connect``) are the exact
-    ``omnigent sandbox`` commands with ``--provider lakebox``
-    pre-filled.
-    """
-    # Pre-fill --provider for the shared sandbox subcommands so
-    # `omnigent lakebox <sub>` ≡ `omnigent sandbox <sub> --provider
-    # lakebox`. default_map values satisfy the (required) --provider
-    # option without redeclaring it on these aliased commands.
-    ctx.default_map = {
-        "create": {"provider": "lakebox"},
-        "auth": {"provider": "lakebox"},
-        "connect": {"provider": "lakebox"},
-    }
-
-
-# Reuse the same command objects (Click allows a command to live in more
-# than one group); the default_map above fixes their provider to lakebox.
-lakebox.add_command(sandbox_create, "create")
-lakebox.add_command(sandbox_auth, "auth")
-lakebox.add_command(sandbox_connect, "connect")

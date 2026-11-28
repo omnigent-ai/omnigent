@@ -480,7 +480,7 @@ class SessionsNamespace:
             runs it on a caller-managed runner; ``"managed"`` uploads the
             bundle and has the server provision a sandbox host to run it.
         :param sandbox_provider: With ``host_type="managed"``, which
-            configured sandbox provider to provision (e.g. ``"lakebox"``);
+            configured sandbox provider to provision (e.g. ``"modal"``);
             ``None`` takes the server's first. Ignored for external hosts.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
