@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from omnigent_client import TERMINAL_TASK_STATUSES, child_session_busy
+from omnigent_client.session_lifecycle import is_session_closed
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
@@ -255,7 +256,7 @@ class _SubagentNode:
     # web-parity ``Failed`` label (outranks a stale ``completed`` status).
     last_task_error: bool = False
     # Whether the child session is closed to new user input — derived from its
-    # labels / title via :func:`omnigent.util.session_lifecycle.is_session_closed`.
+    # labels / title via :func:`omnigent_client.session_lifecycle.is_session_closed`.
     # Sticky (a closed session never reopens); gates interactive chat: a closed
     # child is view-only because a ``message`` to it returns 409 CONFLICT.
     closed: bool = False
@@ -667,6 +668,11 @@ def _term_height() -> int:
         return os.get_terminal_size().lines
     except (ValueError, OSError):
         return 24
+
+
+def _server_not_installed(err: Exception) -> bool:
+    """Whether ``err`` only says ``omnigent`` is not installed, so there is no CLI log."""
+    return isinstance(err, ModuleNotFoundError) and err.name == "omnigent"
 
 
 def _prompt_input_max_rows() -> int:
@@ -1544,7 +1550,8 @@ class TerminalHost:
 
             redirect_stderr_to_log()
         except Exception as err:
-            _log.exception("Failed to redirect stderr to the CLI diagnostics log: %s", err)
+            if not _server_not_installed(err):
+                _log.exception("Failed to redirect stderr to the CLI diagnostics log: %s", err)
         return self
 
     async def _drain_pending_handlers(self) -> None:
@@ -1589,7 +1596,8 @@ class TerminalHost:
 
             restore_stderr()
         except Exception as err:
-            _log.exception("Failed to restore stderr from the CLI diagnostics log: %s", err)
+            if not _server_not_installed(err):
+                _log.exception("Failed to restore stderr from the CLI diagnostics log: %s", err)
         # Clear the title before the drain so it reverts even if a
         # handler blocks for the full 30s budget below.
         self._try_clear_window_title()
@@ -3174,13 +3182,9 @@ class TerminalHost:
         # never reopens, and a partial delta that omits labels must not flip it
         # back to open. Derive it from the same labels/title the server uses so
         # the selector knows the child is view-only (a ``message`` to a closed
-        # session 409s). Imported lazily to keep this UI SDK importable without
-        # the ``omnigent`` server package on the path.
-        if not node.closed:
-            from omnigent.util.session_lifecycle import is_session_closed
-
-            if is_session_closed(child.get("labels"), child.get("title")):
-                node.closed = True
+        # session 409s).
+        if not node.closed and is_session_closed(child.get("labels"), child.get("title")):
+            node.closed = True
         # ``done_at`` stamps a TERMINAL task OUTCOME (completed / failed /
         # cancelled, or a durable failure detail) — NOT a merely-not-busy loop.
         # Web parity: a child whose loop is idle between turns (``busy=False``

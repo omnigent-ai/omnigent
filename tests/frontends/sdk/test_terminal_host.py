@@ -34,15 +34,27 @@ def _formatted_text_plain(fragments: Iterable[tuple[str, str]]) -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("redirect failed"),
+        ModuleNotFoundError("No module named 'psutil'", name="psutil"),
+    ],
+    ids=["error", "missing-dependency"],
+)
 async def test_aenter_logs_stderr_redirect_failures(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    error: Exception,
 ) -> None:
     """
     Stderr redirect setup failures must be logged, not silently swallowed.
 
+    Only a missing ``omnigent`` package is expected; a missing dependency is a failure.
+
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log capture fixture.
+    :param error: Failure the redirect raises.
     :returns: ``None``.
     """
 
@@ -51,9 +63,9 @@ async def test_aenter_logs_stderr_redirect_failures(
         Stand in for a failed diagnostics stderr redirect.
 
         :returns: ``None``.
-        :raises RuntimeError: Always, to exercise host logging.
+        :raises Exception: Always, to exercise host logging.
         """
-        raise RuntimeError("redirect failed")
+        raise error
 
     monkeypatch.setattr(
         "omnigent.cli_diagnostics.redirect_stderr_to_log",
@@ -65,7 +77,7 @@ async def test_aenter_logs_stderr_redirect_failures(
         async with host:
             pass
 
-    expected = "Failed to redirect stderr to the CLI diagnostics log: redirect failed"
+    expected = f"Failed to redirect stderr to the CLI diagnostics log: {error}"
     assert expected in caplog.text, (
         f"TerminalHost.__aenter__ swallowed stderr redirect failures instead "
         f"of logging them: {caplog.text!r}"
@@ -73,15 +85,25 @@ async def test_aenter_logs_stderr_redirect_failures(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("restore failed"),
+        ModuleNotFoundError("No module named 'psutil'", name="psutil"),
+    ],
+    ids=["error", "missing-dependency"],
+)
 async def test_aexit_logs_stderr_restore_failures(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    error: Exception,
 ) -> None:
     """
     Stderr restore failures must be logged, not silently swallowed.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log capture fixture.
+    :param error: Failure the restore raises.
     :returns: ``None``.
     """
 
@@ -90,9 +112,9 @@ async def test_aexit_logs_stderr_restore_failures(
         Stand in for a failed diagnostics stderr restore.
 
         :returns: ``None``.
-        :raises RuntimeError: Always, to exercise host logging.
+        :raises Exception: Always, to exercise host logging.
         """
-        raise RuntimeError("restore failed")
+        raise error
 
     monkeypatch.setattr(
         "omnigent.cli_diagnostics.restore_stderr",
@@ -104,7 +126,7 @@ async def test_aexit_logs_stderr_restore_failures(
         async with host:
             pass
 
-    expected = "Failed to restore stderr from the CLI diagnostics log: restore failed"
+    expected = f"Failed to restore stderr from the CLI diagnostics log: {error}"
     assert expected in caplog.text, (
         f"TerminalHost.__aexit__ swallowed stderr restore failures instead "
         f"of logging them: {caplog.text!r}"

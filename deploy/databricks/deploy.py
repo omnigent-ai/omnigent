@@ -201,9 +201,8 @@ def set_version_in_pyproject(path: Path, new_version: str) -> str:
     )
     if count != 1:
         raise RuntimeError(f"could not rewrite version in {path}")
-    # The lockstep graph is circular: omnigent pins both SDKs, the
-    # client pins omnigent back, and the ui-sdk pins the client. All
-    # three names must be stamped or the resolver still dead-ends.
+    # Lockstep pins: omnigent pins both SDKs and the ui-sdk pins the
+    # client. Every pin must be stamped or the resolver dead-ends.
     updated = re.sub(
         r'"(omnigent(?:-client|-ui-sdk)?)==[^"]+"',
         rf'"\1=={new_version}"',

@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _package_version
 from typing import Any, Literal, overload
 
 import httpx
 from pydantic import ValidationError
-
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
-from omnigent.server.schemas import UsageReport
-from omnigent.version import VERSION
 
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._files import FilesNamespace
@@ -21,6 +19,12 @@ from ._session import Session
 from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
+from .wire import OMNIGENT_INTERNAL_WS_ORIGIN, UsageReport
+
+try:
+    VERSION = _package_version("omnigent-client")
+except PackageNotFoundError:  # running from a source tree without install metadata
+    VERSION = "0+unknown"
 
 # Default User-Agent for SDK requests, e.g. ``omnigent-client/0.22.0 python-httpx/0.28.1``.
 SDK_USER_AGENT = f"omnigent-client/{VERSION} python-httpx/{httpx.__version__}"
@@ -378,7 +382,7 @@ class OmnigentClient:
         Fetch the calling user's aggregated LLM spend.
 
         Calls ``GET /v1/usage`` and validates the body into
-        :class:`omnigent.server.schemas.UsageReport`: UTC calendar-day
+        :class:`omnigent_client.wire.UsageReport`: UTC calendar-day
         windows (``cost_today``, ``cost_last_7d``, ``cost_last_30d``),
         the all-time ``total_cost_usd``, the ``daily_costs`` timeline
         and per-session ``sessions`` detail.
