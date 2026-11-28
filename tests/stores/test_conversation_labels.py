@@ -17,7 +17,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
 )
-from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
+from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY, is_internal_label_key
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -149,6 +149,46 @@ def test_set_labels_many_keys_atomic(
 
 
 # ── Survival across conversation_items churn ───────────
+
+
+def test_set_labels_deletes_keys_in_the_same_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``delete_keys`` removes labels alongside the upsert; a missing key is
+    ignored and unmentioned keys stay."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"team": "ml", "env": "dev", "owner": "ana"})
+    conversation_store.set_labels(conv.id, {"env": "prod"}, delete_keys=["team", "never-set"])
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"env": "prod", "owner": "ana"}
+
+    conversation_store.set_labels(conv.id, {}, delete_keys=["owner"])
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"env": "prod"}
+
+
+def test_set_labels_rolls_back_deletes_when_the_upsert_fails(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delete and an upsert share one transaction: when the upsert raises,
+    the deleted label is still there afterwards."""
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"team": "ml"})
+
+    def failing_upsert(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("upsert refused")
+
+    monkeypatch.setattr(sqlalchemy_store, "_upsert_prepared_labels", failing_upsert)
+    with pytest.raises(RuntimeError, match="upsert refused"):
+        conversation_store.set_labels(conv.id, {"env": "prod"}, delete_keys=["team"])
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"team": "ml"}
 
 
 def test_labels_survive_item_appends(
@@ -489,3 +529,23 @@ def test_fork_does_not_inherit_archived_at_label(
     forked = conversation_store.get_conversation(fork.id)
     assert forked is not None
     assert ARCHIVED_AT_LABEL_KEY not in forked.labels
+
+
+# ── Internal vs user label keys ────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("key", "internal"),
+    [
+        ("omni_project", True),
+        ("omnigent.pinned.bob@example.com", True),
+        ("omnigent.archived_at", True),
+        ("cost_control.plan", True),
+        ("team", False),
+        ("omnigent", False),
+        ("omni_projects", False),
+    ],
+)
+def test_is_internal_label_key(key: str, internal: bool) -> None:
+    """Omnigent-owned keys are hidden from, and rejected for, user editing."""
+    assert is_internal_label_key(key) is internal
