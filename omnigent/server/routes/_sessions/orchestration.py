@@ -2525,6 +2525,15 @@ def _persist_native_cumulative_usage(
     return _priced_cost_for_display(current)
 
 
+# The report fields that feed a session's ``total_cost_usd`` and ``by_model``, the only
+# inputs of a displayed subtree total. Context and ``policy_cost_usd`` fields feed neither.
+_DISPLAYED_USAGE_REPORT_KEYS = (
+    "cumulative_cost_usd",
+    "cumulative_input_tokens",
+    "cumulative_output_tokens",
+)
+
+
 async def _persist_external_session_usage(
     session_id: str,
     body: SessionEventInput,
@@ -2539,6 +2548,11 @@ async def _persist_external_session_usage(
     At least one of ``data.context_tokens`` (non-negative int),
     ``data.context_window`` (positive int), or a cumulative usage field
     (:func:`_persist_native_cumulative_usage`) must be present.
+
+    The subtree cost roll-up loads the session's whole spawn tree, so it runs only
+    for reports carrying a :data:`_DISPLAYED_USAGE_REPORT_KEYS` field — always for
+    those, so a retried report re-publishes totals an earlier failure never sent.
+    Other reports broadcast just their context fields and re-publish no ancestor.
 
     :param session_id: Session/conversation identifier.
     :param body: External session-usage event body.
@@ -2637,14 +2651,6 @@ async def _persist_external_session_usage(
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush. The
     # caller's row supplies the root so the tree scan needs no extra row read.
-    subtree_usage, tree = await asyncio.to_thread(
-        load_session_usage_and_tree,
-        session_id,
-        conversation_store,
-        root_conversation_id=conv.root_conversation_id if conv is not None else None,
-    )
-    subtree_cost = _priced_cost_for_display(subtree_usage)
-    usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
     # fields as "no change" so a window-only update doesn't zero tokens.
     # ``total_cost_usd`` is included only when the subtree is priced
@@ -2658,20 +2664,28 @@ async def _persist_external_session_usage(
         event_payload["context_tokens"] = raw_tokens
     if raw_window is not None:
         event_payload["context_window"] = raw_window
-    if subtree_cost is not None:
-        event_payload["total_cost_usd"] = subtree_cost
     if cost_display_hidden():
         event_payload["cost_hidden"] = True
-    if usage_by_model is not None:
-        event_payload["usage_by_model"] = usage_by_model
+    tree: list[Conversation] | None = None
+    if any(body.data.get(key) is not None for key in _DISPLAYED_USAGE_REPORT_KEYS):
+        subtree_usage, tree = await asyncio.to_thread(
+            load_session_usage_and_tree,
+            session_id,
+            conversation_store,
+            root_conversation_id=conv.root_conversation_id if conv is not None else None,
+        )
+        subtree_cost = _priced_cost_for_display(subtree_usage)
+        if subtree_cost is not None:
+            event_payload["total_cost_usd"] = subtree_cost
+        usage_by_model = _usage_by_model_for_display(subtree_usage)
+        if usage_by_model is not None:
+            event_payload["usage_by_model"] = usage_by_model
     event = SessionUsageEvent(**event_payload)
     session_stream.publish(session_id, event.model_dump(exclude_none=True))
-    # This session's usage also moves its ANCESTORS' subtree cost (its spend
-    # rolls up into every ancestor), so re-publish each ancestor's subtree cost
-    # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # Reuses the tree summed above, so a flush loads it once. No-op for a
-    # top-level session (no ancestors). Threaded: it sums the tree per ancestor.
-    await asyncio.to_thread(_publish_ancestor_subtree_costs, tree, session_id)
+    if tree is not None:
+        # Spend rolls up into every ancestor, so re-publish their subtree costs
+        # from the tree loaded above (a no-op for a top-level session).
+        await asyncio.to_thread(_publish_ancestor_subtree_costs, tree, session_id)
     return raw_tokens
 
 

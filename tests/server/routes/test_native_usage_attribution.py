@@ -770,6 +770,128 @@ async def test_child_flush_publishes_every_ancestor_from_one_tree_load(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param({"context_tokens": 1234}, id="context-only"),
+        # Claude-native's statusLine gauge: flat counters the server doesn't persist.
+        pytest.param(
+            {"context_tokens": 1234, "input_tokens": 900, "output_tokens": 50},
+            id="native-token-gauge",
+        ),
+        # Mid-turn enforcement cost while the displayed statusLine total is frozen.
+        pytest.param({"context_tokens": 1234, "policy_cost_usd": 9.0}, id="policy-cost-only"),
+    ],
+)
+async def test_flush_that_leaves_displayed_usage_unchanged_skips_the_tree_load(
+    db_uri: str,
+    usage_events: list[dict],
+    data: dict,
+) -> None:
+    """A report that can't move any subtree total publishes its context fields only."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_external_session_usage,
+    )
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    tree = _seed_usage_tree(store)
+    row = store.get_conversation(tree.leaf)
+    assert row is not None
+    before = _usage(store, tree.leaf)
+
+    with _captured_sql(db_uri) as statements:
+        await _persist_external_session_usage(
+            tree.leaf,
+            SessionEventInput(type="external_session_usage", data=data),
+            store,
+            row,
+        )
+
+    assert _conversation_tree_scans(statements) == []
+    assert usage_events == [
+        {"type": "session.usage", "conversation_id": tree.leaf, "context_tokens": 1234}
+    ]
+    after = _usage(store, tree.leaf)
+    assert after["total_cost_usd"] == before["total_cost_usd"]
+    assert after["by_model"] == before["by_model"]
+    # The enforcement figure is still persisted for the cost gate.
+    assert after.get("policy_cost_usd") == data.get("policy_cost_usd")
+
+
+@pytest.mark.asyncio
+async def test_retried_cost_report_publishes_totals_its_failed_flush_never_sent(
+    db_uri: str,
+    usage_events: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cost report persisted before its roll-up failed still publishes when retried."""
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    tree = _seed_usage_tree(store)
+    report = SessionEventInput(
+        type="external_session_usage",
+        data={"cumulative_cost_usd": 4.5, "model": "m1"},
+    )
+    load_tree = orchestration.load_session_usage_and_tree
+    tree_loads: list[str] = []
+
+    def fail_first_tree_load(session_id: str, *args, **kwargs):
+        tree_loads.append(session_id)
+        if len(tree_loads) == 1:
+            raise OSError("tree read failed")
+        return load_tree(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(orchestration, "load_session_usage_and_tree", fail_first_tree_load)
+
+    with pytest.raises(OSError, match="tree read failed"):
+        await orchestration._persist_external_session_usage(tree.leaf, report, store)
+    assert usage_events == []
+    # The own-usage persist committed before the roll-up failed.
+    assert _usage(store, tree.leaf)["total_cost_usd"] == pytest.approx(4.5)
+
+    # The forwarder retries the identical report, which no longer changes persisted usage.
+    await orchestration._persist_external_session_usage(tree.leaf, report, store)
+
+    assert [(e["conversation_id"], e["total_cost_usd"]) for e in usage_events] == [
+        (tree.leaf, 20.5),
+        (tree.mid, 22.5),
+        (tree.root, 31.5),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_token_only_flush_still_rolls_up_its_per_model_usage(
+    db_uri: str,
+    usage_events: list[dict],
+) -> None:
+    """Token growth moves per-model usage even when no cost is priced, so it rolls up."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_external_session_usage,
+    )
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    tree = _seed_usage_tree(store)
+
+    await _persist_external_session_usage(
+        tree.leaf,
+        SessionEventInput(
+            type="external_session_usage",
+            data={"cumulative_input_tokens": 100, "model": "m1"},
+        ),
+        store,
+    )
+
+    # The leaf's m1 bucket grows 40 -> 100; the grandchild adds 160 below it.
+    assert [
+        (e["conversation_id"], e["usage_by_model"]["m1"]["input_tokens"]) for e in usage_events
+    ] == [(tree.leaf, 260), (tree.mid, 280), (tree.root, 370)]
+
+
+@pytest.mark.asyncio
 async def test_relay_turn_completion_publishes_every_ancestor_from_one_tree_load(
     db_uri: str,
     usage_events: list[dict],
