@@ -221,7 +221,9 @@ def _request_event(elicitation_id: str, message: str | None = None) -> dict[str,
     return event
 
 
-def _resolved_event(elicitation_id: str, action: str | None = None) -> dict[str, Any]:
+def _resolved_event(
+    elicitation_id: str, action: str | None = None, reason: str | None = None
+) -> dict[str, Any]:
     """Build a ``response.elicitation_resolved`` event dict."""
     event: dict[str, Any] = {
         "type": "response.elicitation_resolved",
@@ -229,6 +231,8 @@ def _resolved_event(elicitation_id: str, action: str | None = None) -> dict[str,
     }
     if action is not None:
         event["action"] = action
+    if reason is not None:
+        event["reason"] = reason
     return event
 
 
@@ -720,6 +724,78 @@ async def test_resolution_notice_without_verdict_says_not_approved(
         resolution = dispatch.calls[1]
         assert "no human verdict recorded" in resolution.notice
         assert "NOT approved" in resolution.notice
+
+
+@pytest.mark.asyncio
+async def test_unanswered_resolution_does_not_claim_the_child_is_continuing(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A wait that ended with nobody answering must not read as "still running".
+
+    Stopping a claude-native child kills the harness holding its permission
+    prompt, so the server clears the wait with ``reason="unanswered"`` and no
+    verdict. The generic notice would then tell the parent the sub-agent "is
+    continuing" and that its result is still coming, so an orchestrator waits
+    on a process that is already gone.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="claude_code:stopped", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+    )
+
+    notifier.observe(child.id, _request_event("elicit_stopped"))
+    await _wait_for_calls(dispatch, expected=1)
+    notifier.observe(child.id, _resolved_event("elicit_stopped", reason="unanswered"))
+    await _wait_for_calls(dispatch, expected=2)
+
+    resolution = dispatch.calls[1]
+    assert resolution.parent_id == parent.id
+    assert "claude_code/stopped" in resolution.notice
+    # The three claims the generic notice makes, none of which hold here.
+    assert "it is continuing" not in resolution.notice
+    assert "result will arrive in your inbox" not in resolution.notice
+    assert "nobody answered it" in resolution.notice
+    assert "NOT approved" in resolution.notice
+    assert "sys_session_get_info" in resolution.notice
+
+
+@pytest.mark.asyncio
+async def test_unanswered_reason_does_not_override_a_recorded_verdict(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """A verdict still wins: an answered prompt keeps the continuing wording.
+
+    Guards the narrow branch from swallowing the common path, where a
+    resolution can carry both a verdict and a bookkeeping reason.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:answered", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+    )
+
+    notifier.observe(child.id, _request_event("elicit_answered"))
+    await _wait_for_calls(dispatch, expected=1)
+    notifier.observe(
+        child.id, _resolved_event("elicit_answered", action="accept", reason="unanswered")
+    )
+    await _wait_for_calls(dispatch, expected=2)
+
+    resolution = dispatch.calls[1]
+    assert "action: accept" in resolution.notice
+    assert "it is continuing" in resolution.notice
 
 
 class _ResolveDuringDispatch:
