@@ -9,6 +9,7 @@ import subprocess
 import sys
 from bisect import bisect_right
 from pathlib import Path
+from urllib.parse import urlsplit
 
 POLICY_FILES = frozenset({"dev/lint/lint_reference_policy.py"})
 PROHIBITED_NAMES = frozenset(
@@ -43,6 +44,22 @@ PUBLIC_HOSTS = frozenset(
         "login.databricks.com",
     }
 )
+SYNTHETIC_FIXTURE_HOSTS = frozenset(
+    {
+        "test-workspace.cloud.databricks.com",
+        "test-alias.cloud.databricks.com",
+        "test-workspace.azuredatabricks.net",
+        "test-app.databricksapps.com",
+    }
+)
+SYNTHETIC_FIXTURE_URLS = frozenset(
+    {
+        "https://accounts.azuredatabricks.net/oidc/accounts/test-account",
+        "https://accounts.azuredatabricks.net/oidc/accounts/test-account/"
+        ".well-known/openid-configuration",
+        "https://accounts.azuredatabricks.net/oidc/accounts/test-account/v1/token",
+    }
+)
 
 
 def host_pattern(suffixes: tuple[str, ...]) -> re.Pattern[str]:
@@ -54,6 +71,51 @@ def host_pattern(suffixes: tuple[str, ...]) -> re.Pattern[str]:
 
 
 HOST = host_pattern(HOST_SUFFIXES)
+URL = re.compile(r"[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _normalized_url(value: str) -> str:
+    authority_end = value.find("/", value.index("://") + 3)
+    if authority_end == -1:
+        return value.lower()
+    return value[:authority_end].lower() + value[authority_end:]
+
+
+def _allowed_host(line: str, match: re.Match[str]) -> bool:
+    host = match.group().lower()
+    if host in PUBLIC_HOSTS:
+        return True
+    for url in URL.finditer(line):
+        if url.start() <= match.start() and match.end() <= url.end():
+            value = url.group()
+            try:
+                parsed = urlsplit(value)
+                hostname = parsed.hostname
+                port = parsed.port
+                authority_start = url.start() + value.index("://") + 3
+                hostname_matches = hostname is not None and (
+                    match.start() == authority_start
+                    and match.end() == authority_start + len(hostname)
+                )
+                if not hostname_matches:
+                    return False
+                synthetic_host_url = (
+                    parsed.scheme.lower() == "https"
+                    and hostname is not None
+                    and hostname.lower() in SYNTHETIC_FIXTURE_HOSTS
+                    and parsed.netloc.lower() == hostname.lower()
+                    and parsed.username is None
+                    and parsed.password is None
+                    and port is None
+                )
+            except ValueError:
+                return False
+            return synthetic_host_url or _normalized_url(value) in SYNTHETIC_FIXTURE_URLS
+    return host in SYNTHETIC_FIXTURE_HOSTS and not (
+        line[max(0, match.start() - 3) : match.start()] == "://"
+        or (match.start() and line[match.start() - 1] in ":@/")
+        or (match.end() < len(line) and line[match.end()] in ":/?#")
+    )
 
 
 def _violation_lines(text: str) -> set[int]:
@@ -64,7 +126,7 @@ def _violation_lines(text: str) -> set[int]:
     original_lines = text.split("\n")
     for line_number, normalized in enumerate(words.split("\n"), 1):
         if PROHIBITED_NAMES.intersection(re.findall(r"[a-z]+", normalized.lower())) or any(
-            match.group().lower() not in PUBLIC_HOSTS
+            not _allowed_host(original_lines[line_number - 1], match)
             for match in HOST.finditer(original_lines[line_number - 1])
         ):
             lines.add(line_number)
