@@ -415,7 +415,7 @@ async def test_read_only_tools_only_send_gets(name, args):
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 29
+    assert len(TICKET_TOOLS) == 30
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (
@@ -977,3 +977,59 @@ async def test_ticket_list_query_searches_and_keeps_the_match():
     assert found["has_more"] is True and found["last_id"] == TICKET
     assert "stage_id" in refused["error"]
     assert "completed_since" in refused_since["error"]
+
+
+async def test_line_stats_tool_counts_missing_commits_here_and_posts_them(monkeypatch):
+    from types import SimpleNamespace
+
+    import omnigent.server.project_line_stats as line_stats_module
+
+    known, gone = "a" * 40, "b" * 40
+    monkeypatch.setattr(
+        line_stats_module,
+        "line_stats",
+        lambda checkout, sha: (
+            SimpleNamespace(added=3, removed=1, raw_added=13, raw_removed=1, files=2)
+            if sha == known
+            else None
+        ),
+    )
+    seen: list = []
+    missing = {"shas": [known, gone], "remaining": 4}
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.content))
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        if request.url.path.endswith("/line-stats/missing"):
+            return httpx.Response(200, json=missing)
+        return httpx.Response(200, json={"recorded": 1})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        result = json.loads(
+            await execute_ticket_tool("sys_project_line_stats_record", {}, client, SOURCE)
+        )
+        missing["shas"] = []
+        idle = json.loads(
+            await execute_ticket_tool("sys_project_line_stats_record", {}, client, SOURCE)
+        )
+    assert result == {"recorded": 1, "unreachable": 1, "remaining": 4}
+    posts = [json.loads(body) for method, _, body in seen if method == "POST"]
+    assert posts == [
+        {
+            "stats": [
+                {
+                    "sha": known,
+                    "added": 3,
+                    "removed": 1,
+                    "raw_added": 13,
+                    "raw_removed": 1,
+                    "files": 2,
+                }
+            ]
+        }
+    ]
+    # Nothing missing: one cheap read and no write.
+    assert idle == {"recorded": 0, "unreachable": 0, "remaining": 0}

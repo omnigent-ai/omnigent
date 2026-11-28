@@ -406,6 +406,25 @@ class SysProjectDeployStatusTool(_TicketTool):
     arguments = DeployStatus
 
 
+class RecordLineStats(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit: int = Field(
+        default=50, ge=1, le=50, description="Most landed commits to count in this call."
+    )
+
+
+class SysProjectLineStatsRecordTool(_TicketTool):
+    tool_name = "sys_project_line_stats_record"
+    help_text = (
+        "Count the lines this project's landed commits added and removed, with git on this "
+        "host, and record them for the Summary's Changes landed. It only handles landed "
+        "commits that have no counts yet, up to limit, and returns quickly when there are "
+        "none. A commit's counts never change once recorded. Generated files such as "
+        "openapi.json and lockfiles are left out of the headline numbers."
+    )
+    arguments = RecordLineStats
+
+
 class ListProjectArtifacts(BaseModel):
     model_config = ConfigDict(extra="forbid")
     since: float | None = Field(
@@ -911,6 +930,7 @@ TICKET_TOOL_CLASSES = (
     SysTicketLandTool,
     SysTicketPushPrefixTool,
     SysProjectDeployStatusTool,
+    SysProjectLineStatsRecordTool,
     SysTicketRevertDraftTool,
     SysTicketImportPrTool,
     SysSessionLinkTicketTool,

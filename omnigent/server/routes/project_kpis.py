@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 from collections.abc import Collection
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
@@ -25,6 +26,7 @@ from omnigent.entities.project_kpi import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
+from omnigent.server.github_pr_status import pull_request_status
 from omnigent.server.project_kpis import (
     LANDED_COMMIT_LABELS,
     KpiInputs,
@@ -136,6 +138,9 @@ class ProjectKpis(BaseModel):
     kpis: list[ProjectKpiValue]
     metrics: list[KpiMetric] = Field(description="The metrics a KPI may track.")
 
+
+#: Merged-PR drill-down rows whose sizes are read from GitHub, newest first.
+PR_LINES_MAX = 25
 
 StatusItemMetric = Literal[
     "merged_prs",
@@ -569,6 +574,33 @@ def create_project_kpis_router(
         )
         return await asyncio.to_thread(build, request, project, window, revision, user_id)
 
+    def add_line_counts(
+        project: Project, metric: str, rows: list[dict[str, Any]], user_id: str | None
+    ) -> None:
+        """Lines added and removed on each landed-change or merged-PR row, when known."""
+        if metric == "changes_landed":
+            commits = [(row.get("detail") or {}).get("commit") for row in rows]
+            stats = ticket_store.commit_line_stats(
+                project.id, [commit for commit in commits if commit], user_id=user_id
+            )
+            for row, commit in zip(rows, commits, strict=True):
+                if commit in stats:
+                    row["detail"] = {**(row.get("detail") or {}), **stats[commit]}
+        elif metric == "merged_prs":
+            urls = [row["url"] for row in rows[:PR_LINES_MAX] if row.get("url")]
+            if not urls:
+                return
+            with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
+                statuses = dict(zip(urls, pool.map(pull_request_status, urls), strict=True))
+            for row in rows:
+                status = statuses.get(row.get("url") or "")
+                if status and status.get("additions") is not None:
+                    row["detail"] = {
+                        **(row.get("detail") or {}),
+                        "added": status["additions"],
+                        "removed": status["deletions"],
+                    }
+
     def build_items(
         request: Request,
         project: Project,
@@ -633,6 +665,7 @@ def create_project_kpis_router(
             else:
                 row["title"] = None
                 row["url"] = row["id"]
+        add_line_counts(project, metric, rows, user_id)
         metric_info = KPI_METRICS_BY_ID.get(metric)
         base = {
             "object": "project.status_items",

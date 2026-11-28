@@ -60,13 +60,17 @@ def test_open_pr_buckets_check_runs_and_statuses() -> None:
         "merge_state_status": "DIRTY",
         "checks_supported": True,
         "checks": {"failing": 2, "pending": 1, "total": 5, "partial": False},
+        "additions": None,
+        "deletions": None,
     }
 
 
 def test_merged_pr_skips_ci_reads() -> None:
-    calls, fetch = _reader({PR_PATH: _pr(state="closed", merged_at="2026-01-01T00:00:00Z")})
+    merged = _pr(state="closed", merged_at="2026-01-01T00:00:00Z", additions=12, deletions=4)
+    calls, fetch = _reader({PR_PATH: merged})
     status = github_pr_status.pull_request_status(URL, fetch=fetch)
     assert status is not None and status["state"] == "MERGED"
+    assert (status["additions"], status["deletions"]) == (12, 4)
     assert calls == [PR_PATH]
 
 

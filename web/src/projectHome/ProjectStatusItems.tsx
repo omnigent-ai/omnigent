@@ -1,3 +1,4 @@
+import { formatLines } from "@/lib/projectStatusApi";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
@@ -245,6 +246,15 @@ function ItemTable({
                 {row.detail?.from_stage_id && (
                   <span className="block text-xs text-muted-foreground">
                     {row.detail.from_stage_id} → {row.detail.to_stage_id}
+                  </span>
+                )}
+                {row.detail?.added != null && (
+                  <span className="block text-xs text-muted-foreground tabular-nums">
+                    {formatLines(row.detail.added, row.detail.removed)} lines
+                    {row.detail.raw_added != null &&
+                      (row.detail.raw_added !== row.detail.added ||
+                        row.detail.raw_removed !== row.detail.removed) &&
+                      ` (${formatLines(row.detail.raw_added, row.detail.raw_removed)} with generated files)`}
                   </span>
                 )}
                 {!row.counted_in_total && !excluded && (

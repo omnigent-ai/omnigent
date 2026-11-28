@@ -7,6 +7,7 @@ import re
 import uuid
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
+from itertools import batched
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +19,7 @@ from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlProject,
+    SqlProjectCommitLineStats,
     SqlProjectShare,
     SqlProjectTicket,
     SqlProjectTicketEvent,
@@ -1061,6 +1063,98 @@ class ProjectTicketStore:
                 if values:
                     found[ticket_id] = (stage_id, values)
             return found
+
+    def ticket_commit_shas(self, project_id: str, *, user_id: str | None) -> builtins.set[str]:
+        """Full commit SHAs in the project's tickets' ``verified`` and ``approved`` labels."""
+        return {
+            value.lower()
+            for _stage, values in self.label_values(
+                project_id, ("verified", "approved"), user_id=user_id
+            ).values()
+            for value in values.values()
+            if re.fullmatch(r"[0-9a-fA-F]{40}", value)
+        }
+
+    def commit_line_stats(
+        self, project_id: str, shas: Collection[str], *, user_id: str | None
+    ) -> builtins.dict[str, dict[str, int]]:
+        """Stored line counts for *shas*, by SHA; SHAs without a row are omitted."""
+        wanted = sorted({sha.lower() for sha in shas})
+        if not wanted:
+            return {}
+        with self._session("read_commit_line_stats") as session:
+            self._project(session, project_id, user_id)
+            found: dict[str, dict[str, int]] = {}
+            for batch in batched(wanted, 500):
+                rows = session.scalars(
+                    select(SqlProjectCommitLineStats).where(
+                        SqlProjectCommitLineStats.workspace_id == current_workspace_id(),
+                        SqlProjectCommitLineStats.project_id == _identifier(project_id),
+                        SqlProjectCommitLineStats.sha.in_(batch),
+                    )
+                )
+                for row in rows:
+                    found[row.sha] = {
+                        "added": row.added,
+                        "removed": row.removed,
+                        "raw_added": row.raw_added,
+                        "raw_removed": row.raw_removed,
+                        "files": row.files,
+                    }
+            return found
+
+    def record_commit_line_stats(
+        self,
+        project_id: str,
+        stats: builtins.list[dict[str, Any]],
+        *,
+        user_id: str | None,
+        allowed_shas: Collection[str],
+    ) -> int:
+        """Store line counts for SHAs in *allowed_shas* that have none yet; returns how many.
+
+        A commit's counts never change, so an existing row is kept as it is.
+        """
+        allowed = {sha.lower() for sha in allowed_shas}
+        incoming = {
+            str(row["sha"]).lower(): row for row in stats if str(row["sha"]).lower() in allowed
+        }
+        if not incoming:
+            return 0
+
+        def write(session: Session) -> int:
+            self._project(session, project_id, user_id)
+            existing = set(
+                session.scalars(
+                    select(SqlProjectCommitLineStats.sha).where(
+                        SqlProjectCommitLineStats.workspace_id == current_workspace_id(),
+                        SqlProjectCommitLineStats.project_id == _identifier(project_id),
+                        SqlProjectCommitLineStats.sha.in_(sorted(incoming)),
+                    )
+                )
+            )
+            now = now_epoch()
+            added = 0
+            for sha, row in sorted(incoming.items()):
+                if sha in existing:
+                    continue
+                session.add(
+                    SqlProjectCommitLineStats(
+                        workspace_id=current_workspace_id(),
+                        project_id=_identifier(project_id),
+                        sha=sha,
+                        added=int(row["added"]),
+                        removed=int(row["removed"]),
+                        raw_added=int(row["raw_added"]),
+                        raw_removed=int(row["raw_removed"]),
+                        files=int(row["files"]),
+                        recorded_at=now,
+                    )
+                )
+                added += 1
+            return added
+
+        return run_write_transaction(self._session, "record_commit_line_stats", write)
 
     def ticket_titles(
         self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None

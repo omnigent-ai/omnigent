@@ -29,7 +29,15 @@ export interface ProjectStatusItem {
   member: string | null;
   /** Hours for time metrics, USD for spend, else null. */
   value: number | null;
-  detail?: { from_stage_id?: string; to_stage_id?: string } | null;
+  detail?: {
+    from_stage_id?: string;
+    to_stage_id?: string;
+    /** A landed change's or merged PR's size, generated files left out for landed ones. */
+    added?: number;
+    removed?: number;
+    raw_added?: number;
+    raw_removed?: number;
+  } | null;
   /** False when the total counts it on a later day instead. */
   counted_in_total: boolean;
   reason?: string | null;

@@ -14,6 +14,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   PROJECT_STATUS_WINDOWS,
   formatCents,
+  formatLines,
   getProjectStatusSummary,
   projectStatusSummaryKey,
   prsMergedZeroNote,
@@ -263,6 +264,7 @@ function HeadlineNumbers({
         <StatTile
           label="Changes landed"
           value={String(totals.changes_landed)}
+          note={landedLinesNote(totals)}
           onOpen={() => onDrill({ label: "Changes landed", metric: "changes_landed", range })}
         />
       )}
@@ -367,9 +369,20 @@ const COLUMNS: { key: ProjectStatusSortKey; label: string; numeric: boolean }[] 
   { key: "name", label: "Agent", numeric: false },
   { key: "tickets_done", label: "Tickets serviced", numeric: true },
   { key: "prs_merged", label: "PRs merged", numeric: true },
+  { key: "lines_added", label: "Lines landed", numeric: true },
   { key: "spend_cents", label: "Spend", numeric: true },
   { key: "cost_per_merged_pr_cents", label: "Cost per merged PR", numeric: true },
 ];
+
+/** "+120 / −30 lines", and how many commits that covers when some aren't counted yet. */
+export function landedLinesNote(totals: ProjectStatusSummary["totals"]): string | undefined {
+  const counted = totals.changes_landed_lines_counted ?? 0;
+  if (!counted || totals.changes_landed == null) return undefined;
+  const lines = `${formatLines(totals.changes_landed_lines_added, totals.changes_landed_lines_removed)} lines`;
+  return counted < totals.changes_landed
+    ? `${lines}, ${counted} of ${totals.changes_landed} counted`
+    : lines;
+}
 
 /** Agent rows plus each person's own chats that did work: the rows spend and tickets come from. */
 export function agentRows(members: readonly ProjectStatusMember[]): ProjectStatusMember[] {
@@ -378,7 +391,8 @@ export function agentRows(members: readonly ProjectStatusMember[]): ProjectStatu
       member.kind !== "human" ||
       member.tickets_done > 0 ||
       (member.spend_cents ?? 0) > 0 ||
-      (member.prs_merged ?? 0) > 0,
+      (member.prs_merged ?? 0) > 0 ||
+      (member.lines_added ?? 0) + (member.lines_removed ?? 0) > 0,
   );
 }
 
@@ -400,12 +414,15 @@ function AgentsTable({
   if (!members.length)
     return <p className="text-sm text-muted-foreground">No agents have activity yet.</p>;
   const rows = sortStatusMembers(members, sort.key, sort.direction);
+  // Lines show once a host has counted any landed commit.
+  const showLines = (totals.changes_landed_lines_counted ?? 0) > 0;
+  const columns = COLUMNS.filter((column) => column.key !== "lines_added" || showLines);
   return (
     <div className="overflow-x-auto rounded-lg border border-border/60">
       <table className="w-full text-sm">
         <thead className="border-b border-border/60 text-muted-foreground">
           <tr>
-            {COLUMNS.map((column) => {
+            {columns.map((column) => {
               const active = sort.key === column.key;
               return (
                 <th
@@ -489,6 +506,11 @@ function AgentsTable({
               >
                 {member.prs_merged === null ? "—" : String(member.prs_merged)}
               </NumberCell>
+              {showLines && (
+                <NumberCell label={`Lines landed for ${memberDisplayName(member)}`}>
+                  {formatLines(member.lines_added, member.lines_removed)}
+                </NumberCell>
+              )}
               <NumberCell
                 label={`Spend by ${memberDisplayName(member)}`}
                 onOpen={
@@ -516,6 +538,14 @@ function AgentsTable({
             </th>
             <NumberCell>{String(totals.tickets_done)}</NumberCell>
             <NumberCell>{totals.prs_merged === null ? "—" : String(totals.prs_merged)}</NumberCell>
+            {showLines && (
+              <NumberCell>
+                {formatLines(
+                  totals.changes_landed_lines_added,
+                  totals.changes_landed_lines_removed,
+                )}
+              </NumberCell>
+            )}
             <NumberCell>{formatCents(totals.spend_cents)}</NumberCell>
             <NumberCell>{formatCents(totals.cost_per_merged_pr_cents)}</NumberCell>
           </tr>

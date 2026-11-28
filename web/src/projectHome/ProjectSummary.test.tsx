@@ -9,7 +9,7 @@ import type * as telemetryApi from "@/lib/projectTelemetryApi";
 import * as itemsApi from "@/lib/projectStatusItemsApi";
 import * as projectsApi from "@/lib/projectsApi";
 import { draftToDefinition } from "./ProjectKpis";
-import { ProjectSummary } from "./ProjectSummary";
+import { agentRows, landedLinesNote, ProjectSummary } from "./ProjectSummary";
 
 const projects = vi.hoisted(() => ({
   data: [] as { id: string | null; name: string }[],
@@ -555,5 +555,44 @@ describe("draftToDefinition", () => {
       why: "W",
       not_measured_reason: "Later.",
     });
+  });
+});
+
+describe("landedLinesNote", () => {
+  const base = {
+    changes_landed: 4,
+    changes_landed_lines_added: 120,
+    changes_landed_lines_removed: 30,
+  };
+
+  it("says how big the landed changes were, and how many it covers", () => {
+    const totals = summary().totals;
+    expect(landedLinesNote({ ...totals, ...base, changes_landed_lines_counted: 4 })).toBe(
+      "+120 / −30 lines",
+    );
+    expect(landedLinesNote({ ...totals, ...base, changes_landed_lines_counted: 3 })).toBe(
+      "+120 / −30 lines, 3 of 4 counted",
+    );
+    expect(
+      landedLinesNote({ ...totals, ...base, changes_landed_lines_counted: 0 }),
+    ).toBeUndefined();
+  });
+});
+
+describe("agentRows", () => {
+  it("keeps a person's own chats once landed lines are credited to them", () => {
+    const quiet: statusApi.ProjectStatusMember = {
+      key: "user:ann@example.com",
+      kind: "human",
+      name: "ann@example.com",
+      user_id: "ann@example.com",
+      identity_id: null,
+      tickets_done: 0,
+      prs_merged: 0,
+      spend_cents: 0,
+      cost_per_merged_pr_cents: null,
+    };
+    expect(agentRows([quiet])).toEqual([]);
+    expect(agentRows([{ ...quiet, lines_added: 12, lines_removed: 0 }])).toHaveLength(1);
   });
 });

@@ -1206,6 +1206,22 @@ class SqlProjectMergedPrRefresh(OmnigentBase):
     refreshed_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class SqlProjectCommitLineStats(OmnigentBase):
+    """Lines a landed commit added and removed, generated files left out; set by a host."""
+
+    __tablename__ = "project_commit_line_stats"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    sha: Mapped[str] = mapped_column(String(40), primary_key=True)
+    added: Mapped[int] = mapped_column(Integer, nullable=False)
+    removed: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_added: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_removed: Mapped[int] = mapped_column(Integer, nullable=False)
+    files: Mapped[int] = mapped_column(Integer, nullable=False)
+    recorded_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class SqlProjectKpiRevision(OmnigentBase):
     """One append-only revision of a project's KPI set; the highest revision is current."""
 

@@ -86,6 +86,8 @@ def _read_status(url: str, fetch: Fetch) -> dict[str, Any] | None:
         "merge_state_status": mergeable.upper() if isinstance(mergeable, str) else None,
         "checks_supported": supported,
         "checks": checks,
+        "additions": pr.get("additions") if isinstance(pr.get("additions"), int) else None,
+        "deletions": pr.get("deletions") if isinstance(pr.get("deletions"), int) else None,
     }
 
 

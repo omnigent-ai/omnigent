@@ -199,6 +199,8 @@ async def execute_ticket_tool(
             params = dict(body, **({"ticket_id": ticket_id} if ticket_id else {}))
             result = await request("GET", f"/v1/projects/{project_id}/files", params=params)
             return json.dumps(result, ensure_ascii=False)
+        if name == "sys_project_line_stats_record":
+            return await _record_line_stats(project_id, body, request)
         if name == "sys_project_telemetry_get":
             role = body.pop("role", None)
             if role is not None:
@@ -424,6 +426,48 @@ async def _create_identity(body: dict[str, Any], project_id: str, request: Any) 
             "identity": {key: created[key] for key in ("id", "name", "instructions")},
             "existing": False,
             "note": "Created; it appears in the project's Team dialog.",
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _record_line_stats(project_id: str, body: dict[str, Any], request: Any) -> str:
+    """Count landed commits missing line stats with git here, and post them to the server."""
+    from omnigent.server.project_landing import _default_checkout
+    from omnigent.server.project_line_stats import line_stats
+
+    base = f"/v1/projects/{project_id}/tickets/line-stats"
+    missing = await request("GET", f"{base}/missing", params={"limit": body.get("limit", 50)})
+    shas = missing.get("shas") or []
+    if not shas:
+        return json.dumps({"recorded": 0, "unreachable": 0, "remaining": 0})
+    checkout = _default_checkout()
+    counted, unreachable = [], []
+    for sha in shas:
+        stats = await asyncio.to_thread(line_stats, checkout, sha)
+        if stats is None:
+            unreachable.append(sha)
+            continue
+        counted.append(
+            {
+                "sha": sha,
+                "added": stats.added,
+                "removed": stats.removed,
+                "raw_added": stats.raw_added,
+                "raw_removed": stats.raw_removed,
+                "files": stats.files,
+            }
+        )
+    recorded = 0
+    if counted:
+        result = await request("POST", base, json={"stats": counted})
+        recorded = int(result.get("recorded", 0))
+    return json.dumps(
+        {
+            "recorded": recorded,
+            # Commits this host's git can't see, e.g. not fetched here yet.
+            "unreachable": len(unreachable),
+            "remaining": int(missing.get("remaining", 0)),
         },
         ensure_ascii=False,
     )

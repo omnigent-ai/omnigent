@@ -2070,6 +2070,60 @@
         "title": "CommentPage",
         "type": "object"
       },
+      "CommitLineStats": {
+        "additionalProperties": false,
+        "description": "One landed commit's line counts, as computed by git on a host.",
+        "properties": {
+          "added": {
+            "description": "Lines added, generated files left out.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Added",
+            "type": "integer"
+          },
+          "files": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Files",
+            "type": "integer"
+          },
+          "raw_added": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Raw Added",
+            "type": "integer"
+          },
+          "raw_removed": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Raw Removed",
+            "type": "integer"
+          },
+          "removed": {
+            "description": "Lines removed, generated files left out.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Removed",
+            "type": "integer"
+          },
+          "sha": {
+            "description": "The landed commit's full SHA.",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sha",
+          "added",
+          "removed",
+          "raw_added",
+          "raw_removed",
+          "files"
+        ],
+        "title": "CommitLineStats",
+        "type": "object"
+      },
       "CompactionCompletedEvent": {
         "description": "Conversation history compaction has finished.\n\nEmitted after compaction completes \u2014 either by the server after\n`compact_conversation_now()` (explicit `/compact`), or by a\nharness that compacted its own internal context. Clients that\nrendered a \"Compacting\u2026\" spinner on\n`CompactionInProgressEvent` should upgrade it to the\npermanent \"Conversation compacted\" marker on this event.\n\nWhen emitted by a harness, `summary` and `summary_model`\nare populated so the runner can persist a compaction item for\nsession resume. When emitted by the server's explicit\n`/compact` path, those fields are `None`.",
         "properties": {
@@ -6084,6 +6138,30 @@
         "title": "MessageData",
         "type": "object"
       },
+      "MissingLineStats": {
+        "properties": {
+          "remaining": {
+            "description": "How many more are missing beyond this page.",
+            "format": "int64",
+            "title": "Remaining",
+            "type": "integer"
+          },
+          "shas": {
+            "description": "Landed commits with no line counts yet.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Shas",
+            "type": "array"
+          }
+        },
+        "required": [
+          "shas",
+          "remaining"
+        ],
+        "title": "MissingLineStats",
+        "type": "object"
+      },
       "ModelUsage": {
         "description": "Cumulative token/cost usage attributed to a single LLM model.\n\nOne value in the `usage_by_model` map on `SessionResponse` /\n`SessionUsageEvent`, keyed by the raw harness-reported model id\n(e.g. `\"claude-sonnet-4-6\"`, `\"databricks-gpt-5-5\"`). Counts are\nsummed over the session's subtree (itself + sub-agent descendants), so a\nparent folds in sub-agents that ran a different model. Token buckets\nmirror the flat per-session breakdown.",
         "properties": {
@@ -8547,6 +8625,31 @@
             "title": "Kind",
             "type": "string"
           },
+          "lines_added": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Lines added by landed commits credited to this member (its tickets' role).",
+            "title": "Lines Added"
+          },
+          "lines_removed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lines Removed"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -8741,6 +8844,39 @@
             ],
             "description": "Distinct commits landed in the window (a ticket's verified, else approved, SHA); null when the project has never landed one.",
             "title": "Changes Landed"
+          },
+          "changes_landed_lines_added": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Lines the window's landed commits added, generated files left out; null until a host has recorded counts for any of them.",
+            "title": "Changes Landed Lines Added"
+          },
+          "changes_landed_lines_counted": {
+            "default": 0,
+            "description": "How many of the window's landed commits have line counts.",
+            "format": "int64",
+            "title": "Changes Landed Lines Counted",
+            "type": "integer"
+          },
+          "changes_landed_lines_removed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Lines they removed, generated files left out.",
+            "title": "Changes Landed Lines Removed"
           },
           "cost_per_merged_pr_cents": {
             "anyOf": [
@@ -9368,6 +9504,40 @@
           "name"
         ],
         "title": "ReconnectLiveMCPServerRequest",
+        "type": "object"
+      },
+      "RecordLineStats": {
+        "additionalProperties": false,
+        "properties": {
+          "stats": {
+            "items": {
+              "$ref": "#/components/schemas/CommitLineStats"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Stats",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stats"
+        ],
+        "title": "RecordLineStats",
+        "type": "object"
+      },
+      "RecordedLineStats": {
+        "properties": {
+          "recorded": {
+            "description": "New rows; commits that already had counts are kept.",
+            "format": "int64",
+            "title": "Recorded",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "recorded"
+        ],
+        "title": "RecordedLineStats",
         "type": "object"
       },
       "RelayAck": {
@@ -27850,6 +28020,114 @@
           }
         },
         "summary": "File Intake Ticket",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/line-stats": {
+      "post": {
+        "description": "Record git line counts for this project's landed commits; known ones are kept.\n\nOnly an agent session in this project may call it, for SHAs on this project's\ntickets.",
+        "operationId": "record_line_stats_v1_projects__project_id__tickets_line_stats_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordLineStats"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordedLineStats"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Line Stats",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/line-stats/missing": {
+      "get": {
+        "description": "Landed commits whose line counts aren't recorded yet, at most *limit*.\n\nFor the agent tool that computes them with git on its host.",
+        "operationId": "missing_line_stats_v1_projects__project_id__tickets_line_stats_missing_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MissingLineStats"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Missing Line Stats",
         "tags": [
           "project tickets"
         ]

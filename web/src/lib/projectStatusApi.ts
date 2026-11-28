@@ -18,6 +18,11 @@ export interface ProjectStatusTotals {
   prs_merged: number | null;
   /** Distinct commits landed in the window; null when the project never landed one. */
   changes_landed?: number | null;
+  /** Lines those commits added and removed, generated files left out; null until counted. */
+  changes_landed_lines_added?: number | null;
+  changes_landed_lines_removed?: number | null;
+  /** How many of the window's landed commits have line counts. */
+  changes_landed_lines_counted?: number;
   spend_cents: number | null;
   cost_per_merged_pr_cents: number | null;
   members: number;
@@ -36,6 +41,9 @@ export interface ProjectStatusMember {
   prs_merged: number | null;
   spend_cents: number | null;
   cost_per_merged_pr_cents: number | null;
+  /** Lines added and removed by landed commits credited to this member; null until counted. */
+  lines_added?: number | null;
+  lines_removed?: number | null;
 }
 
 export interface ProjectStatusSummary {
@@ -91,8 +99,20 @@ export function prsMergedZeroNote(
     : undefined;
 }
 
+/** Added and removed as two numbers, never one total, e.g. "+1,234 / −56". */
+export function formatLines(added: number | null | undefined, removed: number | null | undefined) {
+  if (added == null || removed == null) return "—";
+  const count = new Intl.NumberFormat("en-US");
+  return `+${count.format(added)} / −${count.format(removed)}`;
+}
+
 export type ProjectStatusSortKey =
-  "name" | "tickets_done" | "prs_merged" | "spend_cents" | "cost_per_merged_pr_cents";
+  | "name"
+  | "tickets_done"
+  | "prs_merged"
+  | "lines_added"
+  | "spend_cents"
+  | "cost_per_merged_pr_cents";
 
 /** Sort member rows by a column; missing values sort last in either direction. */
 export function sortStatusMembers(
@@ -103,8 +123,8 @@ export function sortStatusMembers(
   const sign = direction === "asc" ? 1 : -1;
   return [...members].sort((left, right) => {
     if (key === "name") return sign * left.name.localeCompare(right.name);
-    const a = left[key];
-    const b = right[key];
+    const a = left[key] ?? null;
+    const b = right[key] ?? null;
     if (a === null && b === null) return left.name.localeCompare(right.name);
     if (a === null) return 1;
     if (b === null) return -1;

@@ -94,6 +94,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_ticket_land",
         "sys_ticket_push_prefix",
         "sys_project_deploy_status",
+        "sys_project_line_stats_record",
         "sys_ticket_revert_draft",
         "sys_ticket_import_pr",
         "sys_session_link_ticket",

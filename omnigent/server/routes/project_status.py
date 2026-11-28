@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.project_kpis import LANDED_COMMIT_LABELS, KpiInputs, changes_landed_total
+from omnigent.server.project_kpis import LANDED_COMMIT_LABELS, KpiInputs, landed_line_totals
 from omnigent.server.project_status import (
     UNAVAILABLE,
     MemberKey,
@@ -23,6 +23,7 @@ from omnigent.server.project_status import (
     StatusSources,
     StatusWindow,
     build_summary,
+    identity_member_key,
     load_status_sources,
     member_key_for_session,
     status_period,
@@ -58,6 +59,19 @@ class ProjectStatusTotals(BaseModel):
             "null when the project has never landed one."
         ),
     )
+    changes_landed_lines_added: int | None = Field(
+        default=None,
+        description=(
+            "Lines the window's landed commits added, generated files left out; null until a "
+            "host has recorded counts for any of them."
+        ),
+    )
+    changes_landed_lines_removed: int | None = Field(
+        default=None, description="Lines they removed, generated files left out."
+    )
+    changes_landed_lines_counted: int = Field(
+        default=0, description="How many of the window's landed commits have line counts."
+    )
     spend_cents: int | None
     cost_per_merged_pr_cents: int | None
     members: int
@@ -78,6 +92,11 @@ class ProjectStatusMember(BaseModel):
     prs_merged: int | None
     spend_cents: int | None
     cost_per_merged_pr_cents: int | None
+    lines_added: int | None = Field(
+        default=None,
+        description="Lines added by landed commits credited to this member (its tickets' role).",
+    )
+    lines_removed: int | None = Field(default=None)
 
 
 class ProjectStatusSources(BaseModel):
@@ -218,8 +237,21 @@ def create_project_status_router(
             )
             return tickets_submitted_by_person(project, rows)
 
-        def count_changes_landed() -> int | None:
-            return changes_landed_total(
+        def count_changes_landed() -> dict[str, Any] | None:
+            labels = ticket_store.label_values(
+                project.id, (*LANDED_COMMIT_LABELS, "assignee"), user_id=user_id
+            )
+            roles = {
+                identity.name.strip().casefold(): identity_member_key(identity.id)
+                for identity in project_store.list_identities(project.id, user_id=user_id)
+            }
+
+            def credit(item: Any) -> Any:
+                # A ticket's lines go to its role; else to whoever landed it.
+                assignee = labels.get(item.key, (None, {}))[1].get("assignee", "")
+                return roles.get(assignee.strip().casefold()) or item.member
+
+            return landed_line_totals(
                 KpiInputs(
                     project=project,
                     period=period,
@@ -233,12 +265,11 @@ def create_project_status_router(
                         lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
                     ),
                     history_since=period.since_epoch,
-                    ticket_labels=functools.cache(
-                        lambda: ticket_store.label_values(
-                            project.id, LANDED_COMMIT_LABELS, user_id=user_id
-                        )
-                    ),
-                )
+                    ticket_labels=lambda: labels,
+                ),
+                lambda shas: ticket_store.commit_line_stats(project.id, shas, user_id=user_id),
+                credit,
+                move_member_resolver(project, conversation_store),
             )
 
         timings: dict[str, float] = {}
@@ -299,7 +330,16 @@ def create_project_status_router(
             prs_merged=prs,
             tickets_submitted=submitted,
         )
-        summary["totals"]["changes_landed"] = landed
+        summary["totals"]["changes_landed"] = None if landed is None else landed["count"]
+        if landed is not None:
+            summary["totals"]["changes_landed_lines_added"] = landed["added"]
+            summary["totals"]["changes_landed_lines_removed"] = landed["removed"]
+            summary["totals"]["changes_landed_lines_counted"] = landed["counted"]
+            counted = landed["counted"] > 0
+            for member in summary["members"]:
+                lines = landed["by_member"].get(member["key"], [0, 0])
+                member["lines_added"] = lines[0] if counted else None
+                member["lines_removed"] = lines[1] if counted else None
         return {**summary, "description": project.description}
 
     return router

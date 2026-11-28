@@ -65,10 +65,22 @@ from omnigent.server.persona_mentions import (
     person_aliases,
     split_mentions,
 )
-from omnigent.server.project_kpis import ticket_times
+from omnigent.server.project_kpis import (
+    LANDED_COMMIT_LABELS,
+    landed_commit,
+    landed_stage_index,
+    ticket_times,
+)
 from omnigent.server.project_landing import RISK_OK_LABEL, could_supersede, is_pure_rebase
+from omnigent.server.project_line_stats import (
+    LINE_STATS_BATCH_MAX,
+    MissingLineStats,
+    RecordedLineStats,
+    RecordLineStats,
+)
 from omnigent.server.project_reliability import settings as reliability_settings
 from omnigent.server.project_router import router_session_ids
+from omnigent.server.project_status_cache import project_status_cache
 from omnigent.server.project_status_spend import project_total_cents
 from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_access, require_user
@@ -1152,6 +1164,84 @@ def create_project_tickets_router(
             configuration = await asyncio.to_thread(store.update_stages, project_id, body, who)
         wake(request)
         return configuration
+
+    def require_project_agent(who: TicketActor) -> None:
+        if who.session_id is None:
+            raise OmnigentError(
+                "Only an agent session in this project records line counts",
+                code=ErrorCode.FORBIDDEN,
+            )
+
+    def landed_shas(project: Any, user_id: str | None) -> list[str]:
+        """Landed SHAs of tickets now at or past the landed stage, newest stage order kept."""
+        stages = store.stages(project.id, user_id=user_id)["stages"]
+        start = landed_stage_index(project.config or {}, stages)
+        if start is None:
+            return []
+        rank = {str(stage["id"]): index for index, stage in enumerate(stages)}
+        found = []
+        for stage_id, values in store.label_values(
+            project.id, LANDED_COMMIT_LABELS, user_id=user_id
+        ).values():
+            commit = landed_commit(values)
+            if commit and rank.get(stage_id or "", -1) >= start:
+                found.append(commit)
+        return sorted(set(found))
+
+    @router.get("/line-stats/missing", response_model=MissingLineStats)
+    async def missing_line_stats(
+        request: Request,
+        project_id: str,
+        limit: int = Query(LINE_STATS_BATCH_MAX, ge=1, le=LINE_STATS_BATCH_MAX),
+    ) -> dict[str, Any]:
+        """Landed commits whose line counts aren't recorded yet, at most *limit*.
+
+        For the agent tool that computes them with git on its host.
+        """
+        who = await actor(request, project_id)
+        require_project_agent(who)
+        project = await load_project(request, project_id, who)
+
+        def missing() -> dict[str, Any]:
+            shas = landed_shas(project, who.user_id)
+            known = store.commit_line_stats(project.id, shas, user_id=who.user_id)
+            todo = [sha for sha in shas if sha not in known]
+            return {"shas": todo[:limit], "remaining": max(0, len(todo) - limit)}
+
+        return await asyncio.to_thread(missing)
+
+    @router.post("/line-stats", response_model=RecordedLineStats)
+    async def record_line_stats(
+        request: Request, project_id: str, body: RecordLineStats
+    ) -> dict[str, Any]:
+        """Record git line counts for this project's landed commits; known ones are kept.
+
+        Only an agent session in this project may call it, for SHAs on this project's
+        tickets.
+        """
+        who = await actor(request, project_id)
+        require_project_agent(who)
+        project = await load_project(request, project_id, who)
+
+        def record() -> dict[str, Any]:
+            allowed = store.ticket_commit_shas(project.id, user_id=who.user_id)
+            unknown = sorted({row.sha for row in body.stats} - allowed)
+            if unknown:
+                raise OmnigentError(
+                    f"Not a commit on this project's tickets: {', '.join(unknown[:5])}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            recorded = store.record_commit_line_stats(
+                project.id,
+                [row.model_dump() for row in body.stats],
+                user_id=who.user_id,
+                allowed_shas=allowed,
+            )
+            if recorded:
+                project_status_cache.invalidate(project.id, ("tickets",))
+            return {"recorded": recorded}
+
+        return await asyncio.to_thread(record)
 
     @router.get("/search")
     async def search_tickets(

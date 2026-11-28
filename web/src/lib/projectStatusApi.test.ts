@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   formatCents,
+  formatLines,
   prsMergedZeroNote,
   sortStatusMembers,
   type ProjectStatusMember,
@@ -69,5 +70,13 @@ describe("prsMergedZeroNote", () => {
     expect(prsMergedZeroNote(0, 0)).toBeUndefined();
     expect(prsMergedZeroNote(3, 12)).toBeUndefined();
     expect(prsMergedZeroNote(null, 12)).toBeUndefined();
+  });
+});
+
+describe("formatLines", () => {
+  it("shows added and removed as two numbers, never one total", () => {
+    expect(formatLines(1234, 56)).toBe("+1,234 / −56");
+    expect(formatLines(null, 3)).toBe("—");
+    expect(formatLines(undefined, undefined)).toBe("—");
   });
 });

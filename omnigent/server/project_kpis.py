@@ -510,6 +510,48 @@ def has_landed_commits(inputs: KpiInputs) -> bool:
     )
 
 
+def landed_line_totals(
+    inputs: KpiInputs,
+    stats_for: Callable[[list[str]], dict[str, dict[str, int]]],
+    credit: Callable[[SeriesItem], MemberKey | None],
+    member_of: MemberOfMove = _no_member,
+) -> dict[str, Any] | None:
+    """Changes landed in the window with their recorded line counts.
+
+    ``count`` is :func:`changes_landed_total`'s. ``added``/``removed`` sum the commits
+    that have counts (``None`` when none do), ``counted`` says how many, and
+    ``by_member`` credits each commit's lines to ``credit(item)``.
+    """
+    count = changes_landed_total(inputs)
+    if count is None:
+        return None
+    series = load_series(["changes_landed"], inputs, member_of)["changes_landed"]
+    period = inputs.period
+    items = items_in_range(series, period.since_epoch, period.until_epoch + 1)
+    stats = stats_for(sorted({item.detail["commit"] for item in items}))
+    added = removed = counted = 0
+    by_member: dict[MemberKey, list[int]] = {}
+    for item in items:
+        commit = stats.get(item.detail["commit"])
+        if commit is None:
+            continue
+        counted += 1
+        added += commit["added"]
+        removed += commit["removed"]
+        member = credit(item)
+        if member is not None:
+            totals = by_member.setdefault(member, [0, 0])
+            totals[0] += commit["added"]
+            totals[1] += commit["removed"]
+    return {
+        "count": count,
+        "added": added if counted else None,
+        "removed": removed if counted else None,
+        "counted": counted,
+        "by_member": by_member,
+    }
+
+
 def changes_landed_total(inputs: KpiInputs) -> int | None:
     """Changes landed in the window; ``None`` when the project has never landed a commit."""
     if not has_landed_commits(inputs):
