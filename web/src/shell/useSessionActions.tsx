@@ -370,7 +370,7 @@ export function useSessionActions({
                 {conversation.host_id
                   ? " and stops its runner, including side chats running on it."
                   : "."}{" "}
-                Conversation histories are kept.
+                Conversation histories are kept. Any open side shells are closed.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
