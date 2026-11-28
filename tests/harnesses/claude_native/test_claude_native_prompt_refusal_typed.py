@@ -42,6 +42,16 @@ _SETTINGS_ERROR_DIALOG = (
     "  Enter to confirm · Esc to cancel\n"
 )
 
+_MODEL_SWITCH_DIALOG = (
+    f"{'▔' * 80}\n"
+    "   Switch model?\n"
+    "   Your next response will be slower and use more tokens\n"
+    "   This conversation is cached for the current model. Switching to Claude\n"
+    "   Sonnet means the full history gets re-read.\n"
+    "   ❯ 1. Yes, switch to Claude Sonnet\n"
+    "     2. No, go back\n"
+)
+
 
 class _Clock:
     def __init__(self) -> None:
@@ -127,18 +137,25 @@ def test_a_prompt_after_the_paste_is_not_retryable(
     assert raised.value.nothing_typed is False
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [_SETTINGS_ERROR_DIALOG, _MODEL_SWITCH_DIALOG],
+    ids=["settings-error", "footerless-model-switch"],
+)
 def test_the_readiness_gate_dialog_refusal_awaits_an_answer(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     """A dialog only the terminal shows is held by the executor until it closes."""
-    _show(monkeypatch, _SETTINGS_ERROR_DIALOG)
+    _show(monkeypatch, pane)
+    sent = []
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: sent.append(args))
 
-    with pytest.raises(ClaudeTerminalDialog, match="Settings Error") as raised:
-        claude_native_bridge._wait_for_claude_prompt_ready(
-            "/tmp/example/tmux.sock", "main", timeout_s=1.0, bridge_dir=bridge_dir
-        )
+    with pytest.raises(ClaudeTerminalDialog) as raised:
+        claude_native_bridge.inject_user_message(bridge_dir, content="Follow-up", timeout_s=1.0)
 
     assert raised.value.awaits_answer is True
+    assert sent == []
+    assert claude_native_bridge.time.monotonic() < 1.0
 
 
 def test_an_occupied_input_box_refusal_awaits_no_answer(
@@ -157,13 +174,39 @@ def test_an_occupied_input_box_refusal_awaits_no_answer(
     ("pane", "expected"),
     [
         (_SETTINGS_ERROR_DIALOG, True),
+        (_MODEL_SWITCH_DIALOG, True),
+        (_MODEL_SWITCH_DIALOG.replace("❯ 1.", "  1.").replace("  2.", "❯ 2."), True),
+        (_MODEL_SWITCH_DIALOG.replace("Switch model?", "Change effort level?"), True),
+        (_MODEL_SWITCH_DIALOG.replace("❯", " "), False),
+        (_MODEL_SWITCH_DIALOG.split("   ❯")[0], False),
+        (_MODEL_SWITCH_DIALOG.replace("2. No, go back", "Other text"), False),
+        (_MODEL_SWITCH_DIALOG.split("\n", 1)[1], False),
+        ("\n".join("> " + line for line in _MODEL_SWITCH_DIALOG.splitlines()), False),
+        (_MODEL_SWITCH_DIALOG + f"{_RULE}\nLauncher starting\n", False),
+        (_MODEL_SWITCH_DIALOG + f"{_RULE}\n❯\n{_RULE}\n", False),
         # The launcher's install question is answered in the same terminal.
         ("No Claude Code installation found. Would you like to install it? [Y/n]:", True),
         ("Would you like to install it? [Y/n]: y\nInstalling Claude Code...", False),
         (f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n", False),
         ("", False),
     ],
-    ids=["dialog", "install-prompt", "install-answered", "composer", "torn-capture"],
+    ids=[
+        "dialog",
+        "model-switch-yes",
+        "model-switch-no",
+        "effort-switch",
+        "no-selector",
+        "title-only",
+        "missing-no-choice",
+        "no-rule",
+        "quoted-dialog",
+        "older-dialog",
+        "dialog-above-composer",
+        "install-prompt",
+        "install-answered",
+        "composer",
+        "torn-capture",
+    ],
 )
 def test_terminal_dialog_pending_reads_the_pane(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: bool

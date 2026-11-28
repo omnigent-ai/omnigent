@@ -35,7 +35,7 @@ from pathlib import Path
 
 received, delivered = map(Path, sys.argv[1:3])
 panel_kind = sys.argv[3] if len(sys.argv) > 3 else ""
-panel_open = panel_kind in {"btw", "transcript", "question"}
+panel_open = panel_kind in {"btw", "transcript", "question", "confirmation"}
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
@@ -53,6 +53,14 @@ if panel_kind == "question":
         "  2. Try a different bridge\r\n  3. Type something.\r\n"
         + rule + "\r\n  4. Chat about this\r\n"
         "Enter to select · ↑/↓ to navigate · Esc to cancel\r\n")
+    sys.stdout.flush()
+elif panel_kind == "confirmation":
+    rule = "▔" * os.get_terminal_size().columns
+    sys.stdout.write("\x1b[H\x1b[2J" + rule + "\r\n"
+        "   Switch model?\r\n"
+        "   Your next response will be slower and use more tokens\r\n"
+        "   ❯ 1. Yes, switch to Claude Sonnet\r\n"
+        "     2. No, go back\r\n")
     sys.stdout.flush()
 elif panel_kind == "transcript":
     sys.stdout.write("\x1b[H\x1b[2J" + "─" * os.get_terminal_size().columns + "\r\n"
@@ -74,7 +82,7 @@ while True:
         log.write(chunk)
     buffer += chunk
     if panel_open:
-        close_key = b"1\r" if panel_kind == "question" else (
+        close_key = b"1\r" if panel_kind in {"question", "confirmation"} else (
             b"\x0f" if panel_kind == "transcript" else b"\x1b")
         if close_key in buffer or (panel_kind == "question" and b"\x1b" in buffer):
             panel_open = False
@@ -250,6 +258,33 @@ def test_question_with_a_footer_word_split_by_tmux_keeps_waiting(
     poll_until(lambda: bridge.claude_pane_ready(pane.bridge_dir), timeout_s=5.0, interval_s=0.05)
     bridge.inject_user_message(pane.bridge_dir, content="AFTER_QUESTION", timeout_s=1.0)
     assert json.loads(pane.delivered.read_text()) == ["AFTER_QUESTION"]
+
+
+@pytest.mark.parametrize("pane", [("emacs", "confirmation")], indirect=True)
+@pytest.mark.parametrize("operation", ["message", "settings"])
+def test_footerless_model_confirmation_holds_input_until_answered(
+    pane: _Pane, operation: str
+) -> None:
+    """A real terminal keeps its dialog until an explicit answer, then accepts input once."""
+    with pytest.raises(bridge.ClaudeTerminalDialog) as caught:
+        if operation == "message":
+            bridge.inject_user_message(pane.bridge_dir, content="AFTER_CONFIRM", timeout_s=1.0)
+        else:
+            bridge.inject_slash_command(pane.bridge_dir, command="/effort high", timeout_s=1.0)
+    assert caught.value.awaits_answer
+    assert bridge.terminal_dialog_pending(pane.bridge_dir)
+    assert not pane.received.exists()
+
+    subprocess.run(
+        [*pane.tmux, "send-keys", "-t", "main", "1", "Enter"],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    poll_until(lambda: bridge.claude_pane_ready(pane.bridge_dir), timeout_s=5.0, interval_s=0.05)
+    assert not bridge.terminal_dialog_pending(pane.bridge_dir)
+    bridge.inject_user_message(pane.bridge_dir, content="AFTER_CONFIRM", timeout_s=1.0)
+    assert json.loads(pane.delivered.read_text()) == ["AFTER_CONFIRM"]
 
 
 @pytest.mark.parametrize("pane", [("emacs", "btw")], indirect=True, ids=["narrow-quick-answer"])
