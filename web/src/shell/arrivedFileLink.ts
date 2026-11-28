@@ -2,7 +2,7 @@
 // can rewrite the URL (its viewer drops `diff` before the diff loads), so the tabs sidebar opens
 // the link as it arrived instead.
 
-import { useCallback } from "react";
+import { useCallback, useLayoutEffect } from "react";
 import { useLocation, useNavigationType } from "@/lib/routing";
 import type { WorkspaceFileOpenOptions } from "@/shell/workspaceTabs/workspacePlaceNavigation";
 import { citedFilePosition } from "./filePositionState";
@@ -28,26 +28,29 @@ let arrived: { pathname: string; params: URLSearchParams } | null = null;
 /**
  * Remembers the query of the latest location reached by a page load, a push or back/forward.
  * A replace that keeps its session and file, as the app's own cleanup of the URL does, keeps
- * it; any other replace forgets it. `take(path)` returns that query once, when it links to
- * `path`, and forgets it either way.
+ * it; any other replace forgets it, so the link lasts until it leaves the URL. Only committed
+ * locations count, so a render React discards changes nothing. `peek(path)` returns that
+ * query when it links to `path`, the same each time, as a replayed effect needs.
  */
-export function useArrivedFileLink(): { take: (path: string) => URLSearchParams | null } {
+export function useArrivedFileLink(): { peek: (path: string) => URLSearchParams | null } {
   const location = useLocation();
   const navigationType = useNavigationType();
-  if (navigationType !== "REPLACE" && seenLocation !== location) {
-    seenLocation = location;
-    arrived = { pathname: location.pathname, params: new URLSearchParams(location.search) };
-  } else if (
-    arrived &&
-    (location.pathname !== arrived.pathname ||
-      new URLSearchParams(location.search).get("file") !== arrived.params.get("file"))
-  ) {
-    arrived = null;
-  }
-  const take = useCallback((path: string) => {
-    const params = arrived?.params ?? null;
-    arrived = null;
-    return params?.get("file") === path ? params : null;
-  }, []);
-  return { take };
+  // Before the shell's own effects, which read it, in the same commit.
+  useLayoutEffect(() => {
+    if (navigationType !== "REPLACE" && seenLocation !== location) {
+      seenLocation = location;
+      arrived = { pathname: location.pathname, params: new URLSearchParams(location.search) };
+    } else if (
+      arrived &&
+      (location.pathname !== arrived.pathname ||
+        new URLSearchParams(location.search).get("file") !== arrived.params.get("file"))
+    ) {
+      arrived = null;
+    }
+  }, [location, navigationType]);
+  const peek = useCallback(
+    (path: string) => (arrived?.params.get("file") === path ? arrived.params : null),
+    [],
+  );
+  return { peek };
 }

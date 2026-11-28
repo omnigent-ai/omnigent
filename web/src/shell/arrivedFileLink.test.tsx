@@ -1,6 +1,6 @@
-import type { ReactNode } from "react";
+import { StrictMode, Suspense, startTransition, useEffect, type ReactNode } from "react";
 import { act, render, renderHook } from "@testing-library/react";
-import { MemoryRouter, type NavigateFunction, useNavigate } from "react-router-dom";
+import { MemoryRouter, type NavigateFunction, useLocation, useNavigate } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import { fileLinkOpenOptions, useArrivedFileLink } from "./arrivedFileLink";
 
@@ -26,41 +26,96 @@ function arrivedLink(entry: string) {
   return renderHook(() => ({ link: useArrivedFileLink(), navigate: useNavigate() }), { wrapper });
 }
 
+/** What a mounted shell sees of the hook, and its router's navigate. */
+interface Shell {
+  peek?: (path: string) => URLSearchParams | null;
+  navigate?: NavigateFunction;
+}
+
+const neverResolves = new Promise<never>(() => {});
+
 describe("useArrivedFileLink", () => {
-  it("keeps the link a page arrived with across the app's own rewrites, and hands it over once", () => {
+  it("keeps the link a page arrived with across the app's own rewrites until it leaves the URL", () => {
     const { result } = arrivedLink("/c/s?file=a.ts&diff=1");
     act(() => result.current.navigate("/c/s?file=a.ts", { replace: true }));
 
-    expect(result.current.link.take("a.ts")?.toString()).toBe("file=a.ts&diff=1");
-    expect(result.current.link.take("a.ts")).toBeNull();
+    // Read as often as an effect runs, replays included, while the link stays in the URL.
+    expect(result.current.link.peek("a.ts")?.toString()).toBe("file=a.ts&diff=1");
+    expect(result.current.link.peek("a.ts")?.toString()).toBe("file=a.ts&diff=1");
+    // Handed over: the app takes the link off the URL.
+    act(() => result.current.navigate("/c/s", { replace: true }));
+    expect(result.current.link.peek("a.ts")).toBeNull();
+  });
+
+  it("gives a replayed effect the same link, as StrictMode replays the shell's", () => {
+    const shell: Shell = {};
+    const seen: (string | null)[] = [];
+    function Probe() {
+      const { peek } = useArrivedFileLink();
+      shell.navigate = useNavigate();
+      useEffect(() => {
+        seen.push(peek("a.ts")?.toString() ?? null);
+      }, [peek]);
+      return null;
+    }
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={["/c/s?file=a.ts&diff=1"]}>
+          <Probe />
+        </MemoryRouter>
+      </StrictMode>,
+    );
+
+    expect(seen.length).toBeGreaterThan(1);
+    expect(new Set(seen)).toEqual(new Set(["file=a.ts&diff=1"]));
+  });
+
+  it("keeps the link through a navigation whose render never commits", () => {
+    const shell: Shell = {};
+    function Probe() {
+      shell.peek = useArrivedFileLink().peek;
+      shell.navigate = useNavigate();
+      // The next page is still loading, so React keeps this one on screen.
+      if (useLocation().search.includes("b.ts")) throw neverResolves;
+      return null;
+    }
+    render(
+      <MemoryRouter initialEntries={["/c/s?file=a.ts&diff=1"]}>
+        <Suspense fallback={null}>
+          <Probe />
+        </Suspense>
+      </MemoryRouter>,
+    );
+    const navigate = shell.navigate!;
+    act(() => startTransition(() => navigate("/c/s?file=b.ts")));
+
+    expect(shell.peek!("a.ts")?.toString()).toBe("file=a.ts&diff=1");
   });
 
   it("keeps the link for a shell that remounts after the app rewrote the URL", () => {
-    const hooks: { take?: (path: string) => URLSearchParams | null; navigate?: NavigateFunction } =
-      {};
+    const shell: Shell = {};
     function Probe() {
-      hooks.take = useArrivedFileLink().take;
-      hooks.navigate = useNavigate();
+      shell.peek = useArrivedFileLink().peek;
+      shell.navigate = useNavigate();
       return null;
     }
-    const shell = (generation: number) => (
+    const tree = (generation: number) => (
       <MemoryRouter initialEntries={["/c/s?file=a.ts&diff=1"]}>
         <Probe key={generation} />
       </MemoryRouter>
     );
-    const { rerender } = render(shell(1));
-    act(() => hooks.navigate!("/c/s?file=a.ts", { replace: true }));
-    rerender(shell(2));
+    const { rerender } = render(tree(1));
+    act(() => shell.navigate!("/c/s?file=a.ts", { replace: true }));
+    rerender(tree(2));
 
-    expect(hooks.take!("a.ts")?.toString()).toBe("file=a.ts&diff=1");
+    expect(shell.peek!("a.ts")?.toString()).toBe("file=a.ts&diff=1");
   });
 
-  it("takes a link that names another file as nothing, and forgets it", () => {
+  it("gives nothing for another file than the one the link names", () => {
     const { result } = arrivedLink("/c/s?file=a.ts&diff=1");
-    act(() => result.current.navigate("/c/s?file=b.ts", { replace: true }));
 
-    expect(result.current.link.take("b.ts")).toBeNull();
-    expect(result.current.link.take("a.ts")).toBeNull();
+    expect(result.current.link.peek("b.ts")).toBeNull();
+    expect(result.current.link.peek("a.ts")?.toString()).toBe("file=a.ts&diff=1");
   });
 
   it.each([
@@ -73,15 +128,18 @@ describe("useArrivedFileLink", () => {
       act(() => result.current.navigate(rewrite, { replace: true }));
     }
 
-    expect(result.current.link.take("a.ts")).toBeNull();
+    expect(result.current.link.peek("a.ts")).toBeNull();
   });
 
   it("follows each link a person follows, back and forward included", () => {
     const { result } = arrivedLink("/c/s?file=a.ts");
     act(() => result.current.navigate("/c/s?file=b.ts&line=2"));
-    expect(result.current.link.take("b.ts")?.get("line")).toBe("2");
+    expect(result.current.link.peek("b.ts")?.get("line")).toBe("2");
 
     act(() => result.current.navigate(-1));
-    expect(result.current.link.take("a.ts")?.toString()).toBe("file=a.ts");
+    expect(result.current.link.peek("a.ts")?.toString()).toBe("file=a.ts");
+
+    act(() => result.current.navigate(1));
+    expect(fileLinkOpenOptions(result.current.link.peek("b.ts")!)).toEqual({ line: 2 });
   });
 });

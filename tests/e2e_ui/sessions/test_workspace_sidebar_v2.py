@@ -23,7 +23,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -83,20 +83,16 @@ def _start_with_no_pinned_pages(page: Page) -> None:
     page.add_init_script(f"window.localStorage.setItem({_PINNED_PAGES_KEY!r}, JSON.stringify([]))")
 
 
-def _set_flag(
-    page: Page, enabled: bool, *, settings_pins: bool = False, answer_after: float = 0
-) -> None:
+def _set_flag(page: Page, enabled: bool, *, settings_pins: bool = False) -> None:
     """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``.
 
     With the flag on, a journey opens the tabs it needs, so its strips start with nothing
-    pinned unless ``settings_pins`` keeps Settings as shipped. ``answer_after`` holds each
-    answer for that many seconds, as a slow server does while the app starts.
+    pinned unless ``settings_pins`` keeps Settings as shipped.
     """
     if enabled and not settings_pins:
         _start_with_no_pinned_pages(page)
 
     def answer(route: Route) -> None:
-        time.sleep(answer_after)
         response = route.fetch()
         info = response.json()
         info["features"] = {**(info.get("features") or {}), "workspace_sidebar_v2": enabled}
@@ -1051,17 +1047,56 @@ def test_diff_file_link_opens_its_diff_in_diffs(
     also when the server says the tabs sidebar is on only after the page has loaded."""
     base_url, session_id = git_session
     (tmp_path / "repository" / "base.txt").write_text("Add the base\nedited for the link\n")
-    _set_flag(page, True, answer_after=2.0 if slow_server else 0)
-    if slow_server:
-        # Until the server answers, the classic sidebar shows the file, and its viewer takes
-        # ``diff`` off the URL while the file's changes load; hold them past the answer.
-        def hold_changes(route: Route) -> None:
-            time.sleep(3.0)
-            route.continue_()
+    _set_flag(page, True)
+    # Until the server answers, the classic sidebar shows the file, and its viewer takes
+    # ``diff`` off the URL while the file's diff loads. A slow server answers only once it has,
+    # and the classic file's diff and changes stay unanswered until the link is handed over,
+    # so ``diff`` can't come back first.
+    held: dict[str, list[Route]] = {"info": [], "changes": []}
+    released: set[str] = set()
 
-        page.route("**/resources/environments/default/changes", hold_changes)
+    def hold(kind: str) -> Callable[[Route], None]:
+        def handle(route: Route) -> None:
+            if kind in released:
+                route.fallback()
+            else:
+                held[kind].append(route)
+
+        return handle
+
+    def release(kind: str) -> None:
+        released.add(kind)
+        for route in held[kind]:
+            route.fallback()
+
+    if slow_server:
+        page.route("**/v1/info", hold("info"))
+        page.route("**/resources/environments/default/changes", hold("changes"))
+        page.route("**/resources/environments/default/diff/**", hold("changes"))
     page.set_viewport_size(_VIEWPORTS["desktop"])
     page.goto(f"{base_url}/c/{session_id}?file=base.txt&diff=1")
+    if slow_server:
+        page.wait_for_function(
+            """() => {
+              const params = new URLSearchParams(location.search);
+              return params.get("file") === "base.txt" && !params.has("diff");
+            }""",
+            timeout=30_000,
+        )
+        assert held["info"], "the app asked the server nothing before the viewer took diff off"
+        # The router writes the URL at once but renders it in a transition; let that render
+        # land before the answer, so the shell reads the rewritten link.
+        page.evaluate(
+            """async () => {
+              for (let frame = 0; frame < 30; frame += 1) {
+                await new Promise((resolve) => requestAnimationFrame(resolve));
+              }
+            }"""
+        )
+        assert "diff=" not in page.evaluate("location.search")
+        release("info")
+        expect(page).not_to_have_url(re.compile(r"[?&]file="), timeout=60_000)
+        release("changes")
 
     sidebar = page.get_by_role("complementary", name="Workspace")
     strip = sidebar.get_by_role("tablist", name="Workspace tabs")

@@ -2034,7 +2034,7 @@ function AppShellImpl() {
   useEffect(() => {
     const tabsSession = tabsSessionRef.current;
     if (tabsSession === null || !citationPath) return;
-    const link = arrivedFileLink.take(citationPath) ?? searchParams;
+    const link = arrivedFileLink.peek(citationPath) ?? searchParams;
     const options = fileLinkOpenOptions(link);
     void routeToWorkspaceTabs((tabs) =>
       tabs.openWorkspaceFileLink(tabsSession, citationPath, options, "link"),
