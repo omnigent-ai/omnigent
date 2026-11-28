@@ -67,7 +67,10 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
-from omnigent.policies.builtins.safety import scheduled_task_review_error
+from omnigent.policies.builtins.safety import (
+    apply_scheduled_task_clear,
+    scheduled_task_review_error,
+)
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.journal_tools import (
     JOURNAL_TOOL_NAMES,
@@ -5650,6 +5653,8 @@ async def _execute_scheduled_task_tool(
         error = scheduled_task_review_error(args, action=action)
         if error:
             return json.dumps({"error": f"{tool_name}: {error}"})
+        if tool_name == "sys_scheduled_task_update":
+            args, _ = apply_scheduled_task_clear(args)
     if "project_name" in args and "project_id" in args:
         return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
     raw_project_name = args.get("project_name")

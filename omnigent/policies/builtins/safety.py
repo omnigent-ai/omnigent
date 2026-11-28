@@ -461,10 +461,48 @@ def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
     return ", ".join([*known, *extra])
 
 
+# Optional update fields an agent may reset with ``clear`` when its client can't send null.
+SCHEDULED_TASK_CLEARABLE_FIELDS = (
+    "permission_mode",
+    "max_cost_usd",
+    "model_override",
+    "reasoning_effort",
+    "session_id",
+    "workspace",
+    "project_id",
+)
+
+
+def apply_scheduled_task_clear(
+    args: dict[str, object],
+) -> tuple[dict[str, object], str | None]:
+    """Turn an update's ``clear`` list into explicit nulls, or say why it's invalid.
+
+    :returns: The arguments without ``clear`` and with each listed field set to
+        ``None``, and an error message or ``None``.
+    """
+    if "clear" not in args:
+        return args, None
+    clear = args["clear"]
+    if not isinstance(clear, list) or not all(isinstance(name, str) for name in clear):
+        return args, "clear must be a list of field names."
+    unknown = sorted(set(clear) - set(SCHEDULED_TASK_CLEARABLE_FIELDS))
+    if unknown:
+        allowed = ", ".join(SCHEDULED_TASK_CLEARABLE_FIELDS)
+        return args, f"clear can't reset {', '.join(unknown)}; it accepts {allowed}."
+    cleared = {key: value for key, value in args.items() if key != "clear"}
+    for name in clear:
+        cleared[name] = None
+    return cleared, None
+
+
 def scheduled_task_review_error(
     args: dict[str, object], *, action: str, require_complete: bool = True
 ) -> str | None:
     """Validate review values, allowing omitted fields only for legacy callers."""
+    args, clear_error = apply_scheduled_task_clear(args)
+    if clear_error:
+        return clear_error
     missing = sorted(_SCHEDULED_TASK_REVIEW_FIELDS.difference(args))
     if require_complete and missing:
         hint = (
@@ -594,6 +632,8 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     error = scheduled_task_review_error(args, action=action, require_complete=False)
     if error:
         return {"result": "DENY", "reason": f"Cannot {action} a scheduled task. {error}"}
+    # Review what will be sent: fields in ``clear`` show as cleared.
+    args, _ = apply_scheduled_task_clear(args)
     if action == "create":
         name = _clip(str(args.get("name") or "(unnamed)"))
         review = _scheduled_task_review(

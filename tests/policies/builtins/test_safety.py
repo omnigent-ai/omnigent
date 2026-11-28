@@ -972,6 +972,30 @@ def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
     assert "state=paused" in result["reason"]
 
 
+def test_ask_on_scheduled_task_change_reviews_cleared_fields() -> None:
+    """A ``clear`` list still asks, and the prompt shows the fields it resets."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                    "prompt": "Daily summary.",
+                    "permission_mode": "null",
+                    "clear": ["permission_mode", "max_cost_usd"],
+                },
+            },
+        }
+    )
+    assert result["result"] == "ASK"
+    assert "max_cost_usd=None" in result["reason"]
+    assert "agent default" in result["reason"]
+
+
 @pytest.mark.parametrize(
     "tool", ["sys_scheduled_task_list", "sys_scheduled_task_delete", "web_search"]
 )

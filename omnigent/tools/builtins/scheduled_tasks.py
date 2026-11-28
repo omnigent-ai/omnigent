@@ -407,6 +407,28 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "Null stops filing them into a project."
                             ),
                         },
+                        "clear": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": [
+                                    "permission_mode",
+                                    "max_cost_usd",
+                                    "model_override",
+                                    "reasoning_effort",
+                                    "session_id",
+                                    "workspace",
+                                    "project_id",
+                                ],
+                            },
+                            "description": (
+                                "Fields to reset, the same as sending JSON null for each: "
+                                "e.g. ['max_cost_usd'] removes the cost cap and "
+                                "['permission_mode'] uses the agent's default. Use it when "
+                                "you can't send null; it wins over a value you also pass. "
+                                "The change still needs approval."
+                            ),
+                        },
                     },
                     "required": ["scheduled_task_id", "prompt", "permission_mode"],
                     "additionalProperties": False,

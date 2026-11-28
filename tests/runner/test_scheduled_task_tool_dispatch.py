@@ -381,6 +381,35 @@ async def test_update_forwards_agent_switch_cost_cap_and_project(
     }
 
 
+@pytest.mark.asyncio
+async def test_update_clear_resets_fields_a_client_cant_send_null_for() -> None:
+    """``clear`` sends null for each named field and leaves the rest as passed."""
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    arguments = {
+        "scheduled_task_id": _TASK_ID,
+        "prompt": "Daily summary.",
+        "permission_mode": "null",
+        "clear": ["max_cost_usd", "permission_mode"],
+    }
+    jsonschema.validate(
+        arguments, SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
+    )
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update", json.dumps(arguments), server_client=client
+    )
+    _, _, body = client.calls[-1]
+    assert body == {"prompt": "Daily summary.", "permission_mode": None, "max_cost_usd": None}
+
+    refused = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_scheduled_task_update",
+            json.dumps({**arguments, "clear": ["prompt"]}),
+            server_client=client,
+        )
+    )
+    assert "can't reset prompt" in refused["error"]
+
+
 class _ProjectsClient(_RecordingClient):
     """Serves ``/v1/projects`` from a list; other calls get the scripted response."""
 
@@ -558,7 +587,8 @@ def test_update_schema_accepts_a_project_id_or_null(project_id: str | None) -> N
         (
             SysScheduledTaskUpdateTool(),
             _SCHEDULED_TASK_UPDATE_FIELDS,
-            {"project_name", "scheduled_task_id"},
+            # ``clear`` is applied as nulls on the forwarded fields.
+            {"project_name", "scheduled_task_id", "clear"},
         ),
     ],
     ids=["create", "update"],
