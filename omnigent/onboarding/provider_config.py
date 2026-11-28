@@ -104,6 +104,12 @@ RESPONSES_WIRE_API = "responses"
 CHAT_WIRE_API = "chat"
 _VALID_WIRE_API = (RESPONSES_WIRE_API, CHAT_WIRE_API)
 
+# Accepted ``pi_api`` values: a Pi ``models.json`` API that pi-native writes
+# instead of the one ``wire_api`` implies. ``mistral-conversations`` is Pi's
+# Mistral client, which reads Mistral's chunked (reasoning) message content.
+PI_MISTRAL_API = "mistral-conversations"
+_VALID_PI_API = (PI_MISTRAL_API,)
+
 # Provider kinds (the top-level ``kind:`` discriminator on a provider entry).
 # - ``key``: a vendor API key reached via families (Anthropic / OpenAI).
 # - ``subscription``: a logged-in CLI (``claude`` / ``codex``) — no families,
@@ -325,6 +331,12 @@ class FamilyConfig:
     :param max_output_tokens: Optional maximum output token count for the
         default model (e.g. ``65536``). When set, pi-native sessions
         advertise this limit in ``models.json`` instead of Pi's 16k default.
+    :param pi_api: Optional Pi API for this family's models in pi-native
+        sessions, overriding the one ``wire_api`` implies. Only
+        ``"mistral-conversations"`` is accepted, for a Chat Completions
+        endpoint serving Mistral models (directly or through a gateway) whose
+        reasoning content the OpenAI client renders as ``[object Object]``.
+        Only meaningful for the ``openai`` family.
     """
 
     base_url: str
@@ -336,6 +348,7 @@ class FamilyConfig:
     pricing: ModelPricingConfig | None = None
     context_window: int | None = None
     max_output_tokens: int | None = None
+    pi_api: str | None = None
 
     @property
     def default_model(self) -> str | None:
@@ -801,6 +814,21 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
             )
         max_output_tokens = max_output_tokens_raw
 
+    pi_api_raw = raw.get("pi_api")
+    pi_api: str | None = None
+    if pi_api_raw is not None:
+        pi_api = str(pi_api_raw)
+        if pi_api not in _VALID_PI_API:
+            raise OmnigentError(
+                f"{prefix}.pi_api must be one of {_VALID_PI_API}, got {pi_api!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if family_name != OPENAI_FAMILY:
+            raise OmnigentError(
+                f"{prefix}.pi_api is only supported on the {OPENAI_FAMILY!r} family.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
     return FamilyConfig(
         base_url=base_url_raw,
         api_key=api_key,
@@ -811,6 +839,7 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
         pricing=pricing,
         context_window=context_window,
         max_output_tokens=max_output_tokens,
+        pi_api=pi_api,
     )
 
 

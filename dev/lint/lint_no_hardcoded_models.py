@@ -29,7 +29,7 @@ MODEL_ID_RE = re.compile(
       | kimi-k\d[a-z0-9._:/-]*
       | qwen\d[a-z0-9][a-z0-9._:/-]*
       | llama-\d[a-z0-9][a-z0-9._:/-]*
-      | mistral-[a-z0-9][a-z0-9._:/-]*
+      | mistral-(?!conversations(?![a-z0-9._:/-]))[a-z0-9][a-z0-9._:/-]*
       | deepseek-[a-z0-9][a-z0-9._:/-]*
     )\b(?![a-z0-9._:/-])
     """,

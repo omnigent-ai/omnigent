@@ -472,6 +472,37 @@ def test_inline_databricks_gateway_partial_listing_keeps_default_on_declared_sur
 
 
 @pytest.mark.parametrize("default_listed", [True, False], ids=["listed", "omitted"])
+def test_inline_databricks_gateway_pi_api_opens_default_on_mistral_provider(
+    monkeypatch: pytest.MonkeyPatch, default_listed: bool
+) -> None:
+    """A gateway default with ``pi_api`` gets its own Mistral provider, ahead of the surfaces."""
+    default = "main.models.mistral_large"
+    gemini = [{"id": "system.ai.gemini-3-flash"}, *([{"id": default}] if default_listed else [])]
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], gemini),
+    )
+    gateway = _databricks_openai_gateway_config()["providers"]["openai-gateway"]["openai"]
+    mlflow_url = gateway["base_url"].replace("/codex/v1", "/mlflow/v1")
+    config = _mistral_family_config(mlflow_url)
+    config["providers"]["mistral"]["openai"]["models"] = {"default": default}
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    rendered = provider.to_models_config()
+    mistral = rendered["providers"]["omnigent-mistral"]
+    assert mistral["api"] == "mistral-conversations"
+    assert mistral["baseUrl"] == mlflow_url.removesuffix("/v1")
+    assert [row["id"] for row in mistral["models"]] == [default]
+    assert [row["id"] for row in rendered["providers"]["omnigent-mlflow"]["models"]] == [
+        row["id"] for row in gemini
+    ]
+    assert creds._default_model_provider_id(provider, rendered) == "omnigent-mistral"
+
+
+@pytest.mark.parametrize("default_listed", [True, False], ids=["listed", "omitted"])
 def test_inline_databricks_gateway_keeps_configured_limits_on_default(
     monkeypatch: pytest.MonkeyPatch, default_listed: bool
 ) -> None:
@@ -1649,6 +1680,45 @@ def test_openai_responses_wire_api_explicit() -> None:
     assert provider.api == "openai-responses"
     assert provider.base_url == "https://api.openai.com/v1"
     assert provider.model == "gpt-4o"
+
+
+def _mistral_family_config(base_url: str, **tiers: str) -> dict[str, object]:
+    return {
+        "providers": {
+            "mistral": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": base_url,
+                    "api_key": "mistral-key",
+                    "wire_api": "chat",
+                    "pi_api": "mistral-conversations",
+                    "models": {"default": "mistral-large-latest", **tiers},
+                },
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "tiers", [{}, {"coder": "devstral-latest"}], ids=["default-only", "curated-tiers"]
+)
+def test_openai_family_pi_api_renders_pi_mistral_client(tiers: dict[str, str]) -> None:
+    """``pi_api`` selects Pi's Mistral client, which appends ``/v1`` itself."""
+    config = _mistral_family_config("https://api.example.com/v1/", **tiers)
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    rendered = provider.to_models_config()["providers"]
+    assert list(rendered) == ["omnigent"]
+    assert rendered["omnigent"]["api"] == "mistral-conversations"
+    assert rendered["omnigent"]["baseUrl"] == "https://api.example.com"
+    assert "compat" not in rendered["omnigent"]
+    assert [row["id"] for row in rendered["omnigent"]["models"]] == [
+        "mistral-large-latest",
+        *tiers.values(),
+    ]
 
 
 def _cli_config_databricks_config() -> dict[str, object]:
@@ -3519,6 +3589,36 @@ def test_gateway_provider_max_output_tokens_validation_rejects_negative() -> Non
         }
     }
     with pytest.raises(OmnigentError, match="max_output_tokens"):
+        load_providers(config)
+
+
+@pytest.mark.parametrize(
+    ("family", "pi_api", "message"),
+    [
+        ("openai", "mistral", "pi_api must be one of"),
+        ("anthropic", "mistral-conversations", "only supported on the 'openai' family"),
+    ],
+)
+def test_gateway_provider_pi_api_validation(family: str, pi_api: str, message: str) -> None:
+    """``pi_api`` accepts only a known Pi API, and only on the OpenAI family."""
+    from omnigent.errors import OmnigentError
+    from omnigent.onboarding.provider_config import load_providers
+
+    config = {
+        "providers": {
+            "bad-provider": {
+                "kind": "gateway",
+                family: {
+                    "api_key": "test-key",
+                    "base_url": "https://api.example.com",
+                    "models": {"default": "model"},
+                    "pi_api": pi_api,
+                },
+                "default": True,
+            }
+        }
+    }
+    with pytest.raises(OmnigentError, match=message):
         load_providers(config)
 
 
