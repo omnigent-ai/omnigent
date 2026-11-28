@@ -1,10 +1,11 @@
-// Every window-level binding fires the handler the registry names when its chords are
-// pressed, so a registry entry can't advertise a chord nothing acts on.
+// Every window-level binding's hook acts on each of its chords, on the Mac and elsewhere, so a
+// registry entry can't advertise a chord nothing acts on. A binding's `module` says where its
+// handler lives; each case here mounts that hook itself.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, renderHook, screen } from "@testing-library/react";
 import { PinIcon } from "lucide-react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { useAddSiblingSessionHotkey } from "@/hooks/useAddSiblingSessionHotkey";
@@ -13,7 +14,7 @@ import { useApprovalPromptOnScreen, useApproveHotkey } from "@/hooks/useApproveH
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
-import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
+import { resetHistoryNavigationForTests, useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useMessageNavHotkeys } from "@/hooks/useMessageNavHotkeys";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
@@ -106,9 +107,12 @@ function keydownFor(chord: Chord, mac: boolean): KeyboardEvent {
 }
 
 interface HandlerCase {
-  /** Mounts the handler, once it's ready for the chord, and returns a check that it acted. */
-  mount: () => (() => boolean) | Promise<() => boolean>;
-  /** The shell the case runs in, where the binding has a chord only there. */
+  /**
+   * Mounts the handler, once it's ready for the binding's chord at `chordIndex`, and returns a
+   * check that it acted.
+   */
+  mount: (chordIndex: number) => (() => boolean) | Promise<() => boolean>;
+  /** The shell the case runs in, where the binding has a chord only there; both platforms if unset. */
   environment?: Partial<ShortcutEnvironment> & { electron?: boolean };
 }
 
@@ -205,7 +209,7 @@ function openSessionCase(command: "pin" | "archive" | "fork", mac: boolean): Han
   const hosted = quickPickHostCase(() => run.mock.calls.length > 0, { mac });
   return {
     environment: hosted.environment,
-    mount: () => {
+    mount: (chordIndex) => {
       run.mockReset();
       usePaletteCommandsStore.setState({
         groups: {
@@ -224,7 +228,7 @@ function openSessionCase(command: "pin" | "archive" | "fork", mac: boolean): Han
           },
         },
       });
-      return hosted.mount();
+      return hosted.mount(chordIndex);
     },
   };
 }
@@ -270,15 +274,19 @@ function goToFileCase(mode: "goToFile" | "searchText"): HandlerCase {
   );
 }
 
+const SESSION_SLOTS = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"];
+
 const RECENT_CONVERSATIONS = [
   { id: "a", title: "A", updated_at: 2 },
   { id: "b", title: "B", updated_at: 1 },
 ] as unknown as Conversation[];
 
+let unreadSessions = 0;
+
 const HANDLERS: Partial<Record<ShortcutId, HandlerCase>> = {
   "palette.commands": spyCase((spy) => renderHook(() => useCommandPaletteHotkey(spy))),
   "palette.sessions": spyCase((spy) =>
-    renderHook(() => useCommandPaletteHotkey(() => {}, true, false, spy)),
+    renderHook(() => useCommandPaletteHotkey(() => {}, true, undefined, spy)),
   ),
   "shortcuts.show": {
     mount: () => {
@@ -294,10 +302,12 @@ const HANDLERS: Partial<Record<ShortcutId, HandlerCase>> = {
   },
   "session.addSibling": spyCase((spy) => renderHook(() => useAddSiblingSessionHotkey(spy, true))),
   "session.rename": spyCase((spy) => renderHook(() => useRenameSessionHotkey(spy))),
+  // A session of its own per press, since the unread mark outlives the case.
   "session.toggleUnread": {
     mount: () => {
-      renderHook(() => useToggleUnreadHotkey({ id: "conv-1", updated_at: 5_000 }));
-      return () => isExplicitlyUnread("conv-1");
+      const id = `conv-${(unreadSessions += 1)}`;
+      renderHook(() => useToggleUnreadHotkey({ id, updated_at: 5_000 }));
+      return () => isExplicitlyUnread(id);
     },
   },
   "settings.open": {
@@ -330,10 +340,11 @@ const HANDLERS: Partial<Record<ShortcutId, HandlerCase>> = {
       return () => screen.queryByText("A") !== null;
     },
   },
+  // Each digit opens the session in its slot.
   "session.number": {
-    mount: () => {
-      renderHook(() => useSessionNumberHotkeys(["a", "b"]));
-      return navigatedTo("/c/a");
+    mount: (chordIndex) => {
+      renderHook(() => useSessionNumberHotkeys(SESSION_SLOTS));
+      return navigatedTo(`/c/${SESSION_SLOTS[chordIndex]}`);
     },
   },
   "view.mode": {
@@ -448,11 +459,8 @@ const HANDLERS: Partial<Record<ShortcutId, HandlerCase>> = {
   "find.open": {
     mount: () => {
       const openFind = vi.fn();
-      const release = registerFindSurface({ isActive: () => true, openFind });
-      return () => {
-        release();
-        return openFind.mock.calls.length > 0;
-      };
+      onTestFinished(registerFindSurface({ isActive: () => true, openFind }));
+      return () => openFind.mock.calls.length > 0;
     },
   },
 };
@@ -461,24 +469,48 @@ const HANDLERS: Partial<Record<ShortcutId, HandlerCase>> = {
 const ALL_BINDINGS = [...APP_SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS];
 const appBindings = ALL_BINDINGS.filter((binding) => binding.handler.scope === "app");
 
-function environmentOf(id: ShortcutId): Partial<ShortcutEnvironment> & { mac: boolean } {
+type CaseEnvironment = Partial<ShortcutEnvironment> & { mac: boolean };
+
+/** The shells `id`'s case runs in: its pinned platform, or the Mac and elsewhere. */
+function environmentsOf(id: ShortcutId): CaseEnvironment[] {
   const { electron = false, ...environment } = HANDLERS[id]?.environment ?? {};
-  return { mac: false, native: electron, ...environment };
+  const platforms = environment.mac === undefined ? [false, true] : [environment.mac];
+  return platforms.map((mac) => ({ native: electron, ...environment, mac }));
 }
 
-/** Mount `id`'s handler in its case's shell and press `chord` there. */
-async function pressFor(id: ShortcutId, chord: Chord): Promise<boolean> {
+interface ChordPress {
+  id: ShortcutId;
+  environment: CaseEnvironment;
+  chordIndex: number;
+  chord: Chord;
+}
+
+/** Every chord each window-level binding has, in every shell its case runs in. */
+const CHORD_PRESSES: ChordPress[] = appBindings.flatMap(({ id }) =>
+  environmentsOf(id).flatMap((environment) =>
+    activeShortcutChords(id, environment).map((chord, chordIndex) => ({
+      id,
+      environment,
+      chordIndex,
+      chord,
+    })),
+  ),
+);
+
+/** Mount the binding's handler in its case's shell and press the chord there. */
+async function pressFor({ id, environment, chordIndex, chord }: ChordPress): Promise<boolean> {
   const handlerCase = HANDLERS[id]!;
-  const environment = environmentOf(id);
   shell.mac = environment.mac;
   shell.native = environment.native ?? false;
   shell.electron = handlerCase.environment?.electron ?? false;
-  const acted = await handlerCase.mount();
+  const acted = await handlerCase.mount(chordIndex);
   act(() => {
     document.body.dispatchEvent(keydownFor(chord, environment.mac));
   });
   return acted();
 }
+
+const INITIAL_SESSION_ORDER = useSidebarSessionOrderStore.getState();
 
 afterEach(() => {
   cleanup();
@@ -489,6 +521,9 @@ afterEach(() => {
   navigate.mockReset();
   submitApproval.mockReset();
   usePaletteCommandsStore.setState({ groups: {} });
+  useSidebarSessionOrderStore.setState(INITIAL_SESSION_ORDER, true);
+  window.history.replaceState(null, "");
+  resetHistoryNavigationForTests();
 });
 
 describe("shortcut registry handlers", () => {
@@ -504,7 +539,7 @@ describe("shortcut registry handlers", () => {
 
   it("leaves only the listed bindings without a handler", () => {
     const unhandled = ALL_BINDINGS.filter(({ handler }) => handler.scope === "unhandled");
-    // The new pull request page's keys, added ahead of the page that binds them.
+    // The pull request page's keys; nothing mounted binds them yet.
     expect(unhandled.map(({ id }) => id)).toEqual([
       "pullRequests.removeSelected",
       "pullRequestStack.next",
@@ -516,9 +551,17 @@ describe("shortcut registry handlers", () => {
     expect(Object.keys(HANDLERS).sort()).toEqual(appBindings.map(({ id }) => id).sort());
   });
 
-  it.each(appBindings.map(({ id }) => id))("runs %s from the chord it shows", async (id) => {
-    const chord = activeShortcutChords(id, environmentOf(id))[0];
-    expect(chord, `${id} has no chord here`).toBeDefined();
-    expect(await pressFor(id, chord!)).toBe(true);
+  it("presses a chord for every window-level binding", () => {
+    const pressed = new Set(CHORD_PRESSES.map(({ id }) => id));
+    expect(appBindings.map(({ id }) => id).filter((id) => !pressed.has(id))).toEqual([]);
+  });
+
+  it.each(
+    CHORD_PRESSES.map((press) => ({
+      ...press,
+      name: `${press.id}, chord ${press.chordIndex + 1} ${press.environment.mac ? "on the Mac" : "elsewhere"}`,
+    })),
+  )("runs $name", async (press) => {
+    expect(await pressFor(press)).toBe(true);
   });
 });

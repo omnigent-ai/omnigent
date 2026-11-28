@@ -143,7 +143,6 @@ const widget = (module: string): ShortcutHandler => ({ scope: "widget", module }
 const elsewhere = (owner: string): ShortcutHandler => ({ scope: "elsewhere", owner });
 const unhandled = (reason: string): ShortcutHandler => ({ scope: "unhandled", reason });
 
-// Handlers that several bindings share.
 const QUICK_PICK_HOST = app("shell/quickPickShortcuts/QuickPickShortcutHost.tsx");
 const RECENT_SESSION_SWITCH = app("hooks/useRecentSessionSwitch.ts");
 const GO_TO_FILE = app("shell/goToFile/goToFileCommands.ts");
