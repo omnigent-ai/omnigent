@@ -249,7 +249,9 @@ def test_merge_failures_are_user_facing(
         github._merge_pr("/workspace", reference, merge_method="merge", expected_head=HEAD_SHA)
 
 
-def test_enterprise_merges_require_a_signed_in_host(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_enterprise_merges_on_a_host_never_set_up_run_no_gh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(github, "_list_accounts", lambda _root: (True, [{"host": "github.com"}]))
     calls: list[GhCall] = []
     signed_out = (1, "", "You are not logged into any accounts on ghe.example.com")
@@ -260,7 +262,8 @@ def test_enterprise_merges_require_a_signed_in_host(monkeypatch: pytest.MonkeyPa
         github._merge_options("/workspace", reference)
     with pytest.raises(ValueError, match="Sign in to this GitHub host"):
         github._merge_pr("/workspace", reference, merge_method="merge", expected_head=HEAD_SHA)
-    assert [argv for argv, _token in calls] == [["auth", "status", "-h", "ghe.example.com"]] * 2
+    # Not even a sign-in check names the host: gh would send it an environment token.
+    assert calls == []
 
 
 @pytest.mark.parametrize("slow", ["account lookup", "merge"])

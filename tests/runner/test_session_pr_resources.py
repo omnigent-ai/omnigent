@@ -387,7 +387,8 @@ def test_title_deadline_is_shared_across_enterprise_auth_and_view(
         github._gh_timed_out.reset(timeout_token)
         github._gh_deadline.reset(token)
     if command_seconds == 0.6:
-        assert timeouts == pytest.approx([2.0, 1.4, 0.8])
+        # The account's token, then the read: a set-up host needs no sign-in check.
+        assert timeouts == pytest.approx([2.0, 1.4])
         assert result == {"title": "Enterprise PR"}
         assert timed_out is False
     else:
@@ -1727,8 +1728,7 @@ def test_enterprise_without_auth_retains_selection(
     monkeypatch.setattr(github, "_list_accounts", lambda _: (True, []))
 
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
-        if args == ["auth", "status", "-h", "github.example.org"]:
-            return 1, "", "You are not logged into any accounts on github.example.org"
+        assert "github.example.org" not in " ".join(args), "unknown host request"
         assert args[args.index("-R") + 1] in {
             "github.com/example/one",
             "github.com/example/two",
@@ -1745,12 +1745,12 @@ def test_enterprise_without_auth_retains_selection(
     assert len(info["prs"]) == 3
 
 
-@pytest.mark.parametrize(
-    "json_supported", [True, False], ids=["listing_omits_host", "gh_without_json"]
-)
-def test_enterprise_host_signed_in_only_when_named_can_attach_and_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, json_supported: bool
+@pytest.mark.parametrize("set_up", ["OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "GH_HOST"])
+def test_an_enterprise_host_missing_from_the_listing_but_set_up_can_attach_and_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, set_up: str
 ) -> None:
+    """A host gh signs in to only when named needs GH_HOST or the configured hosts."""
+    monkeypatch.setenv(set_up, "github.example.org")
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github.shutil, "which", lambda _: "/bin/gh")
     monkeypatch.setattr(github._config, "github_account_preference", lambda _: None)
@@ -1759,13 +1759,8 @@ def test_enterprise_host_signed_in_only_when_named_can_attach_and_read(
 
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
         if args[:4] == ["auth", "status", "--json", "hosts"]:
-            if json_supported:
-                return 0, json.dumps(listed), ""
-            return 1, "", "unknown flag: --json"
-        if args == ["auth", "status"]:
-            return 0, "Logged in to github.com account octocat", ""
-        if args == ["auth", "status", "-h", "github.example.org"]:
-            return 0, "Logged in to github.example.org account octocat", ""
+            return 0, json.dumps(listed), ""
+        assert args[:2] != ["auth", "status"], args
         if args[:2] == ["pr", "view"]:
             assert args[args.index("-R") + 1] == "github.example.org/example/one"
             return 0, json.dumps({"number": 42, "url": url, "title": "Enterprise PR"}), ""

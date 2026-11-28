@@ -213,7 +213,7 @@ def test_the_whole_read_stays_within_the_gh_call_cap(monkeypatch: pytest.MonkeyP
 def test_a_read_on_an_enterprise_host_stays_within_the_gh_call_cap(
     monkeypatch: pytest.MonkeyPatch, status_json: bool
 ) -> None:
-    """The sign-in check there can ask for the listing, its fallback, then the host."""
+    """A configured enterprise host needs no sign-in check, so every call is the walk's."""
     monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "github.example.com")
     monkeypatch.setattr(github_stack, "MAX_DEPTH", 50)
     graph = StackGraph(monkeypatch, _chain(github_stack.MAX_GH_CALLS + 5), current=1)
@@ -222,8 +222,7 @@ def test_a_read_on_an_enterprise_host_stays_within_the_gh_call_cap(
     stack = github_stack.pull_request_stack("/workspace", _reference(1, "github.example.com"))
 
     assert stack["truncated"] is True
-    assert ["auth", "status", "-h", "github.example.com"] in graph.calls
-    assert (["auth", "status"] in graph.calls) is not status_json
+    assert not any(call[:2] == ["auth", "status"] for call in graph.calls)
     assert len(graph.calls) == github_stack.MAX_GH_CALLS
 
 

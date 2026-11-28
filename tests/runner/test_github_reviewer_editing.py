@@ -140,7 +140,9 @@ def test_review_candidate_failures_are_user_facing(
         github._review_candidates("/workspace", reference)
 
 
-def test_enterprise_reviewers_require_a_signed_in_host(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_enterprise_reviewers_on_a_host_never_set_up_run_no_gh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(github, "_list_accounts", lambda _root: (True, [{"host": "github.com"}]))
     calls: list[GhCall] = []
     signed_out = (1, "", "You are not logged into any accounts on ghe.example.com")
@@ -152,7 +154,8 @@ def test_enterprise_reviewers_require_a_signed_in_host(monkeypatch: pytest.Monke
         github._review_candidates("/workspace", reference)
     with pytest.raises(ValueError, match="Sign in to this GitHub host"):
         github._edit_reviewers("/workspace", reference, add=[octocat], remove=[])
-    assert [argv for argv, _token in calls] == [["auth", "status", "-h", "ghe.example.com"]] * 2
+    # Not even a sign-in check names the host: gh would send it an environment token.
+    assert calls == []
 
 
 def test_edit_reviewers_withdraws_then_requests_and_returns_review_states(

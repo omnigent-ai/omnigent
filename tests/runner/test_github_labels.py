@@ -187,7 +187,9 @@ def test_repo_labels_failures_are_user_facing(
         github._repo_labels("/workspace", reference)
 
 
-def test_enterprise_labels_require_a_signed_in_host(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_enterprise_labels_on_a_host_never_set_up_run_no_gh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(github, "_list_accounts", lambda _root: (True, [{"host": "github.com"}]))
     calls: list[GhCall] = []
     signed_out = (1, "", "You are not logged into any accounts on ghe.example.com")
@@ -198,7 +200,8 @@ def test_enterprise_labels_require_a_signed_in_host(monkeypatch: pytest.MonkeyPa
         github._repo_labels("/workspace", reference)
     with pytest.raises(ValueError, match="Sign in to this GitHub host"):
         github._edit_labels("/workspace", reference, add=["bug"], remove=[])
-    assert [argv for argv, _token in calls] == [["auth", "status", "-h", "ghe.example.com"]] * 2
+    # Not even a sign-in check names the host: gh would send it an environment token.
+    assert calls == []
 
 
 def test_edit_labels_removes_then_adds_and_returns_the_final_labels(

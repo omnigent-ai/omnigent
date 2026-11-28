@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -214,3 +215,35 @@ def test_every_gh_process_in_the_runner_starts_through_the_gate() -> None:
 )
 def test_the_audit_finds_each_way_to_start_gh(source: str) -> None:
     assert _gh_process_starts(ast.parse(source)) != []
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        lambda reference: github_resource._pr_json("/workspace", reference, "title"),
+        lambda reference: github_resource._repo_labels("/workspace", reference),
+        lambda reference: github_resource._merge_options("/workspace", reference),
+        lambda reference: github_resource._pr_commits("/workspace", reference, head_sha="a" * 40),
+        lambda reference: github_resource._gh_active_token("/workspace", reference.host),
+        lambda reference: github_resource._gh_auth_token("/workspace", "octo", reference.host),
+    ],
+    ids=["pr-json", "labels", "merge-options", "commits", "active-token", "login-token"],
+)
+def test_a_pull_request_on_a_host_never_set_up_runs_no_gh_at_all(
+    started: list[list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    entry: Callable[[PullRequestRef], object],
+) -> None:
+    """With only an environment enterprise token, nothing asks gh about the host or reads a
+    token for it: gh counts every host but github.com as signed in, and would send it there."""
+    monkeypatch.setenv("GH_ENTERPRISE_TOKEN", "dummy-enterprise-token")
+    reference = PullRequestRef.from_url(f"https://{UNKNOWN}/o/r/pull/7")
+
+    try:
+        result = entry(reference)
+    except ValueError as exc:
+        assert "Sign in to this GitHub host" in str(exc)
+    else:
+        assert result is None
+
+    assert started == []

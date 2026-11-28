@@ -158,6 +158,7 @@ def test_upload_attachment_posts_the_bytes_to_user_attachments(
 
 
 def test_enterprise_uploads_go_to_the_hosts_upload_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "ghe.example.com")
     monkeypatch.setattr(github, "_pr_token", lambda _root, _reference: None)
     monkeypatch.setattr(
         github, "_list_accounts", lambda _root: (True, [{"host": "ghe.example.com"}])
@@ -430,6 +431,7 @@ def test_create_comment_posts_literal_markdown_as_selected_account(
     monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef, url: str
 ) -> None:
     reference = PullRequestRef.from_url(url)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "ghe.example.com")
     monkeypatch.setattr(github, "_list_accounts", lambda _root: (True, [{"host": reference.host}]))
     calls: list[GhCall] = []
     body = "  **Thanks**\n`$(literal)` <!-- preserved -->"

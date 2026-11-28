@@ -440,17 +440,8 @@ def _known_github_host(host: str) -> bool:
     return GitHubProvider().matches_host(host, EnvInstances())
 
 
-def _gh_signed_in_to_host(root: str, host: str) -> bool:
-    """Whether ``gh`` reports a login on ``host``.
-
-    Some setups sign ``gh`` in to an enterprise host only when a command names that host,
-    so a host missing from the global listing is asked about directly.
-    """
-    _, accounts = _list_accounts(root)
-    if host in {account.get("host") for account in accounts}:
-        return True
-    rc, _, _ = _gh(["auth", "status", "-h", host], cwd=root)
-    return rc == 0
+# The refusal for a pull request on a host the user never set up for GitHub.
+UNKNOWN_HOST = "Sign in to this GitHub host with gh, or set GH_HOST to it, before viewing its PRs"
 
 
 def _resolved_base_nwo(root: str) -> str | None:
@@ -499,7 +490,12 @@ def _own_scope(host: str) -> Iterator[None]:
 
 
 def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
-    """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
+    """Return *login*'s GitHub token via ``gh auth token --user`` (never logged).
+
+    ``None`` for a host the user never set up, without running ``gh``.
+    """
+    if not _known_github_host(host):
+        return None
     with _own_scope(host):
         rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
     if rc != 0:
@@ -508,7 +504,13 @@ def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | Non
 
 
 def _gh_active_token(root: str, host: str = "github.com") -> str | None:
-    """Return the token of ``gh``'s active account on *host* (never logged)."""
+    """Return the token of ``gh``'s active account on *host* (never logged).
+
+    ``None`` for a host the user never set up, without running ``gh``: there, ``gh`` would
+    answer with an enterprise token from the environment.
+    """
+    if not _known_github_host(host):
+        return None
     with _own_scope(host):
         rc, out, _ = _gh(["auth", "token", "-h", host], cwd=root)
     if rc != 0:
@@ -1425,7 +1427,7 @@ def _one_pr_account(root: str, reference: PullRequestRef, *, timed_out: str) -> 
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
-    if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
+    if not _known_github_host(reference.host):
         return None
     return _gh_pr_view(
         [str(reference.number), "-R", _repo_argument(reference)],
@@ -2134,8 +2136,9 @@ def _pr_compare(
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:
-    if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
-        raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
+    del root
+    if not _known_github_host(reference.host):
+        raise ValueError(UNKNOWN_HOST)
     return ["--hostname", reference.host]
 
 
