@@ -489,15 +489,19 @@ _RICH_DIFF_STYLE = """() => {
 }"""
 
 
-@pytest.mark.parametrize("color_scheme", ["light", "dark"])
+@pytest.mark.parametrize(
+    ("color_scheme", "palette"), [("light", None), ("dark", None), ("dark", "dracula")]
+)
 def test_a_markdown_rich_diff_marks_its_changes_and_skips_laying_out_far_sections(
     page: Page,
     git_session: tuple[str, str],  # noqa: F811 — pytest injects the imported fixture
     tmp_path: Path,
     color_scheme: str,
+    palette: str | None,
 ) -> None:
     """A Markdown file's rich diff marks an added block with the diff's addition bar and tint
-    and its changed words, and a long document's groups skip layout while off screen."""
+    and its changed words, and a long document's groups skip layout while off screen. Under
+    another palette the tints follow that palette's background."""
     base_url, session_id = git_session
     paragraphs = "".join(f"Paragraph {index} says hello.\n\n" for index in range(2_000))
     commit_then_edit(
@@ -522,3 +526,11 @@ def test_a_markdown_rich_diff_marks_its_changes_and_skips_laying_out_far_section
     assert style["tint"] not in (None, style["transparent"]), style
     assert style["word"] not in (None, style["transparent"], style["tint"]), style
     assert style["groups"] == "auto", style
+
+    if palette is not None:
+        page.evaluate(
+            "(name) => document.documentElement.setAttribute('data-theme', name)", palette
+        )
+        themed = page.evaluate(_RICH_DIFF_STYLE)
+        assert themed["tint"] != style["tint"], (style, themed)
+        assert themed["word"] != style["word"], (style, themed)

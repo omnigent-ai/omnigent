@@ -278,13 +278,31 @@
   --warning: #d4972a;
   --info: #3b8ff5;
   /* Added and removed lines in diffs: their own role, separate from status text. The line
-     and word tints are the default palette's, as rich Markdown diffs show them. */
+     and word tints mix the diff colours into each palette's background. */
   --diff-addition-color: #2ea65c;
   --diff-deletion-color: #c8324c;
-  --diff-addition-line: #f1f9f3;
-  --diff-deletion-line: #fdf1f1;
-  --diff-addition-word: #e0f1e5;
-  --diff-deletion-word: #f9e0e2;
+  --diff-line-strength: 7%;
+  --diff-word-strength: 15%;
+  --diff-addition-line: color-mix(
+    in lab,
+    var(--diff-addition-color) var(--diff-line-strength),
+    var(--background)
+  );
+  --diff-deletion-line: color-mix(
+    in lab,
+    var(--diff-deletion-color) var(--diff-line-strength),
+    var(--background)
+  );
+  --diff-addition-word: color-mix(
+    in lab,
+    var(--diff-addition-color) var(--diff-word-strength),
+    var(--background)
+  );
+  --diff-deletion-word: color-mix(
+    in lab,
+    var(--diff-deletion-color) var(--diff-word-strength),
+    var(--background)
+  );
   /* The warning amber, deepened to read as text on every palette's popover. */
   --search-match-foreground: #7b5300;
   /* Session active / idle-alive blue — a deeper, saturated azure
@@ -352,10 +370,9 @@
   --info: #3b8ff5;
   --diff-addition-color: #2ea65c;
   --diff-deletion-color: #e65b77;
-  --diff-addition-line: #1a2826;
-  --diff-deletion-line: #351d2a;
-  --diff-addition-word: #1e4231;
-  --diff-deletion-word: #592939;
+  /* Dark surfaces need stronger tints; at 20% lines match code diffs. */
+  --diff-line-strength: 20%;
+  --diff-word-strength: 40%;
   /* The warning amber, lightened to read as text on every dark palette's popover. */
   --search-match-foreground: #efb14a;
   /* Session active / idle-alive blue, lightened for the dark glass card so
@@ -3429,7 +3446,7 @@ main[data-shell-header="hidden"] .extension-view-status {
 
 /* ── Rich Markdown diff (DiffReview) ──────────────────────────────────────
    Added and removed blocks and their changed words take the palette's diff
-   tints (--diff-*-line / --diff-*-word), the same solved set code diffs use. */
+   tints (--diff-*-line / --diff-*-word), mixed into the palette's background. */
 .markdown-diff-preview {
   padding: 16px 24px 24px;
   /* The tints mix into this background, so it sits under them. */
