@@ -391,7 +391,12 @@ async def _remote_start_point(
         deadline=deadline,
         allow_partial=True,
     )
-    oldest = first_line(entry.stdout) if entry.success and not entry.overflowed else ""
+    # Git ends the entry with LF alone; a ref name may hold other Unicode spaces and separators.
+    oldest = (
+        entry.stdout.decode("utf-8", "replace").split("\n", 1)[0]
+        if entry.success and not entry.overflowed
+        else ""
+    )
     if not oldest.startswith(_CREATED_FROM):
         return None
     start = oldest.removeprefix(_CREATED_FROM)

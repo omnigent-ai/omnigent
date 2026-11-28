@@ -809,6 +809,33 @@ async def test_a_pushed_branch_still_compares_with_the_branch_it_started_from(
     assert _paths(response) == ["feature.txt"]
 
 
+@pytest.mark.parametrize(
+    "suffix", ["\u00a0", "\u2028suffix"], ids=["trailing no-break space", "line separator"]
+)
+async def test_a_start_whose_name_holds_unicode_spaces_is_read_whole(
+    tmp_path: Path, suffix: str
+) -> None:
+    """A start named ``fork/literal`` plus a no-break space or line separator, both valid in a
+    ref name, compares with that branch, not with ``fork/literal``."""
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    _git(root, "update-ref", "refs/remotes/fork/literal", fork_next)
+    _git(root, "checkout", "-q", "--detach", fork_next)
+    _write(root / "source.txt", "source\n")
+    _commit(root, "source")
+    source = _head(root)
+    _git(root, "update-ref", f"refs/remotes/fork/literal{suffix}", source)
+    _git(root, "checkout", "-q", "-b", "feature", f"fork/literal{suffix}")
+    _write(root / "feature.txt", "feature\n")
+    _commit(root, "feature")
+    _push_upstream(root, "fork", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == f"fork/literal{suffix}"
+    assert response.base.base == source
+    assert _paths(response) == ["feature.txt"]
+
+
 async def test_a_long_lived_branch_still_compares_with_the_branch_it_started_from(
     tmp_path: Path,
 ) -> None:
