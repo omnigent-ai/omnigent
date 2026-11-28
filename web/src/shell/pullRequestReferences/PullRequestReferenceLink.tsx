@@ -17,7 +17,6 @@ import type { Components } from "react-markdown";
 
 import { GitPullRequestIcon } from "lucide-react";
 
-import { useMessageTextStreaming } from "@/components/ai-elements/messageText";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { isBehindOpenLayer } from "@/lib/automaticFocus";
 import type { CodeHostPullRequest } from "@/lib/codeHosts";
@@ -175,8 +174,7 @@ export interface PlainReferenceLook {
  * A reference to `reference`'s PR, opening `href`. `children` is what the
  * author wrote, kept for a link with its own text; a bare reference or URL shows the reference's
  * label instead. `wrapTrigger` wraps the link in, say, the renderer's own menu, in either look.
- * `cardAction` shows at the foot of its hover card. While its message streams in, it stays a
- * plain link and looks nothing up.
+ * `cardAction` shows at the foot of its hover card.
  */
 export function PullRequestReferenceLink({
   reference,
@@ -196,15 +194,14 @@ export function PullRequestReferenceLink({
   cardAction?: ReactNode;
 }) {
   const scope = usePullRequestReferenceScope();
-  const streaming = useMessageTextStreaming();
   const anchor = useRef<HTMLAnchorElement>(null);
-  const near = useHasBeenNearViewport(anchor) && !streaming;
+  const near = useHasBeenNearViewport(anchor);
   const lookup = useReferencedPullRequest(reference.target, scope, near);
   const text = children ?? reference.label;
   const pr = lookup.pr?.state ? lookup.pr : null;
-  // While a message streams, or nothing is known or offered, there's no card to open.
-  const hasCard = !streaming && (pr !== null || Boolean(cardAction));
-  const visual = pr && !streaming ? pullRequestLifecycleVisual(pr.state!, pr.is_draft) : null;
+  // While nothing is known or offered, there's no card to open.
+  const hasCard = pr !== null || Boolean(cardAction);
+  const visual = pr ? pullRequestLifecycleVisual(pr.state!, pr.is_draft) : null;
   // A PR the read hasn't described keeps the renderer's plain look; its card still offers the action.
   const trigger = visual ? (
     <a
@@ -395,8 +392,8 @@ function PullRequestMarkdownLink({
 }
 
 /**
- * A `#123` written in prose: a reference in a view that reads them, else the text as written, as
- * it is while its message streams in. `behavior` gives it its renderer's menu, click and card.
+ * A `#123` written in prose: a reference in a view that reads them, else the text as written.
+ * `behavior` gives it its renderer's menu, click and card.
  */
 export function PullRequestShorthand({
   children,
@@ -406,9 +403,8 @@ export function PullRequestShorthand({
   behavior?: PullRequestReferenceLinkBehavior;
 }): ReactNode {
   const scope = usePullRequestReferenceScope();
-  const streaming = useMessageTextStreaming();
   const written = typeof children === "string" ? children : null;
-  const resolved = scope && written && !streaming ? scope.shorthand(written) : null;
+  const resolved = scope && written ? scope.shorthand(written) : null;
   if (!resolved) return children;
   // The PR as the scope recognized it, with the hosts it knows, never parsed again.
   const pullRequest = resolved.reference.target;
