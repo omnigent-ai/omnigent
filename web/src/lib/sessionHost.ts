@@ -10,11 +10,29 @@
 //
 // A small standalone map (rather than reading the TanStack Query cache) keeps
 // this decoupled from the query-key convention and needs no QueryClient handle.
-// A session's host_id is fixed for its lifetime, so the recorded value can't go
-// stale. Returns `null` when the session hasn't been loaded yet or is a hostless
-// local session, leaving routing to the default.
+// A host switch can leave an entry stale until reparsed or a wrong_replica refusal corrects it.
+// Returns `null` when the session hasn't been loaded yet or is a hostless
+// local session; such requests carry the client's own key (`routingKey.ts`).
+
+import { clientRoutingKey } from "./routingKey.ts";
 
 const _sessionHosts = new Map<string, string>();
+// Track newer observations even when a host or parent returns to its previous value.
+const _sessionRoutingRevisions = new Map<string, number>();
+let _nextRoutingRevision = 0;
+const _hostChangeListeners = new Set<() => void>();
+
+/** Subscribe to host/parent changes so live streams can recheck their effective host. */
+export function subscribeSessionHostChanges(listener: () => void): () => void {
+  _hostChangeListeners.add(listener);
+  return () => {
+    _hostChangeListeners.delete(listener);
+  };
+}
+
+function notifySessionHostChanges(): void {
+  for (const listener of _hostChangeListeners) listener();
+}
 
 /**
  * Record (or clear) the host a session is bound to. Called wherever a session
@@ -22,19 +40,104 @@ const _sessionHosts = new Map<string, string>();
  * that loses its host binding stops routing to the old replica.
  */
 export function setSessionHost(sessionId: string, hostId: string | null | undefined): void {
+  _sessionRoutingRevisions.set(sessionId, ++_nextRoutingRevision);
+  if ((_sessionHosts.get(sessionId) ?? null) === (hostId || null)) return;
   if (hostId) {
     _sessionHosts.set(sessionId, hostId);
   } else {
     _sessionHosts.delete(sessionId);
   }
+  notifySessionHostChanges();
+}
+
+// A managed create that chose its sandbox host's id records it in this label;
+// the row's host_id stays null until the host binds.
+export const REQUESTED_HOST_ID_LABEL = "omnigent.sandbox.requested_host_id";
+
+/**
+ * The host id a session routes by: its bound host, else the id its managed
+ * create chose for a sandbox host that hasn't bound yet.
+ */
+export function sessionRoutingHostId(
+  hostId: string | null | undefined,
+  labels: Record<string, string> | null | undefined,
+): string | null {
+  return hostId || labels?.[REQUESTED_HOST_ID_LABEL] || null;
+}
+
+// A sub-agent or side chat runs on its parent's runner, whose tunnel lives on the
+// replica keyed by the PARENT's host — the child row carries no host_id of its
+// own. Recording the parent link lets a child key its traffic by the nearest
+// host-bound ancestor instead of going keyless to the default replica.
+const _sessionParents = new Map<string, string>();
+
+/** Routing parent a child's labels encode (side chat or fork), or null if independent. */
+export function parentIdFromLabels(labels: Record<string, string> | undefined): string | null {
+  return (
+    labels?.["omnigent.side_chat.source_id"] ??
+    (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null) ??
+    null
+  );
+}
+
+/**
+ * Record (or clear) a session's parent so a hostless child resolves its host
+ * through the ancestor chain. Called wherever a session object is parsed.
+ */
+export function setSessionParent(
+  sessionId: string,
+  parentId: string | null | undefined,
+  labels?: Record<string, string>,
+): void {
+  _sessionRoutingRevisions.set(sessionId, ++_nextRoutingRevision);
+  const routingParent = parentId ?? parentIdFromLabels(labels);
+  const nextParent = routingParent && routingParent !== sessionId ? routingParent : null;
+  if ((_sessionParents.get(sessionId) ?? null) === nextParent) return;
+  if (nextParent) {
+    _sessionParents.set(sessionId, nextParent);
+  } else {
+    _sessionParents.delete(sessionId);
+  }
+  notifySessionHostChanges();
+}
+
+/**
+ * A session's routing parent id, or `null` for an independent session or one
+ * whose snapshot hasn't been seen yet.
+ */
+export function getSessionParent(sessionId: string): string | null {
+  return _sessionParents.get(sessionId) ?? null;
 }
 
 /**
  * Resolve a session's host_id for slice-key routing, or `null` when unknown
- * (session not loaded yet, or a hostless local session).
+ * (session not loaded yet, or a hostless local session). A session with no
+ * host of its own inherits the nearest host-bound ancestor's. Nesting has no
+ * depth limit, so only a revisited id (a malformed cycle) ends the walk.
  */
 export function getSessionHost(sessionId: string): string | null {
-  return _sessionHosts.get(sessionId) ?? null;
+  return getSessionHostRouting(sessionId).hostId;
+}
+
+export interface SessionHostRouting {
+  readonly ownerId: string | null;
+  readonly hostId: string | null;
+  readonly revision: number;
+}
+
+/** Resolve the host's owner and newest observation along the routing ancestry. */
+export function getSessionHostRouting(sessionId: string): SessionHostRouting {
+  const visited = new Set<string>();
+  let id: string | null = sessionId;
+  let revision = 0;
+  while (id !== null && !visited.has(id)) {
+    visited.add(id);
+    revision = Math.max(revision, _sessionRoutingRevisions.get(id) ?? 0);
+    const hostId = _sessionHosts.get(id);
+    if (hostId) return { ownerId: id, hostId, revision };
+    id = _sessionParents.get(id) ?? null;
+  }
+  return { ownerId: null, hostId: null, revision };
 }
 
 // ── Keyless-demoted hosts ────────────────────────────────────────────────────
@@ -115,11 +218,11 @@ let _modalHostResolved = false;
  * first-seen insertion order (Map iteration order), which is stable enough for
  * a best-effort cache-affinity hint.
  */
-function pickModalHost(hosts: Map<string, string>): string | null {
+function pickModalHost(hostIds: Iterable<string>): string | null {
   const counts = new Map<string, number>();
   let best: string | null = null;
   let bestCount = 0;
-  for (const host of hosts.values()) {
+  for (const host of hostIds) {
     const next = (counts.get(host) ?? 0) + 1;
     counts.set(host, next);
     if (next > bestCount) {
@@ -142,19 +245,28 @@ function pickModalHost(hosts: Map<string, string>): string | null {
  * persisted-preference backstop, so a stale/sandbox-sentinel choice can never
  * become the slice key.
  */
-export function resolveModalHost(): void {
+export function resolveModalHost(ownListHostIds: Iterable<string>): void {
   if (_modalHostResolved) return;
-  _modalHostId = pickModalHost(_sessionHosts);
+  _modalHostId = pickModalHost(ownListHostIds);
   _modalHostResolved = true;
 }
 
 /**
- * The frozen modal host_id, or `null` (→ send no key → default route) before
- * it is resolved or when no host could be picked. Read by `authenticatedFetch`
- * (host-less routes) and `buildUpdatesUrl`.
+ * The frozen modal host_id, or `null` before it is resolved or when no host
+ * could be picked. Read through {@link updatesRoutingKey}.
  */
 export function modalHostId(): string | null {
   return _modalHostId;
+}
+
+/**
+ * Slice key for the `/updates` stream and the writes whose events it reports
+ * (project changes, a scheduled task's or run's new session). The server delivers those
+ * events only within one replica, so they share the modal host's replica, or
+ * this client's key when there is no modal host.
+ */
+export function updatesRoutingKey(): string {
+  return _modalHostId ?? clientRoutingKey();
 }
 
 /**

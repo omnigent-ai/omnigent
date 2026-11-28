@@ -143,8 +143,12 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
       "https://test-\(UUID().uuidString.lowercased()).cloud.databricks.com/omnigent?o=123")
     let credentials = MemoryDatabricksCredentialStore()
     try credentials.save(credentialTokens(), for: context.scope)
+    let sessions = FakeWorkspaceSessions()
+    sessions.hold = true
+    let authenticating = expectation(description: "workspace session request")
+    sessions.onRequest = { authenticating.fulfill() }
     let bootstrap = makeBootstrap(
-      credentials, login: FakeWorkspaceLogin(), sessions: FakeWorkspaceSessions())
+      credentials, login: FakeWorkspaceLogin(), sessions: sessions)
     let model = WebViewModel()
     let suite = "omnigent-test-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -166,6 +170,14 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     webView.onLoad = { loaded.fulfill() }
     coordinator.load(context.pageURL, in: webView)
     XCTAssertTrue(webView.requests.isEmpty)
+    await fulfillment(of: [authenticating], timeout: 10)
+    let shell = WebShellView(
+      initialURL: context.pageURL, connectToNewServer: {}, switchToServer: { _ in },
+      loadFailed: { _, _ in }, loadSucceeded: {})
+    XCTAssertTrue(model.isAuthenticating)
+    XCTAssertFalse(model.serverSwitcherHidden)
+    XCTAssertTrue(shell.showsServerSwitcher(for: model))
+    sessions.release()
     await fulfillment(of: [loaded], timeout: 10)
     XCTAssertEqual(webView.requests.first?.url, context.pageURL)
     XCTAssertNil(webView.requests.first?.value(forHTTPHeaderField: "Authorization"))
@@ -181,6 +193,32 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     webView.removeFromSuperview()
     await coordinator.websiteDataStore.removeData(
       ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+  }
+
+  func testCoordinatorDetachDefersPublishedCleanupUntilAfterTeardown() async throws {
+    let url = URL(string: "https://example.com")!
+    let model = WebViewModel()
+    let suite = "omnigent-test-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let parent = OmnigentWebView(
+      initialURL: url, model: model, settings: SettingsStore(defaults: defaults),
+      databricksInternalFeaturesEnabled: false, loadFailed: { _, _ in }, loadSucceeded: {},
+      pushServerPicker: {}, requestSwitchServer: { _ in }, openServerSetup: {})
+    let coordinator = parent.makeCoordinator()
+    let webView = WKWebView()
+    model.webView = webView
+    model.isAuthenticating = true
+    coordinator.attach(webView)
+
+    coordinator.detach()
+
+    XCTAssertTrue(model.isAuthenticating, "Teardown must not synchronously publish into SwiftUI")
+    XCTAssertNil(model.webView)
+    let mainQueueDrained = expectation(description: "deferred model cleanup")
+    DispatchQueue.main.async { mainQueueDrained.fulfill() }
+    await fulfillment(of: [mainQueueDrained], timeout: 1)
+    XCTAssertFalse(model.isAuthenticating)
   }
 
   func testClearedGrantCannotInstallACompletedCookieExchange() async throws {
@@ -207,7 +245,8 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
   func testConfigurationAndSessionFailuresStillHaveMessages() {
     for error: Error in [
       DatabricksOAuthError.invalidClientID, DatabricksSessionError.missingCookie,
-      DatabricksSessionError.networkUnavailable, DatabricksSessionError.rejected(403),
+      DatabricksSessionError.networkUnavailable(DatabricksTransportFailure(URLError(.timedOut))),
+      DatabricksSessionError.rejected(403),
     ] {
       XCTAssertEqual(
         OmnigentWebView.Coordinator.workspaceErrorMessage(error), error.localizedDescription)
@@ -228,6 +267,32 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     XCTAssertNil(
       OmnigentWebView.Coordinator.workspaceErrorMessage(
         DatabricksSessionError.cancelled, databricksInternalFeaturesEnabled: true))
+  }
+
+  func testWrappedUnreachableHostKeepsTheSharedPageLoadGuidance() {
+    let unreachable = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotFindHost)
+    let guidance = OmnigentWebView.connectionErrorMessage(
+      for: unreachable, databricksInternalFeaturesEnabled: true)
+    let failure = DatabricksTransportFailure(unreachable)
+    for error: Error in [
+      DatabricksSessionError.networkUnavailable(failure),
+      DatabricksOAuthError.networkUnavailable(failure),
+    ] {
+      XCTAssertEqual(
+        OmnigentWebView.Coordinator.workspaceErrorMessage(
+          error, databricksInternalFeaturesEnabled: true), guidance)
+      XCTAssertEqual(
+        OmnigentWebView.Coordinator.workspaceErrorMessage(
+          error, databricksInternalFeaturesEnabled: false),
+        "Could not reach Databricks. Please try again. (NSURLErrorDomain -1003)")
+    }
+    // A timeout is not a DNS failure, so it keeps the message that names its code.
+    let timedOut = DatabricksSessionError.networkUnavailable(
+      DatabricksTransportFailure(URLError(.timedOut)))
+    XCTAssertEqual(
+      OmnigentWebView.Coordinator.workspaceErrorMessage(
+        timedOut, databricksInternalFeaturesEnabled: true),
+      "Could not reach Databricks. Please try again. (NSURLErrorDomain -1001)")
   }
 
   func testSilentRecoveryDoesNotPresentBrowserWhenGrantIsMissing() async throws {
@@ -699,6 +764,32 @@ final class DatabricksLifecycleTests: XCTestCase {
     h.view.removeFromSuperview()
   }
 
+  func testDownloadLinksBecomeDownloadsAndOtherBlobNavigationsLoad() async throws {
+    let h = try await coordinatorFixture(
+      recover: { _ in XCTFail("Unexpected recovery") },
+      failure: { _ in XCTFail("Unexpected failure") })
+    let url = URL(string: "blob:\(h.context.scope.workspaceOrigin.absoluteString)/file")!
+    var policies: [WKNavigationActionPolicy] = []
+    for shouldPerformDownload in [true, false] {
+      h.coordinator.webView(
+        h.view, decidePolicyFor: BlobNavigationAction(url, download: shouldPerformDownload),
+        decisionHandler: { policies.append($0) })
+    }
+    XCTAssertEqual(policies, [.download, .allow])
+    h.coordinator.detach()
+    h.view.removeFromSuperview()
+    await h.coordinator.websiteDataStore.removeData(
+      ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+  }
+
+  func testDownloadFileNamesStayInsideTheirDirectory() {
+    XCTAssertEqual(
+      ["report.pdf", "../../Library/settings", "", ".", "..", "/"].map {
+        OmnigentWebView.Coordinator.downloadFileName($0)
+      },
+      ["report.pdf", "settings", "download", "download", "download", "download"])
+  }
+
   private struct CoordinatorFixture {
     let context: DatabricksWebContext
     let credentials: MemoryDatabricksCredentialStore
@@ -831,6 +922,26 @@ private final class FakeWorkspaceSessions: DatabricksSessionCreating {
     pending?.resume()
     pending = nil
   }
+}
+
+private final class MainFrameInfo: WKFrameInfo {
+  override var isMainFrame: Bool { true }
+}
+
+/// A main-frame `blob:` navigation, as the web app's `<a download>` save starts.
+private final class BlobNavigationAction: WKNavigationAction {
+  private let url: URL
+  private let download: Bool
+
+  init(_ url: URL, download: Bool) {
+    self.url = url
+    self.download = download
+    super.init()
+  }
+
+  override var request: URLRequest { URLRequest(url: url) }
+  override var targetFrame: WKFrameInfo? { MainFrameInfo() }
+  override var shouldPerformDownload: Bool { download }
 }
 
 @MainActor

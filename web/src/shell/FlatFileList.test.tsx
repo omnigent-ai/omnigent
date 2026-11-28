@@ -1,10 +1,11 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
+import { ROW_STATUS_SLOT_CLASS } from "./fileStatusUtils";
 import { FlatFileList } from "./FlatFileList";
 
 afterEach(cleanup);
@@ -66,7 +67,7 @@ describe("FlatFileList runner-offline state", () => {
 });
 
 describe("FlatFileList status / download alignment", () => {
-  it("does not show a file-size label", () => {
+  it("shows file size using the same caption treatment as the Files tree", () => {
     renderList({
       files: [
         {
@@ -81,13 +82,10 @@ describe("FlatFileList status / download alignment", () => {
       ],
     });
 
-    expect(screen.queryByText(/\bKB\b/)).not.toBeInTheDocument();
+    expect(screen.getByText("2.0 KB")).toHaveClass("text-sm", "text-muted-foreground");
   });
 
-  it("overlays the download button on the status letter so both share one slot", () => {
-    // The status letter and the hover download button occupy the same relative
-    // container: the letter reserves the width and the button overlays it
-    // (absolute inset-0), so the button appears exactly where the letter was.
+  it("keeps status separate while actions replace the far-right file size", () => {
     renderList({
       files: [
         {
@@ -103,11 +101,12 @@ describe("FlatFileList status / download alignment", () => {
     });
 
     const letter = screen.getByText("M");
-    const slot = letter.parentElement;
-    expect(slot).toHaveClass("relative");
-    // The letter hides on hover but keeps its width to avoid a layout shift.
-    expect(letter).toHaveClass("group-hover:invisible");
+    expect(letter.parentElement).toHaveClass(ROW_STATUS_SLOT_CLASS);
 
+    const size = screen.getByText("2.0 KB");
+    const slot = size.parentElement;
+    expect(slot).toHaveClass("relative");
+    expect(size).toHaveClass("group-hover:invisible");
     const download = screen.getByRole("button", { name: /download app\.ts/i });
     const overlay = download.closest("span.absolute") as HTMLElement | null;
     expect(overlay).not.toBeNull();
@@ -221,5 +220,68 @@ describe("FlatFileList copy path", () => {
     fireEvent.click(button);
 
     expect(copyTextMock).toHaveBeenCalledWith("src/deep/app.ts");
+  });
+});
+
+describe("FlatFileList repository groups", () => {
+  const file = (path: string, repository_root?: string): WorkspaceChangedFile => ({
+    path,
+    name: path.split("/").at(-1)!,
+    repository_root,
+    status: "modified",
+    bytes: 10,
+    modified_at: null,
+    lines_added: 1,
+    lines_removed: 0,
+  });
+  const files = [file("web/src/app.ts", "web"), file("api/src/app.ts", "api"), file("notes.md")];
+
+  it("groups repositories in order and selects/copies duplicate names by full path", () => {
+    const onFileSelect = vi.fn();
+    renderList({ files, onFileSelect });
+    expect(screen.getAllByRole("group").map((group) => group.getAttribute("aria-label"))).toEqual([
+      "api",
+      "web",
+      "Other files",
+    ]);
+    for (const root of ["api", "web"]) {
+      const group = within(screen.getByRole("group", { name: root }));
+      expect(group.getByText("src")).toBeInTheDocument();
+      fireEvent.click(group.getByRole("button", { name: `${root}/src/app.ts` }));
+      expect(onFileSelect).toHaveBeenLastCalledWith(`${root}/src/app.ts`);
+      fireEvent.click(group.getByRole("button", { name: "Copy path: app.ts" }));
+      expect(copyTextMock).toHaveBeenLastCalledWith(`${root}/src/app.ts`);
+    }
+    const header = screen.getByRole("button", { name: "api, 1 changed files" });
+    fireEvent.click(header);
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "api/src/app.ts" })).toBeNull();
+    expect(screen.getByRole("button", { name: "web/src/app.ts" })).toBeInTheDocument();
+    fireEvent.click(header);
+    expect(screen.getByRole("button", { name: "api/src/app.ts" })).toBeInTheDocument();
+  });
+
+  it("keeps search and hidden-file filtering inside groups", () => {
+    const onShowHidden = vi.fn();
+    renderList({ files: [...files, file("api/.env", "api")], searchQuery: "api/", onShowHidden });
+    expect(screen.getAllByRole("group")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "api, 1 changed files" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "api/.env" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Click to show" }));
+    expect(onShowHidden).toHaveBeenCalledOnce();
+  });
+
+  it("shows hidden files when requested and leaves legacy rows flat", () => {
+    renderList({ files: [file(".env"), file("z.py")], showHidden: true });
+    expect(screen.queryByRole("group")).toBeNull();
+    expect(screen.getByRole("button", { name: ".env" })).toBeInTheDocument();
+  });
+
+  it("allows opening deleted files without offering a download", () => {
+    const onFileSelect = vi.fn();
+    renderList({ files: [{ ...file("api/gone.py", "api"), status: "deleted" }], onFileSelect });
+    fireEvent.click(screen.getByRole("button", { name: "api/gone.py" }));
+    expect(onFileSelect).toHaveBeenCalledWith("api/gone.py");
+    expect(screen.queryByRole("button", { name: /download/i })).toBeNull();
   });
 });

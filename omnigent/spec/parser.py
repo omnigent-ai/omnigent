@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
 import sys
+from collections.abc import Collection, Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -30,10 +33,13 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
     OSEnvSpec,
     TerminalEnvSpec,
+    parse_write_paths,
 )
+from omnigent.inner.git_ssh_policy import parse_git_ssh_bindings as _parse_git_ssh
 from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
+    MEMORY_TOOL_NAMES,
     AgentSpec,
     ApiKeyAuth,
     BuiltinToolConfig,
@@ -57,8 +63,11 @@ from omnigent.spec.types import (
     SandboxConfig,
     SharePolicy,
     SkillSpec,
+    ToolGroupsConfig,
     ToolsConfig,
 )
+from omnigent.spec.validator import _SKILL_NAME_MAX_LEN, _SKILL_NAME_PATTERN
+from omnigent.util.env_credentials import _ENV_REF_RE, env_names_with_omnigent_prefix
 
 _log = logging.getLogger(__name__)
 
@@ -97,9 +106,16 @@ class _ConfigYamlLoader(yaml.SafeLoader):
 _BOOL_TAG = "tag:yaml.org,2002:bool"
 _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
-# ``executor.config`` keys kept as their nested YAML structure instead of
-# string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+# ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "broker_gateway",
+        "context_files",
+        "disable_native_tools",
+        "system_prompt_mode",
+        "web_search",
+    }
+)
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
 # from SafeLoader by reference, so in-place edits below would strip
@@ -275,6 +291,10 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(os_env, executor.harness_kind)
+    model_egress = _parse_model_egress(raw.get("model_egress"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
@@ -301,6 +321,9 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # the specified sub-agent types. Defaults to False — session
     # reads stay always-on, but every write grant is explicit.
     spawn = bool(raw.get("spawn", False))
+    # Top-level ``tool_groups:`` opts out of framework-owned tool groups
+    # that otherwise register on every agent; each group defaults to on.
+    tool_groups = parse_tool_groups(raw.get("tool_groups"), spawn=spawn)
     # Top-level ``agent_session_sharing:`` flag is the SOLE enabler of
     # the ``sys_session_share`` tool, independent of ``spawn`` /
     # ``tools.agents`` (and unrelated to server-API / CLI sharing).
@@ -315,12 +338,24 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     if raw_instructions is None:
         raw_instructions = raw.get("prompt")
     instructions = _resolve_instructions(root, raw_instructions)
-    skills = _discover_skills(root / "skills")
+    skills = _with_legacy_skill_names(_discover_skills(root / "skills"))
     skills_filter = _parse_skills_filter(raw.get("skills"))
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
     mcp_servers = mcp_servers + _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
     local_tools = _discover_local_tools(root / "tools")
     sub_agents = _discover_sub_agents(root / "agents", expand_env=expand_env)
+    tool_groups = resolve_memory_tool_group(
+        tool_groups,
+        raw.get("tool_groups"),
+        builtins=tools_config.builtins,
+        own_tool_names=_own_tool_names(root, local_tools, mcp_servers),
+        agent_name=raw.get("name"),
+    )
+    tool_groups = resolve_file_tool_group(
+        tool_groups,
+        raw.get("tool_groups"),
+        builtins=tools_config.builtins,
+    )
 
     return AgentSpec(
         spec_version=spec_version,
@@ -341,9 +376,11 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         sub_agents=sub_agents,
         async_enabled=async_enabled,
         os_env=os_env,
+        model_egress=model_egress,
         terminals=terminals,
         timers=timers,
         spawn=spawn,
+        tool_groups=tool_groups,
         agent_session_sharing=agent_session_sharing,
     )
 
@@ -493,6 +530,191 @@ def _parse_tools_config(
         retry=retry,
         sandbox=sandbox,
     )
+
+
+_TOOL_GROUP_NAMES: frozenset[str] = frozenset(ToolGroupsConfig.__dataclass_fields__)
+
+
+def parse_tool_groups(raw: object, *, spawn: bool) -> ToolGroupsConfig:
+    """
+    Parse the top-level ``tool_groups:`` block into a
+    :class:`ToolGroupsConfig`.
+
+    Strict on purpose: the block mostly exists to *remove* tools, so a
+    typo'd group name or a non-boolean value fails the load rather than
+    silently leaving every group registered (or ``files`` off). Shared by
+    the native parser and the omnigent-dialect adapter so both loaders
+    reject the same input.
+
+    :param raw: The raw ``tool_groups:`` value, or ``None`` if absent.
+        Example: ``{"browser": False, "files": True}``.
+    :param spawn: The spec's top-level ``spawn:`` flag, needed to reject
+        disabling agent discovery while ``sys_session_create`` is granted.
+    :returns: A populated :class:`ToolGroupsConfig`; every group but
+        ``files`` on when *raw* is ``None``.
+    :raises OmnigentError: If *raw* is not a mapping, names an unknown
+        group, maps a group to a non-boolean, or disables
+        ``agent_discovery`` while a tool that needs it stays enabled.
+    """
+    if raw is None:
+        return ToolGroupsConfig()
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"tool_groups must be a YAML mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    unknown = sorted(str(key) for key in raw if str(key) not in _TOOL_GROUP_NAMES)
+    if unknown:
+        raise OmnigentError(
+            f"tool_groups: unknown group(s) {unknown}; "
+            f"expected one of {sorted(_TOOL_GROUP_NAMES)}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    enabled: dict[str, bool] = {}
+    for name, value in raw.items():
+        if not isinstance(value, bool):
+            raise OmnigentError(
+                f"tool_groups.{name} must be a boolean, got {type(value).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        enabled[str(name)] = value
+    groups = ToolGroupsConfig(**enabled)
+    _reject_orphaned_agent_id_tools(groups, spawn=spawn)
+    return groups
+
+
+_LEGACY_HINDSIGHT_TOOLS = frozenset({"hindsight_retain", "hindsight_recall", "hindsight_reflect"})
+
+
+def resolve_memory_tool_group(
+    tool_groups: ToolGroupsConfig,
+    raw_tool_groups: object,
+    *,
+    builtins: Iterable[BuiltinToolConfig],
+    own_tool_names: Iterable[str],
+    agent_name: str | None,
+) -> ToolGroupsConfig:
+    """
+    Turn the memory group off for an agent that brings its own memory tools.
+
+    Either case keeps one memory surface in front of the model:
+
+    - The deprecated ``hindsight_*`` builtins: the agent keeps them, with a
+      deprecation warning.
+    - A local tool or MCP server named like a memory tool: the agent's tool keeps
+      the name. The runner routes those names to the memory server only for an
+      agent with memory on, so the tool works as it would without memory.
+
+    Setting ``tool_groups.memory: true`` in either case is ambiguous and is rejected.
+
+    :param tool_groups: The parsed groups.
+    :param raw_tool_groups: The raw ``tool_groups:`` value, to tell an explicit
+        ``memory: true`` from the default.
+    :param builtins: The spec's ``tools.builtins`` entries.
+    :param own_tool_names: Names of the spec's local tools and MCP servers.
+    :param agent_name: The spec's name, for the warning.
+    :returns: *tool_groups*, with ``memory`` off in either case.
+    :raises OmnigentError: If ``memory: true`` is set in either case.
+    """
+    explicit_on = isinstance(raw_tool_groups, dict) and raw_tool_groups.get("memory") is True
+    hindsight = sorted({b.name for b in builtins} & _LEGACY_HINDSIGHT_TOOLS)
+    clashes = sorted(set(own_tool_names) & MEMORY_TOOL_NAMES)
+    if hindsight and explicit_on:
+        raise OmnigentError(
+            f"tool_groups.memory: true conflicts with the deprecated {', '.join(hindsight)} "
+            "builtins: they would give the model two memory systems. Remove the hindsight_* "
+            "builtins and configure the Hindsight backend on the server "
+            "(`omnigent server --memory-backend hindsight`), or set tool_groups.memory: false.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if clashes and explicit_on:
+        raise OmnigentError(
+            f"tool_groups.memory: true conflicts with this agent's own {', '.join(clashes)} "
+            "tool or MCP server: rename it, or set tool_groups.memory: false.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if hindsight and tool_groups.memory:
+        _log.warning(
+            "Agent %r declares the deprecated hindsight_* builtins; tool_groups.memory is "
+            "off for it. Use the memory_* tools with the Hindsight backend instead "
+            "(`omnigent server --memory-backend hindsight`).",
+            agent_name,
+        )
+    if hindsight or clashes:
+        return replace(tool_groups, memory=False)
+    return tool_groups
+
+
+_REMOVED_FILE_TOOLS = frozenset({"upload_file", "list_files", "download_file"})
+
+
+def resolve_file_tool_group(
+    tool_groups: ToolGroupsConfig,
+    raw_tool_groups: object,
+    *,
+    builtins: Iterable[BuiltinToolConfig],
+) -> ToolGroupsConfig:
+    """
+    Keep the file tools off for an agent that still declares their removed names.
+
+    ``upload_file``, ``list_files`` and ``download_file`` became the opt-in
+    ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``. A policy
+    written for an old name does not match the new one, so an agent that still
+    lists an old name cannot turn the file tools on until those entries are
+    removed.
+
+    :param tool_groups: The parsed groups.
+    :param raw_tool_groups: The raw ``tool_groups:`` value, to tell an explicit
+        ``files: true`` from the default.
+    :param builtins: The spec's ``tools.builtins`` entries.
+    :returns: *tool_groups*, with ``files`` off when a removed name is declared.
+    :raises OmnigentError: If ``files: true`` is set alongside a removed name.
+    """
+    removed = sorted({b.name for b in builtins} & _REMOVED_FILE_TOOLS)
+    if not removed:
+        return tool_groups
+    if isinstance(raw_tool_groups, dict) and raw_tool_groups.get("files") is True:
+        raise OmnigentError(
+            f"tool_groups.files: true conflicts with the removed {', '.join(removed)} "
+            "builtins: remove them from tools.builtins, and rename any policy selector "
+            "that names them to the sys_ tool.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return replace(tool_groups, files=False)
+
+
+def _reject_orphaned_agent_id_tools(groups: ToolGroupsConfig, *, spawn: bool) -> None:
+    """
+    Refuse disabling agent discovery while a tool that takes an agent id stays on.
+
+    ``sys_session_create`` (granted by ``spawn: true``) and
+    ``sys_scheduled_task_create`` tell the model to take ``agent_id`` from
+    ``sys_agent_list`` / ``sys_agent_get``, so without them the model is
+    pointed at tools the runner refuses.
+
+    :param groups: The parsed tool groups.
+    :param spawn: The spec's top-level ``spawn:`` flag.
+    :raises OmnigentError: If ``agent_discovery`` is off while ``spawn`` or
+        the ``scheduled_tasks`` group is on.
+    """
+    if groups.agent_discovery:
+        return
+    dependents = [
+        label
+        for label, on in (
+            ("spawn: true", spawn),
+            ("tool_groups.scheduled_tasks", groups.scheduled_tasks),
+        )
+        if on
+    ]
+    if dependents:
+        raise OmnigentError(
+            f"tool_groups.agent_discovery: false conflicts with {' and '.join(dependents)}: "
+            "those tools send the model to sys_agent_list / sys_agent_get for an "
+            "agent_id; keep agent_discovery on, or also set scheduled_tasks: false "
+            "and drop spawn",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _parse_sandbox_config(
@@ -727,6 +949,19 @@ def _parse_executor(
     )
 
 
+def _api_key_source_env_names(raw_key: str) -> tuple[str, ...]:
+    """Retain credential references before expanding a legacy API key."""
+    return tuple(
+        sorted(
+            {
+                name
+                for match in _ENV_REF_RE.finditer(raw_key)
+                for name in env_names_with_omnigent_prefix(match.group(1) or match.group(2))
+            }
+        )
+    )
+
+
 def _parse_executor_auth(
     raw: dict[str, object],
     *,
@@ -774,6 +1009,20 @@ def _parse_executor_auth(
                 "executor.auth.api_key is required when type is 'api_key'",
                 code=ErrorCode.INVALID_INPUT,
             )
+        source_env_names = set(_api_key_source_env_names(raw_key))
+        serialized_names = raw_auth.get("source_env_names", ())
+        if not isinstance(serialized_names, (list, tuple)):
+            raise OmnigentError(
+                "executor.auth.source_env_names must be a list of environment variable names",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        for name in serialized_names:
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+                raise OmnigentError(
+                    "executor.auth.source_env_names must contain valid environment variable names",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            source_env_names.update(env_names_with_omnigent_prefix(name))
         api_key = expand_env_vars({"api_key": raw_key})["api_key"] if expand_env else raw_key
         raw_base_url = raw_auth.get("base_url")
         base_url: str | None = None
@@ -784,7 +1033,9 @@ def _parse_executor_auth(
                 if expand_env
                 else raw_base_url_str
             )
-        return ApiKeyAuth(api_key=api_key, base_url=base_url)
+        return ApiKeyAuth(
+            api_key=api_key, base_url=base_url, source_env_names=tuple(sorted(source_env_names))
+        )
     if auth_type == "databricks":
         profile_val = str(raw_auth.get("profile") or "")
         if not profile_val:
@@ -987,6 +1238,10 @@ def _parse_os_env_sandbox(
     mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
+    git_ssh = _parse_git_ssh(raw.get("git_ssh"))
+    from omnigent.inner.tcp_egress_policy import parse_tcp_egress
+
+    tcp_egress = parse_tcp_egress(raw.get("tcp_egress"), egress_rules=egress_rules or ())
     from omnigent.inner.sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
     if "type" not in raw:
@@ -1000,6 +1255,16 @@ def _parse_os_env_sandbox(
                 code=ErrorCode.INVALID_INPUT,
             )
         sandbox_type = _resolve_sandbox_type(raw_type)
+    try:
+        parsed_write_paths = parse_write_paths(write_paths_raw)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    if sandbox_type != "linux_bwrap" and any(
+        not isinstance(p, str) and p.copy_on_write for p in parsed_write_paths or []
+    ):
+        raise OmnigentError(
+            "copy_on_write requires sandbox.type=linux_bwrap", code=ErrorCode.INVALID_INPUT
+        )
     if egress_rules and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise OmnigentError(
             "os_env.sandbox.egress_rules requires sandbox.type=linux_bwrap "
@@ -1010,6 +1275,18 @@ def _parse_os_env_sandbox(
             "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
             "darwin_seatbelt on macOS; do not use sandbox.type=none with "
             "egress_rules.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if git_ssh and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise OmnigentError(
+            "os_env.sandbox.git_ssh requires linux_bwrap or darwin_seatbelt "
+            "for hard network enforcement",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if tcp_egress and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise OmnigentError(
+            "os_env.sandbox.tcp_egress requires linux_bwrap or darwin_seatbelt "
+            "for hard network enforcement",
             code=ErrorCode.INVALID_INPUT,
         )
     credential_proxy = _parse_credential_proxy(raw.get("credential_proxy"))
@@ -1041,7 +1318,7 @@ def _parse_os_env_sandbox(
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=[str(p) for p in read_paths_raw] if read_paths_raw is not None else None,
-        write_paths=[str(p) for p in write_paths_raw] if write_paths_raw is not None else None,
+        write_paths=parsed_write_paths,
         write_files=[str(p) for p in write_files_raw] if write_files_raw is not None else None,
         allow_network=bool(raw.get("allow_network", True)),
         cwd_allow_hidden=cwd_allow_hidden,
@@ -1053,6 +1330,8 @@ def _parse_os_env_sandbox(
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
+        git_ssh=git_ssh,
+        tcp_egress=tcp_egress,
     )
 
 
@@ -1341,6 +1620,35 @@ def _parse_egress_rules(raw: object) -> list[str] | None:
         except ValueError as exc:
             raise OmnigentError(
                 f"os_env.sandbox.egress_rules[{i}] is invalid: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        validated.append(entry)
+    return validated
+
+
+def _parse_model_egress(raw: object) -> list[str] | None:
+    """Parse the explicit model-signing grant independently of generic egress."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise OmnigentError(
+            "model_egress must be a non-empty list of HTTP egress rules",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    from omnigent.inner.egress.rules import parse_rule
+
+    validated: list[str] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, str):
+            raise OmnigentError(
+                f"model_egress[{index}] must be a string",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            parse_rule(entry)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"model_egress[{index}] is invalid: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         validated.append(entry)
@@ -2306,7 +2614,7 @@ def discover_host_skills(
         for spec in _discover_skills(d, skipped=skipped):
             if spec.name in seen_names:
                 continue
-            if filter_names is not None and spec.name not in filter_names:
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             seen_names.add(spec.name)
             skills.append(spec)
@@ -2511,12 +2819,56 @@ def _quote_description_with_colon(frontmatter_str: str) -> str:
     return "\n".join(out)
 
 
+def skill_matches_names(spec: SkillSpec, names: Collection[str]) -> bool:
+    """
+    Whether a configured ``skills:`` name list selects *spec*.
+
+    Lists written before skills were invoked by directory may name a skill
+    by its frontmatter ``name``, so that label is accepted as an alias.
+
+    :param spec: Parsed skill, e.g. directory ``review`` labelled ``code-review``.
+    :param names: Configured names, e.g. ``["code-review"]``.
+    :returns: ``True`` when the list names the skill's command or its label.
+    """
+    return spec.name in names or (spec.display_name is not None and spec.display_name in names)
+
+
+def _is_valid_bundled_skill_name(name: str) -> bool:
+    """Whether *name* passes the bundled-skill name validation."""
+    return bool(_SKILL_NAME_PATTERN.match(name)) and len(name) <= _SKILL_NAME_MAX_LEN
+
+
+def _with_legacy_skill_names(skills: list[SkillSpec]) -> list[SkillSpec]:
+    """
+    Keep the frontmatter name of bundled skills whose directory is not a valid name.
+
+    Bundles were validated on the frontmatter ``name`` before skills were
+    invoked by directory, so ``skills/Code_Review/`` named ``code-review``
+    still loads, as ``code-review``.
+
+    :param skills: Bundled skills as parsed from ``<bundle>/skills/``.
+    :returns: The same skills, with the frontmatter name as the command
+        where only it is valid.
+    """
+    return [
+        replace(skill, name=skill.display_name, display_name=None)
+        if skill.display_name is not None
+        and not _is_valid_bundled_skill_name(skill.name)
+        and _is_valid_bundled_skill_name(skill.display_name)
+        else skill
+        for skill in skills
+    ]
+
+
 def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
 
     The file must begin with YAML frontmatter delimited by ``---``
     lines, containing at least ``name`` and ``description`` keys.
+    The skill's directory name becomes :attr:`SkillSpec.name` (the
+    invocation identifier); a frontmatter ``name`` that differs from it
+    becomes :attr:`SkillSpec.display_name`.
 
     :param skill_md: Path to the ``SKILL.md`` file, e.g.
         ``skills/code-review/SKILL.md``.
@@ -2535,7 +2887,8 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         # scanner in _discover_skills and the per-skill guards in the menu
         # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
-            f"SKILL.md could not be read: {skill_md}: {exc}",
+            f"SKILL.md could not be read: {skill_md} "
+            f"({type(exc).__name__}, errno={getattr(exc, 'errno', None)})",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
     match = _FRONTMATTER_RE.match(text)
@@ -2548,14 +2901,12 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     try:
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
-        # Retry with colon-bearing prose quoted before giving up, and report
-        # the ORIGINAL error if that still fails so the message names the real
-        # complaint rather than the rewrite's.
+        # Retry prose containing colons; diagnostics must not include file contents.
         try:
             frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
         except yaml.YAMLError:
             raise OmnigentError(
-                f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
+                f"SKILL.md has invalid YAML frontmatter: {skill_md} ({type(exc).__name__})",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
     if not isinstance(frontmatter, dict):
@@ -2578,12 +2929,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     # ``user-invocable: false`` marks an internal orchestration skill that
     # the user should not invoke directly; absent/true ⇒ invocable.
     user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
+    label = str(name)
     return SkillSpec(
-        name=str(name),
+        name=skill_md.parent.name,
         description=str(description),
         content=content.strip(),
         skill_dir=skill_md.parent,
         user_invocable=user_invocable,
+        display_name=label if label != skill_md.parent.name else None,
     )
 
 
@@ -2706,6 +3059,9 @@ def _parse_inline_mcp_servers(
         if str(val.get("type", "")) != "mcp":
             continue
         name = str(key)
+        if val.get("transport") == "registry":
+            servers.append(_parse_registry_mcp_server(name, val, "inline MCP server"))
+            continue
         command = val.get("command")
         url = val.get("url")
         if command is not None:
@@ -2713,7 +3069,7 @@ def _parse_inline_mcp_servers(
         elif url is not None:
             transport = "http"
         else:
-            # Databricks-managed server or unknown shape — no local
+            # Managed server or unknown shape — no local
             # endpoint to display; skip.
             continue
         raw_args = val.get("args", [])
@@ -2845,6 +3201,12 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         transport_str = str(transport)
+        if transport_str == "registry":
+            raise OmnigentError(
+                "Managed MCP references must be inline in config.yaml tools, "
+                "where older servers can ignore them; registry sidecars are unsupported",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if transport_str == "http":
             servers.append(_parse_http_mcp_server(name, raw, yaml_file, expand_env=expand_env))
         elif transport_str == "stdio":
@@ -2856,6 +3218,33 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
     return servers
+
+
+def _parse_registry_mcp_server(name: str, raw: dict, source: str) -> MCPServerConfig:
+    """Keep only a catalog reference in agent bundles and runner configuration."""
+    if any(
+        key in raw
+        for key in (
+            "url",
+            "headers",
+            "command",
+            "args",
+            "env",
+            "auth",
+            "profile",
+            "databricks_server",
+        )
+    ):
+        raise OmnigentError(
+            f"Registry MCP {name!r} cannot override its server configuration: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return MCPServerConfig(
+        name=name,
+        transport="registry",
+        description=raw.get("description"),
+        tools=[] if raw.get("tools") == [] else _parse_mcp_tool_allowlist(name, raw, source),
+    )
 
 
 def _parse_http_mcp_server(
@@ -3091,6 +3480,62 @@ def _discover_local_tools(
             rel_path = str(tool_file.relative_to(tools_dir.parent))
             tools.append(LocalToolInfo(name=tool_name, path=rel_path, language=language))
     return tools
+
+
+def _own_tool_names(
+    root: Path, local_tools: list[LocalToolInfo], mcp_servers: list[MCPServerConfig]
+) -> list[str]:
+    """
+    Every name an agent's own tools may register under.
+
+    A Python tool file registers each ``@tool`` function under the function's own
+    name, which can differ from the file name, so the names a file defines count
+    too.
+
+    :param root: The agent directory, e.g. ``Path("/agents/researcher")``.
+    :param local_tools: The discovered local tools.
+    :param mcp_servers: The configured MCP servers.
+    :returns: Tool and MCP server names, plus the names each Python tool file
+        defines.
+    """
+    names = [tool.name for tool in local_tools] + [server.name for server in mcp_servers]
+    for tool in local_tools:
+        if tool.language == "python" and tool.path is not None:
+            names.extend(_names_defined_in(root / tool.path))
+    return names
+
+
+def _names_defined_in(source: Path) -> list[str]:
+    """
+    The module-scope names a Python file binds, read without importing it.
+
+    ``@tool`` only accepts module-scope functions and registers each under its own
+    name, which may be defined inside a module-level ``if``, ``try`` or ``with``
+    block. So every statement at module scope is searched, but not function or
+    class bodies. Importing the file instead would run the agent's code while
+    parsing its spec.
+
+    :param source: The file, e.g. ``Path("/agents/a/tools/python/helpers.py")``.
+    :returns: Function, class and assigned names; ``[]`` for a file that can't be
+        read or parsed (loading the tool reports that).
+    """
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return []
+    names: list[str] = []
+    pending: list[ast.AST] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(node.name)  # its body is another scope
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.append(node.id)
+        pending.extend(ast.iter_child_nodes(node))
+    return names
 
 
 def _discover_sub_agents(

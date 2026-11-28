@@ -51,6 +51,18 @@ describe("ComposerAttachments", () => {
     expect(screen.queryByRole("img")).toBeNull();
   });
 
+  it.each([
+    ["bundle.zip", "ZIP"],
+    ["report.docx", "DOCX"],
+    ["app.sqlite", "SQLITE"],
+  ])("shows %s as an ordinary file card", (name, type) => {
+    renderList([new File([new Uint8Array(4)], name)]);
+    expect(screen.getByText(name)).toBeInTheDocument();
+    expect(screen.getByText(`${type} · 4 B`)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Remove ${name}` })).toBeInTheDocument();
+    expect(screen.queryByText("workspace")).toBeNull();
+  });
+
   it("removes the clicked attachment by index", () => {
     const { onRemove } = renderList([
       new File([new Uint8Array(4)], "a.png", { type: "image/png" }),
@@ -87,6 +99,31 @@ describe("ComposerAttachments", () => {
     // Creating the URL in an effect (not in render) keeps the committed <img>'s
     // URL from being revoked by StrictMode's mount → cleanup → remount cycle.
     expect(revoke).not.toHaveBeenCalledWith(src);
+  });
+
+  it("under StrictMode, revokes every created URL exactly once and no others", () => {
+    const created: string[] = [];
+    URL.createObjectURL = vi.fn(() => {
+      const url = `blob:mock-${created.length}`;
+      created.push(url);
+      return url;
+    });
+    const { unmount } = render(
+      <StrictMode>
+        <ImageLightboxProvider>
+          <ComposerAttachments
+            files={[new File([new Uint8Array(4)], "shot.png", { type: "image/png" })]}
+            onRemove={vi.fn()}
+          />
+        </ImageLightboxProvider>
+      </StrictMode>,
+    );
+    const committedSrc = screen.getByRole("img", { name: "shot.png" }).getAttribute("src");
+    unmount();
+    // Each created URL is revoked once; the last one is the committed src, revoked on unmount.
+    expect(revoke.mock.calls.map(([url]) => url).sort()).toEqual([...created].sort());
+    expect(new Set(created).size).toBe(created.length);
+    expect(revoke).toHaveBeenLastCalledWith(committedSrc);
   });
 });
 

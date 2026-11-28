@@ -42,7 +42,9 @@ from __future__ import annotations
 import copy
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
+
+from cachetools import LRUCache
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 
@@ -56,6 +58,11 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 # SSE chokepoint). Empty inner dicts are popped eagerly so
 # :func:`count_for` doesn't see stale keys.
 _pending: WorkspaceScopedCache[str, dict[str, dict[str, Any]]] = WorkspaceScopedCache()
+# Absence from the pending index is not proof of confirmation. Keep recent
+# resolution evidence for polling clients, bounded across all workspaces.
+_native_resolutions: WorkspaceScopedCache[tuple[str, str], Literal["unanswered", "confirmed"]] = (
+    WorkspaceScopedCache(lambda: LRUCache(maxsize=4096))
+)
 _lock = threading.Lock()
 
 # Optional observer (``subagent_block_notifier``) run synchronously on every
@@ -150,6 +157,7 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         with _lock:
             ids = _pending.setdefault(conversation_id, {})
             ids[elicitation_id] = event
+            _native_resolutions.pop((conversation_id, elicitation_id), None)
             count = len(ids)
         _notify_count_hook(conversation_id, count)
         _notify_observer(conversation_id, event)
@@ -158,6 +166,16 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         elicitation_id = event.get("elicitation_id")
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
+        with _lock:
+            key = (conversation_id, elicitation_id)
+            pending = _pending.get(conversation_id, {}).get(elicitation_id, {})
+            params = pending.get("params")
+            if (
+                isinstance(params, dict) and params.get("native_delivery")
+            ) or key in _native_resolutions:
+                _native_resolutions[key] = (
+                    "unanswered" if event.get("reason") == "unanswered" else "confirmed"
+                )
         resolve(conversation_id, elicitation_id)
         _notify_observer(conversation_id, event)
 
@@ -255,12 +273,11 @@ def pending_session_ids() -> list[str]:
     """
     Return ids of every session with at least one outstanding elicitation.
 
-    Used by ``GET /v1/sessions/{id}`` as a cheap pre-check before the
-    descendant walk that mirrors child pending prompts into an ancestor
-    snapshot — that walk costs one ``list_conversations`` query per
-    session in the tree, so it should run only when some session other
-    than the one being snapshotted actually has an outstanding prompt
-    (the rare, transient case).
+    Used by ``GET /v1/sessions/{id}`` to mirror descendant sub-agents'
+    pending prompts into an ancestor snapshot: the snapshot walks up from
+    these sessions to find the ones below it, so the lookup costs one
+    batched read per tree level rather than a query per session in the
+    snapshotted session's tree.
 
     :returns: Session ids with outstanding elicitations, e.g.
         ``["conv_child123"]``. Empty when nothing is pending anywhere.
@@ -345,7 +362,9 @@ def project_for_peek(event: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def lookup(elicitation_id: str) -> tuple[str, dict[str, Any]] | None:
+def lookup(
+    elicitation_id: str, *, conversation_id: str | None = None
+) -> tuple[str, dict[str, Any]] | None:
     """
     Look up a single outstanding elicitation by its correlation id.
 
@@ -358,15 +377,29 @@ def lookup(elicitation_id: str) -> tuple[str, dict[str, Any]] | None:
 
     :param elicitation_id: The elicitation correlation id to look up,
         e.g. ``"elicit_abc123"``.
+    :param conversation_id: Restrict lookup to this session. Callers that
+        know the session must pass it: ancestor mirrors share the same id,
+        so the first global match does not establish ownership.
     :returns: ``(conversation_id, event_dict)`` when found, ``None``
         otherwise. The event dict is a deep copy so callers cannot
         mutate the index.
     """
     with _lock:
+        if conversation_id is not None:
+            event = _pending.get(conversation_id, {}).get(elicitation_id)
+            return (conversation_id, copy.deepcopy(event)) if event is not None else None
         for conv_id, ids in _pending.items():
             if elicitation_id in ids:
                 return conv_id, copy.deepcopy(ids[elicitation_id])
     return None
+
+
+def native_resolution_for(
+    conversation_id: str, elicitation_id: str
+) -> Literal["unanswered", "confirmed"] | None:
+    """Return recent resolution evidence; missing/evicted evidence is unknown."""
+    with _lock:
+        return _native_resolutions.get((conversation_id, elicitation_id))
 
 
 def reset_for_tests() -> None:
@@ -382,4 +415,5 @@ def reset_for_tests() -> None:
     global _observer
     with _lock:
         _pending.clear()
+        _native_resolutions.clear()
     _observer = None

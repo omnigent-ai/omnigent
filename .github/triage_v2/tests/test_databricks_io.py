@@ -6,6 +6,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+import requests
+from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessageRole
 
 from issue_prioritization.areas import AreaCatalog
@@ -29,6 +31,12 @@ from issue_prioritization.domain import (
 from issue_prioritization.model_serving import serving_endpoint_classifier
 from issue_prioritization.mutations import BotState, MutationPlan, MutationTarget
 from issue_prioritization.pipeline import ClassificationFailure, PipelineMode, PipelineRun
+
+
+@pytest.fixture(autouse=True)
+def isolated_ci_attribution(monkeypatch):
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
 
 
 def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
@@ -133,7 +141,8 @@ class FakeServingEndpoints:
         return self.response
 
 
-def test_serving_classifier_uses_online_chat_endpoint() -> None:
+@pytest.mark.parametrize("review_bugs", [False, True])
+def test_serving_classifier_uses_online_chat_endpoint(review_bugs) -> None:
     payload = json.dumps(
         {
             "type": "Bug",
@@ -147,20 +156,48 @@ def test_serving_classifier_uses_online_chat_endpoint() -> None:
     )
     serving = FakeServingEndpoints(
         SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=payload), text=None)]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=payload), text=None, finish_reason="stop"
+                )
+            ]
         )
     )
     workspace = SimpleNamespace(serving_endpoints=serving)
-    classifier = serving_endpoint_classifier("test-endpoint", AreaCatalog({}, {}), workspace)
+    classifier = serving_endpoint_classifier(
+        "test-endpoint", AreaCatalog({}, {}), workspace, review_bugs=review_bugs
+    )
 
     result = classifier.classify(IssueContent(7, "Broken flow", "It fails", (), "user"))
 
     assert result.issue_type == IssueType.BUG
     endpoint, request = serving.calls[0]
     assert endpoint == "test-endpoint"
-    assert request["max_tokens"] == 2048
+    assert request["max_tokens"] == (8192 if review_bugs else 2048)
     assert request["messages"][0].role == ChatMessageRole.USER
     assert "Broken flow" in request["messages"][0].content
+
+
+@pytest.mark.parametrize("payload", ['{"type":"Feature","impact":"low"}', '{"type":'])
+def test_serving_classifier_rejects_truncated_responses_before_json_parsing(payload):
+    serving = FakeServingEndpoints(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=payload), text=None, finish_reason="length"
+                )
+            ]
+        )
+    )
+    classifier = serving_endpoint_classifier(
+        "test-endpoint",
+        AreaCatalog({}, {}),
+        SimpleNamespace(serving_endpoints=serving),
+        review_bugs=True,
+    )
+    with pytest.raises(RuntimeError, match="output token limit"):
+        classifier.classify(IssueContent(7, "Broken", "", (), "user"))
+    assert len(serving.calls) == 1
 
 
 def test_serving_classifier_rejects_empty_response() -> None:
@@ -170,3 +207,60 @@ def test_serving_classifier_rejects_empty_response() -> None:
 
     with pytest.raises(RuntimeError, match="no choices"):
         classifier.classify(IssueContent(7, "Broken", "", (), "user"))
+
+
+@pytest.mark.parametrize("pipeline", ["issue-triage", "needs-info-response"])
+def test_ci_classifier_sends_authenticated_tagged_gateway_request(monkeypatch, pipeline):
+    monkeypatch.setenv("OMNIGENT_CI_PIPELINE", pipeline)
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    requests_sent = []
+    classification = {
+        "type": "Bug",
+        "impact": "medium",
+        "area_keys": [],
+        "evidence_kind": "observed_intermittent",
+        "information_status": "sufficient",
+        "missing_information": [],
+        "reasoning": "Affects a real workflow.",
+    }
+
+    def send(session, request, **kwargs):
+        response = requests.Response()
+        response.request = request
+        response.headers["Content-Type"] = "application/json"
+        if request.url.endswith("/.well-known/databricks-config"):
+            response.status_code = 404
+            response._content = b'{"error_code":"NOT_FOUND"}'
+            return response
+        requests_sent.append(request)
+        response.status_code = 200
+        response._content = json.dumps(
+            {
+                "choices": [
+                    {"message": {"content": json.dumps(classification)}, "finish_reason": "stop"}
+                ]
+            }
+        ).encode()
+        return response
+
+    monkeypatch.setattr(requests.Session, "send", send)
+    workspace = WorkspaceClient(
+        host="https://dbc-1.cloud.databricks.com", token="test-only-secret", auth_type="pat"
+    )
+    classifier = serving_endpoint_classifier("test-endpoint", AreaCatalog({}, {}), workspace)
+    result = classifier.classify(IssueContent(7, "Broken flow", "It fails", (), "user"))
+
+    assert result.issue_type == IssueType.BUG
+    assert len(requests_sent) == 1
+    request = requests_sent[0]
+    assert request.url == "https://dbc-1.cloud.databricks.com/ai-gateway/mlflow/v1/chat/completions"
+    assert request.method == "POST"
+    assert request.headers["Authorization"] == "Bearer test-only-secret"
+    tags = json.loads(request.headers["Databricks-Ai-Gateway-Request-Tags"])
+    assert tags["pipeline"] == pipeline
+    assert tags["run_id"] == "123"
+    body = json.loads(request.body)
+    assert body["model"] == "test-endpoint"
+    assert body["max_tokens"] == 2048
+    assert body["messages"][0]["role"] == "user"
+    assert "Broken flow" in body["messages"][0]["content"]

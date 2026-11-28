@@ -13,20 +13,18 @@ runner is needed), and the GET read path that surfaces it.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER
 from omnigent.server.routes._auth_helpers import attribution_user
 from omnigent.server.routes.sessions import _build_new_item
 from omnigent.server.schemas import SessionEventInput
@@ -40,7 +38,6 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
-from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent
 
 _RUNNER_BINDING_TOKEN = "runner-created-by-token"
@@ -151,7 +148,9 @@ def _seed_items(db_uri: str, session_id: str) -> None:
 
 
 @pytest.fixture()
-def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+def auth_app(
+    runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> FastAPI:
     """App with ``permission_store`` enabled so auth is active.
 
     Uses header-mode auth so tests can authenticate via
@@ -176,30 +175,8 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         comment_store=SqlAlchemyCommentStore(db_uri),
         permission_store=SqlAlchemyPermissionStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=True),
+        runner_tunnel_tokens=getattr(request, "param", None),
     )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """Async HTTP client wired to the auth-enabled app."""
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 @pytest.mark.asyncio
@@ -342,6 +319,120 @@ async def test_post_event_uses_runner_supplied_created_by(
     items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
     [persisted] = items.data
     assert persisted.created_by == "bob@example.com"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "auth_app",
+    [None, frozenset({_RUNNER_BINDING_TOKEN, "different-runner-token"})],
+    indirect=True,
+    ids=["no-global-token", "global-token"],
+)
+@pytest.mark.parametrize("binding", ["token-bound", "different-token", "stable-id"])
+@pytest.mark.parametrize(
+    "event,args",
+    [
+        (
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {"terminal_launch_args": ["--sandbox", "read-only"]},
+            },
+            ["--sandbox", "read-only"],
+        ),
+        (
+            {
+                "type": "external_permission_mode_change",
+                "data": {"permission_mode": "default", "initial_observation": False},
+            },
+            ["--permission-mode", "default"],
+        ),
+    ],
+    ids=["codex", "claude"],
+)
+async def test_bound_runner_can_update_native_approval_mode(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    binding: str,
+    event: dict[str, object],
+    args: list[str],
+) -> None:
+    session_id = _seed_shared_session(
+        db_uri, {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_OWNER}
+    )
+    if binding == "stable-id":
+        assert SqlAlchemyConversationStore(db_uri).set_runner_id(session_id, "legacy-runner")
+        runner_headers = {RUNNER_TUNNEL_TOKEN_HEADER: _RUNNER_BINDING_TOKEN}
+    else:
+        runner_headers = _bind_runner(db_uri, session_id)
+        if binding == "different-token":
+            runner_headers[RUNNER_TUNNEL_TOKEN_HEADER] = "different-runner-token"
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    authorized = binding == "token-bound"
+    assert response.status_code == (202 if authorized else 403), response.text
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert stored is not None
+    assert stored.terminal_launch_args == (args if authorized else None)
+    if binding == "stable-id":
+        response = await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json=event,
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
+        assert response.status_code == 202, response.text
+        stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert stored is not None
+        assert stored.terminal_launch_args == args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batched", [False, True], ids=["single", "batch"])
+@pytest.mark.parametrize(
+    "poster,expected_status",
+    [("editor", 403), ("manager", 403), ("owner", 202), ("bound-runner", 202)],
+)
+async def test_external_transcript_requires_owner_or_bound_runner(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    poster: str,
+    expected_status: int,
+    batched: bool,
+) -> None:
+    """Editors can no longer publish transcripts; owners and bound runners can."""
+    session_id = _seed_shared_session(
+        db_uri,
+        {
+            "editor@example.com": LEVEL_EDIT,
+            "manager@example.com": LEVEL_MANAGE,
+            "owner@example.com": LEVEL_OWNER,
+        },
+    )
+    email = "editor@example.com" if poster == "bound-runner" else f"{poster}@example.com"
+    headers = {"X-Forwarded-Email": email}
+    if poster == "bound-runner":
+        headers.update(_bind_runner(db_uri, session_id))
+    event = {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "typed in the terminal"}],
+            },
+            "response_id": "resp_transcript_authority",
+        },
+    }
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=[event] if batched else event,
+        headers=headers,
+    )
+    assert response.status_code == expected_status, response.text
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id)
+    assert len(items.data) == (1 if expected_status == 202 else 0)
 
 
 @pytest.mark.asyncio
@@ -553,7 +644,8 @@ async def test_external_conversation_item_direct_terminal_attributes_request_act
     """
     from omnigent.runtime import pending_inputs
 
-    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    # External transcripts require session ownership or a bound runner.
+    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_OWNER})
 
     # Ensure no stale pending entry exists for this session — the fix only
     # fires on the no-pending-entry branch, so a leftover entry would mask

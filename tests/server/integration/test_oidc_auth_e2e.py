@@ -10,123 +10,31 @@ logout, and expired-ticket eviction.
 
 from __future__ import annotations
 
+import re
 import time
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import jwt
 import pytest
 
-from omnigent.server.admin_list import AdminList
-from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.oidc import OIDCConfig
 from omnigent.server.routes.auth import (
     _CLI_TICKET_TTL_SECONDS,
     _CliTicket,
     _evict_expired_tickets,
-    create_auth_router,
+)
+from tests.server.integration.oidc_fixtures import (
+    TEST_SIGNING_KEY,
+    _mint_state_cookie,
+    _mock_httpx_client_for_github,
+    _pkce_pair,
+)
+from tests.server.integration.oidc_fixtures import (
+    build_oidc_transport as _build_oidc_app,
 )
 
 pytestmark = pytest.mark.asyncio
-
-_TEST_SECRET = b"a" * 32
-_GITHUB_TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
-
-
-def _make_oidc_config() -> OIDCConfig:
-    """Build a minimal GitHub-flavoured OIDCConfig for testing."""
-    return OIDCConfig(
-        issuer="https://github.com",
-        client_id="test-client-id",
-        client_secret="test-client-secret",
-        redirect_uri="http://localhost:8000/auth/callback",
-        cookie_secret=_TEST_SECRET,
-        scopes="read:user user:email",
-        session_ttl_hours=8,
-        logout_redirect_uri=None,
-        allowed_domains=None,
-        provider_type="github",
-        authorization_endpoint="https://github.com/login/oauth/authorize",
-        token_endpoint=_GITHUB_TOKEN_ENDPOINT,
-        jwks_uri=None,
-        userinfo_endpoint="https://api.github.com/user",
-        allow_invites=False,
-    )
-
-
-def _build_oidc_app() -> httpx.ASGITransport:
-    """Build a minimal FastAPI app with only the OIDC auth router."""
-    from fastapi import FastAPI
-
-    config = _make_oidc_config()
-    auth_provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
-    admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
-
-    router = create_auth_router(
-        auth_provider=auth_provider,
-        permission_store=None,
-        admin_list=admin_list,
-    )
-
-    app = FastAPI()
-    app.include_router(router, prefix="/auth")
-    return httpx.ASGITransport(app=app)
-
-
-def _mint_state_cookie(
-    state: str,
-    code_verifier: str = "test-verifier",
-    return_to: str = "/",
-    ticket: str | None = None,
-) -> str:
-    """Mint a signed auth-state cookie matching what /auth/login produces."""
-    config = _make_oidc_config()
-    payload: dict = {
-        "state": state,
-        "code_verifier": code_verifier,
-        "return_to": return_to,
-        "exp": int(time.time()) + 300,
-    }
-    if ticket:
-        payload["ticket"] = ticket
-    return jwt.encode(payload, config.cookie_secret, algorithm="HS256")
-
-
-def _mock_httpx_client_for_github(
-    token_status: int = 200,
-    token_json: object | None = None,
-    emails_json: list | None = None,
-) -> AsyncMock:
-    """Build a mock httpx.AsyncClient context manager for GitHub endpoints.
-
-    Returns an AsyncMock suitable for use as an async context manager
-    (``async with httpx.AsyncClient() as client``).
-    """
-    if token_json is None:
-        token_json = {"access_token": "gho_test_token", "token_type": "bearer"}
-    if emails_json is None:
-        emails_json = [{"email": "alice@example.com", "primary": True, "verified": True}]
-
-    token_resp = MagicMock()
-    token_resp.status_code = token_status
-    token_resp.json.return_value = token_json
-    token_resp.text = str(token_json)
-
-    emails_resp = MagicMock()
-    emails_resp.status_code = 200
-    emails_resp.json.return_value = emails_json
-
-    mock_client = AsyncMock()
-    mock_client.post = AsyncMock(return_value=token_resp)
-    mock_client.get = AsyncMock(return_value=emails_resp)
-
-    # Make it work as an async context manager.
-    mock_cm = AsyncMock()
-    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_cm.__aexit__ = AsyncMock(return_value=False)
-    return mock_cm
 
 
 # ── 1. Login redirect ──────────────────────────────────────────────
@@ -167,14 +75,20 @@ async def test_login_redirects_to_idp_with_pkce_params() -> None:
 async def test_cli_login_creates_ticket() -> None:
     """POST /auth/cli-login returns a ticket_id and login URL."""
     transport = _build_oidc_app()
+    _, challenge = _pkce_pair()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post("/auth/cli-login")
+        resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": challenge, "code_challenge_method": "S256"},
+        )
 
     assert resp.status_code == 200
     body = resp.json()
     assert "ticket" in body
     assert "login_url" in body
     assert body["login_url"].startswith("/auth/login?ticket=")
+    assert "reauth=1" in body["login_url"]
+    assert re.fullmatch(r"[A-Z2-9]{4}-[A-Z2-9]{4}", body["user_code"])
 
 
 # ── 3. CLI poll (pending) ─────────────────────────────────────────
@@ -183,13 +97,17 @@ async def test_cli_login_creates_ticket() -> None:
 async def test_cli_poll_returns_pending_before_callback() -> None:
     """GET /auth/cli-poll returns 202 while the ticket is unfulfilled."""
     transport = _build_oidc_app()
+    verifier, challenge = _pkce_pair()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         # Create a ticket first.
-        create_resp = await client.post("/auth/cli-login")
+        create_resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": challenge, "code_challenge_method": "S256"},
+        )
         ticket_id = create_resp.json()["ticket"]
 
         # Poll -- should be pending.
-        poll_resp = await client.get(f"/auth/cli-poll?ticket={ticket_id}")
+        poll_resp = await client.get(f"/auth/cli-poll?ticket={ticket_id}&code_verifier={verifier}")
 
     assert poll_resp.status_code == 202
     assert poll_resp.json()["status"] == "pending"
@@ -236,7 +154,7 @@ async def test_callback_exchanges_code_and_sets_session_cookie() -> None:
     assert "ap_session" in resp.cookies
     # Validate the session JWT.
     session_jwt = resp.cookies["ap_session"]
-    payload = jwt.decode(session_jwt, _TEST_SECRET, algorithms=["HS256"])
+    payload = jwt.decode(session_jwt, TEST_SIGNING_KEY, algorithms=["HS256"])
     assert payload["sub"] == "alice@example.com"
 
 

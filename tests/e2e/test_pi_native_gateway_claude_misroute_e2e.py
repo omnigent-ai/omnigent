@@ -26,7 +26,7 @@ warning) and **passes once the fix lands**.
 
 Modelled on ``tests/e2e/test_repl_approval_e2e.py`` (a proven pexpect + fake
 ``HOME`` CLI e2e). The resolution-boundary defects are additionally pinned in
-``tests/test_pi_native_gateway_claude_routing.py``.
+``tests/harnesses/pi_native/test_pi_native_gateway_claude_routing.py``.
 """
 
 from __future__ import annotations

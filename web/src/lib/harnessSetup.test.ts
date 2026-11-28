@@ -8,7 +8,11 @@ import {
   harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
+  harnessWarningBadgeText,
+  isNativeOpenCodeHarness,
+  missingHarnessCredentialCopy,
   resolveSetupSteps,
+  skillInvocationPrefix,
 } from "./harnessSetup";
 import type { SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
@@ -30,6 +34,19 @@ const info = (overrides: Partial<ServerInfo> = {}): ServerInfo =>
     installable_harnesses: ["codex", "codex-native", "pi", "pi-native"],
     ...overrides,
   }) as ServerInfo;
+
+describe("missingHarnessCredentialCopy", () => {
+  it.each([
+    ["codex-native", "Codex", "No ChatGPT account or API key on laptop"],
+    ["native-claude", "Claude Code", "No Claude subscription or API key on laptop"],
+    ["pi-native", "Pi", "No API key or gateway credential on laptop"],
+    ["cursor-native", "Cursor", "No credentials on laptop"],
+  ])("uses the credential wording for %s", (harness, harnessName, expectedStart) => {
+    expect(missingHarnessCredentialCopy(harness, harnessName, "laptop")).toBe(
+      `${expectedStart}, so new sessions can’t use ${harnessName}.`,
+    );
+  });
+});
 
 // A codex-shaped server descriptor: one-click install, then a UI-authable auth
 // step (the form lists subscription / API key / gateway; `command` is the
@@ -196,6 +213,61 @@ describe("harnessReadinessOnHost", () => {
     });
   });
 
+  it("keeps needs-auth SDK harnesses selectable (advisory, not a gate)", () => {
+    // The daemon cannot see agent-level credentials (executor.auth) and its
+    // launch gate stays ungated for SDK harnesses, so needs-auth must warn
+    // without disabling the row.
+    expect(
+      harnessReadinessOnHost("claude-sdk", hostWith({ "claude-sdk": "needs-auth" })),
+    ).toMatchObject({
+      state: "available",
+      reason: "needs-auth",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+    expect(
+      harnessReadinessOnHost("openai-agents", hostWith({ "openai-agents": "needs-auth" })),
+    ).toMatchObject({
+      state: "available",
+      reason: "needs-auth",
+      selectable: true,
+    });
+    // Every SDK spelling the daemon reports readiness for stays selectable,
+    // including the antigravity aliases (specs may use any spelling and the
+    // agents API preserves it).
+    for (const harness of ["antigravity", "agy", "google-antigravity", "openai-agents-sdk"]) {
+      expect(harnessReadinessOnHost(harness, hostWith({ [harness]: "needs-auth" }))).toMatchObject({
+        state: "available",
+        reason: "needs-auth",
+        selectable: true,
+        fallbackRelevant: false,
+      });
+    }
+    // CLI-backed harnesses keep the blocking setup-required mapping: their
+    // launch really is gated on host-side setup. The *native* antigravity
+    // spellings wrap the agy CLI and stay blocking too.
+    for (const harness of ["pi", "agy-native", "native-antigravity"]) {
+      expect(harnessReadinessOnHost(harness, hostWith({ [harness]: "needs-auth" }))).toMatchObject({
+        state: "setup-required",
+        reason: "needs-auth",
+        selectable: false,
+      });
+    }
+  });
+
+  it("keeps a CLI that did not answer its version check selectable", () => {
+    // The host still launches a resolved CLI whose probe timed out.
+    const host = hostWith({ "pi-native": "cli-unresponsive" });
+    expect(harnessReadinessOnHost("pi-native", host)).toMatchObject({
+      state: "available",
+      reason: "cli-unresponsive",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+    expect(harnessUnavailableReasonOnHost("pi-native", host)).toBe("cli-unresponsive");
+    expect(harnessWarningBadgeText("cli-unresponsive")).toBe("not responding");
+  });
+
   it("marks host-wide unavailability as irrelevant to harness fallback", () => {
     expect(
       harnessReadinessOnHost("codex-native", {
@@ -218,6 +290,34 @@ describe("harnessReadinessOnHost", () => {
       label: "Harness is not installed",
       description: "Install this harness on the selected host before using it.",
     });
+  });
+});
+
+describe("tmux-unavailable readiness", () => {
+  const host = hostWith({ "claude-native": "tmux-unavailable", "claude-sdk": true });
+
+  it("blocks the native harness with tmux repair copy", () => {
+    expect(harnessReadinessOnHost("claude-native", host)).toEqual({
+      state: "setup-required",
+      reason: "tmux-unavailable",
+      selectable: false,
+      fallbackRelevant: true,
+      explanation: {
+        label: "tmux is required",
+        description: "Install tmux 3.3 or newer on the selected host, then check again.",
+      },
+    });
+    expect(harnessUnavailableReasonOnHost("claude-native", host)).toBe("tmux-unavailable");
+    expect(harnessWarningBadgeText("tmux-unavailable")).toBe("needs tmux");
+    expect(harnessWarningBadgeText("tmux-unavailable", true)).toBe("needs setup");
+  });
+
+  it("leaves SDK harnesses on the same host ready", () => {
+    expect(harnessReadinessOnHost("claude-sdk", host)).toMatchObject({
+      state: "available",
+      reason: "ready",
+    });
+    expect(harnessUnavailableReasonOnHost("claude-sdk", host)).toBeNull();
   });
 });
 
@@ -293,7 +393,7 @@ describe("harnessAuthableOnHost", () => {
   });
 
   it("false for env-auth / own-login harnesses, flag off, offline, or loading", () => {
-    // OpenCode/Qwen (env-auth) and Cursor (own-login) are NOT UI-authable.
+    // OpenCode/Cursor (own CLI login) and Qwen (env-auth) are NOT UI-authable.
     expect(harnessAuthableOnHost(info(), "opencode-native", online)).toBe(false);
     expect(harnessAuthableOnHost(info(), "qwen", online)).toBe(false);
     expect(harnessAuthableOnHost(info(), "cursor-native", online)).toBe(false);
@@ -375,8 +475,100 @@ describe("resolveSetupSteps", () => {
     expect(steps[0].command).toBe("omni setup");
   });
 
+  it("adds a tmux step after the done CLI steps when only tmux is missing", () => {
+    const steps = resolveSetupSteps(
+      CODEX_STEPS,
+      "codex-native",
+      hostWith({ "codex-native": "tmux-unavailable" }),
+    );
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "done"],
+      ["auth", "done"],
+      ["tmux", "todo"],
+    ]);
+    expect(steps[2].title).toBe("Install tmux 3.3 or newer");
+    expect(steps[2].command).toBe("brew install tmux");
+  });
+
+  it("shows the tmux step even when the server publishes no steps", () => {
+    const steps = resolveSetupSteps(
+      undefined,
+      "codex-native",
+      hostWith({ "codex-native": "tmux-unavailable" }),
+    );
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["tmux", "todo"]]);
+  });
+
   it("returns [] with no descriptor or no harness", () => {
     expect(resolveSetupSteps(undefined, "codex", hostWith({ codex: false }))).toEqual([]);
     expect(resolveSetupSteps(CODEX_STEPS, null, hostWith({ codex: false }))).toEqual([]);
+  });
+});
+
+// The server's opencode descriptor: install, then an optional run-on-host CLI
+// login. Free models need no login, so that step is informational (no status key).
+const OPENCODE_STEPS: SetupStepWire[] = [
+  {
+    kind: "install",
+    title: "Install OpenCode",
+    detail: "We'll install OpenCode on the host for you.",
+    action: "install",
+    command: null,
+    status_key: "installed",
+  },
+  {
+    kind: "auth",
+    title: "Sign in to a provider (optional)",
+    detail:
+      "OpenCode's free models work without signing in. Sign in on the host to use your own providers.",
+    action: "command",
+    command: "opencode auth login",
+    status_key: null,
+  },
+];
+
+describe("OpenCode setup", () => {
+  it("recognizes every OpenCode harness spelling", () => {
+    expect(isNativeOpenCodeHarness("opencode-native")).toBe(true);
+    expect(isNativeOpenCodeHarness("native-opencode")).toBe(true);
+    expect(isNativeOpenCodeHarness("opencode")).toBe(true);
+    expect(isNativeOpenCodeHarness("codex-native")).toBe(false);
+    expect(isNativeOpenCodeHarness("cursor-native")).toBe(false);
+  });
+
+  it("flags a 1.x OpenCode host as outdated with only the install to do", () => {
+    const host = hostWith({ "opencode-native": "version-too-low" });
+    expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBe("version-too-low");
+    expect(harnessWarningBadgeText("version-too-low")).toBe("outdated");
+    const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "todo"]]);
+  });
+
+  it("treats an installed OpenCode with no provider login as ready", () => {
+    const host = hostWith({ "opencode-native": true });
+    expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBeNull();
+    const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "done"]]);
+  });
+});
+
+describe("skillInvocationPrefix", () => {
+  it("returns $ for codex-native", () => {
+    expect(skillInvocationPrefix("codex-native")).toBe("$");
+  });
+
+  it("returns / for non-Codex native harnesses", () => {
+    expect(skillInvocationPrefix("claude-native")).toBe("/");
+    expect(skillInvocationPrefix("cursor-native")).toBe("/");
+  });
+
+  it("returns / for SDK and bare harness spellings", () => {
+    expect(skillInvocationPrefix("codex")).toBe("/");
+    expect(skillInvocationPrefix("claude")).toBe("/");
+  });
+
+  it("returns / for null and undefined", () => {
+    expect(skillInvocationPrefix(null)).toBe("/");
+    expect(skillInvocationPrefix(undefined)).toBe("/");
   });
 });

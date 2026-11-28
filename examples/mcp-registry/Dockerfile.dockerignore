@@ -1,0 +1,12 @@
+.git
+.venv
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+graphify-out
+web
+tests
+editors
+docs
+designs
+omnigent/server/static/web-ui

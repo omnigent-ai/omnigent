@@ -17,8 +17,10 @@ export default {
     }
     const upstream = new URL(env.UPSTREAM_URL);
     const incoming = new URL(request.url);
-    // Preserve path + query; swap only the origin to the real server.
-    upstream.pathname = incoming.pathname;
+    // Preserve path + query; swap the origin and keep any base path carried
+    // by UPSTREAM_URL (a server mounted under a prefix, e.g. …/omnigent), so
+    // relay /health reaches <base>/health rather than the deployment root.
+    upstream.pathname = upstream.pathname.replace(/\/+$/, "") + incoming.pathname;
     upstream.search = incoming.search;
     // Reconstruct the request against the upstream origin. Passing the
     // original `request` as init copies method, headers (incl.

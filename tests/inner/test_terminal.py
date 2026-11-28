@@ -6,21 +6,35 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+import omnigent.util.tmux_compat as tmux_compat
+from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
+from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+from omnigent.inner.claude_model_access import ClaudeModelAccess
+from omnigent.inner.datamodel import (
+    GitSshBinding,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+    TcpEgressRoute,
+    TerminalEnvSpec,
+)
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import (
     TerminalInstance,
     _apply_utf8_locale_default,
@@ -28,7 +42,18 @@ from omnigent.inner.terminal import (
     _is_utf8_locale_value,
     create_terminal_instance,
 )
+from omnigent.inner.terminal_lifecycle import (
+    TERMINAL_INSTANCE_ID_ENV,
+    TERMINAL_LAUNCH_ID_ENV,
+    TERMINAL_LAUNCH_SESSION_ID_ENV,
+)
+from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+from omnigent.runner.resource_registry import trim_terminal_output
+from tests._helpers.egress_ca import prepare_isolated_egress_ca
+from tests._helpers.live_server import terminate_process
+from tests._helpers.polling import poll_until
+from tests._helpers.stdio_jsonrpc import read_json_line
 
 
 @dataclass
@@ -84,7 +109,7 @@ def test_threaded_idle_watcher_reports_terminal_exit(
     )
     exited = threading.Event()
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
@@ -161,10 +186,14 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(
     exited = threading.Event()
     snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None, None, None])
 
-    instance._capture_pane_for_idle_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
+    def _capture() -> tuple[bool, str] | None:
+        # A live-pane capture, then tmux "gone"; the fold reports both the
+        # live/dead state and the snapshot in one call.
+        snap = next(snapshots)
+        return None if snap is None else (False, snap)
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
-    # The initial synthetic capture is from a live pane; never probe real tmux.
-    monkeypatch.setattr(instance, "_pane_is_dead", lambda: False)
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -176,6 +205,247 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(
         assert instance.last_pane_text() == "startup failed\ntry config"
     finally:
         instance._stop_idle_watcher_thread()
+
+
+@pytest.mark.parametrize(
+    ("captured", "expected"),
+    [
+        ("0 10000\nfirst error\nlater detail\n", "first error\nlater detail"),
+        ("100 10000\nfirst error\nlater detail\n", "first error\nlater detail"),
+        ("101 10000\npartialcredential\nlater detail\n", "later detail"),
+        ("101 10000\npartialcredential", None),
+        ("99 101\npartialcredential\nlater detail\n", "later detail"),
+        ("0 0\npartialcredential\nlater detail\n", "later detail"),
+        ("unknown\npartialcredential\nlater detail\n", None),
+        ("\npartialcredential\nlater detail\n", None),
+        ("-1 10000\npartialcredential\n", None),
+        ("0 -1\npartialcredential\n", None),
+        ("0 10000 extra\npartialcredential\n", None),
+        ("partialcredential", None),
+    ],
+)
+def test_exit_history_omits_potentially_incomplete_leading_records(
+    tmp_path: Path, captured: str, expected: str | None
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_pane_snapshot("unsafe visible credential continuation")
+
+    instance._remember_exit_snapshot(captured)
+
+    assert (instance._last_exit_snapshot is None) == (expected is None)
+    assert instance.last_exit_text() == expected
+    assert instance.last_pane_text() == "unsafe visible credential continuation"
+
+
+def test_missing_exit_history_does_not_use_partial_visible_record(tmp_path: Path) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_pane_snapshot("unsafe visible credential continuation")
+
+    assert instance._last_exit_snapshot is None
+    assert instance.last_exit_text() is None
+    assert instance.last_pane_text() == "unsafe visible credential continuation"
+
+
+@pytest.mark.parametrize(
+    "banner",
+    [
+        "Pane is dead (status 2, Wed Sep 23 12:00:00 2026)",
+        "Pane is dead (signal term, Wed Sep 23 12:00:00 2026)",
+        "Pane is dead (status",
+        "Pane is dead (signal",
+    ],
+)
+@pytest.mark.parametrize("padding", ["", "\n" * 80, " \t\n" * 80], ids=["none", "blank", "space"])
+def test_exit_text_removes_only_padding_before_dead_pane_banner(
+    tmp_path: Path, banner: str, padding: str
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    raw = (
+        "\x1b[31merror: synthetic startup failure\x1b[0m\n\n"
+        "usage: preserve this spacing\n" + padding + f"\x1b[7m{banner}\x1b[0m\n\n"
+    )
+    instance._remember_exit_snapshot("0 10000\n" + raw)
+    instance._remember_pane_snapshot(raw)
+    visible_before = instance.last_pane_text()
+
+    assert instance.last_exit_text() == (
+        "error: synthetic startup failure\n\nusage: preserve this spacing\n" + banner
+    )
+    assert instance._last_exit_snapshot == raw
+    assert instance._last_pane_snapshot == raw
+    assert instance.last_pane_text() == visible_before
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "startup error\n\n\napplication footer",
+        "startup error\n\n\nlog: Pane is dead (status 2)",
+        "startup error\n\n\nPane is dead (status 2)\n\napplication footer",
+        "startup error\n\n\nPane is",
+    ],
+)
+def test_exit_text_preserves_non_banner_padding(tmp_path: Path, text: str) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_snapshot("0 10000\n" + text)
+
+    assert instance.last_exit_text() == text
+    assert instance._last_exit_snapshot == text
+
+
+@pytest.mark.parametrize("capture", ["async", "sync"])
+async def test_failed_exit_history_capture_does_not_fall_back_to_partial_visible_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_pane_snapshot("unsafe visible credential continuation")
+
+    def fail(*_args: str) -> NoReturn:
+        raise RuntimeError("tmux target gone")
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=fail))
+    monkeypatch.setattr(instance, "_tmux_output_sync", fail)
+    if capture == "async":
+        await instance._capture_exit_snapshot()
+    else:
+        instance._capture_exit_snapshot_sync()
+
+    assert instance._last_exit_snapshot is None
+    assert instance.last_exit_text() is None
+    assert instance.last_pane_text() == "unsafe visible credential continuation"
+
+
+@pytest.mark.parametrize("duplicate_path", ["async", "sync"])
+@pytest.mark.parametrize(
+    "duplicate_result",
+    [
+        None,
+        "0 10000\n",
+        "0 10000\n \n\t\n",
+        "0 10000\n\x1b[31m\x1b[0m\n",
+        "unknown bounds\nunsafe partial credential",
+        "101 10000\nunsafe partial credential",
+    ],
+    ids=["failure", "empty", "whitespace", "ansi_only", "malformed", "clipped_record"],
+)
+async def test_duplicate_exit_capture_preserves_good_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    duplicate_path: str,
+    duplicate_result: str | None,
+) -> None:
+    """A competing capture cannot erase a safe snapshot while its producer returns."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_status("1 2")
+    instance._remember_pane_snapshot("unsafe visible credential continuation")
+    diagnostic = "error: unexpected argument '--invalid' found"
+    good_capture = f"0 10000\n{diagnostic}\n"
+    published = threading.Event()
+    finish_primary = threading.Event()
+    duplicate_started = threading.Event()
+    finish_duplicate = threading.Event()
+    original_remember = instance._remember_exit_snapshot
+
+    def remember(captured: str) -> None:
+        original_remember(captured)
+        if captured == good_capture:
+            published.set()
+            assert finish_primary.wait(5)
+
+    def duplicate_output() -> str:
+        if duplicate_result is None:
+            raise RuntimeError("tmux removed during cleanup")
+        return duplicate_result
+
+    sync_calls = 0
+
+    def output_sync(*_args: str) -> str:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            return good_capture
+        duplicate_started.set()
+        assert finish_duplicate.wait(5)
+        return duplicate_output()
+
+    async def output_async(*_args: str) -> str:
+        duplicate_started.set()
+        assert await asyncio.to_thread(finish_duplicate.wait, 5)
+        return duplicate_output()
+
+    monkeypatch.setattr(instance, "_remember_exit_snapshot", remember)
+    monkeypatch.setattr(instance, "_tmux_output_sync", output_sync)
+    monkeypatch.setattr(instance, "_tmux_output", output_async)
+    primary = asyncio.create_task(asyncio.to_thread(instance._capture_exit_snapshot_sync))
+    duplicate: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.to_thread(published.wait, 5)
+        assert instance.last_exit_text() == diagnostic
+        assert not primary.done()
+        duplicate = asyncio.create_task(
+            instance._capture_exit_snapshot()
+            if duplicate_path == "async"
+            else asyncio.to_thread(instance._capture_exit_snapshot_sync)
+        )
+        assert await asyncio.to_thread(duplicate_started.wait, 5)
+        assert instance.last_exit_text() == diagnostic
+        finish_primary.set()
+        await primary
+        finish_duplicate.set()
+        await duplicate
+        assert instance.last_exit_text() == diagnostic
+    finally:
+        finish_primary.set()
+        finish_duplicate.set()
+        await asyncio.gather(primary, *([duplicate] if duplicate is not None else []))
+
+
+def test_client_interaction_within_reports_recency(tmp_path: Path) -> None:
+    """
+    No interaction ever reads False; a fresh stamp reads True only inside the window.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert not instance.client_interaction_within(60.0)
+    instance.note_client_interaction()
+    assert instance.client_interaction_within(60.0)
+    assert not instance.client_interaction_within(0.0)
 
 
 def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> None:
@@ -354,8 +624,9 @@ def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path)
     recovered_twice = threading.Event()
     successful_ticks = 0
 
-    def _capture() -> str | None:
-        return next(captures, "steady")
+    def _capture() -> tuple[bool, str] | None:
+        snap = next(captures, "steady")
+        return None if snap is None else (False, snap)
 
     def _on_tick() -> None:
         nonlocal successful_ticks
@@ -363,9 +634,8 @@ def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path)
         if successful_ticks >= 2:
             recovered_twice.set()
 
-    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -401,7 +671,7 @@ def test_threaded_idle_watcher_uses_session_probe_to_confirm_capture_failure(
             confirmed.set()
         return True
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = _confirm  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
@@ -471,7 +741,7 @@ def test_threaded_idle_watcher_treats_confirmation_start_failure_as_unknown(
             retried.set()
         raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     monkeypatch.setattr(terminal_mod.subprocess, "run", _cannot_fork)
     monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
 
@@ -715,20 +985,26 @@ def test_capture_probe_logs_command_return_code_and_stderr(
     )
 
     with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
-        snapshot = instance._capture_pane_for_idle_or_none()
+        state = instance._capture_pane_state_or_none()
 
-    assert snapshot is None
+    assert state is None
     message = caplog.records[-1].getMessage()
     assert "rc=17" in message
     assert "\n" not in message
     payload = json.loads(message.split("(rc=17): ", 1)[1])
     assert payload == {
         "cmd": [
-            "tmux",
+            terminal_mod._tmux_executable(),
             "-S",
             str(instance.socket_path),
             "-f",
             terminal_mod._TMUX_CONFIG_PATH,
+            "list-panes",
+            "-t",
+            "main",
+            "-F",
+            "#{pane_dead} #{pane_dead_status}",
+            ";",
             "capture-pane",
             "-t",
             "main",
@@ -756,8 +1032,7 @@ def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
         running=True,
     )
     # A steady, unchanging pane: no activity edges, but ticks still fire.
-    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: (False, "steady frame")  # type: ignore[method-assign]
     ticks = threading.Event()
     count = {"n": 0}
 
@@ -770,6 +1045,53 @@ def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
     assert ticks.wait(timeout=1.0)
     instance._stop_idle_watcher_thread()
     assert count["n"] >= 3
+
+
+def test_threaded_idle_watcher_records_when_output_changed_the_screen(tmp_path: Path) -> None:
+    """``screen_changed_within`` reports the watcher's screen diff, or ``None``
+    when the watcher has not watched for the whole window or has gone stale.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    frames = iter(["booting", "working 1", "working 2"])
+    current = {"frame": "booting"}
+
+    def _capture() -> tuple[bool, str]:
+        current["frame"] = next(frames, current["frame"])
+        return False, current["frame"]
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    ticks = threading.Event()
+    count = {"n": 0}
+
+    def _on_tick() -> None:
+        count["n"] += 1
+        if count["n"] >= 5:
+            ticks.set()
+
+    assert instance.screen_changed_within(60.0) is None
+    instance.start_idle_watcher_thread(on_tick=_on_tick, poll_interval_s=0.01)
+    assert ticks.wait(timeout=1.0)
+    try:
+        assert instance.screen_changed_within(60.0) is None, "watched for less than the window"
+        assert instance._screen_watch_started_at is not None
+        instance._screen_watch_started_at -= 120.0
+        assert instance.screen_changed_within(60.0) is True
+        assert instance._screen_changed_at is not None
+        instance._screen_changed_at -= 120.0
+        assert instance.screen_changed_within(60.0) is False
+    finally:
+        instance._stop_idle_watcher_thread()
+    assert instance._screen_watched_at is not None
+    instance._screen_watched_at -= 60.0
+    assert instance.screen_changed_within(60.0) is None, "a stale capture says nothing"
 
 
 def test_pane_pid_sync_returns_pane_process_pid(tmp_path: Path) -> None:
@@ -923,8 +1245,10 @@ def test_threaded_idle_watcher_reports_exit_on_dead_pane(tmp_path: Path) -> None
     )
     exited = threading.Event()
     # capture-pane still succeeds (server alive); the pane is dead.
-    instance._capture_pane_for_idle_or_none = lambda: "claude exited: boom\nbye"  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: True  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: (  # type: ignore[method-assign]
+        True,
+        "claude exited: boom\nbye",
+    )
 
     instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
 
@@ -937,7 +1261,7 @@ def test_threaded_idle_watcher_retries_unknown_pane_death(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A pane-death probe that cannot start backs off without reporting exit."""
+    """A pane probe that cannot start backs off without reporting exit."""
     instance = TerminalInstance(
         name="runtime",
         session_key="main",
@@ -948,8 +1272,6 @@ def test_threaded_idle_watcher_retries_unknown_pane_death(
     exited = threading.Event()
     retried = threading.Event()
     attempts = 0
-
-    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
 
     def _cannot_probe(*args: str) -> NoReturn:
         del args
@@ -968,6 +1290,316 @@ def test_threaded_idle_watcher_retries_unknown_pane_death(
     instance._stop_idle_watcher_thread()
     assert not exited.is_set()
     assert instance.running is True
+
+
+def _idle_watch_instance(tmp_path: Path) -> TerminalInstance:
+    """Build a running terminal instance for idle-watcher unit tests."""
+    return TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+
+class _StubDetector:
+    """Minimal :class:`_IdleDetector` stand-in for interval-policy tests."""
+
+    def __init__(self, *, changed: bool, quiescent: bool) -> None:
+        self.changed_this_tick = changed
+        self._quiescent = quiescent
+
+    def quiescent_for(self, seconds: float) -> bool:
+        del seconds
+        return self._quiescent
+
+
+def test_next_idle_poll_interval_grows_toward_capped_ceiling() -> None:
+    """Backoff grows geometrically but never past the per-base ceiling."""
+    # Generic 1s base: the global 2s cap bounds growth.
+    assert terminal_mod._next_idle_poll_interval(1.0, 1.0) == 2.0
+    assert terminal_mod._next_idle_poll_interval(2.0, 1.0) == 2.0
+    # Fast 0.2s claude-native base: base * max-multiple (2s) bounds growth.
+    assert terminal_mod._next_idle_poll_interval(0.2, 0.2) == pytest.approx(0.4)
+    assert terminal_mod._next_idle_poll_interval(1.6, 0.2) == pytest.approx(2.0)
+    assert terminal_mod._next_idle_poll_interval(2.0, 0.2) == pytest.approx(2.0)
+
+
+def test_idle_poll_backoff_env_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The env var pins the base cadence without a code rollback."""
+    monkeypatch.delenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, raising=False)
+    assert terminal_mod._idle_poll_backoff_enabled() is True
+    for off in ("0", "false", "no", "off", "OFF", " Off "):
+        monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, off)
+        assert terminal_mod._idle_poll_backoff_enabled() is False
+    monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, "1")
+    assert terminal_mod._idle_poll_backoff_enabled() is True
+
+
+def test_wake_signal_coalesces_and_latches_expected_output() -> None:
+    """Repeated wakes collapse to one; expect_output latches until consumed."""
+    signal = terminal_mod._WakeSignal()
+    assert signal.consume(0.0) == (False, False)
+    signal.wake(expect_output=False)
+    signal.wake(expect_output=True)
+    signal.wake(expect_output=False)
+    assert signal.consume(0.0) == (True, True)
+    assert signal.consume(0.0) == (False, False)
+
+
+def test_wake_signal_consume_returns_on_wake_not_timeout() -> None:
+    """A backed-off watcher's wait returns on the wake, not the full timeout."""
+    signal = terminal_mod._WakeSignal()
+
+    def _producer() -> None:
+        time.sleep(0.05)
+        signal.wake(expect_output=True)
+
+    threading.Thread(target=_producer, daemon=True).start()
+    start = time.monotonic()
+    woken, expects_output = signal.consume(5.0)
+    elapsed = time.monotonic() - start
+    assert woken is True and expects_output is True
+    assert elapsed < 1.0
+
+
+def test_idle_detector_quiescent_for_tracks_last_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``quiescent_for`` accrues quiet time, and a content change resets it."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(terminal_mod.time, "monotonic", lambda: clock["now"])
+    detector = terminal_mod._IdleDetector()
+    detector.tick("frame-one")
+    clock["now"] = 1005.0
+    assert detector.quiescent_for(5.0) is True
+    assert detector.quiescent_for(6.0) is False
+    # A changed snapshot resets the quiet clock.
+    detector.tick("frame-two")
+    assert detector.quiescent_for(5.0) is False
+    # An unchanged snapshot keeps accruing from the last change.
+    clock["now"] = 1011.0
+    detector.tick("frame-two")
+    assert detector.quiescent_for(5.0) is True
+
+
+def test_next_watch_interval_backs_off_only_when_fully_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Interval growth is held back by any signal that the pane is not idle."""
+    instance = _idle_watch_instance(tmp_path)
+    quiet = _StubDetector(changed=False, quiescent=True)
+
+    def interval(**kwargs: object) -> float:
+        base = {
+            "detector": quiet,
+            "woken": False,
+            "backoff_enabled": True,
+            "backoff_allowed": None,
+            "hold_base_until": 0.0,
+            "now": 100.0,
+        }
+        base.update(kwargs)
+        return instance._next_watch_interval(1.0, 1.0, **base)  # type: ignore[arg-type]
+
+    # Fully quiet and allowed → grows one step, capped at the global 2s.
+    assert interval() == 2.0
+    assert interval(backoff_allowed=lambda: True) == 2.0
+    # Any "not idle" signal pins the base cadence.
+    assert interval(detector=_StubDetector(changed=True, quiescent=True)) == 1.0
+    assert interval(detector=_StubDetector(changed=False, quiescent=False)) == 1.0
+    assert interval(woken=True) == 1.0
+    assert interval(backoff_enabled=False) == 1.0
+    assert interval(backoff_allowed=lambda: False) == 1.0
+    assert interval(hold_base_until=200.0) == 1.0
+
+    # A failing predicate holds the base cadence instead of ending the watcher,
+    # and is logged once rather than on every tick.
+    def failing_predicate() -> bool:
+        raise NameError("status poller gone")
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.inner.terminal"):
+        assert interval(backoff_allowed=failing_predicate) == 1.0
+        assert interval(backoff_allowed=failing_predicate) == 1.0
+    failures = [r for r in caplog.records if "backoff predicate failed" in r.getMessage()]
+    assert len(failures) == 1
+
+
+def test_tmux_executable_for_path_caches_and_searches_path_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolution is cached per ``PATH`` value and searches that value.
+
+    An unchanged ``PATH`` reuses the cached binary without re-walking it; a
+    changed ``PATH`` re-resolves. Each lookup searches the same ``PATH`` string
+    used as the cache key, so a cached result matches the path it was found on.
+    """
+    terminal_mod._tmux_executable_for_path.cache_clear()
+    searched: list[str | None] = []
+
+    def _fake_which(cmd: str, path: str | None = None) -> str | None:
+        searched.append(path)
+        return f"{path}/tmux"
+
+    monkeypatch.setattr(terminal_mod.shutil, "which", _fake_which)
+    try:
+        first = terminal_mod._tmux_executable_for_path("/a/bin")
+        cached = terminal_mod._tmux_executable_for_path("/a/bin")
+        changed = terminal_mod._tmux_executable_for_path("/b/bin")
+    finally:
+        terminal_mod._tmux_executable_for_path.cache_clear()
+
+    assert first == "/a/bin/tmux"
+    assert cached == "/a/bin/tmux"
+    assert changed == "/b/bin/tmux"
+    # One walk per distinct PATH, each searching exactly its own value.
+    assert searched == ["/a/bin", "/b/bin"]
+
+
+def test_capture_pane_state_or_none_folds_liveness_and_capture(tmp_path: Path) -> None:
+    """One tmux invocation yields both the dead/alive flag and the capture."""
+    instance = _idle_watch_instance(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def _one_shot(*args: str) -> str:
+        calls.append(args)
+        return "0 \n\x1b[31mframe line\x1b[0m\nsecond"
+
+    instance._tmux_output_sync = _one_shot  # type: ignore[method-assign]
+    assert instance._capture_pane_state_or_none() == (False, "\x1b[31mframe line\x1b[0m\nsecond")
+    assert len(calls) == 1
+    assert calls[0][0] == "list-panes"
+    assert ";" in calls[0] and "capture-pane" in calls[0]
+    assert instance.last_exit_status() is None
+
+    instance._tmux_output_sync = lambda *a: "1 42\nfinal frame"  # type: ignore[method-assign]
+    assert instance._capture_pane_state_or_none() == (True, "final frame")
+    assert instance.last_exit_status() == 42
+
+
+def test_threaded_watcher_reduces_tmux_forks_once_pane_is_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An idle pane bounds the watcher's tmux forks near the backed-off ceiling."""
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_AFTER_SECONDS", 0.03)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 0.2)
+
+    def forks_over_window(*, backoff: bool) -> int:
+        monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, "1" if backoff else "0")
+        instance = _idle_watch_instance(tmp_path)
+        count = {"n": 0}
+
+        def _capture() -> tuple[bool, str]:
+            count["n"] += 1
+            return (False, "steady")
+
+        instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+        instance.start_idle_watcher_thread(on_tick=lambda: None, poll_interval_s=0.01)
+        time.sleep(1.0)
+        instance._stop_idle_watcher_thread()
+        return count["n"]
+
+    without_backoff = forks_over_window(backoff=False)
+    with_backoff = forks_over_window(backoff=True)
+    # Backoff must strictly cut forks and bound them near the ceiling rate
+    # (window / max interval plus the geometric ramp), not the base-tick rate.
+    assert with_backoff < without_backoff
+    assert with_backoff <= 15
+
+
+def test_threaded_watcher_wakes_promptly_from_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wake interrupts a backed-off watcher's multi-second sleep at once."""
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_AFTER_SECONDS", 0.02)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 2.0)
+    instance = _idle_watch_instance(tmp_path)
+    ticks = {"n": 0}
+
+    def _capture() -> tuple[bool, str]:
+        ticks["n"] += 1
+        return (False, "steady")
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread(on_tick=lambda: None, poll_interval_s=0.01)
+    try:
+        # Grow the interval to the 2s ceiling, then align to the start of a
+        # fresh backed-off sleep so the wake has the full ceiling to beat.
+        time.sleep(1.5)
+        start = ticks["n"]
+        align_deadline = time.monotonic() + 10.0
+        while ticks["n"] == start:
+            assert time.monotonic() < align_deadline, "watcher stopped ticking"
+            time.sleep(0.01)
+        before = ticks["n"]
+        woke_at = time.monotonic()
+        instance.wake_idle_watcher()
+        deadline = woke_at + 1.0
+        while ticks["n"] == before and time.monotonic() < deadline:
+            time.sleep(0.005)
+        latency = time.monotonic() - woke_at
+    finally:
+        instance._stop_idle_watcher_thread()
+    assert ticks["n"] > before
+    assert latency < 1.0  # far below the ~2s sleep the wake interrupted
+
+
+def test_threaded_idle_watcher_confirms_exit_at_base_cadence_after_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backed-off watcher drops to the base cadence to confirm an exit.
+
+    Each failure-confirmation retry must run at the base interval, not the
+    grown backoff ceiling, so a lost terminal is reported within the base
+    window instead of several ceiling-length sleeps.
+    """
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_AFTER_SECONDS", 0.03)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 0.5)
+    monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, "1")
+    instance = _idle_watch_instance(tmp_path)
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+    quiet_capture_times: list[float] = []
+    failing = {"on": False}
+    first_fail = {"at": 0.0}
+
+    def _capture() -> tuple[bool, str] | None:
+        if not failing["on"]:
+            quiet_capture_times.append(time.monotonic())
+            return (False, "steady")
+        if first_fail["at"] == 0.0:
+            first_fail["at"] = time.monotonic()
+        return None
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    exited = threading.Event()
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+    try:
+        # Let the quiet pane grow the interval to the 0.5s ceiling, then fail
+        # so the exit is confirmed from a fully backed-off state.
+        poll_until(
+            lambda: (
+                len(quiet_capture_times) >= 2
+                and quiet_capture_times[-1] - quiet_capture_times[-2] >= 0.4
+            ),
+            timeout_s=5.0,
+            interval_s=0.05,
+        )
+        quiet_captures = len(quiet_capture_times)
+        failing["on"] = True
+        assert exited.wait(timeout=2.0)
+        exit_latency = time.monotonic() - first_fail["at"]
+    finally:
+        instance._stop_idle_watcher_thread()
+    # Backoff engaged: far fewer than the ~100 base-cadence ticks the ~1s it
+    # takes to reach the ceiling would otherwise produce.
+    assert quiet_captures <= 15
+    # Exit confirmed within the base window, not three ceiling-length sleeps.
+    assert exit_latency < 0.4
+    assert instance.running is False
 
 
 @pytest.mark.asyncio
@@ -1034,7 +1666,8 @@ async def test_is_alive_false_when_pane_dead(
         """Capture argv and report a dead pane (``#{pane_dead}`` -> ``1``)."""
         del stdout, stderr
         captured.append(list(cmd))
-        return _ProcessWithStdout(stdout=b"1\n", returncode=0)
+        output = b"1 2\n" if "list-panes" in cmd else b"error: invalid startup argument\n"
+        return _ProcessWithStdout(stdout=output, returncode=0)
 
     monkeypatch.setattr(
         terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
@@ -1052,7 +1685,316 @@ async def test_is_alive_false_when_pane_dead(
     assert instance.running is False
     # Must probe the pane-dead flag, not merely whether the session exists.
     assert captured, "is_alive never forked a tmux probe"
-    assert captured[-1][-1] == "#{pane_dead}"
+    assert captured[0][-1] == "#{pane_dead} #{pane_dead_status}"
+    assert instance.last_exit_status() == 2
+    assert instance.last_pane_text() == "error: invalid startup argument"
+
+
+@pytest.mark.parametrize("detection", ["is_alive", "async_watcher", "threaded_watcher"])
+@pytest.mark.parametrize(
+    ("final_fields", "expected_status", "expected_signal"),
+    [
+        ("1|2|", 2, None),
+        ("1|0|", 0, None),
+        ("1||TERM", None, "SIGTERM"),
+        ("1||15", None, "SIGTERM"),
+        ("1||RTMIN+1", None, "RTMIN+1"),
+        ("1||999", None, "999"),
+        ("1||", None, None),
+        ("malformed", None, None),
+        (None, None, None),
+    ],
+)
+async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    detection: str,
+    final_fields: str | None,
+    expected_status: int | None,
+    expected_signal: str | None,
+) -> None:
+    """PTY EOF may arrive before tmux has reaped the child and stored its status."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+        keep_alive_after_exit=True,
+    )
+    refresh_calls = 0
+    reap_requests = 0
+
+    def output(*args: str) -> str:
+        nonlocal refresh_calls, reap_requests
+        if args[0] == "run-shell":
+            assert args == ("run-shell", "-b", ":")
+            reap_requests += 1
+            return ""
+        if args[0] == "list-panes":
+            if args[-1] != terminal_mod._PANE_EXIT_STATUS_FORMAT:
+                return "1\n"
+            refresh_calls += 1
+            if refresh_calls == 1:
+                return "1||\n"
+            if final_fields is None:
+                raise RuntimeError("tmux target gone")
+            return final_fields
+        if args[0] == "display-message":
+            return "0 10000\nsafe exit diagnostic\n"
+        if args[0] == "capture-pane":
+            return "visible final frame\n"
+        assert args[0] == "detach-client"
+        return ""
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=output))
+    monkeypatch.setattr(instance, "_tmux_output_sync", output)
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            **{
+                **vars(asyncio),
+                "create_subprocess_exec": AsyncMock(
+                    return_value=_ProcessWithStdout(stdout=b"1\n", returncode=0)
+                ),
+            }
+        ),
+    )
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(terminal_mod, "_EXIT_STATUS_POLL_SECONDS", 0.001)
+    # An expired budget must still report an unknown-status exit immediately.
+    monkeypatch.setattr(
+        terminal_mod, "_EXIT_STATUS_REFRESH_SECONDS", 0 if final_fields == "1||" else 5
+    )
+    try:
+        if detection == "threaded_watcher":
+            exited = threading.Event()
+            instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.001)
+            assert await asyncio.to_thread(exited.wait, 1)
+        elif detection == "async_watcher":
+            exited_async = asyncio.Event()
+            instance.start_idle_watcher(lambda: None, on_exit=exited_async.set)
+            await asyncio.wait_for(exited_async.wait(), timeout=1)
+        else:
+            assert await asyncio.wait_for(instance.is_alive(), timeout=1) is False
+
+        assert instance.running is False
+        assert instance.last_exit_status() == expected_status
+        assert instance.last_exit_signal() == expected_signal
+        assert instance.last_exit_text() == "safe exit diagnostic"
+        assert refresh_calls == (1 if final_fields == "1||" else 2)
+        assert reap_requests == (0 if final_fields == "1||" else 1)
+    finally:
+        await instance._stop_idle_watcher()
+        instance._stop_idle_watcher_thread()
+
+
+@pytest.mark.parametrize("capture", ["async", "sync"])
+async def test_exit_status_refresh_recovers_a_lost_child_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str
+) -> None:
+    """A missed SIGCHLD leaves the pane unreaped until another server child exits."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    clock = iter([10.0, 10.04, 10.09, 10.1])
+    monkeypatch.setattr(
+        terminal_mod, "time", SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _: None)
+    )
+    monkeypatch.setattr(terminal_mod, "_EXIT_STATUS_POLL_SECONDS", 0)
+    probes = 0
+    reap_requests = 0
+
+    def output(*args: str) -> str:
+        nonlocal probes, reap_requests
+        if args[0] == "run-shell":
+            assert args == ("run-shell", "-b", ":")
+            reap_requests += 1
+            return ""
+        assert args[0] == "list-panes"
+        probes += 1
+        return "1|2|" if reap_requests and probes >= 3 else "1||"
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=output))
+    monkeypatch.setattr(instance, "_tmux_output_sync", output)
+    if capture == "async":
+        await instance._refresh_exit_status()
+    else:
+        instance._refresh_exit_status_sync()
+
+    assert instance.last_exit_status() == 2
+    assert probes == 3
+    assert reap_requests == 1
+
+
+@pytest.mark.parametrize("capture", ["async", "sync"])
+@pytest.mark.parametrize("fields", ["1|0|", "1|2|", "1||TERM", "1||15"])
+async def test_exit_status_refresh_does_not_nudge_already_reaped_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str, fields: str
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    commands: list[tuple[str, ...]] = []
+
+    def output(*args: str) -> str:
+        commands.append(args)
+        return fields
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=output))
+    monkeypatch.setattr(instance, "_tmux_output_sync", output)
+    if capture == "async":
+        await instance._refresh_exit_status()
+    else:
+        instance._refresh_exit_status_sync()
+
+    assert len(commands) == 1
+    assert commands[0][0] == "list-panes"
+
+
+@pytest.mark.parametrize("cancel_during", ["probe", "reap_request"])
+async def test_exit_status_refresh_propagates_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_during: str
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    probing = asyncio.Event()
+
+    async def waiting_probe(*args: str) -> str:
+        if cancel_during == "reap_request" and args[0] == "list-panes":
+            return "1||"
+        probing.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(instance, "_tmux_output", waiting_probe)
+    task = asyncio.create_task(instance._refresh_exit_status())
+    await asyncio.wait_for(probing.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        # Await the task to verify cancellation escapes the diagnostic refresh.
+        await task
+
+
+@pytest.mark.parametrize("capture", ["async", "sync"])
+@pytest.mark.parametrize(
+    "reap_error", [None, RuntimeError("tmux target gone"), OSError("fork failed")]
+)
+async def test_exit_status_refresh_stops_at_its_grace_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capture: str,
+    reap_error: Exception | None,
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    clock = iter([10.0, 10.04, 10.09, 10.1])
+    sleep_intervals: list[float] = []
+    monkeypatch.setattr(
+        terminal_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock), sleep=sleep_intervals.append),
+    )
+    probes = 0
+    reap_requests = 0
+
+    def pending(*args: str) -> str:
+        nonlocal probes, reap_requests
+        if args[0] == "run-shell":
+            reap_requests += 1
+            if reap_error is not None:
+                raise reap_error
+            return ""
+        probes += 1
+        return "1||"
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=pending))
+    monkeypatch.setattr(instance, "_tmux_output_sync", pending)
+    if capture == "async":
+        await instance._refresh_exit_status()
+    else:
+        instance._refresh_exit_status_sync()
+        assert sleep_intervals == pytest.approx([0.01, 0.01])
+
+    assert probes == 3
+    assert reap_requests == 1
+    assert instance.last_exit_status() is None
+    assert list(clock) == []
+
+
+@pytest.mark.parametrize("watcher", ["async", "threaded"])
+async def test_liveness_probe_before_first_watcher_tick_still_reports_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, watcher: str
+) -> None:
+    """A client probe may observe a dead pane before its watcher gets a turn."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path / "terminal",
+        running=True,
+        keep_alive_after_exit=True,
+    )
+    create = AsyncMock(return_value=_ProcessWithStdout(stdout=b"1 2\n", returncode=0))
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(return_value="invalid argument\n"))
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0)
+    assert await instance.is_alive() is False
+    exits: list[tuple[int | None, str | None]] = []
+
+    def on_exit() -> None:
+        exits.append((instance.last_exit_status(), instance.last_pane_text()))
+
+    if watcher == "threaded":
+        await asyncio.to_thread(
+            instance._idle_watch_loop_threaded,
+            threading.Event(),
+            on_exit=on_exit,
+            poll_interval_s=0,
+        )
+    else:
+        await asyncio.wait_for(instance._idle_watch_loop(lambda: None, on_exit=on_exit), 1)
+
+    assert exits == [(2, "invalid argument")]
+
+
+@pytest.mark.parametrize("watcher", ["async", "threaded"])
+async def test_explicit_close_before_first_watcher_tick_does_not_report_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, watcher: str
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path / "terminal",
+        running=True,
+    )
+    exits: list[bool] = []
+    monkeypatch.setattr(instance, "_tmux", AsyncMock())
+    if watcher == "threaded":
+        instance.start_idle_watcher_thread(on_exit=lambda: exits.append(True), poll_interval_s=1)
+    else:
+        instance.start_idle_watcher(lambda: None, on_exit=lambda: exits.append(True))
+
+    await instance.close()
+
+    assert instance.running is False
+    assert exits == []
 
 
 @pytest.mark.asyncio
@@ -1089,6 +2031,97 @@ async def test_is_alive_true_when_pane_live(
     )
 
     assert await instance.is_alive() is True
+    assert instance.running is True
+
+
+class _StalledProcess:
+    """A tmux probe that never answers until it's killed."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+        self.reaped = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self) -> int:
+        self.reaped = True
+        self.returncode = -9
+        return -9
+
+
+@pytest.mark.asyncio
+async def test_is_alive_kills_and_reaps_its_probe_when_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that gives up on a stalled liveness probe leaves no tmux child behind."""
+    probe = _StalledProcess()
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _StalledProcess:
+        del cmd, stdout, stderr
+        return probe
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(instance.is_alive(), 0.05)
+    assert probe.killed and probe.reaped
+    # Giving up says nothing about the terminal, so it stays running.
+    assert instance.running is True
+
+
+@pytest.mark.asyncio
+async def test_is_alive_kills_and_reaps_a_dead_panes_capture_when_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that gives up while a dead pane's last screen is captured leaves no tmux child."""
+    capture = _StalledProcess()
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _ProcessWithStdout | _StalledProcess:
+        del stdout, stderr
+        if "list-panes" in cmd:
+            return _ProcessWithStdout(stdout=b"1 2\n", returncode=0)
+        return capture
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(instance.is_alive(), 0.05)
+    assert capture.killed and capture.reaped
+    # The capture didn't finish, so the exit watcher still owns marking it stopped.
     assert instance.running is True
 
 
@@ -1252,14 +2285,76 @@ async def test_is_alive_false_when_probe_communication_fails(
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("start_on_attach", [False, True])
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "test\n",
+        "test\n\n",
+        "first\nsecond",
+        "",
+        "it's a test",
+        "$(printf expanded); $HOME",
+        "test",
+    ],
+)
+async def test_launch_preserves_prompt_and_following_args_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, prompt: str, start_on_attach: bool
+) -> None:
+    """Prompt text must stay one argument without consuming later connection flags."""
+    output = tmp_path / "argv.json"
+    script = (
+        "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
+    )
+    expected = [
+        prompt,
+        "-c",
+        'approvals_reviewer="auto_review"',
+        "--remote",
+        "ws://127.0.0.1:12345",
+    ]
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-c", script, str(output), *expected],
+        keep_alive_after_exit=True,
+        tmux_start_on_attach=start_on_attach,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        if start_on_attach:
+            await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        async with asyncio.timeout(5):
+            while await instance.is_alive():
+                await asyncio.sleep(0.01)
+
+        assert json.loads(output.read_text()) == expected
+        assert instance.last_exit_status() == 0
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("exit_status", [0, 255, -15, -9])
+@pytest.mark.parametrize(
+    ("program_status_app", "close_stdio"),
+    [(None, False), ("claude-code", False), ("claude-code", True)],
+)
 @pytest.mark.asyncio
 async def test_server_survives_inner_process_exit_real_tmux(
-    tmp_path: Path, short_tmp_parent: Path
+    tmp_path: Path,
+    short_tmp_parent: Path,
+    exit_status: int,
+    program_status_app: str | None,
+    close_stdio: bool,
 ) -> None:
     """
     The private tmux server outlives an inner-process exit (issue #540).
 
-    Launches a real tmux terminal whose inner command exits immediately. With
+    Launches a real tmux terminal whose inner command prints then exits. With
     the default ``exit-empty on`` the server would vanish and every later
     control command would fail with ``no server running``. With
     ``remain-on-exit on`` / ``exit-empty off`` the server and session must stay
@@ -1268,6 +2363,11 @@ async def test_server_survives_inner_process_exit_real_tmux(
 
     :param tmp_path: Temporary directory for the real tmux socket.
     """
+    exit_signal = tmp_path / "exit-signal"
+    exit_command = f"kill -{-exit_status} $$" if exit_status < 0 else f"exit {exit_status}"
+    if close_stdio:
+        # Force PTY EOF before waitpid can retrieve the final exit status.
+        exit_command = f"exec 0<&- 1>&- 2>&-; sleep 0.05; {exit_command}"
     instance = TerminalInstance(
         name="bash",
         session_key="s1",
@@ -1276,11 +2376,27 @@ async def test_server_survives_inner_process_exit_real_tmux(
         socket_path=short_tmp_parent / "tmux.sock",
         private_dir=tmp_path,
         command="sh",
-        args=["-c", "exit 0"],
+        args=[
+            "-c",
+            'printf "terminal-final-output\\n"; '
+            'while [ ! -e "$1" ]; do sleep 0.02; done; '
+            f'printf "terminal-exit-tail\\n"; {exit_command}',
+            "sh",
+            str(exit_signal),
+        ],
         keep_alive_after_exit=True,
+        program_status_app=program_status_app,
     )
     try:
         await instance.launch(cwd=tmp_path)
+        for _ in range(250):
+            frame = await instance._tmux_output("capture-pane", "-t", instance.tmux_target, "-p")
+            if "terminal-final-output" in frame:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("terminal never rendered output")
+        exit_signal.touch()
 
         # Wait for the inner `sh` to exit. is_alive() flips running -> False
         # once the pane is dead.
@@ -1311,6 +2427,194 @@ async def test_server_survives_inner_process_exit_real_tmux(
             "exit-empty/remain-on-exit were not applied: "
             f"{probe.stderr.decode().strip()!r}"
         )
+        state = instance._capture_pane_state_or_none()
+        assert state is not None and state[0] is True
+        assert instance.last_exit_status() == (exit_status if exit_status >= 0 else None), (
+            instance.last_exit_text()
+        )
+        signal_name = instance.last_exit_signal()
+        assert (signal_name.upper().removeprefix("SIG") if signal_name else None) == {
+            -15: "TERM",
+            -9: "KILL",
+        }.get(exit_status)
+        final_frame = await instance._tmux_output(
+            "capture-pane", "-t", instance.tmux_target, "-p", "-S", "-100"
+        )
+        assert "terminal-final-output" in final_frame
+        assert "terminal-exit-tail" in final_frame
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("height", [24, 40, 41, 45, 60])
+@pytest.mark.parametrize("width", [20, 80])
+async def test_exit_history_preserves_error_in_tall_pane_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, height: int, width: int
+) -> None:
+    """Screen padding must not push a short startup error outside the exported tail."""
+    error = "error: synthetic startup argument is invalid"
+    script = f"import sys\nprint({error!r}, flush=True)\nsys.exit(2)\n"
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-u", "-c", script],
+        keep_alive_after_exit=True,
+        tmux_start_on_attach=True,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        await instance._tmux("resize-window", "-t", "main", "-x", str(width), "-y", str(height))
+        # Release the existing launch gate only after the final geometry is applied.
+        await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        async with asyncio.timeout(5):
+            while await instance.is_alive():
+                await asyncio.sleep(0.01)
+
+        raw = instance._last_exit_snapshot
+        visible_before = instance.last_pane_text()
+        assert raw is not None and "\n\n\n\n" in raw
+        assert instance.last_exit_status() == 2
+        history = instance.last_exit_text()
+        assert history is not None and error in history
+        assert "Pane is dead (" in history
+        exported = trim_terminal_output(sanitize_diagnostic_text(history))
+        assert exported is not None and error in exported
+        assert "Pane is dead (" in exported
+        assert len(exported.splitlines()) <= 40
+        assert len(exported) <= 4000
+        assert instance._last_exit_snapshot == raw
+        assert instance.last_pane_text() == visible_before
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("detection", ["is_alive", "async_watcher", "threaded_watcher"])
+async def test_exit_history_retains_scrolled_startup_error_real_tmux(
+    tmp_path: Path,
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    detection: str,
+) -> None:
+    """A startup error above the visible screen survives every exit detection path."""
+    error = "error: unexpected argument '--invalid-test-flag' found"
+    script = (
+        "import sys\n"
+        "print('outside-bounded-history')\n"
+        "for i in range(150): print(f'old output {i}')\n"
+        f"print({error!r}, file=sys.stderr)\n"
+        "for i in range(30): print(f'usage detail {i}')\n"
+        "print('final startup marker')\n"
+        "sys.exit(2)\n"
+    )
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-u", "-c", script],
+        keep_alive_after_exit=True,
+    )
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
+    try:
+        await instance.launch(cwd=tmp_path)
+        if detection == "threaded_watcher":
+            exited = threading.Event()
+            instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+            assert await asyncio.to_thread(exited.wait, 5)
+        elif detection == "async_watcher":
+            exited_async = asyncio.Event()
+            instance.start_idle_watcher(lambda: None, on_exit=exited_async.set)
+            await asyncio.wait_for(exited_async.wait(), timeout=5)
+        else:
+            async with asyncio.timeout(5):
+                while await instance.is_alive():
+                    await asyncio.sleep(0.01)
+
+        visible = await instance._tmux_output("capture-pane", "-t", "main", "-p")
+        assert error not in visible
+        assert "final startup marker" in visible
+        assert instance.last_exit_status() == 2
+        history = instance.last_exit_text()
+        assert history is not None
+        assert error in history
+        assert "usage detail 0" in history
+        assert "usage detail 29" in history
+        assert "final startup marker" in history
+        assert "outside-bounded-history" not in history
+        # A concurrent screen read finishing later cannot replace the exit tail.
+        instance._remember_pane_snapshot(visible)
+        assert error not in (instance.last_pane_text() or "")
+        assert instance.last_exit_text() == history
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("detection", ["is_alive", "async_watcher", "threaded_watcher"])
+@pytest.mark.parametrize("scrollback", [10000, 101])
+async def test_exit_history_omits_wrapped_credential_without_its_prefix_real_tmux(
+    tmp_path: Path,
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    detection: str,
+    scrollback: int,
+) -> None:
+    """A clipped credential's lowercase suffix must never become the exported tail."""
+    canary = "wrappedsecretsentinel"
+    script = (
+        "import sys\n"
+        f"sys.stdout.write('Authorization: Bearer ' + {canary!r} * 1000)\n"
+        "sys.exit(2)\n"
+    )
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-u", "-c", script],
+        scrollback=scrollback,
+        keep_alive_after_exit=True,
+    )
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
+    try:
+        await instance.launch(cwd=tmp_path)
+        if detection == "threaded_watcher":
+            exited = threading.Event()
+            instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+            assert await asyncio.to_thread(exited.wait, 5)
+        elif detection == "async_watcher":
+            exited_async = asyncio.Event()
+            instance.start_idle_watcher(lambda: None, on_exit=exited_async.set)
+            await asyncio.wait_for(exited_async.wait(), timeout=5)
+        else:
+            async with asyncio.timeout(5):
+                while await instance.is_alive():
+                    await asyncio.sleep(0.01)
+
+        raw = await instance._tmux_output(
+            "capture-pane", "-t", "main", "-p", "-e", "-J", "-S", "-100"
+        )
+        assert "Authorization" not in raw
+        assert canary in raw
+        # Without a complete first record, redaction alone cannot recognize the suffix.
+        assert canary in (trim_terminal_output(sanitize_diagnostic_text(raw)) or "")
+        visible = await instance._tmux_output("capture-pane", "-t", "main", "-p")
+        assert canary in visible
+        instance._remember_pane_snapshot(visible)
+        assert instance.last_exit_status() == 2
+        assert instance._last_exit_snapshot is None
+        assert instance.last_exit_text() is None
+        exported = trim_terminal_output(sanitize_diagnostic_text(instance.last_exit_text() or ""))
+        assert canary not in (exported or "")
+        assert exported is None
+        assert canary in (instance.last_pane_text() or "")
     finally:
         await instance.close()
 
@@ -1363,6 +2667,204 @@ async def _capture_launch_argv(
     return captured[0]
 
 
+async def _failed_launch_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process: _ProcessWithStdout,
+) -> str:
+    """Launch with a failing mocked tmux and return the raised error message."""
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+        env: dict[str, str],
+    ) -> _ProcessWithStdout:
+        """Check both streams are captured, then hand back the failing process."""
+        del cmd, env
+        assert stdout is asyncio.subprocess.PIPE
+        assert stderr is asyncio.subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            **(vars(asyncio) | {"create_subprocess_exec": fake_create_subprocess_exec})
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await instance.launch(cwd=tmp_path)
+    assert instance.running is False
+    return str(excinfo.value)
+
+
+async def test_launch_failure_preserves_stdout_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux launch failure must retain a stdout-only diagnostic."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _ProcessWithStdout(
+            returncode=1, stdout=b"new-session refused: server socket unavailable\n"
+        ),
+    )
+    assert message == ("tmux launch failed (rc=1): new-session refused: server socket unavailable")
+
+
+async def test_launch_failure_reports_stderr_before_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When both streams carry text, stderr leads and stdout is preserved."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _ProcessWithStdout(returncode=1, stdout=b"stdout-detail\n", stderr=b"stderr-detail\n"),
+    )
+    assert message == "tmux launch failed (rc=1): stderr-detail; stdout-detail"
+
+
+async def test_launch_failure_names_silent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A silent tmux failure includes its return code and an explicit reason."""
+    message = await _failed_launch_error(tmp_path, monkeypatch, _ProcessWithStdout(returncode=2))
+    assert message == "tmux launch failed (rc=2): <tmux produced no output>"
+
+
+@pytest.mark.parametrize("launch_fails", [False, True])
+async def test_launch_discards_previous_exit_diagnostics_before_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_status("1 2")
+    instance._exit_status_is_pending("1||TERM")
+    instance._remember_exit_snapshot("0 10000\nprevious startup failure")
+
+    async def spawn(*_args: object, **_kwargs: object) -> _ProcessWithStdout:
+        assert instance.last_exit_status() is None
+        assert instance.last_exit_signal() is None
+        assert instance.last_exit_text() is None
+        return _ProcessWithStdout(returncode=1 if launch_fails else 0, stderr=b"launch failed")
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
+    )
+    if launch_fails:
+        with pytest.raises(RuntimeError, match="tmux launch failed"):
+            await instance.launch(cwd=tmp_path)
+    else:
+        await instance.launch(cwd=tmp_path)
+
+    assert instance.last_exit_status() is None
+    assert instance.last_exit_signal() is None
+    assert instance.last_exit_text() is None
+
+
+async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inherited = {
+        TERMINAL_INSTANCE_ID_ENV: "a" * 32,
+        TERMINAL_LAUNCH_ID_ENV: "b" * 32,
+        TERMINAL_LAUNCH_SESSION_ID_ENV: "synthetic-parent",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        env=inherited,
+    )
+    instance.lifecycle_trace.session_id = "synthetic-owner"
+    spawn = AsyncMock(return_value=_SuccessfulProcess())
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
+    )
+
+    await instance.launch()
+    first = spawn.call_args.kwargs["env"]
+    assert first[TERMINAL_INSTANCE_ID_ENV] == instance.diagnostic_id
+    assert first[TERMINAL_LAUNCH_SESSION_ID_ENV] == "synthetic-owner"
+    assert first[TERMINAL_LAUNCH_ID_ENV] == instance.lifecycle_trace.launch_id
+    assert first[TERMINAL_LAUNCH_ID_ENV] != inherited[TERMINAL_LAUNCH_ID_ENV]
+    instance.lifecycle_trace.note_request("stop_session", "runner_request")
+    instance.lifecycle_trace.note_exit()
+    instance.lifecycle_trace.note_cleanup()
+
+    await instance.launch()
+    assert spawn.call_count == 1
+    assert instance.lifecycle_trace.launch_id == first[TERMINAL_LAUNCH_ID_ENV]
+    instance.running = False
+    await instance.launch()
+    second = spawn.call_args.kwargs["env"]
+    assert spawn.call_count == 2
+    assert second[TERMINAL_INSTANCE_ID_ENV] == first[TERMINAL_INSTANCE_ID_ENV]
+    assert second[TERMINAL_LAUNCH_ID_ENV] != first[TERMINAL_LAUNCH_ID_ENV]
+    snapshot = instance.lifecycle_trace.snapshot()
+    assert snapshot["terminal_control_requests"] == []
+    assert snapshot["terminal_exit_observed_at"] is None
+    assert snapshot["terminal_cleanup_started_at"] is None
+
+
+async def test_failed_launch_telemetry_does_not_block_or_reuse_parent_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    for key in (TERMINAL_INSTANCE_ID_ENV, TERMINAL_LAUNCH_ID_ENV, TERMINAL_LAUNCH_SESSION_ID_ENV):
+        monkeypatch.setenv(key, "inherited-parent")
+
+    def fail(_instance_id: str) -> dict[str, str]:
+        raise OSError("diagnostic initialization failed")
+
+    monkeypatch.setattr(instance.lifecycle_trace, "launch_environment", fail)
+    spawn = AsyncMock(return_value=_SuccessfulProcess())
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
+    )
+    await instance.launch()
+    assert instance.running
+    assert not {
+        TERMINAL_INSTANCE_ID_ENV,
+        TERMINAL_LAUNCH_ID_ENV,
+        TERMINAL_LAUNCH_SESSION_ID_ENV,
+    }.intersection(spawn.call_args.kwargs["env"])
+
+
 @pytest.mark.parametrize("version", [(3, 3), (3, 10)])
 def test_require_supported_tmux_accepts_minimum_or_newer(
     monkeypatch: pytest.MonkeyPatch,
@@ -1370,7 +2872,7 @@ def test_require_supported_tmux_accepts_minimum_or_newer(
 ) -> None:
     """Managed-terminal preflight accepts tmux 3.3 and newer."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
-    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+    monkeypatch.setattr(tmux_compat, "tmux_version", lambda _: version)
 
     terminal_mod._require_supported_tmux()
 
@@ -1378,11 +2880,17 @@ def test_require_supported_tmux_accepts_minimum_or_newer(
 def test_require_supported_tmux_rejects_missing_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Managed terminals retain the existing clear missing-tmux error."""
+    """A missing tmux is a host setup error whose message says how to fix it."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: None)
 
-    with pytest.raises(RuntimeError, match="tmux is not installed or not on PATH"):
+    with pytest.raises(RuntimeError, match="tmux is not installed or not on PATH") as caught:
         terminal_mod._require_supported_tmux()
+
+    assert isinstance(caught.value, terminal_mod.TmuxUnavailableError)
+    assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
+    assert "brew install tmux" in str(caught.value)
+    # Desktop hosts keep the app's startup PATH, so restarting the host alone can't help.
+    assert "quit and reopen the Omnigent app" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -1399,9 +2907,25 @@ def test_require_supported_tmux_rejects_old_or_unknown_version(
 ) -> None:
     """Managed terminals fail early unless tmux 3.3 support is confirmed."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
-    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+    monkeypatch.setattr(tmux_compat, "tmux_version", lambda _: version)
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(terminal_mod.TmuxUnavailableError, match=message):
+        terminal_mod._require_supported_tmux()
+
+
+def test_require_supported_tmux_treats_undecodable_version_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``tmux -V`` that prints invalid UTF-8 still fails as a clear host setup error."""
+    tmux = tmp_path / "tmux"
+    tmux.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+    tmux.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(
+        terminal_mod.TmuxUnavailableError, match="Could not determine the installed tmux version"
+    ):
         terminal_mod._require_supported_tmux()
 
 
@@ -1431,6 +2955,8 @@ def test_create_terminal_instance_propagates_keep_alive_after_exit(
     result = create_terminal_instance(name="bash", session_key="s1", spec=spec)
     try:
         assert result.instance.keep_alive_after_exit is keep_alive
+        assert result.instance.sandbox_policy is None
+        assert spec.os_env.sandbox is None
     finally:
         shutil.rmtree(result.instance.private_dir, ignore_errors=True)
 
@@ -1461,7 +2987,7 @@ async def test_launch_omits_keep_alive_options_by_default(
     """
     Keeping the server alive past exit is opt-in: a default terminal must NOT
     set remain-on-exit / exit-empty, preserving the ``has-session``-means-alive
-    contract for codex / cursor / REPL / generic terminals.
+    contract for cursor / REPL / generic terminals.
 
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -2044,9 +3570,10 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=terminal_mod.asyncio.subprocess),
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
-    monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
+    launcher = Mock(return_value="/test/launcher")
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", launcher)
     instance = TerminalInstance(
         name="bash",
         session_key="test-keyring",
@@ -2069,6 +3596,7 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     spawn.assert_awaited_once()
     env = spawn.call_args.kwargs["env"]
     if sandbox_active:
+        assert launcher.call_args.kwargs["cwd"] == str(tmp_path)
         assert session_env.keys().isdisjoint(env)
     else:
         assert {name: env[name] for name in session_env} == session_env
@@ -2242,7 +3770,11 @@ def _write_instance_dir(root: Path, name: str, owner_pid: int | None) -> Path:
     instance_dir = root / name
     instance_dir.mkdir()
     if owner_pid is not None:
-        (instance_dir / "owner.pid").write_text(str(owner_pid), encoding="utf-8")
+        owner_claim.write_owner_claim(instance_dir)
+        marker = instance_dir / "owner.pid"
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        lines[0] = str(owner_pid)
+        marker.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return instance_dir
 
 
@@ -2283,7 +3815,6 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import os
 
     def _raise_if_called(*args: object, **kwargs: object) -> None:
         """Fail the test if kill-server runs with no socket present."""
@@ -2501,6 +4032,412 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
         shutil.rmtree(instance.private_dir, ignore_errors=True)
 
 
+@pytest.fixture
+def terminal_proxy_ca(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep terminal relay certificates separate from the host's cached CA."""
+    prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
+
+
+@pytest.mark.parametrize("allow_private", [False, True])
+async def test_terminal_model_relay_honors_private_opt_in_without_egress_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_proxy_ca: None,
+    allow_private: bool,
+) -> None:
+    """Automatic model access retains the spec's private-destination policy."""
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    # Resolve a policy without requiring an installed OS sandbox or launching tmux.
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr("omnigent.inner.os_env.resolve_sandbox", lambda *_: policy)
+    created = create_terminal_instance(
+        "shell",
+        "main",
+        TerminalEnvSpec(),
+        parent_os_env_spec=OSEnvSpec(
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                allow_network=False,
+                egress_allow_private_destinations=allow_private,
+            ),
+        ),
+    )
+    instance = created.instance
+    instance.model_access = ClaudeModelAccess(
+        "https://127.0.0.1", "authorization", lambda: "parent-only-key"
+    )
+    try:
+        assert not instance.egress_rules
+        assert instance.sandbox_policy is not None
+        instance._bootstrap_egress_proxy(instance.sandbox_policy, {})
+        assert instance._egress_handle is not None
+        proxy = instance._egress_handle._proxy
+        # Exercise the real guard: replacing it would hide a dropped opt-in.
+        if allow_private:
+            assert await proxy._assert_destination_allowed("127.0.0.1", 443) is None
+        else:
+            with pytest.raises(PermissionError, match="egress_allow_private_destinations"):
+                await proxy._assert_destination_allowed("127.0.0.1", 443)
+    finally:
+        await instance.close()
+
+
+async def test_terminal_profile_credential_resolves_during_async_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_proxy_ca: None
+) -> None:
+    """The terminal starts its signer after minting a parent-only profile credential."""
+    credential = "parent-only-key"
+    access = ClaudeModelAccess(
+        "https://model.test",
+        "authorization",
+        lambda: asyncio.run(asyncio.sleep(0, result=credential)),
+    )
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        env={"MODEL_ALIAS": credential},
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+        model_access=access,
+    )
+    spawn = AsyncMock(return_value=_SuccessfulProcess())
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(
+        terminal_mod, "create_exec_launcher", lambda *_args, **_kwargs: "/test/launcher"
+    )
+    monkeypatch.setattr(instance, "_tmux_base_cmd", lambda path_env=None: ["tmux"])
+    try:
+        await instance.launch(cwd=tmp_path)
+        environment = spawn.call_args.kwargs["env"]
+        assert environment["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+        assert credential not in str(environment)
+        assert instance._egress_handle is not None
+    finally:
+        instance.running = False
+        await instance.close()
+
+
+async def test_terminal_cancel_waits_for_egress_bootstrap_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation cannot leave a proxy starting after its owner has cleaned up."""
+    started = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+        egress_rules=["POST model.test/v1/messages"],
+    )
+
+    def bootstrap(policy: SandboxPolicy, env: dict[str, str]) -> SandboxPolicy:
+        started.set()
+        assert release.wait(timeout=5)
+        events.append("started")
+        return policy
+
+    monkeypatch.setattr(instance, "_bootstrap_egress_proxy", bootstrap)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: events.append("stopped"))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert events == ["started", "stopped"]
+    finally:
+        release.set()
+
+
+async def test_terminal_cancel_waits_for_launcher_validation_and_removes_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late launcher result belongs to the cancelled terminal, not a future launch."""
+    started = threading.Event()
+    release = threading.Event()
+    launcher_path = tmp_path / "launcher.sh"
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        private_dir / "tmux.sock",
+        private_dir,
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+    )
+    stopped: list[bool] = []
+
+    def validate_and_create(*_args: object, **_kwargs: object) -> str:
+        started.set()
+        assert release.wait(timeout=5)
+        launcher_path.write_text("#!/bin/sh\n", encoding="utf-8")
+        return str(launcher_path)
+
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", validate_and_create)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: stopped.append(True))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=1)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert not launcher_path.exists()
+        assert stopped == [True]
+    finally:
+        release.set()
+        if not launch.done():
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+
+
+def test_failed_terminal_fork_removes_partially_created_private_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr(terminal_mod.tempfile, "mkdtemp", lambda **_kwargs: str(private_dir))
+
+    def fail_copy(*_args: object) -> None:
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(terminal_mod, "_copy_tree", fail_copy)
+    spec = TerminalEnvSpec(
+        command="cat",
+        os_env=OSEnvSpec(cwd=str(tmp_path), fork=True),
+    )
+    with pytest.raises(OSError, match="copy failed"):
+        create_terminal_instance("shell", "main", spec)
+    assert not private_dir.exists()
+
+
+@pytest.mark.parametrize("spawn_fails", [False, True])
+async def test_terminal_launcher_is_owned_until_close_or_spawn_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawn_fails: bool
+) -> None:
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    launcher_path = tmp_path / "launcher.sh"
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        private_dir / "tmux.sock",
+        private_dir,
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+    )
+
+    def create_launcher(*_args: object, **_kwargs: object) -> str:
+        launcher_path.write_text("#!/bin/sh\n", encoding="utf-8")
+        return str(launcher_path)
+
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", create_launcher)
+    monkeypatch.setattr(instance, "_tmux_base_cmd", lambda path_env=None: ["tmux"])
+    monkeypatch.setattr(instance, "_tmux", AsyncMock())
+    if spawn_fails:
+        monkeypatch.setattr(
+            terminal_mod.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=FileNotFoundError("tmux")),
+        )
+    else:
+        monkeypatch.setattr(
+            terminal_mod.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=_SuccessfulProcess()),
+        )
+    try:
+        if spawn_fails:
+            with pytest.raises(FileNotFoundError, match="tmux"):
+                await instance.launch(cwd=tmp_path)
+            assert not launcher_path.exists()
+        else:
+            await instance.launch(cwd=tmp_path)
+            assert launcher_path.exists()
+    finally:
+        await instance.close()
+    assert not launcher_path.exists()
+
+
+@pytest.mark.parametrize("broker_kind", ["git_ssh", "tcp_egress"])
+async def test_terminal_cancel_waits_for_optional_broker_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broker_kind: str
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    if broker_kind == "git_ssh":
+        policy = replace(
+            policy,
+            git_ssh=[
+                GitSshBinding(
+                    "git.test", 22, "git", "repo", frozenset({"read"}), "key", "known_hosts"
+                )
+            ],
+        )
+    else:
+        policy = replace(policy, tcp_egress=[TcpEgressRoute("database", "db.test", 5432)])
+    instance = TerminalInstance(
+        "shell", "main", tmp_path / "tmux.sock", tmp_path, sandbox_policy=policy
+    )
+    stopped: list[bool] = []
+
+    def bootstrap(_policy: SandboxPolicy, _env: dict[str, str]) -> SandboxPolicy:
+        started.set()
+        assert release.wait(timeout=5)
+        return policy
+
+    monkeypatch.setattr(instance, f"_bootstrap_{broker_kind}", bootstrap)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: stopped.append(True))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=1)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert stopped == [True]
+    finally:
+        release.set()
+
+
+async def test_terminal_model_relay_restores_thinking_only_for_selected_gateway(
+    tmp_path: Path,
+    terminal_proxy_ca: None,
+) -> None:
+    """The terminal's signer restores thinking without changing ordinary egress."""
+    access = ClaudeModelAccess(
+        "https://gateway.test/anthropic", "authorization", lambda: "parent-only-key"
+    )
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        model_access=access,
+        egress_rules=["POST other.test/**"],
+    )
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    body = json.dumps(
+        {
+            "model": "databricks-claude-opus-4-8",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).encode()
+    try:
+        instance._bootstrap_egress_proxy(policy, {})
+        assert instance._egress_handle is not None
+        proxy = instance._egress_handle._proxy
+        signed = proxy._reconstruct_request(
+            bearer_token="parent-only-key",
+            method="POST",
+            connect_host=access.host,
+            sni_host=access.host,
+            request_host=access.host,
+            target="/anthropic/v1/messages?beta=true",
+            headers=[
+                ("Authorization", f"Bearer {access.placeholder}"),
+                ("Content-Type", "application/json"),
+            ],
+            body=body,
+        )
+        expected = json.loads(body)
+        expected["thinking"]["display"] = "summarized"
+        assert json.loads(signed.body) == expected
+        assert signed.header("Content-Length") == str(len(signed.body))
+        assert signed.header("Authorization") == "Bearer parent-only-key"
+
+        for host, path in (
+            ("other.test", "/anthropic/v1/messages"),
+            (access.host, "/v1/messages"),
+            (access.host, "/anthropic/v1/messages/count_tokens"),
+        ):
+            headers = f"Content-Length: {len(body)}\r\n\r\n".encode()
+            assert proxy._transform_request_body("POST", host, 443, path, headers, body) == (
+                headers,
+                body,
+            )
+    finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_model_relay_rejects_missing_or_wrong_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_proxy_ca: None,
+) -> None:
+    """A terminal's unauthenticated proxy port cannot resolve model credentials alone."""
+    credential = Mock(return_value="parent-only-key")
+    access = ClaudeModelAccess("https://model.test", "x-api-key", credential)
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        model_access=access,
+    )
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    environment: dict[str, str] = {}
+    relay: subprocess.Popen[str] | None = None
+    try:
+        instance._bootstrap_egress_proxy(policy, environment)
+        handle = instance._egress_handle
+        assert handle is not None
+        assert environment["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+        assert "@" not in environment["HTTPS_PROXY"]
+        monkeypatch.setattr(
+            handle._proxy, "_assert_destination_allowed", AsyncMock(return_value="127.0.0.1")
+        )
+        credential.reset_mock()
+        relay_code = (
+            "import json, sys; from omnigent.inner.egress.relay import start_relay; "
+            "ready = start_relay(int(sys.argv[1]), sys.argv[2]); assert ready.wait(5); "
+            "print(json.dumps({'status': 'READY'}), flush=True); sys.stdin.read()"
+        )
+        relay = subprocess.Popen(
+            [sys.executable, "-c", relay_code, str(handle.relay_port), str(handle.socket_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert relay.stdout is not None
+        assert read_json_line(relay.stdout, timeout_s=10) == {"status": "READY"}
+        trust = ssl.create_default_context(cafile=str(handle.ca_bundle_path))
+        async with httpx.AsyncClient(
+            proxy=f"http://127.0.0.1:{handle.relay_port}",
+            verify=trust,
+            trust_env=False,
+            timeout=5,
+        ) as client:
+            for headers in ({}, {"x-api-key": "wrong"}):
+                response = await client.post(
+                    "https://model.test/v1/messages",
+                    json={"model": "claude-test", "messages": []},
+                    headers=headers,
+                )
+                assert response.status_code == 403
+        credential.assert_not_called()
+    finally:
+        if relay is not None:
+            terminate_process(relay, timeout_s=5)
+        await instance.close()
+
+
 # ── UTF-8 locale default for native TUI panes (issue #2427) ──────────────────
 
 
@@ -2586,3 +4523,34 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+@pytest.mark.asyncio
+async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) -> None:
+    """
+    ``read(join_wrapped=True)`` captures with ``-J`` so a token wider than the
+    80-column pane (a sign-in address) reads back as one line; the default
+    read is unchanged.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    async def _tmux_output(*args: str) -> str:
+        calls.append(args)
+        return "open https://signin.example.com/device?user_code=ABCDEFGH"
+
+    instance._tmux_output = _tmux_output  # type: ignore[method-assign]
+
+    plain = await instance.read()
+    joined = await instance.read(join_wrapped=True)
+
+    assert calls[0] == ("capture-pane", "-t", instance.tmux_target, "-p")
+    assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
+    assert plain["screen"] == joined["screen"]
+    assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]

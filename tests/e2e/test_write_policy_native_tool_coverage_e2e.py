@@ -28,13 +28,13 @@ so a failure is specifically the ``NotebookEdit`` coverage gap.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import httpx
 import pytest
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _READ_ONLY_HANDLER = "omnigent.policies.builtins.orchestration.read_only_os"
 _WORKTREE_GUARD_HANDLER = "omnigent.policies.builtins.orchestration.worktree_guard"
@@ -48,8 +48,6 @@ def _create_bare_session(http_client: httpx.Client) -> str:
     ``PreToolUse`` hook calls, so the journey is fully exercised without
     booting the CLI.
     """
-    import io
-    import tarfile
     import uuid
 
     import yaml
@@ -60,18 +58,9 @@ def _create_bare_session(http_client: httpx.Client) -> str:
         "prompt": "You are a test agent.",
         "executor": {"harness": "openai-agents", "model": "gpt-4o-mini"},
     }
-    with io.BytesIO() as buf:
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            yaml_bytes = yaml.dump(config).encode()
-            info = tarfile.TarInfo(f"{name}.yaml")
-            info.size = len(yaml_bytes)
-            tar.addfile(info, io.BytesIO(yaml_bytes))
-        bundle = buf.getvalue()
-    resp = http_client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    bundle = bundle_files({f"{name}.yaml": yaml.dump(config).encode()})
+    resp = post_session_bundle(
+        http_client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     assert resp.status_code in (200, 201), f"session create failed: {resp.text[:500]}"
     return str(resp.json()["session_id"])

@@ -1,0 +1,208 @@
+"""User-level MCP server inventory for a connected host."""
+
+from __future__ import annotations
+
+import asyncio
+import secrets
+from typing import Literal
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field, ValidationError
+
+from omnigent.host.frames import (
+    CAP_MCP_INVENTORY,
+    CAP_MCP_SERVER_ENABLED,
+    HostMcpServersFrame,
+    HostMcpServersResultFrame,
+    HostSetMcpServerEnabledFrame,
+    HostSetMcpServerEnabledResultFrame,
+    encode_host_frame,
+)
+from omnigent.server.auth import AuthProvider
+from omnigent.server.feature_flags import (
+    FeatureFlags,
+    McpDisabledServersGate,
+    active_harnesses,
+)
+from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.stores.host_store import HostStore
+
+_MCP_SERVERS_TIMEOUT_S = 15.0
+
+
+class McpServerSummary(BaseModel):
+    """An MCP server a harness loads on the host, without secrets.
+
+    :param name: Server name as configured, e.g. ``"github"``.
+    :param harness: Harness family that loads it: ``claude``, ``codex``, ``cursor``, or ``pi``.
+    :param transport: ``stdio`` for a local process, ``http`` for a remote server.
+    :param scope: Config scope; always ``user`` today.
+    :param managed: Whether an organization pins this server for every user on the
+        host (Claude Code's enterprise MCP config), so it is not the user's to edit.
+    :param plugin: Plugin that bundles the server, e.g. ``"figma"``.
+    :param url_host: Hostname of a remote server, e.g. ``"mcp.linear.app"``.
+    :param auth_status: Account state reported by the host's sign-in manager:
+        ``connected`` or ``sign_in_required``; ``None`` when nothing reports one.
+    :param sign_in_url: Where the user finishes signing in; only with
+        ``sign_in_required``, and only an http(s) URL carrying no credentials.
+    """
+
+    name: str
+    harness: str
+    transport: Literal["stdio", "http"]
+    scope: Literal["user"]
+    managed: bool = False
+    enabled: bool | None = None
+    locked: bool = False
+    plugin: str | None = None
+    source_id: str | None = None
+    url_host: str | None = None
+    auth_status: Literal["connected", "sign_in_required"] | None = None
+    sign_in_url: str | None = None
+
+
+class McpServersResponse(BaseModel):
+    """User-level MCP servers discovered on a host."""
+
+    mcp_servers: list[McpServerSummary]
+
+
+class McpServerEnabledRequest(BaseModel):
+    harness: Literal["claude", "codex"]
+    server: str = Field(min_length=1, max_length=1024)
+    plugin: str | None = Field(default=None, max_length=1024)
+    source_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    enabled: bool
+
+
+class McpServerEnabledResponse(BaseModel):
+    server: McpServerSummary
+
+
+def create_mcp_servers_router(
+    host_registry: HostRegistry,
+    host_store: HostStore,
+    *,
+    auth_provider: AuthProvider | None = None,
+    mcp_disabled_servers: McpDisabledServersGate,
+    feature_flags: FeatureFlags,
+) -> APIRouter:
+    """Build the MCP inventory route, mounted under ``/v1``."""
+    router = APIRouter()
+
+    @router.get("/hosts/{host_id}/mcp-servers")
+    async def get_mcp_servers(request: Request, host_id: str) -> McpServersResponse:
+        """List the user-level MCP servers configured for each harness on a host.
+
+        Returns names and non-secret metadata only; the caller must own the host.
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(
+            resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+        )
+        conn = host_registry.get(host_id)
+        if conn is None:
+            raise host_absent_error(host)
+        if CAP_MCP_INVENTORY not in conn.hello.capabilities:
+            raise HTTPException(status_code=501, detail="update the host to list its MCP servers")
+        result = await request_host_mcp_servers(host_registry=host_registry, host_conn=conn)
+        if result.status != "ok":
+            raise HTTPException(
+                status_code=502, detail=result.error or "host MCP inventory failed"
+            )
+        active = active_harnesses(mcp_disabled_servers, feature_flags)
+        servers = []
+        for row in result.mcp_servers:
+            summary = dict(row)
+            if summary["harness"] not in active:
+                summary.pop("enabled", None)
+                summary.pop("locked", None)
+            servers.append(McpServerSummary.model_validate(summary))
+        return McpServersResponse(mcp_servers=servers)
+
+    @router.put("/hosts/{host_id}/mcp-servers/enabled")
+    async def set_mcp_server_enabled(
+        request: Request, host_id: str, body: McpServerEnabledRequest
+    ) -> McpServerEnabledResponse:
+        user_id = require_user(request, auth_provider)
+        if body.harness not in active_harnesses(mcp_disabled_servers, feature_flags):
+            raise HTTPException(status_code=404, detail="MCP enablement is not enabled")
+        host = await asyncio.to_thread(
+            resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+        )
+        if body.server == "omnigent":
+            raise HTTPException(status_code=422, detail="Omnigent's MCP relay cannot be toggled")
+        conn = host_registry.get(host_id)
+        if conn is None:
+            raise host_absent_error(host)
+        if CAP_MCP_SERVER_ENABLED not in conn.hello.capabilities:
+            raise HTTPException(status_code=501, detail="update the host to toggle MCP servers")
+        result = await request_host_set_mcp_server_enabled(
+            host_registry=host_registry, host_conn=conn, body=body
+        )
+        if result.status != "ok":
+            raise HTTPException(
+                status_code=422 if result.error_code == "invalid_server" else 502,
+                detail=result.error or "host MCP enablement failed",
+            )
+        try:
+            return McpServerEnabledResponse(server=McpServerSummary.model_validate(result.server))
+        except ValidationError:
+            raise HTTPException(
+                status_code=502, detail="host sent malformed MCP enablement reply"
+            ) from None
+
+    return router
+
+
+async def request_host_mcp_servers(
+    *, host_registry: HostRegistry, host_conn: HostConnection
+) -> HostMcpServersResultFrame:
+    """Request the MCP inventory over the host tunnel, with bounded waiting and cleanup."""
+    request_id = secrets.token_hex(8)
+    future: asyncio.Future[HostMcpServersResultFrame] = asyncio.get_running_loop().create_future()
+    host_conn.pending_mcp_servers[request_id] = future
+    try:
+        host_registry.send_text(
+            host_conn, encode_host_frame(HostMcpServersFrame(request_id=request_id))
+        )
+        return await asyncio.wait_for(future, timeout=_MCP_SERVERS_TIMEOUT_S)
+    except ConnectionError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"host '{host_conn.host_id}' connection lost"
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"host '{host_conn.host_id}' did not list MCP servers "
+                f"within {_MCP_SERVERS_TIMEOUT_S:.0f}s"
+            ),
+        ) from exc
+    finally:
+        host_conn.pending_mcp_servers.pop(request_id, None)
+
+
+async def request_host_set_mcp_server_enabled(
+    *, host_registry: HostRegistry, host_conn: HostConnection, body: McpServerEnabledRequest
+) -> HostSetMcpServerEnabledResultFrame:
+    """Save a preference over the host tunnel with bounded waiting and cleanup."""
+    request_id = secrets.token_hex(8)
+    future: asyncio.Future[HostSetMcpServerEnabledResultFrame] = (
+        asyncio.get_running_loop().create_future()
+    )
+    host_conn.pending_mcp_server_enabled[request_id] = future
+    try:
+        host_registry.send_text(
+            host_conn,
+            encode_host_frame(
+                HostSetMcpServerEnabledFrame(request_id=request_id, **body.model_dump())
+            ),
+        )
+        return await asyncio.wait_for(future, timeout=_MCP_SERVERS_TIMEOUT_S)
+    except (ConnectionError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail="host MCP enablement request failed") from exc
+    finally:
+        host_conn.pending_mcp_server_enabled.pop(request_id, None)

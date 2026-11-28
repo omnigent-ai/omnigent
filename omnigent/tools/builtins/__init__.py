@@ -24,6 +24,7 @@ from collections.abc import Callable
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
 from omnigent.tools.builtins.agents import (
     SysAgentDownloadTool,
@@ -35,6 +36,13 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelAsyncTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.gadgets import GADGET_TOOLS
+from omnigent.tools.builtins.journal import (
+    SysJournalReadTool,
+    SysJournalWriteNoteTool,
+    SysJournalWritePlanTool,
+    SysJournalWriteStatusTool,
+)
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
 from omnigent.tools.builtins.load_skill import (
@@ -44,16 +52,30 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_meta_text,
     list_skill_resources,
 )
+from omnigent.tools.builtins.memory import (
+    MemoryDeleteTool,
+    MemoryGetTool,
+    MemoryListTool,
+    MemorySearchTool,
+    MemoryWriteTool,
+)
 from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
 from omnigent.tools.builtins.nimble_research import NimbleResearchTool
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
 from omnigent.tools.builtins.scheduled_tasks import (
+    SysReminderSetTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
     SysScheduledTaskUpdateTool,
+)
+from omnigent.tools.builtins.session_projects import (
+    SysProjectListTool,
+    SysProjectUpdateTool,
+    SysSessionLinkPrTool,
+    SysSessionUpdateTool,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
@@ -70,13 +92,21 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.user_inbox import SysUserInboxListTool, SysUserInboxPostTool
+from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
     "BUILTIN_NAMES",
+    "GADGET_TOOLS",
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "MemoryDeleteTool",
+    "MemoryGetTool",
+    "MemoryListTool",
+    "MemorySearchTool",
+    "MemoryWriteTool",
     "NimbleExtractTool",
     "NimbleResearchTool",
     "ReadSkillFileTool",
@@ -86,8 +116,15 @@ __all__ = [
     "SysAgentListTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
+    "SysJournalReadTool",
+    "SysJournalWriteNoteTool",
+    "SysJournalWritePlanTool",
+    "SysJournalWriteStatusTool",
     "SysListModelsTool",
+    "SysProjectListTool",
+    "SysProjectUpdateTool",
     "SysReadInboxTool",
+    "SysReminderSetTool",
     "SysScheduledTaskCreateTool",
     "SysScheduledTaskDeleteTool",
     "SysScheduledTaskListTool",
@@ -96,13 +133,18 @@ __all__ = [
     "SysSessionCreateTool",
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
+    "SysSessionLinkPrTool",
     "SysSessionListTool",
     "SysSessionRenameTool",
     "SysSessionSendTool",
     "SysSessionShareTool",
+    "SysSessionUpdateTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
+    "SysUserInboxListTool",
+    "SysUserInboxPostTool",
     "UpdateCommentTool",
+    "WebReadTool",
     "WebSearchTool",
     "any_skill_has_resources",
     "find_skill_by_name",
@@ -122,18 +164,6 @@ __all__ = [
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
 
-def _create_upload_file(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for UploadFileTool.
-
-    :param config: Tool config (unused).
-    :returns: An UploadFileTool instance.
-    """
-    from omnigent.tools.builtins.upload_file import UploadFileTool
-
-    return UploadFileTool()
-
-
 def _create_search_conversations(config: dict[str, str]) -> Tool:
     """
     Lazy factory for SearchConversationsTool.
@@ -146,30 +176,6 @@ def _create_search_conversations(config: dict[str, str]) -> Tool:
     )
 
     return SearchConversationsTool()
-
-
-def _create_list_files(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for ListFilesTool.
-
-    :param config: Tool config (unused).
-    :returns: A ListFilesTool instance.
-    """
-    from omnigent.tools.builtins.list_files import ListFilesTool
-
-    return ListFilesTool()
-
-
-def _create_download_file(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for DownloadFileTool.
-
-    :param config: Tool config (unused).
-    :returns: A DownloadFileTool instance.
-    """
-    from omnigent.tools.builtins.download_file import DownloadFileTool
-
-    return DownloadFileTool()
 
 
 def _create_export_agent(config: dict[str, str]) -> Tool:
@@ -250,11 +256,9 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
+    "web_read": lambda config: WebReadTool(config=config),
     "nimble_research": lambda config: NimbleResearchTool(config=config),
     "nimble_extract": lambda config: NimbleExtractTool(config=config),
-    "upload_file": _create_upload_file,
-    "list_files": _create_list_files,
-    "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
     # Framework-owned: need runtime context. ``web_fetch`` is
@@ -267,6 +271,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "web_fetch": None,
     "list_comments": None,
     "update_comment": None,
+    # Session file tools: registered by ``ToolManager._register_file_tools``
+    # only when the spec sets ``tool_groups.files: true``.
+    "sys_files_upload": None,
+    "sys_files_list": None,
+    "sys_files_download": None,
     # ``sys_list_models`` is auto-registered by
     # ``ToolManager._register_sub_agent_tools`` with the dispatch grant
     # and intercepted by name in the runner's tool dispatch — reserved
@@ -277,10 +286,10 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # name in the runner's tool dispatch — reserved here so user specs
     # cannot shadow it.
     "sys_advise_models": None,
-    # ``browser_*`` embedded-browser tools are framework-owned: always
+    # ``browser_*`` embedded-browser tools are framework-owned:
     # auto-registered by ``ToolManager._register_browser_tools`` (the
-    # single source of truth for registration), so any agent can drive
-    # the desktop app's browser without the spec opting in. Reserved
+    # single source of truth for registration) unless the spec sets
+    # ``tool_groups.browser: false``. Reserved
     # here with ``None`` — exactly like ``list_comments`` /
     # ``update_comment`` — so user specs cannot shadow the names and
     # ``get_builtin_tool`` returns ``None`` for them (they are not
@@ -291,6 +300,8 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    **dict.fromkeys(sorted(ADVANCED_BROWSER_TOOL_NAMES)),
+    "ui_open_file": None,
 }
 
 # Hindsight long-term memory (optional ``hindsight`` extra). Registered only

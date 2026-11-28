@@ -15,12 +15,15 @@ import type { ConversationState } from "./chatStore";
 const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   blocks: true,
   pendingUserMessages: true,
+  failedUploads: true,
+  settledShellInputs: true,
   activeResponse: true,
   interruptedResponseIds: true,
   status: true,
   sessionStatus: true,
   backgroundTaskCount: true,
   backgroundTasks: true,
+  backgroundAgents: true,
   blockedOn: true,
   isNativeTerminalSession: true,
   nativeVendorOwnsModel: true,
@@ -48,12 +51,16 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   tokensUsed: true,
   sessionCostUsd: true,
   sessionUsageByModel: true,
+  sessionUsageLoading: true,
   gitBranch: true,
   todos: true,
   codexModelOptions: true,
   terminalPending: true,
   viewers: true,
   sandboxStatus: true,
+  sandboxActionDismissed: true,
+  startupPending: true,
+  failedInputs: true,
   mcpStartup: true,
   mcpStartupLaunch: true,
   btwSidechat: true,
@@ -61,7 +68,9 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   runnerLaunchedAt: true,
   failedSendDraft: true,
   pendingRetryStableId: true,
+  restoredSendDraft: true,
   sendLatchedAt: true,
+  sendLatchSeenRunning: true,
   historyGeneration: true,
   awaitingSideChatFor: true,
 };
@@ -81,12 +90,15 @@ export function createInitialConversationState(): ConversationState {
   return {
     blocks: [],
     pendingUserMessages: [],
+    failedUploads: [],
+    settledShellInputs: [],
     activeResponse: null,
     interruptedResponseIds: [],
     status: "idle",
     sessionStatus: "idle",
     backgroundTaskCount: 0,
     backgroundTasks: [],
+    backgroundAgents: [],
     blockedOn: null,
     isNativeTerminalSession: false,
     nativeVendorOwnsModel: false,
@@ -114,12 +126,16 @@ export function createInitialConversationState(): ConversationState {
     tokensUsed: null,
     sessionCostUsd: null,
     sessionUsageByModel: null,
+    sessionUsageLoading: false,
     gitBranch: null,
     todos: [],
     codexModelOptions: [],
     terminalPending: false,
     viewers: [],
     sandboxStatus: null,
+    sandboxActionDismissed: null,
+    startupPending: false,
+    failedInputs: [],
     mcpStartup: null,
     mcpStartupLaunch: { pending: false, dismissed: false },
     btwSidechat: null,
@@ -127,8 +143,31 @@ export function createInitialConversationState(): ConversationState {
     runnerLaunchedAt: null,
     failedSendDraft: null,
     pendingRetryStableId: null,
+    restoredSendDraft: null,
     sendLatchedAt: null,
+    sendLatchSeenRunning: null,
     historyGeneration: 0,
     awaitingSideChatFor: null,
   };
+}
+
+/**
+ * The unsent work a conversation rebuild or rekey must carry over: sends the server has not
+ * acknowledged, and uploads parked on their bubbles. Every site that drops or rebuilds an entry
+ * uses this, so no path can carry one list and miss the other.
+ */
+export function unsentWorkOf(
+  state: Pick<ConversationState, "pendingUserMessages" | "failedUploads">,
+): Pick<ConversationState, "pendingUserMessages" | "failedUploads"> {
+  return {
+    pendingUserMessages: state.pendingUserMessages.filter((p) => p.posted !== true),
+    failedUploads: state.failedUploads,
+  };
+}
+
+/** Whether a carried set of unsent work holds anything. */
+export function hasUnsentWorkToCarry(
+  carried: Pick<ConversationState, "pendingUserMessages" | "failedUploads">,
+): boolean {
+  return carried.pendingUserMessages.length > 0 || carried.failedUploads.length > 0;
 }

@@ -19,7 +19,6 @@ from omnigent.inner.codex_executor import (
     _tool_signature,
 )
 from omnigent.inner.executor import TurnComplete
-from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.runtime.harnesses import _executor_adapter
 from tests.inner.test_codex_executor import _FakeAppSession, _FakeProcess
 
@@ -504,7 +503,7 @@ async def test_same_session_turn_waits_for_inflight_native_close(waiters: int) -
     executor = CodexExecutor(codex_path="/bin/echo", cwd="/tmp", app_session_factory=factory)
     executor._session_states["session-1"] = _CodexSessionState(
         app_session=old_session,
-        signature=(CODEX_DEFAULT_MODEL, "", "/tmp", _tool_signature([])),
+        signature=(None, "", "/tmp", _tool_signature([])),
     )
 
     close_task = asyncio.create_task(executor.close_session("session-1"))
@@ -581,6 +580,8 @@ async def test_cancelled_native_close_kills_and_reaps_sigterm_ignoring_child(
     session._proc = child
     session._codex_home_dir = tmp_path / "codex-home"
     session._codex_home_dir.mkdir()
+    home_stat = session._codex_home_dir.stat()
+    session._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
     try:
         assert child.stdout is not None
         async with asyncio.timeout(5):

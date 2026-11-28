@@ -16,11 +16,26 @@ import pytest
 from omnigent.util.server_url import (
     ServerUrl,
     display_server_url,
+    format_host_port,
     is_workspace_hosted_url,
     org_id_from_url,
 )
 
 _WORKSPACE_API = "https://ws.databricks.com/api/2.0/omnigent"
+
+
+@pytest.mark.parametrize(
+    "host, expected",
+    [
+        ("server.example.test", "server.example.test:6767"),
+        ("127.0.0.1", "127.0.0.1:6767"),
+        ("::1", "[::1]:6767"),
+        ("2001:db8::1", "[2001:db8::1]:6767"),
+        ("[::1]", "[::1]:6767"),
+    ],
+)
+def test_format_host_port(host: str, expected: str) -> None:
+    assert format_host_port(host, 6767) == expected
 
 
 @pytest.fixture(autouse=True)
@@ -149,6 +164,10 @@ def test_display_round_trips_through_login_resolution(monkeypatch) -> None:
 
     assert resolved.api_base == _WORKSPACE_API
     assert resolved.org_id == "123"
+    # Every CLI resolution also attributes the CLI's own debug-log rows.
+    from omnigent import debug_logging
+
+    assert debug_logging._process_identity()[0] == "123"
 
 
 @pytest.mark.parametrize(
@@ -169,8 +188,8 @@ def test_org_id_from_url(url: str, expected: str | None) -> None:
     [
         # Databricks workspace API mount → the recognizable /omnigent SPA URL.
         (
-            "https://e2-dogfood.staging.cloud.databricks.com/api/2.0/omnigent",
-            "https://e2-dogfood.staging.cloud.databricks.com/omnigent",
+            "https://example.staging.cloud.databricks.com/api/2.0/omnigent",
+            "https://example.staging.cloud.databricks.com/omnigent",
         ),
         # A trailing ``?o=<org>`` selector on the API base is kept on the
         # display URL so a copy-paste still routes to the right workspace.

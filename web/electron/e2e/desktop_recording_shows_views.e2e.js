@@ -26,6 +26,8 @@ const path = require("node:path");
 
 const {
   desktopDepsAvailable,
+  execInBrowserView,
+  openBrowserFixture,
   spawnServer,
   launchDesktop,
   saveRecording,
@@ -97,23 +99,7 @@ function bannerFractions(clip, fps = 2, width = 160, height = 120) {
 // Drive the preload-exposed browser APIs from the shell renderer (same helpers
 // as desktop_cookie_isolation.e2e.js — they run in the SPA window's context).
 async function openView(window, conversationId, url) {
-  return window.evaluate(
-    ([cid, u]) =>
-      window.omnigentDesktop.browserOpenOrNavigate(cid, u, {
-        x: 40,
-        y: 80,
-        width: 900,
-        height: 520,
-      }),
-    [conversationId, url],
-  );
-}
-
-async function execInView(window, conversationId, js) {
-  return window.evaluate(
-    ([cid, code]) => window.omnigentDesktop.browserExecute(cid, code),
-    [conversationId, js],
-  );
+  return openBrowserFixture(window, conversationId, url);
 }
 
 async function setActive(window, conversationId) {
@@ -129,7 +115,7 @@ async function waitForViewOnOrigin(window, conversationId, origin, timeoutMs = 3
   for (;;) {
     // oxlint-disable-next-line no-await-in-loop -- Poll each navigation probe sequentially.
     const r = await Promise.race([
-      execInView(window, conversationId, "location.origin"),
+      execInBrowserView(window, conversationId, "location.origin"),
       new Promise((resolve) => {
         setTimeout(() => resolve(null), 3_000);
       }),
@@ -195,7 +181,7 @@ describe(
           assert.equal(opened.ok, true, `conv_A open failed: ${opened.error}`);
           await setActive(window, "conv_A");
           await waitForViewOnOrigin(window, "conv_A", server.serverUrl);
-          const painted = await execInView(
+          const painted = await execInBrowserView(
             window,
             "conv_A",
             `document.body.innerHTML = '<div style="position: fixed; inset: 0; background: #1a7f37; color: white; font: 28px sans-serif; padding: 40px;">' +

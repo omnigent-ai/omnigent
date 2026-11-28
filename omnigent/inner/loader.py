@@ -18,6 +18,7 @@ from .datamodel import (
     OSEnvSpec,
     ParamDef,
     TerminalEnvSpec,
+    parse_write_paths,
 )
 from .policies import (
     FunctionPolicy,
@@ -75,6 +76,7 @@ _OmnigentYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
 def load_agent_def(
     path_or_dict: str | Path | YamlData,
     *,
+    expand_env: bool = True,
     enforce_handler_allowlist: bool = False,
 ) -> AgentDef:
     """Load an AgentDef from a YAML file path or a raw dict.
@@ -88,11 +90,11 @@ def load_agent_def(
     resolution. See :func:`_resolve_instructions` for the rules.
 
     :param path_or_dict: A YAML file path or already-parsed dict.
-    :param enforce_handler_allowlist: When ``True``, reject any
-        ``type: function`` policy whose ``handler:`` / ``callable:``
-        dotted path is not a registered policy handler, *before*
-        ``_parse_agent_def`` resolves and (for factory policies)
-        **calls** it. This is the guard for the untrusted
+    :param expand_env: Whether to expand executor auth environment references.
+        Must be ``False`` for tenant-supplied bundles.
+    :param enforce_handler_allowlist: When ``True``, reject dynamic tool
+        targets (including nested agent tools) and unregistered function
+        policy handlers before importing or calling them. This guards the untrusted
         agent-bundle upload path: ``omnigent.spec.load`` routes a
         single-file omnigent YAML bundle here during
         ``validate_agent_bundle``, and the loader executes policy
@@ -100,7 +102,7 @@ def load_agent_def(
         ``handler: subprocess.Popen`` would otherwise run during
         validation. Defaults to ``False`` so trusted callers (local
         ``omnigent run``, operator specs, the CLI) keep working with
-        custom handlers — the operator already has code execution, so
+        custom handlers and tools — the operator already has code execution, so
         the restriction would add no security there.
     """
     path: Path | None = None
@@ -125,14 +127,19 @@ def load_agent_def(
         )
     if enforce_handler_allowlist:
         _reject_unregistered_policy_handlers(data)
-    return _parse_agent_def(data, instructions_root=instructions_root)
+    return _parse_agent_def(
+        data,
+        expand_env=expand_env,
+        instructions_root=instructions_root,
+        allow_dynamic_tools=not enforce_handler_allowlist,
+    )
 
 
 def _reject_unregistered_policy_handlers(data: YamlData) -> None:
     """Reject unregistered handlers before parsing an uploaded policy.
 
     Check legacy handler/callable fields and native function paths, including
-    wrapped handlers. Tool callable paths are validated separately.
+    wrapped handlers. Tool targets are guarded separately by the recursive tool parser.
     """
     from omnigent.policies.registry import (
         function_policy_handler_allowed,
@@ -250,6 +257,8 @@ def _resolve_instructions(
 def _parse_agent_def(
     data: YamlData,
     *,
+    expand_env: bool,
+    allow_dynamic_tools: bool,
     instructions_root: Path | None = None,
 ) -> AgentDef:
     agent = AgentDef()
@@ -276,11 +285,29 @@ def _parse_agent_def(
     agent.spawn = data.get("spawn", False)
     agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
+    raw_model_egress = data.get("model_egress")
+    if raw_model_egress is not None:
+        if not isinstance(raw_model_egress, list) or not raw_model_egress:
+            raise ValueError("model_egress must be a non-empty list")
+        from .egress.rules import parse_rule
+
+        agent.model_egress = []
+        for index, rule in enumerate(raw_model_egress):
+            if not isinstance(rule, str):
+                raise ValueError(f"model_egress[{index}] must be a string")
+            parse_rule(rule)
+            agent.model_egress.append(rule)
 
     # Executor
     executor_data = data.get("executor")
     if executor_data:
-        agent.executor = _parse_executor_spec(executor_data)
+        agent.executor = _parse_executor_spec(executor_data, expand_env=expand_env)
+
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(
+        agent.os_env, agent.executor.harness if agent.executor else None
+    )
 
     # Params
     for pname, pdata in data.get("params", {}).items():
@@ -295,11 +322,13 @@ def _parse_agent_def(
 
     # Tools
     for tname, tdata in data.get("tools", {}).items():
-        agent.tools[tname] = _parse_tool(tname, tdata)
+        agent.tools[tname] = _parse_tool(
+            tname, tdata, expand_env=expand_env, allow_dynamic_tools=allow_dynamic_tools
+        )
 
     # Policies
     for pname, pdata in data.get("policies", {}).items():
-        agent.policies[pname] = _parse_policy(pname, pdata)
+        agent.policies[pname] = _parse_policy(pname, pdata, expand_env=expand_env)
 
     # Memories
     for mname, mdata in data.get("memories", {}).items():
@@ -333,27 +362,21 @@ def _parse_agent_def(
     # Terminals
     for term_name, term_data in data.get("terminals", {}).items():
         agent.terminals[str(term_name)] = _parse_terminal_env_spec(term_data)
-    # Cross-field validation: a terminal with ``allow_sandbox_override``
-    # lets the LLM pass an arbitrary ``sandbox`` arg to
-    # ``sys_terminal_launch``. The override only mutates ``sandbox.type``
-    # — egress_rules stay on the policy object but an override to
-    # ``none`` (an accepted override value) can't enforce them, so the
-    # LLM effectively drops the egress allow-list. Reject the
-    # combination at parse time rather than silently accept a spec
-    # that's only as strong as the LLM lets it be.
+    # An override to "none" would retain network policy fields while
+    # dropping their enforcement.
     for term_name, term_spec in agent.terminals.items():
         if not term_spec.allow_sandbox_override:
             continue
         effective_sandbox = _effective_terminal_sandbox(term_spec, agent.os_env)
-        if effective_sandbox is not None and effective_sandbox.egress_rules:
+        if effective_sandbox is not None and effective_sandbox.requires_network_enforcement:
             raise ValueError(
                 f"terminal {term_name!r}: allow_sandbox_override=true is "
-                "incompatible with egress_rules on the effective sandbox. "
+                "incompatible with egress_rules, git_ssh, or tcp_egress on the effective sandbox. "
                 "An override of sandbox.type to 'none' "
-                "drops hard network enforcement while egress_rules remain "
+                "drops hard network enforcement while network policy remains "
                 "as inert decoration on the policy, so the LLM could "
-                "silently bypass the network allow-list. Either remove "
-                "allow_sandbox_override or remove egress_rules from the "
+                "silently bypass it. Either remove "
+                "allow_sandbox_override or remove network policy from the "
                 "effective sandbox."
             )
 
@@ -371,7 +394,9 @@ def _parse_agent_def(
 # ---------------------------------------------------------------------------
 
 
-def _parse_tool(name: str, data: str | YamlData) -> Tool:
+def _parse_tool(
+    name: str, data: str | YamlData, *, expand_env: bool, allow_dynamic_tools: bool
+) -> Tool:
     if isinstance(data, str):
         if data == "inherit":
             return InheritedTool(name=name)
@@ -387,6 +412,17 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
         return FunctionTool(name=name, description=str(data))
 
     tool_type = data.get("type", "function")
+
+    # Guard imports in the recursive parser so nested tools cannot bypass
+    # the upload restriction. Module initialization is already a side effect.
+    if not allow_dynamic_tools and (
+        (tool_type == "function" and isinstance(data.get("callable"), str))
+        or (tool_type == "cancellable_function" and isinstance(data.get("runner"), str))
+    ):
+        raise ValueError(
+            f"Tool {name!r}: uploaded agent bundles may not declare a "
+            "server-side Python callable tool."
+        )
 
     if tool_type == "function":
         # Reject typos like ``runtime: clinet`` at load time.
@@ -430,6 +466,12 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
         )
 
     if tool_type == "mcp":
+        if data.get("transport") == "registry":
+            raise ValueError(
+                "Managed MCP references require native config.yaml (spec_version: 1) "
+                "with inline tools, or the session MCP picker/API; "
+                "older servers cannot read them in legacy agent YAML"
+            )
         # ``profile`` can be declared directly (``profile: myprof``)
         # or inside an ``auth:`` block (``auth: {type: databricks,
         # profile: myprof}``). The ``auth:`` block is the preferred
@@ -484,7 +526,9 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
 
         sub_tools: dict[str, Tool] = {}
         for sname, sdata in data.get("tools", {}).items():
-            sub_tools[sname] = _parse_tool(sname, sdata)
+            sub_tools[sname] = _parse_tool(
+                sname, sdata, expand_env=expand_env, allow_dynamic_tools=allow_dynamic_tools
+            )
         raw_max_sessions = data.get("max_sessions")
         max_sessions: int | None = None
         if raw_max_sessions is not None:
@@ -503,7 +547,7 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
             description=data.get("description"),
             prompt=data.get("prompt"),
             tools=sub_tools,
-            executor=_parse_executor_spec(data.get("executor")),
+            executor=_parse_executor_spec(data.get("executor"), expand_env=expand_env),
             os_env=(
                 data.get("os_env")
                 if data.get("os_env") == "inherit"
@@ -547,7 +591,7 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
 # ---------------------------------------------------------------------------
 
 
-def _parse_policy(name: str, data: YamlData | str | bool | None) -> Policy:
+def _parse_policy(name: str, data: YamlData | str | bool | None, *, expand_env: bool) -> Policy:
     if not isinstance(data, dict):
         return Policy(name=name)
 
@@ -598,7 +642,7 @@ def _parse_policy(name: str, data: YamlData | str | bool | None) -> Policy:
             # `None` means no prompt was configured; PromptPolicy.evaluate()
             # fails closed in that case.
             prompt=data.get("prompt"),
-            executor=_parse_executor_spec(data.get("executor")),
+            executor=_parse_executor_spec(data.get("executor"), expand_env=expand_env),
             allow_set_labels=bool(data.get("allow_set_labels", False)),
             allowed_label_keys=(
                 [str(key) for key in data.get("allowed_label_keys", [])]
@@ -632,7 +676,9 @@ def _resolve_callable(dotted_path: str) -> DynamicCallable | None:
         return None
 
 
-def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | None:
+def _parse_executor_spec(
+    data: YamlData | str | bool | None, *, expand_env: bool
+) -> ExecutorSpec | None:
     if not data:
         return None
     if isinstance(data, str):
@@ -665,12 +711,20 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
         if isinstance(raw_auth, dict):
             from omnigent.spec.parser import _parse_executor_auth
 
-            auth = _parse_executor_auth(data, expand_env=True)
+            auth = _parse_executor_auth(data, expand_env=expand_env)
+        context_files = data.get("context_files")
+        if "context_files" in data and not isinstance(context_files, bool):
+            raise ValueError("executor.context_files must be a boolean")
+        system_prompt_mode = data.get("system_prompt_mode")
+        if "system_prompt_mode" in data and system_prompt_mode not in ("append", "replace"):
+            raise ValueError("executor.system_prompt_mode must be 'append' or 'replace'")
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
             auth=auth,
+            context_files=context_files,
+            system_prompt_mode=system_prompt_mode,
         )
     return None
 
@@ -784,6 +838,11 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         if raw_type is not None and not isinstance(raw_type, str):
             raise TypeError("os_env.sandbox.type must be a string or null")
         sandbox_type = _resolve_sandbox_type(raw_type)
+    parsed_write_paths = parse_write_paths(data.get("write_paths"))
+    if sandbox_type != "linux_bwrap" and any(
+        not isinstance(p, str) and p.copy_on_write for p in parsed_write_paths or []
+    ):
+        raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
     egress_rules = data.get("egress_rules")
     # Mirror the Omnigent parser's hard reject of ``egress_rules`` paired with
     # a backend that cannot enforce them at spawn time. Without this
@@ -819,9 +878,18 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     from omnigent.spec.parser import (
         _credential_proxy_macos_unsupported_reason,
         _parse_credential_proxy,
+        _parse_git_ssh,
     )
 
+    from .tcp_egress_policy import parse_tcp_egress
+
     credential_proxy = _parse_credential_proxy(data.get("credential_proxy"))
+    git_ssh = _parse_git_ssh(data.get("git_ssh"))
+    tcp_egress = parse_tcp_egress(data.get("tcp_egress"), egress_rules=egress_rules or ())
+    if git_ssh and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise ValueError("os_env.sandbox.git_ssh requires linux_bwrap or darwin_seatbelt")
+    if tcp_egress and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise ValueError("os_env.sandbox.tcp_egress requires linux_bwrap or darwin_seatbelt")
     if credential_proxy is not None and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise ValueError(
             "os_env.sandbox.credential_proxy requires sandbox.type=linux_bwrap "
@@ -850,11 +918,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=data.get("read_paths"),
-        write_paths=(
-            list(data["write_paths"])
-            if "write_paths" in data and data.get("write_paths") is not None
-            else None
-        ),
+        write_paths=parsed_write_paths,
         write_files=(
             list(data["write_files"])
             if "write_files" in data and data.get("write_files") is not None
@@ -882,6 +946,8 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
+        git_ssh=git_ssh,
+        tcp_egress=tcp_egress,
     )
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import sqlite3
 import threading
 from collections.abc import AsyncIterator, Iterator
@@ -24,6 +25,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine
+from omnigent.debug_logging import record_to_row
 from omnigent.llms.types import (
     FunctionCallOutput,
     MessageOutput,
@@ -47,6 +49,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
 # ── Controllable mock LLM ─────────────────────────────
 
@@ -391,6 +395,35 @@ class _MockResponsesNamespace:
 
 
 @pytest.fixture()
+def debug_log_rows() -> Iterator[list[dict[str, Any]]]:
+    """
+    Server debug-log rows built the way the sink builds them.
+
+    ``record_to_row`` fills ambient attribution (user, session) from context
+    variables at emit time, so rows are built inside ``emit`` instead of from
+    ``caplog`` records after the fact.
+
+    :yields: Rows appended in emit order for ``omnigent.*`` INFO+ records.
+    """
+    rows: list[dict[str, Any]] = []
+
+    class _RowCapture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            rows.append(record_to_row(record, "server"))
+
+    handler = _RowCapture(level=logging.INFO)
+    omnigent_logger = logging.getLogger("omnigent")
+    previous_level = omnigent_logger.level
+    omnigent_logger.addHandler(handler)
+    omnigent_logger.setLevel(logging.INFO)
+    try:
+        yield rows
+    finally:
+        omnigent_logger.removeHandler(handler)
+        omnigent_logger.setLevel(previous_level)
+
+
+@pytest.fixture()
 def mock_llm() -> Iterator[ControllableMockClient]:
     """
     A ``ControllableMockClient`` instance for the current test.
@@ -631,20 +664,13 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     )
 
 
-@pytest_asyncio.fixture()
-async def client(
+@contextlib.asynccontextmanager
+async def _app_client(
     app: FastAPI,
     mock_llm: ControllableMockClient,
     tmp_path: Path,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """
-    Async HTTP client wired to the FastAPI app (no real server).
-
-    On teardown, releases blocked mock calls and destroys DBOS
-    before the event loop shuts down. This must happen in an async
-    fixture because the pytest-asyncio runner closes the event loop
-    immediately after async fixture teardown completes.
-    """
+    """Serve a real app and drain its harness/relay work before the loop closes."""
     # Initialize the HarnessProcessManager for tests that hit the
     # fallback executor path (when _runner_client is not set).
     from omnigent.runtime import set_harness_process_manager
@@ -654,23 +680,97 @@ async def client(
     await pm.start()
     set_harness_process_manager(pm)
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    # Release blocked mock calls so background threads can finish.
-    mock_llm.release_all()
-    # Cancel any background relay tasks started by PATCH-bound
-    # tests; the stub runner never responds so they'd otherwise
-    # hang teardown. Snapshot first because cancellation fires
-    # the done-callback that mutates the dict.
-    relay_tasks = [h.task for h in sessions_routes._runner_relay_tasks.values()]
-    for task in relay_tasks:
-        if not task.done():
-            task.cancel()
-    for task in relay_tasks:
-        # Let SystemExit / KeyboardInterrupt through so Ctrl-C still aborts.
-        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-    sessions_routes._runner_relay_tasks.clear()
-    set_harness_process_manager(None)
-    await pm.shutdown()
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
+    finally:
+        # Release blocked mock calls so background threads can finish.
+        mock_llm.release_all()
+        # Cancel any background relay tasks started by PATCH-bound
+        # tests; the stub runner never responds so they'd otherwise
+        # hang teardown. Snapshot first because cancellation fires
+        # the done-callback that mutates the dict.
+        relay_tasks = [h.task for h in sessions_routes._runner_relay_tasks.values()]
+        for task in relay_tasks:
+            if not task.done():
+                task.cancel()
+        for task in relay_tasks:
+            # Let SystemExit / KeyboardInterrupt through so Ctrl-C still aborts.
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        sessions_routes._runner_relay_tasks.clear()
+        set_harness_process_manager(None)
+        await pm.shutdown()
+
+
+@pytest_asyncio.fixture()
+async def client(
+    app: FastAPI, mock_llm: ControllableMockClient, tmp_path: Path
+) -> AsyncIterator[httpx.AsyncClient]:
+    """HTTP client with real stores and mock LLM responses."""
+    async with _app_client(app, mock_llm, tmp_path) as client:
+        yield client
+
+
+@pytest.fixture()
+def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """App with real policy storage; runtime policy wiring belongs to the client."""
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        policy_store=SqlAlchemyPolicyStore(db_uri),
+    )
+
+
+@pytest_asyncio.fixture()
+async def policy_client(
+    policy_app: FastAPI,
+    mock_llm: ControllableMockClient,
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Serve policy routes and expose their database to runtime policy evaluation."""
+    from omnigent.runtime import _globals
+
+    async with _app_client(policy_app, mock_llm, tmp_path) as client:
+        monkeypatch.setattr(_globals, "_policy_store", SqlAlchemyPolicyStore(db_uri))
+        yield client
+
+
+@pytest.fixture()
+def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """App fixture with a permission store + auth provider enabled."""
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+
+@pytest_asyncio.fixture()
+async def auth_client(
+    auth_app: FastAPI,
+    mock_llm: ControllableMockClient,
+    tmp_path: Path,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """HTTP client wired to the auth-enabled app."""
+    async with _app_client(auth_app, mock_llm, tmp_path) as client:
+        yield client

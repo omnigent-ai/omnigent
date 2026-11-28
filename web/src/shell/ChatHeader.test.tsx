@@ -1,14 +1,21 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import type { ServerInfo } from "@/lib/capabilities";
+import { resetUiFeatureOverridesForTests, writeUiFeatureOverride } from "@/lib/uiFeatureOverrides";
+import { useFeatureFlagsPickerStore } from "@/store/featureFlagsPicker";
 import { ChatHeader } from "./ChatHeader";
+import { claimChatPaneViewToggleHost, releaseChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -57,14 +64,25 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  tasksPanelOpen: false,
+  showTasks: false,
+  onOpenTasks: () => {},
+  contentSearchPanelOpen: false,
+  showContentSearch: false,
+  onOpenContentSearch: () => {},
+  sideChatsPanelOpen: false,
+  showSideChats: false,
+  onOpenSideChats: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
 function renderHeader(props: {
   sidebarOpen: boolean;
+  serverInfo?: ServerInfo;
   isChildSession?: boolean;
   subAgentName?: string | null;
   conversationId?: string;
+  workingDirectory?: string;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
@@ -73,31 +91,37 @@ function renderHeader(props: {
   wrapperLabel?: string | null;
   canShare?: boolean;
   canFork?: boolean;
+  forkDisabledReason?: string;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
+  rightPanelOpen?: boolean;
+  rightPanelCollapsesItself?: boolean;
   showFilesPanel?: boolean;
   pending?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
   onFork?: () => void;
+  settingsMode?: boolean;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
+        <TooltipProvider delayDuration={0}>
           <ChatHeader
             sidebarOpen={props.sidebarOpen}
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
+            settingsMode={props.settingsMode}
             isChildSession={props.isChildSession ?? false}
             subAgentName={props.subAgentName ?? null}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
             // right-panel toggle / rail entries all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
+            workingDirectory={props.workingDirectory}
             actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
             projectName={props.projectName ?? null}
@@ -106,6 +130,7 @@ function renderHeader(props: {
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
             canFork={props.canFork ?? false}
+            forkDisabledReason={props.forkDisabledReason}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
@@ -115,19 +140,29 @@ function renderHeader(props: {
             hasHeaderMenu={props.hasHeaderMenu ?? false}
             showFilesPanel={props.showFilesPanel ?? false}
             hasRailContent={props.hasRailContent ?? true}
-            rightPanelOpen={false}
+            rightPanelOpen={props.rightPanelOpen ?? false}
             onToggleRightPanel={() => {}}
+            rightPanelCollapsesItself={props.rightPanelCollapsesItself}
             pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
           />
         </TooltipProvider>
       </QueryClientProvider>
     </MemoryRouter>,
+    {
+      wrapper: ({ children }) => (
+        <CapabilitiesProvider info={props.serverInfo ?? "loading"}>{children}</CapabilitiesProvider>
+      ),
+    },
   );
 }
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
+  resetUiFeatureOverridesForTests();
+  useFeatureFlagsPickerStore.setState({ open: false, replaced: false });
+  vi.restoreAllMocks();
   setOmnigentHostConfig({});
   isIOSShellMock.mockReturnValue(false);
   isAndroidShellMock.mockReturnValue(false);
@@ -214,6 +249,61 @@ describe("ChatHeader — workspace pane alignment", () => {
 
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+    expect(header).toHaveClass("h-[76px]", "px-4", "py-4", "md:h-12", "md:py-3");
+  });
+
+  it.each([false, true])("adds the backdrop only on desktop sessions (mobile=%s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const landing = renderHeader({ sidebarOpen: true });
+    expect(landing.container.querySelector("header")).not.toHaveClass("session-header-glass");
+    landing.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(
+      session.container.querySelector("header")!.classList.contains("session-header-glass"),
+    ).toBe(!mobile);
+  });
+
+  it("lets a page's content take clicks under the header, away from its controls", () => {
+    // A page scrolls under the header without a backdrop, e.g. its Back link.
+    const page = renderHeader({ sidebarOpen: true });
+    expect(page.container.querySelector("header")).toHaveClass(
+      "pointer-events-none",
+      "*:pointer-events-auto",
+    );
+    page.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(session.container.querySelector("header")).not.toHaveClass("pointer-events-none");
+  });
+});
+
+describe("ChatHeader — workspace pane shortcut", () => {
+  it.each([
+    { rightPanelOpen: false, label: "Expand right panel" },
+    { rightPanelOpen: true, label: "Collapse right panel" },
+  ])("shows the shortcut when the action is '$label'", ({ rightPanelOpen, label }) => {
+    vi.useFakeTimers();
+    try {
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: "conv_workspace_shortcut",
+        rightPanelOpen,
+      });
+      const trigger = screen.getByRole("button", { name: label });
+
+      expect(trigger).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+]`);
+      fireEvent.focus(trigger);
+      act(() => vi.advanceTimersByTime(1000));
+
+      const tooltip = screen.getByRole("tooltip");
+      expect(tooltip).toHaveTextContent(label);
+      expect(
+        Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+      ).toEqual([MOD_KEY, ALT_KEY, "]"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -230,7 +320,32 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     // Closed: the toggle is the only sidebar affordance, so it must be
     // present. A regression here would hide the only way to reopen the
     // sidebar via pointer.
-    expect(screen.getByRole("button", { name: "Open sidebar" })).toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "Open sidebar" });
+    expect(toggle).toBeInTheDocument();
+    expect(toggle.querySelector("svg")).toHaveClass("lucide-panel-left");
+  });
+
+  it("uses the menu icon for the mobile sidebar toggle", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({ sidebarOpen: false });
+
+    expect(screen.getByRole("button", { name: "Open sidebar" }).querySelector("svg")).toHaveClass(
+      "lucide-menu",
+    );
+  });
+
+  it("uses the menu icon and faded header surface for the mobile settings menu", () => {
+    const { container } = renderHeader({ sidebarOpen: false, settingsMode: true });
+
+    const button = screen.getByRole("button", { name: "Open settings menu" });
+    expect(button.querySelector("svg")).toHaveClass("lucide-menu");
+    expect(container.querySelector("header")).toHaveClass("settings-mobile-header");
+  });
+
+  it("drops the settings header fade while the sidebar is open", () => {
+    const { container } = renderHeader({ sidebarOpen: true, settingsMode: true });
+
+    expect(container.querySelector("header")).not.toHaveClass("settings-mobile-header");
   });
 
   it("cancels the pending peek as soon as the toggle is pressed", () => {
@@ -295,12 +410,18 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.queryByRole("navigation", { name: "Conversation" })).toBeNull();
   });
 
-  it("shows a plain title (no folder, no link) for an unfiled top-level session", () => {
+  it.each([false, true])("shows the top-level title only on desktop (mobile=%s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
     renderHeader({
       sidebarOpen: true,
       conversationId: "conv-1",
       conversationTitle: "Fix the login bug",
     });
+    if (mobile) {
+      expect(screen.queryByText("Fix the login bug")).toBeNull();
+      expect(screen.queryByRole("navigation", { name: "Conversation" })).toBeNull();
+      return;
+    }
     const title = screen.getByText("Fix the login bug");
     expect(title).toBeInTheDocument();
     // Top-level has nowhere to climb, so the title is not a link.
@@ -321,22 +442,32 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.getByText("Fix the login bug")).toBeInTheDocument();
   });
 
-  it("appends the sub-agent identity and links the title back to the parent", () => {
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: "child-9",
-      isChildSession: true,
-      conversationTitle: "Fix the login bug",
-      titleLinkTo: "/c/parent-123",
-      boundAgent: { id: "a1", name: "check-account-eligibility" },
-    });
-    // The title is the way back out — it links to the parent session route.
-    const back = screen.getByRole("link", { name: "Back to parent session" });
-    expect(back).toHaveAttribute("href", "/c/parent-123");
-    expect(back).toHaveTextContent("Fix the login bug");
-    // The sub-agent's bound-agent name is appended on the right.
-    expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
-  });
+  it.each([false, true])(
+    "keeps parent navigation without mobile session titles (mobile=%s)",
+    (mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: "child-9",
+        isChildSession: true,
+        conversationTitle: "Fix the login bug",
+        titleLinkTo: "/c/parent-123",
+        boundAgent: { id: "a1", name: "check-account-eligibility" },
+      });
+      // The title is the way back out — it links to the parent session route.
+      const back = screen.getByRole("link", { name: "Back to parent session" });
+      expect(back).toHaveAttribute("href", "/c/parent-123");
+      if (mobile) {
+        expect(back).toHaveTextContent("Back");
+        expect(screen.queryByText("Fix the login bug")).toBeNull();
+        expect(screen.queryByText("check-account-eligibility")).toBeNull();
+        return;
+      }
+      expect(back).toHaveTextContent("Fix the login bug");
+      // The sub-agent's bound-agent name is appended on the right.
+      expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
+    },
+  );
 
   it("names the session's own sub-agent, not the parent bundle's agent row", () => {
     // A `sys_session_send` child is bound to its PARENT bundle's agent row,
@@ -368,6 +499,24 @@ describe("ChatHeader — conversation breadcrumb", () => {
       boundAgent: { id: "a1", name: "check-account-eligibility" },
     });
     expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["claude-native-ui", "claude-code-native-ui", "Claude Code"],
+    ["claude-native-ui", null, "Claude Code"],
+    ["codex-native-ui", "codex-native-ui", "Codex"],
+  ] as const)("uses the product name for %s with wrapper %s", (name, wrapperLabel, displayName) => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name },
+      wrapperLabel,
+    });
+    expect(screen.getByText(displayName)).toBeInTheDocument();
+    expect(screen.queryByText(name)).toBeNull();
   });
 
   it("names the product, not the internal wrapper row, on a native sub-agent", () => {
@@ -543,30 +692,114 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   });
 });
 
+describe("ChatHeader — the switch in the chat pane's strip", () => {
+  it("renders the Chat/Terminal switch in the chat pane's spot while one is claimed", () => {
+    const view = renderHeaderWithSession(makeTerminalFirstCtx());
+    const header = view.container.querySelector("header")!;
+    const switchIn = (root: ParentNode) =>
+      root.querySelector('[role="group"][aria-label="Switch between chat and terminal"]');
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
+
+    const spot = document.createElement("span");
+    document.body.append(spot);
+    act(() => claimChatPaneViewToggleHost("sess-1", spot));
+    // The claim is module-wide: let it go even when an assertion below fails.
+    onTestFinished(() => {
+      releaseChatPaneViewToggleHost("sess-1", spot);
+      spot.remove();
+    });
+    expect(switchIn(header)).toBeNull();
+    expect(switchIn(spot)).toHaveAttribute("data-variant", "pane");
+    // One switch, so its chord stays bound once.
+    expect(
+      screen.getAllByRole("group", { name: /switch between chat and terminal/i }),
+    ).toHaveLength(1);
+
+    act(() => releaseChatPaneViewToggleHost("sess-1", spot));
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
+  });
+});
+
+describe("ChatHeader — warm header workspace ownership", () => {
+  it.each(["sess-a", null])(
+    "keeps the toolbar in the URL-owned spot %s while the header is B",
+    (workspaceId) => {
+      const spotA = document.createElement("span");
+      const spotB = document.createElement("span");
+      document.body.append(spotA, spotB);
+      claimChatPaneViewToggleHost("sess-a", spotA);
+      claimChatPaneViewToggleHost("sess-b", spotB);
+      onTestFinished(() => {
+        releaseChatPaneViewToggleHost("sess-a", spotA);
+        releaseChatPaneViewToggleHost("sess-b", spotB);
+        spotA.remove();
+        spotB.remove();
+      });
+      const view = renderHeaderWithSession(makeTerminalFirstCtx(), {
+        conversationId: "sess-b",
+        workspaceConversationId: workspaceId,
+      });
+      const root = workspaceId ? spotA : view.container.querySelector("header")!;
+      expect(
+        root.querySelector('[role="group"][aria-label="Switch between chat and terminal"]'),
+      ).not.toBeNull();
+      expect(spotB).toBeEmptyDOMElement();
+    },
+  );
+});
+
 describe("ChatHeader — floating mobile controls", () => {
-  it("gives the mobile control clusters the same glass surface", () => {
-    // The bar paints no background and chat scrolls under it, so each cluster
-    // needs its own blurred pill to stay legible over moving content.
+  it("adds glass to the mobile sidebar and shared action container", () => {
     isMobileMock.mockReturnValue(true);
-    renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true });
+    const onOpenSidebar = vi.fn();
+    renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true, onOpenSidebar });
 
     const toggle = screen.getByRole("button", { name: "Open sidebar" });
+    const menu = screen.getByRole("button", { name: "Session actions" });
     const cluster = screen.getByRole("button", { name: "Share session" }).parentElement;
-    for (const surface of [toggle, cluster]) {
-      expect(surface).toHaveClass(
-        "max-md:rounded-full",
-        "max-md:bg-background/70",
-        "max-md:backdrop-blur-xl",
-        "max-md:backdrop-saturate-150",
+    for (const button of [toggle, menu]) {
+      const surface = (button.querySelector<HTMLElement>(".glass-surface") ??
+        button
+          .closest("[data-mobile-header-group]")
+          ?.querySelector<HTMLElement>(".glass-surface"))!;
+      expect(surface.parentElement).toHaveAttribute("aria-hidden", "true");
+      expect(surface).toHaveClass("glass-surface--fallback");
+      expect(surface).toHaveClass("[&>.glass-surface\\_\\_sheen]:opacity-0");
+      expect(surface.querySelector(".glass-surface__sheen")).not.toBeNull();
+      expect(surface.style.getPropertyValue("--glass-frost")).toBe("0");
+      expect(surface.style.background).toBe("var(--omni-glass-background, hsl(0 0% 100% / 0%))");
+      expect(surface.style.backdropFilter).toBe(
+        "blur(var(--omni-glass-blur, 8px)) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(var(--omni-glass-brightness, 1.04))",
       );
+      expect(surface.querySelector('feDisplacementMap[result="dispRed"]')).toHaveAttribute(
+        "scale",
+        "-270",
+      );
+      expect(surface.style.boxShadow).toContain("inset 0 0 2px 1px rgba(212, 212, 216, 0.08)");
+      expect(surface.style.boxShadow).toContain("0 2px 6px 1px rgba(17, 17, 26, 0.08)");
+      expect(surface.querySelector('feGaussianBlur[in="output"]')).toHaveAttribute(
+        "stdDeviation",
+        "4.4",
+      );
+      expect(surface).toHaveStyle({ borderRadius: button === toggle ? "22px" : "20px" });
+      expect(button).toHaveClass(
+        "size-11",
+        "rounded-full",
+        "bg-transparent",
+        "p-0",
+        "shadow-none",
+        "active:transform-none!",
+        "[--icon-container-default:20px]",
+      );
+      expect(button).toHaveAttribute("data-size", "icon");
     }
-    // Nothing to show on the landing composer — the pill must not paint empty.
+    expect(cluster).not.toHaveClass("glass-surface");
     expect(cluster).toHaveClass("max-md:empty:hidden");
+    fireEvent.click(toggle);
+    expect(onOpenSidebar).toHaveBeenCalledWith(false);
   });
 
-  it("keeps the two clusters the same size around a lone control", () => {
-    // The right pill read visibly larger than the left toggle while it padded
-    // its child; with no padding a lone size-10 kebab is the same 40px circle.
+  it("shares the glass material across the sidebar and grouped session actions", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: false,
@@ -586,8 +819,42 @@ describe("ChatHeader — floating mobile controls", () => {
     const toggle = screen.getByRole("button", { name: "Open sidebar" });
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger.parentElement).not.toHaveClass("max-md:px-1", "max-md:py-1");
-    expect(trigger).toHaveClass("size-10");
-    expect(toggle).toHaveClass("size-10");
+    for (const button of [toggle, trigger]) {
+      expect(button).toHaveClass("size-11", "max-md:size-11", "rounded-full");
+      expect(button).toHaveAttribute("data-size", "icon");
+      expect(button).toHaveClass(
+        "p-0",
+        "shadow-none",
+        "hover:bg-transparent",
+        "aria-expanded:bg-transparent",
+        "active:transform-none!",
+      );
+    }
+    const sidebarSurface = toggle.querySelector<HTMLElement>(".glass-surface")!;
+    expect(trigger.querySelector(".glass-surface")).toBeNull();
+    const group = trigger.closest("[data-mobile-header-group]")!;
+    const menuSurface = group.querySelector<HTMLElement>(".glass-surface")!;
+    expect(group).toHaveClass("rounded-[20px]");
+    expect(group.querySelectorAll(".glass-surface")).toHaveLength(1);
+    expect(menuSurface.className).toBe(sidebarSurface.className);
+    for (const property of [
+      "box-shadow",
+      "backdrop-filter",
+      "--glass-frost",
+      "--glass-saturation",
+    ]) {
+      expect(menuSurface.style.getPropertyValue(property)).toBe(
+        sidebarSurface.style.getPropertyValue(property),
+      );
+    }
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+  });
+
+  it("keeps the desktop header free of mobile glass surfaces", () => {
+    const view = renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true });
+    expect(view.container.querySelector(".glass-surface")).toBeNull();
+    expect(screen.getByRole("button", { name: "Open sidebar" })).toHaveClass("size-6");
   });
 
   it("folds the Chat/Terminal switch into the header kebab on mobile", () => {
@@ -609,9 +876,7 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(screen.getByTestId("view-mode-menu-terminal")).toBeInTheDocument();
   });
 
-  it("rounds the kebab's own background so no square shows inside the pill", () => {
-    // The ghost button paints `aria-expanded:bg-muted` at its rounded-lg
-    // radius, which showed as a square behind the round pill once open.
+  it("keeps the fallback mobile kebab circular", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: true,
@@ -620,14 +885,15 @@ describe("ChatHeader — floating mobile controls", () => {
       hasHeaderMenu: true,
     });
 
-    expect(screen.getByTestId("session-actions-menu")).toHaveClass("max-md:rounded-full");
+    expect(screen.getByTestId("session-actions-menu")).toHaveClass("rounded-full");
   });
 
-  it("gives the fallback menu the same glass as the controls", () => {
+  it("keeps the fallback menu legible over scrolling content", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: true,
       conversationId: "conv-1",
+      workingDirectory: "/Users/ajay/projects/omni",
       canShare: true,
       hasHeaderMenu: true,
     });
@@ -636,6 +902,9 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(screen.getByRole("menu")).toHaveClass(
       "max-md:bg-background/70",
       "max-md:backdrop-blur-xl",
+    );
+    expect(screen.getByLabelText("Working directory: /Users/ajay/projects/omni")).toHaveTextContent(
+      "omni",
     );
   });
 
@@ -667,6 +936,24 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     labels: {},
     permission_level: 3,
   };
+
+  it.each([
+    { name: "landing", actionConversation: null },
+    { name: "shared session", actionConversation: null, conversationId: "conv-1" },
+    { name: "sub-agent", actionConversation: conversation, isChildSession: true },
+    { name: "pending session", actionConversation: conversation, pending: true },
+  ])("leaves the rename shortcut untouched on $name", (props) => {
+    renderHeader({ sidebarOpen: true, conversationTitle: conversation.title, ...props });
+    const pressed = new KeyboardEvent("keydown", {
+      code: "KeyR",
+      ctrlKey: true,
+      altKey: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(pressed);
+    expect(pressed.defaultPrevented).toBe(false);
+    expect(screen.queryByRole("textbox", { name: "Session name" })).toBeNull();
+  });
 
   it("keeps the overflow trigger immediately after a truncating title", () => {
     renderHeader({
@@ -700,7 +987,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(trigger.closest("nav.conversation-breadcrumb")).toBeNull();
     // Rightmost control in the header's action cluster.
     expect(trigger.parentElement?.lastElementChild).toBe(trigger);
-    expect(screen.getByText(conversation.title as string)).toBeInTheDocument();
+    expect(screen.queryByText(conversation.title as string)).toBeNull();
   });
 
   it("keeps the mobile Share / Agent info analytics on the owner-managed path", () => {
@@ -793,6 +1080,31 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(onFork).toHaveBeenCalledOnce();
   });
 
+  it.each([false, true])("disables the fallback Fork menu (mobile=%s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      actionConversation: null,
+      canFork: true,
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      onFork,
+    });
+    fireEvent.pointerDown(
+      screen.getByTestId(mobile ? "session-actions-menu" : "desktop-fork-actions-menu"),
+      { button: 0 },
+    );
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    // Both layouts carry the 44px floor, which applies only in native shells and
+    // touch-primary browsers; mouse/keyboard browsers keep their dense rows.
+    expect(fork).toHaveClass("mobile-touch-target");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(onFork).not.toHaveBeenCalled();
+  });
+
   it("folds the workspace-rail entries into the one mobile kebab", () => {
     // Previously a second `PanelRight` trigger sat beside the kebab; the rail
     // entries now ride in the same menu, so a phone has a single trigger.
@@ -811,15 +1123,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
-    // textContent includes it but it's invisible; the labels are what matters.
-    const svgTitleText = (el: Element) =>
-      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
-    expect(
-      screen
-        .getAllByRole("menuitem")
-        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
-    ).toEqual([
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Export",
       "Rename",
@@ -827,7 +1131,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Add to project",
       "Files",
       "Changes",
-      "GitHub",
+      "Pull Requests",
       "Agents1",
       "Archive",
       "Delete",
@@ -854,6 +1158,85 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(onOpenFiles).toHaveBeenCalled();
   });
 
+  it("opens the Tasks drawer from the kebab, with no count of workers", () => {
+    const onOpenTasks = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, showTasks: true, subagentsWorking: 2, onOpenTasks },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    const item = screen.getByTestId("mobile-tasks-action");
+    // Busy sub-agents count on the Agents item; the Tasks item is just its label.
+    expect(item.textContent?.trim()).toBe("Tasks");
+    fireEvent.click(item);
+    expect(onOpenTasks).toHaveBeenCalled();
+  });
+
+  it("opens the content-search drawer from the kebab when the feature is available", () => {
+    const onOpenContentSearch = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, showContentSearch: true, onOpenContentSearch },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Content search" }));
+    expect(onOpenContentSearch).toHaveBeenCalled();
+  });
+
+  it("opens the side-chats drawer from the kebab when the harness supports it", () => {
+    const onOpenSideChats = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      mobileMenu: { ...mobileMenu, showSideChats: true, onOpenSideChats },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+    expect(onOpenSideChats).toHaveBeenCalled();
+  });
+
+  it("hides the side-chats entry for a harness without side chat", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      mobileMenu: { ...mobileMenu, showSideChats: false },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    expect(screen.queryByRole("menuitem", { name: "Side chats" })).toBeNull();
+  });
+
   it("keeps the rail entries reachable when the session isn't owner-managed", () => {
     // No owner menu and nothing else to offer: the fallback kebab must still
     // render, or the drawers have no mobile entry point at all.
@@ -872,24 +1255,28 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getByRole("menuitem", { name: "Files" })).toBeInTheDocument();
   });
 
-  it("drops the rail entries while a push panel owns the right side", () => {
-    isMobileMock.mockReturnValue(true);
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: conversation.id,
-      conversationTitle: conversation.title,
-      actionConversation: conversation,
-      hasRailContent: true,
-      showFilesPanel: true,
-      mobileMenu: { ...mobileMenu, filesPanelOpen: true },
-    });
+  it.each(["filesPanelOpen", "contentSearchPanelOpen"] as const)(
+    "drops the rail entries while a push panel owns the right side (%s)",
+    (openPanel) => {
+      isMobileMock.mockReturnValue(true);
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: conversation.id,
+        conversationTitle: conversation.title,
+        actionConversation: conversation,
+        hasRailContent: true,
+        showFilesPanel: true,
+        mobileMenu: { ...mobileMenu, showContentSearch: true, [openPanel]: true },
+      });
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
-      button: 0,
-    });
-    expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
-    expect(screen.getByRole("menuitem", { name: "Pin" })).toBeInTheDocument();
-  });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+      });
+      expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
+      expect(screen.queryByRole("menuitem", { name: "Content search" })).toBeNull();
+      expect(screen.getByRole("menuitem", { name: "Pin" })).toBeInTheDocument();
+    },
+  );
 
   it("does not add a management menu to a sub-agent breadcrumb", () => {
     renderHeader({
@@ -904,5 +1291,79 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByRole("link", { name: "Back to parent session" })).toBeInTheDocument();
     expect(screen.getByText("reviewer")).toBeInTheDocument();
+  });
+});
+
+describe("ChatHeader — UI feature overrides", () => {
+  const serverInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { quick_pick_palette: true, canvas: false, session_overview: true },
+  };
+
+  it("hides the warning with no effective overrides", () => {
+    renderHeader({ sidebarOpen: true, serverInfo });
+    expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
+  });
+
+  it.each([false, true])("names overrides and opens the picker (mobile: %s)", async (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    expect(writeUiFeatureOverride("canvas", false)).toBe(true);
+    expect(writeUiFeatureOverride("session_overview", false)).toBe(true);
+    resetUiFeatureOverridesForTests();
+    renderHeader({ sidebarOpen: true, serverInfo });
+    const label = "UI feature flags overridden: Canvas Off, Session cost sidebar Off";
+    const button = screen.getByRole("button", { name: label });
+    expect(button).toHaveClass("text-warning");
+    fireEvent.pointerMove(button, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+    fireEvent.click(button);
+    expect(useFeatureFlagsPickerStore.getState().open).toBe(true);
+  });
+
+  it.each<Record<string, boolean>>([
+    { quick_pick_palette: false, canvas: false },
+    { quick_pick_palette: true },
+  ])("hides stored decisions when the gate is disabled or flags are unreported", (features) => {
+    expect(writeUiFeatureOverride("canvas", true)).toBe(true);
+    resetUiFeatureOverridesForTests();
+    renderHeader({
+      sidebarOpen: true,
+      serverInfo: { ...serverInfo, features },
+    });
+    expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
+  });
+});
+
+describe("ChatHeader — right panel toggle beside a sidebar that collapses itself", () => {
+  const toggle = (name: string) => screen.queryByRole("button", { name });
+
+  it("hides while the sidebar is open, so its own Collapse button is the only one", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_floating",
+      rightPanelOpen: true,
+      rightPanelCollapsesItself: true,
+    });
+    expect(toggle("Collapse right panel")).toBeNull();
+    expect(toggle("Expand right panel")).toBeNull();
+    // Nothing sits in the corner, so the header keeps its usual end padding.
+    expect(document.querySelector("header")).not.toHaveAttribute("data-corner-toggle");
+  });
+
+  it("shows Expand right panel while the sidebar is collapsed", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_floating",
+      rightPanelOpen: false,
+      rightPanelCollapsesItself: true,
+    });
+    expect(toggle("Expand right panel")).not.toBeNull();
+    // The row ends where the open sidebar's Collapse button sits, so the toggle keeps its spot.
+    expect(document.querySelector("header")).toHaveAttribute("data-corner-toggle");
+  });
+
+  it("keeps Collapse right panel when the sidebar has no corner button of its own", () => {
+    renderHeader({ sidebarOpen: true, conversationId: "conv_floating", rightPanelOpen: true });
+    expect(toggle("Collapse right panel")).not.toBeNull();
   });
 });

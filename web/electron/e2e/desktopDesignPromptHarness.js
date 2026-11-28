@@ -155,7 +155,7 @@ async function startDesignBackend(tmpDir) {
         "  harness: openai-agents",
         "os_env:",
         "  type: caller_process",
-        `  cwd: ${JSON.stringify(tmpDir)}`,
+        "  cwd: .",
         "  sandbox:",
         "    type: none",
         "",
@@ -165,18 +165,22 @@ async function startDesignBackend(tmpDir) {
       env: { ...process.env, COPYFILE_DISABLE: "1" },
     });
     assert.equal(archive.status, 0, archive.stderr?.toString());
-    const form = new FormData();
-    form.set("metadata", JSON.stringify({}));
-    form.set("bundle", new Blob([archive.stdout], { type: "application/gzip" }), "agent.tar.gz");
-    const created = await jsonRequest(`${serverUrl}/v1/sessions`, { method: "POST", body: form });
-    const sessionId = created.session_id;
-    assert.equal(typeof sessionId, "string");
-    await jsonRequest(`${serverUrl}/v1/sessions/${sessionId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ runner_id: runnerId }),
-    });
-    return { serverUrl, sessionId, mockUrl, close };
+    const createSession = async () => {
+      const form = new FormData();
+      form.set("metadata", JSON.stringify({}));
+      form.set("bundle", new Blob([archive.stdout], { type: "application/gzip" }), "agent.tar.gz");
+      const created = await jsonRequest(`${serverUrl}/v1/sessions`, { method: "POST", body: form });
+      assert.equal(typeof created.session_id, "string");
+      await jsonRequest(`${serverUrl}/v1/sessions/${created.session_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runner_id: runnerId }),
+      });
+      return created.session_id;
+    };
+    const otherSessionId = await createSession();
+    const sessionId = await createSession();
+    return { serverUrl, sessionId, otherSessionId, mockUrl, close };
   } catch (error) {
     await close();
     throw error;
@@ -238,7 +242,8 @@ async function startFormFixture() {
   };
 }
 
-async function launchDesignDesktop(tmpDir, recordDir, serverUrl) {
+/** Launch the desktop app on `serverUrl`; `env` adds to its environment. */
+async function launchDesignDesktop(tmpDir, recordDir, serverUrl, env = {}) {
   const { _electron } = require("playwright");
   const userDataDir = path.join(tmpDir, "user-data");
   fs.mkdirSync(userDataDir);
@@ -260,6 +265,7 @@ async function launchDesignDesktop(tmpDir, recordDir, serverUrl) {
     env: {
       ...isolatedEnv(path.join(tmpDir, "config")),
       OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0",
+      ...env,
     },
     ...(recordDir ? { recordVideo: { dir: recordDir } } : {}),
   });
@@ -330,6 +336,7 @@ module.exports = {
   NATIVE_DIALOG_PAGE,
   MOCK_REPLY,
   eventually,
+  jsonRequest,
   startDesignBackend,
   startFormFixture,
   launchDesignDesktop,

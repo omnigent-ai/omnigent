@@ -202,7 +202,7 @@ async def test_fork_preserves_labels(
 
     # Labels should be inherited from source — fork_conversation
     # copies labels in its transaction.
-    assert fork["labels"] == {"env": "prod", "team": "ml"}, (
+    assert fork["labels"] == {"env": "prod", "team": "ml", "omnigent.client_surface": "cli"}, (
         f"Fork labels should match source labels, "
         f"got {fork['labels']!r}. If empty, fork_conversation is "
         "not copying labels from the source."
@@ -405,8 +405,9 @@ async def test_fork_a_fork(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    A fork can itself be forked (nested fork). All three sessions
-    are independent with distinct IDs, agent IDs, and copied items.
+    A fork can itself be forked (nested fork). All three sessions are
+    independent with distinct IDs and copied items, and share the one agent
+    row (forks of your own session reuse your agent).
     """
     agent = await create_test_agent(client)
     session = await _create_session(
@@ -426,11 +427,11 @@ async def test_fork_a_fork(
     assert resp2.status_code == 201
     fork2 = resp2.json()
 
-    # All three must have distinct IDs and agent IDs.
+    # Distinct sessions, one shared agent row.
     ids = {session["id"], fork1["id"], fork2["id"]}
     assert len(ids) == 3, f"All three sessions must have unique IDs, got {ids}."
     agent_ids = {session["agent_id"], fork1["agent_id"], fork2["agent_id"]}
-    assert len(agent_ids) == 3, f"All three sessions must have unique agent_ids, got {agent_ids}."
+    assert agent_ids == {session["agent_id"]}, f"Forks must share the agent, got {agent_ids}."
 
     # The second fork should have the same items as the first fork
     # (which has the same items as the source).

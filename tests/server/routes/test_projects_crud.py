@@ -117,6 +117,46 @@ async def test_list_projects(project_client: httpx.AsyncClient) -> None:
     assert {p["name"] for p in body["data"]} == {"A", "B"}
 
 
+async def test_list_projects_pages_in_creation_order(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """A ``limit``/``after`` request pages the caller's own projects without gaps."""
+    for name in ("First", "Second", "Third"):
+        await multi_user_client.post("/v1/projects", json={"name": name}, headers=_as_user(ALICE))
+    bob = await multi_user_client.post("/v1/projects", json={"name": "Bob"}, headers=_as_user(BOB))
+
+    first = await multi_user_client.get(
+        "/v1/projects", params={"limit": 2}, headers=_as_user(ALICE)
+    )
+    assert first.status_code == 200, first.text
+    page = first.json()
+    assert len(page["data"]) == 2
+    assert page["has_more"] is True and page["last_id"] == page["data"][-1]["id"]
+
+    rest = await multi_user_client.get(
+        "/v1/projects", params={"limit": 2, "after": page["last_id"]}, headers=_as_user(ALICE)
+    )
+    assert rest.json()["has_more"] is False
+    paged = page["data"] + rest.json()["data"]
+    assert sorted(p["name"] for p in paged) == ["First", "Second", "Third"]
+    # Projects created in the same second fall back to id order.
+    keyset = sorted(paged, key=lambda p: (p["created_at"], p["id"]))
+    assert [p["id"] for p in paged] == [p["id"] for p in keyset]
+
+    foreign = await multi_user_client.get(
+        "/v1/projects", params={"after": bob.json()["id"]}, headers=_as_user(ALICE)
+    )
+    assert foreign.status_code == 400
+    unknown = await multi_user_client.get(
+        "/v1/projects", params={"after": "0" * 32}, headers=_as_user(ALICE)
+    )
+    assert unknown.status_code == 400
+    oversized = await multi_user_client.get(
+        "/v1/projects", params={"limit": 201}, headers=_as_user(ALICE)
+    )
+    assert oversized.status_code == 422
+
+
 async def test_get_project(project_client: httpx.AsyncClient) -> None:
     """A created project can be fetched by id; unknown ids 404."""
     created = (await project_client.post("/v1/projects", json={"name": "X"})).json()
@@ -159,6 +199,31 @@ async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClien
     assert created["config"] == cfg
     fetched = (await project_client.get(f"/v1/projects/{created['id']}")).json()
     assert fetched["config"] == cfg
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        {"url": "https://git.example.com/team/app.git", "branch": "main"},
+        # A legacy bare string, and a null, are stored as-is; the composer ignores them.
+        "https://git.example.com/team/app.git",
+        None,
+    ],
+    ids=["object", "legacy-string", "null"],
+)
+async def test_repository_config_is_stored_opaquely(
+    project_client: httpx.AsyncClient, repository: object
+) -> None:
+    """The saved repository round-trips through create, get and rename untouched."""
+    config = {"agent_id": "187b7cb7ac30abf4debfaa578d052ec6", "repository": repository}
+    created = (
+        await project_client.post("/v1/projects", json={"name": "Repo", "config": config})
+    ).json()
+    assert created["config"] == config
+    fetched = (await project_client.get(f"/v1/projects/{created['id']}")).json()
+    assert fetched["config"] == config
+    renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "Renamed"})
+    assert renamed.json()["config"] == config
 
 
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
@@ -229,9 +294,9 @@ async def test_session_projects_unions_first_class_and_labels(
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": both["id"], "name": "Both", "icon": None},
-        {"id": empty["id"], "name": "Empty FC", "icon": None},
-        {"id": None, "name": "Label Only", "icon": None},
+        {"id": both["id"], "name": "Both", "icon": None, "muted": False},
+        {"id": empty["id"], "name": "Empty FC", "icon": None, "muted": False},
+        {"id": None, "name": "Label Only", "icon": None, "muted": False},
     ]
 
 
@@ -253,8 +318,28 @@ async def test_session_projects_surfaces_config_icon(
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": fire["id"], "name": "Fire", "icon": "🔥"},
-        {"id": plain["id"], "name": "Plain", "icon": None},
+        {"id": fire["id"], "name": "Fire", "icon": "🔥", "muted": False},
+        {"id": plain["id"], "name": "Plain", "icon": None, "muted": False},
+    ]
+
+
+async def test_session_projects_surfaces_config_muted(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Only a literal ``config.muted: true`` marks the sidebar folder muted."""
+    muted = (
+        await project_client.post("/v1/projects", json={"name": "A", "config": {"muted": True}})
+    ).json()
+    # A non-boolean value someone else wrote into the opaque config doesn't mute.
+    truthy = (
+        await project_client.post("/v1/projects", json={"name": "B", "config": {"muted": "yes"}})
+    ).json()
+
+    resp = await project_client.get("/v1/sessions/projects")
+    assert resp.status_code == 200
+    assert resp.json() == [
+        {"id": muted["id"], "name": "A", "icon": None, "muted": True},
+        {"id": truthy["id"], "name": "B", "icon": None, "muted": False},
     ]
 
 
@@ -469,7 +554,7 @@ async def test_rejected_project_mutation_announces_nothing(
         assert bob_events == []
 
 
-async def test_project_order_round_trip(project_client: httpx.AsyncClient) -> None:
+async def test_project_order_round_trip(project_client: httpx.AsyncClient, db_uri: str) -> None:
     """Custom order affects both discovery APIs and survives rename/delete/reset."""
 
     async def names(path: str) -> list[str]:
@@ -492,6 +577,15 @@ async def test_project_order_round_trip(project_client: httpx.AsyncClient) -> No
     )
     assert response.status_code == 200
     assert response.json() == {"ordered_project_ids": ordered, "sort_mode": "manual"}
+    # A fresh store reads the persisted preference without a users-table column.
+    from sqlalchemy import inspect
+
+    from omnigent.db.utils import get_or_create_engine
+
+    assert "project_order" not in {
+        column["name"] for column in inspect(get_or_create_engine(db_uri)).get_columns("users")
+    }
+    assert SqlAlchemyProjectStore(db_uri).get_order_preference(user_id=None) == response.json()
     for path in ["/v1/projects", "/v1/sessions/projects"]:
         assert await names(path) == ["WORK", "BUG", "DOC"]
     await project_client.patch(f"/v1/projects/{ids[2]}", json={"name": "ZZZ"})
@@ -532,8 +626,9 @@ async def test_project_order_rejects_oversized_or_malformed_ids(
 async def test_corrupt_order_does_not_break_project_discovery(
     project_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    from sqlalchemy import text
+    from sqlalchemy import LargeBinary, bindparam, update
 
+    from omnigent.db.db_models import SqlPreference
     from omnigent.db.utils import get_or_create_engine
 
     for name in ("Z", "A"):
@@ -543,7 +638,13 @@ async def test_corrupt_order_does_not_break_project_discovery(
     ).raise_for_status()
     with get_or_create_engine(db_uri).begin() as connection:
         connection.execute(
-            text("UPDATE users SET project_order=:raw WHERE workspace_id=0 AND id='local'"),
+            update(SqlPreference)
+            .where(
+                SqlPreference.workspace_id == 0,
+                SqlPreference.user_id == "local",
+                SqlPreference.key == "project_order",
+            )
+            .values(value=bindparam("raw", type_=LargeBinary)),
             {"raw": b"\x00\x01broken compression"},
         )
     preference = await project_client.get("/v1/projects/order")

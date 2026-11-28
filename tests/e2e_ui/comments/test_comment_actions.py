@@ -13,9 +13,10 @@ every file type):
   3. ``test_delete_comment`` — the "Delete" action removes the card and the
      comment is gone from the REST list.
   4. ``test_address_all_moves_comments_to_addressed_tab`` — "Address All"
-     POSTs to ``/comments/send`` (which marks every open comment addressed and
-     dispatches a formatted message to the agent); the Open tab drains and the
-     comments reappear under the Addressed tab.
+     POSTs to ``/comments/send`` (which marks every open comment in the
+     session addressed, across files, and dispatches one formatted message to
+     the agent); the Open tab drains and the comments reappear under the Sent
+     tab.
   5. ``test_comment_link_opens_same_comment_in_new_browser`` — the per-card
      "Copy link" button writes a deep link to the clipboard; opening that link
      in a fresh browser context lands on the file with the exact comment
@@ -56,6 +57,9 @@ from tests.e2e_ui.conftest import open_right_rail
 # ---------------------------------------------------------------------------
 
 _FILE_PATH = "comment_actions.md"
+
+# A second file whose open comment "Address All" must send along with the first file's.
+_OTHER_FILE_PATH = "comment_actions_other.md"
 
 # Anchor paragraph for the seeded comment(s); appears exactly once so the
 # stored offsets unambiguously match the file content.
@@ -118,6 +122,7 @@ def _seed_comment(
     body: str,
     *,
     author: str | None = None,
+    path: str = _FILE_PATH,
 ) -> str:
     """POST one open comment anchored to ``anchor`` and return its id.
 
@@ -133,6 +138,7 @@ def _seed_comment(
     :param anchor: Substring of the file content the comment anchors to.
     :param body: Comment body text.
     :param author: Optional identity to attribute the comment to.
+    :param path: File the comment belongs to; seeded with ``_FILE_CONTENT``.
     :returns: The created comment id.
     """
     start = _FILE_CONTENT.find(anchor)
@@ -140,7 +146,7 @@ def _seed_comment(
     resp = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/comments",
         json={
-            "path": _FILE_PATH,
+            "path": path,
             "body": body,
             "start_index": start,
             "end_index": start + len(anchor),
@@ -158,11 +164,10 @@ def _seed_comment(
 # ---------------------------------------------------------------------------
 
 
-def _seed_file(base_url: str, session_id: str) -> None:
+def _seed_file(base_url: str, session_id: str, path: str = _FILE_PATH) -> None:
     """PUT the test markdown file into the session's filesystem resources."""
     file_url = (
-        f"{base_url}/v1/sessions/{session_id}"
-        f"/resources/environments/default/filesystem/{_FILE_PATH}"
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}"
     )
     httpx.put(
         file_url,
@@ -414,21 +419,28 @@ def test_single_user_comment_is_editable_and_deletable(
 
 
 def test_address_all_moves_comments_to_addressed_tab(
-    page: Page,
+    request: pytest.FixtureRequest,
     commented_session: tuple[str, str, str],
 ) -> None:
-    """ "Address All" sends open comments to the agent and moves them to Addressed.
+    """ "Address All" sends every file's open comments and moves them to Sent.
 
     ``/comments/send`` marks every requested comment ``addressed`` server-side
     and returns a formatted message the SPA dispatches to the agent. The Open
-    tab drains and the comments reappear under the Addressed tab — this is the
+    tab drains and the comments reappear under the Sent tab, and an open
+    comment on another file is sent in the same message — this is the
     deterministic, server-side half of the flow (the agent's reply is not
     asserted, only that the comments transitioned).
     """
     base_url, session_id, _comment_id = commented_session
     # Seed a second open comment so "Address All" addresses more than one.
     _seed_comment(base_url, session_id, _ANCHOR_TEXT_2, "Second open comment for address-all.")
+    _seed_file(base_url, session_id, _OTHER_FILE_PATH)
+    _seed_comment(
+        base_url, session_id, _ANCHOR_TEXT, "Open comment on another file.", path=_OTHER_FILE_PATH
+    )
 
+    # Create the page after setup so a recording starts at the user's journey.
+    page: Page = request.getfixturevalue("page")
     file_viewer = _open_comments_panel(page, base_url, session_id)
 
     # Both open comments are listed; select one before addressing them.
@@ -438,10 +450,14 @@ def test_address_all_moves_comments_to_addressed_tab(
 
     address_all = file_viewer.get_by_role("button", name=re.compile("Address All", re.IGNORECASE))
     expect(address_all).to_be_enabled()
+    # The label and tooltip include the other file's open comment.
+    expect(address_all).to_have_text("Address All (3)")
+    address_all.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Sends 3 draft comments from 2 files")
     address_all.click()
 
-    # The selected comment follows its status transition into Addressed.
-    addressed_tab = file_viewer.get_by_role("button", name=re.compile("Addressed"))
+    # The selected comment follows its status transition into Sent.
+    addressed_tab = file_viewer.get_by_role("button", name=re.compile("Sent"))
     expect(addressed_tab).to_contain_text("2")
     expect(addressed_tab).to_have_class(re.compile("border-primary"))
     selected_card = file_viewer.locator("div.border-primary").filter(has_text=_SHORT_BODY)
@@ -453,14 +469,18 @@ def test_address_all_moves_comments_to_addressed_tab(
     file_viewer.get_by_role("button", name=re.compile("Open")).click()
     expect(file_viewer).to_contain_text("No open comments.")
 
-    # REST confirms both comments carry status "addressed".
+    # REST confirms every comment in the session, including the other file's, is addressed.
     comments_resp = httpx.get(
-        f"{base_url}/v1/sessions/{session_id}/comments?path={_FILE_PATH}",
+        f"{base_url}/v1/sessions/{session_id}/comments",
         timeout=10.0,
     )
     comments_resp.raise_for_status()
     comments = comments_resp.json()
-    assert len(comments) == 2, f"Expected 2 comments, got {comments}"
+    assert sorted(c["path"] for c in comments) == [
+        _FILE_PATH,
+        _FILE_PATH,
+        _OTHER_FILE_PATH,
+    ], comments
     assert all(c["status"] == "addressed" for c in comments), comments
 
 

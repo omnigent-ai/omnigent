@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -17,9 +17,12 @@ from fastapi import FastAPI
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.runner import app as _runner_app
 from omnigent.runner import create_runner_app
+from omnigent.runner import native as _runner_native
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
+from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import NullServerClient
 
 # The real store-backed catalog resolver, captured before the autouse fixture
@@ -30,24 +33,57 @@ REAL_CLAUDE_LAUNCH_CATALOG = claude_native.claude_launch_catalog
 REAL_CLAUDE_REPROBED_LAUNCH_CATALOG = claude_native.claude_reprobed_launch_catalog
 REAL_CODEX_LAUNCH_CATALOG = codex_native_app_server.codex_launch_catalog
 REAL_CODEX_REPROBED_LAUNCH_CATALOG = codex_native_app_server.codex_reprobed_launch_catalog
+REAL_DATABRICKS_PROFILE_CODEX_MODELS = codex_native_app_server.databricks_profile_codex_models
 
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# ``omnigent.runner.app`` serves the private native helpers listed in
+# ``omnigent.runner.native.__all__`` through a module ``__getattr__`` that
+# forwards to the orchestration module, and its ``_native_builder`` wrappers
+# copy any *app-level* override of those names onto orchestration for the
+# duration of an ``_auto_create_*`` call. That keeps
+# ``monkeypatch.setattr(runner_app, "<helper>", ...)`` working — but
+# ``MonkeyPatch.undo`` restores the "old" value it read through ``__getattr__``
+# with a plain ``setattr``, which MATERIALIZES the pristine orchestration
+# function as a permanent ``runner_app`` global. From then on the wrapper sees
+# that stale original as an intentional override and clobbers any
+# orchestration-level patch a later test in the same xdist worker makes
+# (``test_codex_tui_recovery_preserves_live_control_plane`` failed exactly this
+# way whenever a test that patched ``runner_app._codex_native_launch_config``
+# had run first). Snapshot which forwarded names are absent from the app
+# module before any test runs, and drop whatever a test leaves behind.
+_FORWARDED_NATIVE_NAMES: frozenset[str] = frozenset(
+    name for name in _runner_native.__all__ if name not in vars(_runner_app)
+)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> Iterator[None]:
+    """Un-materialize native helpers leaked into ``omnigent.runner.app`` globals.
+
+    A hook wrapper (not an autouse fixture) so the scrub runs after *every*
+    fixture finalizer — including the ``monkeypatch`` undo that creates the
+    leak — regardless of fixture setup order.
+
+    :param item: The test item being torn down.
+    :param nextitem: The next scheduled item, if any (unused).
+    """
+    del item, nextitem
+    yield
+    for name in _FORWARDED_NATIVE_NAMES:
+        if name in vars(_runner_app):
+            delattr(_runner_app, name)
 
 
 @pytest.fixture(autouse=True)
 def _isolated_model_catalog_store(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Keep launch-path catalog consults off the developer's machine.
+    """Keep launch-path catalog reads off the developer's machine.
 
-    The native launch paths consult the shared model-catalog store and, on
-    a miss, probe the REAL harness CLIs — which a unit test must never do
-    (a real ``claude`` boot takes ~6 s and writes the developer's real
-    ``~/.omnigent`` store). Redirect the store's directory seam per test
-    and stub the launch-catalog resolvers to "no catalog" (the
-    pre-catalog behavior); a test exercising catalogs re-patches them
-    explicitly.
+    Redirect the catalog store per test and stub CLI and workspace model
+    discovery; a test that exercises a resolver restores it explicitly.
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
     monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)
@@ -64,6 +100,23 @@ def _isolated_model_catalog_store(
     )
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.codex_reprobed_launch_catalog", _no_catalog
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.databricks_profile_codex_models",
+        lambda _profile: codex_native_app_server.DatabricksCodexModelListing(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_claude_prompt_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the claude-native model-change prompt wait off a real tmux pane.
+
+    The handler waits for the pane's prompt before typing. Runner tests have no
+    pane behind them, so that wait passes at once; a test that exercises it
+    re-patches ``wait_for_input_ready`` itself.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.wait_for_input_ready", lambda *_a, **_k: None
     )
 
 
@@ -278,6 +331,10 @@ class _FakeProcessManager:
         """Check if a session was registered via :meth:`get_client`."""
         return conversation_id in self._sessions
 
+    def registered_client(self, conversation_id: str) -> _ScriptedHarnessClient | None:
+        """Return the existing scripted client without creating a session."""
+        return self._client if conversation_id in self._sessions else None
+
     def has_active_turn(self, conversation_id: str) -> bool:
         """Check if a turn is marked active for this conversation."""
         return conversation_id in self._active_turns
@@ -306,7 +363,12 @@ class _FakeProcessManager:
         return True
 
     async def release(
-        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+        expected_client: object = ...,
+        can_release: Callable[[], bool] | None = None,
     ) -> None:
         """Record a release and remove the session.
 
@@ -318,6 +380,13 @@ class _FakeProcessManager:
             conversation with an active turn is not torn down.
         """
         self.release_calls.append((conversation_id, only_if_idle_cutoff))
+        if can_release is not None and not can_release():
+            return
+        if (
+            expected_client is not ...
+            and self.registered_client(conversation_id) is not expected_client
+        ):
+            return
         if only_if_idle_cutoff is not None and conversation_id in self._active_turns:
             return
         self.released.append(conversation_id)
@@ -355,6 +424,20 @@ async def _spec_resolver_returning(spec: AgentSpec) -> Any:
         return spec
 
     return _resolve
+
+
+async def _build_app_for_spec(
+    spec: AgentSpec, *, terminal_registry: TerminalRegistry | None = None
+) -> tuple[FastAPI, _FakeProcessManager]:
+    """Build the real runner app with an idle harness and one fixed agent spec."""
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    return app, pm
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -730,6 +813,7 @@ class _BlockingHarnessClient(_ScriptedHarnessClient):
 
 def _build_interrupt_app(
     gate: asyncio.Event,
+    sse_frames: list[str] | None = None,
 ) -> tuple[FastAPI, _FakeProcessManager, _BlockingHarnessClient]:
     """Build a runner app whose harness emits dangling function_calls.
 
@@ -740,6 +824,8 @@ def _build_interrupt_app(
 
     :param gate: Event that unblocks the harness after the
         function_call frames.
+    :param sse_frames: Frames to stream instead; the gate blocks
+        before the second one.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
     # Use the test-only harness so _build_spawn_env_from_spec returns None
@@ -750,7 +836,7 @@ def _build_interrupt_app(
         name="t",
         executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
     )
-    sse_frames = [
+    default_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_int"}}),
         _sse(
             {
@@ -777,7 +863,9 @@ def _build_interrupt_app(
         ),
         _sse({"type": "response.completed", "response": {"id": "resp_int"}}),
     ]
-    harness_client = _BlockingHarnessClient(sse_frames, gate)
+    harness_client = _BlockingHarnessClient(
+        default_frames if sse_frames is None else sse_frames, gate
+    )
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -810,7 +898,7 @@ def _no_wake_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def _record(seconds: float) -> None:
         recorded.append(seconds)
 
-    monkeypatch.setattr("omnigent.runner.app._wake_retry_sleep", _record)
+    monkeypatch.setattr("omnigent.runner.subagent_work._wake_retry_sleep", _record)
     return recorded
 
 

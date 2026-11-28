@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +41,9 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from omnigent.terminals.shell_inspection import ShellInspection, ShellState
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -151,9 +156,23 @@ class _CapturingResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def set_session_background_publisher(
+        self,
+        publisher: Callable[[str, bool], None],
+    ) -> None:
+        """
+        Accept the background-shell publisher installed by the runner app.
+
+        :param publisher: Callable ``(session_id, running) -> None``.
+        :returns: None.
+        """
+        self._session_background_publisher = publisher
+
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
+        *,
+        accepts_inferred_status: Callable[[], bool] | None = None,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -162,9 +181,14 @@ class _CapturingResourceRegistry:
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
         :param publisher: Callable ``(session_id, status) -> None``.
+        :param accepts_inferred_status: Unused server capability check.
         :returns: None.
         """
+        del accepts_inferred_status
         self._session_status_publisher = publisher
+
+    def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
+        self._session_failure_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -298,6 +322,39 @@ def test_terminal_activity_refreshes_harness_idle_lease(tmp_path: Path) -> None:
     assert process_manager.activity_noted == ["conv_native"]
 
 
+@pytest.mark.asyncio
+async def test_background_shell_reports_reach_the_server_as_session_events(
+    tmp_path: Path,
+) -> None:
+    """The runner posts the flag as a session event, never into its session stream."""
+    posts: list[tuple[str, Any]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+            posts.append((url, kwargs.get("json")))
+            return httpx.Response(202, json={"queued": False}, request=httpx.Request("POST", url))
+
+    resource_registry = _CapturingResourceRegistry(tmp_path)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        resource_registry=resource_registry,  # type: ignore[arg-type]
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = "conv_background_report"
+
+    resource_registry._session_background_publisher(session_id, True)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert len(posts) == 1
+    url, body = posts[0]
+    assert url == f"/v1/sessions/{session_id}/events"
+    assert body["type"] == "external_background_work"
+    assert body["data"]["running"] is True
+    assert isinstance(body["data"]["reported_at"], int)
+    assert session_id not in app.state.session_event_queues
+
+
 @pytest.fixture
 def registry(tmp_path: Path) -> TerminalRegistry:
     terminal_registry = TerminalRegistry(
@@ -341,6 +398,40 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
         yield c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "targets,status",
+    [
+        ([{"url": "https://github.com/org/repo", "path": ""}], 200),
+        ([{"url": "https://github.com/org/repo", "path": "../outside"}], 400),
+        ([{"url": "https://github.com/org/repo", "path": ""}] * 11, 400),
+        ([{"path": ""}], 400),
+    ],
+)
+async def test_repository_branches_runner_contract(
+    tmp_path: Path, targets: object, status: int
+) -> None:
+    app = create_runner_app(
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/repository-branches",
+            params={"repositories": json.dumps(targets)},
+        )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {
+            "repositories": [
+                {"url": "https://github.com/org/repo", "branch": None, "pushed": None}
+            ]
+        }
 
 
 @pytest.mark.asyncio
@@ -775,6 +866,73 @@ async def test_get_terminal_by_id(
 
 
 @pytest.mark.asyncio
+async def test_sign_in_link_reports_the_prompt_a_running_pane_shows(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    tmp_path: Path,
+) -> None:
+    """
+    GET /sign-in-link lifts the live sign-in prompt from the agent's own pane,
+    reading it with wrapped rows joined so a wide address comes back whole. A
+    saved link in an old error card is bound to a launcher process that has
+    moved on; the web asks here at click time instead. Only the native agent's
+    pane counts: a shell the person opened alongside it cannot supply the
+    address, however sign-in-like its output looks.
+    """
+    instance = _make_instance("codex", "main", tmp_path)
+    _seed_registry(registry, "conv_abc", [instance])
+    shell = registry.get("conv_abc", "bash", "s1")
+    assert shell is not None
+
+    async def _shell_read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        del scrollback, join_wrapped
+        return {
+            "screen": (
+                "! First copy your one-time code: 1A2B-3C4D\n"
+                "Press Enter to open https://github.com/login/device in your browser...\n"
+            )
+        }
+
+    shell.read = _shell_read  # type: ignore[method-assign]
+    reads: list[bool] = []
+
+    async def _read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        del scrollback
+        reads.append(join_wrapped)
+        return {
+            "screen": (
+                "Logging in via SSO...\n"
+                "please open the following URL:\n"
+                "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
+                "code: HQ7M-2KPD\n"
+            )
+        }
+
+    instance.read = _read  # type: ignore[method-assign]
+
+    resp = await client.get("/v1/sessions/conv_abc/sign-in-link")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "pending": True,
+        "url": "https://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz",
+        "code": "HQ7M-2KPD",
+        "terminal_id": "terminal_codex_main",
+    }
+    assert reads == [True]
+
+
+@pytest.mark.asyncio
+async def test_sign_in_link_reports_nothing_pending_without_a_prompt(
+    client: httpx.AsyncClient,
+) -> None:
+    """Panes showing no address (or none running) answer ``pending: false``."""
+    resp = await client.get("/v1/sessions/conv_abc/sign-in-link")
+    assert resp.status_code == 200
+    assert resp.json() == {"pending": False, "url": None, "code": None}
+
+
+@pytest.mark.asyncio
 async def test_get_terminal_by_id_returns_404_when_tmux_exited(
     client: httpx.AsyncClient,
     registry: TerminalRegistry,
@@ -807,6 +965,154 @@ async def test_get_terminal_by_id_returns_404_when_tmux_exited(
     # claude-native. A 200 here would preserve the reconnect loop bug.
     assert resp.status_code == 404
     assert instance.running is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_reads_only_the_named_terminal_of_that_session(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shell route inspects the session's own terminal and answers no pids."""
+    inspected: list[str] = []
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        inspected.append(self.name)
+        return ShellInspection(ShellState.BUSY, "vim", 1)
+
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await client.get(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell",
+        params={"socket": "/tmp/elsewhere.sock", "pid": "1"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"state": "busy", "foreground": "vim", "background_jobs": 1}
+    assert inspected == ["bash"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Another session's terminal, in the same runner and workspace.
+        "/v1/sessions/conv_abc/resources/terminals/terminal_other_s1/shell",
+        "/v1/sessions/conv_abc/resources/terminals/terminal_nope_s1/shell",
+        # A terminal whose tmux has exited.
+        "/v1/sessions/conv_abc/resources/terminals/terminal_stale_s3/shell",
+        "/v1/sessions/conv_unknown/resources/terminals/terminal_bash_s1/shell",
+    ],
+    ids=["other session", "unknown", "not running", "unknown session"],
+)
+async def test_terminal_shell_answers_every_miss_with_the_same_404(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A foreign terminal can't be told apart from a missing one, and none is inspected."""
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await client.get(path)
+
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"code": "not_found", "message": "Terminal not found"}}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_the_same_404_when_tmux_exited_under_a_stale_flag(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal still flagged running whose tmux is gone is a miss, not an "unknown" answer."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+
+    async def dead_tmux() -> bool:
+        return False
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    instance.is_alive = dead_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    assert instance.running is True
+    resp = await client.get("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell")
+
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"code": "not_found", "message": "Terminal not found"}}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_unknown_in_time_when_its_liveness_check_stalls(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux liveness probe that never answers is cut off with the read, not waited out."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    gave_up = asyncio.Event()
+
+    async def stalled_tmux() -> bool:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            gave_up.set()
+        raise AssertionError("unreachable")
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    instance.is_alive = stalled_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await asyncio.wait_for(
+        client.get("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"), 5
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"state": "unknown", "foreground": None, "background_jobs": None}
+    assert gave_up.is_set()
+
+
+@pytest.mark.asyncio
+async def test_repeated_terminal_shell_requests_share_one_liveness_check_and_read(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Several close paths asking at once start one tmux probe and one read between them.
+
+    Busy, since only a read begun after a request may answer it idle.
+    """
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    probes = 0
+    reads = 0
+    release = asyncio.Event()
+
+    async def live_tmux() -> bool:
+        nonlocal probes
+        probes += 1
+        await release.wait()
+        return True
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        nonlocal reads
+        reads += 1
+        return ShellInspection(ShellState.BUSY, "vim", 0)
+
+    instance.is_alive = live_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    path = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"
+    requests = [asyncio.create_task(client.get(path)) for _ in range(3)]
+
+    async def probe_started() -> None:
+        while probes == 0:
+            await asyncio.sleep(0)
+
+    # Bounded, so a request that never probes fails here instead of hanging.
+    await asyncio.wait_for(probe_started(), timeout=5)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    responses = await asyncio.gather(*requests)
+
+    assert [resp.json()["state"] for resp in responses] == ["busy"] * 3
+    assert (probes, reads) == (1, 1)
 
 
 @pytest.mark.asyncio
@@ -1042,12 +1348,12 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
     ``omnigent claude`` wrapper) could spawn an unsandboxed
     terminal in a session whose YAML declared an egress allow-list.
     """
-    from omnigent.inner.datamodel import AgentDef, OSEnvSandboxSpec, OSEnvSpec
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="hardened",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
@@ -1063,7 +1369,7 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
         assert request.url.path == "/v1/sessions/conv_test"
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_hardened"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         assert agent_id == "agent_hardened"
         assert session_id == "conv_test"
         return agent
@@ -1119,13 +1425,6 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     could spawn the YAML-declared terminal name with a completely
     different command.
     """
-    from omnigent.inner.datamodel import (
-        AgentDef,
-        OSEnvSandboxSpec,
-        OSEnvSpec,
-        TerminalEnvSpec,
-    )
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     declared_zsh = TerminalEnvSpec(
@@ -1134,8 +1433,10 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
         env={"OPERATOR": "set"},
         os_env="inherit",
     )
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="hardened",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
@@ -1147,7 +1448,7 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_hardened"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -1194,7 +1495,6 @@ async def test_create_terminal_rejects_unavailable_native_shell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A mixed-version request cannot silently substitute another shell."""
-    from omnigent.inner.datamodel import AgentDef
     from omnigent.native.native_coding_agents import (
         CLAUDE_NATIVE_AGENT_NAME,
         native_shell_terminal_specs,
@@ -1208,15 +1508,17 @@ async def test_create_terminal_rejects_unavailable_native_shell(
     monkeypatch.setattr("shutil.which", lambda _name: None)
     monkeypatch.setattr("omnigent._platform._INTERACTIVE_SHELL_DIRS", ())
 
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name=CLAUDE_NATIVE_AGENT_NAME,
+        executor=ExecutorSpec(),
         terminals=native_shell_terminal_specs(["fish"]),
     )
 
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_native"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -1269,13 +1571,6 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     workspace must be baked into the launched spec (never via
     ``cwd_override``, which the stub asserts stays ``None``).
     """
-    from omnigent.inner.datamodel import (
-        AgentDef,
-        OSEnvSandboxSpec,
-        OSEnvSpec,
-        TerminalEnvSpec,
-    )
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     # Declared shell owns its os_env with the placeholder cwd — the
@@ -1288,8 +1583,10 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
-    agent = AgentDef(
+    agent = AgentSpec(
+        spec_version=1,
         name="polly-like",
+        executor=ExecutorSpec(),
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=".",
@@ -1301,7 +1598,7 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_polly"})
 
-    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+    async def _resolver(agent_id: str, session_id: str) -> AgentSpec:
         return agent
 
     server_client = httpx.AsyncClient(
@@ -1562,6 +1859,8 @@ class _WatcherCapture:
         was wired.
     :param on_tick: The per-tick callback the registry passed (drives the
         claude-native status-file poller), or ``None`` if none was wired.
+    :param idle_poll_backoff_allowed: The native idle-poll backoff gate the
+        registry passed, or ``None`` when no backoff gate was wired.
     :param idle_threshold_s: The per-watcher idle threshold the registry
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
@@ -1573,6 +1872,7 @@ class _WatcherCapture:
     on_idle: Callable[[], None] | None = None
     on_exit: Callable[[], None] | None = None
     on_tick: Callable[[], None] | None = None
+    idle_poll_backoff_allowed: Callable[[], bool] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
     replace: bool = False
@@ -1608,6 +1908,7 @@ def _make_capturing_instance(
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1617,6 +1918,7 @@ def _make_capturing_instance(
         capture.on_activity = on_activity
         capture.on_exit = on_exit
         capture.on_tick = on_tick
+        capture.idle_poll_backoff_allowed = idle_poll_backoff_allowed
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
         capture.replace = replace
@@ -1627,18 +1929,14 @@ def _make_capturing_instance(
     return instance
 
 
-class _LaunchReturningRegistry:
-    """Terminal-registry stub whose ``launch`` returns a fixed instance.
-
-    The real terminal launch helpers only call
-    ``launch`` on its terminal registry; returning a prepared instance
-    lets the test exercise the real ``_start_terminal_activity_watcher``
-    wiring without spawning a terminal.
+class _LaunchReturningRegistry(TerminalRegistry):
+    """Register a prepared instance using the real registry's ownership lookups.
 
     :param instance: The instance every ``launch`` returns.
     """
 
     def __init__(self, instance: TerminalInstance) -> None:
+        super().__init__()
         self._instance = instance
 
     async def launch(
@@ -1651,20 +1949,21 @@ class _LaunchReturningRegistry:
         parent_os_env: Any | None = None,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
+        program_status_app: str | None = None,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
-        :param conversation_id: Session/conversation id (unused).
+        :param conversation_id: Session/conversation id that owns the instance.
         :param terminal_name: Terminal name (unused).
         :param session_key: Per-launch key (unused).
         :param spec: Terminal env spec (unused).
         :param parent_os_env: Agent os_env (unused).
         :param cwd_override: cwd override (unused).
         :param sandbox_override: sandbox override (unused).
+        :param program_status_app: Runtime status application identity.
         :returns: The prepared terminal instance.
         """
         del (
-            conversation_id,
             terminal_name,
             session_key,
             spec,
@@ -1672,6 +1971,8 @@ class _LaunchReturningRegistry:
             cwd_override,
             sandbox_override,
         )
+        self._instance.program_status_app = program_status_app
+        _seed_registry(self, conversation_id, [self._instance])
         return self._instance
 
 
@@ -1949,6 +2250,12 @@ async def test_concurrent_resource_reads_share_one_session_snapshot(
         """
         nonlocal snapshot_count
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+                "include_live_status": "false",
+            }
             snapshot_count += 1
             snapshot_started.set()
             await release.wait()
@@ -2621,6 +2928,167 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
 
 
 @pytest.mark.asyncio
+async def test_slow_changed_files_listing_leaves_the_default_executor_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``git status`` stuck in the changes listing holds no default-executor worker.
+
+    A listing the browser abandons keeps its git call running; on the default
+    executor, enough of them starve every other offload, message delivery included.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+
+    conv = "conv_slow_changes"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    release_git = threading.Event()
+    listing_threads: list[str] = []
+
+    class _SlowGitRegistry:
+        """Stands in for a git status that takes minutes on a large tree."""
+
+        def __init__(self, watch_path: Path | None) -> None:
+            self.watch_path = watch_path
+
+        def start(self) -> None:
+            return None
+
+        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
+            del session_id, limit
+            listing_threads.append(threading.current_thread().name)
+            release_git.wait(budget(10))
+            return []
+
+    monkeypatch.setattr(
+        filesystem_registry_mod,
+        "create_filesystem_registry",
+        lambda *, watch_path=None: _SlowGitRegistry(watch_path),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(
+                200, json={"id": conv, "agent_id": None, "workspace": str(workspace)}
+            )
+        return httpx.Response(200, json={})
+
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    )
+    app = create_runner_app(runner_workspace=workspace, server_client=server_client)
+    path = f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            # Concurrent listings share one scan, so one stuck git status
+            # would fill the one-worker default executor if it ran there.
+            listings = [asyncio.create_task(client.get(path)) for _ in range(2)]
+            await poll_until_async(lambda: len(listing_threads) >= 1, timeout_s=budget(5))
+
+            quick = asyncio.to_thread(lambda: "done")
+            assert await asyncio.wait_for(quick, timeout=budget(2)) == "done"
+            assert all(name.startswith("runner-slow-io_") for name in listing_threads)
+
+            release_git.set()
+            responses = await asyncio.gather(*listings)
+    finally:
+        release_git.set()
+        await server_client.aclose()
+
+    assert [response.status_code for response in responses] == [200, 200]
+
+
+@pytest.mark.asyncio
+async def test_listings_arriving_mid_scan_share_the_next_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent changes listings share git status runs instead of each queuing one.
+
+    Refetches the browser abandons would otherwise stack full scans on the slow-IO
+    pool. A listing that arrives mid-scan gets the next scan, never the running one,
+    so its answer is no older than the request.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+    from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
+
+    conv = "conv_shared_changes"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scans_started: list[int] = []
+    releases = [threading.Event() for _ in range(4)]
+
+    class _GatedGitRegistry:
+        """Each git status blocks until the test releases it, then names itself."""
+
+        def __init__(self, watch_path: Path | None) -> None:
+            self.watch_path = watch_path
+
+        def start(self) -> None:
+            return None
+
+        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
+            del session_id, limit
+            scan = len(scans_started)
+            scans_started.append(scan)
+            releases[scan].wait(budget(10))
+            return [{"path": f"scan-{scan}.txt", "status": "modified"}]
+
+    monkeypatch.setattr(
+        filesystem_registry_mod,
+        "create_filesystem_registry",
+        lambda *, watch_path=None: _GatedGitRegistry(watch_path),
+    )
+    arrivals: list[object] = []
+    coalesced_run = FreshCallCoalescer.run
+
+    async def _observed_run(self: Any, key: Any, call: Any) -> Any:
+        arrivals.append(key)
+        return await coalesced_run(self, key, call)
+
+    monkeypatch.setattr(FreshCallCoalescer, "run", _observed_run)
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(
+                200, json={"id": conv, "agent_id": None, "workspace": str(workspace)}
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    )
+    app = create_runner_app(runner_workspace=workspace, server_client=server_client)
+    path = f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            first = asyncio.create_task(client.get(path))
+            await poll_until_async(lambda: scans_started == [0], timeout_s=budget(5))
+            late = [asyncio.create_task(client.get(path)) for _ in range(3)]
+            await poll_until_async(lambda: len(arrivals) == 4, timeout_s=budget(5))
+
+            releases[0].set()
+            first_response = await first
+            await poll_until_async(lambda: len(scans_started) == 2, timeout_s=budget(5))
+            releases[1].set()
+            late_responses = await asyncio.gather(*late)
+    finally:
+        for release in releases:
+            release.set()
+        await server_client.aclose()
+
+    assert scans_started == [0, 1]
+    assert first_response.status_code == 200, first_response.text
+    assert [entry["path"] for entry in first_response.json()["data"]] == ["scan-0.txt"]
+    for response in late_responses:
+        assert response.status_code == 200, response.text
+        assert [entry["path"] for entry in response.json()["data"]] == ["scan-1.txt"]
+
+
+@pytest.mark.asyncio
 async def test_reset_state_discards_a_snapshot_fill_already_in_flight(
     tmp_path: Path,
 ) -> None:
@@ -2734,6 +3202,7 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
 
     from omnigent.runner.resource_registry import TerminalLifecycle
     from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
     class _Terminal(TerminalInstance):
         closed: bool = False
@@ -2759,6 +3228,8 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
         private_dir=tmp_path / "dead",
         running=True,
     )
+    dead._remember_exit_status("1 2")
+    dead._last_exit_snapshot = "startup parser error"
     successor = _Terminal(
         name="claude",
         session_key="main",
@@ -2771,7 +3242,7 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
     terminal_registry._by_conversation["conv_evict"] = {("claude", "main"): successor}
     terminal_registry._instance_locks[("conv_evict", "claude", "main")] = threading.Lock()
 
-    with pytest.raises(RuntimeError, match="is not running"):
+    with pytest.raises(TerminalExitedDuringLaunch, match="exit status 2") as exited:
         await registry._observe_terminal_with_lifecycle(
             TerminalLifecycle.AUXILIARY,
             session_id="conv_evict",
@@ -2780,6 +3251,9 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
             instance=dead,
         )
 
+    assert exited.value.instance is dead
+    assert exited.value.instance.last_exit_status() == 2
+    assert exited.value.instance.last_exit_text() == "startup parser error"
     assert successor.closed is False, (
         "the live successor on this key must survive eviction of the dead instance"
     )

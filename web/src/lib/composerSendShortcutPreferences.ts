@@ -51,6 +51,20 @@ export function isComposerSendKey(
 }
 
 /**
+ * Alt/Option+Enter inserts a line break like Shift+Enter, matching most harness
+ * TUIs. Browsers insert nothing for this chord, so the composer does it itself.
+ */
+export function isComposerAltNewlineKey(event: ComposerSendKeyEvent): boolean {
+  return (
+    event.key === "Enter" &&
+    event.altKey === true &&
+    event.metaKey !== true &&
+    event.ctrlKey !== true &&
+    !event.isComposing
+  );
+}
+
+/**
  * The "steer everything now" chord: Mod+Enter (Cmd on macOS, Ctrl elsewhere).
  * When Mod+Enter is already the send chord, Mod+Shift+Enter takes over so the
  * modifier keeps one meaning per mode.

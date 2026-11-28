@@ -16,11 +16,14 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import yaml
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
 from omnigent.runtime import workflow as wf
 from omnigent.runtime.workflow import (
     _build_antigravity_spawn_env,
@@ -68,6 +71,7 @@ def _make_spec(
     profile: str | None = None,
     auth: ApiKeyAuth | DatabricksAuth | None = None,
     config_extra: dict[str, object] | None = None,
+    os_env: OSEnvSpec | None = None,
 ) -> AgentSpec:
     """Build a minimal antigravity :class:`AgentSpec` for spawn-env tests."""
     config: dict[str, object] = {"harness": "antigravity"}
@@ -83,7 +87,37 @@ def _make_spec(
         instructions="You are a test agent.",
         executor=ExecutorSpec(type="omnigent", config=config, model=model, auth=auth),
         llm=LLMConfig(model=model) if model is not None else None,
+        os_env=os_env,
     )
+
+
+@pytest.mark.parametrize(
+    "os_env",
+    [None, OSEnvSpec(cwd="/workspace", sandbox=OSEnvSandboxSpec(type="none"))],
+)
+def test_os_policy_preserved_for_harness(
+    monkeypatch: pytest.MonkeyPatch, os_env: OSEnvSpec | None
+) -> None:
+    env = _build_antigravity_spawn_env(_make_spec(os_env=os_env))
+    if os_env is None:
+        assert "HARNESS_ANTIGRAVITY_OS_ENV" not in env
+    else:
+        monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", env["HARNESS_ANTIGRAVITY_OS_ENV"])
+        assert resolve_harness_os_env("HARNESS_ANTIGRAVITY_OS_ENV") == os_env
+
+
+@pytest.mark.parametrize(
+    "os_env",
+    [
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"), fork=True),
+    ],
+)
+def test_unsupported_os_policy_rejected_before_provider_resolution(os_env: OSEnvSpec) -> None:
+    with patch.object(wf, "_resolve_spec_model") as resolve_model:
+        with pytest.raises(ValueError, match="Antigravity"):
+            _build_antigravity_spawn_env(_make_spec(os_env=os_env))
+    resolve_model.assert_not_called()
 
 
 def test_model_threads_into_env_var() -> None:
@@ -93,9 +127,27 @@ def test_model_threads_into_env_var() -> None:
 
 
 def test_no_model_omits_env_var() -> None:
-    """A spec with no model omits ``HARNESS_ANTIGRAVITY_MODEL`` entirely."""
+    """A spec with no model and no antigravity.model omits the env var."""
     env = _build_antigravity_spawn_env(_make_spec(model=None))
     assert "HARNESS_ANTIGRAVITY_MODEL" not in env
+
+
+def test_no_model_falls_back_to_antigravity_config_model(tmp_path: Path) -> None:
+    """When the spec omits model, ``antigravity.model`` is threaded into spawn env."""
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"antigravity": {"model": "gemini-2.5-flash"}})
+    )
+    env = _build_antigravity_spawn_env(_make_spec(model=None))
+    assert env["HARNESS_ANTIGRAVITY_MODEL"] == "gemini-2.5-flash"
+
+
+def test_spec_model_wins_over_antigravity_config_model(tmp_path: Path) -> None:
+    """An explicit ``executor.model`` is not overridden by ``antigravity.model``."""
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"antigravity": {"model": "gemini-2.5-flash"}})
+    )
+    env = _build_antigravity_spawn_env(_make_spec(model="gemini-3-pro"))
+    assert env["HARNESS_ANTIGRAVITY_MODEL"] == "gemini-3-pro"
 
 
 def test_api_key_auth_threads_key_only() -> None:

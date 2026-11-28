@@ -13,6 +13,9 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+import { FileViewerContext } from "./FileViewerContext";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+import type * as workspaceImage from "./TipTapWorkspaceImage";
 
 // ── Module mocks ──────────────────────────────────────────────────────────
 
@@ -36,16 +39,22 @@ vi.mock("@tiptap/extension-list", () => ({
   TaskList: {},
   TaskItem: { configure: vi.fn().mockReturnValue({}) },
 }));
+vi.mock("./tiptapBoundedTokenizers", () => ({
+  BoundedTaskList: {},
+  BoundedTable: { configure: vi.fn().mockReturnValue({}) },
+}));
 vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
 vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
 vi.mock("./tiptapMarkdownPatches", () => ({
   installMarkdownSerializerPatch: vi.fn(),
   installMarkdownParserPatch: vi.fn(),
 }));
-vi.mock("./TipTapWorkspaceImage", () => ({
+vi.mock("./TipTapWorkspaceImage", async (importOriginal) => ({
+  ...(await importOriginal<typeof workspaceImage>()),
   createWorkspaceImageExtension: vi.fn().mockReturnValue({}),
   ImageAwareLink: { configure: vi.fn().mockReturnValue({}) },
 }));
+vi.mock("@/lib/openLinkInApp", () => ({ followLinkWithPopupFallback: vi.fn() }));
 vi.mock("./TipTapCommentExtension", () => ({
   createCommentDecorationExtension: vi.fn().mockReturnValue({}),
   commentDecorationKey: {},
@@ -62,11 +71,16 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
 }));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof workspaceChangedFiles>();
+  return { ...actual, useSessionActive: vi.fn() };
+});
 
 import * as permissions from "@/hooks/usePermissions";
 import * as syncHook from "./useMarkdownEditorSync";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
+import * as workspaceChangedFiles from "@/hooks/useWorkspaceChangedFiles";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -81,7 +95,7 @@ function makeSyncResult(
     discardAndApplyExternal: vi.fn(),
     dismissExternalUpdate: vi.fn(),
     markSaved: vi.fn(),
-    reconcileServerContent: vi.fn().mockReturnValue(false),
+    beginServerCheck: vi.fn(() => () => "write"),
     ...overrides,
   };
 }
@@ -96,10 +110,12 @@ function setupReadOnlyHooks() {
     mutateAsync: vi.fn(),
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(undefined);
+  vi.mocked(workspaceChangedFiles.useSessionActive).mockReturnValue(false);
 }
 
 function setupEditHooks(
   syncOverrides: Partial<ReturnType<typeof syncHook.useMarkdownEditorSync>> = {},
+  sessionActive = false,
 ) {
   vi.mocked(permissions.useCanEdit).mockReturnValue(true);
   vi.mocked(syncHook.useMarkdownEditorSync).mockReturnValue(makeSyncResult(syncOverrides));
@@ -110,20 +126,33 @@ function setupEditHooks(
     mutateAsync: vi.fn(),
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(undefined);
+  vi.mocked(workspaceChangedFiles.useSessionActive).mockReturnValue(sessionActive);
 }
 
-function renderViewer(content: string, truncated = false) {
+const openFile = vi.fn();
+const fileViewerContext = {
+  openFile,
+  openGithubTab: () => {},
+  isChangedPath: () => false,
+  conversationId: "conv_1",
+  workspaceRoot: "/ws",
+  workspaceHome: null,
+};
+
+function renderViewer(content: string, truncated = false, path = "/test.md") {
   return render(
-    <MarkdownRichTextViewer
-      content={content}
-      conversationId="conv_1"
-      path="/test.md"
-      isSettled={true}
-      truncated={truncated}
-      comments={[]}
-      activeSelection={null}
-      onSetActiveSelection={() => {}}
-    />,
+    <FileViewerContext.Provider value={fileViewerContext}>
+      <MarkdownRichTextViewer
+        content={content}
+        conversationId="conv_1"
+        path={path}
+        isSettled={true}
+        truncated={truncated}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+      />
+    </FileViewerContext.Provider>,
   );
 }
 
@@ -131,10 +160,14 @@ function renderViewer(content: string, truncated = false) {
 
 beforeEach(() => {
   setupReadOnlyHooks();
+  openFile.mockClear();
+  vi.mocked(followLinkWithPopupFallback).mockReset();
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  window.getSelection()?.removeAllRanges();
   cleanup();
 });
 
@@ -283,6 +316,59 @@ describe("MarkdownRichTextViewer dirty banners", () => {
   });
 });
 
+// ── Agent-running warning ─────────────────────────────────────────────────────
+
+describe("MarkdownRichTextViewer agent-running warning", () => {
+  it("shows the warning when the session is active and the editor is clean", () => {
+    // Agent turn in flight + editable + not yet dirty → warn before the user edits.
+    setupEditHooks({ isDirty: false, hasExternalUpdate: false }, true);
+    renderViewer("content");
+    expect(screen.getByText(/Omnigent is still working/)).toBeDefined();
+  });
+
+  it("hides the warning when the session is idle", () => {
+    // Turn finished — no need to warn any longer.
+    setupEditHooks({ isDirty: false, hasExternalUpdate: false }, false);
+    renderViewer("content");
+    expect(screen.queryByText(/Omnigent is still working/)).toBeNull();
+  });
+
+  it("hides the warning in read-only mode even when session is active", () => {
+    // Read-only viewers can't edit, so the warning is irrelevant.
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(syncHook.useMarkdownEditorSync).mockReturnValue(makeSyncResult());
+    vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
+      isPending: false,
+      isError: false,
+      reset: vi.fn(),
+      mutateAsync: vi.fn(),
+    } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
+    vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(undefined);
+    vi.mocked(workspaceChangedFiles.useSessionActive).mockReturnValue(true);
+    renderViewer("content");
+    expect(screen.queryByText(/Omnigent is still working/)).toBeNull();
+  });
+
+  it("hides the warning once the user starts editing (isDirty=true)", () => {
+    // User has already started editing — don't stack a pre-edit warning on top
+    // of the unsaved-changes banner.
+    setupEditHooks({ isDirty: true, hasExternalUpdate: false }, true);
+    renderViewer("content");
+    expect(screen.queryByText(/Omnigent is still working/)).toBeNull();
+    // The normal dirty banner is still visible instead.
+    expect(screen.getByText(/commenting is available once saved/)).toBeDefined();
+  });
+
+  it("hides the warning when a conflict banner has taken over", () => {
+    // Conflict banner takes priority — both would be at the same position,
+    // so only the conflict (more actionable) should show.
+    setupEditHooks({ isDirty: true, hasExternalUpdate: true }, true);
+    renderViewer("content");
+    expect(screen.queryByText(/Omnigent is still working/)).toBeNull();
+    expect(screen.getByText(/modified externally/)).toBeDefined();
+  });
+});
+
 // ── Link following ───────────────────────────────────────────────────────────
 
 describe("MarkdownRichTextViewer link following", () => {
@@ -294,13 +380,19 @@ describe("MarkdownRichTextViewer link following", () => {
   function clickLink(
     container: HTMLElement,
     eventInit: Parameters<typeof fireEvent.click>[1] = {},
+    href = HREF,
+    mouseDownInit = eventInit,
   ) {
     const scroll = container.querySelector(".overflow-auto");
     if (!scroll) throw new Error("scroll container not found");
     const anchor = document.createElement("a");
-    anchor.setAttribute("href", HREF);
+    anchor.setAttribute("href", href);
+    const label = document.createElement("strong");
+    label.textContent = "harnesses";
+    anchor.appendChild(label);
     scroll.appendChild(anchor);
-    fireEvent.click(anchor, eventInit);
+    fireEvent.mouseDown(label, mouseDownInit);
+    return fireEvent.click(label, eventInit);
   }
 
   it("opens a link in a new tab on a plain click in read-only mode", () => {
@@ -315,7 +407,7 @@ describe("MarkdownRichTextViewer link following", () => {
     expect(open).toHaveBeenCalledWith(HREF, "_blank", "noopener,noreferrer");
   });
 
-  it("does NOT follow a link on a plain click in edit mode (click places the cursor)", () => {
+  it("opens a link with one plain click in edit mode, including a formatted label", () => {
     const open = vi.fn();
     vi.stubGlobal("open", open);
     setupEditHooks();
@@ -323,8 +415,8 @@ describe("MarkdownRichTextViewer link following", () => {
 
     clickLink(container);
 
-    // Edit mode: a bare click must position the cursor, not navigate away.
-    expect(open).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledExactlyOnceWith(HREF, "_blank", "noopener,noreferrer");
+    expect(followLinkWithPopupFallback).toHaveBeenCalledWith(expect.anything(), HREF, "conv_1");
   });
 
   it("follows a link on ⌘/Ctrl+click in edit mode (escape hatch)", () => {
@@ -339,6 +431,86 @@ describe("MarkdownRichTextViewer link following", () => {
     open.mockClear();
     clickLink(container, { ctrlKey: true });
     expect(open).toHaveBeenCalledWith(HREF, "_blank", "noopener,noreferrer");
+  });
+
+  it("does not open twice when the shared link handler consumes the click", () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    vi.mocked(followLinkWithPopupFallback).mockImplementation((event) => event.preventDefault());
+    setupEditHooks();
+    const { container } = renderViewer("content");
+
+    clickLink(container);
+
+    expect(followLinkWithPopupFallback).toHaveBeenCalledOnce();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it.each([{ altKey: true }, { shiftKey: true }])(
+    "keeps %j available for caret placement and selection in edit mode",
+    (eventInit) => {
+      const open = vi.fn();
+      vi.stubGlobal("open", open);
+      setupEditHooks();
+      const { container } = renderViewer("content");
+
+      expect(clickLink(container, eventInit)).toBe(false);
+
+      expect(open).not.toHaveBeenCalled();
+      expect(followLinkWithPopupFallback).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not navigate when selecting link text", () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    setupEditHooks();
+    const { container } = renderViewer("content");
+    vi.spyOn(window, "getSelection").mockReturnValue({ isCollapsed: false } as Selection);
+
+    expect(
+      clickLink(container, { clientX: 40, clientY: 10 }, HREF, { clientX: 10, clientY: 10 }),
+    ).toBe(false);
+
+    expect(open).not.toHaveBeenCalled();
+    expect(followLinkWithPopupFallback).not.toHaveBeenCalled();
+  });
+
+  it("follows a fresh click even before the editor collapses a previous selection", () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    setupEditHooks();
+    const { container } = renderViewer("content");
+    vi.spyOn(window, "getSelection").mockReturnValue({ isCollapsed: false } as Selection);
+
+    clickLink(container, { clientX: 10, clientY: 10 });
+
+    expect(open).toHaveBeenCalledExactlyOnceWith(HREF, "_blank", "noopener,noreferrer");
+  });
+
+  it.each([true, false])("opens relative files in the viewer (canEdit=%s)", (canEdit) => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    if (canEdit) setupEditHooks();
+    const { container } = renderViewer("content", false, "docs/guide.md");
+
+    expect(clickLink(container, {}, "../notes/plan%20draft.md#steps")).toBe(false);
+
+    expect(openFile).toHaveBeenCalledExactlyOnceWith("notes/plan draft.md");
+    expect(open).not.toHaveBeenCalled();
+    expect(followLinkWithPopupFallback).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "#top", "?query=only"])("does not open an empty or in-page target (%j)", (href) => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    setupEditHooks();
+    const { container } = renderViewer("content");
+
+    expect(clickLink(container, {}, href)).toBe(false);
+
+    expect(open).not.toHaveBeenCalled();
+    expect(openFile).not.toHaveBeenCalled();
   });
 });
 

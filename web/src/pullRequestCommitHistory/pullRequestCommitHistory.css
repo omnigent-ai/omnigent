@@ -1,0 +1,499 @@
+/* The new Commits page, ported from the reference app's commit history. Its palette names map
+   onto the theme's tokens here, and every rule stays inside the page. */
+.commit-history {
+  --commit-muted: var(--muted-foreground);
+  --commit-surface: var(--muted);
+  --commit-accent: var(--primary);
+  --commit-success: var(--status-green);
+  --commit-danger: var(--status-red);
+  --commit-warning: var(--status-yellow);
+  --commit-hover: color-mix(in srgb, var(--foreground) 8%, transparent);
+  --commit-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  min-height: 0;
+  flex: 1 1 0;
+  overflow: auto;
+  container: commit-history / inline-size;
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+/* Header and search, sticky together */
+.commit-history .commit-history-top {
+  position: sticky;
+  z-index: 4;
+  top: 0;
+}
+.commit-history .commit-list-heading {
+  display: flex;
+  min-height: 60px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 11px 18px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--commit-surface) 92%, var(--background));
+  backdrop-filter: blur(18px);
+}
+.commit-history .commit-list-heading > div:first-child {
+  display: grid;
+  gap: 1px;
+}
+.commit-history .commit-list-heading h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 670;
+  letter-spacing: -0.01em;
+}
+.commit-history .commit-list-eyebrow {
+  color: var(--commit-muted);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.commit-history .commit-list-heading-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--commit-muted);
+  font-size: 9.5px;
+  text-align: right;
+}
+.commit-history .commit-list-heading-actions a {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.commit-history .commit-search-button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  outline: 0;
+  background: transparent;
+  color: var(--commit-muted);
+  cursor: default;
+}
+.commit-history .commit-search-button:is(:hover, :focus-visible),
+.commit-history .commit-search-button[aria-expanded="true"] {
+  background: var(--commit-hover);
+  color: var(--foreground);
+}
+.commit-history .commit-search-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--commit-accent) 75%, transparent);
+  outline-offset: -2px;
+}
+.commit-history .commit-search-button svg,
+.commit-history .commit-search > svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.5;
+}
+
+/* Search */
+.commit-history .commit-search {
+  display: grid;
+  min-height: 38px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 18px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--commit-surface) 96%, var(--background));
+  color: var(--commit-muted);
+  backdrop-filter: blur(18px);
+}
+.commit-history .commit-search input {
+  width: 100%;
+  height: 27px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 6px;
+  outline: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  -webkit-appearance: none;
+}
+.commit-history .commit-search input::-webkit-search-cancel-button {
+  display: none;
+}
+.commit-history .commit-search input:focus {
+  border-color: var(--commit-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--commit-accent) 15%, transparent);
+}
+.commit-history .commit-search > span {
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Timeline */
+.commit-history .commit-list {
+  width: min(100%, 980px);
+  margin: 0 auto;
+  padding: 16px 18px 60px;
+  list-style: none;
+}
+.commit-history .commit-list li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 20px minmax(0, 1fr);
+}
+.commit-history .commit-rail {
+  position: relative;
+  display: grid;
+  grid-template-rows: 1fr 14px 1fr;
+  justify-items: center;
+}
+.commit-history .commit-rail-line {
+  width: 1px;
+  background: color-mix(in srgb, var(--border) 90%, transparent);
+}
+.commit-history .commit-list li:first-child .commit-rail-line.before,
+.commit-history .commit-list li:last-child .commit-rail-line.after {
+  background: transparent;
+}
+.commit-history .commit-node {
+  width: 9px;
+  height: 9px;
+  align-self: center;
+  border: 2px solid var(--commit-accent);
+  border-radius: 50%;
+  background: var(--background);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--commit-accent) 9%, transparent);
+}
+
+/* Cards */
+.commit-history .commit-row {
+  display: grid;
+  min-width: 0;
+  min-height: 62px;
+  grid-template-columns: minmax(0, 1fr) auto auto 22px 22px;
+  align-items: center;
+  gap: 5px;
+  margin: 4px 0 4px 3px;
+  padding: 0 8px 0 0;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--commit-surface) 54%, var(--background));
+  transition:
+    background 100ms ease,
+    border-color 100ms ease;
+}
+/* A commit with a description has its "…" between the card's button and its CI state. */
+.commit-history .commit-row.has-body {
+  grid-template-columns: minmax(0, 1fr) 22px auto auto 22px 22px;
+}
+.commit-history .commit-row-body {
+  grid-column: 1 / -1;
+  margin: -4px 0 0;
+  padding: 0 4px 10px 50px;
+  color: var(--commit-muted);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.commit-history .commit-row:hover {
+  border-color: color-mix(in srgb, var(--foreground) 14%, var(--border));
+  background: color-mix(in srgb, var(--commit-surface) 80%, var(--background));
+}
+.commit-history .commit-row:has(> .commit-row-main:focus-visible) {
+  border-color: var(--commit-accent);
+}
+.commit-history .commit-row-main {
+  display: grid;
+  min-width: 0;
+  align-self: stretch;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0 9px 10px;
+  border: 0;
+  border-radius: 8px 0 0 8px;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.commit-history .commit-row-main:is(:hover, :focus-visible) .commit-copy > strong {
+  color: var(--commit-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.commit-history .commit-avatar {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 50%;
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--commit-accent) 20%, var(--commit-surface)),
+    var(--commit-surface)
+  );
+  color: var(--foreground);
+  font-size: 9px;
+  font-weight: 720;
+}
+.commit-history .commit-copy {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+.commit-history .commit-copy > strong {
+  font-size: 11px;
+  font-weight: 640;
+  overflow-wrap: anywhere;
+}
+.commit-history .commit-copy > span {
+  overflow: hidden;
+  color: var(--commit-muted);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.commit-history .commit-copy b {
+  color: color-mix(in srgb, var(--foreground) 88%, var(--commit-muted));
+  font-weight: 620;
+}
+.commit-history .commit-ci {
+  display: inline-flex;
+  padding: 0 4px;
+}
+.commit-history .commit-ci.passing {
+  color: var(--commit-success);
+}
+.commit-history .commit-ci.failing {
+  color: var(--commit-danger);
+}
+.commit-history .commit-ci.pending {
+  color: var(--commit-warning);
+}
+.commit-history .commit-ci.none {
+  color: var(--commit-muted);
+}
+.commit-history .commit-row code {
+  color: var(--commit-muted);
+  font-family: var(--commit-mono);
+  font-size: 9.5px;
+}
+.commit-history .commit-row-sha {
+  border-radius: 4px;
+  cursor: pointer;
+}
+.commit-history .commit-row-sha:hover code {
+  color: var(--commit-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.commit-history .commit-sha-copy,
+.commit-history .commit-body-toggle,
+.commit-history .commit-row-open {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--commit-muted);
+  cursor: default;
+}
+.commit-history .commit-row-open {
+  cursor: pointer;
+}
+.commit-history .commit-body-toggle {
+  cursor: pointer;
+}
+.commit-history .commit-body-toggle[aria-expanded="true"] {
+  background: var(--commit-hover);
+  color: var(--foreground);
+}
+.commit-history :is(.commit-sha-copy, .commit-body-toggle, .commit-row-open):hover {
+  background: var(--commit-hover);
+  color: var(--foreground);
+}
+.commit-history .commit-sha-copy.copied {
+  color: var(--commit-success);
+}
+.commit-history .commit-sha-copy.failed {
+  color: var(--commit-danger);
+}
+.commit-history :is(.commit-sha-copy, .commit-body-toggle, .commit-row-open) svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.5;
+}
+
+/* Empty states */
+.commit-history .commit-empty {
+  display: grid;
+  height: 100%;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  padding: 24px;
+  color: var(--commit-muted);
+  font-size: 10.5px;
+  text-align: center;
+}
+.commit-history .commit-empty svg {
+  width: 26px;
+  height: 26px;
+  margin-bottom: 3px;
+  stroke-width: 1.25;
+}
+.commit-history .commit-empty strong {
+  color: var(--foreground);
+  font-size: 13px;
+}
+.commit-history .commit-search-empty {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 44px 20px;
+  color: var(--commit-muted);
+  font-size: 10px;
+  text-align: center;
+}
+.commit-history .commit-search-empty strong {
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+/* Narrow panes: the header wraps, the gutters tighten, and the short SHA gives way last. */
+@container commit-history (max-width: 480px) {
+  .commit-history .commit-list-heading {
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    padding: 10px 12px;
+  }
+  .commit-history .commit-search {
+    padding-inline: 12px;
+  }
+  .commit-history .commit-list {
+    padding: 12px 10px 48px;
+  }
+}
+@container commit-history (max-width: 380px) {
+  .commit-history .commit-row-sha {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .commit-history .commit-row {
+    transition: none;
+  }
+}
+
+/* The open commit's header on the new page, ported from the reference's commit detail. */
+.commit-detail-header {
+  --commit-muted: var(--muted-foreground);
+  --commit-accent: var(--primary);
+  --commit-hover: color-mix(in srgb, var(--foreground) 8%, transparent);
+  display: grid;
+  min-width: 0;
+  flex-shrink: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  /* A wrapped title or a description grows the header down; the controls stay on top. */
+  align-items: start;
+  gap: 10px;
+  padding: 10px 7px 10px 9px;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+  color: var(--foreground);
+}
+.commit-detail-header .commit-back {
+  display: flex;
+  height: 28px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px 0 5px;
+  border: 0;
+  border-radius: 5px;
+  outline: 0;
+  background: transparent;
+  color: var(--commit-accent);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 620;
+}
+.commit-detail-header .commit-back:is(:hover, :focus-visible) {
+  background: var(--commit-hover);
+}
+.commit-detail-header .commit-back:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--commit-accent) 75%, transparent);
+  outline-offset: -2px;
+}
+.commit-detail-header .commit-back svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.5;
+}
+.commit-detail-header .commit-detail-message {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.commit-detail-header .commit-detail-message > span {
+  overflow: hidden;
+  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.commit-detail-header .commit-detail-title {
+  margin: 0;
+  font-size: 10.5px;
+  font-weight: 640;
+  overflow-wrap: anywhere;
+}
+.commit-detail-header .commit-message-body {
+  margin-top: 4px;
+}
+.commit-detail-header .commit-message-body :is(p, button) {
+  font-size: 10px;
+}
+.commit-detail-header .commit-detail-message > span {
+  color: var(--commit-muted);
+  font-size: 9px;
+}
+.commit-detail-header code {
+  color: var(--commit-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9.5px;
+}
+.commit-detail-header .commit-position {
+  color: var(--commit-muted);
+  font-size: 9px;
+  /* Level with the buttons beside it. */
+  line-height: 28px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.commit-detail-header .commit-navigation {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.commit-detail {
+  container: commit-detail / inline-size;
+}
+/* Narrow panes: the position gives way before the title does. */
+@container commit-detail (max-width: 360px) {
+  .commit-detail-header .commit-position {
+    display: none;
+  }
+}

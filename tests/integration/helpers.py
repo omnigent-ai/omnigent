@@ -6,26 +6,11 @@ from typing import Any
 
 import httpx
 
+from tests._helpers.messages import all_message_text as all_message_text
 from tests.e2e.conftest import (
     poll_session_until_terminal,
     send_user_message_to_session,
 )
-
-
-def all_message_text(body: dict[str, Any]) -> str:
-    """Concatenate every message text block from a terminal turn body.
-
-    :param body: The dict returned by ``poll_session_until_terminal``.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def failure_detail(body: dict[str, Any]) -> str:

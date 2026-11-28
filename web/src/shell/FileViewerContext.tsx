@@ -2,7 +2,9 @@
 // FileViewer panel without prop-drilling through AppShell → Outlet → ChatPage
 // → BlockRenderer → ToolCard.
 
-import { createContext, useContext } from "react";
+import { createContext, useContext, useMemo } from "react";
+
+import type { PullRequestSubtab } from "./pullRequestPanelView";
 
 /**
  * A 1-based citation target. Object identity is the navigation request key:
@@ -11,22 +13,65 @@ import { createContext, useContext } from "react";
 export interface FilePosition {
   line: number;
   column?: number;
+  /** Last line of a cited range (`file.ts:10-20`), greater than `line`. */
+  endLine?: number;
+  /** Column just past a cited range's end, on `endLine` (or `line`). */
+  endColumn?: number;
+}
+
+/**
+ * A request to show a file in its diff, as a Changes-list click makes. Object
+ * identity is the request key, as for `FilePosition`.
+ */
+export interface FileDiffRequest {
+  readonly view: "diff";
 }
 
 export type OpenFileOptions = Partial<FilePosition>;
 
+/** `path` is where the viewer goes next; null when its tab closes or the session is left. */
 export type FileNavigationGuard = (
-  path: string,
+  path: string | null,
   options: OpenFileOptions | undefined,
   navigate: () => void,
 ) => void;
+
+/** What to show of a session's pull requests: all of them, or one pull request. */
+export type PullRequestsTarget =
+  | { kind: "overview" }
+  /**
+   * One PR; with `list`, in the tab that lists them beside it, as choosing it there does.
+   * With `overview`, a tab already showing it returns to its Overview too. A new tab opens on
+   * `view` unless the URL names a section; one already showing the PR keeps its own.
+   */
+  | { kind: "pull"; url: string; list?: true; overview?: true; view?: PullRequestSubtab };
+
+/**
+ * `classic: "open"` opens Classic's Pull Requests tab as `openGithubTab` does;
+ * `"stay"` leaves Classic as it is, for callers whose panel already shows the change.
+ */
+export interface ShowPullRequestsOptions {
+  classic: "open" | "stay";
+  /** In the tabs sidebar, open or keep the tab behind the current one, as a browser's ⌘-click does. */
+  background?: boolean;
+}
 
 interface FileViewerContextType {
   openFile: (path: string, options?: OpenFileOptions) => void;
   /** The mounted viewer confirms dirty navigation before selection or URL changes. */
   registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
-  /** Open GitHub in the workspace rail or mobile drawer. */
-  openGithubTab: () => void;
+  /** Runs the registered guards, then `commit` once the viewer allows leaving its file. */
+  guardFileNavigation?: FileNavigationGuard;
+  /** Open Pull Requests in the workspace rail or mobile drawer. */
+  openGithubTab: (prUrl?: string) => void;
+  /**
+   * Show all pull requests or one of them: in the tabs sidebar, its own tab
+   * (revealing the sidebar); elsewhere as `options` says. Absent where only
+   * `openGithubTab` exists, such as a grid pane.
+   */
+  showPullRequests?: (target: PullRequestsTarget, options: ShowPullRequestsOptions) => void;
+  /** Show a host-absolute folder in the Files tree; absent where no Files panel exists. */
+  openFolder?: (absolutePath: string) => void;
   /**
    * Returns true when `path` is a known workspace file (present in the
    * session's changed-files list). Used as the synchronous fast path for
@@ -51,6 +96,8 @@ interface FileViewerContextType {
    * against {@link workspaceRoot}. Null when unknown.
    */
   workspaceHome: string | null;
+  /** Host running the session, so desktop-only file actions can check it is this machine. */
+  sessionHostId?: string | null;
 }
 
 export const FileViewerContext = createContext<FileViewerContextType | null>(null);
@@ -63,12 +110,32 @@ export function useFileViewer(): ((path: string, options?: OpenFileOptions) => v
   return useContext(FileViewerContext)?.openFile ?? null;
 }
 
+/** Returns the callback that shows a folder in the Files tree, or `null` when there is none. */
+export function useFolderOpener(): ((absolutePath: string) => void) | null {
+  return useContext(FileViewerContext)?.openFolder ?? null;
+}
+
 /**
- * Returns a callback that opens the GitHub rail tab or mobile drawer, or `null`
+ * Returns a callback that opens the Pull Requests rail tab or mobile drawer, or `null`
  * when used outside AppShell (tests, Storybook).
  */
-export function useOpenGithubTab(): (() => void) | null {
+export function useOpenGithubTab(): ((prUrl?: string) => void) | null {
   return useContext(FileViewerContext)?.openGithubTab ?? null;
+}
+
+/** Show a session's pull requests from this chat; falls back to `openGithubTab` where that's all there is. */
+export function useShowPullRequests():
+  ((target: PullRequestsTarget, options: ShowPullRequestsOptions) => void) | null {
+  const context = useContext(FileViewerContext);
+  return useMemo(() => {
+    if (!context) return null;
+    if (context.showPullRequests) return context.showPullRequests;
+    const { openGithubTab } = context;
+    return (target: PullRequestsTarget, options: ShowPullRequestsOptions) => {
+      if (options.classic === "open")
+        openGithubTab(target.kind === "pull" ? target.url : undefined);
+    };
+  }, [context]);
 }
 
 // Stable fallback used when the context is absent (tests, Storybook).

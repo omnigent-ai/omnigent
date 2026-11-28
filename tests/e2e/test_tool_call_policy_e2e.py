@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 
+from tests._helpers.messages import all_message_text as _all_text
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -55,18 +56,6 @@ def _tool_outputs(body: dict[str, Any]) -> list[str]:
         for item in body.get("output", [])
         if item.get("type") == "function_call_output"
     ]
-
-
-def _all_text(body: dict[str, Any]) -> str:
-    """Concatenate every assistant message text block in a response body."""
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def test_tool_call_deny_blocks_callable_tool(

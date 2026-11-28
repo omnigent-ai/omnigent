@@ -22,6 +22,7 @@ abort propagates as a ``ConnectionError`` from the body iterator.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import AsyncIterator
 
@@ -36,6 +37,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
+
+# A session event sent to the runner: a user message, approval, or other input
+# that can start work there.
+_SESSION_EVENTS_PATH = re.compile(r"^/v1/sessions/[^/]+/events$")
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):
@@ -115,6 +120,20 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         self._registry = registry
         self._runner_id = runner_id
 
+    async def wait_for_runner(self, timeout_s: float) -> bool:
+        """
+        Wait until this transport's runner has a live tunnel or the timeout expires.
+
+        Lets a caller that just saw the runner go offline park until it
+        re-registers, instead of retrying requests on a fixed interval.
+
+        :param timeout_s: Maximum seconds to wait, e.g. ``90.0``.
+        :returns: ``True`` when the runner is registered when the wait ends.
+        """
+        return (
+            await self._registry.wait_for_runner(self._runner_id, timeout_s=timeout_s) is not None
+        )
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         session = self._registry.get(self._runner_id)
         if session is None:
@@ -134,7 +153,11 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         body_str, encoding = encode_body(body, content_type) if body else (None, "utf-8")
 
         try:
-            state = self._registry.open_request(self._runner_id, req_id)
+            state = self._registry.open_request(
+                self._runner_id,
+                req_id,
+                generation=request.extensions.get("runner_tunnel_generation"),
+            )
         except KeyError as exc:
             raise httpx.ConnectError(f"runner {self._runner_id!r} is offline") from exc
         try:
@@ -155,6 +178,8 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                     )
                 ),
             )
+            if request.method == "POST" and _SESSION_EVENTS_PATH.match(request.url.path):
+                self._registry.note_work_dispatched(self._runner_id)
             # Block until the response head arrives (or the tunnel
             # aborts the request).
             head = await state.head_future
@@ -173,6 +198,14 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             headers=[(k, v) for k, v in head.headers],
             stream=stream,
             request=request,
+            extensions={
+                "omnigent_runner_connection": {
+                    "runner_id": state.session.runner_id,
+                    "runner_version": state.session.hello.runner_version,
+                    "connection_id": state.session.hello.connection_id,
+                    "generation": state.session.generation,
+                }
+            },
         )
 
     async def aclose(self) -> None:

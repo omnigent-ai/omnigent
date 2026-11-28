@@ -210,10 +210,10 @@ that wires Pi's provider/model. Key env vars: `HARNESS_PI_NATIVE_BRIDGE_DIR`,
 
 ```bash
 .venv/bin/python -m pytest \
-  tests/test_pi_native_bridge.py \
-  tests/test_pi_native_credentials.py \
-  tests/test_pi_native_extension.py \
-  tests/test_pi_native_interrupt_replay_e2e.py -q   # interrupt e2e needs `node`
+  tests/harnesses/pi_native/test_pi_native_bridge.py \
+  tests/harnesses/pi_native/test_pi_native_credentials.py \
+  tests/harnesses/pi_native/test_pi_native_extension.py \
+  tests/harnesses/pi_native/test_pi_native_interrupt_replay_e2e.py -q   # interrupt e2e needs `node`
 # JS unit tests: node omnigent/resources/pi_native/omnigent_pi_native_extension.test.js
 ```
 

@@ -13,6 +13,7 @@ import pytest
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     SandboxCapabilityError,
+    SandboxGoneError,
 )
 from omnigent.onboarding.sandboxes.daytona import (
     HOST_IMAGE_ENV_VAR,
@@ -43,10 +44,19 @@ class _FakeConflictError(_FakeDaytonaError):
 
 
 class _FakeSandboxState(Enum):
-    """Stands in for ``daytona.SandboxState`` (the subset attach reads)."""
+    """Stands in for the Daytona states used by lifecycle decisions."""
 
     STARTED = "started"
     STOPPED = "stopped"
+    ARCHIVED = "archived"
+    STARTING = "starting"
+    RESTORING = "restoring"
+    STOPPING = "stopping"
+    ARCHIVING = "archiving"
+    DESTROYING = "destroying"
+    DESTROYED = "destroyed"
+    ERROR = "error"
+    BUILD_FAILED = "build_failed"
 
 
 @dataclass
@@ -212,8 +222,13 @@ class _FakeSandbox:
         self.process = _FakeProcess()
         self.fs = _FakeFileSystem()
         self.state = _FakeSandboxState.STARTED
+        self.error_reason: str | None = None
+        self.refresh_states: list[_FakeSandboxState] = []
         self.refresh_data_calls: int = 0
-        self.start_calls: int = 0
+        self.start_calls: list[float | None] = []
+        self.stop_calls: list[float | None] = []
+        self.start_waits: list[float | None] = []
+        self.stop_waits: list[float | None] = []
         self.autostop_intervals: list[int] = []
         # Exception ``set_autostop_interval`` raises (models a
         # provider rejection), or ``None`` for normal configuration.
@@ -222,11 +237,35 @@ class _FakeSandbox:
     def refresh_data(self) -> None:
         """Record the state refresh."""
         self.refresh_data_calls += 1
+        if self.refresh_states:
+            self.state = self.refresh_states.pop(0)
 
-    def start(self) -> None:
+    def start(self, timeout: float | None = None) -> None:
         """Record the start and transition to STARTED."""
-        self.start_calls += 1
+        self.start_calls.append(timeout)
         self.state = _FakeSandboxState.STARTED
+
+    def stop(self, timeout: float | None = 60, force: bool = False) -> None:
+        """Record the stop and settle it, as STOPPED by default."""
+        del force
+        self.stop_calls.append(timeout)
+        self._settle(_FakeSandboxState.STOPPED)
+
+    def wait_for_sandbox_start(self, timeout: float | None = 60) -> None:
+        """Record the wait and settle an in-flight start, as STARTED by default."""
+        self.start_waits.append(timeout)
+        self._settle(_FakeSandboxState.STARTED)
+
+    def wait_for_sandbox_stop(self, timeout: float | None = 60) -> None:
+        """Record the wait and settle an in-flight stop, as STOPPED by default."""
+        self.stop_waits.append(timeout)
+        self._settle(_FakeSandboxState.STOPPED)
+
+    def _settle(self, target: _FakeSandboxState) -> None:
+        """Take the next scripted state, raising on failure states."""
+        self.state = self.refresh_states.pop(0) if self.refresh_states else target
+        if self.state in {_FakeSandboxState.ERROR, _FakeSandboxState.BUILD_FAILED}:
+            raise _FakeDaytonaError(f"Sandbox {self.id} failed with state: {self.state.value}")
 
     def set_autostop_interval(self, interval: int) -> None:
         """Record the configured idle auto-stop interval."""
@@ -302,6 +341,8 @@ class _FakeDaytonaState:
     :param create_raises: Exception ``create`` raises instead of
         provisioning (e.g. a canned SDK authorization error), or
         ``None`` for normal creation.
+    :param get_raises: Exception ``get`` raises instead of resolving a
+        sandbox, or ``None`` for normal lookup.
     :param delete_raises: Exceptions successive ``delete`` calls raise
         before succeeding (popped front-first) — models the live
         "Sandbox state change in progress" conflict window.
@@ -312,6 +353,7 @@ class _FakeDaytonaState:
     deleted: list[str] = field(default_factory=list)
     client_count: int = 0
     create_raises: Exception | None = None
+    get_raises: Exception | None = None
     delete_raises: list[Exception] = field(default_factory=list)
 
 
@@ -357,6 +399,8 @@ def _install_fake_daytona(monkeypatch: pytest.MonkeyPatch) -> _FakeDaytonaState:
 
         def get(self, sandbox_id: str) -> _FakeSandbox:
             """Resolve a live sandbox or raise the not-found error."""
+            if state.get_raises is not None:
+                raise state.get_raises
             sandbox = state.sandboxes.get(sandbox_id)
             if sandbox is None:
                 raise _FakeNotFoundError(sandbox_id)
@@ -703,7 +747,7 @@ def test_attach_starts_stopped_sandbox(fake_daytona: _FakeDaytonaState) -> None:
     # State was refreshed before the decision (a cached handle's state
     # is stale) and exactly one start was issued.
     assert sandbox.refresh_data_calls == 1
-    assert sandbox.start_calls == 1
+    assert sandbox.start_calls == [900.0]
 
 
 def test_attach_running_sandbox_skips_start(fake_daytona: _FakeDaytonaState) -> None:
@@ -717,13 +761,213 @@ def test_attach_running_sandbox_skips_start(fake_daytona: _FakeDaytonaState) -> 
 
     launcher.attach(sandbox_id)
 
-    assert fake_daytona.sandboxes[sandbox_id].start_calls == 0
+    assert fake_daytona.sandboxes[sandbox_id].start_calls == []
 
 
 def test_attach_unknown_sandbox_fails_with_hint(fake_daytona: _FakeDaytonaState) -> None:
     """A vanished sandbox surfaces as a clear error naming the id."""
     with pytest.raises(click.ClickException, match="dt-gone"):
         DaytonaSandboxLauncher().attach("dt-gone")
+
+
+def test_capabilities_advertise_resumable_sandboxes(fake_daytona: _FakeDaytonaState) -> None:
+    """Managed wake calls the provider resume path instead of replacing the sandbox."""
+    assert DaytonaSandboxLauncher().capabilities.resume_stopped
+
+
+def test_resume_waits_for_archive_in_progress(fake_daytona: _FakeDaytonaState) -> None:
+    """A wake racing an archive waits for persistence before restoring it."""
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    sandbox.state = _FakeSandboxState.ARCHIVING
+    sandbox.refresh_states = [_FakeSandboxState.ARCHIVED]
+
+    launcher.resume(sandbox_id)
+
+    assert sandbox.start_calls == [900.0]
+
+
+def test_resume_deleted_sandbox_requests_recreation(fake_daytona: _FakeDaytonaState) -> None:
+    """Definitive absence enters the shared fresh-generation fallback."""
+    with pytest.raises(SandboxGoneError, match="dt-gone"):
+        DaytonaSandboxLauncher().resume("dt-gone")
+
+
+def test_resume_provider_failure_does_not_request_replacement(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """A provider outage preserves a workspace that may still exist."""
+    fake_daytona.get_raises = _FakeDaytonaError("provider unavailable")
+
+    with pytest.raises(click.ClickException, match="provider unavailable") as exc:
+        DaytonaSandboxLauncher().resume("dt-unknown")
+
+    assert not isinstance(exc.value, SandboxGoneError)
+
+
+def test_stop_parks_sandbox_for_in_place_resume(fake_daytona: _FakeDaytonaState) -> None:
+    """Parking stops compute without deleting, so a later resume reuses the workspace."""
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+
+    launcher.stop(sandbox_id)
+
+    assert len(sandbox.stop_calls) == 1
+    assert sandbox.state is _FakeSandboxState.STOPPED
+    assert fake_daytona.deleted == []
+
+    launcher.resume(sandbox_id)
+
+    assert sandbox.start_calls == [900.0]
+
+
+@pytest.mark.parametrize(
+    ("state", "refresh_states", "start_waits", "stop_waits", "stop_calls"),
+    [
+        (_FakeSandboxState.STARTED, [], [], [], [900.0]),
+        (_FakeSandboxState.STOPPED, [], [], [], []),
+        (_FakeSandboxState.ARCHIVED, [], [], [], []),
+        (_FakeSandboxState.STOPPING, [], [], [900.0], []),
+        (_FakeSandboxState.ARCHIVING, [_FakeSandboxState.ARCHIVED], [], [], []),
+        (_FakeSandboxState.STARTING, [], [900.0], [], [900.0]),
+        (_FakeSandboxState.RESTORING, [], [900.0], [], [900.0]),
+    ],
+)
+def test_stop_settles_each_state_without_conflicting_transitions(
+    fake_daytona: _FakeDaytonaState,
+    state: _FakeSandboxState,
+    refresh_states: list[_FakeSandboxState],
+    start_waits: list[float],
+    stop_waits: list[float],
+    stop_calls: list[float],
+) -> None:
+    """Parked sandboxes are left alone, and an in-flight start finishes before the stop."""
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    sandbox.state = state
+    sandbox.refresh_states = list(refresh_states)
+
+    launcher.stop(sandbox_id)
+
+    assert sandbox.start_waits == start_waits
+    assert sandbox.stop_waits == stop_waits
+    assert sandbox.stop_calls == stop_calls
+    assert sandbox.state in {_FakeSandboxState.STOPPED, _FakeSandboxState.ARCHIVED}
+    assert sandbox.start_calls == []
+    assert fake_daytona.deleted == []
+
+
+@pytest.mark.parametrize(
+    ("state", "settled", "message", "gone", "stop_calls"),
+    [
+        (
+            _FakeSandboxState.STARTED,
+            _FakeSandboxState.DESTROYED,
+            "no longer exists",
+            True,
+            [900.0],
+        ),
+        (
+            _FakeSandboxState.STARTED,
+            _FakeSandboxState.ERROR,
+            "failed with state: error",
+            False,
+            [900.0],
+        ),
+        (_FakeSandboxState.STOPPING, _FakeSandboxState.DESTROYED, "no longer exists", True, []),
+        (
+            _FakeSandboxState.STOPPING,
+            _FakeSandboxState.ERROR,
+            "failed with state: error",
+            False,
+            [],
+        ),
+        (_FakeSandboxState.ARCHIVING, _FakeSandboxState.ERROR, "in state 'error'", False, []),
+        (_FakeSandboxState.ARCHIVING, _FakeSandboxState.DESTROYED, "no longer exists", True, []),
+        (
+            _FakeSandboxState.STARTING,
+            _FakeSandboxState.ERROR,
+            "failed with state: error",
+            False,
+            [],
+        ),
+    ],
+)
+def test_stop_reports_a_transition_that_settles_unusable(
+    fake_daytona: _FakeDaytonaState,
+    state: _FakeSandboxState,
+    settled: _FakeSandboxState,
+    message: str,
+    gone: bool,
+    stop_calls: list[float],
+) -> None:
+    """A stop or wait ending in failure or deletion raises instead of reporting it parked."""
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    sandbox.state = state
+    sandbox.refresh_states = [settled]
+
+    with pytest.raises(click.ClickException, match=message) as exc:
+        launcher.stop(sandbox_id)
+
+    assert isinstance(exc.value, SandboxGoneError) is gone
+    assert sandbox.stop_calls == stop_calls
+    assert fake_daytona.deleted == []
+
+
+@pytest.mark.parametrize("transition", ["resume", "stop"])
+@pytest.mark.parametrize(
+    ("state", "message", "gone"),
+    [
+        (_FakeSandboxState.ERROR, "in state 'error': disk quota exceeded", False),
+        (_FakeSandboxState.BUILD_FAILED, "in state 'build_failed'", False),
+        (_FakeSandboxState.DESTROYING, "being deleted; retry later", False),
+        (_FakeSandboxState.DESTROYED, "no longer exists", True),
+    ],
+)
+def test_unusable_states_block_start_and_stop(
+    fake_daytona: _FakeDaytonaState,
+    transition: str,
+    state: _FakeSandboxState,
+    message: str,
+    gone: bool,
+) -> None:
+    """Failed or deleting sandboxes get a diagnosis, and only definitive deletion is gone."""
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    sandbox.state = state
+    if state is _FakeSandboxState.ERROR:
+        sandbox.error_reason = "disk quota exceeded"
+
+    with pytest.raises(click.ClickException, match=message) as exc:
+        getattr(launcher, transition)(sandbox_id)
+
+    assert isinstance(exc.value, SandboxGoneError) is gone
+    assert sandbox.start_calls == []
+    assert sandbox.stop_calls == []
+    assert fake_daytona.deleted == []
+
+
+def test_stop_distinguishes_deleted_sandbox_from_provider_failure(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """A missing sandbox is gone; a provider outage keeps the binding for a retry."""
+    with pytest.raises(SandboxGoneError, match="dt-gone"):
+        DaytonaSandboxLauncher().stop("dt-gone")
+
+    fake_daytona.get_raises = _FakeDaytonaError("provider unavailable")
+    with pytest.raises(
+        click.ClickException,
+        match="Could not stop Daytona sandbox 'dt-unknown': provider unavailable",
+    ) as exc:
+        DaytonaSandboxLauncher().stop("dt-unknown")
+
+    assert not isinstance(exc.value, SandboxGoneError)
 
 
 def test_keep_alive_disables_autostop(fake_daytona: _FakeDaytonaState) -> None:

@@ -1,5 +1,10 @@
 # Omnigent on Kubernetes
 
+To try multiple server replicas, see the [NGINX example](multi_replica/README.md).
+It explains how browser requests reach the server connected to each host and
+includes a local test that replaces the server pods during an active session.
+The manifests below deploy a single server replica.
+
 Deploy Omnigent to any Kubernetes cluster using Kustomize. The manifests pull
 the prebuilt image and set up a persistent volume and health checks. They also
 include an Ingress so you can serve the app over HTTPS at a public web address,
@@ -93,8 +98,9 @@ TLS is affected).
 
 ## Release features
 
-Release features are deployment-wide and off by default. Set the
-comma-separated `OMNIGENT_FEATURES` value in `base/configmap.yaml`, apply your
+Override feature defaults with comma-separated names in `OMNIGENT_FEATURES`:
+a name enables, `-name` disables, and empty uses defaults. Set the value in
+`base/configmap.yaml`, apply your
 Kustomize target, and restart the Deployment so every pod receives one fresh
 startup snapshot:
 
@@ -104,7 +110,9 @@ kubectl rollout restart deployment/omnigent
 kubectl rollout status deployment/omnigent
 ```
 
-Use the same restart after removing a feature for rollback. See
+Use the same restart after adding `-feature_name` for rollback. Runner
+overrides such as `-claude_osc_status` also need to be set on separately
+running hosts; restart their host/runners and launch fresh terminals. See
 [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for known keys.
 
 ## Deploy with an external database

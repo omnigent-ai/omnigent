@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum DesignTokens {
   static let radius: CGFloat = 8
@@ -13,8 +14,19 @@ enum DesignTokens {
   static let darkMutedForeground = Color(red: 0.572, green: 0.643, blue: 0.702)
   static let darkBorder = Color(red: 0.215, green: 0.219, blue: 0.230)
 
+  static let nativeBackground = UIColor { traits in
+    UIColor(background(traits.userInterfaceStyle == .dark ? .dark : .light))
+  }
+
   static func background(_ scheme: ColorScheme) -> Color {
     scheme == .dark ? darkBackground : lightBackground
+  }
+
+  /// Onboarding page surface, a hair off the card background (web
+  /// `--onboarding-wizard-background`).
+  static func wizardBackground(_ scheme: ColorScheme) -> Color {
+    scheme == .dark
+      ? Color(red: 0.075, green: 0.075, blue: 0.082) : Color(red: 0.988, green: 0.984, blue: 0.984)
   }
 
   static func foreground(_ scheme: ColorScheme) -> Color {

@@ -17,8 +17,6 @@ import contextlib
 import json
 import os
 import shutil
-import subprocess
-import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -29,11 +27,10 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.server_runner import server_runner
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
-    find_free_port,
     get_mock_requests,
     release_mock_gate,
     upload_agent,
@@ -84,104 +81,52 @@ def codex_budget_rig(
         ),
         encoding="utf-8",
     )
-    token = uuid.uuid4().hex
-    runner_id = token_bound_runner_id(token)
-    port = find_free_port()
+    base_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+    }
     env = {
-        **{
-            key: value
-            for key, value in os.environ.items()
-            if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
-        },
-        "HOME": str(native_home),
         "CODEX_HOME": str(codex_home),
         "OMNIGENT_CONFIG_HOME": str(config_dir),
-        "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
         "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
         "OMNIGENT_SKIP_WEB_UI": "true",
         "OMNIGENT_CODEX_PATH": str(shutil.which("codex")),
-        "PYTHONPATH": str(_REPO),
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
     }
-    processes: list[subprocess.Popen[bytes]] = []
-    base_url = f"http://127.0.0.1:{port}"
     with (
-        (tmp_path / "server.log").open("w") as server_log,
-        (tmp_path / "runner.log").open("w") as runner_log,
+        server_runner(
+            tmp_path,
+            workspace=workspace,
+            server_cwd=_REPO,
+            base_env=base_env,
+            server_env=env,
+            health_timeout=60,
+            poll_interval=0.5,
+            wait_ready=False,
+        ) as stack,
         httpx.Client(
-            base_url=base_url,
+            base_url=stack.base_url,
             timeout=15,
             trust_env=False,
             headers={"x-omnigent-background-session-titles": "off"},
         ) as client,
     ):
-        try:
-            processes.append(
-                subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-m",
-                        "omnigent.cli",
-                        "server",
-                        "--host",
-                        "127.0.0.1",
-                        "--port",
-                        str(port),
-                        "--database-uri",
-                        f"sqlite:///{tmp_path / 'test.db'}",
-                        "--artifact-location",
-                        str(tmp_path / "artifacts"),
-                    ],
-                    cwd=_REPO,
-                    env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": token},
-                    stdout=server_log,
-                    stderr=subprocess.STDOUT,
-                )
-            )
-            processes.append(
-                subprocess.Popen(
-                    [sys.executable, "-m", "omnigent.runner._entry"],
-                    cwd=_REPO,
-                    env={
-                        **env,
-                        "OMNIGENT_RUNNER_ID": runner_id,
-                        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": token,
-                        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                        "RUNNER_SERVER_URL": base_url,
-                    },
-                    stdout=runner_log,
-                    stderr=subprocess.STDOUT,
-                )
-            )
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline:
-                assert all(proc.poll() is None for proc in processes), "server/runner exited"
-                with contextlib.suppress(httpx.HTTPError):
-                    response = client.get(f"/v1/runners/{runner_id}/status", timeout=2)
-                    if response.status_code == 200 and response.json().get("online"):
-                        break
-                time.sleep(0.5)
-            else:
-                pytest.fail(f"server/runner did not start; logs: {tmp_path}")
-            yield client, workspace, runner_id, mock_url
-        finally:
-            for proc in reversed(processes):
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=5)
+        assert stack.runner_home == native_home, "native configuration must match runner HOME"
+        stack.start_runner(cwd=_REPO, env=env)
+        yield client, workspace, stack.runner_id, mock_url
 
 
-def _snapshot(client: httpx.Client, session_id: str) -> dict[str, Any]:
+def _snapshot(
+    client: httpx.Client, session_id: str, *, evidence: dict[str, Any] | None = None
+) -> dict[str, Any]:
     response = client.get(f"/v1/sessions/{session_id}")
     response.raise_for_status()
-    return response.json()
+    snapshot = response.json()
+    if evidence is not None:
+        evidence.update(_budget_state_summary(snapshot))
+    return snapshot
 
 
 def _wait_for(probe: Callable[[], Any], *, description: str, deadline: float) -> Any:
@@ -209,9 +154,85 @@ def _shell_response(call_id: str, command: str, **options: Any) -> dict[str, Any
     }
 
 
-def _work_requests(mock_url: str, model: str) -> list[dict[str, Any]]:
+def _budget_state_summary(state: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fixed state labels and bounded elicitation counts."""
+    statuses = {
+        "idle",
+        "launching",
+        "running",
+        "waiting",
+        "queued",
+        "in_progress",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+    summary: dict[str, Any] = {}
+    for key in ("status", "current_task_status"):
+        value = state.get(key)
+        summary[key] = value if isinstance(value, str) and value in statuses else "other"
+    busy = state.get("busy")
+    summary["busy"] = busy if isinstance(busy, bool) else "other"
+    pending = state.get("pending_elicitations")
+    count = len(pending) if isinstance(pending, list) else state.get("pending_elicitations_count")
+    summary["pending_elicitations_count"] = (
+        count if type(count) is int and 0 <= count <= 999_999 else "unavailable"
+    )
+    return summary
+
+
+def _budget_request_evidence(requests: list[dict[str, Any]], states: dict[str, Any]) -> str:
+    """Bound request structure to four requests, four items each and 4096 ASCII bytes."""
+    labels = {
+        "role": {"system", "developer", "user", "assistant", "tool"},
+        "type": {
+            "message",
+            "function_call",
+            "function_call_output",
+            "reasoning",
+            "item_reference",
+        },
+        "name": {"sys_session_send", "mcp__omnigent.sys_session_send", "exec_command"},
+    }
+    summary: dict[str, Any] = {
+        "request_count": len(requests),
+        "requests_omitted": max(0, len(requests) - 4),
+        "parent_at_cost_check": _budget_state_summary(states.get("parent", {})),
+        "child_at_discovery": _budget_state_summary(states.get("child", {})),
+        "requests": [],
+    }
+    for request_index in range(max(0, len(requests) - 4), len(requests)):
+        items = requests[request_index].get("input")
+        detail: dict[str, Any] = {
+            "request_index": request_index,
+            "item_count": "other",
+            "items": [],
+        }
+        if isinstance(items, list):
+            detail["item_count"] = len(items)
+            detail["items_omitted"] = max(0, len(items) - 4)
+            for item_index in range(max(0, len(items) - 4), len(items)):
+                item = items[item_index]
+                entry: dict[str, Any] = {"item_index": item_index}
+                for key, allowed in labels.items():
+                    value = item.get(key) if isinstance(item, dict) else None
+                    entry[key] = value if isinstance(value, str) and value in allowed else "other"
+                detail["items"].append(entry)
+        summary["requests"].append(detail)
+    encoded = json.dumps(summary, ensure_ascii=True, separators=(",", ":"))
+    if len(encoded) > 4096:
+        encoded = json.dumps({"request_count": len(requests), "structure_omitted": True})
+    return encoded
+
+
+def _work_requests(
+    mock_url: str, model: str, *, evidence: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     """Exclude the CLI's auxiliary title-generation requests from turn counts."""
-    return [body for body in get_mock_requests(mock_url, key=model) if body.get("tools")]
+    requests = [body for body in get_mock_requests(mock_url, key=model) if body.get("tools")]
+    if evidence is not None:
+        evidence["detail"] = _budget_request_evidence(requests, evidence)
+    return requests
 
 
 def test_codex_child_enforces_root_cost_budget_without_parent_activity(
@@ -231,7 +252,7 @@ def test_codex_child_enforces_root_cost_budget_without_parent_activity(
         },
         "os_env": {
             "type": "caller_process",
-            "cwd": str(workspace),
+            "cwd": ".",
             "sandbox": {"type": "none"},
         },
     }
@@ -316,10 +337,14 @@ def test_codex_child_enforces_root_cost_budget_without_parent_activity(
         )
         response.raise_for_status()
 
+        evidence: dict[str, Any] = {"parent": {}, "child": {}}
+
         def find_child() -> str | None:
             response = client.get(f"/v1/sessions/{parent_id}/child_sessions")
             response.raise_for_status()
             rows = response.json()["data"]
+            if rows:
+                evidence["child"] = _budget_state_summary(rows[0])
             return rows[0]["id"] if rows else None
 
         child_id = _wait_for(find_child, description="native child dispatch", deadline=deadline)
@@ -334,9 +359,11 @@ def test_codex_child_enforces_root_cost_budget_without_parent_activity(
             deadline=deadline,
         )
         assert (workspace / "under-budget.txt").read_text() == "allowed"
-        assert (_snapshot(client, parent_id).get("total_cost_usd") or 0) < 100
-        parent_requests = len(_work_requests(mock_url, _PARENT_MODEL))
-        assert parent_requests == 2
+        assert (
+            _snapshot(client, parent_id, evidence=evidence["parent"]).get("total_cost_usd") or 0
+        ) < 100
+        parent_requests = len(_work_requests(mock_url, _PARENT_MODEL, evidence=evidence))
+        assert parent_requests == 2, evidence["detail"]
         release_mock_gate(mock_url)
         _wait_for(
             lambda: len(_work_requests(mock_url, _CHILD_MODEL)) == 3,

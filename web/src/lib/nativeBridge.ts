@@ -20,12 +20,76 @@
 //   * This module never throws: a broken/old shell must not take down
 //     notifications in the browser path.
 
+import type { CodeHostDesktopApi, CodeHostDesktopFeatures } from "./nativeBridgeCodeHost";
+
 /**
  * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
  * `move` are live drag frames carrying an open fraction; `open` and `close`
  * are the settle decision the shell made on release.
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
+
+// Mirrors the protocol versions in electron/src/hostIdentity.js.
+export const SESSION_HOST_PROTOCOL = 1;
+export const SSH_PREVIEW_PROTOCOL = 1;
+export const TRUSTED_REMOTE_PREVIEW_PROTOCOL = 1;
+
+export interface BrowserHostOptions {
+  sourceHostId?: string | null;
+  sessionHostProtocol?: number;
+  sshPreviewProtocol?: number;
+  trustedRemotePreviewProtocol?: number;
+  navigationRetryToken?: string;
+  sourceSshTarget?: string;
+}
+
+export interface BrowserNavigationResult {
+  ok: boolean;
+  created?: boolean;
+  hostIsThisMachine?: boolean;
+  sshPreviewHost?: boolean;
+  trustedRemotePreviewHost?: boolean;
+  retryWithFreshHost?: boolean;
+  navigationRetryToken?: string;
+  error?: string;
+}
+
+export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
+  return hostId ? { sourceHostId: hostId, sessionHostProtocol: SESSION_HOST_PROTOCOL } : {};
+}
+
+/** A chord as physical keys, which main matches against a focused embedded page's key presses. */
+export interface BrowserForwardedChord {
+  key?: string;
+  code?: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+}
+
+/** An app chord a focused embedded page handed over, as keydown fields. */
+export interface BrowserForwardedKeydown {
+  type: "keydown";
+  key: string;
+  code: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  repeat: boolean;
+}
+
+export interface BrowserRecentSessionInput {
+  type: "keydown" | "keyup";
+  key: "Tab" | "Control" | "Escape";
+  code: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  repeat: boolean;
+}
 
 /**
  * Extra hints for the badge on shells that render it as a tappable OS
@@ -79,6 +143,11 @@ interface NativeShellApi {
    */
   onOpenPath?: (callback: (path: string) => void) => () => void;
   /**
+   * Subscribe to the desktop find bar opening, from the shortcut or the Edit
+   * menu. Absent on older shells / outside Electron; returns an unsubscribe.
+   */
+  onFindOpened?: (callback: () => void) => () => void;
+  /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
    * can drive its sidebar as an interactive drawer: `begin`/`move` carry a 0→1
@@ -97,6 +166,8 @@ interface NativeShellApi {
    * fallback so a newer SPA can still ask an older shell to hide the switcher.
    */
   setSidebarOpen?: (open: boolean) => void;
+  /** Control root-document scrolling; nested web scrollers remain independent. */
+  setDocumentScrollEnabled?: (enabled: boolean) => void;
   /**
    * Current server origin + managed/recent choices, or null on a foreign page.
    * Optional: shells older than the sidebar server picker lack it — the SPA
@@ -106,6 +177,8 @@ interface NativeShellApi {
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
   /** Re-point this window/shell to a server URL returned by the picker. */
   switchServer?: (url: string) => Promise<void>;
+  /** Sign the window's server out. Absent on shells that predate it. */
+  signOutOfServer?: () => Promise<boolean>;
   /** Return to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
   /**
@@ -127,6 +200,9 @@ interface NativeShellApi {
    * hardcoding them. Absent on older shells. Returns an unsubscribe.
    */
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
+  /** Area above the docked iOS keyboard; floating keyboard controls do not shrink it. */
+  getKeyboardViewport?: () => { width: number; height: number } | null;
+  onKeyboardViewportChanged?: (callback: () => void) => () => void;
 }
 
 export type ThemeSource = "light" | "dark" | "system";
@@ -157,8 +233,10 @@ export interface NativeViewModeParams {
  * server-served and may be newer than the installed shell, whose preload then
  * lacks these methods.
  */
-interface ElectronDesktopApi extends NativeShellApi {
+interface ElectronDesktopApi extends NativeShellApi, CodeHostDesktopApi {
   kind: "electron";
+  /** The runner picked during onboarding for this server, returned once. */
+  takeOnboardingRunner?: () => Promise<OnboardingRunner | null>;
   /**
    * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
    * notifications are shell-owned (native corner overlay + Server menu); this
@@ -168,16 +246,41 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
+  /** Reveal one of this machine's files in the OS file manager. */
+  revealFile?: (hostId: string, path: string) => Promise<boolean>;
+  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
+  chooseDirectory?: (defaultPath?: string) => Promise<string | null>;
+  /** This machine's path for a dropped File; "" if none or off the pinned server. */
+  getPathForFile?: (file: File) => Promise<string>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
   controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
   /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
   onHostStatusChanged?: (callback: () => void) => () => void;
-  /** Desktop feature gates (MDM-managed); absent on older shells. */
+  /** Desktop feature gates; absent on older shells. */
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
+  /** Remote hosts trusted for localhost previews; absent on older shells. */
+  getTrustedRemoteHosts?: () => Promise<TrustedRemoteHostsResult>;
+  /** Trust one remote host for localhost previews; absent on older shells. */
+  addTrustedRemoteHost?: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+  /** Remove one trusted remote host; absent on older shells. */
+  removeTrustedRemoteHost?: (
+    serverUrl: string,
+    hostId: string,
+  ) => Promise<TrustedRemoteHostsResult>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
+  /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
+  connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
+  /** A workspace API call on a session host's local socket; absent on Windows and older shells. */
+  workspaceSocketRequest?: (request: WorkspaceSocketRequest) => Promise<WorkspaceSocketResponse>;
+  /** Extend this machine's running Arca instance with an approved mode. */
+  extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
+  /** Renew this machine's dbcert. */
+  refreshDbcert?: (options?: DbcertRefreshOptions) => Promise<DbcertRefreshResult>;
+  /** Check local credentials before an Arclet launch without starting sign-in. */
+  checkDbcert?: () => Promise<DbcertStatusResult>;
 
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
@@ -192,8 +295,13 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+    opts?: BrowserHostOptions & {
+      force?: boolean;
+      agent?: boolean;
+      rememberedArcaHostId?: string;
+      sourceIsArcaHost?: boolean;
+    },
+  ) => Promise<BrowserNavigationResult>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -201,13 +309,278 @@ interface ElectronDesktopApi extends NativeShellApi {
    * predating the feature — callers must optional-chain.
    */
   browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
+  /** Forward the recent-session gesture from a focused embedded Browser page. */
+  onBrowserRecentSessionInput?: (
+    callback: (input: BrowserRecentSessionInput) => void,
+  ) => () => void;
+  /** Enable native input interception only while this renderer supports it. */
+  browserSetRecentSessionSwitchSupported?: (
+    supported: boolean,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  /** Clear native key interception when the recent-session gesture was declined. */
+  browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
+  /** Optional capability: the app chords a focused embedded page hands to this renderer. */
+  browserSetForwardedChords?: (
+    chords: BrowserForwardedChord[],
+  ) => Promise<{ ok: boolean; count?: number; error?: string }>;
+  onBrowserForwardedInput?: (callback: (input: BrowserForwardedKeydown) => void) => () => void;
+  /**
+   * Inspect the local Google Chrome profiles for cookies in the site tree the
+   * conversation's view is on, and across every website. Metadata only (profile
+   * + counts): no Keychain access and no cookie values. Absent on shells
+   * predating the feature.
+   */
+  browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
+  /**
+   * Copy one Chrome profile's cookies into the conversation's own in-memory
+   * browser session: every website's for {@link CHROME_COOKIE_ALL_SITES_SCOPE},
+   * else one site tree, for which `expectedHost` must still match the view's
+   * current site. Decrypts via the Keychain (system prompt on the first import).
+   */
+  browserChromeCookieImport?: (
+    conversationId: string,
+    args: { profileId: string; expectedHost: string; scope?: string },
+  ) => Promise<ChromeCookieImportResult>;
+  /** Subscribe to native menu commands for this window; returns an unsubscribe. */
+  onDesktopCommand?: (
+    callback: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits?: boolean;
+      quitDetail?: string | null;
+    }) => void,
+  ) => () => void;
+  /** Report which menu commands this page can run now (fire-and-forget). */
+  setDesktopCommandState?: (state: DesktopCommandState) => void;
+  /** The menu commands this shell routes to the page; absent on shells from before the list. */
+  desktopCommands?: readonly string[];
+  /** Report the conversation this page has loaded, or null for none (fire-and-forget). */
+  reportConversationShown?: (conversationId: string | null) => void;
+  /** Close this window once the page has confirmed. Resolves whether it closed. */
+  closeWindow?: () => Promise<boolean>;
+  /** Open a session in its own desktop window on this server. Resolves whether it opened. */
+  openSessionWindow?: (sessionId: string) => Promise<boolean>;
+  /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
+  confirmQuit?: (options: { dontAskAgain: boolean }) => Promise<boolean>;
+  /**
+   * Start macOS Dictation (Edit > Start Dictation…) in the focused field. Only
+   * macOS shells expose it. Resolves whether the shell started it.
+   */
+  startSystemDictation?: () => Promise<boolean>;
+  /**
+   * A system-wide shortcut, "show" when no id is given; absent on shells predating it. Only
+   * shells reporting `floatingComposerShortcut` know an id other than "show".
+   */
+  getGlobalShortcut?: (id?: GlobalShortcutId) => Promise<GlobalShortcutStatus | null>;
+  /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
+  setGlobalShortcut?: (
+    change: GlobalShortcutChange,
+    id?: GlobalShortcutId,
+  ) => Promise<GlobalShortcutSaveResult>;
+  /** Takes the next chord ahead of the page's shortcuts and the menu; null when cancelled. */
+  recordGlobalShortcut?: (id?: GlobalShortcutId) => Promise<string | null>;
+  cancelGlobalShortcutRecording?: () => Promise<boolean>;
+  /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
+  browserFocusedView?: () => Promise<string | null>;
+  /** "Widen window when opening the right sidebar"; absent on shells predating it. */
+  rightSidebarWindow?: RightSidebarWindowBridge;
+  /** The floating New Agent panel; absent on shells predating it. */
+  floatingComposer?: FloatingComposerBridge;
+}
+
+/** The shell's setting that widens the window for the right sidebar, and the page's reports. */
+export interface RightSidebarWindowBridge {
+  getWidensWindow: () => Promise<boolean>;
+  /** Resolves false when the shell couldn't save it. */
+  setWidensWindow: (enabled: boolean) => Promise<boolean>;
+  /** The user opened the right sidebar, `width` CSS px wide. */
+  opened: (width: number) => void;
+  /** The user closed the right sidebar. */
+  closed: () => void;
+  /** Forget the previous session's growth without resizing; absent on older shells. */
+  reset?: () => void;
+}
+
+/** Why the shell didn't open a path from the floating panel in a main window. */
+export type FloatingComposerOpenError = "not-composer" | "bad-path" | "window-loading";
+
+/** A panel launch's first message, handed to a main window that sends it. */
+export interface FloatingLaunchMessage {
+  text: string;
+  skill: { name: string; args: string } | null;
+  files: { name: string; type: string; bytes: Uint8Array<ArrayBuffer> }[];
+}
+
+/** A launch's first message the shell offers a main window to send itself. */
+export interface FloatingLaunchOffer {
+  offerId: number;
+  sessionId: string;
+}
+
+/** The desktop shell's floating New Agent panel. */
+export interface FloatingComposerBridge {
+  /** From a main window: this document can render the panel (version 1) for its server. */
+  announceSupport: (version: number) => void;
+  /** From the panel: hide it, keeping its draft. */
+  dismiss: () => void;
+  /** From the panel: show `/c/<id>` or an app page in a main window, then hide. */
+  openInMainWindow: (
+    path: string,
+    message?: FloatingLaunchMessage | null,
+  ) => Promise<{ ok: true; delivery?: "page" } | { ok: false; error: FloatingComposerOpenError }>;
+  /** From the panel: its native file picker opened or closed. */
+  filePicker: (state: "open" | "closed") => void;
+  /** From the panel: its composer rendered, so the shell shows it without a loading state. Newer shells only. */
+  ready?: () => void;
+  /** To the panel: it came on screen or took the keyboard again. Returns an unsubscribe. Newer shells only. */
+  onShown?: (callback: () => void) => () => void;
+  /** From the panel: whether a launch's message can go to a main window that sends it. Newer shells only. */
+  canHandOffLaunch?: () => Promise<boolean>;
+  /** From a main window: takes launches' first messages offered to it; returns an unsubscribe. Newer shells only. */
+  onLaunchOffer?: (callback: (offer: FloatingLaunchOffer) => void) => () => void;
+  /** From a main window: the offered message, once; null when it isn't ours. Newer shells only. */
+  takeLaunchOffer?: (offerId: number) => Promise<FloatingLaunchMessage | null>;
+  /** From a main window: whether the taken offer is still ours, so it may be sent. Newer shells only. */
+  confirmLaunchOffer?: (offerId: number) => Promise<boolean>;
+  /** From a main window: won't send the offer, so the panel delivers it now. Newer shells only. */
+  declineLaunchOffer?: (offerId: number) => Promise<boolean>;
+}
+
+/** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
+export type DesktopCommand =
+  | "close"
+  | "new-terminal"
+  | "new-browser-tab"
+  | "archive-session"
+  | "toggle-pin-session"
+  | "fork-session"
+  | "go-back"
+  | "go-forward"
+  | "reload"
+  | "focus-address-bar"
+  | "reopen-closed-tab"
+  | "previous-tab"
+  | "next-tab"
+  | "quit";
+
+const DESKTOP_COMMANDS: readonly string[] = [
+  "close",
+  "new-terminal",
+  "new-browser-tab",
+  "archive-session",
+  "toggle-pin-session",
+  "fork-session",
+  "go-back",
+  "go-forward",
+  "reload",
+  "focus-address-bar",
+  "reopen-closed-tab",
+  "previous-tab",
+  "next-tab",
+  "quit",
+] satisfies DesktopCommand[];
+
+export interface DesktopCommandEvent {
+  command: DesktopCommand;
+  /** The embedded browser view that held keyboard focus when Close fired, else null. */
+  browserViewId: string | null;
+  /** Whether closing this window quits the app (its last window, off macOS). */
+  closingQuits: boolean;
+  /** For Quit: what quitting stops (local sessions, a local server), else null. */
+  quitDetail: string | null;
+}
+
+/** What the page tells the shell so it can enable and label its menu items. */
+export interface DesktopCommandState {
+  commands: DesktopCommand[];
+  sessionPinned: boolean;
+  sessionArchived: boolean;
+  /** An open pick list has the keyboard and steps on Ctrl-N / Ctrl-P, which the menu then leaves. */
+  pickListFocused?: boolean;
+}
+
+/** One importable site tree and how many cookies a profile holds for it. */
+export interface ChromeCookieScopeCount {
+  /** The page's host or one of its parent domains. */
+  host: string;
+  /** Cookies on that domain and its subdomains, plus inherited domain cookies. */
+  cookieCount: number;
+}
+
+/** One local Chrome profile that holds cookies for the current site. */
+export interface ChromeCookieProfile {
+  /** Chrome's profile directory name (e.g. `Default`, `Profile 2`). */
+  id: string;
+  /** Chrome's profile display name, falling back to the directory name. */
+  name: string;
+  /** How many cookies the profile holds for the page's own host tree. */
+  cookieCount: number;
+  /** Counts per scope, narrowest first (see {@link ChromeCookiePreviewResult.scopes}).
+   *  Only scopes this profile actually holds cookies for are listed. */
+  scopes?: ChromeCookieScopeCount[];
+}
+
+/** The import scope for every website in a Chrome profile, not one site tree. */
+export const CHROME_COOKIE_ALL_SITES_SCOPE = "*";
+
+/** One local Chrome profile and how many cookies it holds across every website. */
+export interface ChromeCookieAllSitesProfile {
+  id: string;
+  name: string;
+  cookieCount: number;
+}
+
+export interface ChromeCookiePreviewResult {
+  ok: boolean;
+  /** Host whose page asked for the import (main-derived from the real URL). */
+  host?: string;
+  /** Scopes the user may pick: `host`, then each parent domain Chrome holds
+   *  a domain cookie for. */
+  scopes?: string[];
+  /** Profiles with at least one cookie for any scope; empty when none match. */
+  profiles?: ChromeCookieProfile[];
+  /** Profiles with at least one cookie for any website. Absent on shells that
+   *  can only import one site. */
+  allSitesProfiles?: ChromeCookieAllSitesProfile[];
+  error?: string;
+}
+
+export interface ChromeCookieImportResult {
+  ok: boolean;
+  /** The user declined the shell's own confirmation; nothing was read. */
+  cancelled?: boolean;
+  host?: string;
+  /** The site tree actually copied, or {@link CHROME_COOKIE_ALL_SITES_SCOPE}. */
+  scope?: string;
+  profileId?: string;
+  profileName?: string;
+  /** Cookies matching the site tree (before decryption). */
+  found?: number;
+  /** Cookies written into the conversation's session. */
+  imported?: number;
+  /** Matched cookies we could not decrypt and left out. */
+  skipped?: number;
+  /** Cookies Chrome believes are valid but the session rejected. */
+  failed?: number;
+  error?: string;
 }
 
 /** A lifecycle action for the host daemon. */
 export type HostControlAction = "start" | "stop" | "restart";
 
+export type ArcaExtendMode = "overnight" | "workweek";
+export type ArcaExtendResult =
+  { ok: true; shutdownAt: number | null } | { ok: false; error: string };
+export type DbcertRefreshResult = { ok: true } | { ok: false; error: string };
+export interface DbcertRefreshOptions {
+  skipArcaSync?: boolean;
+}
+export type DbcertStatusResult = { ok: true; valid: boolean } | { ok: false; error: string };
+
 /** Result of connecting the Arca instance as a host, from the desktop shell. */
 export interface ArcaConnectResult extends HostActionResult {
+  /** Actual daemon identity captured on Arca for this selected server target. */
+  identity?: { serverUrl: string; hostId: string };
   /**
    * The box's host daemon was already connected to this server (the command
    * reused it) — so no new host will appear in the host list.
@@ -225,17 +598,64 @@ export interface ArcaConnectResult extends HostActionResult {
   shownInConsole?: boolean;
 }
 
+/** One workspace API call for the desktop shell to send to a host's local socket. */
+export interface WorkspaceSocketRequest {
+  /** The session's host; the shell reaches it over SSH when this desktop connected it that way. */
+  hostId: string;
+  /** An SSH alias the shell may verify and record for `hostId` when it has none. */
+  sshTarget?: string;
+  /** The socket the server named for the session's host, on the host's machine. */
+  socketPath: string;
+  /** The call's path, e.g. `/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile`. */
+  path: string;
+  headers: Record<string, string>;
+  body: Uint8Array;
+}
+
+/** The host's whole HTTP response to a {@link WorkspaceSocketRequest}. */
+export interface WorkspaceSocketResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: Uint8Array;
+}
+
 /**
- * Desktop-shell feature gates the server can't know about, sourced from MDM
- * managed preferences. All fields optional: an older shell reports fewer.
+ * The desktop shell's way to call a host's local workspace socket, or null
+ * outside the shell, on Windows, and in shells too old to offer it.
  */
-export interface DesktopFeatures {
+export function workspaceSocketBridge():
+  ((request: WorkspaceSocketRequest) => Promise<WorkspaceSocketResponse>) | null {
+  const electron = electronApi();
+  return electron?.workspaceSocketRequest ? electron.workspaceSocketRequest.bind(electron) : null;
+}
+
+/**
+ * Desktop-shell feature gates the server can't know about. All fields
+ * optional: an older shell reports fewer.
+ */
+export interface DesktopFeatures extends CodeHostDesktopFeatures {
   /**
-   * Databricks-internal features (e.g. the Arca host option) are enabled.
-   * Already scoped by the shell: true only when the MDM flag is set AND the
-   * window's server is Databricks-managed.
+   * Managed features (e.g. the Arca host option) are enabled.
+   * Already scoped by the shell: true only when the flag is set AND the
+   * window's server is a managed server.
    */
   databricksInternalFeatures?: boolean;
+  /** This window may offer one-click Arca extension. */
+  canExtendArca?: boolean;
+  /** This window may renew the laptop's dbcert. */
+  canRefreshDbcert?: boolean;
+  /** Shell can restore Arca preview identity after a desktop restart. */
+  arcaPreviewRecovery?: boolean;
+  /** This shell can import the current site's cookies from local Google Chrome. */
+  chromeCookieImport?: boolean;
+  /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
+  sshLocalhostPreview?: boolean;
+  /** Shell can ask to trust a remote host for localhost previews. */
+  trustedRemoteLocalhostPreview?: boolean;
+  /** This shell can show the floating New Agent panel (macOS). */
+  floatingComposer?: boolean;
+  /** This shell's shortcut calls take the "floatingComposer" id (macOS). */
+  floatingComposerShortcut?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -252,8 +672,24 @@ export interface CliStatus {
   installCommand: string;
   /** Whether a just-submitted path was accepted (present on pick/set results). */
   accepted?: boolean;
-  /** MDM policy disables set/browse/reset of custom CLI paths. */
+  /** Policy disables set/browse/reset of custom CLI paths. */
   customizationDisabled?: boolean;
+}
+
+/** One remote host trusted for localhost previews, in settings-file shape. */
+export interface TrustedRemoteHost {
+  server_url: string;
+  host_id: string;
+}
+
+/** Result of listing, adding, or removing trusted remote hosts. */
+export interface TrustedRemoteHostsResult {
+  ok: boolean;
+  serverUrl?: string;
+  error?: string;
+  hosts?: TrustedRemoteHost[];
+  added?: boolean;
+  removed?: boolean;
 }
 
 /** This machine's identity, read from local config (fast — no subprocess). */
@@ -275,6 +711,36 @@ export interface HostActionResult {
    * generic error. Set by the desktop's `omnigent:host-control` handler.
    */
   authError?: boolean;
+}
+
+/** "Show Omnigent from anywhere", or the floating New Agent panel's shortcut. */
+export type GlobalShortcutId = "show" | "floatingComposer";
+
+/** A system-wide shortcut's setting; `accelerator` is an Electron accelerator. */
+export interface GlobalShortcutSetting {
+  enabled: boolean;
+  accelerator: string;
+}
+
+/** A chord to save, or `{ enabled: false }` to turn the shortcut off and keep its chord. */
+export type GlobalShortcutChange = GlobalShortcutSetting | { enabled: false; accelerator?: never };
+
+/** `setting` is what the shell saved, which may differ from what a stale window showed. */
+export interface GlobalShortcutSaveResult {
+  ok: boolean;
+  setting?: GlobalShortcutSetting;
+  error?: string;
+  /** A free chord to offer in place of the one the shell couldn't register. */
+  suggestion?: string;
+}
+
+/**
+ * The saved shortcut, with `error` while it is on but the shell couldn't register it, and a
+ * `suggestion` free chord when there is one.
+ */
+export interface GlobalShortcutStatus extends GlobalShortcutSetting {
+  error?: string;
+  suggestion?: string;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";
@@ -334,10 +800,30 @@ export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
   /**
+   * The server URL the user picked when sign-in moved to `currentOrigin`'s host
+   * (it may carry a workspace `?o=` selector), else null. Absent on older shells.
+   */
+  currentServer?: string | null;
+  /** Recent URL → the server URL the user picked for it, for display. Absent on older shells. */
+  recentLabels?: Record<string, string>;
+  /**
    * Server URLs supplied through macOS Managed Preferences. Optional because a
-   * newer server-served SPA can run inside a desktop shell that predates MDM.
+   * newer server-served SPA can run inside a desktop shell that predates this.
    */
   managedServers?: string[];
+  /** Display names for managed servers, server URL → name. Absent on older shells. */
+  managedServerNames?: Record<string, string>;
+  /**
+   * Whether the shell owns this server's sign-in (Databricks or OIDC browser
+   * sign-in) and can sign it out. Absent on older shells.
+   */
+  canSignOut?: boolean;
+  /**
+   * Names servers gave themselves in their manifest, origin → name. Display
+   * only (a server can call itself anything), so show the host alongside.
+   * Absent on older shells.
+   */
+  serverNames?: Record<string, string>;
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**
@@ -409,7 +895,7 @@ export function serverManifestOf(info: ServerPickerInfo | null): ServerManifest 
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */
-function electronApi(): ElectronDesktopApi | undefined {
+export function electronApi(): ElectronDesktopApi | undefined {
   if (typeof window === "undefined") return undefined;
   const api = (window as unknown as { omnigentDesktop?: ElectronDesktopApi }).omnigentDesktop;
   return api?.kind === "electron" ? api : undefined;
@@ -445,6 +931,11 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
   return electronApi()?.updates;
 }
 
+/** The floating New Agent panel bridge, or undefined outside Electron / older shells. */
+export function floatingComposerBridge(): FloatingComposerBridge | undefined {
+  return electronApi()?.floatingComposer;
+}
+
 /**
  * True when the desktop shell is new enough to host the embedded browser pane.
  * Older installed builds expose `omnigentDesktop` but predate the `browser*`
@@ -456,6 +947,342 @@ export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
 }
 
+/** Subscribe to recent-session key events forwarded from an embedded Browser page. */
+export function onBrowserRecentSessionInput(
+  callback: (input: BrowserRecentSessionInput) => void,
+): () => void {
+  const electron = electronApi();
+  if (!electron?.onBrowserRecentSessionInput) return () => {};
+  try {
+    return electron.onBrowserRecentSessionInput(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session input subscription failed:", err);
+    return () => {};
+  }
+}
+
+/** Advertise whether this renderer can handle embedded-page Ctrl+Tab events. */
+export async function setBrowserRecentSessionSwitchSupported(supported: boolean): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserSetRecentSessionSwitchSupported) return;
+  try {
+    await electron.browserSetRecentSessionSwitchSupported(supported);
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session support update failed:", err);
+  }
+}
+
+/** Whether a focused embedded page can hand app chords (such as ⌘K) to this renderer. */
+export function browserForwardsChords(): boolean {
+  const electron = electronApi();
+  return (
+    typeof electron?.browserSetForwardedChords === "function" &&
+    typeof electron.onBrowserForwardedInput === "function"
+  );
+}
+
+/** List the app chords a focused embedded page should hand over; an empty list hands over none. */
+export async function setBrowserForwardedChords(chords: BrowserForwardedChord[]): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserSetForwardedChords) return;
+  try {
+    const result = await electron.browserSetForwardedChords(chords);
+    if (result?.ok === false) {
+      console.warn("[nativeBridge] browser forwarded chords update refused:", result.error);
+    }
+  } catch (err) {
+    console.warn("[nativeBridge] browser forwarded chords update failed:", err);
+  }
+}
+
+/** Subscribe to app chords forwarded from a focused embedded page. */
+export function onBrowserForwardedInput(
+  callback: (input: BrowserForwardedKeydown) => void,
+): () => void {
+  const subscribe = electronApi()?.onBrowserForwardedInput;
+  if (typeof subscribe !== "function") return () => {};
+  try {
+    return subscribe(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] browser forwarded input subscription failed:", err);
+    return () => {};
+  }
+}
+
+/** Tell Electron that a forwarded Ctrl+Tab did not open the session switcher. */
+export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserCancelRecentSessionSwitch) return;
+  try {
+    await electron.browserCancelRecentSessionSwitch();
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session cancellation failed:", err);
+  }
+}
+
+/**
+ * True when the desktop shell owns the native menu commands (Close, New
+ * Terminal, New Browser Tab, Pin/Archive Session) and hands them to this page.
+ * Older shells lack the bridge and keep their own Close Window behavior.
+ */
+export function supportsDesktopCommands(): boolean {
+  const electron = electronApi();
+  return (
+    typeof electron?.onDesktopCommand === "function" &&
+    typeof electron.setDesktopCommandState === "function"
+  );
+}
+
+/**
+ * True when the shell's menu routes every one of `commands` to this page, by the list it
+ * advertises. A shell from before that list may still route some, so it answers false.
+ */
+export function shellRoutesDesktopCommands(commands: readonly DesktopCommand[]): boolean {
+  if (!supportsDesktopCommands()) return false;
+  const routed = electronApi()?.desktopCommands;
+  return Array.isArray(routed) && commands.every((command) => routed.includes(command));
+}
+
+/** Subscribe to native menu commands; a no-op outside a supporting shell. */
+export function onDesktopCommand(callback: (event: DesktopCommandEvent) => void): () => void {
+  const electron = electronApi();
+  if (!electron?.onDesktopCommand) return () => {};
+  try {
+    return electron.onDesktopCommand(({ command, browserViewId, closingQuits, quitDetail }) => {
+      // A newer shell may send commands this page doesn't know; drop them.
+      if (!DESKTOP_COMMANDS.includes(command)) return;
+      callback({
+        command: command as DesktopCommand,
+        browserViewId: browserViewId ?? null,
+        closingQuits: closingQuits === true,
+        quitDetail: typeof quitDetail === "string" ? quitDetail : null,
+      });
+    });
+  } catch (err) {
+    console.warn("[nativeBridge] desktop command subscription failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Tell the shell which conversation this page has loaded for the signed-in
+ * user, or null when it shows none. A shell that predates this ignores it.
+ */
+export function reportConversationShown(conversationId: string | null): void {
+  const electron = electronApi();
+  if (!electron?.reportConversationShown) return;
+  try {
+    electron.reportConversationShown(conversationId);
+  } catch (err) {
+    console.warn("[nativeBridge] conversation report failed:", err);
+  }
+}
+
+/** Tell the shell which menu commands this page can run right now. */
+export function setDesktopCommandState(state: DesktopCommandState): void {
+  const electron = electronApi();
+  if (!electron?.setDesktopCommandState) return;
+  try {
+    electron.setDesktopCommandState(state);
+  } catch (err) {
+    console.warn("[nativeBridge] desktop command state update failed:", err);
+  }
+}
+
+/** Close this desktop window after the page's own confirmation; resolves whether it closed. */
+export async function closeDesktopWindow(): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.closeWindow) return false;
+  try {
+    return (await electron.closeWindow()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] closeWindow failed:", err);
+    return false;
+  }
+}
+
+/** True when the desktop shell can open a session in its own app window. */
+export function supportsDesktopSessionWindows(): boolean {
+  return typeof electronApi()?.openSessionWindow === "function";
+}
+
+/** Ask the desktop shell to open ``sessionId`` in its own window; resolves whether it did. */
+export async function openDesktopSessionWindow(sessionId: string): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.openSessionWindow) return false;
+  try {
+    return (await electron.openSessionWindow(sessionId)) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] openSessionWindow failed:", err);
+    return false;
+  }
+}
+
+/** True when the desktop shell can hand dictation to macOS Dictation. */
+export function supportsSystemDictation(): boolean {
+  return typeof electronApi()?.startSystemDictation === "function";
+}
+
+/**
+ * Start macOS Dictation in the field that has focus, so focus the target first.
+ * Resolves whether the shell started it.
+ */
+export async function startSystemDictation(): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.startSystemDictation) return false;
+  try {
+    return (await electron.startSystemDictation()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] startSystemDictation failed:", err);
+    return false;
+  }
+}
+
+/** Quit the desktop app once the page's prompt confirmed. Resolves whether the shell took it. */
+export async function confirmDesktopQuit(dontAskAgain: boolean): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.confirmQuit) return false;
+  try {
+    return (await electron.confirmQuit({ dontAskAgain })) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] confirmQuit failed:", err);
+    return false;
+  }
+}
+
+/**
+ * True when the shell can show Omnigent from anywhere. Needs both calls, so a
+ * shell that can read the shortcut but not save it counts as unsupported.
+ */
+export function supportsGlobalShortcut(): boolean {
+  const electron = electronApi();
+  return (
+    typeof electron?.getGlobalShortcut === "function" &&
+    typeof electron.setGlobalShortcut === "function"
+  );
+}
+
+/** The id to pass the shell: none for "show", so that call is the one every shell takes. */
+function shortcutIdArgs(id: GlobalShortcutId): [] | [GlobalShortcutId] {
+  return id === "show" ? [] : [id];
+}
+
+/** The saved shortcut; `null` outside the shell or on failure. */
+export async function getGlobalShortcut(
+  id: GlobalShortcutId = "show",
+): Promise<GlobalShortcutStatus | null> {
+  const electron = electronApi();
+  if (!electron?.getGlobalShortcut) return null;
+  try {
+    return await electron.getGlobalShortcut(...shortcutIdArgs(id));
+  } catch (err) {
+    console.warn("[nativeBridge] electron getGlobalShortcut failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Saves a chord, or turns the shortcut off for `{ enabled: false }`. Resolves
+ * `{ ok: false, error }` when refused; the setting is unchanged.
+ */
+export async function setGlobalShortcut(
+  change: GlobalShortcutChange,
+  id: GlobalShortcutId = "show",
+): Promise<GlobalShortcutSaveResult> {
+  const electron = electronApi();
+  if (!electron?.setGlobalShortcut) return { ok: false, error: "Couldn't save the shortcut." };
+  try {
+    return await electron.setGlobalShortcut(change, ...shortcutIdArgs(id));
+  } catch (err) {
+    console.warn("[nativeBridge] electron setGlobalShortcut failed:", err);
+    return { ok: false, error: "Couldn't save the shortcut." };
+  }
+}
+
+/** Whether the shell records the next chord itself, before the page's shortcuts see it. */
+export function shellRecordsGlobalShortcut(): boolean {
+  return typeof electronApi()?.recordGlobalShortcut === "function";
+}
+
+/** The next chord, taken by the shell; null when recording was cancelled or failed. */
+export async function recordGlobalShortcut(id: GlobalShortcutId = "show"): Promise<string | null> {
+  try {
+    return (await electronApi()?.recordGlobalShortcut?.(...shortcutIdArgs(id))) ?? null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron recordGlobalShortcut failed:", err);
+    return null;
+  }
+}
+
+export function cancelGlobalShortcutRecording(): void {
+  void electronApi()
+    ?.cancelGlobalShortcutRecording?.()
+    .catch(() => {});
+}
+
+/** Whether the shell can widen the window when the right sidebar opens. */
+export function supportsWidenWindowForRightSidebar(): boolean {
+  const bridge = electronApi()?.rightSidebarWindow;
+  return (
+    typeof bridge?.getWidensWindow === "function" &&
+    typeof bridge.setWidensWindow === "function" &&
+    typeof bridge.opened === "function" &&
+    typeof bridge.closed === "function"
+  );
+}
+
+/** Whether "Widen window when opening the right sidebar" is on; null outside the shell or on failure. */
+export async function getWidenWindowForRightSidebar(): Promise<boolean | null> {
+  if (!supportsWidenWindowForRightSidebar()) return null;
+  try {
+    return (await electronApi()?.rightSidebarWindow?.getWidensWindow()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron getWidensWindow failed:", err);
+    return null;
+  }
+}
+
+/** Saves the setting; resolves false when the shell is absent or couldn't save it. */
+export async function setWidenWindowForRightSidebar(enabled: boolean): Promise<boolean> {
+  if (!supportsWidenWindowForRightSidebar()) return false;
+  try {
+    return (await electronApi()?.rightSidebarWindow?.setWidensWindow(enabled)) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron setWidensWindow failed:", err);
+    return false;
+  }
+}
+
+/** A session switch starts fresh window-growth tracking without resizing the window. */
+export function resetRightSidebarWindowTracking(): void {
+  try {
+    electronApi()?.rightSidebarWindow?.reset?.();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar reset failed:", err);
+  }
+}
+
+/** Tell a supporting shell the user opened (`width` CSS px) or closed the right sidebar. */
+export function reportRightSidebarVisibility(open: boolean, width: number): void {
+  if (!supportsWidenWindowForRightSidebar()) return;
+  const bridge = electronApi()?.rightSidebarWindow;
+  try {
+    if (open) bridge?.opened(width);
+    else bridge?.closed();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar report failed:", err);
+  }
+}
+
+/** The browser page (its view id) that has keyboard focus in this window, if any. */
+export async function focusedBrowserView(): Promise<string | null> {
+  try {
+    return (await electronApi()?.browserFocusedView?.()) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * True when running inside the Electron desktop shell on macOS — the one
  * platform where the shell hides the native title bar (titleBarStyle
@@ -465,6 +1292,15 @@ export function supportsBrowser(): boolean {
  */
 export function isMacElectronShell(): boolean {
   return isElectronShell() && navigator.userAgent.includes("Macintosh");
+}
+
+/**
+ * Mark `<html>` with `data-electron-mac` so the `[data-electron-mac]` rules
+ * reach portals outside AppShell. The shell never changes at runtime, so call
+ * once before first paint.
+ */
+export function applyMacElectronShellAttribute(): void {
+  if (isMacElectronShell()) document.documentElement.dataset.electronMac = "true";
 }
 
 /** True when running inside the iOS WKWebView native shell. */
@@ -596,6 +1432,21 @@ export function onOpenPath(callback: (path: string) => void): () => void {
 }
 
 /**
+ * Subscribe to the desktop find bar opening. A no-op outside the Electron
+ * shell or under a shell too old to send it.
+ */
+export function onFindOpened(callback: () => void): () => void {
+  const native = nativeApi();
+  if (!native?.onFindOpened) return () => {};
+  try {
+    return native.onFindOpened(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onFindOpened failed:", err);
+    return () => {};
+  }
+}
+
+/**
  * Subscribe to native sidebar-drag events from the iOS shell's left-edge swipe
  * (the gesture it repurposed from back-navigation), so the renderer can drive
  * its sidebar as an interactive drawer — tracking the finger on `begin`/`move`
@@ -722,6 +1573,49 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
   }
 }
 
+/** Prevent native focus scrolling while the app shell owns keyboard layout. */
+export function setIOSDocumentScrollEnabled(enabled: boolean): void {
+  const native = nativeApi();
+  if (native?.kind !== "ios") return;
+  try {
+    native.setDocumentScrollEnabled?.(enabled);
+  } catch (err) {
+    console.warn("[nativeBridge] native setDocumentScrollEnabled failed:", err);
+  }
+}
+
+/** UIKit's visible height, or null for older shells and pending orientation updates. */
+export function getIOSKeyboardViewportHeight(): number | null {
+  if (!isIOSShell()) return null;
+  try {
+    const viewport = nativeApi()?.getKeyboardViewport?.();
+    if (
+      !viewport ||
+      !Number.isFinite(viewport.width) ||
+      !Number.isFinite(viewport.height) ||
+      Math.abs(viewport.width - window.innerWidth) > 1 ||
+      viewport.height <= 0
+    ) {
+      return null;
+    }
+    // WebKit can temporarily shrink innerHeight during a keyboard transition.
+    // Only reconcile subpixel rounding; UIKit owns the usable app height.
+    return Math.abs(viewport.height - window.innerHeight) <= 1
+      ? Math.min(viewport.height, window.innerHeight)
+      : viewport.height;
+  } catch {
+    return null;
+  }
+}
+
+export function onNativeKeyboardViewportChanged(callback: () => void): () => void {
+  try {
+    return nativeApi()?.onKeyboardViewportChanged?.(callback) ?? (() => {});
+  } catch {
+    return () => {};
+  }
+}
+
 /**
  * Fetch server picker data from the native shell (Electron or iOS): the
  * current origin plus organization-provided and recently-connected server
@@ -758,6 +1652,22 @@ export async function switchServer(url: string): Promise<void> {
 }
 
 /**
+ * Ask the native shell to sign this window's server out. Every window on that
+ * server returns to the setup page, and the next Connect signs in through the
+ * browser. Resolves false off-shell or when the shell can't sign it out.
+ */
+export async function signOutOfServer(): Promise<boolean> {
+  const native = nativeApi();
+  if (!native?.signOutOfServer) return false;
+  try {
+    return (await native.signOutOfServer()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] native signOutOfServer failed:", err);
+    return false;
+  }
+}
+
+/**
  * Ask the native shell to return this window to its "connect to server"
  * setup page (the picker's "+ Connect to new server…" action). The window
  * navigates away on success.
@@ -789,6 +1699,43 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
   }
 }
 
+/** Where desktop onboarding connected a runner: this machine, or a remote host like Arca. */
+export type OnboardingRunner = "local" | "remote";
+
+/** Features that each take the onboarding runner once per page load. */
+export type OnboardingRunnerConsumer = "hostPicker" | "importReview";
+
+// The shell clears its value on the first IPC read, so every consumer shares one.
+let onboardingRunnerRead: Promise<OnboardingRunner | null> | null = null;
+const onboardingRunnerTakenBy = new Set<OnboardingRunnerConsumer>();
+
+async function readOnboardingRunner(): Promise<OnboardingRunner | null> {
+  try {
+    return (await electronApi()?.takeOnboardingRunner?.()) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The runner picked during desktop onboarding for this server, handed to
+ * each *consumer* once; null otherwise or outside Electron.
+ */
+export function takeOnboardingRunner(
+  consumer: OnboardingRunnerConsumer,
+): Promise<OnboardingRunner | null> {
+  if (onboardingRunnerTakenBy.has(consumer)) return Promise.resolve(null);
+  onboardingRunnerTakenBy.add(consumer);
+  onboardingRunnerRead ??= readOnboardingRunner();
+  return onboardingRunnerRead;
+}
+
+/** Test-only: forget this page load's onboarding runner read. */
+export function resetOnboardingRunnerForTests(): void {
+  onboardingRunnerRead = null;
+  onboardingRunnerTakenBy.clear();
+}
+
 /**
  * Start / stop / restart this machine's host daemon for the window's server,
  * via the desktop shell. Resolves `{ ok, error? }`; a no-op `{ ok: false }`
@@ -806,7 +1753,7 @@ export async function controlHost(action: HostControlAction): Promise<HostAction
 }
 
 /**
- * Fetch the desktop shell's feature gates (MDM-managed). Resolves `null`
+ * Fetch the desktop shell's feature gates. Resolves `null`
  * outside the Electron shell or under a shell too old to expose them — callers
  * must treat null / a missing field as disabled.
  */
@@ -822,10 +1769,39 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
 }
 
 /**
- * Connect the user's Arca instance (Databricks-internal sandbox) to the
- * window's server as a host, via the desktop shell. The shell asks native
- * consent and runs `arca ssh` — resolving only once the remote host daemon
- * started (or failed). A no-op `{ ok: false }` outside the shell.
+ * The trusted-remote-hosts bridge, or null outside the shell / on shells too
+ * old to offer it. Callers must optional-chain; a missing bridge means the
+ * settings-file fallback is the only way to trust a host.
+ */
+export function trustedRemoteHostsBridge(): {
+  list: () => Promise<TrustedRemoteHostsResult>;
+  add: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+  remove: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+} | null {
+  const electron = electronApi();
+  if (
+    !electron?.getTrustedRemoteHosts ||
+    !electron?.addTrustedRemoteHost ||
+    !electron?.removeTrustedRemoteHost
+  ) {
+    return null;
+  }
+  return {
+    list: () => electron.getTrustedRemoteHosts!(),
+    add: (serverUrl, hostId) => electron.addTrustedRemoteHost!(serverUrl, hostId),
+    remove: (serverUrl, hostId) => electron.removeTrustedRemoteHost!(serverUrl, hostId),
+  };
+}
+
+/** Whether this desktop shell can connect the user's Arca instance as a host. */
+export function supportsArcaConnect(): boolean {
+  return typeof electronApi()?.connectArcaHost === "function";
+}
+
+/**
+ * Connect the user's Arca instance to the window's server as a host, via the
+ * desktop shell. The shell asks for native consent first and resolves once the
+ * remote host daemon starts or fails. A no-op `{ ok: false }` outside the shell.
  */
 export async function connectArcaHost(): Promise<ArcaConnectResult> {
   const electron = electronApi();
@@ -837,6 +1813,81 @@ export async function connectArcaHost(): Promise<ArcaConnectResult> {
   } catch (err) {
     console.warn("[nativeBridge] electron connectArcaHost failed:", err);
     return { ok: false, error: String(err) };
+  }
+}
+
+/** Whether this desktop shell can connect a machine the user reaches over SSH. */
+export function supportsSshConnect(): boolean {
+  return typeof electronApi()?.connectSshHost === "function";
+}
+
+/**
+ * Connect `destination` (an ssh alias, host or user@host) to the window's
+ * server as a host. The shell asks consent and handles ssh prompts and the
+ * browser sign-in in its own window. A no-op `{ ok: false }` outside the shell.
+ */
+export async function connectSshHost(destination: string): Promise<ArcaConnectResult> {
+  const electron = electronApi();
+  if (!electron?.connectSshHost) {
+    return { ok: false, error: "not running under the desktop shell" };
+  }
+  try {
+    return await electron.connectSshHost(destination);
+  } catch (err) {
+    console.warn("[nativeBridge] electron connectSshHost failed:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Present only in desktop shells that can extend a running Arca instance. */
+export function hasArcaExtendBridge(): boolean {
+  return typeof electronApi()?.extendArca === "function";
+}
+
+export async function extendArca(mode: ArcaExtendMode): Promise<ArcaExtendResult> {
+  const bridge = electronApi()?.extendArca;
+  if (!bridge) return { ok: false, error: "Arca extend is unavailable in this app." };
+  try {
+    return await bridge(mode);
+  } catch (error) {
+    console.warn("[nativeBridge] electron extendArca failed:", error);
+    return {
+      ok: false,
+      error: "Could not extend Arca from this app.",
+    };
+  }
+}
+
+/** Present only in desktop shells that can renew this machine's dbcert. */
+export function hasDbcertRefreshBridge(): boolean {
+  return typeof electronApi()?.refreshDbcert === "function";
+}
+
+export function hasDbcertPreflightBridge(): boolean {
+  return typeof electronApi()?.checkDbcert === "function" && hasDbcertRefreshBridge();
+}
+
+/** Check the laptop's credentials without opening a browser or renewing them. */
+export async function checkDbcert(): Promise<DbcertStatusResult> {
+  const bridge = electronApi()?.checkDbcert;
+  if (!bridge) return { ok: false, error: "Laptop credential checks are unavailable in this app." };
+  try {
+    return await bridge();
+  } catch (error) {
+    console.warn("[nativeBridge] electron checkDbcert failed:", error);
+    return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
+  }
+}
+
+/** Renew the laptop's dbcert through the desktop shell. */
+export async function refreshDbcert(options?: DbcertRefreshOptions): Promise<DbcertRefreshResult> {
+  const bridge = electronApi()?.refreshDbcert;
+  if (!bridge) return { ok: false, error: "dbcert refresh is unavailable in this app." };
+  try {
+    return await (options ? bridge(options) : bridge());
+  } catch (error) {
+    console.warn("[nativeBridge] electron refreshDbcert failed:", error);
+    return { ok: false, error: "Could not run dbcert from this app." };
   }
 }
 
@@ -891,3 +1942,49 @@ export async function resetCliPath(): Promise<CliStatus | null> {
     return null;
   }
 }
+
+/** True when the desktop shell can reveal this machine's files in the OS file manager. */
+export function supportsFileReveal(): boolean {
+  return typeof electronApi()?.revealFile === "function";
+}
+
+/** Ask the desktop shell to reveal ``path``; resolves false if it could not. */
+export async function revealFile(hostId: string, path: string): Promise<boolean> {
+  try {
+    return (await electronApi()?.revealFile?.(hostId, path)) ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/** True when the desktop shell can open the OS folder chooser for this machine. */
+export function supportsDirectoryChooser(): boolean {
+  return typeof electronApi()?.chooseDirectory === "function";
+}
+
+/** Open the OS folder chooser; resolves the chosen path, or null on cancel or failure. */
+export async function chooseDirectory(defaultPath?: string): Promise<string | null> {
+  try {
+    return (await electronApi()?.chooseDirectory?.(defaultPath)) ?? null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron chooseDirectory failed:", err);
+    return null;
+  }
+}
+
+/** True when the desktop shell can resolve paths of files dropped from the OS. */
+export function supportsDroppedFilePaths(): boolean {
+  return typeof electronApi()?.getPathForFile === "function";
+}
+
+/** This machine's path for a dropped ``file``, or null when the shell can't resolve one. */
+export async function droppedFilePath(file: File): Promise<string | null> {
+  try {
+    return (await electronApi()?.getPathForFile?.(file)) || null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron getPathForFile failed:", err);
+    return null;
+  }
+}
+
+export * from "./nativeBridgeCodeHost";

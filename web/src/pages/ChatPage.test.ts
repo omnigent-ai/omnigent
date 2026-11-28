@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
-import type { ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -11,20 +12,34 @@ import {
 } from "@/components/SlashCommandMenu";
 import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
+  consumePendingInitialPrompt,
+  isListeningForInitialPrompt,
+  setPendingInitialPrompt,
+  type PendingInitialPrompt,
+} from "@/store/chatStore";
+import {
   buildPendingBubbles,
   buildSlashCommandMap,
+  composerOffersClear,
+  composerOffersRewind,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  hasSentNativeInputPending,
+  useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  initialPromptAgentId,
+  useInitialPromptDispatch,
+  failedSessionLastError,
+  isComposerReadOnly,
   isCostRoutingEligible,
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
-  readOnlyReasonForSessionLabels,
+  opensResumePicker,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
@@ -35,16 +50,17 @@ import {
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
   isBackgroundTasksOnly,
-  splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
-  subAgentComposerLabel,
-  modelPickerKindForConv,
   unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
+import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
+import { subAgentComposerLabel } from "@/shell/subagentLabel";
 
 // The Composer's read-only and disabled states are derived from
 // permissionLevel. These tests pin the derivation logic so a
@@ -52,7 +68,7 @@ import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 // or hide the share button from managers.
 
 function composerState(permissionLevel: number | null) {
-  const isReadOnly = permissionLevel === 1;
+  const isReadOnly = isComposerReadOnly(permissionLevel, null, null);
   const canType = !isReadOnly;
   const canSubmit = !isReadOnly;
   return { isReadOnly, canType, canSubmit };
@@ -90,6 +106,17 @@ describe("Composer permission gating", () => {
     expect(state.isReadOnly).toBe(false);
     expect(state.canType).toBe(true);
   });
+
+  it("a structural read-only reason locks the composer at any level", () => {
+    expect(isComposerReadOnly(4, "Mirrored transcript", null)).toBe(true);
+    expect(isComposerReadOnly(null, "Mirrored transcript", null)).toBe(true);
+  });
+
+  it("a temporary send block keeps the level-1 startup fallback editable", () => {
+    // A client-only conversation falls back to level 1 before its session
+    // exists; the send block, not read-only, is what holds submission.
+    expect(isComposerReadOnly(1, null, "Starting the session…")).toBe(false);
+  });
 });
 
 describe("Composer structural read-only reasons", () => {
@@ -110,21 +137,22 @@ describe("Composer structural read-only reasons", () => {
     ).toBe("Claude Code sub-agents are read-only");
   });
 
-  it("gives a sealed codex /side child its own reason, not the generic one", () => {
-    // Server seals a dead side chat with omnigent.closed; the "Side chat"
-    // nickname distinguishes it from an ordinary closed codex sub-agent.
-    expect(
-      readOnlyReasonForSessionLabels(
-        {
-          labels: {
-            "omnigent.closed": "true",
-            "omnigent.wrapper": "codex-native-ui-subagent",
-            "omnigent.codex_native.agent_nickname": "Side chat",
-          },
-        },
-        null,
-      ),
-    ).toBe("This side chat has ended and can't receive new messages");
+  it.each(
+    [undefined, "false", "true"].flatMap((support) =>
+      [true, false].map((live) => ({ support, live })),
+    ),
+  )("gates closed codex /side recovery (live: $live, support: $support)", ({ live, support }) => {
+    const session = {
+      labels: {
+        "omnigent.closed": "true",
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+        ...(support === undefined ? {} : { "omnigent.codex_native.side_chat_resume": support }),
+      },
+    };
+    expect(readOnlyReasonForSessionLabels(live ? session : null, live ? null : session)).toBe(
+      support === "true" ? null : "This sub-agent session is closed",
+    );
   });
 
   it("keeps the generic closed reason for a non-side-chat codex sub-agent", () => {
@@ -204,6 +232,23 @@ describe("Terminal-first surface selection", () => {
       }),
     ).toBe(false);
     expect(shouldMountTerminalSurface(null, null)).toBe(false);
+  });
+});
+
+describe("failedSessionLastError", () => {
+  const error = { code: "runner_failed_to_start", message: "host authentication failed" };
+
+  it("surfaces the error for a failed session", () => {
+    expect(failedSessionLastError({ status: "failed", lastTaskError: error })).toEqual(error);
+  });
+
+  it("hides a stale error on a session that is no longer failed", () => {
+    expect(failedSessionLastError({ status: "running", lastTaskError: error })).toBeNull();
+  });
+
+  it("returns null for a failed session with no error, or no session", () => {
+    expect(failedSessionLastError({ status: "failed" })).toBeNull();
+    expect(failedSessionLastError(null)).toBeNull();
   });
 });
 
@@ -495,6 +540,15 @@ describe("buildPendingBubbles", () => {
       null,
     ) as [Extract<Bubble, { kind: "user" }>];
     expect(replayed.createdAtS).toBeUndefined();
+  });
+
+  it("flags only mid-turn sends as awaiting the agent", () => {
+    const [midTurn, plain] = buildPendingBubbles(
+      [{ ...pending[0]!, sentMidTurn: true }, pending[0]!],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>, Extract<Bubble, { kind: "user" }>];
+    expect(midTurn.awaitingAgent).toBe(true);
+    expect(plain.awaitingAgent).toBeUndefined();
   });
 });
 
@@ -941,6 +995,53 @@ describe("computeShowsWorking", () => {
     );
   });
 
+  it("counts only input this tab sent to a native terminal as awaiting pickup", () => {
+    // A claude-native send's response completes once the message reaches the terminal,
+    // ~200ms before the agent reports running; the indicator must not drop in between.
+    const sent = { tempId: "pend_1", content: [], createdAtS: 1_700_000_000 };
+    const replayed = { tempId: "pi_1", content: [] };
+    expect(hasSentNativeInputPending(true, [sent])).toBe(true);
+    expect(hasSentNativeInputPending(false, [sent])).toBe(false);
+    // Snapshot-replayed input may wait on an offline runner; it doesn't count.
+    expect(hasSentNativeInputPending(true, [replayed])).toBe(false);
+    expect(
+      hasSentNativeInputPending(true, [{ ...sent, initialDraft: { text: "hi", files: [] } }]),
+    ).toBe(false);
+  });
+
+  describe("useWorkingSignals", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const signals = (overrides: Partial<Parameters<typeof useWorkingSignals>[0]> = {}) => ({
+      status: "idle" as const,
+      sessionStatus: "idle" as const,
+      hasPendingInitialMessage: false,
+      nativeInputPending: false,
+      conversationId: "conv-a",
+      ...overrides,
+    });
+
+    it("keeps Working lit for a first message held past the terminal's ready idle", () => {
+      const { result } = renderHook(() =>
+        useWorkingSignals(signals({ hasPendingInitialMessage: true })),
+      );
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+
+    it("lights Working, not Stop, while a native agent picks up input, for at most 3s", () => {
+      const { result, rerender } = renderHook((props) => useWorkingSignals(props), {
+        initialProps: signals({ nativeInputPending: true }),
+      });
+      expect(result.current).toEqual({ isWorking: false, indicatorSendInFlight: true });
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(result.current.indicatorSendInFlight).toBe(false);
+
+      // Another session's pickup gets its own window.
+      rerender(signals({ nativeInputPending: true, conversationId: "conv-b" }));
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+  });
+
   it("an in-flight local send lights the indicator before any server edge", () => {
     // Pressing Enter sets chatStore.status = "streaming" synchronously, while
     // `sessionStatus` stays `idle` until the server publishes `running` (for
@@ -1052,8 +1153,25 @@ describe("shouldShowWorkingIndicator", () => {
 // ── workingIndicatorLabel ───────────────────────────────────────────────────
 
 describe("workingIndicatorLabel — parked on a dialog", () => {
-  it("names what the agent is waiting on", () => {
-    expect(workingIndicatorLabel(0, "permission prompt")).toBe("Blocked on: permission prompt");
+  it("names what the agent is waiting on beside a chat card that can answer it", () => {
+    expect(workingIndicatorLabel(0, "permission prompt", { answerableInChat: true })).toBe(
+      "Blocked on: permission prompt",
+    );
+  });
+
+  it("says a permission prompt with no chat card needs approval in the terminal", () => {
+    expect(workingIndicatorLabel(0, "permission prompt")).toBe(
+      "Waiting for your approval in the agent's terminal.",
+    );
+    expect(workingIndicatorLabel(0, "permission prompt", { terminalView: true })).toBe(
+      "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.",
+    );
+  });
+
+  it("names other terminal-only block reasons", () => {
+    expect(workingIndicatorLabel(0, "input needed")).toBe(
+      "Waiting for you in the agent's terminal (input needed).",
+    );
   });
 
   it("outranks the rotation", () => {
@@ -1069,6 +1187,20 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
     // the terminal tab. A bare "Blocked on: dialog open" leaves the user with
     // no idea where to respond, so the label must guide them to the terminal.
     expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
+  });
+
+  it("tentatively points at the terminal when a hidden prompt replaced its input box", () => {
+    expect(workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON)).toBe(
+      "Something in the agent's terminal may need your input.",
+    );
+    expect(
+      workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON, {
+        terminalView: true,
+        answerableInChat: true,
+      }),
+    ).toBe(
+      "Something in the agent's terminal may need your input. Open the Terminal view to check.",
+    );
   });
 
   it("falls back to the normal label when not parked", () => {
@@ -1341,17 +1473,65 @@ describe("collectBubbleMarkdown", () => {
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
+describe("composer /clear and /rewind gating", () => {
+  const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
+
+  it.each([
+    ["claude-native", true],
+    ["codex-native", true],
+    ["claude-sdk", false],
+    ["openai-agents", false],
+    [null, false],
+  ] as const)(
+    "offers native /clear for %s when the server lists the control",
+    (harness, offered) => {
+      expect(composerOffersClear(harness, info({ session_event_types: ["clear"] }))).toBe(offered);
+      expect(composerOffersClear(harness, info({ session_event_types: ["message"] }))).toBe(false);
+      expect(composerOffersClear(harness, "loading")).toBe(false);
+    },
+  );
+
+  it("offers claude-sdk /clear only when the server continues it in a new session", () => {
+    const sdkClear = info({ session_event_types: ["clear"], session_claude_sdk_clear: true });
+    expect(composerOffersClear("claude-sdk", sdkClear)).toBe(true);
+    expect(composerOffersClear("openai-agents", sdkClear)).toBe(false);
+    // An older server lists "clear" for native sessions only.
+    expect(composerOffersClear("claude-sdk", info({ session_event_types: ["clear"] }))).toBe(false);
+  });
+
+  it.each([
+    ["claude-sdk", true],
+    ["claude-native", true],
+    ["codex-native", false],
+    ["openai-agents", false],
+  ] as const)("offers /rewind for %s when the server has the endpoint", (harness, offered) => {
+    expect(composerOffersRewind(harness, info({ session_rewind: true }))).toBe(offered);
+    expect(composerOffersRewind(harness, info({}))).toBe(false);
+    expect(composerOffersRewind(harness, "loading")).toBe(false);
+  });
+});
+
 describe("buildSlashCommandMap", () => {
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind", "/goal"];
+
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    // /btw (claude-native) and /side (codex-native) are gated off by default,
-    // so both are excluded here.
+    // Session- and harness-specific commands are gated off by default.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => !gatedOffByDefault.includes(name)),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /permissions only when showPermissions is true (codex-native)", () => {
+    expect(buildSlashCommandMap([], true, true)["/permissions"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/permissions"
+      ],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/permissions"]);
   });
 
   it("includes /side only when showSide is true (codex-native)", () => {
@@ -1364,6 +1544,39 @@ describe("buildSlashCommandMap", () => {
     );
   });
 
+  it("includes /clear only when showClear is true (native terminals)", () => {
+    expect(buildSlashCommandMap([], true, true)["/clear"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
+  });
+
+  it("includes /rewind only when showRewind is true", () => {
+    expect(buildSlashCommandMap([], true, true)["/rewind"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap(
+        [],
+        true,
+        true,
+        true,
+        false,
+        false,
+        "/",
+        false,
+        false,
+        false,
+        false,
+        true,
+      )["/rewind"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/rewind"]);
+    // The /permissions slot right before it doesn't turn on /rewind.
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/rewind"
+      ],
+    ).toBeUndefined();
+  });
+
   it("includes /btw only when showBtw is true (claude-native)", () => {
     // Off by default and when explicitly false.
     expect(buildSlashCommandMap([], true, true)["/btw"]).toBeUndefined();
@@ -1371,6 +1584,13 @@ describe("buildSlashCommandMap", () => {
     // On when the session is claude-native.
     expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
       BUILTIN_SLASH_COMMANDS["/btw"],
+    );
+  });
+
+  it("includes /mcp only for a started session", () => {
+    expect(buildSlashCommandMap([], true, true)["/mcp"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false, "/", false, true)["/mcp"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/mcp"],
     );
   });
 
@@ -1421,9 +1641,9 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills. /btw and /side are gated off.
+    // surfaces built-ins above user skills. Session- and harness-specific commands are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => !gatedOffByDefault.includes(name)),
       "/triage-issues",
       "/mlflow-bug",
     ]);
@@ -1574,7 +1794,6 @@ describe("shouldSendInitialPrompt", () => {
     initialPrompt: "read the README",
     initialPromptFileCount: 0,
     promptConversationId: "conv_abc",
-    sentForConversationId: null,
     conversationId: "conv_abc",
     loadingConversation: false,
     agentId: "ag_abc123",
@@ -1614,29 +1833,6 @@ describe("shouldSendInitialPrompt", () => {
     expect(shouldSendInitialPrompt({ ...ready, initialPrompt, initialPromptFileCount: 1 })).toBe(
       true,
     );
-  });
-
-  it("does not send twice for the same conversation (once-guard)", () => {
-    // sentForConversationId mirrors the effect's ref after the first
-    // dispatch for this session. A failure means a re-render (e.g. runner
-    // re-poll) would resend into the same conversation.
-    expect(shouldSendInitialPrompt({ ...ready, sentForConversationId: "conv_abc" })).toBe(false);
-  });
-
-  it("sends again for a different conversation (per-session reset)", () => {
-    // ChatPage stays mounted across `/c/:a` → `/c/:b` (no route key), so a
-    // bare boolean once-guard would latch true after the first auto-send and
-    // silently drop the prompt for every later new chat. Keying the guard by
-    // conversation id resets it: a prompt consumed for conv_xyz still sends
-    // even though conv_abc was already dispatched.
-    expect(
-      shouldSendInitialPrompt({
-        ...ready,
-        promptConversationId: "conv_xyz",
-        sentForConversationId: "conv_abc",
-        conversationId: "conv_xyz",
-      }),
-    ).toBe(true);
   });
 
   it("waits while the conversation is still hydrating", () => {
@@ -1702,46 +1898,6 @@ describe("isSlashCommandText", () => {
     ["empty string", ""],
   ] as const)("does not treat %s as a slash command", (_label, text) => {
     expect(isSlashCommandText(text)).toBe(false);
-  });
-});
-
-describe("splitSlashCommand", () => {
-  // The composer overlay tints only `token`; `before`/`after` stay default,
-  // so the whole draft no longer goes blue once args are typed.
-  it("splits the command token from its args", () => {
-    expect(splitSlashCommand("/cross-review fix the bug")).toEqual({
-      before: "",
-      token: "/cross-review",
-      after: " fix the bug",
-    });
-  });
-
-  it("returns an empty `after` for a bare command", () => {
-    expect(splitSlashCommand("/oncall")).toEqual({
-      before: "",
-      token: "/oncall",
-      after: "",
-    });
-  });
-
-  it("preserves leading whitespace in `before`", () => {
-    expect(splitSlashCommand("  /compact")).toEqual({
-      before: "  ",
-      token: "/compact",
-      after: "",
-    });
-  });
-
-  it("keeps a plugin-namespaced skill name whole", () => {
-    expect(splitSlashCommand("/dev-productivity:simplify now")).toEqual({
-      before: "",
-      token: "/dev-productivity:simplify",
-      after: " now",
-    });
-  });
-
-  it("returns null when the text isn't a command", () => {
-    expect(splitSlashCommand("just prose")).toBeNull();
   });
 });
 
@@ -1812,6 +1968,26 @@ describe("unboundSessionResumableInApp", () => {
     for (const src of ["kimi", "kiro", "qwen"]) {
       expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
     }
+  });
+});
+
+describe("opensResumePicker", () => {
+  it("opens for an unbound fork or a resumable host-less session", () => {
+    const idle = { unboundFork: false, resumableUnbound: false, sandboxLaunching: false };
+    expect(opensResumePicker({ ...idle, unboundFork: true })).toBe(true);
+    expect(opensResumePicker({ ...idle, resumableUnbound: true })).toBe(true);
+    expect(opensResumePicker(idle)).toBe(false);
+  });
+
+  it("stays closed while a managed-sandbox launch places the session", () => {
+    // A sandbox clone remains unbound until its sandbox registers; the server
+    // places it and holds the first send for the launch.
+    expect(
+      opensResumePicker({ unboundFork: true, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
+    expect(
+      opensResumePicker({ unboundFork: false, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
   });
 });
 
@@ -1977,5 +2153,166 @@ describe("routing eligibility gates", () => {
     const child = { ...sdkSession, parentSessionId: "conv_parent" } as unknown as Session;
     expect(isCostRoutingEligible(info(true), child)).toBe(false);
     expect(isSubagentRoutingEligible(info(true), child)).toBe(false);
+  });
+});
+
+describe("useInitialPromptDispatch", () => {
+  const prompt: PendingInitialPrompt = { text: "Fix the build", skill: null };
+  interface Props {
+    conversationId: string | null;
+    loadingConversation: boolean;
+    agentId: string | null;
+  }
+  const loaded = (conversationId: string | null): Props => ({
+    conversationId,
+    loadingConversation: false,
+    agentId: "agent_1",
+  });
+  const loading = (conversationId: string): Props => ({
+    conversationId,
+    loadingConversation: true,
+    agentId: "agent_1",
+  });
+  function renderDispatch(initial: Props, options: { reactStrictMode?: boolean } = {}) {
+    const dispatch = vi.fn();
+    const rendered = renderHook(
+      (props: Props) => useInitialPromptDispatch({ ...props, dispatch }),
+      {
+        initialProps: initial,
+        ...options,
+      },
+    );
+    return { dispatch, ...rendered };
+  }
+
+  it("sends a prompt accepted while the session loads, once, after the page navigates away and back", () => {
+    const { dispatch, rerender } = renderDispatch(loading("conv_away_1"));
+    act(() => setPendingInitialPrompt("conv_away_1", prompt));
+    expect(dispatch).not.toHaveBeenCalled();
+    // Navigating away returns the prompt to the store instead of dropping it.
+    rerender(loaded("conv_elsewhere_1"));
+    expect(dispatch).not.toHaveBeenCalled();
+    rerender(loaded("conv_away_1"));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith(prompt, "agent_1");
+    // Re-renders and another visit don't send it again.
+    rerender(loaded("conv_away_1"));
+    rerender(loaded("conv_elsewhere_1"));
+    rerender(loaded("conv_away_1"));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns an unsent prompt when the page unmounts, and a later mount sends it once", () => {
+    const first = renderDispatch(loading("conv_unmount_1"));
+    act(() => setPendingInitialPrompt("conv_unmount_1", prompt));
+    first.unmount();
+    expect(first.dispatch).not.toHaveBeenCalled();
+    const second = renderDispatch(loaded("conv_unmount_1"));
+    expect(second.dispatch).toHaveBeenCalledTimes(1);
+    expect(second.dispatch).toHaveBeenCalledWith(prompt, "agent_1");
+  });
+
+  it("sends a stashed prompt once under StrictMode's double-invoked effects", () => {
+    setPendingInitialPrompt("conv_strict_1", prompt);
+    const { dispatch } = renderDispatch(loaded("conv_strict_1"), { reactStrictMode: true });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith(prompt, "agent_1");
+  });
+
+  it("sends an accepted prompt once under StrictMode's double-invoked effects", () => {
+    const { dispatch } = renderDispatch(loaded("conv_strict_2"), { reactStrictMode: true });
+    act(() => setPendingInitialPrompt("conv_strict_2", prompt));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("listens for its conversation's prompts only while mounted", () => {
+    const { unmount } = renderDispatch(loaded("conv_listen_1"));
+    expect(isListeningForInitialPrompt("conv_listen_1")).toBe(true);
+    unmount();
+    expect(isListeningForInitialPrompt("conv_listen_1")).toBe(false);
+    setPendingInitialPrompt("conv_listen_1", prompt);
+    expect(consumePendingInitialPrompt("conv_listen_1")).toEqual(prompt);
+  });
+});
+
+describe("useInitialPromptDispatch queueing", () => {
+  const first: PendingInitialPrompt = { text: "first", skill: null };
+  const second: PendingInitialPrompt = { text: "second", skill: null };
+  const loaded = (conversationId: string) => ({
+    conversationId,
+    loadingConversation: false,
+    agentId: "agent_1",
+  });
+
+  it("sends a prompt stashed after an earlier one was sent", () => {
+    const dispatch = vi.fn();
+    renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: loaded("conv_queue_after"),
+    });
+    act(() => setPendingInitialPrompt("conv_queue_after", first));
+    act(() => setPendingInitialPrompt("conv_queue_after", second));
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+
+  it("sends a prompt stashed while another is held, after it", () => {
+    const dispatch = vi.fn();
+    const { rerender } = renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: {
+        conversationId: "conv_queue_held",
+        loadingConversation: true,
+        agentId: "agent_1",
+      },
+    });
+    act(() => setPendingInitialPrompt("conv_queue_held", first));
+    act(() => setPendingInitialPrompt("conv_queue_held", second));
+    expect(dispatch).not.toHaveBeenCalled();
+    rerender(loaded("conv_queue_held"));
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+
+  it("returns both held and waiting prompts in order when the page unmounts", () => {
+    const held = renderHook((props) => useInitialPromptDispatch({ ...props, dispatch: vi.fn() }), {
+      initialProps: {
+        conversationId: "conv_queue_unmount",
+        loadingConversation: true,
+        agentId: "agent_1",
+      },
+    });
+    act(() => setPendingInitialPrompt("conv_queue_unmount", first));
+    act(() => setPendingInitialPrompt("conv_queue_unmount", second));
+    held.unmount();
+    const dispatch = vi.fn();
+    renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: loaded("conv_queue_unmount"),
+    });
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+});
+
+describe("initialPromptAgentId", () => {
+  it("uses the session's bound agent on a session route, not the selected one from another chat", () => {
+    expect(
+      initialPromptAgentId({
+        urlConvId: "conv_1",
+        boundAgentId: "agent_bound",
+        agentId: "agent_selected",
+      }),
+    ).toBe("agent_bound");
+  });
+
+  it("uses the selected agent on the landing page", () => {
+    expect(
+      initialPromptAgentId({
+        urlConvId: null,
+        boundAgentId: "agent_bound",
+        agentId: "agent_selected",
+      }),
+    ).toBe("agent_selected");
+  });
+
+  it("falls back to the selected agent when a session has no bound agent yet", () => {
+    expect(
+      initialPromptAgentId({ urlConvId: "conv_1", boundAgentId: null, agentId: "agent_selected" }),
+    ).toBe("agent_selected");
   });
 });

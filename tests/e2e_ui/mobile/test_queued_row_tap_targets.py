@@ -22,7 +22,7 @@ import os
 from playwright.sync_api import Browser, Route, expect
 
 # iPhone-12-class portrait viewport -- comfortably below the Tailwind ``md``
-# breakpoint (768px) so every ``md:`` rule resolves to its mobile branch.
+# breakpoint (1181px) so every ``md:`` rule resolves to its mobile branch.
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 
 # Minimum mobile tap target (Apple HIG 44pt; WCAG's enhanced target size).
@@ -33,12 +33,12 @@ _EPSILON = 0.5
 _MSG1 = "sentinel-tap-msg1 holds the turn open"
 _MSG2 = "sentinel-tap-msg2 queued follow-up row"
 
-# Accessible names of the queued row's interactive controls, left to right:
-# drag handle, then the right-side steer / edit / delete cluster.
+# Accessible names of the queued row's interactive controls: drag handle,
+# then the right-side edit / send / remove cluster.
 _ACTION_LABELS = (
     "Reorder queued message",
-    "Send queued message now",
     "Edit queued message",
+    "Send queued message now",
     "Remove queued message",
 )
 
@@ -61,6 +61,8 @@ def test_queued_row_controls_meet_mobile_tap_target(
         record_video_dir=os.environ.get("OMNIGENT_E2E_RECORD_DIR"),
     )
     page = context.new_page()
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
 
     def ack_event(route: Route) -> None:
         # Ack every send; never emit a session.status event, so the SPA's
@@ -77,7 +79,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=30_000)
         # Prove the mobile layout branch is actually in effect.
-        assert page.evaluate("matchMedia('(max-width: 767.98px)').matches")
+        assert page.evaluate("matchMedia('(max-width: 1180.98px)').matches")
 
         send = page.get_by_role("button", name="Send", exact=True)
 
@@ -100,6 +102,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
         strip = page.get_by_test_id("composer-queued-strip")
         expect(strip).to_be_visible(timeout=15_000)
         expect(strip).to_contain_text(_MSG2)
+        assert strip.evaluate("element => getComputedStyle(element).paddingLeft") == "8px"
 
         boxes: dict[str, dict[str, float]] = {}
         for label in _ACTION_LABELS:
@@ -123,7 +126,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
             f"mobile tap target (width, height): {undersized}"
         )
 
-        # Adjacent right-side actions (steer -> edit -> delete) must not be
+        # Adjacent right-side actions (edit -> send -> remove) must not be
         # packed so closely that a finger tap is ambiguous: with >=44px-wide
         # targets that do not overlap, adjacent centers sit >=~44px apart.
         cluster = [boxes[label] for label in _ACTION_LABELS[1:]]

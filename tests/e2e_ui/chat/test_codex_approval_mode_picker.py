@@ -108,6 +108,7 @@ def test_codex_native_approval_mode_switch_persists(
     picker = page.get_by_test_id("composer-permission-chip")
     expect(picker).to_be_visible(timeout=15_000)
     picker.click()
+    expect(page.get_by_test_id("composer-permission-option-read-only")).to_have_count(0)
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"

@@ -11,6 +11,7 @@
 // (`id`, `name`), so no boundary conversion is needed.
 
 import { authenticatedFetch } from "./identity";
+import { apiErrorFromResponse } from "./sessionsApi";
 
 /**
  * Default session settings a project stores, pre-filled into the new-chat
@@ -23,10 +24,22 @@ export interface ProjectConfig {
   host_id?: string;
   /** Default working directory / repo path on that host. */
   workspace?: string;
+  /**
+   * Repository the project was created with. A connected-host project has it
+   * checked out at `workspace`; a sandbox project clones it into each new session.
+   */
+  repository?: { url: string; branch?: string };
+  /** Sandbox provider a sandbox project runs on, e.g. "modal". */
+  sandbox_provider?: string;
   /** Default agent id for new sessions. */
   agent_id?: string;
   /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Unset → default folder. */
   icon?: string;
+  /**
+   * The owner muted every session in the project: no notifications, unread
+   * dots, or badge counts, as if each were muted. Unset = not muted.
+   */
+  muted?: boolean;
   /**
    * Per-project worktree default. When `true`, a new session in a git workspace
    * starts in a fresh randomly-named worktree; when `false`, it starts directly
@@ -50,6 +63,12 @@ export interface ProjectConfig {
    * the harness's own configured default.
    */
   model?: string;
+  /**
+   * Default reasoning effort for new sessions with the default agent (e.g.
+   * `"high"`), from that harness's ladder; Codex validates it against the
+   * model's ladder. Unset = the harness's own configured effort.
+   */
+  effort?: string;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */
@@ -89,7 +108,7 @@ export async function listProjects(): Promise<Project[]> {
 /** Fetch a single project (including its `config`) by id. 404s if not owned. */
 export async function getProject(id: string): Promise<Project> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`);
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 
@@ -165,4 +184,12 @@ export async function saveProjectOrder(ids: string[] | null): Promise<ProjectOrd
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as ProjectOrder;
+}
+
+/** The project was renamed, but some of its sessions weren't moved to the new name. */
+export class ProjectMembersNotMovedError extends Error {
+  constructor(reason: string) {
+    super(`Renamed the project, but some of its sessions weren't moved: ${reason}`);
+    this.name = "ProjectMembersNotMovedError";
+  }
 }

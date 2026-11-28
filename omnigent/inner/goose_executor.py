@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner import _proc
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -60,6 +61,13 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
+
+from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    harness_sandbox_preparation,
+    validate_harness_sandbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -353,17 +361,18 @@ class GooseExecutor(Executor):
         Mirrors :meth:`QwenExecutor._sandbox_launch_path`. When
         ``os_env.sandbox`` requests confinement, wraps the goose binary in the
         platform sandbox so the *entire* goose process tree (its builtin shell /
-        editor tools) runs confined to the spec's read/write roots. Falls back to
-        the bare binary (never blocks startup) when no sandbox is requested or the
-        backend is unavailable.
+        editor tools) runs confined to the spec's read/write roots. Requested
+        sandbox failures prevent startup.
         """
         os_env = self._os_env
         if os_env is None:
             return self._goose_path
-        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
-        if sandbox_spec.type == "none":
-            return self._goose_path
-        try:
+        with harness_sandbox_preparation():
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            validate_harness_sandbox(os_env, "Goose", cwd=cwd)
+            sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+            if sandbox_spec.type == "none":
+                return self._goose_path
             from .sandbox import (
                 create_exec_launcher,
                 resolve_sandbox,
@@ -372,12 +381,11 @@ class GooseExecutor(Executor):
                 with_spawn_env_allowlist,
             )
 
-            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
-                return self._goose_path
+                raise OSError("Goose requires an active sandbox for the requested policy")
             # goose must read its own install tree and write its config/state
-            # dirs (~/.config/goose, ~/.local/share/goose) and /tmp, or it can't
+            # dirs (~/.config/goose, ~/.local/share/goose), or it can't
             # start inside the jail.
             goose_bin = Path(self._goose_path)
             if goose_bin.parent != Path("."):
@@ -387,15 +395,11 @@ class GooseExecutor(Executor):
                 [
                     Path.home() / ".config" / "goose",
                     Path.home() / ".local" / "share" / "goose",
-                    Path("/tmp"),
                 ],
             )
             sandbox = with_additional_read_roots(sandbox, [Path.home() / ".config" / "goose"])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(self._goose_path, sandbox)
-        except (OSError, ImportError, NotImplementedError) as exc:
-            logger.warning("Could not apply sandbox for goose; running unsandboxed: %s", exc)
-            return self._goose_path
+            return create_exec_launcher(self._goose_path, sandbox, cwd=str(cwd))
 
     async def _read_stderr(self) -> None:
         """Continuously drain goose stderr, logging each line at debug.
@@ -486,7 +490,7 @@ class GooseExecutor(Executor):
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(req_id, None)
             raise
 
@@ -1085,6 +1089,10 @@ class GooseExecutor(Executor):
         self._reset_process_state()
         return True
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Keep the initiating item identity even when its ACP prompt is empty."""
+        return True
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1106,6 +1114,8 @@ class GooseExecutor(Executor):
                 await self._start_process()
             await self._ensure_initialized()
             session_id = await self._ensure_session()
+        except (HarnessSandboxPreparationError, HarnessSandboxValidationError):
+            raise
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
@@ -1114,6 +1124,9 @@ class GooseExecutor(Executor):
         # a reset) holds no prior context. Captured before we flip the latch
         # below so we know whether to replay history into this turn.
         fresh_session = not self._system_prompt_sent
+
+        candidate_id = messages[-1].get("input_item_id") if messages else None
+        input_item_id = candidate_id if isinstance(candidate_id, str) else None
 
         # Build the prompt payload from the most recent user message.
         user_text = ""
@@ -1182,7 +1195,11 @@ class GooseExecutor(Executor):
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "method": _AGENT_METHOD_SESSION_PROMPT,
-                "params": {"sessionId": session_id, "prompt": prompt_blocks},
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": prompt_blocks,
+                    "_meta": {_META_INPUT_ITEM_ID: input_item_id},
+                },
             }
         )
 
@@ -1222,7 +1239,7 @@ class GooseExecutor(Executor):
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             method = notification.get("method", "")

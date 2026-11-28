@@ -48,6 +48,7 @@ import {
   type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
+  assistantMessagePhase,
   isCompactionItem,
   isErrorItem,
   isFunctionCallItem,
@@ -58,10 +59,14 @@ import {
   isRoutingDecisionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
+  terminalCommandSubmission,
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
-import { taskNotificationMarkerContent } from "./systemMessage";
+import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
+import { readSubagentActivity } from "./subagentActivity";
+import { subagentHandbackReport } from "./subagentHandback";
+import { readTaskActivity } from "./taskActivity";
 
 // Claude built-ins whose call is a question TO the user rather than work
 // the agent did on its own. The elicitation that carried the card is
@@ -91,8 +96,20 @@ const ANSWER_SEPARATOR = '"="';
 export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   const blocks: AnyBlock[] = [];
   const outputs = toolOutputsByCallId(items);
+  const agents = agentNamesByResponseId(items);
+  const handbacks = new Set<string>();
   for (const item of items) {
     if (!item.response_id) continue;
+    if (isFunctionCallItem(item)) {
+      const report = handbackReportBlock(item);
+      if (report !== null) {
+        handbacks.add(item.call_id);
+        blocks.push(report);
+        continue;
+      }
+    }
+    // The handback's result only confirms delivery; the report already shows.
+    if (isFunctionCallOutputItem(item) && handbacks.has(item.call_id)) continue;
     if (isSlashCommandItem(item)) {
       const echo = skillEchoBlock(item);
       if (echo !== null) blocks.push(echo);
@@ -101,10 +118,33 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
       const card = answeredElicitationBlock(item, outputs.get(item.call_id));
       if (card !== null) blocks.push(card);
     }
-    const block = itemToBlock(item);
+    const block = itemToBlock(item, agents.get(item.response_id));
     if (block !== null) blocks.push(block);
   }
   return blocks;
+}
+
+function agentNamesByResponseId(items: ConversationItem[]): Map<string, string | null> {
+  const agents = new Map<string, string | null>();
+  for (const item of items) {
+    if (
+      !item.response_id ||
+      !(
+        (isMessageItem(item) && item.role === "assistant") ||
+        isFunctionCallItem(item) ||
+        isReasoningItem(item)
+      )
+    ) {
+      continue;
+    }
+    const name = item.model?.trim();
+    if (!name) continue;
+    const previous = agents.get(item.response_id);
+    // A model id on routing/compaction items is not an agent identity. Multiple
+    // speakers in one response are also insufficient to attribute its error.
+    agents.set(item.response_id, previous === undefined || previous === name ? name : null);
+  }
+  return agents;
 }
 
 function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
@@ -208,14 +248,50 @@ function answersFromToolResult(
     const at = output.indexOf(`"${question.question}${ANSWER_SEPARATOR}`);
     if (at === -1) continue;
     const from = at + question.question.length + 1 + ANSWER_SEPARATOR.length;
-    const end = output.indexOf('"', from);
-    answers[question.question] = end === -1 ? output.slice(from) : output.slice(from, end);
+    const end = answerEnd(output, from, payload.questions);
+    answers[question.question] = output.slice(from, end);
   }
   return answers;
 }
 
-function itemToBlock(item: ConversationItem): AnyBlock | null {
+/**
+ * Where the answer that starts at ``from`` ends. Answers are not escaped, so one can hold
+ * quotes of its own (a session marker's title). It ends at the next answer's
+ * ``", "<question>"=`` boundary; the last answer ends at the last quote, as the trailing
+ * sentence has none.
+ */
+function answerEnd(
+  output: string,
+  from: number,
+  questions: AskUserQuestionPayload["questions"],
+): number {
+  let next = -1;
+  for (const question of questions) {
+    const at = output.indexOf(`", "${question.question}${ANSWER_SEPARATOR}`, from);
+    if (at !== -1 && (next === -1 || at < next)) next = at;
+  }
+  if (next !== -1) return next;
+  const last = output.lastIndexOf('"');
+  return last >= from ? last : output.length;
+}
+
+function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
+  const data = item as unknown as Record<string, unknown>;
+  // Task markers place and fold like sub-agent markers, so they share the notice kind.
+  if (readSubagentActivity(data) || readTaskActivity(data)) {
+    return {
+      type: "native_tool",
+      ctx: ctxFor(item),
+      toolType: "subagent_activity",
+      label: formatNativeLabel("subagent_activity", data),
+      data,
+    };
+  }
   if (isMessageItem(item) && item.role === "user") {
+    if (!item.is_meta && (item.created_by || item.user_authored === true)) {
+      return userMessageToBlock(item);
+    }
+    if (isClaudeAgentMessageContent(item.content)) return null;
     // Claude Code's background-task wake: the CLI injects a
     // `<task-notification>` user entry (mirrored with `is_meta`) and
     // starts a new turn on it. Render it as a muted system marker so the
@@ -249,7 +325,7 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
     return functionCallOutputToBlock(item);
   }
   if (isErrorItem(item)) {
-    return errorToBlock(item);
+    return errorToBlock(item, agentName);
   }
   if (isReasoningItem(item)) {
     return reasoningToBlock(item);
@@ -311,6 +387,7 @@ function userMessageToBlock(item: MessageItem): UserMessageBlock {
 }
 
 function assistantMessageToBlock(item: MessageItem): TextDone {
+  const phase = assistantMessagePhase(item.phase);
   const text = item.content
     .filter((b): b is { type: "output_text"; text: string } => b.type === "output_text")
     .map((b) => b.text)
@@ -321,16 +398,32 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
     fullText: text,
     hasCodeBlocks: text.includes("```"),
     ...(item.interrupted === true ? { interrupted: true } : {}),
+    ...(phase !== undefined ? { phase } : {}),
+  };
+}
+
+function parsedArguments(item: FunctionCallItem): Record<string, unknown> {
+  try {
+    return JSON.parse(item.arguments) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+/** A sub-agent's handback call rendered as its final answer, or ``null``. */
+function handbackReportBlock(item: FunctionCallItem): TextDone | null {
+  const report = subagentHandbackReport(item.name, parsedArguments(item));
+  if (report === null) return null;
+  return {
+    type: "text_done",
+    ctx: ctxFor(item),
+    fullText: report,
+    hasCodeBlocks: report.includes("```"),
   };
 }
 
 function functionCallToBlock(item: FunctionCallItem): ToolGroup {
-  let args: Record<string, unknown>;
-  try {
-    args = JSON.parse(item.arguments) as Record<string, unknown>;
-  } catch {
-    args = {};
-  }
+  const args = parsedArguments(item);
   const execution: ToolExecution = {
     name: item.name,
     arguments: args,
@@ -360,7 +453,7 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
   };
 }
 
-function errorToBlock(item: ErrorItem): ErrorBlock {
+function errorToBlock(item: ErrorItem, agentName?: string | null): ErrorBlock {
   return {
     type: "error",
     ctx: ctxFor(item),
@@ -368,7 +461,7 @@ function errorToBlock(item: ErrorItem): ErrorBlock {
     code: item.code,
     message: item.message,
     ...(item.level ? { level: item.level } : {}),
-    ...structuredErrorFields(item),
+    ...structuredErrorFields(item, agentName),
   };
 }
 
@@ -449,6 +542,7 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
 function terminalCommandToBlock(item: TerminalCommandItem): TerminalCommandBlock {
   return {
     type: "terminal_command",
+    submission: terminalCommandSubmission(item.submission),
     ctx: ctxFor(item),
     kind: item.kind,
     input: item.input ?? null,

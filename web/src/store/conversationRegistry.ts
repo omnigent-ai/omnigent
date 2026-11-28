@@ -8,6 +8,7 @@
 // on revisit is a transcript cache in a different shape, which is what keeping
 // streams open replaces. Live-or-gone is the simplification.
 
+import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import type { ConversationState } from "./chatStore";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 
@@ -74,7 +75,12 @@ function readNextHopProtocol(): string | null {
 export function maxLiveConversations(
   protocol: ConnectionProtocol = getConnectionProtocol(),
 ): number {
-  return protocol === "multiplexed" ? 30 : 3;
+  // Four grid panes leave two HTTP/1.1 connections available for ordinary requests.
+  return protocol === "multiplexed"
+    ? 30
+    : isFeatureEnabled(getCachedServerInfo() ?? "loading", "grid_sessions_display_ui")
+      ? 4
+      : 3;
 }
 
 /** Writes a patch into a conversation's state. Mirrors zustand's `setState`. */
@@ -121,6 +127,17 @@ export class ConversationRegistry {
   private readonly disposeListeners = new Set<DisposeListener>();
   /** Conversation currently on screen; exempt from eviction. */
   private activeId: string | null = null;
+  private readonly retainedIds = new Map<string, number>();
+
+  /** Keep a visible secondary pane live until its owner unmounts. */
+  retain(id: string): () => void {
+    this.retainedIds.set(id, (this.retainedIds.get(id) ?? 0) + 1);
+    return () => {
+      const count = this.retainedIds.get(id) ?? 0;
+      if (count <= 1) this.retainedIds.delete(id);
+      else this.retainedIds.set(id, count - 1);
+    };
+  }
 
   /**
    * Subscribe to state changes across all entries.
@@ -217,6 +234,7 @@ export class ConversationRegistry {
     for (const entry of [...this.entries.values()]) entry.dispose();
     this.entries.clear();
     this.activeId = null;
+    this.retainedIds.clear();
   }
 
   /**
@@ -237,12 +255,19 @@ export class ConversationRegistry {
       const existingPendingIds = new Set(
         existingState.pendingUserMessages.map((item) => item.tempId),
       );
-      const missingPending = old
-        .getState()
-        .pendingUserMessages.filter((item) => !existingPendingIds.has(item.tempId));
-      if (missingPending.length > 0) {
+      // Every pending message the live entry lacks, posted or not: a just-sent bubble stays until its echo.
+      const oldState = old.getState();
+      const missingPending = oldState.pendingUserMessages.filter(
+        (item) => !existingPendingIds.has(item.tempId),
+      );
+      const existingFailedIds = new Set(existingState.failedUploads.map((item) => item.tempId));
+      const missingFailed = oldState.failedUploads.filter(
+        (item) => !existingFailedIds.has(item.tempId),
+      );
+      if (missingPending.length > 0 || missingFailed.length > 0) {
         existing.setState({
           pendingUserMessages: [...missingPending, ...existingState.pendingUserMessages],
+          failedUploads: [...missingFailed, ...existingState.failedUploads],
         });
       }
       this.release(oldId);
@@ -282,7 +307,7 @@ export class ConversationRegistry {
    */
   evictLruEvictable(exemptId?: string): string | null {
     for (const [id, entry] of this.entries) {
-      if (id === this.activeId || id === exemptId) continue;
+      if (id === this.activeId || id === exemptId || this.retainedIds.has(id)) continue;
       if (hasUnsentWork(entry.getState())) continue;
       this.entries.delete(id);
       entry.dispose();
@@ -348,10 +373,16 @@ export class ConversationRegistry {
  *   - an unsettled optimistic bubble (`send`'s POST hasn't returned); and
  *   - a `failedSendDraft` — a send that failed AND rolled its bubble back, so
  *     the draft is the sole surviving copy of the user's text and files. It is
- *     held until the composer restores it on return; evicting first drops it.
+ *     held until the composer restores it on return; evicting first drops it;
+ *   - a `failedUploads` entry — a send whose upload failed and whose bubble
+ *     waits for Retry or Remove; the entry is the only copy of the message.
  */
 function hasUnsentWork(state: ConversationState): boolean {
-  return state.pendingUserMessages.some((m) => m.posted !== true) || state.failedSendDraft !== null;
+  return (
+    state.pendingUserMessages.some((m) => m.posted !== true) ||
+    state.failedUploads.length > 0 ||
+    state.failedSendDraft !== null
+  );
 }
 
 /** The app's registry. Module-scope, like the store it backs. */

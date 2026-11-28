@@ -5,6 +5,11 @@ compatible Sandbox, delivers its managed-host identity to the waiting bootstrap,
 and starts repository preparation and the normal host. GitHub and Databricks
 credentials still come from the existing owner-bound broker and credential store.
 
+To reduce repository preparation after a claim, admins can also configure
+[`sandbox.git_clone`](../../../../../docs/extending/sandbox_providers.md#faster-initial-git-clones).
+Clone depth and branch selection apply to fresh checkouts without requiring a
+different pool template or prepared repository image.
+
 This is opt-in for `provider: agent_sandbox`. An explicitly shared pool can serve
 different agents and harnesses that use the same infrastructure profile. The
 existing direct Sandbox path supports deployments without a pool and requests

@@ -21,7 +21,7 @@ Env vars read at startup:
   else to Pi's own default.
 - ``HARNESS_PI_GATEWAY``: ``"1"`` / ``"true"`` to write a
   ``models.json`` pointing Pi at a vendor-neutral gateway (base
-  URLs + bearer-token command + model). The Databricks AI gateway
+  URLs + bearer-token command + model). The Databricks Unity Gateway
   is one producer of this transport; generic ``key`` / ``gateway``
   providers are another. Otherwise the executor uses Pi's built-in
   API path.
@@ -58,9 +58,16 @@ Env vars read at startup:
   bundle skill.
 - ``HARNESS_PI_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor sources
-  bundled skills from ``<bundle>/skills/<dir>/`` for the
-  ``"all"`` and named-list cases. Unset for agents without a
-  bundled-skill directory.
+  bundled skills from ``<bundle>/skills/<dir>/`` and
+  ``<bundle>/.pi/skills/<dir>/`` for the ``"all"`` and named-list
+  cases, loads ``<bundle>/.pi/extensions`` via ``--extension``, and
+  appends a bundle-root context file (``AGENTS.md`` et al.) to the
+  system prompt. Unset for agents without a bundle directory.
+- ``HARNESS_PI_CONTEXT_FILES``: Whether Pi automatically loads context files
+  such as ``AGENTS.md`` and ``CLAUDE.md``, including the bundle-root one.
+  Defaults to true.
+- ``HARNESS_PI_SYSTEM_PROMPT_MODE``: ``append`` (default) or ``replace`` Pi's
+  base prompt with Omnigent's composed instructions.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
   future use; currently unused by Pi.
 """
@@ -75,9 +82,9 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from omnigent.harness_startup_config import resolve_harness_path
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.inner.executor import Executor
-from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
 from omnigent.inner.pi_executor import PiExecutor
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
@@ -98,6 +105,8 @@ _ENV_PI_PATH = "OMNIGENT_PI_PATH"
 _LEGACY_ENV_PI_PATH = "HARNESS_PI_PATH"
 _ENV_OS_ENV = "HARNESS_PI_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_PI_SKILLS_FILTER"
+_ENV_CONTEXT_FILES = "HARNESS_PI_CONTEXT_FILES"
+_ENV_SYSTEM_PROMPT_MODE = "HARNESS_PI_SYSTEM_PROMPT_MODE"
 _ENV_BUNDLE_DIR = "HARNESS_PI_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_PI_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
@@ -152,51 +161,8 @@ def _resolve_gateway_base_urls() -> dict[str, str] | None:
 
 
 def _resolve_os_env() -> OSEnvSpec:
-    """
-    Resolve the inner-executor :class:`OSEnvSpec` from env config.
-
-    Reads :data:`_ENV_OS_ENV` and decodes the JSON-encoded dict
-    Omnigent serialized via :func:`dataclasses.asdict` on its
-    :class:`OSEnvSpec`. When the env var is missing or
-    malformed, falls back to ``caller_process + sandbox=none``
-    so AP-bridged tools stay enabled — matches the legacy
-    non-AP path's default for specs without an
-    ``os_env:`` block.
-
-    :returns: An :class:`OSEnvSpec` to hand to
-        :class:`PiExecutor`.
-    """
-    raw = os.environ.get(_ENV_OS_ENV, "").strip()
-    if raw:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            _logger.warning(
-                "%s is not valid JSON (%s); falling back to default os_env",
-                _ENV_OS_ENV,
-                exc,
-            )
-            payload = None
-        if isinstance(payload, dict):
-            sandbox_payload = payload.get("sandbox")
-            sandbox = (
-                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
-            )
-            return OSEnvSpec(
-                type=str(payload.get("type", "caller_process")),
-                cwd=payload.get("cwd"),
-                sandbox=sandbox,
-                fork=bool(payload.get("fork", False)),
-            )
-    # Default: enable natives, no sandbox. Matches the simplest
-    # working config; operators who want real sandbox enforcement
-    # configure ``os_env.sandbox`` explicitly in the spec.
-    return OSEnvSpec(
-        type="caller_process",
-        cwd=None,
-        sandbox=OSEnvSandboxSpec(type="none"),
-        fork=False,
-    )
+    """Decode the supplied policy without downgrading malformed configuration."""
+    return resolve_harness_os_env(_ENV_OS_ENV)
 
 
 def _build_pi_executor() -> Executor:
@@ -204,8 +170,8 @@ def _build_pi_executor() -> Executor:
     Construct a :class:`PiExecutor` from env-var config.
 
     Called lazily by the :class:`ExecutorAdapter` on the first
-    turn. Heavyweight init (CLI discovery, eager Databricks
-    credential resolution) happens at this point — operators
+    turn. CLI discovery happens at this point; credentials resolve
+    asynchronously before the first request. Operators
     see the failure surface as a startup error on the first
     request, not at FastAPI app boot.
 
@@ -213,9 +179,7 @@ def _build_pi_executor() -> Executor:
     :raises ImportError: If the ``pi`` CLI isn't on PATH and
         ``OMNIGENT_PI_PATH`` (legacy ``HARNESS_PI_PATH``) isn't set — the inner executor's
         constructor surfaces this as a clear ImportError.
-    :raises OSError: If ``HARNESS_PI_GATEWAY`` is set but
-        credentials are missing — the inner executor's
-        constructor fails loud.
+    :raises OSError: If a gateway host is configured without an auth command.
     """
     bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
@@ -234,9 +198,13 @@ def _build_pi_executor() -> Executor:
         base_urls_override=_resolve_gateway_base_urls(),
         openai_wire_api=os.environ.get(_ENV_GATEWAY_OPENAI_WIRE_API) or None,
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
+        gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
+        or None,
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
+        context_files=_parse_truthy(_ENV_CONTEXT_FILES, default=True),
+        system_prompt_mode=os.environ.get(_ENV_SYSTEM_PROMPT_MODE, "append"),
     )
 
 

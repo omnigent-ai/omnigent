@@ -1,4 +1,4 @@
-# Connect Databricks (per-user) + MCP through the AI Gateway
+# Connect Databricks (per-user) + MCP through the Unity Gateway
 
 ## Motivation
 
@@ -7,7 +7,7 @@ MCP wired directly to GitHub's hosted MCP. We want the same "Connect …" flow f
 **Databricks**, so that:
 
 1. The user authenticates to their Databricks workspace once (like GitHub), and
-2. The sandbox's MCP tools are routed through the **Databricks AI Gateway (AIGW)**
+2. The sandbox's MCP tools are routed through the **Databricks Unity Gateway (AIGW)**
    — GitHub and other tools are configured there as MCP Services — instead of
    each tool being wired up directly. So the direct GitHub MCP is **replaced** by
    the AIGW MCP when Databricks is connected. (GitHub *clone* still uses the

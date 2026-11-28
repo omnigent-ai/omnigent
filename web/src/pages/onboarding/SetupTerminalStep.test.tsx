@@ -1,32 +1,170 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SetupTerminalStep } from "./SetupTerminalStep";
+import { SetupTerminalStep, WARMUP_MS } from "./SetupTerminalStep";
 
 afterEach(cleanup);
 
 describe("SetupTerminalStep", () => {
-  it("starts the local server on mount and shows Ready on success", async () => {
-    const onStartLocal = vi.fn().mockResolvedValue({ ok: true });
-    render(<SetupTerminalStep onStartLocal={onStartLocal} onBack={vi.fn()} />);
+  it("runs the action on mount and shows Ready on success", async () => {
+    const onRun = vi.fn().mockResolvedValue({ ok: true });
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} />);
 
-    expect(onStartLocal).toHaveBeenCalledOnce();
+    expect(onRun).toHaveBeenCalledOnce();
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
-    // No failure controls on success.
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
-  it("shows the error and a Retry that starts the server again on failure", async () => {
-    const onStartLocal = vi
+  it("shows the error and a Retry that runs the action again on failure", async () => {
+    const onRun = vi
       .fn()
       .mockResolvedValueOnce({ ok: false, error: "omnigent CLI not found" })
       .mockResolvedValueOnce({ ok: true });
-    render(<SetupTerminalStep onStartLocal={onStartLocal} onBack={vi.fn()} />);
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} />);
 
     expect(await screen.findByText("omnigent CLI not found")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(onStartLocal).toHaveBeenCalledTimes(2);
+    expect(onRun).toHaveBeenCalledTimes(2);
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
+  });
+
+  it("shows the error and its existing recovery action on separate lines", async () => {
+    const errorMessage = "Sign-in to https://team.example.com/ didn't complete.";
+    const errorAction = "Finish signing in and try again.";
+    const onRun = vi.fn().mockResolvedValue({
+      ok: false,
+      error: `${errorMessage} ${errorAction}`,
+      errorMessage,
+      errorAction,
+    });
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByText(errorMessage)).toHaveClass("text-destructive");
+    expect(screen.queryByText(`${errorMessage} ${errorAction}`)).toBeNull();
+    const actionLine = screen.getByText(errorAction);
+    expect(actionLine).toHaveClass("text-cyan-700");
+    expect(actionLine.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("installs first when onInstallCli is present, then runs the action", async () => {
+    const calls: string[] = [];
+    const onInstallCli = vi.fn(async () => {
+      calls.push("install");
+      return { ok: true };
+    });
+    const onRun = vi.fn(async () => {
+      calls.push("run");
+      return { ok: true };
+    });
+    render(<SetupTerminalStep onInstallCli={onInstallCli} onRun={onRun} onBack={vi.fn()} />);
+
+    expect(await screen.findByText("Server ready")).toBeInTheDocument();
+    expect(calls).toEqual(["install", "run"]);
+  });
+
+  it("holds the empty terminal for the warm-up beat, then installs", async () => {
+    // With a log stream to show, install (and its output) is deferred for the
+    // whole beat, so the empty loader/terminal show first.
+    vi.useFakeTimers();
+    try {
+      const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+      const onInstallLog = vi.fn(() => () => {});
+      render(
+        <SetupTerminalStep
+          onInstallCli={onInstallCli}
+          onInstallLog={onInstallLog}
+          onRun={vi.fn().mockResolvedValue({ ok: true })}
+          onBack={vi.fn()}
+        />,
+      );
+      // Still held one tick short of the beat.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(WARMUP_MS - 1);
+      });
+      expect(onInstallCli).not.toHaveBeenCalled();
+      // Fires once the beat elapses.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(onInstallCli).toHaveBeenCalledOnce();
+      // The log stream is subscribed before install starts, so no early output
+      // is lost during the beat.
+      expect(onInstallLog.mock.invocationCallOrder[0]).toBeLessThan(
+        onInstallCli.mock.invocationCallOrder[0],
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the warm-up beat when unmounted during the hold", async () => {
+    vi.useFakeTimers();
+    try {
+      const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+      const onInstallLog = vi.fn(() => () => {});
+      const { unmount } = render(
+        <SetupTerminalStep
+          onInstallCli={onInstallCli}
+          onInstallLog={onInstallLog}
+          onRun={vi.fn().mockResolvedValue({ ok: true })}
+          onBack={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(WARMUP_MS - 1);
+      });
+      unmount();
+      // Past when the beat would have fired: the install must not start.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(WARMUP_MS);
+      });
+      expect(onInstallCli).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("installs once even when re-rendered with fresh callbacks mid-install", async () => {
+    let releaseInstall: ((r: { ok: boolean }) => void) | undefined;
+    const installStarts = vi.fn();
+    // Stable identity for the assertion, but a NEW wrapper each render (mirrors
+    // the parent recreating onInstallCli/onRun) to prove we don't re-fire.
+    const installImpl = () => {
+      installStarts();
+      return new Promise<{ ok: boolean }>((res) => {
+        releaseInstall = res;
+      });
+    };
+    const onRun = vi.fn().mockResolvedValue({ ok: true });
+    const { rerender } = render(
+      <SetupTerminalStep
+        onInstallCli={() => installImpl()}
+        onRun={() => onRun()}
+        onBack={vi.fn()}
+      />,
+    );
+    // A parent re-render (e.g. deferred server list resolved) with new callbacks.
+    rerender(
+      <SetupTerminalStep
+        onInstallCli={() => installImpl()}
+        onRun={() => onRun()}
+        onBack={vi.fn()}
+      />,
+    );
+    releaseInstall?.({ ok: true });
+    expect(await screen.findByText("Server ready")).toBeInTheDocument();
+    expect(installStarts).toHaveBeenCalledTimes(1);
+    expect(onRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops at the install failure and does not run the action", async () => {
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: false, error: "install broke" });
+    const onRun = vi.fn().mockResolvedValue({ ok: true });
+    render(<SetupTerminalStep onInstallCli={onInstallCli} onRun={onRun} onBack={vi.fn()} />);
+
+    expect(await screen.findByText("install broke")).toBeInTheDocument();
+    expect(onRun).not.toHaveBeenCalled();
   });
 
   it("renders streamed log lines from onSetupLog and unsubscribes on unmount", async () => {
@@ -36,9 +174,9 @@ describe("SetupTerminalStep", () => {
       emit = cb;
       return unsubscribe;
     });
-    const onStartLocal = vi.fn().mockResolvedValue({ ok: true });
+    const onRun = vi.fn().mockResolvedValue({ ok: true });
     const { unmount } = render(
-      <SetupTerminalStep onStartLocal={onStartLocal} onSetupLog={onSetupLog} onBack={vi.fn()} />,
+      <SetupTerminalStep onRun={onRun} onSetupLog={onSetupLog} onBack={vi.fn()} />,
     );
 
     expect(onSetupLog).toHaveBeenCalledOnce();
@@ -51,11 +189,63 @@ describe("SetupTerminalStep", () => {
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
+  it("fills the bar from the start when there's no install step", () => {
+    let emit: (line: string) => void = () => {};
+    const props = {
+      onRun: () => new Promise<{ ok: boolean }>(() => {}),
+      onSetupLog: (cb: (line: string) => void) => {
+        emit = cb;
+        return () => {};
+      },
+      onBack: vi.fn(),
+    };
+    const { container, rerender } = render(<SetupTerminalStep {...props} />);
+    const bar = () => container.querySelector<HTMLElement>("[style*='width']")?.style.width;
+    expect(bar()).toBe("10%");
+    act(() => emit("$ omnigent host --server https://team.example.com/"));
+    expect(bar()).toBe("35%");
+    rerender(<SetupTerminalStep {...props} connection={{ phase: "connecting" }} />);
+    expect(bar()).toBe("70%");
+  });
+
+  it("offers Cancel while the action is still running, and not once it has finished", async () => {
+    const onCancel = vi.fn();
+    let finish: (v: { ok: boolean }) => void = () => {};
+    const onRun = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} onCancel={onCancel} />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onCancel).toHaveBeenCalledOnce();
+    await act(async () => finish({ ok: false }));
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("leaves the server connect's own Cancel alone", () => {
+    const onCancel = vi.fn();
+    const onCancelConnect = vi.fn();
+    render(
+      <SetupTerminalStep
+        onRun={() => new Promise(() => {})}
+        onBack={vi.fn()}
+        onCancel={onCancel}
+        onCancelConnect={onCancelConnect}
+        connection={{ phase: "connecting" }}
+      />,
+    );
+    const buttons = screen.getAllByRole("button", { name: /cancel/i });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(onCancelConnect).toHaveBeenCalledOnce();
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
   it("fires onBack from Back on the failure screen", async () => {
     const onBack = vi.fn();
-    render(
-      <SetupTerminalStep onStartLocal={vi.fn().mockResolvedValue({ ok: false })} onBack={onBack} />,
-    );
+    render(<SetupTerminalStep onRun={vi.fn().mockResolvedValue({ ok: false })} onBack={onBack} />);
     fireEvent.click(await screen.findByRole("button", { name: "Back" }));
     expect(onBack).toHaveBeenCalledOnce();
   });

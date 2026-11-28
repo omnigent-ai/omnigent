@@ -5,7 +5,15 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { SessionCard, type SessionCardData, type SessionCardNode } from "./SessionCard";
+
+const FORGE_DISPLAY = {
+  id: "example_forge",
+  display_name: "Example Forge",
+  request_name: "pull request",
+  number_prefix: "!",
+};
 
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
   return {
@@ -25,6 +33,7 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
 function renderCard(
   data: Partial<SessionCardData> & { conversation: Conversation },
   selected = false,
+  onParentClick?: () => void,
 ) {
   const props = {
     id: data.conversation.id,
@@ -33,7 +42,9 @@ function renderCard(
   } as unknown as NodeProps<SessionCardNode>;
   render(
     <TooltipProvider>
-      <SessionCard {...props} />
+      <div onClick={onParentClick}>
+        <SessionCard {...props} />
+      </div>
     </TooltipProvider>,
   );
   return { card: screen.getByTestId("session-card"), onOpen: props.data.onOpen };
@@ -63,15 +74,38 @@ describe("SessionCard", () => {
     expect(screen.getAllByText("Needs response").length).toBeGreaterThan(0);
   });
 
-  it("shows the unread dot for finished output the user has not seen", () => {
-    // The list seeds the viewer's last-seen baseline; a later updated_at reads as unseen.
-    seedReadState([{ id: "conv_1", viewer_last_seen: 50, updated_at: 100 }]);
-    const { card } = renderCard({
-      conversation: conversation({ status: "idle", updated_at: 100 }),
-    });
-    expect(card).toHaveAttribute("data-state", "unseen");
-    expect(screen.getByText("New messages")).toBeInTheDocument();
-  });
+  it.each([false, true])(
+    "shows the unread dot for finished output the user has not seen, muted=%s",
+    (muted) => {
+      // The list seeds the viewer's last-seen baseline; a later updated_at reads as unseen.
+      seedReadState([{ id: "conv_1", viewer_last_seen: 50, updated_at: 100 }]);
+      const { card } = renderCard({
+        conversation: conversation({
+          status: "idle",
+          updated_at: 100,
+          labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {},
+        }),
+      });
+      expect(card).toHaveAttribute("data-state", muted ? "idle" : "unseen");
+      expect(screen.queryByText("New messages") !== null).toBe(!muted);
+    },
+  );
+
+  it.each([false, true])(
+    "shows unread output over background work until it is seen, seen=%s",
+    (seen) => {
+      seedReadState([{ id: "conv_1", viewer_last_seen: seen ? 100 : 50, updated_at: 100 }]);
+      const { card } = renderCard({
+        conversation: conversation({
+          status: "idle",
+          background_work_running: true,
+          updated_at: 100,
+        }),
+      });
+      expect(card).toHaveAttribute("data-state", seen ? "running" : "unseen");
+      expect(screen.getByText(seen ? "Running" : "New messages")).toBeInTheDocument();
+    },
+  );
 
   it("falls back to idle and failed labels", () => {
     renderCard({ conversation: conversation({ status: "idle" }) });
@@ -102,7 +136,47 @@ describe("SessionCard", () => {
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
     expect(link).toHaveTextContent("#7 Ship it");
+    expect(link).toHaveAttribute("title", "Ship it (open)");
   });
+
+  it("says how old a stale pull request state is", () => {
+    renderCard({
+      conversation: conversation(),
+      pullRequest: {
+        number: 7,
+        title: "Ship it",
+        state: "OPEN",
+        url: "https://github.com/acme/repo/pull/7",
+        state_checked_at: Date.now() / 1000 - 2 * 3600,
+      },
+    });
+    expect(screen.getByRole("link", { name: "Open pull request #7" })).toHaveAttribute(
+      "title",
+      "Ship it (open, as of 2h ago)",
+    );
+  });
+
+  it.each([
+    { provider: "github", prefix: "#", url: "https://github.com/acme/repo/pull/7" },
+    {
+      provider: "example_forge",
+      provider_display: FORGE_DISPLAY,
+      prefix: "!",
+      url: "https://forge.example.test/acme/proj/_git/repo/pullrequest/7",
+    },
+    { provider: null, prefix: "#", url: "https://github.com/acme/repo/pull/7" },
+  ])(
+    "puts $prefix before the number of a $provider pull request",
+    ({ provider, prefix, url, ...metadata }) => {
+      renderCard({
+        conversation: conversation({ git_branch: "feat/canvas" }),
+        pullRequest: { number: 7, title: "Ship it", state: "OPEN", url, provider, ...metadata },
+      });
+      const link = screen.getByRole("link", { name: `Open pull request ${prefix}7` });
+      expect(link).toHaveAttribute("href", url);
+      expect(link.textContent).toBe(`${prefix}7 Ship it`);
+    },
+  );
 
   it("uses explicit fallbacks for missing fields", () => {
     renderCard({ conversation: conversation({ title: null, workspace: null, status: "failed" }) });
@@ -112,12 +186,15 @@ describe("SessionCard", () => {
   });
 
   it("opens from the keyboard but leaves pointer clicks to selection and drag", () => {
-    const { card, onOpen } = renderCard({ conversation: conversation() });
+    const onParentClick = vi.fn();
+    const { card, onOpen } = renderCard({ conversation: conversation() }, false, onParentClick);
     fireEvent.click(card, { detail: 1 });
     expect(onOpen).not.toHaveBeenCalled();
+    expect(onParentClick).toHaveBeenCalledOnce();
     fireEvent.keyDown(card, { key: "Enter" });
     fireEvent.click(card, { detail: 0 });
     expect(onOpen).toHaveBeenCalledTimes(2);
     expect(onOpen).toHaveBeenCalledWith("conv_1");
+    expect(onParentClick).toHaveBeenCalledOnce();
   });
 });

@@ -177,6 +177,31 @@ def test_git_without_dash_c_abstains() -> None:
     assert policy(_sh("git commit -m wip")) is None
 
 
+@pytest.mark.parametrize(
+    "spawned",
+    [
+        "find . -maxdepth 0 -exec git -C /etc/secrets log +",
+        "xargs git worktree add /outside",
+    ],
+)
+def test_process_spawning_utility_escape_is_gated(spawned: str) -> None:
+    """A ``git -C`` / worktree escape spawned by find/xargs is gated.
+
+    The utility's head is not modelled here, so the segment abstained → ALLOW.
+    It is now treated as an unresolved invocation and, because the segment reads
+    as a directory/worktree op, surfaced via the configured action.
+    """
+    policy = block_working_dir_changes()
+    result = policy(_sh(spawned))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_process_spawning_utility_without_dir_op_abstains() -> None:
+    """A benign ``find`` naming no dir/worktree op is not over-blocked."""
+    policy = block_working_dir_changes()
+    assert policy(_sh("find . -name '*.py'")) is None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 1 — git worktree gating
 # ══════════════════════════════════════════════════════════════════════════════
@@ -426,6 +451,34 @@ def test_untokenizable_gated_segment_surfaces_action() -> None:
     policy = block_working_dir_changes()
     result = policy(_sh('cd "/et'))
     assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # today's status\necho done",
+        "cat <<DATA\ntoday's status\nDATA\necho done",
+        "sh -c 'echo ready # status'",
+        "echo \\\nready",
+        "echo $(echo ready)",
+        'echo "$(echo ready)"',
+        "echo `echo ready`",
+        'echo "`echo ready`"',
+        "echo $'text'",
+        'echo $"text"',
+    ],
+)
+@pytest.mark.parametrize("action,expected", [("deny", "DENY"), ("ask", "ASK")])
+def test_unsupported_shell_syntax_takes_configured_action(
+    command: str, action: str, expected: str
+) -> None:
+    policy = block_working_dir_changes(action=action)
+    assert _action(policy(_sh(command))) == expected
+
+
+@pytest.mark.parametrize("command", ["echo '$(text)'", "echo '`text`'", r'echo "\$(text)"'])
+def test_literal_substitution_text_abstains(command: str) -> None:
+    assert block_working_dir_changes()(_sh(command)) is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

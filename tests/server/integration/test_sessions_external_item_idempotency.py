@@ -8,6 +8,9 @@ parallel. ``data.source_id`` makes the persist idempotent.
 
 from __future__ import annotations
 
+import copy
+import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -69,7 +72,8 @@ async def test_reposted_item_with_source_id_persists_once(
     session_id = await _create_session(client, "idem-repost")
     first = await _post_item(client, session_id, text="hello once", source_id="rec-1:0:message")
     second = await _post_item(client, session_id, text="hello once", source_id="rec-1:0:message")
-    assert first["item_id"] == second["item_id"]
+    third = await _post_item(client, session_id, text="hello once", source_id="rec-1:0:message")
+    assert first["item_id"] == second["item_id"] == third["item_id"]
     assert await _message_texts(client, session_id) == ["hello once"]
 
 
@@ -82,6 +86,61 @@ async def test_distinct_source_ids_persist_separately(
     assert await _message_texts(client, session_id) == ["same text", "same text"]
 
 
+async def test_agy_reader_restart_preserves_messages_and_tool_pairs(
+    client: httpx.AsyncClient,
+) -> None:
+    from omnigent.harnesses.antigravity_native.reader import _emit_step
+
+    session_id = await _create_session(client, "agy-reader-restart")
+    fixtures = Path(__file__).parents[2] / "fixtures" / "antigravity" / "steps"
+    steps = [
+        json.loads((fixtures / f"{name}.json").read_text())
+        for name in ("user_input", "stream_view_file_done", "stream_planner_text_done")
+    ]
+
+    async def replay(snapshot, cascade_id="cascade-original"):
+        turn_active = False
+        for step in snapshot:
+            turn_active = await _emit_step(
+                step,
+                client=client,
+                session_id=session_id,
+                cascade_id=cascade_id,
+                turn_active=turn_active,
+            )
+
+    async def items():
+        response = await client.get(f"/v1/sessions/{session_id}/items")
+        response.raise_for_status()
+        return response.json()["data"]
+
+    await replay(steps)
+    original = await items()
+    assert [item["type"] for item in original] == [
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert original[1]["call_id"] == original[2]["call_id"]
+
+    # A restarted reader has no in-memory seen set and replays the snapshot.
+    await replay(copy.deepcopy(steps))
+    assert await items() == original
+
+    # Repeating the same words in a later turn must still create a new item.
+    followup = copy.deepcopy(steps[0])
+    followup["metadata"]["executionId"] = "next-user-turn"
+    await replay([*steps, followup])
+    after_followup = await items()
+    assert len(after_followup) == 5
+    assert after_followup[-1]["content"] == original[0]["content"]
+
+    # A different cascade is a different source even when step indices repeat.
+    await replay(steps, cascade_id="cascade-after-clear")
+    assert len(await items()) == 9
+
+
 async def test_repost_without_source_id_keeps_legacy_behavior(
     client: httpx.AsyncClient,
 ) -> None:
@@ -89,6 +148,39 @@ async def test_repost_without_source_id_keeps_legacy_behavior(
     await _post_item(client, session_id, text="legacy", source_id=None)
     await _post_item(client, session_id, text="legacy", source_id=None)
     assert await _message_texts(client, session_id) == ["legacy", "legacy"]
+
+
+async def test_reposted_batch_persists_each_item_once_in_order(
+    client: httpx.AsyncClient,
+) -> None:
+    # A forwarder re-posts a timed-out batch whose prefix already committed; the
+    # run's single append must dedupe item by item and keep the batch order.
+    session_id = await _create_session(client, "idem-batch")
+    batch = [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": f"part {i}"}],
+                    "agent": "worker",
+                },
+                "response_id": "resp_claude_echo",
+                "source_id": f"rec-{i}:0:message",
+            },
+        }
+        for i in range(5)
+    ]
+    first = await client.post(f"/v1/sessions/{session_id}/events", json=batch[:3])
+    second = await client.post(f"/v1/sessions/{session_id}/events", json=batch)
+    assert first.status_code in (200, 201, 202), first.text
+    assert second.status_code in (200, 201, 202), second.text
+    first_ids = [ack["item_id"] for ack in first.json()]
+    second_ids = [ack["item_id"] for ack in second.json()]
+    assert second_ids[:3] == first_ids
+    assert len(set(second_ids)) == 5
+    assert await _message_texts(client, session_id) == [f"part {i}" for i in range(5)]
 
 
 async def test_duplicate_repost_restores_the_drained_pending_input(

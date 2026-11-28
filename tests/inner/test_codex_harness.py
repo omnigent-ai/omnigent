@@ -13,12 +13,16 @@ e2e suite when available.
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from omnigent.inner import codex_harness
+from omnigent.inner.model_signer import SignerLaunchConfig
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 
 
@@ -51,8 +55,10 @@ def test_create_app_returns_fastapi_with_required_routes() -> None:
     assert "/v1/sessions/{conversation_id}/events" in paths
 
 
+@pytest.mark.parametrize("brokered_gateway", [False, True])
 def test_executor_factory_reads_env_vars(
     monkeypatch: pytest.MonkeyPatch,
+    brokered_gateway: bool,
 ) -> None:
     """Factory passes env-var values through to CodexExecutor.
 
@@ -60,7 +66,7 @@ def test_executor_factory_reads_env_vars(
     process before spawning the subprocess (which inherits
     them) are how the wrap learns its config. Verifies model,
     databricks, profile, cwd, codex_path, web_search,
-    disable_native_tools all thread through.
+    disable_native_tools, and brokered_gateway all thread through.
     """
     monkeypatch.setenv("HARNESS_CODEX_MODEL", "test-model-id")
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY", "true")
@@ -77,6 +83,10 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
     monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
     monkeypatch.setenv("HARNESS_CODEX_DISABLE_NATIVE_TOOLS", "true")
+    if brokered_gateway:
+        monkeypatch.setenv("HARNESS_CODEX_BROKERED_GATEWAY", "true")
+    else:
+        monkeypatch.delenv("HARNESS_CODEX_BROKERED_GATEWAY", raising=False)
 
     captured: dict[str, Any] = {}
 
@@ -95,6 +105,7 @@ def test_executor_factory_reads_env_vars(
         gateway_auth_refresh_interval_ms: str | None,
         enable_web_search: bool,
         disable_native_tools: bool,
+        brokered_gateway: bool,
         **_kwargs: Any,
     ) -> None:
         captured["cwd"] = cwd
@@ -109,6 +120,7 @@ def test_executor_factory_reads_env_vars(
         captured["gateway_auth_refresh_interval_ms"] = gateway_auth_refresh_interval_ms
         captured["enable_web_search"] = enable_web_search
         captured["disable_native_tools"] = disable_native_tools
+        captured["brokered_gateway"] = brokered_gateway
 
     with patch(
         "omnigent.inner.codex_harness.CodexExecutor.__init__",
@@ -133,6 +145,7 @@ def test_executor_factory_reads_env_vars(
     # default is False, we set "true" → expect True.
     assert captured["enable_web_search"] is False
     assert captured["disable_native_tools"] is True
+    assert captured["brokered_gateway"] is brokered_gateway
     # Default os_env when no HARNESS_CODEX_OS_ENV is set: the
     # parity-preserving caller_process + sandbox=none.
     os_env_value = captured["os_env"]
@@ -140,6 +153,184 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.type == "caller_process"
     assert os_env_value.sandbox is not None
     assert os_env_value.sandbox.type == "none"
+
+
+_GATEWAY_ROUTE = {
+    "HARNESS_CODEX_GATEWAY": "true",
+    "HARNESS_CODEX_GATEWAY_HOST": "https://gateway.example",
+    "HARNESS_CODEX_GATEWAY_BASE_URL": "https://gateway.example/v1",
+    "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf token",
+    "HARNESS_CODEX_MODEL": "gpt-gateway",
+}
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({}, id="config-toml"),
+        pytest.param(
+            {"HARNESS_CODEX_GATEWAY": "0", "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf token"},
+            id="gateway-off-auth-command",
+        ),
+        pytest.param(
+            {
+                "HARNESS_CODEX_GATEWAY": "0",
+                "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf token",
+                "HARNESS_CODEX_MODEL_PROVIDER": "openai",
+            },
+            id="gateway-off-openai-pin",
+        ),
+        pytest.param(
+            {"HARNESS_CODEX_MODEL_PROVIDER": "custom", "HARNESS_CODEX_GATEWAY_HOST": "https://x"},
+            id="custom-pin",
+        ),
+        pytest.param(_GATEWAY_ROUTE, id="gateway"),
+    ],
+)
+def test_child_model_provider_matches_the_executor_route(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The catalog's reading of a child's route agrees with the executor the wrap builds."""
+    for name in {*_GATEWAY_ROUTE, "HARNESS_CODEX_MODEL_PROVIDER", "HARNESS_CODEX_SIGNER_PROVIDER"}:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    codex = tmp_path / "codex"
+    codex.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", str(codex))
+
+    executor = codex_harness._build_codex_executor()
+    provider = codex_harness.codex_child_model_provider(os.environ)
+
+    pins = [
+        json.loads(override.removeprefix("model_provider="))
+        for override in executor._codex_config_overrides
+        if override.startswith("model_provider=")
+    ]
+    assert provider == ("" if executor._gateway else (pins[0] if pins else None))
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_executor_factory_passes_runner_selected_skills_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, configured: bool
+) -> None:
+    """Only the runner-selected skill directory crosses the harness boundary."""
+    skills_dir = tmp_path / "session skills"
+    if configured:
+        monkeypatch.setenv("HARNESS_CODEX_SKILLS_DIR", str(skills_dir))
+    else:
+        monkeypatch.delenv("HARNESS_CODEX_SKILLS_DIR", raising=False)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch("omnigent.inner.codex_harness.CodexExecutor.__init__", _fake_init):
+        codex_harness._build_codex_executor()
+
+    assert captured["skills_dir"] == (skills_dir if configured else None)
+
+
+def test_executor_factory_builds_registered_ucode_signer_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production harness converts trusted workflow inputs into typed authority."""
+    endpoint = "https://example.databricks.com/ai-gateway/codex/v1"
+    monkeypatch.setenv("HARNESS_CODEX_MODEL", "databricks-gpt-5")
+    monkeypatch.setenv("HARNESS_CODEX_SIGNER_PROVIDER", "databricks-ucode-v1")
+    monkeypatch.setenv("HARNESS_CODEX_SIGNER_ENDPOINT", endpoint)
+    monkeypatch.setenv("HARNESS_CODEX_GATEWAY_HOST", "https://example.databricks.com")
+    monkeypatch.setenv("HARNESS_CODEX_DATABRICKS_PROFILE", "test-profile")
+    monkeypatch.setenv(
+        "HARNESS_CODEX_MODEL_EGRESS",
+        '["POST example.databricks.com/ai-gateway/codex/v1/responses"]',
+    )
+    monkeypatch.setenv(
+        "HARNESS_CODEX_OS_ENV",
+        '{"type":"caller_process","sandbox":{"type":"linux_bwrap"}}',
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch("omnigent.inner.codex_harness.CodexExecutor.__init__", _fake_init):
+        codex_harness._build_codex_executor()
+
+    signer = captured["signer_launch_config"]
+    assert isinstance(signer, SignerLaunchConfig)
+    assert signer.binding_id == "databricks-ucode-v1"
+    assert signer.endpoint == endpoint
+    assert signer.auth_profile == "test-profile"
+    assert signer.routes[0].path == "/ai-gateway/codex/v1/responses"
+    assert captured["gateway"] is False
+    assert captured["gateway_auth_command"] is None
+    assert captured["base_url_override"] is None
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "match"),
+    [
+        ("HARNESS_CODEX_MODEL_EGRESS", "", "model egress"),
+        ("HARNESS_CODEX_SIGNER_PROVIDER", "bedrock", "unsupported"),
+        (
+            "HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
+            "sh -c 'steal-token'",
+            "legacy gateway auth command",
+        ),
+    ],
+)
+def test_executor_factory_fails_closed_for_invalid_signer_inputs(
+    name: str,
+    value: str,
+    match: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = "https://example.databricks.com/ai-gateway/codex/v1"
+    monkeypatch.setenv("HARNESS_CODEX_MODEL", "databricks-gpt-5")
+    monkeypatch.setenv("HARNESS_CODEX_SIGNER_PROVIDER", "databricks-ucode-v1")
+    monkeypatch.setenv("HARNESS_CODEX_SIGNER_ENDPOINT", endpoint)
+    monkeypatch.setenv("HARNESS_CODEX_GATEWAY_HOST", "https://example.databricks.com")
+    monkeypatch.setenv("HARNESS_CODEX_DATABRICKS_PROFILE", "test-profile")
+    monkeypatch.setenv(
+        "HARNESS_CODEX_MODEL_EGRESS",
+        '["POST example.databricks.com/ai-gateway/codex/v1/responses"]',
+    )
+    monkeypatch.setenv(
+        "HARNESS_CODEX_OS_ENV",
+        '{"type":"caller_process","sandbox":{"type":"linux_bwrap"}}',
+    )
+    if value:
+        monkeypatch.setenv(name, value)
+    else:
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises((OSError, ValueError), match=match):
+        codex_harness._build_codex_executor()
+
+
+def test_executor_factory_rejects_arbitrary_ucode_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HARNESS_CODEX_MODEL", "databricks-gpt-5")
+    monkeypatch.setenv("HARNESS_CODEX_SIGNER_PROVIDER", "databricks-ucode-v1")
+    monkeypatch.setenv(
+        "HARNESS_CODEX_SIGNER_ENDPOINT",
+        "https://evil.example/ai-gateway/codex/v1",
+    )
+    monkeypatch.setenv("HARNESS_CODEX_GATEWAY_HOST", "https://example.databricks.com")
+    monkeypatch.setenv("HARNESS_CODEX_DATABRICKS_PROFILE", "test-profile")
+    monkeypatch.setenv(
+        "HARNESS_CODEX_MODEL_EGRESS",
+        '["POST evil.example/ai-gateway/codex/v1/responses"]',
+    )
+    monkeypatch.setenv(
+        "HARNESS_CODEX_OS_ENV",
+        '{"type":"caller_process","sandbox":{"type":"linux_bwrap"}}',
+    )
+
+    with pytest.raises(ValueError, match="registered Databricks ucode endpoint"):
+        codex_harness._build_codex_executor()
 
 
 def test_executor_factory_cwd_falls_back_to_runner_workspace(
@@ -239,6 +430,20 @@ def test_executor_factory_decodes_os_env_json(
                     "write_paths": None,
                     "write_files": None,
                     "allow_network": False,
+                    "credential_proxy": {
+                        "entries": [
+                            {
+                                "host": "model.example.com",
+                                "scheme": "bearer",
+                                "source": {
+                                    "kind": "unix_socket",
+                                    "path": "/private/model-token.sock",
+                                    "refresh_interval_seconds": 300,
+                                },
+                                "inject_env": ["OMNIGENT_CODEX_GATEWAY_TOKEN"],
+                            }
+                        ],
+                    },
                 },
                 "fork": False,
             }
@@ -269,35 +474,11 @@ def test_executor_factory_decodes_os_env_json(
     # default ``True``.
     assert os_env_value.sandbox.allow_network is False
     assert os_env_value.sandbox.read_paths == ["/srv/data"]
-
-
-def test_executor_factory_falls_back_on_malformed_os_env_json(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Malformed ``HARNESS_CODEX_OS_ENV`` falls back to default.
-
-    A malformed payload should NOT crash the wrap — that would
-    bring the whole subprocess down on first turn. The wrap
-    instead logs a warning and defaults to the parity-preserving
-    ``caller_process + sandbox=none`` so the agent still starts.
-    """
-    monkeypatch.setenv("HARNESS_CODEX_OS_ENV", "{this-is-not-json")
-    captured: dict[str, Any] = {}
-
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured["os_env"] = kwargs["os_env"]
-
-    with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
-        _fake_init,
-    ):
-        codex_harness._build_codex_executor()
-
-    os_env_value = captured["os_env"]
-    assert os_env_value is not None
-    assert os_env_value.type == "caller_process"
-    assert os_env_value.sandbox is not None
-    assert os_env_value.sandbox.type == "none"
+    binding = os_env_value.sandbox.credential_proxy.entries[0]
+    assert binding.source.kind == "unix_socket"
+    assert binding.source.path == "/private/model-token.sock"
+    assert binding.source.refresh_interval_seconds == 300
+    assert binding.inject_env == ["OMNIGENT_CODEX_GATEWAY_TOKEN"]
 
 
 @pytest.mark.parametrize(
@@ -529,3 +710,20 @@ def test_bundle_dir_unset_passes_none(
 
     assert captured["bundle_dir"] is None
     assert captured["agent_name"] is None
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [(None, None), ("[]", []), ('["claude","codex"]', ["claude", "codex"]), ("bad", None)],
+)
+def test_mcp_executor_factory_activation(monkeypatch, raw, expected):
+    from omnigent.runner.identity import RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR
+
+    monkeypatch.setenv("HARNESS_CODEX_GATEWAY", "false")
+    if raw is None:
+        monkeypatch.delenv(RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR, raw)
+    with patch.object(codex_harness, "CodexExecutor") as executor:
+        codex_harness._build_codex_executor()
+    assert executor.call_args.kwargs["active_harnesses"] == expected

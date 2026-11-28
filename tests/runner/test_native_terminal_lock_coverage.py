@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.harness_plugins import _BUILTIN_NATIVE_PROVIDERS
-from omnigent.runner.app import _require_full_native_lock_coverage
+from omnigent.runner.app_support import _require_full_native_lock_coverage
 from omnigent.runner.native.interrupt import _UNIFORM_INTERRUPT, _UNIFORM_STOP
 
 # Built-in native harnesses are dispatched by ``agent.key`` (e.g. "devin").
@@ -80,3 +80,22 @@ def test_devin_is_wired_into_interrupt_and_stop() -> None:
     assert _UNIFORM_INTERRUPT["devin"].module == "omnigent.harnesses.devin_native.bridge"
     assert _UNIFORM_INTERRUPT["devin"].inject_fn == "inject_interrupt"
     assert _UNIFORM_STOP["devin"].module == "omnigent.harnesses.devin_native.bridge"
+
+
+@pytest.mark.parametrize("key", sorted(_BUILTIN_NATIVE_KEYS))
+def test_every_native_terminal_role_logs_input_ready(key: str) -> None:
+    # The terminal watcher emits ``native_input_ready`` for whatever probe its
+    # terminal role resolves to, so every built-in harness must launch with a
+    # role that names it and resolves a probe; otherwise the event is silently
+    # never logged (how pi-native and devin-native were missed).
+    from omnigent.harness_plugins import native_agents
+    from omnigent.runner import resource_registry
+
+    agent = next(agent for agent in native_agents() if agent.key == key)
+    roles = {
+        value
+        for name, value in vars(resource_registry).items()
+        if name.endswith("_NATIVE_TERMINAL_ROLE")
+    }
+    assert agent.harness in roles, f"no *_NATIVE_TERMINAL_ROLE for {agent.harness}"
+    assert callable(resource_registry._native_input_ready_probe(agent.harness))

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 
+import pytest
+
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.classification import IssueContent, PromptClassifier, build_prompt
 from issue_prioritization.domain import (
@@ -49,6 +51,27 @@ def test_prompt_includes_only_prefetched_duplicate_candidates() -> None:
 
     assert '"number": 12' in prompt
     assert "Never return an issue number absent from the candidate list" in prompt
+
+
+@pytest.mark.parametrize("review_bugs", [False, True])
+def test_prompt_preserves_reported_failures_with_workarounds(review_bugs) -> None:
+    prompt = build_prompt(
+        IssueContent(
+            7735,
+            "[Bug] Models not shown in selector",
+            "OpenRouter models appear in Pi but only the default appears in Omnigent.",
+            ("Bug",),
+            "community",
+        ),
+        _areas(),
+        review_bugs=review_bugs,
+    )
+    compact = " ".join(prompt.split())
+
+    assert "[Bug] title or Bug label as the author's reported intent" in compact
+    assert "If that distinction is uncertain, retain Bug" in compact
+    assert '"how do I" wording does not turn a reported failure into a Feature' in compact
+    assert "Explain any type override in reasoning separately from the impact assessment" in compact
 
 
 def test_prompt_treats_blocked_core_user_journeys_as_impact() -> None:
@@ -198,8 +221,14 @@ def test_content_hash_ignores_bot_managed_labels() -> None:
         "community",
     )
     lifecycle = IssueContent(1, "Broken", "Details", ("Feature", "needs-info"), "community")
+    # The repro-agent flips validating/validated:* on the same content; those must
+    # not re-grade (only a real body/title edit does).
+    validation = IssueContent(
+        1, "Broken", "Details", ("Bug", "validating", "validated:likely_repro"), "community"
+    )
     changed = IssueContent(1, "Broken", "New details", ("Bug",), "community")
 
     assert base.content_hash == managed.content_hash
     assert base.content_hash == lifecycle.content_hash
+    assert base.content_hash == validation.content_hash
     assert base.content_hash != changed.content_hash

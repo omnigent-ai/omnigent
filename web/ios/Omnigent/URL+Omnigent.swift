@@ -51,6 +51,21 @@ extension URL {
     return components.url?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
   }
 
+  /// `routePath` (absolute, e.g. `/auth/login`) under this server URL's mount, without its
+  /// query or fragment: `https://h/omnigent/` + `/v1/me` is `https://h/omnigent/v1/me`.
+  func omnigentEndpoint(_ routePath: String) -> URL? {
+    guard routePath.hasPrefix("/"),
+      let encodedRoute = routePath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+      var components = URLComponents(url: self, resolvingAgainstBaseURL: false)
+    else { return nil }
+    var mount = Substring(components.percentEncodedPath)
+    while mount.hasSuffix("/") { mount = mount.dropLast() }
+    components.percentEncodedPath = String(mount) + encodedRoute
+    components.percentEncodedQuery = nil
+    components.percentEncodedFragment = nil
+    return components.url
+  }
+
   var omnigentHostLabel: String {
     guard let host else { return absoluteString }
     if let port {

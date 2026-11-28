@@ -62,6 +62,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 
+from .sandbox import reject_unsupported_harness_sandbox
+
 _logger = logging.getLogger(__name__)
 
 # Maximum seconds to wait for a Hermes subprocess to complete a single turn.
@@ -255,6 +257,7 @@ class HermesExecutor(Executor):
         :param bundle_dir: Agent bundle directory (reserved).
         :param agent_name: Agent display name (reserved).
         """
+        reject_unsupported_harness_sandbox(os_env, "Hermes")
         self._hermes_path = hermes_path or shutil.which("hermes") or "hermes"
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -403,7 +406,7 @@ class HermesExecutor(Executor):
                 proc.communicate(),
                 timeout=_HERMES_TURN_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _logger.warning("Hermes subprocess timed out after %ss", _HERMES_TURN_TIMEOUT_S)
             yield ExecutorError(
                 message=f"Hermes subprocess timed out after {_HERMES_TURN_TIMEOUT_S}s",
@@ -436,7 +439,7 @@ class HermesExecutor(Executor):
                     proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     with contextlib.suppress(ProcessLookupError):
                         proc.kill()
                     with contextlib.suppress(Exception):
@@ -540,7 +543,7 @@ class HermesExecutor(Executor):
             proc.terminate()
         try:
             await asyncio.wait_for(proc.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
         return True

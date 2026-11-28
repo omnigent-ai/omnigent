@@ -1,9 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { CheckIcon, Link2Icon, WandSparklesIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
+import { replaceEmojiShortcodes } from "@/lib/emojiShortcodes";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -37,13 +39,21 @@ export interface CommentsPanelProps {
   comments: Comment[];
   addressedComments: Comment[];
   activeSelection: ActiveSelection | null;
-  onAddComment: (body: string) => void;
+  /**
+   * Adds a comment on the active selection. One that returns a promise keeps the typed text
+   * until it resolves `true`, so a failed save can be tried again.
+   */
+  onAddComment: (body: string) => void | Promise<boolean>;
   onAddressAll: () => void;
   onEditComment: (id: string, body: string) => void;
   onDeleteComment: (id: string) => void;
   onClickComment: (comment: Comment) => void;
   /** When false, "Address All" is disabled (no agent registered). */
   canAddress: boolean;
+  /** Draft comments "Address All" sends, including other files'. Defaults to `comments.length`. */
+  addressCount?: number;
+  /** Files those drafts come from. Defaults to 1. */
+  addressFileCount?: number;
   addressPending: boolean;
   /**
    * When false, the add-comment form and all edit/delete buttons are hidden
@@ -53,6 +63,8 @@ export interface CommentsPanelProps {
    * owner/editor access).
    */
   canEdit?: boolean;
+  /** What the panel says to a viewer who can't comment; the default names a session. */
+  readOnlyMessage?: string;
   /**
    * Called when the user clicks the "Copy link" icon on a comment.
    * The caller is responsible for building the URL and writing to clipboard.
@@ -81,8 +93,11 @@ export function CommentsPanel({
   onDeleteComment,
   onClickComment,
   canAddress,
+  addressCount = comments.length,
+  addressFileCount = 1,
   addressPending,
   canEdit = true,
+  readOnlyMessage = "You have read-only access to this session.",
   pendingBodyRef,
   onCopyCommentLink,
   now,
@@ -91,6 +106,9 @@ export function CommentsPanel({
   const [body, setBody] = useState("");
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
   const selectedCardRef = useRef<HTMLDivElement>(null);
   const autoRouteRef = useRef<{ selection: ActiveSelection; tab: Tab } | null>(null);
   const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
@@ -106,11 +124,43 @@ export function CommentsPanel({
   const activeSelectionStart = activeSelection?.start_index;
   const activeSelectionEnd = activeSelection?.end_index;
   const activeCommentId = activeSelection?.comment_id;
+  const activeAnchor = activeSelection?.anchor_content;
+  // Counts selections, so a save that finishes after the viewer moved on leaves the new text.
+  const selectionGeneration = useRef(0);
+  // While a save is in flight the draft is read-only, so its completion can't erase newer text.
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
+    selectionGeneration.current += 1;
+    setSaving(false);
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
-  }, [activeSelectionStart, activeSelectionEnd, activeCommentId, pendingBodyRef]);
+  }, [activeSelectionStart, activeSelectionEnd, activeCommentId, activeAnchor, pendingBodyRef]);
+
+  const submitComment = () => {
+    const clear = () => {
+      setBody("");
+      if (pendingBodyRef) pendingBodyRef.current = "";
+    };
+    if (saving) return;
+    const outcome = onAddComment(body.trim());
+    if (outcome instanceof Promise) {
+      const generation = selectionGeneration.current;
+      setSaving(true);
+      void outcome.then(
+        (saved) => {
+          if (selectionGeneration.current !== generation) return;
+          setSaving(false);
+          if (saved) clear();
+        },
+        () => {
+          if (selectionGeneration.current === generation) setSaving(false);
+        },
+      );
+    } else {
+      clear();
+    }
+  };
 
   // Auto-focus the textarea when a new pending selection appears (no existing
   // comment at that range) so the user can start typing immediately.
@@ -161,6 +211,11 @@ export function CommentsPanel({
       : comment.status === "draft" &&
         activeSelectionStart === comment.start_index &&
         activeSelectionEnd === comment.end_index;
+  // This panel lists only the open file's drafts, so name the wider scope when there is one.
+  const addressesOtherFiles = addressCount > comments.length;
+  const addressScope =
+    `Sends ${addressCount} draft comment${addressCount === 1 ? "" : "s"} ` +
+    `from ${addressFileCount} file${addressFileCount === 1 ? "" : "s"}`;
 
   return (
     <div
@@ -179,17 +234,35 @@ export function CommentsPanel({
       <div className="flex h-11 shrink-0 items-center justify-between px-3 border-b border-border">
         <span className="text-sm font-semibold">Comments</span>
         {tab === "open" && (
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            className="rounded-full px-3 gap-1.5"
-            disabled={!canAddress || comments.length === 0 || addressPending}
-            onClick={onAddressAll}
-          >
-            <WandSparklesIcon className="size-3.5" />
-            Address All
-          </Button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  className="rounded-full px-3 gap-1.5"
+                  disabled={!canAddress || addressCount === 0 || addressPending}
+                  onClick={onAddressAll}
+                >
+                  <WandSparklesIcon className="size-3.5" />
+                  {addressesOtherFiles ? (
+                    `Address All (${addressCount})`
+                  ) : (
+                    <>
+                      Address All
+                      {addressCount > 0 && (
+                        <span className="rounded-full bg-muted px-1.5 text-[10px] tabular-nums">
+                          {addressCount}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </Button>
+              </TooltipTrigger>
+              {addressesOtherFiles && <TooltipContent>{addressScope}</TooltipContent>}
+            </Tooltip>
+          </TooltipProvider>
         )}
       </div>
 
@@ -209,7 +282,7 @@ export function CommentsPanel({
               )}
               onClick={() => setTab(t)}
             >
-              {t === "open" ? "Open" : "Addressed"}
+              {t === "open" ? "Open" : "Sent"}
               {count > 0 && (
                 <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
                   {count}
@@ -222,7 +295,7 @@ export function CommentsPanel({
 
       {!canEdit && (
         <div className="shrink-0 border-b border-border px-3 py-2 text-sm text-muted-foreground">
-          You have read-only access to this session.
+          {readOnlyMessage}
         </div>
       )}
 
@@ -250,16 +323,23 @@ export function CommentsPanel({
                 rows={3}
                 placeholder="Add a comment…"
                 value={body}
+                readOnly={saving}
+                aria-busy={saving || undefined}
                 onChange={(e) => {
                   setBody(e.target.value);
                   if (pendingBodyRef) pendingBodyRef.current = e.target.value;
                 }}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  isComposingRef.current = false;
+                }}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey && body.trim()) {
+                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
+                  if (e.key === "Enter" && !e.shiftKey && body.trim() && !saving) {
                     e.preventDefault();
-                    onAddComment(body.trim());
-                    setBody("");
-                    if (pendingBodyRef) pendingBodyRef.current = "";
+                    submitComment();
                   }
                 }}
               />
@@ -267,14 +347,10 @@ export function CommentsPanel({
                 type="button"
                 size="xs"
                 className="w-full"
-                disabled={!body.trim()}
-                onClick={() => {
-                  onAddComment(body.trim());
-                  setBody("");
-                  if (pendingBodyRef) pendingBodyRef.current = "";
-                }}
+                disabled={!body.trim() || saving}
+                onClick={submitComment}
               >
-                Add Comment
+                {saving ? "Saving…" : "Add Comment"}
               </Button>
             </div>
           ) : null)}
@@ -307,7 +383,7 @@ export function CommentsPanel({
           )
         ) : addressedComments.length === 0 ? (
           <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
-            No addressed comments.
+            No sent comments.
           </div>
         ) : (
           <div className="space-y-2 p-3">
@@ -361,6 +437,8 @@ function CommentCard({
 }: CommentCardProps) {
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState(c.body);
+  // Display only: editing still shows the body as typed.
+  const displayBody = useMemo(() => replaceEmojiShortcodes(c.body), [c.body]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
@@ -399,7 +477,7 @@ function CommentCard({
     if (!editing) setEditBody(c.body);
   }, [c.id, c.body, editing]);
 
-  const statusLabel = c.status === "addressed" ? "Addressed" : null;
+  const statusLabel = c.status === "addressed" ? "Sent" : null;
 
   function startEdit() {
     setEditBody(c.body);
@@ -464,13 +542,13 @@ function CommentCard({
               !expanded && "line-clamp-4",
             )}
           >
-            {c.body}
+            {displayBody}
           </p>
           {(clamped || expanded) && (
             <button
               type="button"
               aria-expanded={expanded}
-              className="cursor-pointer text-[10px] font-medium text-blue-600 hover:underline dark:text-blue-400"
+              className="cursor-pointer text-[10px] font-medium text-link hover:underline"
               onClick={(e) => {
                 e.stopPropagation();
                 setExpanded((v) => !v);

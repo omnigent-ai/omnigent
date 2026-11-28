@@ -79,9 +79,7 @@ export const SandboxFailed: Story = {
       </ChatStoreSeed>
     ),
   ],
-  render: () => (
-    <ConnectionIndicator liveness={{ kind: "online" }} onShowReconnectHelp={() => undefined} />
-  ),
+  render: () => <RunnerStartingIndicator variant="row" />,
 };
 
 export const LocalAgentDisconnected: Story = {

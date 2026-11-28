@@ -16,6 +16,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any
@@ -25,8 +26,10 @@ import httpx
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
+    get_mock_requests,
     poll_session_until_terminal,
     register_inline_agent,
+    release_mock_gate,
     reset_mock_llm,
     send_user_message_to_session,
 )
@@ -71,6 +74,18 @@ def _mock_agent(
         mock_llm_base_url=(f"{mock_llm_server_url}/v1" if mock_llm_server_url else None),
     )
     return name, model
+
+
+def _wait_for_mock_gate(mock_url: str, timeout: float = 30) -> None:
+    """Wait for the scripted model response to hold the turn open."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = httpx.get(f"{mock_url}/gate/pending", timeout=5)
+        response.raise_for_status()
+        if response.json()["pending"]:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"No blocked model request within {timeout}s")
 
 
 def test_steering_acknowledged(
@@ -139,6 +154,8 @@ def test_steering_with_tool_items(
     fix: tool items must not advance ``last_seen`` past the steer.
     """
     model = f"mock-ws-{uuid.uuid4().hex[:6]}"
+    marker = f"PINEAPPLE_{uuid.uuid4().hex}"
+    steer = f"STOP ALL STEPS. Say only: {marker}"
     reset_mock_llm(mock_llm_server_url)
     agent_name = register_inline_agent(
         http_client,
@@ -162,6 +179,7 @@ def test_steering_with_tool_items(
                 ],
             },
             {
+                "block": True,
                 "tool_calls": [
                     {
                         "call_id": "call_inbox2",
@@ -170,7 +188,7 @@ def test_steering_with_tool_items(
                     },
                 ],
             },
-            {"text": "PINEAPPLE"},
+            {"text": marker},
         ],
         key=model,
     )
@@ -185,13 +203,22 @@ def test_steering_with_tool_items(
         content="Do two inbox reads then respond.",
     )
 
-    _wait_for_session_running(http_client, session_id, timeout=60)
-
-    send_user_message_to_session(
-        http_client,
-        session_id=session_id,
-        content="STOP ALL STEPS. Say only: PINEAPPLE",
-    )
+    try:
+        if mock_llm_server_url is not None:
+            _wait_for_mock_gate(mock_llm_server_url)
+            requests = get_mock_requests(mock_llm_server_url, key=model)
+            assert any(
+                item.get("type") == "function_call_output" and item.get("call_id") == "call_inbox1"
+                for item in requests[-1]["input"]
+            ), "Steering must arrive after the first tool result"
+        _wait_for_session_running(http_client, session_id, timeout=60)
+        send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content=steer,
+        )
+    finally:
+        release_mock_gate(mock_llm_server_url)
 
     body = poll_session_until_terminal(
         http_client,
@@ -202,9 +229,12 @@ def test_steering_with_tool_items(
     assert body["status"] == "completed"
 
     all_text = _extract_all_text(body)
-    assert "PINEAPPLE" in all_text.upper(), (
-        f"Steering with tool items not acknowledged: {all_text[:300]}"
-    )
+    assert marker in all_text, f"Steering with tool items not acknowledged: {all_text[:300]}"
+    if mock_llm_server_url is not None:
+        requests = get_mock_requests(mock_llm_server_url, key=model)
+        assert any(steer in json.dumps(request["input"]) for request in requests[2:]), (
+            "The model never received the steering message after its tool results"
+        )
 
 
 def test_steering_after_completed_starts_new_turn(

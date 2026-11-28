@@ -91,6 +91,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import (
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -105,6 +106,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     read_bridge_state,
     seed_isolated_agy_home,
     update_conversation_id,
+    write_agent_instructions,
     write_bridge_state,
     write_mcp_config,
     write_tmux_target,
@@ -150,6 +152,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.spec.tar_utils import ExtractionError
 
 _logger = logging.getLogger(__name__)
 
@@ -258,10 +261,11 @@ def run_antigravity_native(
     if not resolved_command:
         raise click.ClickException("Antigravity command must not be empty.")
     _preflight_local_tools()
-    # Resolve auth/model config once up front so a missing credential warns
-    # before any server work. agy is OAuth-only (subscription), inherited
-    # from ~/.gemini — nothing is seeded.
-    launch = resolve_native_antigravity_launch(model=model)
+    # Fail early on an invalid selected provider before starting the server.
+    try:
+        launch = resolve_native_antigravity_launch(model=model)
+    except OmnigentError as exc:
+        raise click.ClickException(exc.message) from exc
     # Detect headless ONCE here (a controlling TTY on stdin+stdout means an
     # interactive client will attach to drive agy's request-review prompt; a
     # non-TTY launch must auto-bypass or the unattended turn hangs forever).
@@ -918,6 +922,70 @@ async def _prepare_antigravity_terminal_via_daemon(
     )
 
 
+async def _write_cli_startup_instructions(
+    client: httpx.AsyncClient, session_id: str, bridge_dir: Path
+) -> None:
+    """Resolve the session's authored startup text for a CLI fallback launch."""
+    from omnigent.runner._entry import _AgentSpecCache, _resolve_agent_spec_from_server
+    from omnigent.runner.native.orchestration import (
+        _native_startup_instructions,
+        _native_startup_instructions_from_spec,
+        _resolve_sub_agent_spec_entry,
+    )
+
+    try:
+        snapshot = await _fetch_antigravity_session(client, session_id)
+        agent_id = snapshot.get("agent_id")
+        with TemporaryDirectory(prefix="omnigent-agy-instructions-") as tmp_dir:
+            entry = (
+                await _resolve_agent_spec_from_server(
+                    client, _AgentSpecCache(Path(tmp_dir)), agent_id, session_id=session_id
+                )
+                if isinstance(agent_id, str) and agent_id
+                else None
+            )
+            sub_agent_name = snapshot.get("sub_agent_name")
+            if entry is not None and isinstance(sub_agent_name, str) and sub_agent_name:
+                entry = _resolve_sub_agent_spec_entry(entry, sub_agent_name)
+            instructions = await _native_startup_instructions(
+                entry, client, session_id, workspace=Path.cwd().resolve()
+            )
+    except (
+        httpx.HTTPError,
+        RuntimeError,
+        click.ClickException,
+        OSError,
+        ValueError,
+        ExtractionError,
+        OmnigentError,
+        yaml.YAMLError,
+    ) as error:
+        _logger.warning(
+            "Could not resolve Antigravity startup instructions (%s)",
+            type(error).__name__,
+            extra={"session_id": session_id},
+        )
+        click.echo(
+            "Warning: Could not load your agent's startup instructions. "
+            "Continuing with framework guidance; retry the launch to apply your instructions.",
+            err=True,
+        )
+        instructions = _native_startup_instructions_from_spec(None)
+    try:
+        await asyncio.to_thread(write_agent_instructions, bridge_dir, instructions)
+    except (OSError, ValueError) as error:
+        _logger.warning(
+            "Could not write Antigravity startup instructions (%s)",
+            type(error).__name__,
+            extra={"session_id": session_id},
+        )
+        click.echo(
+            "Warning: Could not refresh Antigravity startup instructions. "
+            "Continuing; the agent may be missing its configured guidance.",
+            err=True,
+        )
+
+
 async def _launch_and_record(
     client: httpx.AsyncClient,
     *,
@@ -988,7 +1056,8 @@ async def _launch_and_record(
     # ``seed_isolated_agy_home`` — in the isolated dir agy actually reads under
     # ``--gemini_dir``. Seeding the real ``~/.gemini`` marker as well would write
     # the user's tree for a file this launch never reads.
-    argv, env_overrides = build_agy_launch(
+    argv, env_overrides = await asyncio.to_thread(
+        build_agy_launch,
         conversation_id=conversation_id if resume else None,
         model=model,
         resume=resume,
@@ -1013,20 +1082,28 @@ async def _launch_and_record(
             trusted_workspace=Path.cwd().resolve(),
         ),
     }
+    await _write_cli_startup_instructions(client, session_id, bridge_dir)
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
     # is up would be silently lost (#1494). Disable it in the isolated dir agy reads
     # under --gemini_dir, never the user's real ~/.gemini.
-    await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    await asyncio.to_thread(
+        ensure_agy_feedback_survey_disabled,
+        agy_home_dir(bridge_dir),
+        launch_env={**os.environ, **env_overrides},
+    )
     # Lead the args so the flag is never swallowed by a later positional.
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
+
+    argv = wrap_agy_gateway_launch([command, *argv[1:]], env_overrides)
     _update_progress(startup_progress, "Starting Antigravity terminal...")
     launched = await _launch_antigravity_terminal(
         client,
         session_id,
         argv=argv,
         env=env_overrides,
-        command=command,
+        command=argv[0],
     )
     # Advertise the tmux pane so a web turn to this CLI-launched session can be
     # bootstrapped into the idle agy TUI by the executor (agy mints its
@@ -1314,13 +1391,26 @@ async def _cold_start_agy_conversation(
             exc_info=True,
         )
         return
-    # Persist the real id (replacing the placeholder) so ``read_bridge_state``
-    # returns it and the reader/executor address the cold-started conversation.
-    # Offloaded (file I/O).
-    if not await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id):
+    # Refuse to replace a real id: the concurrent reader may have adopted the
+    # TUI-minted cascade meanwhile, and the headless phantom must not clobber it.
+    if not await asyncio.to_thread(
+        update_conversation_id, bridge_dir, cascade_id, expect_placeholder=True
+    ):
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        if state is not None and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity cold-start: bridge state already binds conversation %s for "
+                "session %s (the reader adopted it meanwhile); discarding cold-start "
+                "cascade %s.",
+                state.conversation_id,
+                session_id,
+                cascade_id,
+            )
+            return
         _logger.warning(
             "Antigravity cold-start: could not persist cold-started conversation id %s for "
-            "session %s (no bridge state to update); the reader will stay on the placeholder id.",
+            "session %s (no bridge state to update, or the binding changed concurrently); "
+            "the reader will stay on the placeholder id.",
             cascade_id,
             session_id,
         )

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Launch, check, drive, and stop an isolated Omnigent verification environment.
+#
+# Wraps `python -m dev.repro_env` (server + runner + mock model on private ports,
+# with its own config, data, Claude, and Codex directories) so an agent can run
+# it outside the CI workflow. See ../SKILL.md for the full procedure.
+#
+#   verify-env start [--lease SECONDS]   start and wait for ready; prints exports
+#   verify-env doctor                    is the current instance worth driving?
+#   verify-env run -- COMMAND...         run COMMAND against the instance
+#   verify-env paths                     print exports for the current instance
+#   verify-env stop                      stop the instance; evidence is kept
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+pointer="$repo_root/.omnigent/verify/current"
+
+die() { echo "verify-env: $*" >&2; exit 1; }
+
+load() {
+  [[ -f "$pointer" ]] || die "no instance; run: verify-env start"
+  VERIFY_ROOT=$(cat "$pointer")
+  VERIFY_ENV="$VERIFY_ROOT/env"
+  VERIFY_EVIDENCE="$VERIFY_ROOT/evidence"
+}
+
+field() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' \
+    "$VERIFY_ENV/environment.json" "$1" 2>/dev/null || true
+}
+
+paths() {
+  echo "export VERIFY_ROOT=$VERIFY_ROOT"
+  echo "export VERIFY_ENV=$VERIFY_ENV"
+  echo "export VERIFY_EVIDENCE=$VERIFY_EVIDENCE"
+}
+
+start() {
+  local lease=5400
+  [[ "${1:-}" == "--lease" ]] && lease=$2
+  [[ -f omnigent/server/static/web-ui/index.html ]] ||
+    die "web UI not built; run: pnpm install --frozen-lockfile --filter web && pnpm --filter web run build"
+  local run root socket="/env/server.sock"
+  run="run-$(date +%Y%m%d-%H%M%S)"
+  root="$repo_root/.omnigent/verify/$run"
+  # macOS limits Unix socket paths to 104 bytes, and the relay's long-path
+  # fallback uses /proc, which only Linux has. Keep the socket path short there.
+  if [[ "$(uname)" == Darwin ]] && (( ${#root} + ${#socket} >= 100 )); then
+    root=$(cd "$(mktemp -d /tmp/verify-omnigent.XXXXXX)" && pwd -P)
+  fi
+  mkdir -p "$root/evidence" "$(dirname "$pointer")"
+  install -d -m 0700 "$root/env"
+  echo "$root" > "$pointer"
+  load
+  nohup uv run --frozen python -m dev.repro_env --output "$VERIFY_ENV" serve \
+    --lease-seconds "$lease" > "$VERIFY_ROOT/supervisor.log" 2>&1 &
+  echo $! > "$VERIFY_ROOT/supervisor.pid"
+  local status=""
+  for _ in $(seq 1 90); do
+    status=$(field status)
+    [[ "$status" == ready || "$status" == failed || "$status" == stopped ]] && break
+    kill -0 "$(cat "$VERIFY_ROOT/supervisor.pid")" 2>/dev/null || break
+    sleep 2
+  done
+  [[ "$status" == ready ]] ||
+    die "environment is '${status:-not started}': $(field error); see $VERIFY_ROOT/supervisor.log"
+  echo "ready: server $(field base_url), runner $(field runner_id)"
+  paths
+}
+
+doctor() {
+  load
+  local status pid commit
+  status=$(field status)
+  pid=$(cat "$VERIFY_ROOT/supervisor.pid" 2>/dev/null || true)
+  [[ "$status" == ready ]] || die "status is '$status': $(field error)"
+  kill -0 "$pid" 2>/dev/null || die "supervisor $pid is not running"
+  commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' \
+    "$VERIFY_ENV/launch-observations.json")
+  [[ "$commit" == "$(git rev-parse HEAD)" ]] ||
+    echo "warning: instance launched at $commit, checkout is at $(git rev-parse HEAD)" >&2
+  # `exec` fails unless the model server answers and the runner reports online.
+  uv run --frozen python -m dev.repro_env --output "$VERIFY_ENV" exec -- true
+  echo "ok: status ready, supervisor $pid, runner $(field runner_id) online, commit $commit"
+}
+
+stop() {
+  load
+  uv run --frozen python -m dev.repro_env --output "$VERIFY_ENV" stop
+  local pid
+  pid=$(cat "$VERIFY_ROOT/supervisor.pid" 2>/dev/null || true)
+  for _ in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill -0 "$pid" 2>/dev/null && die "supervisor $pid still running after 30s"
+  echo "stopped: status $(field status); evidence kept in $VERIFY_EVIDENCE"
+}
+
+case "${1:-}" in
+  start) shift; start "$@" ;;
+  doctor) doctor ;;
+  paths) load; paths ;;
+  run)
+    shift
+    [[ "${1:-}" == "--" ]] && shift
+    (( $# )) || die "usage: verify-env run -- COMMAND..."
+    load
+    exec uv run --frozen python -m dev.repro_env --output "$VERIFY_ENV" exec -- "$@"
+    ;;
+  stop) stop ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

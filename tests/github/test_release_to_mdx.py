@@ -44,6 +44,11 @@ def test_linkify_leaves_headings_alone() -> None:
     assert mod.linkify_pr_refs("# v0.3.0", "o/o") == "# v0.3.0"
 
 
+def test_linkify_preserves_linked_prs_and_author_credits() -> None:
+    body = "Fix ([#123](https://github.com/o/o/pull/123), [@alice](https://github.com/alice))"
+    assert mod.linkify_pr_refs(body, "o/o") == body
+
+
 def test_release_body_to_mdx_structure() -> None:
     body = "### Major new features\n\n* Seven harnesses (#1132, #330)\n"
     page = mod.release_body_to_mdx("v0.3.0", "2026-06-27", body, "omnigent-ai/omnigent")
@@ -58,7 +63,9 @@ def test_release_body_to_mdx_structure() -> None:
     assert "/pull/1132" in page  # PR refs linkified
     # The MLflow-style "What's Next" footer is appended after the body.
     assert "## What's Next" in page
-    assert "uv tool install" in page
+    # The site advertises only the installer, which checks for Node.js and tmux.
+    assert "curl -fsSL https://omnigent.ai/install.sh | sh" in page
+    assert "pip install" not in page
 
 
 def test_release_date_token_matches_site_index_regex() -> None:

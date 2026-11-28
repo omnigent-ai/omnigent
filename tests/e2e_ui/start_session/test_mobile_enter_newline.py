@@ -11,7 +11,7 @@ The observable failure (reproduced on the running build at the time of filing,
 commit d2556dff):
 
   1. Open the new-session screen (``/``) in a mobile-viewport browser context
-     (``is_mobile: True``, ``has_touch: True``, viewport width < 768 px).
+     (``is_mobile: True``, ``has_touch: True``, viewport width < 1181 px).
   2. Pick a non-terminal agent (polly / any YAML agent — the composer is
      mounted; terminal agents launch into xterm.js immediately so the web
      composer is never shown).
@@ -28,23 +28,21 @@ Pattern mirrors ``test_start_session.py`` — async bodies in fresh threads to
 avoid the pytest-playwright/asyncio loop incompatibility, with the same
 ``page.route`` stubs for ``/v1/hosts``, ``/v1/agents``, and
 ``POST /v1/sessions``.  The test uses a ``new_context`` (not bare ``new_page``)
-with the iPhone 13 device descriptor so the SPA's ``(pointer: coarse)`` /
-``(max-width: 767.98px)`` guards resolve correctly; video is recorded via the
-context so a ``--video on`` pass captures the failing state.
+with the iPhone 13 device descriptor so the SPA's ``(max-width: 1180.98px)``
+guard resolves correctly; video is recorded via the context so a ``--video on``
+pass captures the failing state.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # ---------------------------------------------------------------------------
@@ -53,28 +51,6 @@ from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright sync tests in the same process;
-    once one has run, pytest-asyncio can't start a loop on the main thread.
-    Exceptions (including assertion failures) are re-raised on the caller.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    t = threading.Thread(target=_worker)
-    t.start()
-    t.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def _agents_body_polly() -> str:
@@ -151,9 +127,9 @@ def test_mobile_landing_enter_inserts_newline_not_submit(
 async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         # iPhone 13 device descriptor: is_mobile=True, has_touch=True,
-        # viewport 390×664 (below Tailwind's md breakpoint at 768px).
-        # ``(pointer: coarse)`` and ``(max-width: 767.98px)`` both fire, so the
-        # SPA's mobile guard — when present — correctly suppresses Enter-to-send.
+        # viewport 390×664 (below Tailwind's md breakpoint at 1181px).
+        # ``(max-width: 1180.98px)`` fires, so the SPA's mobile guard — when
+        # present — correctly suppresses Enter-to-send.
         # Use Chromium (available in CI); the SPA's media-query guards are
         # browser-agnostic. Strip ``default_browser_type`` — it's metadata for
         # Playwright's device registry, not a valid context argument.
@@ -222,6 +198,7 @@ async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             # Seed a recent workspace so the host chip auto-fills and the Send
             # button can become enabled.

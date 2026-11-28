@@ -82,6 +82,7 @@ function isUpdateSecurityError(message) {
  * @param {string} deps.iconPath Absolute path to the app icon PNG.
  * @param {boolean} [deps.forceDevUpdateConfig] Enable the development update
  *   config in an unpackaged build (main.js sets this from !app.isPackaged).
+ * @param {boolean} [deps.updatesEnabled] Disable the production feed for dev packages.
  * @param {() => string} [deps.getCurrentVersion] Version shown in update UI.
  *   Defaults to Electron's real app version.
  * @param {(installReady: boolean) => void} [deps.onInstallReadyChange]
@@ -111,6 +112,7 @@ function createDesktopUpdater({
   pinnedOrigin,
   iconPath,
   forceDevUpdateConfig = false,
+  updatesEnabled = true,
   getCurrentVersion = () => app.getVersion(),
   onInstallReadyChange = () => {},
 }) {
@@ -163,7 +165,7 @@ function createDesktopUpdater({
   }
 
   function canUseFeed() {
-    return app.isPackaged || autoUpdater.forceDevUpdateConfig === true;
+    return updatesEnabled && (app.isPackaged || autoUpdater.forceDevUpdateConfig === true);
   }
 
   function reportUnavailableInDev() {

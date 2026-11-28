@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState, type SetStateAction } from "react";
-import { nanoid } from "nanoid";
 import {
+  appendReplyQuote,
   restoreReplyDraft,
   removeReplyQuote,
   serializeReplyDraft,
@@ -8,19 +8,45 @@ import {
   type ReplyDraft,
   type StoredReplyDraft,
 } from "@/lib/replyDraft";
+import {
+  appendQuoteToDocument,
+  removeQuoteFromDocument,
+  replaceQuoteTail,
+  unweaveReplyDraft,
+  weaveReplyDraft,
+} from "@/lib/replyDraftDocument";
 
-export function useReplyDraft() {
-  const [draft, setDraft] = useState<ReplyDraft>({ quotes: [], text: "" });
-  const [activeTextId, focusText] = useState<string | null>(null);
-  // Whether this quoted draft opens a side chat rather than replying inline.
-  // In-memory only: a draft restored from storage degrades to a normal reply
-  // (the quote card stays; the send just goes to the main chat).
-  const [sideChat, setSideChat] = useState(false);
+const EMPTY_DRAFT: ReplyDraft = { quotes: [], text: "" };
+
+/**
+ * The reply draft. In single-document mode, for the CodeMirror composer, the state is the
+ * editor's whole document and the draft is read from it. `value` and every text write then
+ * address its tail, the text after the last card, so code never adds or removes a card.
+ */
+export function useReplyDraft(initialSingleDocument = false) {
+  // A string is single-document mode's document; a draft is the textarea's.
+  const [state, setState] = useState<ReplyDraft | string>(initialSingleDocument ? "" : EMPTY_DRAFT);
+  const [focusedId, focusText] = useState<string | null>(null);
+  const draft = useMemo(
+    () => (typeof state === "string" ? unweaveReplyDraft(state) : state),
+    [state],
+  );
+  const replyDocument = typeof state === "string" ? state : null;
+  // The document has no quote inputs, so none is ever active in it.
+  const activeTextId = replyDocument === null ? focusedId : null;
   const value = draft.quotes.find((quote) => quote.id === activeTextId)?.before ?? draft.text;
 
   const editText = useCallback((id: string | null, next: SetStateAction<string>) => {
-    setDraft((current) => {
+    setState((current) => {
       const update = (text: string) => (typeof next === "function" ? next(text) : next);
+      if (typeof current === "string") {
+        if (id !== null) {
+          if (import.meta.env.DEV)
+            console.warn(`Ignored an edit to quote ${id}'s input in one document.`);
+          return current;
+        }
+        return replaceQuoteTail(current, update(unweaveReplyDraft(current).text));
+      }
       return id === null
         ? { ...current, text: update(current.text) }
         : {
@@ -35,35 +61,36 @@ export function useReplyDraft() {
     (next: SetStateAction<string>) => editText(activeTextId, next),
     [activeTextId, editText],
   );
-  const replaceText = useCallback((text: string, saved?: StoredReplyDraft) => {
-    setDraft(restoreReplyDraft(text, saved));
+  // Stored verbatim (the editor already settled it); ignored outside single-document mode.
+  const setReplyDocument = useCallback((document: string) => {
+    setState((current) => (typeof current === "string" ? document : current));
+  }, []);
+  const setSingleDocument = useCallback((singleDocument: boolean) => {
+    setState((current) => {
+      if ((typeof current === "string") === singleDocument) return current;
+      return typeof current === "string" ? unweaveReplyDraft(current) : weaveReplyDraft(current);
+    });
     focusText(null);
-    setSideChat(false);
+  }, []);
+  const replaceText = useCallback((text: string, saved?: StoredReplyDraft) => {
+    const restored = restoreReplyDraft(text, saved);
+    setState((current) => (typeof current === "string" ? weaveReplyDraft(restored) : restored));
+    focusText(null);
   }, []);
   const appendQuote = useCallback((text: string) => {
-    const id = nanoid();
-    setDraft((current) => ({
-      quotes: [...current.quotes, { id, before: current.text, text: text.replace(/\r\n?/g, "\n") }],
-      text: "",
-    }));
+    setState((current) =>
+      typeof current === "string"
+        ? appendQuoteToDocument(current, text)
+        : appendReplyQuote(current, text),
+    );
     focusText(null);
   }, []);
-  // Append a quote and mark the draft as opening a side chat. The card renders
-  // exactly like a reply quote; on send the composer routes it to /side.
-  const beginSideChatQuote = useCallback(
-    (text: string) => {
-      appendQuote(text);
-      setSideChat(true);
-    },
-    [appendQuote],
-  );
   const removeQuote = useCallback((id: string) => {
-    setDraft((current) => {
-      const next = removeReplyQuote(current, id);
-      // Dropping the last quote makes this an ordinary message again.
-      if (next.quotes.length === 0) setSideChat(false);
-      return next;
-    });
+    setState((current) =>
+      typeof current === "string"
+        ? removeQuoteFromDocument(current, id)
+        : removeReplyQuote(current, id),
+    );
     focusText(null);
   }, []);
   const storedReplyDraft = useMemo(() => snapshotReplyDraft(draft), [draft]);
@@ -74,13 +101,15 @@ export function useReplyDraft() {
     setValue,
     fullText: serializeReplyDraft(draft),
     storedReplyDraft,
+    /** The whole document in single-document mode, else null. */
+    replyDocument,
+    setReplyDocument,
+    setSingleDocument,
     activeTextId,
     focusText,
     editText,
     replaceText,
     appendQuote,
-    beginSideChatQuote,
-    sideChat,
     removeQuote,
   };
 }

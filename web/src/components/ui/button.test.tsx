@@ -76,6 +76,21 @@ describe("buttonVariants translate/transform composition", () => {
 });
 
 describe("buttonVariants icon geometry", () => {
+  it("keeps the default CTA independent from the theme accent", () => {
+    const classes = buttonVariants({ variant: "default" });
+    expect(classes).toContain("bg-primary-cta");
+    expect(classes).toContain("text-primary-cta-foreground");
+    expect(classes).not.toMatch(/(?:^|\s)bg-primary(?:\s|$)/);
+  });
+
+  it("uses regular-weight labels for every button size", () => {
+    for (const size of SIZES) {
+      const classes = buttonVariants({ size });
+      expect(classes).toContain("font-normal");
+      expect(classes).not.toContain("font-medium");
+    }
+  });
+
   it("keeps default button icons at a fixed 14px glyph inside a 16px box", () => {
     const classes = buttonVariants({});
     // index.css owns the fixed geometry through this semantic hook; callers can
@@ -100,7 +115,7 @@ describe("buttonVariants icon geometry", () => {
     );
   });
 
-  it("mutes ghost icon buttons by default without changing primary icon contrast", () => {
+  it("mutes ghost icon buttons without changing primary CTA icon contrast", () => {
     render(
       <>
         <Button variant="ghost" size="icon" aria-label="Ghost icon">
@@ -117,7 +132,7 @@ describe("buttonVariants icon geometry", () => {
       "hover:text-foreground",
     );
     expect(screen.getByRole("button", { name: "Primary icon" })).toHaveClass(
-      "text-primary-foreground",
+      "text-primary-cta-foreground",
     );
     expect(screen.getByRole("button", { name: "Primary icon" })).not.toHaveClass(
       "text-muted-foreground",

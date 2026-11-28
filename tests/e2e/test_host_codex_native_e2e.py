@@ -31,6 +31,7 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.claude_native.bridge import _capture_pane
 from omnigent.harnesses.codex_native.bridge import (
     bridge_dir_for_bridge_id,
     read_bridge_state,
@@ -38,6 +39,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.session import send_user_text
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 # Marker file the cwd-resolution tests ask Codex to read back. It is placed
@@ -205,34 +207,6 @@ def _content_types(item: dict[str, object]) -> list[object]:
     if not isinstance(content, list):
         return []
     return [block.get("type") for block in content if isinstance(block, dict)]
-
-
-def _send_user_text(
-    client: httpx.Client,
-    *,
-    session_id: str,
-    text: str,
-) -> None:
-    """
-    Post a user text message to a session (the web "send" action).
-
-    :param client: HTTP client pointed at the test server.
-    :param session_id: Session/conversation id.
-    :param text: User message text to deliver to the agent.
-    :returns: None.
-    """
-    resp = client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "message",
-            "data": {
-                "role": "user",
-                "content": [{"type": "input_text", "text": text}],
-            },
-        },
-        timeout=30.0,
-    )
-    resp.raise_for_status()
 
 
 def _poll_for_assistant_marker(
@@ -636,6 +610,79 @@ def test_codex_native_builtin_session_can_be_created(
 @pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
     reason=(
+        "codex-native approval-mode e2e needs an authenticated `codex` binary; "
+        "set OMNIGENT_E2E_CODEX_NATIVE=1 to run"
+    ),
+)
+def test_codex_native_approval_mode_switch_uses_live_permissions_menu(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """Runtime mode changes drive the real Codex ``/permissions`` popup."""
+    workspace = tmp_path / "codex_permissions_ws"
+    workspace.mkdir()
+    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+    try:
+        host_id = _online_host_id(http_client)
+        create = http_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": _codex_native_agent_id(http_client),
+                "host_id": host_id,
+                "workspace": str(workspace),
+            },
+            timeout=60.0,
+        )
+        create.raise_for_status()
+        session_id = create.json()["id"]
+        terminal = _poll_for_terminal_resource(
+            http_client,
+            session_id=session_id,
+            resource_id=terminal_resource_id("codex", "main"),
+            timeout=30.0,
+        )
+        # The terminal resource is registered before Codex finishes starting
+        # MCP servers. Let the TUI reach its composer before opening a popup.
+        time.sleep(10.0)
+
+        for mode in ("full-access", "ask-for-approval"):
+            response = http_client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"approval_mode": mode},
+                timeout=30.0,
+            )
+            metadata = terminal["metadata"]
+            assert isinstance(metadata, dict)
+            pane = _capture_pane(str(metadata["tmux_socket"]), str(metadata["tmux_target"]))
+            assert response.status_code == 200, f"{response.text}\nCodex pane:\n{pane}"
+            assert response.json()["labels"]["omnigent.codex_native.approval_mode"] == mode
+
+        unsupported = http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"approval_mode": "read-only"},
+            timeout=30.0,
+        )
+        assert unsupported.status_code == 503, unsupported.text
+        assert "start a new session in read-only mode" in unsupported.text
+
+        snapshot = http_client.get(f"/v1/sessions/{session_id}")
+        snapshot.raise_for_status()
+        assert (
+            snapshot.json()["labels"]["omnigent.codex_native.approval_mode"] == "ask-for-approval"
+        )
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
+    reason=(
         "codex-native round-trip e2e needs `codex` on PATH and OMNIGENT_E2E_CODEX_NATIVE=1 to run"
     ),
 )
@@ -780,7 +827,7 @@ def test_codex_native_spawn_creates_child_session(
             host_id=host_id,
             workspace=str(workspace),
         )
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=(
@@ -1466,7 +1513,7 @@ def test_codex_native_web_model_effort_override_survives_turn(
         # so the override below is a genuine mid-session change (the only
         # path that must ride thread/settings/update — a fresh thread could
         # otherwise be launch-pinned).
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=f"Reply with exactly one word: {boot_marker}",
@@ -1501,7 +1548,7 @@ def test_codex_native_web_model_effort_override_survives_turn(
         # {model, effort} before turn/start; if the app-server rejected those
         # fields (the pre-fix turn-path behavior), this turn would raise an
         # ExecutorError and the marker would never arrive.
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=f"Reply with exactly one word: {switched_marker}",
@@ -1565,7 +1612,7 @@ def test_codex_native_stale_completed_turn_recovers_with_new_turn(
 
         # Complete a real first Codex turn and retain its id. The forwarder
         # normally clears this id when it processes turn/completed.
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=f"Reply with exactly one word: {first_marker}",
@@ -1600,7 +1647,7 @@ def test_codex_native_stale_completed_turn_recovers_with_new_turn(
         assert stale_state is not None
         assert stale_state.active_turn_id == completed_turn_id
 
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=f"Reply with exactly one word: {second_marker}",

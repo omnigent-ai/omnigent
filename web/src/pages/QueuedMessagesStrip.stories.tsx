@@ -49,12 +49,13 @@ export const ReorderableWithSteer: Story = {
 
 export const LongBacklog: Story = {
   args: {
-    messages: Array.from({ length: 7 }, (_, index) =>
+    messages: Array.from({ length: 12 }, (_, index) =>
       message(
         `queue-${index + 1}`,
         `Queued follow-up ${index + 1}: verify this intentionally long message remains truncated inside the composer tray.`,
       ),
     ),
     onSteer: () => undefined,
+    onReorder: () => undefined,
   },
 };

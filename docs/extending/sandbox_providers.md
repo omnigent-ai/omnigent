@@ -24,6 +24,92 @@ Providers whose sandbox boots running the host directly (Kubernetes), or whose
 control plane owns host startup (Gensee), inherit `SandboxHostLauncher` and
 override `start_host` without exposing a general-purpose exec transport.
 
+## Faster initial Git clones
+
+Admins can reduce the history downloaded for new managed sandbox checkouts:
+
+```yaml
+sandbox:
+  provider: agent_sandbox
+  server_url: https://omnigent.example.com
+  git_clone:
+    depth: 50
+    single_branch: true
+```
+
+This is a useful starting point for short coding sessions. It checks out all
+files on the selected branch, with up to 50 commits of history. It applies to
+each requested repository, including those cloned after claiming a warm pool
+Pod. No prepared workspace image is required. Restart the server after changing
+its configuration and create a new sandbox to try it.
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `depth` | `null` | Full history; a positive integer requests shallow history. |
+| `single_branch` | `null` | Preserve the existing rule: an explicit repo branch selects one branch; otherwise fetch all branches. `true` selects only the requested/default branch; `false` fetches all branches. |
+| `filter` | `null` | `blob:none` enables partial cloning: keep commit history and fetch file contents as needed. The initial checkout still includes all files. Requires remote filter support; Git can warn and fall back to an unfiltered clone. |
+| `tags` | `true` | Normal Git tag following. `false` uses `--no-tags`, which persists for later fetches. `true` does not promise to fetch every remote tag. |
+
+Omitting `git_clone` preserves existing commands and behavior. Setting only
+`depth` preserves the existing branch selection, explicitly countering Git's
+implicit single-branch default for shallow clones. Fetching every branch of a
+repository with many branch tips can erase most of the speed benefit; configure
+`single_branch: true` when that tradeoff fits the workload.
+
+Settings apply only when a checkout needs to be created. Retained checkouts are
+not reset, truncated, or reconfigured when a session wakes. An agent-sandbox
+wake that lost its ephemeral workspace recreates it using the current policy.
+Each entry in `sandbox.providers` can override the entire shared `git_clone`
+mapping; use `git_clone: {}` on an entry to restore compatibility defaults.
+
+Kubernetes, Agent Sandbox (including warm pools), and providers using the
+standard exec clone implementation support these options. Gensee, Islo, and
+custom workspace materializers must explicitly implement support; nondefault
+settings otherwise fail before sandbox provisioning, replacement, or resume.
+Third-party providers advertise `SandboxCapabilities.git_clone_options=True`
+and honor `RepoWorkspace.git_clone`. Exec providers that override
+`materialize_workspace` must accept its optional `git_clone` argument when
+opting in. With default settings, legacy overrides receive no new keyword.
+
+Clone settings do not contain credentials. Kubernetes and Agent Sandbox keep
+using the owner-bound GitHub broker for initial clones and the host's existing
+credential helper for later Git operations. Private-repo deepening and lazy
+blob fetches require continuing access to the remote and valid credentials.
+Vault and Databricks connector configuration is independent of this policy.
+
+### Getting more history later
+
+Inside a shallow checkout:
+
+```bash
+git fetch --deepen=100 origin
+# Or restore full history for the configured branch selection:
+git fetch --unshallow origin
+```
+
+Neither command widens a single-branch fetch refspec or re-enables tags. To fetch
+another branch for a PR comparison, name its remote-tracking destination:
+
+```bash
+git fetch origin '+refs/heads/main:refs/remotes/origin/main'
+# If both branches need more history, include both refspecs:
+git fetch --deepen=100 origin \
+  '+refs/heads/main:refs/remotes/origin/main' \
+  '+refs/heads/feature:refs/remotes/origin/feature'
+git fetch --tags origin  # explicitly fetch tags if needed
+```
+
+Replace `main` and `feature` with the relevant branches. When local PR diffs
+cannot find a merge base because history is shallow, Omnigent reports an
+actionable error rather than showing a misleading branch-tip comparison.
+Unfetched base branches and failed lazy file retrieval also produce errors;
+unavailable content is not treated as an added or deleted file.
+
+Keep full-history defaults for history-heavy development, offline work, or tools
+that expect broad history. `blob:none` is opt-in because it moves work to later
+reads: a first historical `git show` or `git blame` can fetch more data and take
+longer. Sparse checkout, submodule recursion, and LFS behavior are unchanged.
+
 ## Creating a community sandbox provider
 
 ### 1. Implement the launcher
@@ -144,9 +230,20 @@ sandbox:
     sweep_interval_s: 86400           # optional; defaults to 1 day
 ```
 
+Disabling `reaper.enabled` stops age-based offline cleanup. Retries of teardown
+already requested by session or host deletion continue running.
+
 The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
+`start_host()` must start the host under the `host_id` it is given: the token
+only resolves for that id, and a client may have chosen the id at create time
+(a managed create's `host_id`) so it can route the session's requests to it
+before the host connects. The host then keys its own traffic by that id, and a
+host whose create chose none does not, so it reaches the same server replica as
+the caller's unkeyed requests. The server sets this through
+`host.slice_key_enabled` in `host_config`, so `start_host()` must accept and
+install `host_config` (as `ExecModelHostLauncher` does).
 
 Sandbox automations use this same launch path and create a fresh sandbox for
 each run. Existing managed sandbox hosts cannot be pinned as automation targets.
@@ -155,9 +252,18 @@ chats: automations do not override timeouts or terminate a sandbox when a run
 finishes. Server owners must choose provider lifetime, idle, and cleanup settings
 appropriate for their automation frequency and resource budget.
 
-For `agent_sandbox`, `sandbox.keep_warm_s` controls the runner idle timeout;
-the existing keepalive renews the sandbox deadline while the runner is alive.
-Once renewal stops, expiry suspends compute while retaining storage. Other
+The server's keepalive calls a provider's `keep_alive` while the sandbox's
+runner reports agent work, and for the runner idle timeout
+(`host_config.runner.idle_timeout_s`, one hour by default) afterwards, so a
+sandbox stays warm about as long as an idle runner stays alive. Viewing a session
+does not count as work. Waiting on a human (an unanswered dialog or permission
+request) counts as work for at most `OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S` seconds per
+wait (one day by default; `0` removes the limit), measured from the runner's first
+active-work check that observes the wait. Messages queued behind a wait that runs
+out are reported as not sent; a server too old to record that keeps the wait open
+instead. After renewal stops, the provider's own idle or expiry
+behavior applies. For `agent_sandbox`, `sandbox.keep_warm_s` sets that runner
+idle timeout, and expiry suspends compute while retaining storage. Other
 providers have different lifetime behavior, so enabling managed sandboxes alone
 does not guarantee a short shutdown time.
 
@@ -173,9 +279,121 @@ it atomically detaches the stale sandbox id from the active host generation.
 Failed terminations stay pending and are retried by later sweeps; providers must
 therefore make `terminate()` succeed when the sandbox is already absent.
 
-The reaper reuses one launcher per workspace and provider. Override
+When a provider's `stop_on_archive` setting is true, archiving a session calls
+`stop()` on its sandbox when no other session uses it (no other session on the
+host, and no side chat or sub-agent of the session), and the next message after
+an unarchive wakes it through `resume()`. Only providers
+whose capabilities declare `resume_stopped` are stopped. `stop()` must treat an
+already stopped sandbox as success; raising `SandboxCapabilityError` leaves the
+sandbox running. Before stopping, the server calls
+`stop_when_archived(owner=..., configured=...)`, which returns the setting by
+default. Override it to decide per owner when the session is archived, for
+example from a feature flag, so turning the behavior on or off needs no server
+restart.
+
+Right after building a launcher, and before `prepare_for_launch()` or
+`provision()`, the server calls `bind_owner(owner)` once. It runs on every
+launch, wake, keepalive, relaunch, and teardown. The owner is the session
+creator, or the host's `user_id` for an existing host. Override it to remember
+the owner for authorization or attribution; the default ignores it. Launchers
+built only to read capabilities or notices are not bound, so keep those
+properties independent of the owner. An override should only record the owner
+(no I/O, never raise): the server builds launchers on teardown paths where an
+exception would abort the operation.
+
+```python
+class AcmeSandboxLauncher(ExecModelHostLauncher):
+    def bind_owner(self, owner: str) -> None:
+        self._owner = owner  # e.g. "alice@example.com"
+```
+
+The reaper reuses one launcher per workspace and provider, except that a
+launcher overriding `bind_owner` is rebuilt and bound per candidate. Override
 `reaper_identity(workspace_id)` when background termination needs a scoped
 credential context; the default context is a no-op.
+
+## Automatic continuation after a host restart
+
+A host opts in through its own `config.yaml`:
+
+```yaml
+host:
+  recover_interrupted_sessions: true
+```
+
+Restart the host process to apply the setting. It advertises this opt-in on its
+current authenticated connection and requests recovery every 30 seconds with its
+live runner IDs. No server-side host preference is stored. This works for ordinary
+machines as well as provider hosts; a stable host identity is required.
+
+For a fleet, distribute the same setting through the existing template:
+
+```yaml
+sandbox:
+  provider: kubernetes
+  host_config:
+    host:
+      recover_interrupted_sessions: true
+```
+
+Provider membership and launch-token provenance do not grant recovery permission.
+Omitting the host flag, setting it to `false`, or using an older host keeps manual
+continuation. Existing controllers remain unchanged. Opt-out closes existing
+recovery episodes; re-enabling does not revive completed or stopped work.
+
+Stock server entrypoints permit host opt-in. Embedded `create_app` integrations
+also need `host_session_recovery=True` or a live callable returning true; this
+permission defaults to false; the default leaves recovery lifecycle hooks unwired.
+A configured live callable may return false to stop execution while retaining
+completion and Stop bookkeeping. Evaluator errors deny recovery. A deployment
+can use this boundary for its own rollout or emergency disable policy.
+
+Administrators may set `recovery_prompt` in the server configuration. It must be
+nonblank and at most 8,000 characters; the server adds the resume marker. An
+existing provider's `host_config.host.recovery_prompt` overrides that default for
+its hosts, independently of admission. Neither a host frame nor an end user can
+supply these instructions. Without an override, the prompt asks the agent to
+continue the task and check interrupted operations before repeating them.
+
+The host must return with its workspace, credentials, and harness state restored.
+Keep recovery disabled when those files can still be restoring after registration.
+The server never provisions or wakes compute through this mechanism.
+
+Only root sessions with a durably witnessed unfinished turn are eligible. The
+server records the turn's response ID before admitting recovery. Completion,
+Stop, human-input waits, newer accepted input, archive/close, and changed bindings
+prevent continuation. A historical running status or disconnect error alone is
+insufficient; turns without reliable evidence or interruption age remain manual.
+Live runners are skipped and missing workspace directories are refused.
+
+Recovery intent uses private `omnigent.recovery.*` conversation labels: the host
+and runner bindings, response ID, expected launch runner, interruption time, phase, attempt
+count and identity, and next retry time. These labels are hidden from normal label
+reads and forks and cannot be written through ordinary label APIs. No new table
+or ledger is needed.
+
+Recovery permits at most three launch attempts
+and a 24-hour window per interrupted task. Launch retries back off; the budget
+survives server restarts. An uncertain continuation delivery stops automatically
+instead of replaying potentially completed work. A new user message starts a fresh
+budget. During recovery the session continues automatically without a visible
+synthetic user message. When the retry budget is exhausted or continuation
+delivery is uncertain, it shows “Automatic resume failed. Please send a new
+message to continue.” This is not an exactly-once guarantee for tool side effects.
+
+Custom conversation stores opt in with `supports_session_recovery = True` after
+implementing `get_session_recovery`, atomic `replace_session_recovery`, and
+`admit_session_recovery`. Admission must validate the current host/runner binding
+and recovery intent under locks ordered with user input, Stop, archive, and
+deletion; unsupported admission fails closed. To recover sessions already marked
+disconnected, implement `get_session_interruption_time` using the original error
+timestamp; without it, only interruptions observed while active are recorded.
+The SQLAlchemy store implements this contract using private `omnigent.recovery.*`
+rows in the existing conversation labels table. Each field fits the label limit; no schema migration is
+needed. These rows are excluded from ordinary label reads and forks, and ordinary
+label writes cannot change them. Recovery and input acceptance share a transaction,
+including in split-database deployments.
+No task ledger file or customer hook configuration is required.
 
 ## Provider capabilities
 
@@ -193,12 +411,21 @@ Providers declare their feature set via a `capabilities` property returning
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
 
+## Provider-owned sandbox profiles
+
+Providers can offer per-user sandbox choices by implementing `list_profiles` and
+`select_profile` on their launcher. They own configuration and authorization;
+Omnigent shows approved metadata and saves an immutable revision reference.
+See [the provider contract and rollout guide](provider_profiles.md).
+
 ## Network policy for harness bridge servers
 
 Native harnesses (e.g. `claude-native`) run small HTTP servers on the sandbox
-host — a tool relay and an MCP control ingress — that the harness's hook and
-helper subprocesses call back into. **By default these bind loopback only
-(`127.0.0.1`)**, so an ordinary host keeps them off every other interface.
+host that the harness's hook and helper subprocesses call back into: a tool
+relay, which **by default binds loopback only (`127.0.0.1`)** so an ordinary
+host keeps it off every other interface, and an MCP control ingress, which by
+default listens on a Unix domain socket under the harness socket root
+(`/tmp/omnigent-<uid>/mcp-<pid>.sock`) and so needs no network policy at all.
 
 A sandbox whose SSRF hardening denies loopback destinations unconditionally
 (e.g. OpenShell) cannot reach a loopback-advertised relay, which fail-closes
@@ -209,9 +436,10 @@ the in-sandbox hooks can reach them. Their ports come from a small stable pool
 a network policy can allowlist by exact host+port:
 
 - **`OMNIGENT_BRIDGE_BIND_HOST`** selects the posture. Unset (default) is
-  loopback-only. `0.0.0.0` binds all interfaces and advertises the detected
-  routable address (falling back to loopback when the host has none). Any
-  other value pins that exact host for both bind and advertisement.
+  loopback-only for the relay and a Unix socket for the MCP ingress. `0.0.0.0`
+  binds both servers on all interfaces and advertises the detected routable
+  address (falling back to loopback when the host has none). Any other value
+  pins that exact host for both bind and advertisement.
 - **Default port pool:** `28700`–`28715`
   (`omnigent.harnesses.claude_native.bridge.DEFAULT_BRIDGE_PORT_POOL`).
   Several servers coexist per host (the MCP ingress plus one tool relay per

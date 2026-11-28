@@ -1,0 +1,82 @@
+"""Serialize CockroachDB schema-change DDL across xdist workers.
+
+The migration tests here run Alembic upgrades/downgrades, and each schema
+change commits under SERIALIZABLE isolation. CockroachDB's descriptor and
+system tables are cluster-wide — shared even across the per-worker test
+databases (``omnigent_test_w0``, ``omnigent_test_w1``, …) — so DDL from
+parallel workers contends on them and CockroachDB aborts a transaction with
+``RETRY_SERIALIZABLE``. The tests invoke migrations directly, bypassing the
+product's serialization-retry path, so a losing worker surfaces the abort as
+a hard failure — a different migration test each run.
+
+Serialize configured CockroachDB migration tests behind a cross-process lock.
+SQLite-only migration tests and non-DDL unit tests stay fully parallel. Wait
+for the lock before starting the per-test timeout, which still covers setup,
+the test, and teardown once the lock is acquired.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from sqlalchemy import Engine
+
+# One lock file per runner; all workers on the host contend on it.
+_CRDB_SCHEMA_LOCK = Path(tempfile.gettempdir()) / "omnigent-crdb-schema-ddl.lock"
+
+
+def _runs_schema_ddl(node: pytest.Item) -> bool:
+    """Whether a test changes the configured database's schema."""
+    name = node.path.name
+    if not (name.startswith("test_migration") or name == "test_cockroachdb.py"):
+        return False
+    fixtures = getattr(node, "fixturenames", ())
+    parameters = getattr(getattr(node, "callspec", None), "params", {})
+    # Scheduled-task tests also use scratch databases or request db_uri dynamically.
+    return (
+        "db_uri" in fixtures
+        or "dispatch_migration_engine" in fixtures
+        or parameters.get("db_engine") == "configured"
+    )
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_protocol(item: pytest.Item) -> Iterator[None]:
+    if "cockroachdb" not in os.environ.get("OMNIGENT_TEST_DB_URI", "") or not _runs_schema_ddl(
+        item
+    ):
+        yield
+        return
+    from filelock import FileLock
+
+    with FileLock(str(_CRDB_SCHEMA_LOCK)):
+        yield
+
+
+@pytest.fixture()
+def record_terminators(monkeypatch: pytest.MonkeyPatch) -> Callable[[Engine], list[str]]:
+    """Record every COMMIT/ROLLBACK an engine sends, including pool resets."""
+
+    def _record(engine: Engine) -> list[str]:
+        terminators: list[str] = []
+        dialect = engine.dialect
+        real_commit, real_rollback = dialect.do_commit, dialect.do_rollback
+
+        def _commit(dbapi_connection: Any) -> None:
+            terminators.append("COMMIT")
+            real_commit(dbapi_connection)
+
+        def _rollback(dbapi_connection: Any) -> None:
+            terminators.append("ROLLBACK")
+            real_rollback(dbapi_connection)
+
+        monkeypatch.setattr(dialect, "do_commit", _commit)
+        monkeypatch.setattr(dialect, "do_rollback", _rollback)
+        return terminators
+
+    return _record

@@ -69,6 +69,35 @@ def dir_search_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, s
         shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
 
 
+# The server's walk gives up after a fixed number of entries; one directory
+# past that size guarantees a truncated result whichever path answers.
+_TRUNCATION_FILE_COUNT = 50_100
+
+
+@pytest.fixture
+def truncated_search_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
+    """A workspace with more untracked files than the server's scan budget."""
+    base_url, session_id = seeded_session
+    # Materializes the workspace on disk and gives the tree a row to wait on.
+    _put_file(base_url, session_id, _BETA)
+    # The search response echoes the workspace root as the runner resolves it,
+    # so the files land where the runner will actually walk.
+    resp = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/search",
+        params={"q": _BETA},
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    many = Path(resp.json()["base"]) / "many"
+    many.mkdir()
+    for i in range(_TRUNCATION_FILE_COUNT):
+        (many / f"f{i}.txt").touch()
+    try:
+        yield (base_url, session_id)
+    finally:
+        shutil.rmtree(many, ignore_errors=True)
+
+
 def _row(rail: Locator, name: str) -> Locator:
     return rail.get_by_role("button", name=re.compile(re.escape(name))).filter(has_text=name)
 
@@ -170,3 +199,28 @@ def test_search_matches_and_reveals_a_directory(
     expect(search).to_have_value("")
     # Back in tree mode the folder row is still present as a tree node.
     expect(folder_row).to_be_visible(timeout=15_000)
+
+
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
+def test_search_says_when_it_stopped_early(
+    page: Page,
+    truncated_search_session: tuple[str, str],
+) -> None:
+    """A miss on a workspace too big to scan must not read as a definite no-match.
+
+    The server reports ``truncated`` when its scan budget ran out before it
+    covered the tree. The panel has to relay that, or a file that exists looks
+    like it does not — the reported monorepo bug.
+    """
+    base_url, session_id = truncated_search_session
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+
+    rail = page.get_by_role("complementary", name="Workspace")
+    search = rail.get_by_role("searchbox", name="Search all files")
+    expect(search).to_be_visible(timeout=30_000)
+    expect(_row(rail, _BETA)).to_be_visible(timeout=15_000)
+
+    _search_for(search, "zz_no_such_file")
+    expect(
+        rail.get_by_text("the search stopped early, so results may be incomplete")
+    ).to_be_visible(timeout=30_000)

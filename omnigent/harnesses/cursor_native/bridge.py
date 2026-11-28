@@ -30,6 +30,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.harnesses.cursor_native.main import CursorModelOption
+    from omnigent.inner.terminal import TerminalInstance
 
 
 #: Env var carrying the bridge dir into the harness executor process.
@@ -58,12 +59,15 @@ _CURSOR_AUTO_APPROVE_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_list",
+    "sys_project_update",
     "sys_session_close",
     "sys_session_create",
     "sys_session_get_history",
     "sys_session_get_info",
     "sys_session_list",
     "sys_session_send",
+    "sys_session_update",
     "sys_terminal_close",
     "sys_terminal_launch",
     "sys_terminal_list",
@@ -945,8 +949,12 @@ def _live_cursor_model_options() -> list[CursorModelOption]:
 
 
 def _picker_highlighted_row(pane: str) -> str | None:
-    """Return the text of Cursor's currently highlighted picker row."""
-    for line in pane.splitlines():
+    """Return Cursor's highlighted picker row, skipping the ``→ /model <id>`` composer line."""
+    lines = pane.splitlines()
+    header_indexes = [index for index, line in enumerate(lines) if _PICKER_MATCH_MARKER in line]
+    if not header_indexes:
+        return None
+    for line in lines[header_indexes[-1] + 1 :]:
         stripped = line.strip()
         if stripped.startswith("→"):
             return stripped.removeprefix("→").strip()
@@ -1015,3 +1023,14 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Cursor's composer placeholder is on screen.
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live terminal; the watcher already captured its pane.
+    """
+    del session_id
+    pane = instance.last_pane_text() or ""
+    return any(marker in pane for marker in _IDLE_MARKERS)

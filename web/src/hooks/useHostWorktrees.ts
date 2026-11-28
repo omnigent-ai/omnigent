@@ -2,6 +2,7 @@ import { queryOptions, useQuery } from "@tanstack/react-query";
 import { useRef } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError } from "@/lib/sessionsApi";
 
 /**
  * One worktree of a repository, as returned by
@@ -31,6 +32,103 @@ export interface HostWorktree {
   updated_at?: number | null;
 }
 
+/**
+ * Windows absolute path: a drive (``C:\repo`` / ``C:/repo``) or a UNC share (``\\server\share`` /
+ * ``//server/share``), as the server's ``_is_unc_path`` reads it.
+ */
+const WINDOWS_ABS_PATH = /^(?:[A-Za-z]:[/\\]|\\\\|\/\/)/;
+
+/** Whether ``path`` is absolute on its host: POSIX or a Windows drive. */
+export function isAbsoluteHostPath(path: string): boolean {
+  return path.startsWith("/") || WINDOWS_ABS_PATH.test(path);
+}
+
+/** Whether ``path`` is a Windows absolute path, read as {@link matchWorktree} reads one. */
+export function isWindowsHostPath(path: string): boolean {
+  return WINDOWS_ABS_PATH.test(path);
+}
+
+/**
+ * ``path`` without trailing separators, where ``\`` is one only on Windows. A root keeps one:
+ * ``/`` stays ``/``, and ``C:\`` stays ``C:\``.
+ */
+export function trimHostPath(path: string): string {
+  if (!WINDOWS_ABS_PATH.test(path)) return path.replace(/(.)\/+$/, "$1");
+  const trimmed = path.replace(/[/\\]+$/, "");
+  return /^[A-Za-z]:$/.test(trimmed) ? path.slice(0, 3) : trimmed;
+}
+
+/** Whether ``path``, already trimmed, is a filesystem root: ``/`` or a drive such as ``C:\``. */
+export function isHostRoot(path: string): boolean {
+  return path === "/" || /^[A-Za-z]:[/\\]$/.test(path);
+}
+
+/**
+ * Canonicalize a path for comparison, mirroring the backend boundary check in
+ * `_workspace_validation._is_subpath_of`: when either side is a Windows
+ * absolute path, treat ``\`` as a separator and drive-letter case as
+ * insignificant; on POSIX keep case and treat ``\`` as a legal filename char.
+ * Trailing separators are dropped so they never affect identity.
+ */
+function canonicalizePath(path: string, windows: boolean): string {
+  const canon = windows ? path.replace(/\\/g, "/").toLowerCase() : path;
+  return canon.replace(/\/+$/, "");
+}
+
+type MatchKind = { kind: "exact" | "contains"; length: number } | { kind: "none" };
+
+/** How ``workspace`` relates to a worktree ``root``, platform-aware. */
+function matchKind(root: string, workspace: string): MatchKind {
+  const windows = WINDOWS_ABS_PATH.test(root) || WINDOWS_ABS_PATH.test(workspace);
+  const r = canonicalizePath(root, windows);
+  const w = canonicalizePath(workspace, windows);
+  if (w === r) return { kind: "exact", length: r.length };
+  // Boundary-aware containment: `/a/foo` is not under `/a/fo` (prefix collision).
+  if (w.startsWith(`${r}/`)) return { kind: "contains", length: r.length };
+  return { kind: "none" };
+}
+
+/** Whether ``path`` is worktree ``root`` itself, compared as {@link matchWorktree} does. */
+export function isWorktreeRoot(root: string, path: string): boolean {
+  return matchKind(root, path).kind === "exact";
+}
+
+/**
+ * ``path`` relative to worktree ``root``, compared as {@link matchWorktree} does: ``/``
+ * separators and the path's own spelling, ``""`` for the root itself, null outside it.
+ */
+export function pathInWorktree(root: string, path: string): string | null {
+  const match = matchKind(root, path);
+  if (match.kind !== "contains") return match.kind === "exact" ? "" : null;
+  const windows = WINDOWS_ABS_PATH.test(root) || WINDOWS_ABS_PATH.test(path);
+  const slashed = (text: string) => (windows ? text.replace(/\\/g, "/") : text);
+  // A filesystem root (``/``, ``C:\``) already ends in the separator the slice skips.
+  const base = slashed(root).replace(/\/+$/, "");
+  return slashed(path)
+    .slice(base.length)
+    .replace(/^\/+|\/+$/g, "");
+}
+
+/**
+ * The worktree whose root contains ``workspace`` — exact match, else the
+ * deepest root ``workspace`` sits under (a workspace bound to a subdir of a
+ * worktree). ``null`` when nothing contains it. Path comparison is
+ * platform-aware (see {@link matchKind}).
+ */
+export function matchWorktree(worktrees: HostWorktree[], workspace: string): HostWorktree | null {
+  let best: HostWorktree | null = null;
+  let bestLength = -1;
+  for (const wt of worktrees) {
+    const match = matchKind(wt.path, workspace);
+    if (match.kind === "exact") return wt;
+    if (match.kind === "contains" && match.length > bestLength) {
+      best = wt;
+      bestLength = match.length;
+    }
+  }
+  return best;
+}
+
 interface VerifiedGitWorktreeCache {
   hostId: string;
   roots: string[];
@@ -39,7 +137,8 @@ interface VerifiedGitWorktreeCache {
 
 function normalizedHostPath(path: string): string {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
-  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+  // Drive and UNC paths ignore case, as in {@link matchKind}.
+  return /^(?:[A-Za-z]:\/|\/\/)/.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 export function pathIsWithinWorktree(path: string, root: string): boolean {
@@ -113,10 +212,17 @@ export async function fetchHostWorktrees(
     if (/not a git (?:repo|repository)/i.test(text)) return [];
   }
   if (!res.ok) {
-    throw new Error(`host worktrees fetch failed: HTTP ${res.status}`);
+    throw new ApiError(`host worktrees fetch failed: HTTP ${res.status}`, res.status, null);
   }
   const body = (await res.json()) as HostWorktreesResponse;
   return body.data;
+}
+
+// A 400 is the host's answer for this path (git failed or timed out there), so
+// retrying only multiplies that timeout. Other failures keep the default retries.
+function shouldRetryHostWorktrees(failureCount: number, error: Error): boolean {
+  if (error instanceof ApiError && error.status === 400) return false;
+  return failureCount < 3;
 }
 
 /** Shared query options for single-path and batched recent-workspace reads. */
@@ -125,6 +231,7 @@ export function hostWorktreesQueryOptions(hostId: string, repoPath: string) {
     queryKey: ["host-worktrees", hostId, repoPath] as const,
     queryFn: () => fetchHostWorktrees(hostId, repoPath),
     staleTime: 5_000,
+    retry: shouldRetryHostWorktrees,
   });
 }
 

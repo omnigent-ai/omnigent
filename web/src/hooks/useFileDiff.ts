@@ -3,16 +3,21 @@
 //
 // Returns `before` (content at first observed modification) and `after`
 // (current content) as strings — either may be null:
-//   before=null → new file (no pre-session snapshot available)
+//   before=null → new file, or unavailable original when baseline_state is unknown
 //   after=null  → deleted file
 //
-// The query is disabled unless the file appears in the changed-files list
-// (only files that were created, modified, or deleted this session have diff
-// data) and the runner is online.
+// Requested diffs can start while the changed-files list is loading. Known
+// unchanged files and unavailable workspaces keep the query disabled.
 
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
-import { useWorkspaceChangedFiles, useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
+import { isTempConvId } from "@/lib/tempConversationId";
+import {
+  useWorkspaceChangedFiles,
+  useWorkspaceEnvironment,
+  useWorkspaceServeable,
+} from "@/hooks/useWorkspaceChangedFiles";
 
 // The primary workspace environment is always "default".
 const DEFAULT_ENVIRONMENT_ID = "default";
@@ -20,19 +25,40 @@ const DEFAULT_ENVIRONMENT_ID = "default";
 export interface FileDiffResponse {
   object: "session.environment.filesystem.file_diff";
   path: string;
-  /** File content at the time of the first modification, or null for new files. */
+  /** Original content, or null for new files and unavailable originals. */
   before: string | null;
+  baseline_state?: "unknown";
   /** Current file content, or null for deleted files. */
   after: string | null;
+  /**
+   * Client-side: when this request started (`Date.now()`). The content is at
+   * least as new as this moment, unlike the cache's response-arrival time.
+   */
+  requestedAt?: number;
 }
 
-async function fetchFileDiff(conversationId: string, path: string): Promise<FileDiffResponse> {
+class FileDiffError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** Fetch one file's before/after content. Throws with the server's reason on failure. */
+export async function fetchFileDiff(
+  conversationId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<FileDiffResponse> {
   // Encode each path segment individually so slashes remain structural.
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
     `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/diff/${encodedPath}`;
-  const res = await authenticatedFetch(url);
+  const requestedAt = Date.now();
+  const res = await authenticatedFetch(url, signal ? { signal } : undefined);
   if (!res.ok) {
     // Surface the server's reason (e.g. "git status timed out after 5.0s")
     // so the diff view shows what actually went wrong rather than a bare
@@ -44,28 +70,65 @@ async function fetchFileDiff(conversationId: string, path: string): Promise<File
     } catch {
       // Non-JSON body (gateway/front-door error) — keep the status line.
     }
-    throw new Error(message);
+    throw new FileDiffError(message, res.status);
   }
-  return (await res.json()) as FileDiffResponse;
+  return { ...((await res.json()) as FileDiffResponse), requestedAt };
+}
+
+/** The query key a file's diff is cached under, shared by every diff surface. */
+export function fileDiffQueryKey(conversationId: string | undefined, path: string | null) {
+  return ["file-diff", conversationId, path] as const;
 }
 
 /**
  * Fetch before/after diff content for a changed workspace file.
  *
  * Disabled (no request made) when:
- * - `conversationId` or `path` is null / undefined
- * - the runner is offline
- * - the file does not appear in the session's changed-files list
+ * - `conversationId` or `path` is missing, or the session id is temporary
+ * - neither the runner nor host can serve the workspace
+ * - the file is known unchanged (or discovery is pending without a request)
  */
-export function useFileDiff(conversationId: string | undefined, path: string | null) {
+export function useFileDiff(
+  conversationId: string | undefined,
+  path: string | null,
+  options: { requested?: boolean } = {},
+) {
   const serveable = useWorkspaceServeable(conversationId);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const queryClient = useQueryClient();
+  const previousUpdate = useRef(changedFiles.dataUpdatedAt);
+  useEffect(() => {
+    const refreshed =
+      previousUpdate.current > 0 && previousUpdate.current !== changedFiles.dataUpdatedAt;
+    previousUpdate.current = changedFiles.dataUpdatedAt;
+    if (refreshed && changedFiles.isSuccess && path) {
+      void queryClient.invalidateQueries({
+        queryKey: fileDiffQueryKey(conversationId, path),
+        exact: true,
+      });
+    }
+  }, [changedFiles.dataUpdatedAt, changedFiles.isSuccess, conversationId, path, queryClient]);
+  const environment = useWorkspaceEnvironment(conversationId);
   const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
 
+  const requestedBeforeDiscovery =
+    options.requested && changedFiles.data === undefined && !changedFiles.isError;
+
   return useQuery({
-    queryKey: ["file-diff", conversationId, path],
+    queryKey: fileDiffQueryKey(conversationId, path),
     queryFn: () => fetchFileDiff(conversationId!, path!),
-    enabled: !!conversationId && !!path && serveable !== false && isInChangedFiles,
+    enabled:
+      !!conversationId &&
+      !isTempConvId(conversationId) &&
+      !!path &&
+      serveable !== false &&
+      environment.data?.available !== false &&
+      (isInChangedFiles || !!requestedBeforeDiscovery),
+    // An old diff link may point to a now-unchanged file; don't retry its expected 404.
+    ...(requestedBeforeDiscovery && {
+      retry: (failureCount: number, error: Error) =>
+        !(error instanceof FileDiffError && error.status === 404) && failureCount < 3,
+    }),
     staleTime: 5_000,
   });
 }

@@ -64,6 +64,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_false",
         help="Force the offline (declared-only) render.",
     )
+    parser.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="Fail if any selected probe is skipped or inconclusive, including "
+        "unavailable harnesses. Requires explicit --live. Use --dimension to "
+        "select the checks your environment can exercise.",
+    )
     transport_grp = parser.add_mutually_exclusive_group()
     transport_grp.add_argument(
         "--transport",
@@ -223,6 +230,10 @@ def main(argv: list[str] | None = None) -> int:
         print("--jobs must be >= 1", file=sys.stderr)
         return 2
 
+    if args.require_complete and args.live is not True:
+        print("--require-complete requires explicit --live", file=sys.stderr)
+        return 2
+
     from tests.harness_bench.runtime_env import bench_creds_skip_reason
 
     creds_skip = bench_creds_skip_reason(args.profile)
@@ -275,9 +286,23 @@ def main(argv: list[str] | None = None) -> int:
     print(output, end="")
 
     if args.report:
-        _write_report(args.report, matrix, json_flag=args.json, markdown_flag=args.markdown)
+        _write_report(
+            args.report,
+            matrix,
+            json_flag=args.json,
+            markdown_flag=args.markdown,
+            declared=declared,
+        )
 
-    return 1 if matrix.has_drift else 0
+    if matrix.has_drift:
+        return 1
+    if args.require_complete and not matrix.complete:
+        print(
+            "incomplete results: selected checks were not all observed; see report",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
 
 
 def _grid_already_shown(sink) -> bool:
@@ -312,18 +337,20 @@ def _select_progress_sink(rich_flag: bool | None, *, probes: list[CapabilityProb
     return LineSink(_line)
 
 
-def _write_report(path: str, matrix, *, json_flag: bool, markdown_flag: bool) -> None:
+def _write_report(
+    path: str, matrix, *, json_flag: bool, markdown_flag: bool, declared: bool = False
+) -> None:
     """Write the matrix to *path*; format from flags, else the extension."""
     if json_flag:
         content = render_json(matrix)
     elif markdown_flag:
-        content = render_markdown(matrix, declared=False)
+        content = render_markdown(matrix, declared=declared)
     elif path.endswith(".json"):
         content = render_json(matrix)
     elif path.endswith((".md", ".markdown")):
-        content = render_markdown(matrix, declared=False)
+        content = render_markdown(matrix, declared=declared)
     else:
-        content = render_table(matrix, color=False, declared=False)
+        content = render_table(matrix, color=False, declared=declared)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content if content.endswith("\n") else content + "\n")
     print(f"report written to {path}", file=sys.stderr)

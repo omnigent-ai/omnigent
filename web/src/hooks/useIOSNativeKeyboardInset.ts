@@ -1,5 +1,9 @@
 import { useEffect, useState } from "react";
-import { isIOSShell } from "@/lib/nativeBridge";
+import {
+  getIOSKeyboardViewportHeight,
+  isIOSShell,
+  onNativeKeyboardViewportChanged,
+} from "@/lib/nativeBridge";
 
 const KEYBOARD_INSET_THRESHOLD_PX = 80;
 
@@ -19,10 +23,10 @@ export function useIOSNativeKeyboardInset(enabled = true): number {
         return;
       }
 
-      const nextInset = getIOSNativeKeyboardInset();
-      setInset(nextInset > KEYBOARD_INSET_THRESHOLD_PX ? nextInset : 0);
+      setInset(getIOSNativeKeyboardInset());
     };
 
+    const unsubscribe = onNativeKeyboardViewportChanged(sync);
     sync();
     window.visualViewport?.addEventListener("resize", sync);
     window.visualViewport?.addEventListener("scroll", sync);
@@ -32,6 +36,7 @@ export function useIOSNativeKeyboardInset(enabled = true): number {
     window.addEventListener("focusout", sync, true);
 
     return () => {
+      unsubscribe();
       window.visualViewport?.removeEventListener("resize", sync);
       window.visualViewport?.removeEventListener("scroll", sync);
       window.removeEventListener("resize", sync);
@@ -48,15 +53,11 @@ function getIOSNativeKeyboardInset(): number {
   const viewport = window.visualViewport;
   if (!viewport) return 0;
 
-  // Keyboard height = the layout viewport (the full webview, kept keyboard-
-  // independent by the native shell's `.ignoresSafeArea(.keyboard)`) minus the
-  // visible visual viewport. Measured against `window.innerHeight`, NOT the
-  // app-shell: useIOSViewportLock resizes the shell down to the visual viewport
-  // when the keyboard opens, so an app-shell-relative measurement would always
-  // read ~0. This value is for fixed, full-viewport overlays (e.g. the mobile
-  // TerminalsPanel) that the shell-lock does not resize — flow content inside
-  // the shell is handled by the lock and needs no manual padding.
+  // Fixed overlays sit outside the resized app shell. Reserve only the docked
+  // keyboard's footprint, using WebKit's viewport on older native shells.
   const layoutBottom = window.innerHeight;
-  const visibleBottom = viewport.offsetTop + viewport.height;
-  return Math.max(0, Math.round(layoutBottom - visibleBottom));
+  const nativeHeight = getIOSKeyboardViewportHeight();
+  const visibleBottom = nativeHeight ?? viewport.offsetTop + viewport.height;
+  const inset = Math.max(0, Math.round(layoutBottom - visibleBottom));
+  return nativeHeight !== null || inset > KEYBOARD_INSET_THRESHOLD_PX ? inset : 0;
 }

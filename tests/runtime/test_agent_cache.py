@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import errno
 import io
+import logging
 import tarfile
 import threading
 from pathlib import Path
@@ -156,6 +157,38 @@ def test_load_memory_cache_hit(
     assert first.workdir == second.workdir
 
 
+def test_spec_metadata_hit_does_not_resolve_workdir(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metadata-only memory hit never accesses the filesystem."""
+    loc = "agent-2/abc123"
+    _store_bundle(artifact_store, loc)
+    first = agent_cache.load_spec("agent-2", loc)
+
+    def reject_path(*args):
+        pytest.fail("metadata memory hit resolved a working directory")
+
+    monkeypatch.setattr(agent_cache, "_cache_path", reject_path)
+    assert agent_cache.load_spec("agent-2", loc) is first
+
+
+def test_spec_metadata_refreshes_when_bundle_location_changes(
+    agent_cache: AgentCache, artifact_store: LocalArtifactStore
+) -> None:
+    _store_bundle(artifact_store, "agent-2/old")
+    first = agent_cache.load_spec("agent-2", "agent-2/old")
+    _store_bundle(
+        artifact_store,
+        "agent-2/new",
+        {"config.yaml": _MINIMAL_CONFIG.replace("test-agent", "updated-agent")},
+    )
+    second = agent_cache.load_spec("agent-2", "agent-2/new")
+    assert second is not first
+    assert second.name == "updated-agent"
+
+
 def test_load_disk_cache_hit(
     artifact_store: LocalArtifactStore,
     cache_dir: Path,
@@ -181,6 +214,171 @@ def test_load_disk_cache_hit(
     second = cache_2.load("agent-3", loc)
     assert second.spec.name == first.spec.name
     assert second.workdir == first.workdir
+
+
+def test_load_follows_a_bundle_another_process_replaced(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """A reinstall keeps the agent id; a cache warm with the old bundle must not serve it."""
+    old_location, new_location = "agent-r/old", "agent-r/new"
+    _store_bundle(artifact_store, old_location)
+    new_bytes = _store_bundle(
+        artifact_store,
+        new_location,
+        {"config.yaml": _MINIMAL_CONFIG.replace("test-agent", "reinstalled")},
+    )
+    stale = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    assert stale.load("agent-r", old_location).spec.name == "test-agent"
+
+    # The installing process swaps the shared disk entry; this one only sees the new row.
+    AgentCache(artifact_store, cache_dir).replace("agent-r", new_location, new_bytes)
+    assert stale.load("agent-r", new_location).spec.name == "reinstalled"
+
+    # A process with its own disk tier rebuilds from the artifact store.
+    separate = AgentCache(artifact_store, cache_dir.parent / "other-cache")
+    assert separate.load("agent-r", old_location).spec.name == "test-agent"
+    assert separate.load("agent-r", new_location).spec.name == "reinstalled"
+
+
+def test_load_rebuilds_a_disk_entry_without_a_location_marker(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """An entry extracted before markers existed may hold any bundle, so it is rebuilt."""
+    location = "agent-legacy/abc123"
+    _store_bundle(artifact_store, location)
+    legacy = cache_dir / "agent-legacy"
+    legacy.mkdir(parents=True)
+    (legacy / "config.yaml").write_text(_MINIMAL_CONFIG.replace("test-agent", "stale"))
+
+    loaded = AgentCache(artifact_store, cache_dir).load("agent-legacy", location)
+
+    assert loaded.spec.name == "test-agent"
+    assert AgentCache(artifact_store, cache_dir).load("agent-legacy", location).spec.name == (
+        "test-agent"
+    )
+
+
+def test_load_reextracts_when_disk_entry_lost_config(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wiped ``config.yaml`` is a cache miss: ``load()`` re-extracts the stored bundle."""
+    loc = "agent-wiped/abc123"
+    _store_bundle(artifact_store, loc)
+
+    # First cache instance populates the disk tier.
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-wiped", loc)
+
+    # The extracted entry loses config.yaml; a stale leftover remains.
+    workdir = cache_dir / "agent-wiped"
+    (workdir / "config.yaml").unlink()
+    (workdir / "stale-leftover").write_text("junk", encoding="utf-8")
+
+    # New cache instance simulates a server restart — empty memory tier,
+    # so the next load hits the poisoned disk tier.
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    with caplog.at_level(logging.INFO, logger=agent_cache_module.__name__):
+        loaded = cache_2.load("agent-wiped", loc)
+
+    assert loaded.spec.name == "test-agent"
+    assert (workdir / "config.yaml").is_file()
+    # The poisoned entry was replaced wholesale, not overlaid.
+    assert not (workdir / "stale-leftover").exists()
+    assert [getattr(record, "event_name", None) for record in caplog.records] == [
+        "agent_cache_rebuild_started",
+        "agent_cache_rebuild_completed",
+    ]
+    assert str(workdir) not in caplog.text
+
+
+@pytest.mark.parametrize("config", ["", "spec_version: [unclosed"])
+def test_load_reextracts_when_disk_entry_config_corrupt(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    config: str,
+) -> None:
+    """A disk entry with an unparseable ``config.yaml`` is also a miss."""
+    loc = "agent-corrupt/abc123"
+    _store_bundle(artifact_store, loc)
+
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-corrupt", loc)
+
+    # Truncated write leaves invalid YAML behind.
+    (cache_dir / "agent-corrupt" / "config.yaml").write_text(config, encoding="utf-8")
+
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    loaded = cache_2.load("agent-corrupt", loc)
+
+    assert loaded.spec.name == "test-agent"
+
+
+def test_stale_disk_read_failure_keeps_another_readers_repair(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late read failure must not delete a cache another reader repaired."""
+    location = "agent-shared/version"
+    _store_bundle(artifact_store, location)
+    seed = AgentCache(artifact_store, cache_dir).load("agent-shared", location)
+    (seed.workdir / "config.yaml").unlink()
+    first_cache = AgentCache(artifact_store, cache_dir)
+    second_cache = AgentCache(artifact_store, cache_dir)
+    real_load_spec = agent_cache_module.load_spec
+    failure_observed = threading.Event()
+    release_failure = threading.Event()
+
+    def delayed_load_spec(source, **kwargs):
+        try:
+            return real_load_spec(source, **kwargs)
+        except FileNotFoundError:
+            if source == seed.workdir and not failure_observed.is_set():
+                failure_observed.set()
+                assert release_failure.wait(timeout=10)
+            raise
+
+    monkeypatch.setattr(agent_cache_module, "load_spec", delayed_load_spec)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(first_cache.load, "agent-shared", location)
+        try:
+            assert failure_observed.wait(timeout=10)
+            repaired = second_cache.load("agent-shared", location)
+            artifact_store.delete(location)
+        finally:
+            release_failure.set()
+        loaded = first.result(timeout=10)
+
+    assert loaded.spec == repaired.spec
+    assert loaded.workdir == repaired.workdir
+    assert (loaded.workdir / "config.yaml").read_text() == _MINIMAL_CONFIG
+
+
+def test_load_poisoned_disk_entry_with_missing_bundle_raises(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A poisoned entry whose bundle is also gone surfaces the store miss as ``KeyError``."""
+    loc = "agent-gone/abc123"
+    _store_bundle(artifact_store, loc)
+
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-gone", loc)
+
+    (cache_dir / "agent-gone" / "config.yaml").unlink()
+    artifact_store.delete(loc)
+
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    with pytest.raises(KeyError):
+        cache_2.load("agent-gone", loc)
+    failure = caplog.records[-1]
+    assert getattr(failure, "event_name", None) == "agent_cache_rebuild_failed"
+    assert getattr(failure, "attributes", {})["exception_type"] == "KeyError"
 
 
 def test_load_missing_agent_raises_key_error(
@@ -549,7 +747,8 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
     monkeypatch: pytest.MonkeyPatch,
     separate_instances: bool,
 ) -> None:
-    """Both loaders see complete bundles, including with separate caches."""
+    """Both loaders see complete bundles, each the one it asked for, including with
+    separate caches."""
     bundle_location = "agent-shared/abc123"
     _store_bundle(artifact_store, bundle_location)
     winner_location = "agent-shared/def456"
@@ -576,10 +775,37 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
             release_extraction.set()
         first_loaded = first.result()
 
-    assert first_loaded.spec.name == second_loaded.spec.name == "winner"
+    assert (first_loaded.spec.name, second_loaded.spec.name) == ("test-agent", "winner")
     assert first_loaded.workdir == second_loaded.workdir == cache_dir / "agent-shared"
-    assert yaml.safe_load((first_loaded.workdir / "config.yaml").read_text())["name"] == "winner"
-    assert not any((cache_dir / ".staging").iterdir())
+    # The loser rebuilt its own entry rather than pair its spec with the winner's files.
+    assert (
+        yaml.safe_load((first_loaded.workdir / "config.yaml").read_text())["name"] == "test-agent"
+    )
+    assert [p.name for p in (cache_dir / ".staging").iterdir()] in ([], ["repair.lock"])
+
+
+def test_a_cold_load_that_loses_to_another_revision_serves_its_own_files(
+    artifact_store: LocalArtifactStore, cache_dir: Path
+) -> None:
+    """A cold loader that finds another revision published rebuilds its own entry, so the
+    spec it returns and the directory it names hold the same revision."""
+    skill = "---\nname: triage\ndescription: d\n---\n{}\n"
+    for location, body in (("agent-x/one", "ONE"), ("agent-x/two", "TWO")):
+        _store_bundle(
+            artifact_store,
+            location,
+            {"config.yaml": _MINIMAL_CONFIG, "skills/triage/SKILL.md": skill.format(body)},
+        )
+    cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache.load("agent-x", "agent-x/one")  # another loader published revision one
+    cache._specs.clear()  # a second worker has no in-memory entry
+
+    loaded = cache._extract_and_cache("agent-x", "agent-x/two", artifact_store.get("agent-x/two"))
+
+    [triage] = loaded.spec.skills
+    assert triage.content.strip() == "TWO"
+    assert (loaded.workdir / "skills/triage/SKILL.md").read_text().strip().endswith("TWO")
+    assert (loaded.workdir / ".omnigent-bundle-location").read_text() == "agent-x/two"
 
 
 def test_load_failure_cleans_unpublished_extraction(
@@ -825,3 +1051,102 @@ def test_cleanup_warning_preserves_original_validation_error(
     assert "Could not clean agent cache staging directory" in caplog.text
     assert "cleanup denied" in caplog.text
     assert not (cache_dir / "agent").exists()
+
+
+_UNREGISTERED_HANDLER_CONFIG = yaml.dump(
+    {
+        "spec_version": 1,
+        "name": "handler-agent",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        "guardrails": {
+            "policies": {
+                "custom_gate": {
+                    "type": "function",
+                    "on": ["tool_call"],
+                    "function": {"path": "example_org.policies.custom_gate", "arguments": {}},
+                }
+            }
+        },
+    }
+)
+
+
+def test_load_rejects_unregistered_handler_in_tenant_bundle(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tenant bundle naming an unregistered policy handler fails to load."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    loc = "handler-tenant/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        agent_cache.load("handler-tenant", loc, expand_env=False)
+
+
+def test_memory_hit_revalidates_handler_for_tenant_load(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec cached in memory is re-checked against the registry on each tenant load."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    loc = "handler-warm/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+    agent_cache.load("handler-warm", loc, expand_env=True)
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        agent_cache.load("handler-warm", loc, expand_env=False)
+
+
+def test_operator_bundle_keeps_custom_handler(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+) -> None:
+    """Operator-authored bundles (``expand_env=True``) may use custom handlers."""
+    loc = "handler-operator/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    loaded = agent_cache.load("handler-operator", loc, expand_env=True)
+
+    assert loaded.spec.name == "handler-agent"
+
+
+def test_local_single_user_keeps_custom_handler_for_tenant_load(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local single-user server keeps its operator's custom handlers."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: True)
+    loc = "handler-local/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    loaded = agent_cache.load("handler-local", loc, expand_env=False)
+
+    assert loaded.spec.name == "handler-agent"
+
+
+def test_disk_hit_rejects_unregistered_handler_without_repairing_entry(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A published disk entry that a tenant may not use is rejected, not rebuilt."""
+    loc = "handler-disk/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+    AgentCache(artifact_store=artifact_store, cache_dir=cache_dir).load(
+        "handler-disk", loc, expand_env=True
+    )
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    fresh_cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+
+    def fail_on_repair(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("policy rejection must not start cache repair")
+
+    monkeypatch.setattr(fresh_cache, "_recover_disk_entry", fail_on_repair)
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        fresh_cache.load("handler-disk", loc, expand_env=False)
+    assert (cache_dir / "handler-disk" / "config.yaml").is_file()

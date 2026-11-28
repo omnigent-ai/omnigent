@@ -1,6 +1,80 @@
 import { describe, expect, it } from "vitest";
-import type { ImageContentBlock, MessageContentBlock } from "./blocks";
-import { attachmentLabel, imagePreview, isTextBlock, keyedAttachments } from "./blocks";
+import type { AnyBlock, ElicitationBlock, ImageContentBlock, MessageContentBlock } from "./blocks";
+import {
+  attachmentLabel,
+  hasPendingOwnElicitation,
+  imagePreview,
+  pendingWorkflowQuestions,
+  isPendingBlockingElicitation,
+  isTextBlock,
+  keyedAttachments,
+  slashCommandDisplayName,
+  slashCommandEchoText,
+  structuredErrorFields,
+} from "./blocks";
+
+describe("slash command display names", () => {
+  it.each([
+    ["claude-native-ui:build-summary", "build-summary"],
+    ["codex-native-ui:build-summary", "build-summary"],
+    ["claude-native-ui:docs:review", "docs:review"],
+    ["dev-productivity:simplify", "dev-productivity:simplify"],
+    ["custom-native-ui:review", "custom-native-ui:review"],
+    ["effort", "effort"],
+    ["claude-native-ui:", "claude-native-ui:"],
+    ["", ""],
+  ])("displays %s as %s", (name, displayName) => {
+    expect(slashCommandDisplayName(name)).toBe(displayName);
+    expect(slashCommandEchoText(name, "")).toBe(`/${displayName}`);
+    expect(slashCommandEchoText(name, "src/main.ts --verbose")).toBe(
+      `/${displayName} src/main.ts --verbose`,
+    );
+  });
+});
+
+describe("structuredErrorFields", () => {
+  it("keeps classified failures and informational notices intact", () => {
+    const classified = {
+      code: "executor_error",
+      title: "The provider rejected the API key",
+      cause: "The configured credential has expired.",
+      remediation: "Update the provider credential.",
+    };
+    expect(structuredErrorFields(classified, "polly")).toEqual({
+      title: classified.title,
+      cause: classified.cause,
+      remediation: classified.remediation,
+    });
+    expect(
+      structuredErrorFields({ code: "unknown_error", source: "harness", level: "info" }, "polly"),
+    ).toEqual({});
+  });
+
+  it.each([
+    "runner_disconnected",
+    "runner_failed_to_start",
+    "required_terminal_exited",
+    "terminal_launch_failed",
+    "native_terminal_start_failed",
+    "workspace_missing",
+    "connection_error",
+    "context_length_exceeded",
+    "output_limit_exceeded",
+    "rate_limit_exceeded",
+    "codex_thread_reset",
+    "internal_error",
+    "native_policy_not_enforced",
+    "model_change_not_applied",
+  ])("preserves the specific or infrastructure headline for %s", (code) => {
+    expect(structuredErrorFields({ code, source: "execution" }, "polly")).toEqual({});
+  });
+
+  it("keeps tool failures and errors with no agent identity generic", () => {
+    expect(structuredErrorFields({ code: "timeout", source: "tool" }, "polly")).toEqual({});
+    expect(structuredErrorFields({ code: "RuntimeError", source: "tool" }, "polly")).toEqual({});
+    expect(structuredErrorFields({ code: "executor_error" }, " ")).toEqual({});
+  });
+});
 
 // `input_image` blocks arrive from the composer (file_id) and from imported
 // sessions (inline `image_url`, or malformed): neither may blank a transcript.
@@ -171,6 +245,60 @@ describe("isTextBlock", () => {
     expect(isTextBlock({ type: "input_file", filename: "notes.pdf" })).toBe(false);
     const block = { type: "input_text", text: { parts: ["hi"] } } as unknown as MessageContentBlock;
     expect(isTextBlock(block)).toBe(false);
+  });
+});
+
+describe("pending elicitation checks", () => {
+  const card: ElicitationBlock = {
+    type: "elicitation",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+    elicitationId: "elic_1",
+    targetSessionId: null,
+    message: "Codex needs input",
+    phase: "codex_request_user_input",
+    policyName: "codex_native_request_user_input",
+    contentPreview: "{}",
+    requestedSchema: {},
+    url: null,
+    status: "pending",
+    response: null,
+  };
+
+  it("isPendingBlockingElicitation counts only a pending card the turn waits on", () => {
+    expect(isPendingBlockingElicitation(card)).toBe(true);
+    expect(isPendingBlockingElicitation({ ...card, isBlocking: false })).toBe(false);
+    expect(isPendingBlockingElicitation({ ...card, status: "responded" })).toBe(false);
+    const responseEnd = { type: "response_end", ctx: card.ctx, status: "pending", response: null };
+    expect(isPendingBlockingElicitation(responseEnd as AnyBlock)).toBe(false);
+  });
+
+  it("hasPendingOwnElicitation counts only this session's own blocking card", () => {
+    expect(hasPendingOwnElicitation([card], "conv_1")).toBe(true);
+    expect(hasPendingOwnElicitation([{ ...card, isBlocking: false }], "conv_1")).toBe(false);
+    expect(hasPendingOwnElicitation([{ ...card, targetSessionId: "conv_child" }], "conv_1")).toBe(
+      false,
+    );
+  });
+
+  it("pendingWorkflowQuestions pairs each of the session's own workflow questions with its task", () => {
+    const question = { ...card, phase: "workflow_request_input", journalStep: "deploy" };
+    expect(
+      pendingWorkflowQuestions(
+        [
+          question,
+          { ...question, elicitationId: "elic_2", journalStep: "docs" },
+          // Answered, another kind of prompt, a sub-agent's mirrored question, and one with no task.
+          { ...question, elicitationId: "elic_3", journalStep: "lint", status: "responded" },
+          { ...card, elicitationId: "elic_4" },
+          { ...question, elicitationId: "elic_5", targetSessionId: "conv_child" },
+          { ...question, elicitationId: "elic_6", journalStep: undefined },
+        ],
+        "conv_1",
+      ),
+    ).toEqual([
+      ["deploy", "elic_1"],
+      ["docs", "elic_2"],
+    ]);
   });
 });
 

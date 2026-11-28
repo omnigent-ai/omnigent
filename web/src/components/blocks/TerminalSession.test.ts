@@ -2,9 +2,9 @@
 //
 // The full TerminalSession constructor needs a real xterm + WebSocket
 // + DOM container, so it's exercised via manual REPL verification (see
-// TerminalView.test.ts). `openTerminalLink` is the one piece of our own
-// logic the WebLinksAddon delegates to — the click handler that makes
-// terminal URLs clickable — so we pin it here.
+// TerminalView.test.ts). `openTerminalLink` is the click handler the
+// terminal link provider delegates to — the piece that makes terminal URLs
+// open the right way — so we pin it here.
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +21,7 @@ import {
   parseTerminalClipboardMessage,
   resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
+  terminalFitReserveWidth,
   terminalTheme,
   terminalKeyEventPayload,
   touchScrollPayload,
@@ -65,6 +66,13 @@ describe("openTerminalLink", () => {
     expect(pushSpy).toHaveBeenCalledWith(null, "", "/c/conv_next");
   });
 
+  it("keeps the router's history index on the entry it pushes", () => {
+    window.history.replaceState({ usr: null, key: "start", idx: 3 }, "", "/c/conv_a");
+    openTerminalLink(new MouseEvent("click"), `${window.location.origin}/c/conv_b`);
+    expect(window.history.state).toEqual({ usr: null, key: expect.any(String), idx: 4 });
+    expect(window.location.pathname).toBe("/c/conv_b");
+  });
+
   it("does not reopen the current same-origin session link", () => {
     window.history.replaceState(null, "", "/c/conv_current");
     const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
@@ -94,17 +102,16 @@ describe("openTerminalLink", () => {
     }
   });
 
-  it("prevents the addon's default in-place navigation", () => {
+  it("prevents the click's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");
     const preventSpy = vi.spyOn(event, "preventDefault");
 
     openTerminalLink(event, "https://example.com/foo");
 
-    // The WebLinksAddon navigates the current document on click by
-    // default; without preventDefault the click would unload the SPA
-    // (and kill the WebSocket-attached terminal) before window.open's
-    // tab is usable. A failure here means that suppression was dropped.
+    // Without preventDefault the click's default navigation would unload the
+    // SPA (and kill the WebSocket-attached terminal) before window.open's
+    // tab is usable.
     expect(preventSpy).toHaveBeenCalledOnce();
   });
 
@@ -155,10 +162,21 @@ describe("resolveTerminalWorkspaceFileLink", () => {
     ["file:///home/u/ws/src/app.ts:42:7", "src/app.ts", 42],
     ["file:///home/u/ws/src/app.ts#L43", "src/app.ts", 43],
     ["file:///home/u/ws/src/app.ts#L44C3", "src/app.ts", 44],
-    ["file:///home/u/ws/src/app.ts#L45-L50", "src/app.ts", 45],
     ["file:///home/u/ws/Design%20Notes.md#L46", "Design Notes.md", 46],
   ])("resolves %s", (uri, path, line) => {
     expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toEqual({ path, line });
+  });
+
+  it.each([
+    ["file:///home/u/ws/src/app.ts#L45-L50", 45, 50],
+    ["file:///home/u/ws/src/app.ts:45-50", 45, 50],
+    ["file:///home/u/ws/src/app.ts:50-45", 50, undefined],
+  ])("carries the cited range of %s", (uri, line, endLine) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toStrictEqual({
+      path: "src/app.ts",
+      line,
+      ...(endLine ? { endLine } : {}),
+    });
   });
 
   it.each([
@@ -282,7 +300,7 @@ describe("terminalTheme", () => {
 
     // Dark mode should retain the terminal-like contrast the rest of the
     // app expects rather than inheriting the light prompt-band treatment.
-    expect(theme.background).toBe("#131517");
+    expect(theme.background).toBe("#0a0a0a");
     expect(theme.foreground).toBe("#e4e4e7");
     expect(theme.brightBlack).toBe("#71717a");
   });
@@ -689,6 +707,18 @@ class FakeResizeObserver {
   }
 }
 
+describe("terminalFitReserveWidth", () => {
+  it("holds back the scrollbar's width as the fit does, or nothing without scrollback", () => {
+    expect(terminalFitReserveWidth({ options: { scrollback: 1000 } })).toBe(14);
+    expect(
+      terminalFitReserveWidth({ options: { scrollback: 1000, overviewRuler: { width: 20 } } }),
+    ).toBe(20);
+    expect(
+      terminalFitReserveWidth({ options: { scrollback: 0, overviewRuler: { width: 20 } } }),
+    ).toBe(0);
+  });
+});
+
 describe("TerminalSession", () => {
   beforeEach(() => {
     FakeWebSocket.instances = [];
@@ -732,15 +762,52 @@ describe("TerminalSession", () => {
     // WHY: the open handler must push a resize frame before the user sees the
     // default 80x24, then surface kind:"connected" to React. readyState is
     // OPEN by the time sendResize runs, so a JSON resize control frame is sent.
-    const { states, socket, session } = makeSession();
+    // The container says the same size in cells, for layouts that measure in cells.
+    const { states, container, socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const resizes = () =>
+      socket.sent
+        .filter((m): m is string => typeof m === "string" && m.includes('"type":"resize"'))
+        .map((m) => JSON.parse(m) as { cols: number; rows: number });
+    const saidSize = () => ({
+      cols: Number(container.dataset.terminalCols),
+      rows: Number(container.dataset.terminalRows),
+    });
+    expect(container.dataset.terminalCols).toBeUndefined();
 
     socket.open();
 
     expect(states.at(-1)).toEqual({ kind: "connected" });
-    const resizeFrame = socket.sent.find(
-      (m) => typeof m === "string" && m.includes('"type":"resize"'),
-    );
-    expect(resizeFrame).toBeDefined();
+    expect(resizes()).toHaveLength(1);
+    // Both carry xterm's own fitted size, not just the same size as each other.
+    expect(resizes()[0]).toMatchObject({ cols: term.cols, rows: term.rows });
+    expect(saidSize()).toEqual({ cols: term.cols, rows: term.rows });
+    expect(container.dataset.terminalFitReserveWidth).toBe(String(terminalFitReserveWidth(term)));
+
+    // A later refit to another size sends it and says it on the container too.
+    (session as unknown as { fit: { fit: () => void } }).fit.fit = () => term.resize(97, 31);
+    FakeResizeObserver.instances[0]!.cb();
+    expect(resizes().at(-1)).toMatchObject({ cols: 97, rows: 31 });
+    expect(saidSize()).toEqual({ cols: 97, rows: 31 });
+    session.dispose();
+  });
+
+  it.each([
+    [
+      "its socket closes",
+      (socket: FakeWebSocket) => socket.emit("close", { code: 1006, reason: "" }),
+    ],
+    ["it's disposed", (_socket: FakeWebSocket, session: TerminalSession) => session.dispose()],
+  ])("stops saying a fitted size once %s", (_case, end) => {
+    const { container, socket, session } = makeSession();
+    socket.open();
+    expect(container.dataset.terminalCols).toBeDefined();
+
+    end(socket, session);
+
+    expect(container.dataset.terminalCols).toBeUndefined();
+    expect(container.dataset.terminalRows).toBeUndefined();
+    expect(container.dataset.terminalFitReserveWidth).toBeUndefined();
     session.dispose();
   });
 
@@ -751,6 +818,107 @@ describe("TerminalSession", () => {
     expect(term.options.linkHandler?.allowNonHttpProtocols).toBe(true);
     expect(term.options.linkHandler?.activate).toBeTypeOf("function");
     session.dispose();
+  });
+
+  describe("pasteCommand", () => {
+    function inputFrames(socket: FakeWebSocket) {
+      return socket.sent.flatMap((frame) =>
+        typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+      );
+    }
+
+    it("pastes one line without Enter and refuses a disconnected socket", () => {
+      const { socket, session } = makeSession();
+      const onResult = vi.fn();
+      session.pasteCommand("pwd", onResult);
+      expect(onResult).toHaveBeenCalledExactlyOnceWith(
+        "The shell is not connected. Nothing was sent.",
+      );
+      expect(inputFrames(socket)).toEqual([]);
+      onResult.mockClear();
+      socket.open();
+      const cancel = session.pasteCommand("printf 'hello λ'\n", onResult);
+      expect(inputFrames(socket)).toEqual(["printf 'hello λ'"]);
+      expect(onResult).toHaveBeenCalledExactlyOnceWith(null);
+      cancel();
+      socket.close();
+      session.pasteCommand("pwd", onResult);
+      expect(inputFrames(socket)).toHaveLength(1);
+      session.dispose();
+    });
+
+    it.each(["printf hello\npwd\n", "printf hello\r\npwd\r\n", "printf\t'hello'\n"])(
+      "waits for bracketed paste and sends %j once without Enter",
+      async (command) => {
+        const { socket, session } = makeSession();
+        const term = (session as unknown as { term: Terminal }).term;
+        const onResult = vi.fn();
+        socket.open();
+        session.pasteCommand(command, onResult);
+        expect(inputFrames(socket)).toEqual([]);
+        expect(onResult).not.toHaveBeenCalled();
+        await new Promise<void>((resolve) => {
+          term.write("\x1b[?2004h", resolve);
+        });
+        const pasted = command.replace(/\r\n/g, "\n").replace(/\n$/, "").replaceAll("\n", "\r");
+        expect(inputFrames(socket)).toEqual([`\x1b[200~${pasted}\x1b[201~`]);
+        expect(onResult).toHaveBeenCalledExactlyOnceWith(null);
+        await new Promise<void>((resolve) => {
+          term.write("\x1b[?2004l\x1b[?2004h", resolve);
+        });
+        expect(inputFrames(socket)).toHaveLength(1);
+        expect(onResult).toHaveBeenCalledOnce();
+        session.dispose();
+      },
+    );
+
+    it.each(["timeout", "cancel", "dispose"])(
+      "cleans up pending input after %s without sending or replaying",
+      async (outcome) => {
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        const term = (session as unknown as { term: Terminal }).term;
+        const onResult = vi.fn();
+        try {
+          socket.open();
+          const cancel = session.pasteCommand("printf hello\npwd", onResult);
+          if (outcome === "cancel") cancel();
+          if (outcome === "dispose") session.dispose();
+          await vi.advanceTimersByTimeAsync(4999);
+          expect(onResult).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(1);
+          if (outcome === "timeout")
+            expect(onResult).toHaveBeenCalledExactlyOnceWith(
+              "The shell is not ready to safely paste this command. Nothing was sent.",
+            );
+          else expect(onResult).not.toHaveBeenCalled();
+          if (outcome !== "dispose") {
+            term.write("\x1b[?2004h");
+            await vi.advanceTimersByTimeAsync(20);
+          }
+          expect(inputFrames(socket)).toEqual([]);
+          expect(onResult).toHaveBeenCalledTimes(outcome === "timeout" ? 1 : 0);
+        } finally {
+          session.dispose();
+          vi.useRealTimers();
+        }
+      },
+    );
+
+    it.each(["echo \x1b[201~\npwd", "pwd\r", "echo \x7f", "echo \x85"])(
+      "rejects control characters in %j without sending",
+      (command) => {
+        const { socket, session } = makeSession();
+        const onResult = vi.fn();
+        socket.open();
+        session.pasteCommand(command, onResult)();
+        expect(onResult).toHaveBeenCalledExactlyOnceWith(
+          "This command contains terminal control characters.",
+        );
+        expect(inputFrames(socket)).toEqual([]);
+        session.dispose();
+      },
+    );
   });
 
   it("grabs keyboard focus on open when focusOnConnect is set", () => {
@@ -1046,6 +1214,62 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it.each([true, false])(
+    "routes browser selections through consent without a recent-input requirement (bridge enabled: %s)",
+    (clipboardEnabled) => {
+      const onClipboardRequest = vi.fn();
+      const { container, session } = makeSession(
+        undefined,
+        undefined,
+        clipboardEnabled,
+        onClipboardRequest,
+      );
+      const term = (session as unknown as { term: Terminal }).term;
+      vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+      const setData = vi.fn();
+      const copy = new Event("copy", { bubbles: true, cancelable: true });
+      Object.defineProperty(copy, "clipboardData", { value: { setData } });
+      const textarea = container.querySelector("textarea")!;
+      const bypassConsent = vi.fn();
+      textarea.addEventListener("copy", bypassConsent);
+
+      textarea.dispatchEvent(copy);
+
+      expect(copy.defaultPrevented).toBe(true);
+      expect(bypassConsent).not.toHaveBeenCalled();
+      expect(setData).not.toHaveBeenCalled();
+      expect(onClipboardRequest).toHaveBeenCalledWith("selected text", copy);
+      session.dispose();
+    },
+  );
+
+  it("does not copy a browser selection without a consent handler", () => {
+    const { container, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+    const setData = vi.fn();
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(copy, "clipboardData", { value: { setData } });
+
+    container.querySelector("textarea")!.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(true);
+    expect(setData).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("leaves copying outside a terminal selection alone", () => {
+    const onClipboardRequest = vi.fn();
+    const { container, session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+
+    container.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(false);
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
   it("forwards validated clipboard frames only after recent input", () => {
     vi.spyOn(performance, "now").mockReturnValue(10_000);
     const onClipboardRequest = vi.fn();
@@ -1082,6 +1306,35 @@ describe("TerminalSession", () => {
       }),
     });
     expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("stops answering the queries the runner lists as answered by tmux", async () => {
+    // WHY: control mode forwards a pane's query after tmux has answered it, so
+    // a second reply from here would reach the program as typed input.
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    const replies = () =>
+      socket.sent.flatMap((frame) =>
+        typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+      );
+    const writePane = async (text: string) => {
+      const bytes = new TextEncoder().encode(text);
+      const data = new ArrayBuffer(bytes.length);
+      new Uint8Array(data).set(bytes);
+      socket.emit("message", { data });
+      await new Promise<void>((resolve) => {
+        term.write("", resolve);
+      });
+    };
+
+    await writePane("\x1b[6n");
+    expect(replies()).toEqual(["\x1b[1;1R"]);
+
+    socket.emit("message", { data: JSON.stringify({ type: "tmux-replies", queries: ["dsr:6"] }) });
+    await writePane("\x1b[6n\x1b[?6n");
+    expect(replies()).toEqual(["\x1b[1;1R", "\x1b[?1;1R"]);
     session.dispose();
   });
 

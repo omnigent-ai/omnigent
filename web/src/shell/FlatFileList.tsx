@@ -1,4 +1,5 @@
-import { FileIcon } from "lucide-react";
+import { useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { ChevronDown, ChevronRight, GitBranch } from "lucide-react";
 import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
@@ -6,12 +7,21 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   ROW_ACTION_SIZE_CLASS,
   ROW_META_SLOT_CLASS,
+  ROW_STATUS_SLOT_CLASS,
+  formatBytes,
   gitStatusLabel,
   gitStatusLetter,
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
+import { useRevealMenu } from "./RevealInFileManager";
 import { useCursorTooltip } from "./useCursorTooltip";
+import {
+  type VirtualRowPlacement,
+  VirtualSessionRows,
+  virtualRowStyle,
+} from "./VirtualSessionRows";
+import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
 export type { ChangedSort } from "@/lib/changedSort";
 import type { ChangedSort } from "@/lib/changedSort";
@@ -63,48 +73,70 @@ export function compareChangedFiles(sort: ChangedSort) {
   };
 }
 
+export function groupChangedFiles(files: WorkspaceChangedFile[], sort: ChangedSort) {
+  const groups = new Map<string, WorkspaceChangedFile[]>();
+  for (const file of files) {
+    const root = file.repository_root ?? "";
+    const group = groups.get(root) ?? [];
+    group.push(file);
+    groups.set(root, group);
+  }
+  return [...groups]
+    .sort(([left], [right]) => (left === "" ? 1 : right === "" ? -1 : left.localeCompare(right)))
+    .map(([root, groupFiles]) => ({ root, files: groupFiles.sort(compareChangedFiles(sort)) }));
+}
+
 function normalizeSearchQuery(query: string): string {
   return query.trim().toLowerCase();
 }
 
+// Space between rows, in px (Tailwind `gap-0.5`).
+const ROW_GAP_PX = 2;
+
 function FileListItem({
   file,
+  placement,
   isDeleted,
   onFileSelect,
   conversationId,
 }: {
   file: WorkspaceChangedFile;
+  placement: VirtualRowPlacement;
   isDeleted: boolean;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
 }) {
   const { handlers, tooltip } = useCursorTooltip(file.path);
-  const slash = file.path.lastIndexOf("/");
-  const dir = slash > 0 ? file.path.slice(0, slash) : "";
+  const reveal = useRevealMenu(isDeleted ? null : file.path);
+  const displayPath =
+    file.repository_root && file.path.startsWith(`${file.repository_root}/`)
+      ? file.path.slice(file.repository_root.length + 1)
+      : file.path;
+  const slash = displayPath.lastIndexOf("/");
+  const dir = slash > 0 ? displayPath.slice(0, slash) : "";
   const hasDownload = !isDeleted && Boolean(conversationId);
 
   return (
-    <li>
+    <li
+      ref={placement.measureRef}
+      data-index={placement.index}
+      style={virtualRowStyle(placement.top)}
+    >
       <div
+        onContextMenu={reveal.onContextMenu}
         className={cn(
-          "group flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1",
+          "group flex w-full min-w-0 items-center gap-2 rounded-md py-0.5 pr-1 pl-2",
           isDeleted ? "opacity-50" : "hover:bg-muted",
         )}
       >
         <button
           type="button"
-          className={cn(
-            "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
-            isDeleted ? "cursor-default" : "cursor-pointer",
-          )}
-          onClick={() => !isDeleted && onFileSelect(file.path)}
-          disabled={isDeleted}
+          className="flex min-w-0 flex-1 cursor-pointer items-baseline gap-1.5 text-left"
+          onClick={() => onFileSelect(file.path)}
+          aria-label={file.path}
         >
-          <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
-          <span
-            className={cn("truncate font-mono text-ui md:text-sm", isDeleted && "line-through")}
-            {...handlers}
-          >
+          <WorkspaceFileIcon path={file.path} className="self-center" />
+          <span className={cn("truncate text-ui", isDeleted && "line-through")} {...handlers}>
             {file.name}
           </span>
           {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
@@ -133,14 +165,10 @@ function FileListItem({
             </span>
           )}
         </span>
-        {/* Status letter at rest, the copy/download pair on hover — the same
-            trailing column the tree rows use, so the two tabs match. */}
-        <span
-          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
-        >
+        <span className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}>
           <span
             className={cn(
-              "rounded px-1 py-0.5 font-mono text-[10px] group-hover:invisible",
+              "rounded px-1 py-0.5 font-mono text-[10px]",
               isDeleted
                 ? "bg-destructive/10 text-destructive"
                 : file.status === "created"
@@ -151,7 +179,18 @@ function FileListItem({
           >
             {gitStatusLetter(file.status)}
           </span>
-          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+        </span>
+        {/* File size at rest, replaced by copy/download actions on hover — the
+            same far-right slot used by the Files tree. */}
+        <span
+          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+        >
+          {file.bytes !== null && !isDeleted && (
+            <span className="text-muted-foreground text-sm group-hover:invisible">
+              {formatBytes(file.bytes)}
+            </span>
+          )}
+          <span className="absolute inset-0 flex items-center justify-end gap-1">
             {hasDownload && conversationId ? (
               <FileDownloadButton conversationId={conversationId} path={file.path} />
             ) : (
@@ -160,9 +199,76 @@ function FileListItem({
             <CopyPathButton path={file.path} revealOnHover />
           </span>
         </span>
+        {reveal.menu}
       </div>
       {tooltip}
     </li>
+  );
+}
+
+function RepositoryFileGroup({
+  root,
+  children,
+  count,
+}: {
+  root: string;
+  children: ReactNode;
+  count: number;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const name = root || "Other files";
+  const Chevron = collapsed ? ChevronRight : ChevronDown;
+  return (
+    <li>
+      <div role="group" aria-label={name}>
+        <button
+          type="button"
+          className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-ui hover:bg-muted"
+          aria-expanded={!collapsed}
+          aria-label={`${name}, ${count} changed files`}
+          onClick={() => setCollapsed(!collapsed)}
+        >
+          <Chevron className="size-3.5 shrink-0" />
+          {root && <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />}
+          <span className="min-w-0 flex-1 truncate">{name}</span>
+          <span className="text-muted-foreground text-sm">{count}</span>
+        </button>
+        {!collapsed && children}
+      </div>
+    </li>
+  );
+}
+
+/** One group's rows, windowed against the panel's scroller so only rows near the viewport mount. */
+function ChangedFileRows({
+  files,
+  scrollElementRef,
+  onFileSelect,
+  conversationId,
+}: {
+  files: WorkspaceChangedFile[];
+  scrollElementRef: RefObject<HTMLElement | null>;
+  onFileSelect: (path: string) => void;
+  conversationId: string | undefined;
+}) {
+  const rows = useMemo(() => files.map((file) => ({ id: file.path, file })), [files]);
+  return (
+    <VirtualSessionRows
+      items={rows}
+      scrollElementRef={scrollElementRef}
+      revealId={null}
+      gap={ROW_GAP_PX}
+      renderRow={({ file }, placement) => (
+        <FileListItem
+          key={file.path}
+          file={file}
+          placement={placement}
+          isDeleted={file.status === "deleted"}
+          onFileSelect={onFileSelect}
+          conversationId={conversationId}
+        />
+      )}
+    />
   );
 }
 
@@ -178,6 +284,7 @@ export function FlatFileList({
   sort,
   conversationId,
   runnerWentOffline = false,
+  scrollParentRef,
 }: {
   files: WorkspaceChangedFile[] | undefined;
   isLoading: boolean;
@@ -197,7 +304,43 @@ export function FlatFileList({
    * false and we fall through to the normal empty state instead.
    */
   runnerWentOffline?: boolean;
+  /**
+   * The scroll container the list lives in (FilesPanel's `<section>`), which
+   * rows are windowed against. When omitted (tests, stories), the list
+   * provides its own scroll container.
+   */
+  scrollParentRef?: RefObject<HTMLElement | null>;
 }) {
+  const ownScrollRef = useRef<HTMLDivElement>(null);
+  const scrollElementRef = scrollParentRef ?? ownScrollRef;
+  const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
+  // Memoized so a re-render with unchanged files (a refetch, a store tick)
+  // doesn't refilter and re-sort a list that can hold thousands of rows.
+  const visibleFiles = useMemo(
+    () =>
+      (files ?? []).filter(
+        (f) => showHidden || !f.path.split("/").some((seg) => seg.startsWith(".")),
+      ),
+    [files, showHidden],
+  );
+  const sortedGroups = useMemo(() => groupChangedFiles(visibleFiles, sort), [visibleFiles, sort]);
+  // Filtering keeps the sorted order, so typing a search never re-sorts.
+  const groups = useMemo(
+    () =>
+      normalizedSearchQuery.length === 0
+        ? sortedGroups
+        : sortedGroups
+            .map(({ root, files: groupFiles }) => ({
+              root,
+              files: groupFiles.filter(
+                (f) =>
+                  f.name.toLowerCase().includes(normalizedSearchQuery) ||
+                  f.path.toLowerCase().includes(normalizedSearchQuery),
+              ),
+            }))
+            .filter((group) => group.files.length > 0),
+    [sortedGroups, normalizedSearchQuery],
+  );
   if (isLoading) {
     return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
   }
@@ -219,18 +362,7 @@ export function FlatFileList({
   if (!files || files.length === 0) {
     return <p className="px-2 py-1 text-muted-foreground text-sm">No workspace changes yet</p>;
   }
-  const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
-  const visibleFiles = files.filter(
-    (f) => showHidden || !f.path.split("/").some((seg) => seg.startsWith(".")),
-  );
-  const sorted = visibleFiles
-    .filter(
-      (f) =>
-        normalizedSearchQuery.length === 0 ||
-        f.name.toLowerCase().includes(normalizedSearchQuery) ||
-        f.path.toLowerCase().includes(normalizedSearchQuery),
-    )
-    .sort(compareChangedFiles(sort));
+  const grouped = files.some((file) => file.repository_root);
   const hiddenCount = files.length - visibleFiles.length;
   if (visibleFiles.length === 0) {
     return (
@@ -246,14 +378,14 @@ export function FlatFileList({
       </p>
     );
   }
-  if (sorted.length === 0) {
+  if (groups.length === 0) {
     return (
       <p className="px-2 py-1 text-muted-foreground text-sm">
         No changed files match "{searchQuery.trim()}"
       </p>
     );
   }
-  return (
+  const list = (
     <>
       {hiddenCount > 0 && (
         <p className="px-2 py-1 text-muted-foreground text-sm">
@@ -268,21 +400,39 @@ export function FlatFileList({
         </p>
       )}
       <TooltipProvider>
-        <ul className="flex flex-col gap-0.5">
-          {sorted.map((file) => {
-            const isDeleted = file.status === "deleted";
-            return (
-              <FileListItem
-                key={file.path}
-                file={file}
-                isDeleted={isDeleted}
-                onFileSelect={onFileSelect}
-                conversationId={conversationId}
-              />
-            );
-          })}
-        </ul>
+        {grouped ? (
+          <ul className="flex flex-col gap-0.5">
+            {groups.map(({ root, files: groupFiles }) => (
+              <RepositoryFileGroup
+                key={`${conversationId}/${root}`}
+                root={root}
+                count={groupFiles.length}
+              >
+                <ChangedFileRows
+                  files={groupFiles}
+                  scrollElementRef={scrollElementRef}
+                  onFileSelect={onFileSelect}
+                  conversationId={conversationId}
+                />
+              </RepositoryFileGroup>
+            ))}
+          </ul>
+        ) : (
+          <ChangedFileRows
+            files={groups[0].files}
+            scrollElementRef={scrollElementRef}
+            onFileSelect={onFileSelect}
+            conversationId={conversationId}
+          />
+        )}
       </TooltipProvider>
     </>
+  );
+  return scrollParentRef ? (
+    list
+  ) : (
+    <div ref={ownScrollRef} className="h-full overflow-y-auto">
+      {list}
+    </div>
   );
 }

@@ -35,7 +35,13 @@ def bound_runner(monkeypatch: pytest.MonkeyPatch) -> None:
 
     runner = _StubRunner()
 
-    async def _resolve_bound_runner(session_id: str, runner_router: Any) -> _StubRunner:
+    async def _resolve_bound_runner(
+        session_id: str,
+        runner_router: Any,
+        *,
+        conversation: Any = None,
+    ) -> _StubRunner:
+        assert conversation is None or conversation.id == session_id
         return runner
 
     async def _skip_relay_readiness(*args: Any, **kwargs: Any) -> None:

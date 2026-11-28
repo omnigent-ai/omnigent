@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Page, Route, expect
+
+from tests.e2e_ui.sessions._sidebar_helpers import choose_session_filter
 
 
 def test_scope_requests_and_bounded_automatic_pagination(
@@ -83,7 +85,7 @@ def test_scope_requests_and_bounded_automatic_pagination(
     expect(load_more).to_be_visible()
 
     # Five loaded pages must still cost one request per scope timer tick.
-    page.clock.pause_at(datetime.now(timezone.utc) + timedelta(seconds=5))
+    page.clock.pause_at(datetime.now(UTC) + timedelta(seconds=5))
     start_count = len(requests)
     for _ in range(3):
         page.clock.fast_forward(60_000)
@@ -102,8 +104,16 @@ def test_scope_requests_and_bounded_automatic_pagination(
         page.wait_for_load_state("networkidle")
     page.clock.run_for(100)
     start_count = len(requests)
-    page.clock.fast_forward(60_000)
-    page.wait_for_load_state("networkidle")
+    # An earlier networkidle event does not wait for this intercepted refresh.
+    with page.expect_response(
+        lambda response: (
+            urlparse(response.url).path == "/v1/sessions"
+            and parse_qs(urlparse(response.url).query).get("visibility") == ["mine"]
+            and "after" not in parse_qs(urlparse(response.url).query)
+            and "pinned" not in parse_qs(urlparse(response.url).query)
+        )
+    ):
+        page.clock.fast_forward(60_000)
     assert len(requests[start_count:]) == 1
     assert requests[-1]["limit"] == ["100"]
     load_more.click()
@@ -183,8 +193,7 @@ def test_mine_filters_a_mixed_visibility_response(
     page.goto(base_url)
     expect(page.get_by_text("Owned from mixed response", exact=True)).to_be_visible()
     expect(page.get_by_text("Shared from mixed response", exact=True)).to_have_count(0)
-    page.get_by_test_id("session-filter").click()
-    page.get_by_test_id("session-filter-all").click()
+    choose_session_filter(page, "all")
     expect(page.get_by_text("Owned from mixed response", exact=True)).to_be_visible()
     expect(page.get_by_text("Shared from mixed response", exact=True)).to_be_visible()
 
@@ -244,7 +253,9 @@ def test_shared_loading_keeps_pins_and_projects_mounted(
     page.goto(base_url, wait_until="domcontentloaded")
     pin = page.get_by_text("Stable pinned session", exact=True)
     expect(pin).to_be_visible()
-    page.get_by_role("button", name="Stable project", exact=True).click()
+    page.get_by_role("button", name="Stable project", exact=True).locator(
+        "[data-section-toggle]"
+    ).first.click()
     folder_row = page.get_by_text("Stable project session", exact=True)
     expect(folder_row).to_be_visible()
     pin_element = pin.element_handle()
@@ -252,8 +263,7 @@ def test_shared_loading_keeps_pins_and_projects_mounted(
     assert pin_element is not None and folder_element is not None
 
     # All needs the pending Shared cache even on a loopback-only test server.
-    page.get_by_test_id("session-filter").click()
-    page.get_by_test_id("session-filter-all").click()
+    choose_session_filter(page, "all")
     sessions = page.locator("section").filter(
         has=page.get_by_role("button", name="Sessions", exact=True)
     )
@@ -295,6 +305,10 @@ def test_templates_load_before_mine_and_discovery_reuses_its_request(
             route.fulfill(json={"data": [], "has_more": False})
 
     def agents(route: Route) -> None:
+        if parse_qs(urlparse(route.request.url).query).get("scope") == ["user"]:
+            # The caller's own agents: a separate list, not the catalog.
+            route.fulfill(json={"data": [], "has_more": False})
+            return
         agent_requests.append(route.request.url)
         route.fulfill(
             json={
@@ -378,9 +392,8 @@ def test_archived_refreshes_on_entry_without_polling(
         route.fulfill(json={"data": data, "has_more": False})
 
     def select(scope: str) -> None:
-        page.get_by_test_id("session-filter").click()
+        choose_session_filter(page, scope)
         option = page.get_by_test_id(f"session-filter-{scope}")
-        option.click()
         expect(option).to_have_count(0)
         page.wait_for_load_state("networkidle")
 

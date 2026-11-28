@@ -50,16 +50,13 @@ import asyncio
 import contextlib
 import errno
 import hashlib
-import io
 import json
 import logging
 import os
 import resource
-import socket
 import sqlite3
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import traceback
@@ -69,6 +66,9 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
+
+from tests._helpers.live_server import find_free_port
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -89,15 +89,6 @@ _RECOVERY_REPLY = "post-exhaustion recovery sentinel"
 # ---------------------------------------------------------------------------
 
 
-def _find_free_port() -> int:
-    """Return an ephemeral TCP port the OS considers free right now."""
-    s = socket.socket()
-    s.bind(("", 0))
-    port: int = s.getsockname()[1]
-    s.close()
-    return port
-
-
 def _build_minimal_agent_bundle() -> bytes:
     """Return a minimal agent bundle (tar.gz bytes) accepted by POST /v1/sessions."""
     config = yaml.dump(
@@ -114,12 +105,7 @@ def _build_minimal_agent_bundle() -> bytes:
             },
         }
     ).encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config)
-        tf.addfile(info, io.BytesIO(config))
-    return buf.getvalue()
+    return bundle_files({"config.yaml": config})
 
 
 def _make_wal_store(path: Path, rows: list[tuple[str, object]]) -> sqlite3.Connection:
@@ -213,7 +199,7 @@ async def _wait_for_mirrored_texts(
 @pytest.fixture(scope="module")
 def emfile_server() -> Iterator[str]:
     """Start a minimal Omnigent server subprocess; yield its base URL."""
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     tmp_root = Path(tempfile.mkdtemp(prefix="cursor-fwd-emfile-e2e-"))
     db_path = tmp_root / "ap.db"
@@ -297,11 +283,7 @@ def emfile_session_id(emfile_server: str) -> str:
     """Create a real session on the test server and return its id."""
     bundle = _build_minimal_agent_bundle()
     with httpx.Client(base_url=emfile_server, timeout=30.0) as client:
-        resp = client.post(
-            "/v1/sessions",
-            data={"metadata": json.dumps({})},
-            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        )
+        resp = post_session_bundle(client.post, "/v1/sessions", bundle)
     assert resp.status_code in (200, 201), (
         f"Session create failed {resp.status_code}: {resp.text[:400]}"
     )

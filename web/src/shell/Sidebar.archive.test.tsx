@@ -1,76 +1,44 @@
+import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
-// Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
-// the archive PATCH (`archived: true`) — no client stop. The row leaves the
-// sidebar optimistically (useArchiveConversation flips the cached `archived`
-// flag in onMutate; the list filters archived rows out client-side), so there
-// is no "Archiving…" status row — the row simply unmounts, like delete's. The
-// only synchronous side effect is the Undo pill (which also links to Settings).
-// The runner stop is the server's job once the flag commits — a client stop
-// would race the server's against the same runner, and put the runner's stop
-// timeouts in front of the flag flip. The kebab's user-facing "Stop session"
-// action is a separate affordance covered by Sidebar.stop.test.tsx.
-// The optimistic cache overlay + error reconcile is covered in
-// sessionListCache.test.ts / useConversations.test.ts.
-//
-// Archived sessions are no longer listed in the sidebar (they moved to the
-// Settings page), so unarchiving is covered by SettingsPage.test.tsx; this
-// file exercises the archive path from a row's kebab.
+// Archiving from a row sends only the PATCH (the server stops the runner) and
+// the row leaves optimistically, except the open session's (Sidebar.openSession.test.tsx).
+// Settings unarchive: SettingsPage.test.tsx; cache overlays: useConversations.test.ts.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 
 // Controllable archive + stop mutations, declared via vi.hoisted so the
 // vi.mock factory can reference them.
 const mocks = vi.hoisted(() => ({
   archive: { mutate: vi.fn() },
+  bulkArchive: { mutate: vi.fn() },
   stop: { mutate: vi.fn() },
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-  }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => mocks.archive,
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => mocks.stop,
-  useProjects: () => ({ data: [] }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useArchiveConversation: () => mocks.archive,
+    useBulkArchiveConversations: () => mocks.bulkArchive,
+    useStopSession: () => mocks.stop,
+  };
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
+import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
 import { Sidebar } from "./Sidebar";
+import { resetArchiveNavigationForTests } from "./sessionCommands/archiveNavigation";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -87,42 +55,26 @@ const CONV: Conversation = {
 };
 
 function mockConversations(conversations: Conversation[]) {
-  const withData = {
-    data: {
-      pages: [
-        {
-          data: conversations,
-          first_id: conversations[0]?.id ?? null,
-          last_id: conversations.at(-1)?.id ?? null,
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
-  // The sidebar fetches a single undifferentiated session list, so the
-  // mock returns the same data for the one query the component issues.
-  useConvMock.mockImplementation(() => withData);
+  const result = conversationPage(conversations);
+  useConvMock.mockImplementation(() => result);
 }
 
-function renderSidebar() {
+const CLEANUP_SERVER: ServerInfo = { ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true };
+
+function renderSidebar(serverInfo: ServerInfo = CLEANUP_SERVER) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open={true} onClose={vi.fn()} />
-            <Toaster />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
+      <CapabilitiesProvider info={serverInfo}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open={true} onClose={vi.fn()} />
+              <Toaster />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>,
   );
 }
@@ -136,11 +88,13 @@ function clickArchive() {
 
 beforeEach(() => {
   mocks.archive.mutate.mockReset();
+  mocks.bulkArchive.mutate.mockReset();
   mocks.stop.mutate.mockReset();
 });
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
 });
 
 describe("archive flow", () => {
@@ -153,7 +107,11 @@ describe("archive flow", () => {
     // Just the flag — the optimistic overlay + error reconcile live in the
     // hook, and the toast fires synchronously (not in a mutate callback, which
     // wouldn't fire once the optimistic overlay unmounts the row).
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
     // The server owns the stop. A client stop here would race it against
     // the same runner and put its timeouts in front of the flag flip.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
@@ -172,24 +130,19 @@ describe("archive flow", () => {
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
   });
 
-  it("shows an Undo pill (with a Settings link) on archive", async () => {
+  it("shows an Undo toast (with a View archived action) on archive", async () => {
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
     // The toast fires synchronously on click (the row is about to unmount, so
     // it can't wait for a mutate callback) — no need to drive onSuccess.
-    const toast = await screen.findByTestId("archive-undo-toast");
     // Singular copy for one session — never "session(s)".
-    expect(toast).toHaveTextContent("Archived 1 session.");
-    // Undo is the prominent action: bold + underlined per the design.
-    const undo = within(toast).getByTestId("archive-undo-button");
-    expect(undo).toHaveClass("font-bold", "underline");
-    // The Settings pointer is kept alongside Undo.
-    expect(within(toast).getByRole("link", { name: "View in Settings" })).toHaveAttribute(
-      "href",
-      "/settings/archived",
-    );
+    expect(await screen.findByText("Archived 1 session")).toBeInTheDocument();
+    expect(screen.queryByText(/session\(s\)/)).not.toBeInTheDocument();
+    // Undo and the View archived pointer are the toast's two actions.
+    expect(screen.getByRole("button", { name: "Undo" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View archived" })).toBeInTheDocument();
   });
 
   it("archives from the row's quick-archive hover button", () => {
@@ -199,8 +152,14 @@ describe("archive flow", () => {
     fireEvent.click(screen.getByTestId("quick-archive-conversation"));
 
     // Same single-PATCH contract as the kebab item, just a different affordance.
+    // An idle session skips the running-session confirmation.
+    expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
   });
 
@@ -216,5 +175,351 @@ describe("archive flow", () => {
     fireEvent.click(screen.getByTestId("quick-archive-conversation"));
 
     expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: false });
+  });
+});
+
+describe("archive worktree prompt", () => {
+  const WORKTREE_CONV: Conversation = { ...CONV, git_branch: "feature/x" };
+  const PREF_KEY = "omnigent:delete-worktrees-on-archive";
+
+  it("archives a non-worktree session without prompting", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+    clickArchive();
+
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks before archiving a worktree session, then deletes on Yes", async () => {
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    await screen.findByTestId("archive-worktree-dialog");
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-worktree-delete"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: true,
+    });
+    // Without "Remember my choice" the answer isn't remembered.
+    expect(localStorage.getItem(PREF_KEY)).toBeNull();
+  });
+
+  it("archives only on No and remembers the choice when asked to", async () => {
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    await screen.findByTestId("archive-worktree-dialog");
+    fireEvent.click(screen.getByTestId("archive-worktree-remember"));
+    fireEvent.click(screen.getByTestId("archive-worktree-keep"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
+    expect(localStorage.getItem(PREF_KEY)).toBe("false");
+  });
+
+  it("cancels the archive when the prompt is dismissed", async () => {
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    const dialog = await screen.findByTestId("archive-worktree-dialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("archives only, without prompting, on a server without worktree cleanup", () => {
+    // Older servers reject the unknown `delete_worktree` field, so even a saved
+    // opt-in must not send it.
+    localStorage.setItem(PREF_KEY, "true");
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar(FALLBACK_SERVER_INFO);
+    clickArchive();
+
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
+  });
+
+  it("applies a saved preference without prompting", () => {
+    localStorage.setItem(PREF_KEY, "true");
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: true,
+    });
+  });
+});
+
+describe("archive running-session prompt", () => {
+  const RUNNING_CONV: Conversation = { ...CONV, status: "running" };
+
+  it("asks before archiving a running session from the quick button, and Cancel keeps it", async () => {
+    mockConversations([RUNNING_CONV]);
+    renderSidebar();
+    fireEvent.click(screen.getByTestId("quick-archive-conversation"));
+
+    const dialog = await screen.findByTestId("archive-running-dialog");
+    expect(dialog).toHaveTextContent("Archive running session?");
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-running-cancel"));
+
+    expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+  });
+
+  it("archives a running session from the row menu once confirmed", async () => {
+    mockConversations([RUNNING_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    await screen.findByTestId("archive-running-dialog");
+    fireEvent.click(screen.getByTestId("archive-running-confirm"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
+    expect(await screen.findByText("Archived 1 session")).toBeInTheDocument();
+  });
+
+  it("cancels the archive when the running prompt is dismissed", async () => {
+    mockConversations([RUNNING_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    const dialog = await screen.findByTestId("archive-running-dialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("continues to the worktree prompt after confirming a running worktree session", async () => {
+    mockConversations([{ ...RUNNING_CONV, git_branch: "feature/x" }]);
+    renderSidebar();
+    clickArchive();
+
+    fireEvent.click(await screen.findByTestId("archive-running-confirm"));
+    await screen.findByTestId("archive-worktree-dialog");
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-worktree-delete"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: true,
+    });
+  });
+
+  it("asks once for a bulk archive that includes a running session", async () => {
+    mockConversations([
+      { ...CONV, id: "conv_idle", title: "Idle Session" },
+      { ...RUNNING_CONV, id: "conv_busy", title: "Busy Session" },
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /Idle Session/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Busy Session/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    const dialog = await screen.findByTestId("archive-running-dialog");
+    expect(dialog).toHaveTextContent("Archive a running session?");
+    expect(dialog).toHaveTextContent("1 of the 2 sessions you're archiving has an agent");
+    expect(mocks.bulkArchive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-running-confirm"));
+
+    expect(mocks.bulkArchive.mutate).toHaveBeenCalledTimes(1);
+    const [{ ids, archived }] = mocks.bulkArchive.mutate.mock.calls[0];
+    expect(archived).toBe(true);
+    expect([...ids].sort()).toEqual(["conv_busy", "conv_idle"]);
+  });
+});
+
+describe("archiving the open session", () => {
+  const SESSIONS = [
+    { ...CONV, id: "conv_a", title: "Alpha" },
+    { ...CONV, id: "conv_b", title: "Bravo" },
+    { ...CONV, id: "conv_c", title: "Charlie" },
+  ];
+  const QUICK_PICK: ServerInfo = {
+    ...FALLBACK_SERVER_INFO,
+    features: { quick_pick_palette: true },
+  };
+
+  function LocationProbe() {
+    const { pathname, search } = useLocation();
+    return <output data-testid="location">{pathname + search}</output>;
+  }
+
+  // On a session route, so the sidebar knows which session is open.
+  function renderOnSession(
+    sessionId: string,
+    {
+      info = FALLBACK_SERVER_INFO,
+      parentOf = {},
+    }: { info?: ServerInfo; parentOf?: Record<string, string> } = {},
+  ) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    for (const [childId, parentSessionId] of Object.entries(parentOf)) {
+      qc.setQueryData(["session", childId], { parentSessionId });
+    }
+    render(
+      <QueryClientProvider client={qc}>
+        <CapabilitiesProvider info={info}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[`/c/${sessionId}`]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+                </Routes>
+                <LocationProbe />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  /** The recent-session host's registration, as quick_pick_palette mounts it. */
+  function registerRecentSessions(history: string[]) {
+    useRecentSessionSwitchStore.setState({
+      history,
+      readLiveSessionIds: () => new Set(SESSIONS.map((session) => session.id)),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+  }
+
+  const location = () => screen.getByTestId("location").textContent;
+  const openRowMenu = (title: string) => {
+    const row = screen.getByRole("link", { name: new RegExp(title) }).closest("li")!;
+    fireEvent.pointerDown(within(row).getByTestId("conversation-actions"), { button: 0 });
+  };
+
+  afterEach(() => {
+    resetArchiveNavigationForTests();
+    useRecentSessionSwitchStore.setState({
+      history: [],
+      readLiveSessionIds: null,
+      sessionsKnown: false,
+      sessionsFailed: false,
+    });
+  });
+
+  it("opens the session visited before it from the row menu, as ⌃[ would", () => {
+    mockConversations(SESSIONS);
+    registerRecentSessions(["conv_b", "conv_c", "conv_a"]);
+    renderOnSession("conv_b", { info: QUICK_PICK });
+    openRowMenu("Bravo");
+    fireEvent.click(screen.getByTestId("archive-conversation"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "conv_b", archived: true }),
+    );
+    expect(location()).toBe("/c/conv_c");
+  });
+
+  it("opens the most recent session not being archived after a bulk archive", () => {
+    mockConversations(SESSIONS);
+    registerRecentSessions(["conv_b", "conv_c", "conv_a"]);
+    renderOnSession("conv_b", { info: QUICK_PICK });
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /Bravo/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Charlie/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    expect(mocks.bulkArchive.mutate).toHaveBeenCalledTimes(1);
+    const { ids } = mocks.bulkArchive.mutate.mock.calls[0][0];
+    expect([...ids].sort()).toEqual(["conv_b", "conv_c"]);
+    expect(location()).toBe("/c/conv_a");
+  });
+
+  it("starts New session in the project of the archived parent the open sub-agent leaves with", () => {
+    const inProject = (session: Conversation, project: string) => ({
+      ...session,
+      labels: { ...session.labels, omni_project: project },
+    });
+    const [alpha, bravo] = SESSIONS;
+    mockConversations([inProject(alpha, "Ops"), inProject(bravo, "Payments")]);
+    useRecentSessionSwitchStore.setState({
+      history: ["conv_child", "conv_a", "conv_b"],
+      readLiveSessionIds: () => new Set(["conv_a", "conv_b"]),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+    renderOnSession("conv_child", { info: QUICK_PICK, parentOf: { conv_child: "conv_a" } });
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /Alpha/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Bravo/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    // Nothing live is left to open, so New session opens in Alpha's project, not Bravo's.
+    expect(location()).toBe("/?project=Ops");
+  });
+
+  it("leaves a sub-agent's view with its bulk-archived parent only with quick_pick_palette", () => {
+    const bulkArchiveFrom = (info: ServerInfo) => {
+      renderOnSession("conv_child", { info, parentOf: { conv_child: "conv_b" } });
+      fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+      fireEvent.click(screen.getByRole("link", { name: /Bravo/ }));
+      fireEvent.click(screen.getByTestId("bulk-archive"));
+      const landed = location();
+      cleanup();
+      return landed;
+    };
+    mockConversations(SESSIONS);
+    registerRecentSessions(["conv_child", "conv_b", "conv_c", "conv_a"]);
+    // Without the flag the selection bar leaves only the archived session's own view, as before.
+    expect(bulkArchiveFrom(FALLBACK_SERVER_INFO)).toBe("/c/conv_child");
+    expect(
+      bulkArchiveFrom({ ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: true } }),
+    ).toBe("/c/conv_c");
+  });
+
+  it("goes home, as before, without quick_pick_palette's recent-session host", () => {
+    mockConversations(SESSIONS);
+    renderOnSession("conv_b");
+    openRowMenu("Bravo");
+    fireEvent.click(screen.getByTestId("archive-conversation"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalled();
+    expect(location()).toBe("/");
+  });
+});
+
+describe("session row quick actions setting", () => {
+  it("keeps Pin and Archive in the row menu only when the quick buttons are turned off", () => {
+    localStorage.setItem("omnigent:session-row-quick-actions", "false");
+    mockConversations([CONV]);
+    renderSidebar();
+
+    expect(screen.queryByTestId("quick-pin-conversation")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("quick-archive-conversation")).not.toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+    // Desktop hides the menu's Pin only while the hover button stands in for it.
+    expect(screen.getByTestId("pin-conversation")).not.toHaveClass("md:hidden");
   });
 });

@@ -22,6 +22,7 @@ import inspect
 from typing import Any
 
 import pytest
+from omnigent_client import PaginatedList
 from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
@@ -147,17 +148,28 @@ class _FakeSessions:
         self._by_parent = by_parent
         self.calls: list[str] = []
 
-    async def child_sessions(self, session_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+    async def child_sessions(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+        **_server_flags: object,  # e.g. descendants=True: answered like an older server
+    ) -> PaginatedList:
         self.calls.append(session_id)
-        return list(self._by_parent.get(session_id, []))
+        return PaginatedList(data=list(self._by_parent.get(session_id, [])), has_more=False)
 
     async def child_sessions_tree(
-        self, session_id: str, *, max_depth: int = 3, limit: int = 100
+        self, session_id: str, *, max_depth: int = 3, limit: int = 100, **kwargs: Any
     ) -> list[dict[str, Any]]:
         # Delegate to the real SDK recursion — it only depends on
         # ``self.child_sessions`` — so we test the actual shared helper.
         return await SessionsNamespace.child_sessions_tree(
-            self, session_id, max_depth=max_depth, limit=limit
+            self,  # type: ignore[arg-type]
+            session_id,
+            max_depth=max_depth,
+            limit=limit,
+            **kwargs,
         )
 
 
@@ -255,6 +267,10 @@ def test_run_repl_wires_subagent_plumbing() -> None:
     assert "_subagent_poll_loop" in src, (
         "the background tree poll (deeper levels) is no longer started"
     )
+    assert src.count("subagent_poll_wake.set()") >= 2, (
+        "child-session events and user input must wake the tree poll, or a "
+        "backed-off poll lags a sub-agent that just resumed"
+    )
     assert "_sync_subagent_root" in src and "_readonly_view" in src, (
         "the root-tracking dropped its read-only-view source of truth — the "
         "root could go stale vs the live main session, making '← back' show "
@@ -269,3 +285,126 @@ def test_run_repl_wires_subagent_plumbing() -> None:
         "existing children won't repopulate the selector without fresh SSE, "
         "or the poll no longer gates on active work and spins forever idle."
     )
+
+
+# ── poll cost: settled subtrees, change detection, backoff ───────────────
+
+
+def _settle(host: TerminalHost, *session_ids: str) -> None:
+    """Age finished nodes past the linger window so they count as settled."""
+    for sid in session_ids:
+        host._subagents[sid].done_at = host._monotonic() - 100.0
+
+
+def _done(sid: str) -> dict[str, Any]:
+    return {"id": sid, "busy": False, "current_task_status": "completed"}
+
+
+def _running(sid: str) -> dict[str, Any]:
+    return {"id": sid, "busy": True, "current_task_status": "in_progress"}
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_skips_children_of_unexpanded_rows() -> None:
+    sessions = _FakeSessions(
+        {"root": [_done("a"), _done("b")], "a": [_done("a1")], "b": [_done("b1")]}
+    )
+
+    nodes = await sessions.child_sessions_tree("root", expand=lambda row: row["id"] != "a")
+
+    assert [n["id"] for n in nodes] == ["a", "b", "b1"]
+    assert "a" not in sessions.calls
+    assert {"root", "b"} <= set(sessions.calls)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skips_settled_subtrees_and_keeps_their_rows() -> None:
+    client = _FakeClient({"root": [_done("a")], "a": [_done("a1")]})
+    host = _host()
+    await _refresh_subagent_tree(client, host, "root")  # type: ignore[arg-type]
+    _settle(host, "a", "a1")
+    client.sessions.calls.clear()
+
+    await _refresh_subagent_tree(client, host, "root", expand_all=False)  # type: ignore[arg-type]
+
+    assert client.sessions.calls == ["root"]
+    assert {n.session_id for n, _ in host.subagent_tree()} == {"a", "a1"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_reads_busy_unknown_and_forced_subtrees() -> None:
+    client = _FakeClient(
+        {
+            "root": [_done("settled"), _done("forced"), _running("busy")],
+            "settled": [_done("s1")],
+            "forced": [_done("f1")],
+            "busy": [_running("x1")],
+        }
+    )
+    host = _host()
+    await _refresh_subagent_tree(client, host, "root")  # type: ignore[arg-type]
+    _settle(host, "settled", "s1", "forced", "f1")
+    client.sessions._by_parent["root"].append(_done("new"))
+    client.sessions._by_parent["new"] = [_done("n1")]
+    client.sessions.calls.clear()
+
+    await _refresh_subagent_tree(  # type: ignore[arg-type]
+        client, host, "root", expand_all=False, force_expand={"forced"}
+    )
+
+    assert {"settled", "s1"}.isdisjoint(client.sessions.calls)
+    assert {"root", "forced", "busy", "new"} <= set(client.sessions.calls)
+    assert {n.session_id for n, _ in host.subagent_tree()} >= {"s1", "f1", "x1", "n1"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_fingerprint_changes_only_when_rows_change() -> None:
+    client = _FakeClient({"root": [_running("a")]})
+    host = _host()
+
+    first = await _refresh_subagent_tree(client, host, "root")  # type: ignore[arg-type]
+    same = await _refresh_subagent_tree(client, host, "root")  # type: ignore[arg-type]
+    client.sessions._by_parent["root"] = [_done("a")]
+    changed = await _refresh_subagent_tree(client, host, "root")  # type: ignore[arg-type]
+
+    assert first is not None and first == same
+    assert changed != first
+
+
+@pytest.mark.asyncio
+async def test_refresh_reports_a_failed_fetch() -> None:
+    class _Failing(_FakeSessions):
+        async def child_sessions(self, session_id: str, **_: object) -> PaginatedList:
+            raise RuntimeError("server down")
+
+    client = _FakeClient({})
+    client.sessions = _Failing({})
+
+    assert await _refresh_subagent_tree(client, _host(), "root") is None  # type: ignore[arg-type]
+
+
+def test_poll_delay_backs_off_until_a_change() -> None:
+    delay = _repl._SUBAGENT_POLL_SECONDS
+    delays = []
+    for _ in range(5):
+        delay = _repl._next_subagent_poll_delay(delay, changed=False)
+        delays.append(delay)
+
+    assert delays == [4.0, 8.0, 10.0, 10.0, 10.0]
+    assert _repl._next_subagent_poll_delay(10.0, changed=True) == _repl._SUBAGENT_POLL_SECONDS
+
+
+def test_subtree_settled_needs_a_known_node_with_nothing_running_below() -> None:
+    host = _host()
+    host.seed_subagent_tree(
+        "root",
+        [{**_done("a"), "parent_id": "root"}, {**_running("a1"), "parent_id": "a"}],
+    )
+    _settle(host, "a")
+
+    assert not host.subagent_subtree_settled("unknown")
+    assert not host.subagent_subtree_settled("a")
+    host.upsert_subagent("a1", parent_id="a", child=_done("a1"))
+    _settle(host, "a1")
+    assert host.subagent_subtree_settled("a")
+    assert "a" in host.subagent_ancestors("a1")

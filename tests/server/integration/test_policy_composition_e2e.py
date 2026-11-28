@@ -18,15 +18,14 @@ policy registry allowlist.
 
 from __future__ import annotations
 
-from typing import Any
-
 import httpx
 import pytest
 
 from omnigent.runtime import get_caps
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_session_for_agent as _create_session
+from tests.server.helpers import create_test_agent, policy_tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -107,33 +106,6 @@ def _install_policies(
     )
 
 
-def _tool_call_request() -> dict[str, Any]:
-    """Build a PHASE_TOOL_CALL EvaluationRequest for testing.
-
-    :returns: EvaluationRequest JSON dict targeting a generic tool.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {"name": "Read", "arguments": {}},
-            "context": {},
-        },
-    }
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """Create a session bound to an agent.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
-
-
 # ── Test 1: DENY + ASK on same phase — DENY wins ──────────────
 
 
@@ -161,7 +133,7 @@ async def test_deny_takes_precedence_over_ask(
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/policies/evaluate",
-        json=_tool_call_request(),
+        json=policy_tool_call_request("Read"),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -248,7 +220,7 @@ async def test_two_deny_policies_first_reason_visible(
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/policies/evaluate",
-        json=_tool_call_request(),
+        json=policy_tool_call_request("Read"),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -289,7 +261,7 @@ async def test_deny_overrides_allow(
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/policies/evaluate",
-        json=_tool_call_request(),
+        json=policy_tool_call_request("Read"),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()

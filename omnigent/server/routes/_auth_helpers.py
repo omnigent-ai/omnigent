@@ -31,6 +31,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    effective_admin,
     local_single_user_enabled,
 )
 from omnigent.server.permissions import (
@@ -42,6 +43,12 @@ from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
 _LEVEL_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner"}
+
+
+def _require_persisted_session_id(conversation_id: str) -> None:
+    """Keep client-only new-chat route IDs out of backing stores."""
+    if conversation_id.startswith("temp:"):
+        raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
 
 
 def get_user_id(
@@ -73,6 +80,33 @@ def attribution_user(user_id: str | None) -> str | None:
     if user_id == RESERVED_USER_LOCAL:
         return None
     return user_id
+
+
+def is_session_owner(
+    user_id: str | None,
+    conversation: Conversation,
+    *,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+) -> bool:
+    """Whether *user_id* holds the owner grant on *conversation*'s root session.
+
+    Unlike :func:`check_session_access` there is no admin bypass; a sub-agent
+    belongs to its root's owner, as it does there. With auth or permissions
+    off, every caller is the owner.
+
+    :param user_id: The caller, e.g. ``"alice@example.com"``, or ``None``.
+    :param conversation: The session to check, e.g. a side chat's parent.
+    :param auth_provider: The server's auth provider, ``None`` when auth is off.
+    :param permission_store: Store for grant lookups, or ``None``.
+    :returns: ``True`` for the owner of the session's root.
+    """
+    if auth_provider is None or permission_store is None:
+        return True
+    if user_id is None:
+        return False
+    grant = permission_store.get(user_id, conversation.root_conversation_id)
+    return grant is not None and grant.level >= LEVEL_OWNER
 
 
 def require_user(
@@ -120,6 +154,7 @@ def _require_access_sync(
     :raises OmnigentError: 403 if insufficient level, 404 if no
         access at all.
     """
+    _require_persisted_session_id(conversation_id)
     if permission_store is None:
         return
     if user_id is None:
@@ -253,7 +288,7 @@ class SessionAccess:
     conversation: Conversation | None
 
 
-def _require_access_and_level_sync(
+def require_access_and_level_sync(
     user_id: str | None,
     conversation_id: str,
     required_level: int,
@@ -261,6 +296,10 @@ def _require_access_and_level_sync(
     conversation_store: ConversationStore,
 ) -> SessionAccess:
     """Synchronous core of :func:`require_access_and_level`.
+
+    Callable directly from a worker thread so a route can run it inside its
+    own :func:`shared_read_scope` alongside the other reads of the request
+    (the nested scope here then reuses the caller's checkout).
 
     Folds :func:`_require_access_sync` and :func:`_get_permission_level_sync`
     into a single resolution: one :meth:`PermissionStore.resolve_access`
@@ -270,8 +309,8 @@ def _require_access_and_level_sync(
     reused for both the sub-agent parent check and the snapshot.
 
     Behaviour is identical to calling ``require_access`` followed by
-    ``get_permission_level``: the displayed level is the caller's direct
-    grant (no parent walk), while the access decision walks sub-agent
+    ``get_permission_level``: the displayed level combines direct and capped
+    public grants (no parent walk), while the access decision walks sub-agent
     parents and yields 403 vs 404 the same way.
 
     :param user_id: The authenticated user, or ``None`` to skip.
@@ -285,6 +324,7 @@ def _require_access_and_level_sync(
     :raises OmnigentError: 401 unauthenticated, 403 insufficient level,
         404 no access at all / conversation not found.
     """
+    _require_persisted_session_id(conversation_id)
     if permission_store is None:
         return SessionAccess(level=None, conversation=None)
     if user_id is None:
@@ -300,8 +340,7 @@ def _require_access_and_level_sync(
     # ``pool_pre_ping`` — is the cost that matters.
     with shared_read_scope():
         # Single round-trip: admin flag + the user's and public grants on the
-        # conversation the caller asked about. The displayed level is the direct
-        # grant (no parent walk), matching get_permission_level exactly.
+        # conversation the caller asked about, without a parent walk for display.
         access = permission_store.resolve_access(user_id, conversation_id)
         level = resolved_level(access)
 
@@ -309,7 +348,7 @@ def _require_access_and_level_sync(
         # check_session_access's admin short-circuit, which never reads the
         # conversation). A missing conversation is left for the snapshot builder
         # to 404 on, exactly as today.
-        if access.is_admin:
+        if effective_admin(access.is_admin):
             return SessionAccess(level=level, conversation=None)
 
         conv = conversation_store.get_conversation(conversation_id)
@@ -371,7 +410,7 @@ async def require_access_and_level(
     :meth:`PermissionStore.resolve_access` + at most one conversation read)
     instead of the ~5-6 separate store round-trips the two helpers issued
     independently. On a remote DB those round-trips dominate the snapshot's
-    fixed cost. Async wrapper over :func:`_require_access_and_level_sync`,
+    fixed cost. Async wrapper over :func:`require_access_and_level_sync`,
     routed through :func:`asyncio.to_thread` to keep the event loop unblocked.
 
     :param user_id: The authenticated user, or ``None`` to skip.
@@ -384,7 +423,7 @@ async def require_access_and_level(
     :raises OmnigentError: 401 / 403 / 404 as documented on the sync core.
     """
     return await asyncio.to_thread(
-        _require_access_and_level_sync,
+        require_access_and_level_sync,
         user_id,
         conversation_id,
         required_level,
@@ -410,6 +449,59 @@ def get_session_owner_id(
         if g.level >= LEVEL_OWNER:
             return g.user_id
     return None
+
+
+def _can_mutate_agent(
+    user_id: str | None,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+) -> bool:
+    """Whether the caller satisfies the agent-ownership mutation gate."""
+    if permission_store is None or local_single_user_enabled():
+        return True
+    if user_id is not None and effective_admin(permission_store.is_admin(user_id)):
+        return True
+    return agent.created_by is not None and user_id == agent.created_by
+
+
+def can_mutate_session_agent(
+    user_id: str | None,
+    conversation_id: str,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+    *,
+    conversation: Conversation | None = None,
+) -> bool:
+    """Return whether the caller may mutate this session's agent bundle.
+
+    The capability requires both effective session ownership (including a
+    child session's parent chain) and ownership of the bound agent. It mirrors
+    the two authorization gates used by bundle and MCP mutations, while
+    preserving auth-disabled, local-single-user, and administrator behavior.
+
+    :param user_id: The authenticated caller, or ``None`` when auth is off.
+    :param conversation_id: Session whose agent would be mutated.
+    :param agent: Agent bound to the session.
+    :param permission_store: Permission store, or ``None`` when auth is off.
+    :param conversation_store: Store used for parent-chain resolution.
+    :param conversation: Optional already-loaded authoritative session row.
+    :returns: ``True`` when both mutation gates allow the caller.
+    """
+    if agent.session_id is None:
+        return False
+    if permission_store is None:
+        return True
+    if not check_session_access(
+        user_id,
+        conversation_id,
+        LEVEL_OWNER,
+        permission_store,
+        conversation_store,
+        conversation=conversation,
+    ):
+        return False
+    return _can_mutate_agent(user_id, agent, permission_store)
 
 
 def require_agent_owner(
@@ -443,16 +535,8 @@ def require_agent_owner(
     :raises OmnigentError: 403 when the caller is neither the owner nor an
         admin.
     """
-    # Auth disabled entirely: no ownership model to enforce.
-    if permission_store is None:
-        return
-    # Local single-user (header auth): grants are keyed by the "local"
-    # sentinel and there is no second identity to forge against. Mirror
-    # validate_session_agent's local handling and allow.
-    if local_single_user_enabled():
-        return
-    # Workspace admins bypass, mirroring check_session_access / resolved_allows.
-    if user_id is not None and permission_store.is_admin(user_id):
+    # Auth disabled, local single-user, and workspace admins bypass.
+    if _can_mutate_agent(user_id, agent, permission_store):
         return
     # Legacy / unowned row: admins only (handled above); everyone else denied.
     if agent.created_by is None:

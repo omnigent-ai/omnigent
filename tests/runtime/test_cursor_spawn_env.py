@@ -68,9 +68,34 @@ def test_model_threads_into_env_var() -> None:
 
 
 def test_no_model_produces_no_model_env_var() -> None:
-    """A spec with no model omits ``HARNESS_CURSOR_MODEL`` (cursor's default applies)."""
+    """A spec with no model and no config default omits ``HARNESS_CURSOR_MODEL``."""
     env = _build_cursor_spawn_env(_make_spec(model=None))
     assert "HARNESS_CURSOR_MODEL" not in env
+
+
+def test_no_model_falls_back_to_global_config_model(tmp_path: Path) -> None:
+    """When the spec omits model, global ``model`` is threaded into the spawn env."""
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": "composer-2.5"}))
+    env = _build_cursor_spawn_env(_make_spec(model=None))
+    assert env["HARNESS_CURSOR_MODEL"] == "composer-2.5"
+
+
+def test_no_model_prefers_cursor_block_over_global(tmp_path: Path) -> None:
+    """``cursor.model`` wins over global ``model`` when both are set."""
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"model": "composer-2.5", "cursor": {"model": "grok-4.5"}})
+    )
+    env = _build_cursor_spawn_env(_make_spec(model=None))
+    assert env["HARNESS_CURSOR_MODEL"] == "grok-4.5"
+
+
+def test_spec_model_wins_over_config_defaults(tmp_path: Path) -> None:
+    """An explicit ``executor.model`` is not overridden by config defaults."""
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"model": "composer-2.5", "cursor": {"model": "grok-4.5"}})
+    )
+    env = _build_cursor_spawn_env(_make_spec(model="gpt-5"))
+    assert env["HARNESS_CURSOR_MODEL"] == "gpt-5"
 
 
 def test_api_key_auth_sets_api_key_env_var() -> None:

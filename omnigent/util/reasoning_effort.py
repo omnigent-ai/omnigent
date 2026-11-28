@@ -8,7 +8,8 @@ from types import MappingProxyType
 
 from omnigent.llms.errors import PermanentLLMError
 
-EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+EFFORT_VALUES = frozenset(EFFORT_ORDER)
 EFFORT_CLEAR_VALUES = frozenset({"default", "off", "reset"})
 
 # Fold a value to a canonical one, but only where the target ladder lacks it:
@@ -23,14 +24,10 @@ OPENAI_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"}
 ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_EFFORTS = ANTHROPIC_EFFORTS
 CODEX_EFFORTS = OPENAI_EFFORTS
-# Codex-native drives the real codex process, which is the per-model authority
-# on reasoning levels — it advertises them via ``model/list`` and validates the
-# pairing itself. Sol reaches ``ultra``; the picker already gates which levels a
-# model offers, so accept codex's full ladder here rather than re-clamping a
-# valid pick down to ``xhigh``.
-CODEX_NATIVE_EFFORTS = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
-)
+# Codex advertises per-model reasoning levels via ``model/list``. Native launch
+# and dispatch clamp incompatible pairs; accept the full vocabulary here so
+# supported ``max``/``ultra`` settings survive harness-level validation.
+CODEX_NATIVE_EFFORTS = EFFORT_VALUES
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
 ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
@@ -301,6 +298,36 @@ def validate_effort(effort: object, provider: str, supported: Iterable[str]) -> 
             return alias
         raise ValueError(unsupported_effort_message(effort_str, provider, supported_set))
     return effort_str
+
+
+def validate_effort_for_harness(effort: str, harness: str | None) -> str:
+    """
+    Validate an explicitly requested *effort* against the harness's declared family.
+
+    A harness whose family is ``NONE`` has no effort plumbing, and an
+    unrecognized one cannot be checked at all — the caller asked for this
+    explicitly, so reject rather than accept-and-drop. (Delivery of a
+    persisted effort takes the opposite tack and filters quietly; see the
+    reasoning guard in :mod:`omnigent.runner.app`.)
+
+    :param effort: Requested effort, e.g. ``"high"``.
+    :param harness: Resolved harness, e.g. ``"claude-native"``.
+    :returns: The canonical effort that harness accepts.
+    :raises ValueError: If the harness supports no effort override, or
+        the value falls outside its vocabulary.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    canonical = canonicalize_harness(harness) if harness is not None else None
+    supported = efforts_for_harness(harness)
+    if not supported:
+        raise ValueError(
+            f"harness {canonical or harness or 'unknown'!r} does not support "
+            "a reasoning-effort override"
+        )
+    validated = validate_effort(effort, canonical or harness or "unknown", supported)
+    assert validated is not None
+    return validated
 
 
 def validate_effort_or_llm_error(

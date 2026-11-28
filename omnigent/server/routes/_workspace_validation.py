@@ -149,7 +149,7 @@ async def _ask_host_stat(
 
         try:
             result = await asyncio.wait_for(future, timeout=_STAT_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise WorkspaceValidationError(
                 f"host '{host_conn.host_id}' did not respond to stat within {_STAT_TIMEOUT_S:.0f}s"
             ) from exc
@@ -206,12 +206,10 @@ def _is_subpath_of(canonical_workspace: str, canonical_boundary: str) -> bool:
     :returns: ``True`` when the workspace is the boundary or
         nested under it.
     """
-    # host.stat realpath on Windows uses backslashes. Only then treat
-    # ``\`` as a separator and ignore drive-letter case. On POSIX a
-    # backslash is a legal filename character, so ``/allowed\escape``
-    # must not look like a child of ``/allowed``.
-    if _is_windows_absolute_path(canonical_workspace) or _is_windows_absolute_path(
-        canonical_boundary
+    # Normalize Windows drive and UNC paths; POSIX backslashes remain literal.
+    if any(
+        _is_windows_absolute_path(path) or _is_unc_path(path)
+        for path in (canonical_workspace, canonical_boundary)
     ):
         workspace = canonical_workspace.replace("\\", "/").lower()
         boundary = canonical_boundary.replace("\\", "/").lower()

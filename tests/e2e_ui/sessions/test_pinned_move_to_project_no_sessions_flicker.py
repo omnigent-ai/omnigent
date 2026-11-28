@@ -152,6 +152,8 @@ def _assert_settled_without_sessions_transit(
     # Keep observing across the post-drop reconcile refetches: a lagging list
     # read racing the PATCH can reintroduce the flicker after the drop settles.
     page.wait_for_timeout(1500)
+    # Filing unpins as a side effect, so it offers no unpin Undo.
+    expect(page.get_by_test_id("unpin-undo-toast-item")).to_have_count(0)
 
     result = page.evaluate(_STOP_TRACE_SCRIPT)
     assert not result["sawInSessions"], (

@@ -10,11 +10,19 @@ import { CheckIcon, CopyIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { COPY_PATH_LABELS } from "./fileCommands/model";
+import { type CopyPathCommandId, pathToCopy, useFileCommandTarget } from "./fileCommands/target";
 
 interface CopyPathButtonProps {
   /** Path to place on the clipboard, e.g. ``"src/main.py"``. */
   path: string;
+  /**
+   * The file menu's copy action to perform, which then names the tooltip; without it the
+   * button copies `path` as given.
+   */
+  command?: CopyPathCommandId;
   /** Tooltip text at rest, e.g. ``"Copy path"``. */
   label?: string;
   /**
@@ -38,9 +46,17 @@ interface CopyPathButtonProps {
  */
 export function CopyPathButton({
   path,
-  label = "Copy path",
+  command,
+  label: labelProp,
   revealOnHover = false,
 }: CopyPathButtonProps) {
+  // With a menu action, the same text as the menu copies, with feedback in place on the row.
+  const target = useFileCommandTarget(path);
+  const copy = command && target ? pathToCopy(target, command) : null;
+  const copiedPath = copy?.text || path;
+  // A relative copy of a file outside the workspace copies its absolute path, and says so.
+  const label =
+    labelProp ?? (command ? COPY_PATH_LABELS[copy?.absolute ? "copy-path" : command] : "Copy path");
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
   const timerRef = useRef<number>(0);
@@ -60,7 +76,7 @@ export function CopyPathButton({
     e.stopPropagation();
     window.clearTimeout(timerRef.current);
     try {
-      await copyText(path);
+      await copyText(copiedPath);
       setCopyError(false);
       setCopied(true);
       timerRef.current = window.setTimeout(() => setCopied(false), 2000);
@@ -80,12 +96,13 @@ export function CopyPathButton({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon-sm"
           aria-label={`${label}: ${filename}`}
           className={cn(
-            "shrink-0 cursor-pointer rounded p-0.5 transition-opacity",
-            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+            "transition-opacity",
             copyError
               ? "text-destructive opacity-100"
               : copied
@@ -100,8 +117,8 @@ export function CopyPathButton({
           onClick={handleClick}
           data-testid="copy-path-button"
         >
-          {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
-        </button>
+          {copied ? <CheckIcon /> : <CopyIcon />}
+        </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">
         {copyError ? "Copy failed" : copied ? "Copied" : label}

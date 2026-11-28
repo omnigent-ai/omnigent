@@ -7,6 +7,7 @@
 // than passed through configure()/addOptions(): TipTap deep-merges options, which
 // clones the ref object and breaks the shared-ref contract.
 
+import type { MarkdownManager } from "@tiptap/markdown";
 import { Extension } from "@tiptap/core";
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
@@ -15,6 +16,7 @@ import type { RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { findPmRangeForComment } from "./TipTapEditorHelpers";
+import { REVEAL_DECORATION_SPEC } from "./TipTapRevealDecoration";
 
 export const commentDecorationKey = new PluginKey<DecorationSet>("commentDecoration");
 
@@ -28,21 +30,30 @@ export interface CommentDecorationState {
   onClickComment: (comment: Comment) => void;
 }
 
-function buildDecorations(doc: ProseMirrorNode, state: CommentDecorationState): DecorationSet {
+function buildDecorations(
+  doc: ProseMirrorNode,
+  state: CommentDecorationState,
+  manager?: MarkdownManager,
+): DecorationSet {
   const { comments, activeSelection, rawContent, pendingRange } = state;
   const decos: Decoration[] = [];
 
   for (const comment of comments) {
-    const range = findPmRangeForComment(doc, comment, rawContent);
+    const range = findPmRangeForComment(doc, comment, rawContent, manager);
     if (!range) continue;
     const isActive =
       activeSelection?.start_index === comment.start_index &&
       activeSelection?.end_index === comment.end_index;
     decos.push(
-      Decoration.inline(range.from, range.to, {
-        class: isActive ? "md-comment md-comment-active" : "md-comment",
-        "data-comment-id": comment.id,
-      }),
+      Decoration.inline(
+        range.from,
+        range.to,
+        {
+          class: isActive ? "md-comment md-comment-active" : "md-comment",
+          "data-comment-id": comment.id,
+        },
+        isActive ? REVEAL_DECORATION_SPEC : undefined,
+      ),
     );
   }
 
@@ -70,13 +81,14 @@ export function createCommentDecorationExtension(
     name: "commentDecoration",
 
     addProseMirrorPlugins() {
+      const editor = this.editor;
       return [
         new Plugin({
           key: commentDecorationKey,
           state: {
             init(_, { doc }) {
               return stateRef.current
-                ? buildDecorations(doc, stateRef.current)
+                ? buildDecorations(doc, stateRef.current, editor.markdown)
                 : DecorationSet.empty;
             },
             apply(tr, decorations, _, newState) {
@@ -89,7 +101,7 @@ export function createCommentDecorationExtension(
                 if (typeof meta === "object" && "pendingRange" in meta) {
                   stateRef.current.pendingRange = meta.pendingRange;
                 }
-                return buildDecorations(newState.doc, stateRef.current);
+                return buildDecorations(newState.doc, stateRef.current, editor.markdown);
               }
               // Remap existing decorations through the transaction automatically.
               return decorations.map(tr.mapping, newState.doc);

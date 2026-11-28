@@ -146,6 +146,28 @@ def _resolve_alias(provider: ProviderEntry, harness: str, model: str) -> str:
     return next(iter(resolved), model)
 
 
+def ambient_gateway_providers(
+    host_config: dict[str, Any] | None, model_discovery: dict[str, Any] | None
+) -> dict[str, ProviderEntry]:
+    """Gateways an unbound target can list through ``sandbox.model_discovery``."""
+    raw = host_config or {}
+    discovery = model_discovery or {}
+    if not discovery:
+        return {}
+    try:
+        if parse_inference_config(raw):
+            return {}
+        providers = load_providers(raw)
+    except (OmnigentError, ValueError):
+        # Startup rejects malformed YAML host_config; a programmatic target gets no preview.
+        return {}
+    return {
+        name: entry
+        for name, entry in providers.items()
+        if isinstance(discovery.get(name), dict) and entry.kind in {"gateway", "key", "local"}
+    }
+
+
 class SandboxInferenceService:
     """Load a static target once, then discover through its saved configuration."""
 
@@ -309,6 +331,59 @@ class SandboxInferenceService:
             saved_binding = runtime["inference"]["harnesses"][_binding_key(runtime, harness)]
             saved_binding["default_model"] = preview["default_model"]
         return copy.deepcopy(snapshot)
+
+    async def ambient_catalog(
+        self, provider: str | None, harness: str, user_id: str | None
+    ) -> dict[str, Any] | None:
+        """Advisory preview of an unbound target's gateway via server-side discovery.
+
+        No snapshot, revision, or default marker; ``None`` when this harness has
+        no discoverable gateway on the target.
+        """
+        deployment = getattr(self._state, "sandbox_config", None)
+        target = deployment.for_provider(provider) if deployment is not None else None
+        if target is None:
+            return None
+        raw: dict[str, Any] = copy.deepcopy(target.host_config or {})
+        discovery = copy.deepcopy(getattr(target, "model_discovery", None) or {})
+        harness = normalize_inference_harness(harness)
+        compatible: list[tuple[ProviderEntry, str]] = []
+        for entry in ambient_gateway_providers(raw, discovery).values():
+            try:
+                _wire(entry, harness)
+            except OmnigentError:
+                continue
+            compatible.append((entry, _family(entry, harness)))
+        if not compatible:
+            return None
+        chosen = next(
+            (entry for entry, family in compatible if family in entry.default_families),
+            compatible[0][0],
+        )
+        runtime = {
+            "providers": raw.get("providers", {}),
+            "inference": {"harnesses": {harness: {"provider": chosen.name}}},
+        }
+        target_id = f"sandbox:{target.provider or 'default'}"
+        result = await self.catalog(
+            {
+                "configuration_revision": inference_revision(
+                    runtime,
+                    {"model_discovery": discovery, "target_id": target_id, "harness": harness},
+                ),
+                "harness": harness,
+                "owner_id": user_id or RESERVED_USER_LOCAL,
+                "runtime_config": runtime,
+                "model_discovery": discovery,
+                "connections": {},
+            }
+        )
+        for row in result["models"]:
+            row["isDefault"] = False
+        if result["status"] == "empty":
+            result["error"] = "The gateway lists no usable models for this harness."
+        result.update(configured=False, configuration_revision=None, default_model=None)
+        return result
 
     def _gateway_models(
         self, snapshot: dict[str, Any], provider: ProviderEntry

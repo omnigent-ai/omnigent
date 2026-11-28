@@ -18,6 +18,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.live_server import find_free_port
+from tests._helpers.mock_llm import mock_llm_answers
+
 # Root of the Omnigent checkout that ships the ``omnigent``
 # package, the example YAMLs, and (in the main checkout) the
 # ``.venv`` with omnigent + pexpect + openai-agents installed.
@@ -163,15 +166,6 @@ def mock_credentials_env(
 # ── Mock LLM server fixtures ────────────────────────────────
 
 
-def _find_free_port() -> int:
-    """Find a free TCP port by binding to port 0."""
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 @pytest.fixture(scope="session")
 def mock_llm_server_url(
     tmp_path_factory: pytest.TempPathFactory,
@@ -187,7 +181,7 @@ def mock_llm_server_url(
     :param tmp_path_factory: Pytest temp path factory for logs.
     :yields: The mock server base URL.
     """
-    mock_port = _find_free_port()
+    mock_port = find_free_port()
     mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
     log_handle = open(mock_log, "w")  # noqa: SIM115
 
@@ -205,12 +199,8 @@ def mock_llm_server_url(
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
-            if resp.status_code == 200:
-                break
-        except httpx.ConnectError:
-            continue
+        if mock_llm_answers(base_url):
+            break
         time.sleep(0.1)
     else:
         proc.kill()

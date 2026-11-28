@@ -127,9 +127,9 @@ describe("HeaderProjectTag", () => {
     expect(screen.getByTestId("header-project-tag").className).not.toContain("opacity-40");
   });
 
-  it("dims the folder glyph when the filed project has no icon", () => {
+  it("renders the folder glyph at full opacity when the filed project has no icon", () => {
     renderTag(<HeaderProjectTag conversationId="conv-1" projectName="Payments" />);
     expect(screen.queryByTestId("project-icon")).toBeNull();
-    expect(screen.getByTestId("header-project-tag").className).toContain("opacity-40");
+    expect(screen.getByTestId("header-project-tag").className).toContain("opacity-100");
   });
 });

@@ -1,6 +1,26 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { mermaid } from "@streamdown/mermaid";
+import { mermaid } from "./mermaidPlugin";
 import type { MermaidErrorComponentProps, MermaidOptions } from "streamdown";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import type { ResolvedThemeMode } from "@/components/theme/themeMode";
+
+// Mermaid 11 wraps an HTML label only when its one-line width measures exactly
+// the 200px maximum, but fractional zoom or display scaling measures it a
+// sub-pixel wider, so long labels stay on one line and are clipped. Forcing the
+// wrapped layout matches what Mermaid picks at 100%. themeCSS is written into
+// the SVG, so it applies while Mermaid measures and in downloaded diagrams.
+// Drop once a Mermaid release fixes mermaid-js/mermaid#7794.
+const MERMAID_LABEL_WRAP_CSS =
+  "foreignObject > div { display: table !important; white-space: break-spaces !important; }";
+
+const MERMAID_THEMES = {
+  light: { theme: "default", themeCSS: MERMAID_LABEL_WRAP_CSS },
+  dark: { theme: "dark", themeCSS: MERMAID_LABEL_WRAP_CSS },
+} as const;
+
+export function mermaidOptionsForTheme(mode: ResolvedThemeMode): MermaidOptions {
+  return { config: MERMAID_THEMES[mode], errorComponent: MermaidError };
+}
 
 // Mermaid's parsers open every syntax error with this line.
 const ERROR_LINE_RE = /^(?:Parse|Lexical) error on line (\d+)/;
@@ -196,6 +216,7 @@ type EscapedRender =
 // uses. Only the error path pays for this: a diagram that parsed first time
 // never reaches this component.
 function useEscapedRender(escaped: EscapedSemicolons | null): EscapedRender {
+  const mode = useResolvedThemeMode();
   const [state, setState] = useState<EscapedRender>({ status: escaped ? "rendering" : "skipped" });
   useEffect(() => {
     if (!escaped) {
@@ -206,7 +227,7 @@ function useEscapedRender(escaped: EscapedSemicolons | null): EscapedRender {
     setState({ status: "rendering" });
     const id = `mermaid-escaped-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     mermaid
-      .getMermaid()
+      .getMermaid(MERMAID_THEMES[mode])
       .render(id, escaped.text)
       .then(({ svg }) => {
         if (cancelled) return;
@@ -218,7 +239,7 @@ function useEscapedRender(escaped: EscapedSemicolons | null): EscapedRender {
     return () => {
       cancelled = true;
     };
-  }, [escaped]);
+  }, [escaped, mode]);
   return state;
 }
 
@@ -297,5 +318,3 @@ export function MermaidError({ chart, error }: MermaidErrorComponentProps) {
     </div>
   );
 }
-
-export const MERMAID_STREAMDOWN_OPTIONS: MermaidOptions = { errorComponent: MermaidError };

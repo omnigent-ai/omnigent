@@ -24,9 +24,13 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent._platform import stable_user_id
 from omnigent.util.json_types import JsonObject as _JsonObject
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
@@ -1271,3 +1275,13 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Kimi's editor and context footer are visible, no menu open.
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live terminal; the watcher already captured its pane.
+    """
+    del session_id
+    return _kimi_tui_ready(instance.last_pane_text() or "")

@@ -5,6 +5,7 @@ import {
   getConnectionProtocol,
   maxLiveConversations,
 } from "./conversationRegistry";
+import * as capabilities from "@/lib/capabilities";
 import type { PendingUserMessage } from "./chatStore";
 
 /** An unsettled optimistic bubble — the shape that pins an entry. */
@@ -18,13 +19,18 @@ function postedBubble(tempId = "pend_1"): PendingUserMessage {
 }
 
 describe("maxLiveConversations", () => {
-  it("allows 30 when multiplexed and only 3 when serial", () => {
-    // Not a product number: HTTP/2 multiplexes over one connection, while
-    // HTTP/1.1 caps ~6 per origin and an SSE stream holds one for its whole
-    // life — 30 there deadlocks every other fetch.
-    expect(maxLiveConversations("multiplexed")).toBe(30);
-    expect(maxLiveConversations("serial")).toBe(3);
-  });
+  it.each([undefined, false, true])(
+    "keeps the serial limit at three unless grids are enabled (%s)",
+    (enabled) => {
+      const cached = vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
+        ...capabilities.FALLBACK_SERVER_INFO,
+        features: enabled === undefined ? {} : { grid_sessions_display_ui: enabled },
+      });
+      expect(maxLiveConversations("multiplexed")).toBe(30);
+      expect(maxLiveConversations("serial")).toBe(enabled ? 4 : 3);
+      cached.mockRestore();
+    },
+  );
 });
 
 describe("getConnectionProtocol", () => {
@@ -127,6 +133,23 @@ describe("ConversationRegistry", () => {
 
   it("returns null when there is nothing to evict", () => {
     expect(registry.evictLruEvictable()).toBeNull();
+  });
+
+  it("keeps all four visible grid panes live until their final owner unmounts", () => {
+    const releases = ["a", "b", "c", "d"].map((id) => {
+      registry.acquire(id);
+      return registry.retain(id);
+    });
+    const releaseSecondOwner = registry.retain("a");
+    registry.acquire("background");
+    expect(registry.evictLruEvictable()).toBe("background");
+    expect(registry.evictLruEvictable()).toBeNull();
+    releases[0]();
+    expect(registry.evictLruEvictable()).toBeNull();
+    releaseSecondOwner();
+    expect(registry.evictLruEvictable()).toBe("a");
+    releases.slice(1).forEach((release) => release());
+    expect(registry.evictLruEvictable()).toBe("b");
   });
 
   it("treats acquire as a recency touch, so a revisited entry is not the victim", () => {
@@ -299,6 +322,22 @@ describe("ConversationRegistry", () => {
     ]);
     expect(temp.disposed).toBe(true);
     expect(registry.has("temp:aaaa0001")).toBe(false);
+  });
+
+  it("rekey onto a live id carries a posted-but-unconsumed bubble until its echo arrives", () => {
+    const temp = registry.acquire("temp:aaaa0002");
+    temp.setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_2",
+          content: [{ type: "input_text", text: "just sent" }],
+          posted: true,
+        },
+      ],
+    });
+    const existing = registry.acquire("conv_real_2");
+    registry.rekey("temp:aaaa0002", "conv_real_2");
+    expect(existing.getState().pendingUserMessages.map((m) => m.tempId)).toEqual(["pend_2"]);
   });
 
   it("rekey is a no-op when the old id is not live", () => {

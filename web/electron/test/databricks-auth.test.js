@@ -8,6 +8,9 @@ const {
   readDatabricksAuthMode,
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
+  isTransientRenewalError,
+  IP_ACL_BLOCKED,
+  SESSION_TRANSPORT,
   createDatabricksAuth,
 } = require("../src/databricks-auth");
 
@@ -253,6 +256,110 @@ describe("Databricks browser session lifecycle", () => {
     assert.deepEqual(h.calls.load, []);
     assert.equal(h.timers.size, 0);
   });
+  it("checks a window's session in place and reports a refused renewal unless a newer page replaced it", async (t) => {
+    let blocked = false;
+    const h = harness({
+      ensureSession: async () => {
+        if (blocked) {
+          throw Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED });
+        }
+        return ORIGIN;
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    assert.equal(h.auth.checkSession(win, "test"), null);
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    assert.equal(await h.auth.checkSession(win, "test"), true);
+    blocked = true;
+    assert.equal(await h.auth.checkSession(win, "test", () => true), true);
+    assert.deepEqual(h.calls.errors, []);
+    assert.equal(h.timers.size, 1);
+    assert.equal(await h.auth.checkSession(win, "test"), false);
+    assert.equal(h.calls.renew.length, 3);
+    assert.deepEqual(h.calls.load, []);
+    assert.deepEqual(
+      h.calls.errors.map(({ url, error }) => [url, error.errorCode]),
+      [[`${ORIGIN}/omnigent`, IP_ACL_BLOCKED]],
+    );
+  });
+  it("keeps a newer page when a superseded check cannot reschedule after cookie removal", async (t) => {
+    let refuse;
+    const h = harness({
+      ensureSession: () =>
+        new Promise((_resolve, reject) => {
+          refuse = () =>
+            reject(Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED }));
+        }),
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    let superseded = false;
+    const checked = h.auth.checkSession(win, "test", () => superseded);
+    await drain();
+    superseded = true;
+    h.removeCookie();
+    refuse();
+
+    assert.equal(await checked, true);
+    assert.deepEqual(h.calls.errors, []);
+    assert.deepEqual(h.calls.load, []);
+    assert.equal(h.calls.renew.length, 1);
+  });
+  it("reports a refused renewal that a blocked login joined after a superseded check", async (t) => {
+    let refuse;
+    const h = harness({
+      ensureSession: () =>
+        new Promise((_resolve, reject) => {
+          refuse = () =>
+            reject(Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED }));
+        }),
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    const checked = h.auth.checkSession(win, "test", () => true);
+    h.request(win, `${ORIGIN}/login`);
+    await drain();
+    refuse();
+    assert.equal(await checked, false);
+    assert.equal(h.calls.renew.length, 1);
+    assert.deepEqual(
+      h.calls.errors.map(({ error }) => error.errorCode),
+      [IP_ACL_BLOCKED],
+    );
+  });
+  for (const cookiePresent of [true, false]) {
+    it(`reports the refused renewal to a caller joining rescheduling with cookie ${cookiePresent ? "present" : "missing"}`, async (t) => {
+      const h = harness({
+        ensureSession: async () => {
+          throw Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED });
+        },
+      });
+      t.after(() => h.auth.dispose());
+      const win = h.window();
+      await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+      const readCookies = h.session.cookies.get;
+      let releaseCookies;
+      h.session.cookies.get = (...args) =>
+        new Promise((resolve) => {
+          releaseCookies = () => resolve(readCookies(...args));
+        });
+      const checked = h.auth.checkSession(win, "test", () => true);
+      await drain();
+      h.request(win, `${ORIGIN}/login`);
+      if (!cookiePresent) h.removeCookie();
+      releaseCookies();
+      assert.equal(await checked, false);
+      assert.equal(h.calls.renew.length, 1);
+      assert.deepEqual(
+        h.calls.errors.map(({ error }) => error.errorCode),
+        [IP_ACL_BLOCKED],
+      );
+      assert.equal(isTransientRenewalError(h.calls.errors[0].error), true);
+    });
+  }
   it("keeps a rejected window blocked after unpinning until a new connection begins", async (t) => {
     const h = harness({
       ensureSession: async () => {
@@ -335,6 +442,7 @@ describe("Databricks browser session lifecycle", () => {
     await drain();
     assert.equal(h.calls.renew.length, 1);
     assert.equal(h.calls.errors.length, 1);
+    assert.equal(h.calls.errors[0].error.errorCode, "SESSION_REJECTED");
   });
   it("does not use an arbitrary foreign navigation as an expiry signal", async (t) => {
     const h = harness();
@@ -410,5 +518,40 @@ describe("Databricks browser session lifecycle", () => {
     assert.equal(h.timers.size, 0);
     assert.deepEqual(h.calls.load, []);
     assert.deepEqual(h.calls.errors, []);
+  });
+});
+
+describe("transient renewal error classification", () => {
+  it("retries only network, timeout, server-side, and IP access list failures", () => {
+    // The shapes fetch rejects with for a refused connection and an AbortSignal.timeout.
+    const refused = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" }),
+    });
+    const timedOut = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    const failure = (message, props) => Object.assign(new Error(message), props);
+    for (const [error, transient] of [
+      [refused, true],
+      [timedOut, true],
+      [new TypeError("fetch failed"), true],
+      [new Error("net::ERR_NAME_NOT_RESOLVED"), true],
+      [failure("Databricks session creation timed out", { errorCode: SESSION_TRANSPORT }), true],
+      [failure("Databricks session response aborted", { errorCode: SESSION_TRANSPORT }), true],
+      [new Error("Databricks session response aborted"), false],
+      [failure("token endpoint 503", { status: 503 }), true],
+      [failure("token endpoint 429", { status: 429 }), true],
+      [failure("HTTP 403", { status: 403, errorCode: IP_ACL_BLOCKED }), true],
+      [failure("no stored Databricks token", { errorCode: "NO_STORED_TOKEN" }), false],
+      [failure("token endpoint 400", { status: 400, errorCode: "invalid_grant" }), false],
+      [failure("token endpoint 401", { status: 401 }), false],
+      [failure("net::ERR_FAILED", { status: 403 }), false],
+      [new Error("Databricks session creation redirected to authentication"), false],
+      [new Error("fetch failed"), false],
+      [failure("Workspace selection cancelled", { name: "AbortError" }), false],
+      [new TypeError("Invalid URL"), false],
+      ["net::ERR_FAILED", false],
+      [null, false],
+    ]) {
+      assert.equal(isTransientRenewalError(error), transient, String(error?.message ?? error));
+    }
   });
 });

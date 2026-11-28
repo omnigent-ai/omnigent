@@ -8,16 +8,13 @@ import re
 from typing import Any
 
 import zstandard
-from sqlalchemy import LargeBinary, asc, select, type_coerce, update
-from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import LargeBinary, asc, select, tuple_, type_coerce, update
 from sqlalchemy.orm import Session
-from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.compression import decode
-from omnigent.db.db_models import SqlProject, SqlUser, current_workspace_id
+from omnigent.db.compression import decode, encode
+from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
+from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -35,6 +32,8 @@ from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
 # above any realistic set of default-session hints (a few short keys) while
 # still capping abuse.
 _CONFIG_MAX_SERIALIZED_LEN = 64 * 1024
+_PROJECT_ORDER_KEY = "project_order"
+_PREFERENCE_MAX_STORED_BYTES = 65535
 
 
 def _encode_config(config: dict[str, Any] | None) -> str | None:
@@ -91,6 +90,16 @@ def _to_entity(row: SqlProject) -> Project:
         updated_at=row.updated_at,
         config=_decode_config(row.config),
     )
+
+
+def _encode_order(preference: ProjectOrderPreference) -> str:
+    """Serialize an order only if its compressed frame fits a MySQL BLOB."""
+    serialized = json.dumps(preference, separators=(",", ":"))
+    stored = encode(serialized)
+    assert stored is not None
+    if len(stored) > _PREFERENCE_MAX_STORED_BYTES:
+        raise OmnigentError("Project order is too large to save", code=ErrorCode.INVALID_INPUT)
+    return serialized
 
 
 def _decode_order(raw: bytes | str | memoryview | None) -> ProjectOrderPreference:
@@ -247,6 +256,29 @@ class SqlAlchemyProjectStore(ProjectStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
+    def list_page(
+        self, *, user_id: str | None, limit: int, after_id: str | None = None
+    ) -> tuple[builtins.list[Project], bool]:
+        """Return a ``(created_at, id)`` keyset page served by ``ix_projects_user_id``."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with self._session("list_projects_page") as session:
+            stmt = (
+                select(SqlProject)
+                .where(SqlProject.workspace_id == current_workspace_id())
+                .where(SqlProject.user_id == user_id)
+            )
+            if after_id is not None:
+                after = session.get(SqlProject, (current_workspace_id(), after_id))
+                if after is None or after.user_id != user_id:
+                    raise ValueError("after must be the id of one of your projects")
+                stmt = stmt.where(
+                    tuple_(SqlProject.created_at, SqlProject.id) > (after.created_at, after.id)
+                )
+            stmt = stmt.order_by(asc(SqlProject.created_at), asc(SqlProject.id)).limit(limit + 1)
+            rows = session.execute(stmt).scalars().all()
+            return [_to_entity(row) for row in rows[:limit]], len(rows) > limit
+
     def update(
         self,
         project_id: str,
@@ -311,14 +343,15 @@ class SqlAlchemyProjectStore(ProjectStore):
         return preference["ordered_project_ids"] if preference["sort_mode"] == "manual" else None
 
     def get_order_preference(self, *, user_id: str | None) -> ProjectOrderPreference:
-        """Read the preference without loading authentication fields."""
+        """Read project ordering from the user's preferences."""
         preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
         with self._session("read_project_order") as session:
             # Decode raw bytes here so malformed values cannot fail in the ORM result processor.
             raw = session.scalar(
-                select(type_coerce(SqlUser.project_order, LargeBinary)).where(
-                    SqlUser.workspace_id == current_workspace_id(),
-                    SqlUser.id == preference_user_id,
+                select(type_coerce(SqlPreference.value, LargeBinary)).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == preference_user_id,
+                    SqlPreference.key == _PROJECT_ORDER_KEY,
                 )
             )
             return _decode_order(raw)
@@ -334,8 +367,12 @@ class SqlAlchemyProjectStore(ProjectStore):
             workspace_id = current_workspace_id()
             if ids is None:
                 raw = session.scalar(
-                    select(type_coerce(SqlUser.project_order, LargeBinary))
-                    .where(SqlUser.workspace_id == workspace_id, SqlUser.id == preference_user_id)
+                    select(type_coerce(SqlPreference.value, LargeBinary))
+                    .where(
+                        SqlPreference.workspace_id == workspace_id,
+                        SqlPreference.user_id == preference_user_id,
+                        SqlPreference.key == _PROJECT_ORDER_KEY,
+                    )
                     .with_for_update()
                 )
                 preference = _decode_order(raw)
@@ -343,12 +380,13 @@ class SqlAlchemyProjectStore(ProjectStore):
                 if raw is None:
                     return preference
                 session.execute(
-                    update(SqlUser)
+                    update(SqlPreference)
                     .where(
-                        SqlUser.workspace_id == workspace_id,
-                        SqlUser.id == preference_user_id,
+                        SqlPreference.workspace_id == workspace_id,
+                        SqlPreference.user_id == preference_user_id,
+                        SqlPreference.key == _PROJECT_ORDER_KEY,
                     )
-                    .values(project_order=json.dumps(preference, separators=(",", ":")))
+                    .values(value=_encode_order(preference))
                 )
                 return preference
             owned = set(
@@ -365,42 +403,12 @@ class SqlAlchemyProjectStore(ProjectStore):
                 "sort_mode": "manual",
                 "ordered_project_ids": ids,
             }
-            encoded = json.dumps(preference, separators=(",", ":"))
-            values = {
-                "workspace_id": workspace_id,
-                "id": preference_user_id,
-                "is_admin": False,
-                "project_order": encoded,
-            }
-            dialect = self._engine.dialect.name
-            stmt: Insert
-            if dialect == "mysql":
-                stmt = (
-                    mysql_insert(SqlUser)
-                    .values(**values)
-                    .on_duplicate_key_update(
-                        project_order=encoded,
-                    )
-                )
-            elif dialect == "sqlite":
-                stmt = (
-                    sqlite_insert(SqlUser)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "id"],
-                        set_={"project_order": encoded},
-                    )
-                )
-            else:
-                stmt = (
-                    pg_insert(SqlUser)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "id"],
-                        set_={"project_order": encoded},
-                    )
-                )
-            session.execute(stmt)
+            upsert_preference_row(
+                session,
+                user_id=preference_user_id,
+                key=_PROJECT_ORDER_KEY,
+                value=_encode_order(preference),
+            )
             return preference
 
         return run_write_transaction(self._session_immediate, "save_project_order", write)

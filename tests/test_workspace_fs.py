@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+from omnigent import workspace_fs
+from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError, read_repository_branches
 
 
 def _git_env() -> dict[str, str]:
@@ -87,6 +89,20 @@ def test_read_text_file_returns_utf8_content(tmp_path: Path) -> None:
     assert result["content"] == "# Title\nbody\n"
 
 
+def test_read_text_file_has_no_agent_line_cap(tmp_path: Path) -> None:
+    """Host fallback serves the full file even when it exceeds 2,000 lines."""
+    content = "".join(f"# line {i}: café\n" for i in range(1, 3_001))
+    (tmp_path / "large.py").write_text(content, encoding="utf-8")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("large.py")
+
+    assert result["truncated"] is False
+    assert result["encoding"] == "utf-8"
+    assert result["content"] == content
+    assert result["bytes"] == len(content.encode("utf-8"))
+
+
 def test_read_binary_file_returns_base64(tmp_path: Path) -> None:
     """Reading a non-UTF-8 file returns base64-encoded content.
 
@@ -111,6 +127,41 @@ def test_read_missing_file_raises_not_found(tmp_path: Path) -> None:
     with pytest.raises(WorkspaceReaderError) as excinfo:
         reader.list_or_read("nope.txt")
     assert excinfo.value.status == 404
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
+def test_read_fifo_raises_not_found_without_blocking(tmp_path: Path) -> None:
+    """A FIFO with no writer answers 404 instead of hanging the reader thread."""
+    os.mkfifo(tmp_path / "pipe")
+    reader = WorkspaceReader(tmp_path)
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.read_file_bytes("pipe")
+    assert excinfo.value.status == 404
+
+
+def test_list_directory_skips_a_non_utf8_name_and_pages_past_it(tmp_path: Path) -> None:
+    """A name that isn't valid UTF-8 can't be sent; every other entry stays reachable."""
+    for name in ("a.txt", "z.txt"):
+        (tmp_path / name).write_text("x")
+    try:
+        with open(os.fsencode(tmp_path) + b"/m\xff.txt", "wb"):
+            pass
+    except OSError:
+        pytest.skip("this filesystem rejects non-UTF-8 names")
+    reader = WorkspaceReader(tmp_path)
+
+    names: list[str] = []
+    after: str | None = None
+    while True:
+        page = reader.list_directory("", limit=1, after=after)
+        names += [e["name"] for e in page.data]
+        if not page.has_more:
+            break
+        after = page.last_id
+
+    assert names == ["a.txt", "z.txt"]
+    listing = reader.list_or_read("", limit=10, order="asc")
+    assert [e["name"] for e in listing["data"]] == ["a.txt", "z.txt"]  # type: ignore[union-attr]
 
 
 def test_read_oversize_file_is_capped_and_flagged(tmp_path: Path, monkeypatch) -> None:
@@ -366,13 +417,14 @@ def test_changes_lists_git_working_tree_modifications(tmp_path: Path) -> None:
     by_path = {e["path"]: e for e in result["data"]}
     assert by_path["committed.txt"]["status"] == "modified"
     assert by_path["new.txt"]["status"] == "created"
-    # Line counts come from numstat (git diff HEAD), so the host-served
-    # list surfaces them just like the runner endpoint. The tracked edit
-    # rewrote one line; the untracked file isn't in numstat → no counts.
+    # The host-served list matches the runner: the tracked edit gets numstat
+    # counts (one line rewritten); the untracked file reports untracked_lines.
     assert by_path["committed.txt"]["lines_added"] == 1
     assert by_path["committed.txt"]["lines_removed"] == 1
+    assert by_path["committed.txt"]["untracked_lines"] is None
     assert by_path["new.txt"]["lines_added"] is None
     assert by_path["new.txt"]["lines_removed"] is None
+    assert by_path["new.txt"]["untracked_lines"] == 1
 
 
 def test_diff_returns_before_and_after_for_modified_file(tmp_path: Path) -> None:
@@ -445,15 +497,103 @@ def _git_branch_repo(path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("state", ["pushed", "local", "deleted", "detached", "offline", "timeout"])
+def test_repository_branch_checks_original_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    """Remote existence, not tracking configuration, decides whether a fork can clone a branch."""
+    checkout = tmp_path / "repo"
+    checkout.mkdir()
+    _git_branch_repo(checkout)
+    remote = tmp_path / "remote.git"
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=checkout, check=True, capture_output=True, env=_git_env()
+        )
+
+    git("init", "--bare", str(remote))
+    git("remote", "add", "origin", str(tmp_path / "different.git"))
+    git("push", str(remote), "main")
+    if state in {"pushed", "deleted", "detached"}:
+        git("push", str(remote), "feature")
+        if state == "deleted":
+            # Leave a stale remote-tracking ref; the remote no longer has this branch.
+            git("update-ref", "refs/remotes/origin/feature", "HEAD")
+            git("push", str(remote), "--delete", "feature")
+        elif state == "detached":
+            git("checkout", "--detach")
+    url = str(remote if state != "offline" else tmp_path / "missing.git")
+    original_config = (checkout / ".git/config").read_bytes()
+    original_index = (checkout / ".git/index").read_bytes()
+    if state == "timeout":
+        original_run = subprocess.run
+
+        def run(args, **kwargs):
+            if "ls-remote" in args:
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return original_run(args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", run)
+    result = read_repository_branches(tmp_path, [{"url": url, "path": "repo"}])
+    assert result == {
+        "repositories": [
+            {
+                "url": url,
+                "branch": None if state == "detached" else "feature",
+                "pushed": True
+                if state == "pushed"
+                else False
+                if state in {"local", "deleted"}
+                else None,
+            }
+        ]
+    }
+    assert read_repository_branches(tmp_path, [{"url": url, "path": "missing"}]) == {
+        "repositories": [{"url": url, "branch": None, "pushed": None}]
+    }
+    assert read_repository_branches(checkout, [{"url": url, "path": ""}]) == result
+    if state == "pushed":
+        second = tmp_path / "second"
+        second.mkdir()
+        _git_branch_repo(second)
+        second_remote = tmp_path / "second.git"
+        git("init", "--bare", str(second_remote))
+        assert read_repository_branches(
+            tmp_path,
+            [
+                {"url": url, "path": "repo"},
+                {"url": str(second_remote), "path": "second"},
+            ],
+        ) == {
+            "repositories": [
+                {"url": url, "branch": "feature", "pushed": True},
+                {"url": str(second_remote), "branch": "feature", "pushed": False},
+            ]
+        }
+    assert (checkout / ".git/config").read_bytes() == original_config
+    assert (checkout / ".git/index").read_bytes() == original_index
+
+
+@pytest.mark.parametrize("path", ["../outside", "escape", "/outside"])
+def test_repository_branches_confine_checkout_paths(tmp_path: Path, path: str) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "escape").symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(WorkspaceReaderError) as failure:
+        read_repository_branches(workspace, [{"url": "https://example.com/repo", "path": path}])
+    assert failure.value.status == 400
+
+
 def test_github_info_without_gh_reports_no_pr(tmp_path: Path, monkeypatch) -> None:
     """Without ``gh`` the host reports the git repo/branch but no PR or base.
 
     The tab is a pure PR view, so ``base_ref`` stays null until a PR resolves it.
     """
-    from omnigent import workspace_fs
+    from omnigent.runner import github_resource
 
     _git_branch_repo(tmp_path)
-    monkeypatch.setattr(workspace_fs.github_resource.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
     reader = WorkspaceReader(tmp_path)
 
     info = reader.github_info()
@@ -466,7 +606,7 @@ def test_github_info_without_gh_reports_no_pr(tmp_path: Path, monkeypatch) -> No
 
 def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
     """``github_changes`` delegates to the gh-backed PR file list."""
-    from omnigent import workspace_fs
+    from omnigent.runner import github_resource
 
     _git_branch_repo(tmp_path)
 
@@ -481,7 +621,7 @@ def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
             )
         return (1, "", "")
 
-    monkeypatch.setattr(workspace_fs.github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
     reader = WorkspaceReader(tmp_path)
 
     result = reader.github_changes()
@@ -503,7 +643,7 @@ def test_github_file_diff_returns_before_after(tmp_path: Path) -> None:
 
 def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None:
     """``github_pr_diff`` resolves the PR number, then delegates to ``gh pr diff <n>``."""
-    from omnigent import workspace_fs
+    from omnigent.runner import github_resource
 
     _git_branch_repo(tmp_path)
 
@@ -514,10 +654,125 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
             return (0, "diff --git a/app.txt b/app.txt\n+changed\n", "")
         return (1, "", "")
 
-    monkeypatch.setattr(workspace_fs.github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
     reader = WorkspaceReader(tmp_path)
 
     result = reader.github_pr_diff()
 
     assert "diff --git a/app.txt b/app.txt" in result["patch"]
     assert "+changed" in result["patch"]
+
+
+def test_search_finds_tracked_files_past_the_scan_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors the runner: tracked files come from git's index whatever the walk
+    budget, and untracked ones from the latest ``git status`` once one has run,
+    so a host-served search on a huge repo agrees with the runner's."""
+    _git_repo(tmp_path)
+    env = _git_env()
+    many = tmp_path / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (tmp_path / "zzz").mkdir()
+    (tmp_path / "zzz" / "target.jsonnet").write_text("y")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "more"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target")
+    assert [e["path"] for e in result["data"]] == ["zzz/target.jsonnet"], result
+    # Until a git status has run, untracked coverage is the walk's — which ran
+    # out of budget in aaa/.
+    assert result["truncated"] is True
+
+    reader.changes("conv")
+    result = reader.search("zzz")
+    assert [(e["path"], e["type"]) for e in result["data"]] == [
+        ("zzz", "directory"),
+        ("zzz/scratch.txt", "file"),
+        ("zzz/target.jsonnet", "file"),
+    ], result
+    # The walk still ran (only it can find ignored files) and still ran out of
+    # budget in aaa/, so the answer stays flagged as possibly incomplete.
+    assert result["truncated"] is True
+
+
+def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``.git`` sorts first and in a clone holds more entries than the whole
+    budget; the walk used to spend all of it there and miss every real file."""
+    _git_repo(tmp_path)
+    (tmp_path / "zz.txt").write_text("x")  # untracked: only the walk can find it
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("zz")
+
+    assert [e["path"] for e in result["data"]] == ["zz.txt"]
+    assert result["truncated"] is False
+
+
+def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Path) -> None:
+    """Ignored files are in neither git's index nor ``git status``, so only the
+    walk can find them — it must keep running once a status snapshot exists."""
+    _git_repo(tmp_path)
+    env = _git_env()
+    (tmp_path / ".gitignore").write_text("build/\n")
+    subprocess.run(
+        ["git", "add", ".gitignore"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "ignore"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "out.log").write_text("ignored")
+    reader = WorkspaceReader(tmp_path)
+
+    reader.changes("conv")
+    result = reader.search("out.log")
+
+    assert [e["path"] for e in result["data"]] == ["build/out.log"], result
+    assert result["truncated"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX filesystem root")
+def test_search_from_filesystem_root_keeps_paths_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reader rooted at ``/`` slices result paths off a root that already ends
+    in the separator; slicing one more character used to turn ``etc`` into ``tc``."""
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 60)
+    reader = WorkspaceReader(Path("/"))
+
+    result = reader.search("etc")
+
+    paths = [e["path"] for e in result["data"]]
+    assert "etc" in paths, paths
+    assert all((Path("/") / p).exists() for p in paths), paths
+
+
+def test_listing_and_reading_never_start_the_change_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Starting the registry may write Git config, so only changes, diffs and search start it."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "a.txt").write_text("a")
+    started: list[Path] = []
+    real = workspace_fs.create_filesystem_registry
+
+    def recording(root: Path) -> object:
+        started.append(root)
+        return real(root)
+
+    monkeypatch.setattr(workspace_fs, "create_filesystem_registry", recording)
+    reader = WorkspaceReader(tmp_path)
+
+    reader.list_directory("", limit=10, after=None)
+    reader.read_file_bytes("a.txt")
+    assert started == []
+    reader.changes("s1")
+    reader.changes("s1")
+    assert started == [tmp_path.resolve()]

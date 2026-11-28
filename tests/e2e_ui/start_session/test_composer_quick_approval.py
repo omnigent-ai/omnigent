@@ -45,7 +45,7 @@ async def _drive(base_url: str, session_id: str, output: Path) -> None:
                 path=output / "quick-bypass-option.png", animations="disabled"
             )
             await page.get_by_role(
-                "menuitem", name="Bypass approvals & sandbox", exact=True
+                "menuitemradio", name="Bypass approvals & sandbox", exact=True
             ).click()
             await expect(chip).to_contain_text("Bypass approvals & sandbox")
             await page.locator("[data-composer-card]").screenshot(

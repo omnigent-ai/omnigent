@@ -1,0 +1,652 @@
+"""Browser-lane coverage for live status events reaching chat indicators."""
+
+from __future__ import annotations
+
+import json
+import re
+from itertools import pairwise
+
+import pytest
+from playwright.sync_api import Locator, Page, expect
+
+from tests.browser_ui.chat._geometry_helpers import open_live
+from tests.browser_ui.chat.session_contract import (
+    ChatSessionContract,
+    message_item,
+    session_status_event,
+)
+
+_WORKING_LABEL_RE = re.compile(
+    r"^(Working|Cooking|Crunching|Tinkering|Pondering|Brewing|Noodling|Wrangling|"
+    r"Conjuring|Assembling|Percolating|Untangling|Scheming|Finagling|Whirring|Puzzling)…$"
+)
+_MONITOR_TASK = {
+    "id": "monitor-ci",
+    "type": "shell",
+    "status": "running",
+    "description": (
+        "Watch PR checks and review comments while CI finishes, including new failures "
+        "and the final review approval before the pull request is ready to merge"
+    ),
+    "command": (
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "endpoint=repos/example/monitoring-compatibility-checks-for-background-task-indicators/"
+        "commits/0123456789abcdef0123456789abcdef01234567/check-runs\n"
+        "while true; do\n"
+        '  checks=$(gh api "$endpoint")\n'
+        "  echo \"$checks\" | jq -r '.check_runs[].conclusion'\n"
+        '  pending=$(echo "$checks" | jq \'[.check_runs[] | select(.status != "completed")] '
+        "| length')\n"
+        '  if [ "$pending" -eq 0 ]; then\n'
+        "    break\n"
+        "  fi\n"
+        "  sleep 15\n"
+        "done"
+    ),
+}
+
+
+def _background_status(
+    chat: ChatSessionContract,
+    count: int,
+    tasks: list[dict[str, str]] | None = None,
+) -> None:
+    data: dict[str, object] = {
+        "conversation_id": chat.session_id,
+        "status": "idle",
+        "background_task_count": count,
+    }
+    if tasks is not None:
+        data["background_tasks"] = tasks
+    chat.emit({"event": "session.status", "data": data})
+
+
+def _pill(page: Page, count: int, *, working: bool = False) -> Locator:
+    """The compact badge, located by its accessible name.
+
+    The visible text is the bare count; the sentence form is the accessible
+    name, prefixed with "Agent working —" while the agent's turn is active.
+    """
+    plural = "" if count == 1 else "s"
+    name = f"{count} background task{plural} still running"
+    if working:
+        name = f"Agent working — {name}"
+    return page.get_by_role("button", name=name, exact=True)
+
+
+@pytest.mark.browser_context_args(has_touch=True)
+@pytest.mark.parametrize("width", [320, 390])
+def test_mobile_layout_reveals_timestamps_and_pending_steering(
+    page: Page, chat_session_contract: ChatSessionContract, width: int
+) -> None:
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+    chat.set_items(
+        [
+            {
+                **message_item("answer", "assistant", "Previous answer", response_id="previous"),
+                "created_at": 1_762_000_000,
+            }
+        ]
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    assert page.evaluate("matchMedia('(pointer:coarse)').matches")
+    timestamp = page.get_by_test_id("message-timestamp")
+    expect(timestamp).to_be_visible()
+    opacity = """element => {
+      let value = 1;
+      for (let node = element; node; node = node.parentElement)
+        value *= Number(getComputedStyle(node).opacity);
+      return value;
+    }"""
+    assert timestamp.evaluate(opacity) >= 0.39
+    chat.emit_busy("current")
+    expect(page.get_by_test_id("working-indicator")).to_be_visible()
+    page.evaluate("localStorage.setItem('omnigent:always-steer', 'true')")
+    chat.event_ack = {"queued": True, "pending_id": "steer"}
+    page.get_by_label("Message the agent").fill("Keep this explanation visible on touch")
+    page.get_by_role("button", name="Send", exact=True).click()
+    notice = page.get_by_test_id("message-awaiting-agent")
+    expect(notice).to_be_visible()
+    page.wait_for_function(f"element => ({opacity})(element) >= 0.39", arg=notice.element_handle())
+    assert notice.evaluate(opacity) >= 0.39
+    footer = notice.locator("..")
+    # Read both boxes in one frame while the pending bubble animates into place.
+    notice_box, timestamp_box = footer.evaluate(
+        """footer => {
+          const bounds = testId => footer.querySelector(`[data-testid="${testId}"]`)
+            ?.getBoundingClientRect().toJSON();
+          return [bounds('message-awaiting-agent'), bounds('message-timestamp')];
+        }"""
+    )
+    assert notice_box is not None and timestamp_box is not None
+    assert notice_box["y"] == pytest.approx(timestamp_box["y"], abs=1)
+    assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1
+
+
+@pytest.mark.parametrize("message", ["text", "attachment"])
+def test_steering_explanation_stays_visible_on_desktop(
+    page: Page, chat_session_contract: ChatSessionContract, message: str
+) -> None:
+    """An unread steer shows its note and whole footer without waiting for hover."""
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    chat.update_session(status="running", labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+    chat.reject_uploads = False
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    chat.emit_busy("current")
+    expect(page.get_by_test_id("working-indicator")).to_be_visible()
+    page.evaluate("localStorage.setItem('omnigent:always-steer', 'true')")
+    chat.event_ack = {"queued": True, "pending_id": "steer"}
+    if message == "text":
+        page.get_by_label("Message the agent").fill("Read this after your current step")
+    else:
+        page.locator('form.chat-composer-form input[type="file"]').set_input_files(
+            [{"name": "notes.txt", "mimeType": "text/plain", "buffer": b"Notes"}]
+        )
+    send = page.get_by_role("button", name="Send", exact=True)
+    expect(send).to_be_enabled()
+    send.click()
+    notice = page.get_by_test_id("message-awaiting-agent")
+    expect(notice).to_be_visible()
+    page.mouse.move(0, 0)
+    opacity = """element => {
+      let value = 1;
+      for (let node = element; node; node = node.parentElement)
+        value *= Number(getComputedStyle(node).opacity);
+      return value;
+    }"""
+    for element in (notice, page.get_by_test_id("message-timestamp")):
+        page.wait_for_function(
+            f"element => ({opacity})(element) >= 0.99", arg=element.element_handle()
+        )
+
+
+def _presented_frames_per_second(page: Page, seconds: float) -> float:
+    browser = page.context.browser
+    assert browser is not None
+    browser.start_tracing(page=page, categories=["viz"])
+    page.wait_for_timeout(seconds * 1000)
+    events = json.loads(browser.stop_tracing())["traceEvents"]
+    return sum(event.get("name") == "Display::DrawAndSwap" for event in events) / seconds
+
+
+def test_bare_idle_clears_the_live_working_indicator(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """The real SPA consumes a running edge followed by an id-less idle.
+
+    While no events arrive, the Working indicator keeps moving without redrawing at display rate.
+    """
+    chat = chat_session_contract
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    working = page.get_by_test_id("working-indicator")
+
+    chat.emit_busy("browser-turn")
+    expect(working).to_be_visible(timeout=10_000)
+    working_font = working.locator(".text-shimmer").evaluate(
+        "element => getComputedStyle(element).fontFamily"
+    )
+    body_font = page.evaluate("() => getComputedStyle(document.body).fontFamily")
+    assert working_font == body_font
+    shimmer = working.locator(".text-shimmer").element_handle()
+    started = shimmer.evaluate("element => getComputedStyle(element).backgroundPosition")
+    frames_per_second = _presented_frames_per_second(page, 3)
+    assert 5 <= frames_per_second < 30, f"a waiting session drew {frames_per_second:.1f} frames/s"
+    page.wait_for_function(
+        f"element => getComputedStyle(element).backgroundPosition !== {json.dumps(started)}",
+        arg=shimmer,
+        timeout=2_000,
+    )
+
+    chat.emit_idle(None)
+    expect(working).to_be_hidden(timeout=10_000)
+
+
+# Each painted frame's top of the matching paragraph, read after the app's resize observers.
+_TRACK_PARAGRAPH_TOPS = """(text) => {
+    window.__paragraphTops = [];
+    const record = () => {
+        const paragraph = [...document.querySelectorAll('[role="log"] p')]
+            .find((element) => element.textContent.includes(text));
+        if (paragraph) {
+            const top = paragraph.getBoundingClientRect().top;
+            window.__paragraphTops.push({ top, time: performance.now() });
+        }
+    };
+    const sample = () => {
+        const observer = new ResizeObserver(() => {
+            observer.disconnect();
+            record();
+        });
+        observer.observe(document.body);
+        requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+}"""
+
+
+def test_turn_end_eases_a_transcript_at_its_end_down(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """The Working row eases closed when the turn ends, so the transcript doesn't drop.
+
+    Removing the row at once moved a transcript scrolled to its end down by the
+    row's height and gap (38px) in one frame.
+    """
+    chat = chat_session_contract
+    response_id = "turn-end"
+    earlier = []
+    for index in range(6):
+        earlier += [
+            message_item(f"earlier-user-{index}", "user", "A question?", response_id=f"r{index}"),
+            message_item(
+                f"earlier-answer-{index}",
+                "assistant",
+                "An earlier answer long enough to fill the screen. " * 6,
+                response_id=f"r{index}",
+            ),
+        ]
+    user = message_item("turn-end-user", "user", "One more question?", response_id=response_id)
+    chat.set_items(list(reversed([*earlier, user])))
+    chat.update_session(status="running")
+    open_live(page, chat)
+    chat.emit_busy(response_id)
+    chat.emit(
+        {
+            "event": "response.created",
+            "data": {"id": response_id, "status": "in_progress", "output": []},
+        }
+    )
+    text = "The reply's only paragraph ends here."
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": f"{text}\n"}})
+    expect(page.locator('[role="log"] p', has_text="only paragraph")).to_be_visible(timeout=10_000)
+    page.wait_for_timeout(500)
+    page.evaluate(_TRACK_PARAGRAPH_TOPS, "only paragraph")
+    page.wait_for_function("() => window.__paragraphTops.length >= 5")
+    row = page.get_by_test_id("working-indicator").bounding_box()
+    assert row
+    page.evaluate(_RECORD_CLOSING_ROW)
+
+    answer = message_item("turn-end-answer", "assistant", text, response_id=response_id)
+    chat.emit({"event": "response.output_item.done", "data": {"item": answer}})
+    chat.emit(
+        {
+            "event": "response.completed",
+            "data": {"id": response_id, "status": "completed", "output": []},
+        }
+    )
+    chat.emit_idle(response_id)
+    expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=10_000)
+    # Sample the frame that paints the row's removal.
+    page.evaluate(
+        "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
+    )
+
+    samples = page.evaluate("() => window.__paragraphTops")
+    moves = [
+        (after["time"], round(after["top"] - before["top"], 1))
+        for before, after in pairwise(samples)
+        if after["top"] != before["top"]
+    ]
+    steps = [step for _, step in moves]
+    assert sum(steps) > 20, f"the transcript didn't move when the turn ended: {steps}"
+    # The frame sampler drops frames on a loaded runner, so its timing can't show the ease.
+    # The close animation's own duration can: removing the row at once runs no animation.
+    durations = page.evaluate("() => window.__closingDurations")
+    assert durations and max(durations) >= 40, (
+        f"the Working row closed at once, not eased: durations {durations}, steps {steps}"
+    )
+
+
+# Records the duration of each animation the Working row runs when it closes.
+_RECORD_CLOSING_ROW = """(() => {
+    window.__closingDurations = [];
+    const animate = Element.prototype.animate;
+    Element.prototype.animate = function (...args) {
+        const animation = animate.apply(this, args);
+        if (this.querySelector('[data-testid="working-indicator"]')) {
+            window.__closingDurations.push(animation.effect.getComputedTiming().duration);
+        }
+        return animation;
+    };
+})()"""
+
+
+# Pauses the indicator's animations and steps them through 3.4s, recording what moves.
+_STEP_WORKING_ANIMATIONS = """(indicator) => {
+  const starfish = indicator.querySelector(".otto-working");
+  const eye = starfish.querySelector(".otto-eye");
+  const label = indicator.querySelector(".text-shimmer");
+  const animations = indicator.getAnimations({ subtree: true });
+  for (const animation of animations) animation.pause();
+  const frames = [];
+  for (let time = 0; time <= 3400; time += 100) {
+    for (const animation of animations) animation.currentTime = time;
+    const row = starfish.parentElement.getBoundingClientRect();
+    frames.push({
+      starfishTop: starfish.getBoundingClientRect().top - row.top,
+      eyeHeight: eye.getBoundingClientRect().height,
+      labelShimmer: getComputedStyle(label).backgroundPosition,
+    });
+  }
+  return frames;
+}"""
+
+
+def test_working_starfish_holds_still_while_it_blinks_and_the_label_shimmers(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Only the starfish's eyes and the label animate while Working shows."""
+    chat = chat_session_contract
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    working = page.get_by_test_id("working-indicator")
+
+    chat.emit_busy("browser-turn")
+    expect(working).to_be_visible(timeout=10_000)
+
+    frames = working.evaluate(_STEP_WORKING_ANIMATIONS)
+    tops = sorted({frame["starfishTop"] for frame in frames})
+    assert len(tops) == 1, f"the starfish moved between offsets {tops}"
+    assert len({frame["eyeHeight"] for frame in frames}) > 1, "the eyes stopped blinking"
+    assert len({frame["labelShimmer"] for frame in frames}) > 1, "the label stopped shimmering"
+
+
+def test_blocked_reason_reaches_the_live_working_indicator(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A parked native turn names its reason and clears it on the next edge."""
+    chat = chat_session_contract
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    working = page.get_by_test_id("working-indicator")
+
+    chat.emit(
+        {
+            "event": "session.status",
+            "data": {
+                "conversation_id": chat.session_id,
+                "status": "running",
+                "blocked_on": "permission prompt",
+            },
+        }
+    )
+    expect(working).to_contain_text(
+        "Waiting for your approval in the agent's terminal.", timeout=10_000
+    )
+
+    chat.emit(session_status_event(chat.session_id, "running"))
+    expect(working).not_to_contain_text("Waiting for your approval", timeout=10_000)
+    expect(working.get_by_text(_WORKING_LABEL_RE)).to_be_visible(timeout=10_000)
+
+    chat.emit_idle(None)
+    expect(working).to_be_hidden(timeout=10_000)
+
+
+@pytest.mark.parametrize(
+    "width",
+    [1280, pytest.param(375, marks=pytest.mark.browser_context_args(has_touch=True))],
+)
+def test_background_task_pill_carries_the_working_state(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """While a turn runs the pill shows a spinner and says so; once idle it is plain again.
+
+    The narrow case is the phone header mount, where the end-of-thread shimmer is
+    usually scrolled out of view and the badge is the only working cue left.
+    """
+    chat = chat_session_contract
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    working = page.get_by_test_id("working-indicator")
+    spinner = page.get_by_test_id("background-task-working")
+
+    _background_status(chat, 1, [_MONITOR_TASK])
+    expect(_pill(page, 1)).to_have_text("1", timeout=10_000)
+    expect(working).to_have_count(0)
+    expect(spinner).to_have_count(0)
+
+    # A running edge carries no count: the sticky tally must survive it.
+    chat.emit_busy("browser-turn")
+    expect(working).to_be_visible(timeout=10_000)
+    expect(_pill(page, 1, working=True)).to_have_text("1")
+    expect(spinner).to_be_visible()
+
+    _background_status(chat, 1, [_MONITOR_TASK])
+    expect(working).to_be_hidden(timeout=10_000)
+    expect(_pill(page, 1)).to_have_text("1")
+    expect(spinner).to_have_count(0)
+
+    _background_status(chat, 0)
+    expect(page.get_by_test_id("background-task-pill")).to_have_count(0)
+
+
+def test_action_banner_follows_the_launch(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A launch that reports ``action_required`` shows its details until it moves on."""
+    chat = chat_session_contract
+    chat.set_health(runner_online=False, host_online=True)
+    chat.update_session(
+        host_id=None,
+        workspace=None,
+        sandbox_status={
+            "stage": "action_required",
+            "provider": "arclet",
+            "details": "Refresh your dbcert on your laptop.",
+        },
+    )
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    banner = page.get_by_role("status").filter(has_text="Refresh your dbcert on your laptop.")
+    expect(banner).to_be_visible(timeout=20_000)
+
+    # The credential arrives. Like the server, update the snapshot as well as the stream.
+    chat.update_session(sandbox_status={"stage": "provisioning", "provider": "arclet"})
+    chat.emit(
+        {
+            "event": "session.sandbox_status",
+            "data": {
+                "type": "session.sandbox_status",
+                "conversation_id": chat.session_id,
+                "stage": "provisioning",
+                "provider": "arclet",
+            },
+        }
+    )
+    expect(banner).to_be_hidden(timeout=10_000)
+
+
+@pytest.mark.parametrize("turns", [0, 1])
+@pytest.mark.parametrize("width", [1280, 375])
+def test_sandbox_failure_stays_in_transcript_above_composer(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    turns: int,
+    width: int,
+) -> None:
+    """Live and persisted launch failures replace progress in the conversation."""
+    chat = chat_session_contract
+    page.set_viewport_size({"width": width, "height": 844})
+    chat.seed_transcript(turns)
+    chat.set_health(runner_online=False, host_online=False)
+    chat.update_session(
+        host_id=None,
+        workspace=None,
+        sandbox_status={"stage": "provisioning", "provider": "arclet"},
+    )
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    expect(page.get_by_test_id("runner-starting-indicator")).to_be_visible(timeout=20_000)
+
+    # A queued turn can still be marked running when sandbox startup fails.
+    chat.emit_busy("launching-turn")
+    status = {"stage": "failed", "provider": "arclet", "error": "Sandbox allocation failed."}
+    chat.update_session(sandbox_status=status)
+    chat.emit(
+        {
+            "event": "session.sandbox_status",
+            "data": {
+                "type": "session.sandbox_status",
+                "conversation_id": chat.session_id,
+                **status,
+            },
+        }
+    )
+
+    failure = page.get_by_test_id("sandbox-failed-indicator")
+    for persisted in (False, True):
+        if persisted:
+            page.reload()
+        expect(failure).to_have_count(1)
+        expect(page.get_by_role("log").get_by_test_id("sandbox-failed-indicator")).to_be_visible()
+        expect(page.get_by_test_id("runner-starting-indicator")).to_be_hidden()
+        expect(page.get_by_test_id("working-indicator")).to_be_hidden()
+        composer = page.get_by_label("Message the agent")
+        expect(composer).to_be_visible()
+        failure_box = failure.bounding_box()
+        composer_box = composer.bounding_box()
+        assert failure_box is not None and composer_box is not None
+        assert failure_box["y"] + failure_box["height"] <= composer_box["y"]
+        failure.get_by_test_id("error-pill").click()
+        expect(failure.get_by_test_id("error-message-content")).to_contain_text(
+            "Sandbox allocation failed."
+        )
+
+
+@pytest.mark.parametrize(
+    "width",
+    [1280, pytest.param(375, marks=pytest.mark.browser_context_args(has_touch=True))],
+)
+def test_background_task_popover_stays_interactive_and_within_viewport(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """Popover layout, animation focus, and native touch survive real browser geometry."""
+    chat = chat_session_contract
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    _background_status(chat, 1, [_MONITOR_TASK])
+
+    def activate(control: Locator) -> None:
+        if width < 1181:
+            control.tap()
+        else:
+            control.click()
+
+    pill = _pill(page, 1)
+    expect(pill).to_have_text("1", timeout=10_000)
+    expect(pill).to_have_attribute("aria-expanded", "false")
+    activate(pill)
+
+    panel = page.get_by_role("dialog", name="1 background task", exact=True)
+    expect(panel).to_be_visible()
+    description = panel.get_by_text(_MONITOR_TASK["description"], exact=True)
+    command = panel.get_by_text(_MONITOR_TASK["command"], exact=True)
+    expand_command = panel.get_by_role("button", name="Expand command", exact=True)
+    collapse_command = panel.get_by_role("button", name="Collapse command", exact=True)
+    expect(description).to_be_visible()
+    expect(command).to_be_visible()
+    expect(expand_command).to_have_attribute("aria-expanded", "false")
+
+    def compact_command_height() -> float:
+        dimensions = command.evaluate(
+            """element => ({
+              height: element.clientHeight,
+              lineHeight: parseFloat(getComputedStyle(element).lineHeight),
+            })"""
+        )
+        assert 0 < dimensions["height"] <= 2 * dimensions["lineHeight"] + 1
+        return dimensions["height"]
+
+    compact_height = compact_command_height()
+    compact_panel_height = panel.evaluate("element => element.clientHeight")
+    bounds = panel.bounding_box()
+    assert bounds is not None
+    assert bounds["x"] >= 0
+    assert bounds["x"] + bounds["width"] <= width
+    for element in (panel, description, command):
+        assert element.evaluate("node => node.scrollWidth <= node.clientWidth + 1")
+
+    toggle_bounds = expand_command.bounding_box()
+    command_bounds = command.bounding_box()
+    description_bounds = description.bounding_box()
+    assert toggle_bounds is not None and command_bounds is not None
+    assert description_bounds is not None
+    assert toggle_bounds["x"] >= command_bounds["x"] + command_bounds["width"] - 0.5
+    assert toggle_bounds["y"] == pytest.approx(description_bounds["y"], abs=2)
+
+    activate(expand_command)
+    expect(collapse_command).to_have_attribute("aria-expanded", "true")
+    assert command.evaluate("element => element.clientHeight") > compact_height
+    assert panel.evaluate("element => element.clientHeight") > compact_panel_height
+    for element in (panel, description, command):
+        assert element.evaluate("node => node.scrollWidth <= node.clientWidth + 1")
+
+    activate(collapse_command)
+    expect(expand_command).to_have_attribute("aria-expanded", "false")
+    assert compact_command_height() == pytest.approx(compact_height, abs=1)
+    assert panel.evaluate("element => element.clientHeight") == pytest.approx(
+        compact_panel_height, abs=1
+    )
+
+    activate(expand_command)
+    expect(collapse_command).to_have_attribute("aria-expanded", "true")
+    exit_animation = page.add_style_tag(
+        content='[data-slot="popover-content"][data-state="closed"] '
+        "{ animation-duration: 5s !important; }"
+    )
+    activate(pill)
+    expect(panel).to_have_attribute("data-state", "closed")
+    activate(pill)
+    expect(panel).to_have_attribute("data-state", "open")
+    expect(expand_command).to_have_attribute("aria-expanded", "false")
+    compact_command_height()
+    exit_animation.evaluate("element => element.remove()")
+
+    composer = page.get_by_label("Message the agent")
+    exit_animation = page.add_style_tag(
+        content='[data-slot="popover-content"][data-state="closed"] '
+        "{ animation-duration: 5s !important; }"
+    )
+    page.keyboard.press("Escape")
+    expect(panel).to_have_attribute("data-state", "closed")
+    activate(composer)
+    expect(composer).to_be_focused()
+    exit_animation.evaluate("element => element.remove()")
+    expect(panel).to_have_count(0)
+    expect(composer).to_be_focused()
+
+    draft = "Keep watching while I review."
+    page.keyboard.type(draft)
+    expect(composer).to_have_value(draft)
+    _background_status(chat, 0)
+    expect(page.get_by_test_id("background-task-pill")).to_have_count(0)
+    _background_status(chat, 1, [_MONITOR_TASK])
+    expect(_pill(page, 1)).to_have_attribute("aria-expanded", "false", timeout=10_000)
+    expect(composer).to_have_value(draft)

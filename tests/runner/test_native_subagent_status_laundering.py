@@ -19,14 +19,15 @@ from typing import Any
 
 import pytest
 
-from omnigent.runner import create_runner_app
+from omnigent.inner.executor import NativeTurnAcceptance
+from omnigent.runner import create_runner_app, subagent_work
 from tests.runner.conftest import (
     _drain_session_event_queue,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, accept_subagent_turn
 
 
 @pytest.mark.asyncio
@@ -61,15 +62,15 @@ async def test_trailing_idle_must_not_launder_failed_child_status() -> None:
 
     runner_app._session_event_queues_ref.pop(parent_id, None)
     runner_app._session_event_queues_ref.pop(child_id, None)
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_child_session(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_child_session(
         child_id,
         parent_session_id=parent_id,
         title="claude:impl",
         tool="claude",
         session_name="impl",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -94,9 +95,9 @@ async def test_trailing_idle_must_not_launder_failed_child_status() -> None:
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app.unregister_child_session(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_child_session(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
 
@@ -126,7 +127,6 @@ async def test_late_failed_report_must_not_be_discarded_by_delivered_completed()
     silently dropped. The parent (and any orchestrator reading child status)
     is left believing the turn succeeded.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
@@ -137,8 +137,8 @@ async def test_late_failed_report_must_not_be_discarded_by_delivered_completed()
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -168,10 +168,10 @@ async def test_late_failed_report_must_not_be_discarded_by_delivered_completed()
             )
             assert failed_resp.status_code == 204, failed_resp.text
 
-            entry = runner_app.get_subagent_work(child_id)
+            entry = subagent_work.get_subagent_work(child_id)
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert entry is not None
     assert entry.status == "failed", (
@@ -205,13 +205,12 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
     the parent inbox, so the send is run-or-failed — never accepted and
     dropped in silence.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    runner_app._session_inboxes_ref[parent_id] = inbox
-    entry = runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -222,7 +221,7 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
         # Absent on an unguarded runner: without the sweep, the wedged
         # dispatch simply stays "launching" and the behavioral asserts
         # below observe the silent loss directly.
-        reap = getattr(runner_app, "reap_stalled_subagent_launches", None)
+        reap = getattr(subagent_work, "reap_stalled_subagent_launches", None)
         if reap is not None:
             # Within the budget: the dispatch is left alone (still launching).
             assert reap(now=entry.created_at + 10.0, timeout_s=180.0) == []
@@ -239,29 +238,37 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
         )
         payload = inbox.get_nowait()
         assert payload["status"] == "failed", payload
-        assert "never started" in str(payload["output"]), (
+        assert "no start acknowledgment" in str(payload["output"]), (
             f"the parent must receive an explanatory failure, got {payload['output']!r}"
         )
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio
-async def test_started_dispatch_is_not_reaped_by_launch_liveness() -> None:
+@pytest.mark.parametrize(
+    "start_reported_before_prompt_accepted",
+    [False, True],
+    ids=["running-edge", "codex-start-reported-before-prompt-accepted"],
+)
+async def test_started_dispatch_is_not_reaped_by_launch_liveness(
+    start_reported_before_prompt_accepted: bool,
+) -> None:
     """
     A dispatch that produced a real edge must never be launch-reaped.
 
     Once the child has reported ``running`` (the launch proof), the liveness
     budget no longer applies — a long-running healthy child is not a wedge.
+    A codex child's start report can also beat the runner's own note that
+    Codex accepted the prompt; the later note must not re-arm the bound.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    runner_app._session_inboxes_ref[parent_id] = inbox
-    entry = runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -269,17 +276,21 @@ async def test_started_dispatch_is_not_reaped_by_launch_liveness() -> None:
     )
 
     try:
-        runner_app.mark_subagent_work_started(child_id)
+        if start_reported_before_prompt_accepted:
+            subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_running")
+        subagent_work.mark_subagent_work_started(child_id)
+        if start_reported_before_prompt_accepted:
+            accept_subagent_turn(child_id, thread_id="thread_running", response_id="codex_running")
         assert entry.status == "running"
-        reaped = runner_app.reap_stalled_subagent_launches(
+        reaped = subagent_work.reap_stalled_subagent_launches(
             now=entry.created_at + 10_000.0, timeout_s=180.0
         )
         assert reaped == []
         assert entry.status == "running"
         assert inbox.empty()
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work_for_session(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio
@@ -293,7 +304,6 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
     failure into the inbox without the wake leaves the parent hanging exactly
     as before — the failure is recorded where nobody will ever read it.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
@@ -315,8 +325,8 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
         server_client=_WakeRecordingServerClient(),  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = inbox
-    entry = runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -324,7 +334,7 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
     )
 
     try:
-        reaped = runner_app.reap_stalled_subagent_launches(
+        reaped = subagent_work.reap_stalled_subagent_launches(
             now=entry.created_at + 200.0,
             timeout_s=180.0,
             mark_terminal=app.state.mark_subagent_terminal_and_wake,
@@ -336,8 +346,8 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
 
         await asyncio.wait_for(wake_seen.wait(), timeout=5.0)
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     notice = wake_bodies[0]["data"]["content"][0]["text"]
     assert "finished (failed)" in notice, (
@@ -356,16 +366,681 @@ def test_launch_timeout_resolver_rejects_non_finite(
     without the explicit ``<= 0`` "disabled" intent. Non-finite values are
     rejected like non-numeric ones, falling back to the default.
     """
-    from omnigent.runner import app as runner_app
 
-    default = runner_app._DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    default = subagent_work._DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
     for bad in ("nan", "inf", "-inf", "+inf", "bogus"):
         monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", bad)
-        assert runner_app.resolve_subagent_launch_timeout_s() == default, bad
+        assert subagent_work.resolve_subagent_launch_timeout_s() == default, bad
     # Explicit disable and a valid override still work.
     monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", "0")
-    assert runner_app.resolve_subagent_launch_timeout_s() == 0.0
+    assert subagent_work.resolve_subagent_launch_timeout_s() == 0.0
     monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", "45.5")
-    assert runner_app.resolve_subagent_launch_timeout_s() == 45.5
+    assert subagent_work.resolve_subagent_launch_timeout_s() == 45.5
     monkeypatch.delenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S")
-    assert runner_app.resolve_subagent_launch_timeout_s() == default
+    assert subagent_work.resolve_subagent_launch_timeout_s() == default
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel_before_result", [False, True], ids=["direct", "after-unconfirmed-cancel"]
+)
+async def test_real_completion_replaces_a_launch_timeout_failure(
+    cancel_before_result: bool,
+) -> None:
+    """
+    A child's own terminal edge overrides the reaper's "no start acknowledgment".
+
+    User journey: a parent sends a follow-up to a worker that is already busy;
+    no fresh ``running`` edge is relayed, so the launch-liveness reaper fails
+    the dispatch at the budget and tells the parent. Minutes later the worker
+    genuinely finishes and its ``idle`` edge arrives as ``completed``. That
+    completion must be delivered — the reaper's failure was a guess made
+    without a single edge from the child — or the parent waits forever on a
+    report that is sitting in the child's transcript. An interrupt's
+    unconfirmed ``cancelled`` in between must not spend that guess.
+    """
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="claude-native",
+        title="critique-desktop",
+    )
+    try:
+        subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 200.0, timeout_s=180.0)
+        assert entry.status == "failed" and entry.delivered
+        assert inbox.get_nowait()["status"] == "failed"
+        if cancel_before_result:
+            cancel = subagent_work.mark_subagent_work_terminal(
+                child_id, status="cancelled", output=None
+            )
+            assert not cancel.delivered_now and entry.launch_timed_out
+
+        ack = subagent_work.mark_subagent_work_terminal(
+            child_id, status="completed", output="Both assessments are in. Full report: ..."
+        )
+        assert ack.delivered_now, (
+            "the child's genuine completion after a launch-timeout guess must be "
+            f"delivered to the parent, got reason={ack.reason!r}"
+        )
+        assert entry.status == "completed"
+        payload = inbox.get_nowait()
+        assert payload["status"] == "completed"
+        assert "Full report" in str(payload["output"])
+        # The guess is spent: a later trailing idle is not re-delivered.
+        again = subagent_work.mark_subagent_work_terminal(child_id, status="completed", output="")
+        assert not again.delivered_now and inbox.empty()
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_real_failure_still_replaces_a_launch_timeout_failure() -> None:
+    """A genuine ``failed`` edge after the reaper's guess carries the real error text."""
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude-native", title="x"
+    )
+    try:
+        subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 200.0, timeout_s=180.0)
+        inbox.get_nowait()
+        ack = subagent_work.mark_subagent_work_terminal(
+            child_id, status="failed", output="Error: 400 from the model API"
+        )
+        assert ack.delivered_now
+        assert inbox.get_nowait()["output"] == "Error: 400 from the model API"
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
+    """
+    The runner's own verified prompt delivery counts as the launch proof.
+
+    A follow-up sent to a child that is already active yields no fresh
+    ``running`` edge, so the only evidence the child took the message is the
+    runner's verified paste. Once it is delivered the dispatch must leave
+    ``launching`` so the reaper cannot fail a working child.
+    """
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude-native", title="x"
+    )
+    try:
+        assert subagent_work.mark_subagent_work_started(uuid.uuid4().hex) is None
+        assert subagent_work.mark_subagent_work_started(child_id) is entry
+        assert entry.status == "running"
+        assert (
+            subagent_work.reap_stalled_subagent_launches(
+                now=entry.created_at + 900.0, timeout_s=180.0
+            )
+            == []
+        )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+
+
+# Exercise previous/current-turn acceptance, start and settlement interleavings
+# across dispatch replacement and draining.
+
+_START_BUDGET_S = 180.0
+_PREVIOUS_ACCEPTED_AT = 1000.0
+_STEER_ACCEPTED_AT = 5000.0
+_POST_TIMEOUT_STEER_ACCEPTED_AT = 1300.0
+
+
+def _drive_steer_lifecycle(
+    events: list[str],
+    *,
+    parent_id: str,
+    child_id: str,
+    previous_response_id: str,
+    current_response_id: str,
+) -> subagent_work._SubagentWorkEntry | None:
+    """Apply the events in order to a drained previous dispatch and the steer that follows it.
+
+    ``accept_prev`` / ``run_prev`` / ``settle_prev`` belong to the previous turn; ``accept_steer``
+    / ``run_steer`` to the steered turn; ``register`` is the steer's fresh registration;
+    ``drain_old`` drains the previous dispatch's result; ``forget_session`` deletes the child.
+    ``reap_prev`` provisionally fails the accepted turn before a later same-session steer.
+    """
+    previous = subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="codex", title="review"
+    )
+    previous.status = "completed"
+    previous.delivered = True
+    previous_work_id = previous.work_id
+    fresh: subagent_work._SubagentWorkEntry | None = None
+    previous_request = subagent_work.begin_subagent_child_acceptance(child_id)
+    steer_request = None
+    previous_acceptance = NativeTurnAcceptance(child_id, "thread_lifecycle", previous_response_id)
+    steer_acceptance = NativeTurnAcceptance(child_id, "thread_lifecycle", current_response_id)
+    try:
+        for event in events:
+            if event == "accept_prev":
+                subagent_work.arm_subagent_child_start_timeout(
+                    child_id,
+                    acceptance=previous_acceptance,
+                    request=previous_request,
+                    now=_PREVIOUS_ACCEPTED_AT,
+                )
+            elif event in ("run_prev", "run_steer", "run_unidentified"):
+                subagent_work.note_subagent_child_start_reported(
+                    child_id,
+                    response_id=(
+                        None
+                        if event == "run_unidentified"
+                        else (
+                            previous_acceptance if event == "run_prev" else steer_acceptance
+                        ).response_id
+                    ),
+                )
+            elif event in ("settle_prev", "settle_unidentified"):
+                accepted = subagent_work._children_accepted_turns.get(child_id)
+                subagent_work.note_subagent_child_turn_settled(
+                    child_id,
+                    response_id=previous_acceptance.response_id
+                    if event == "settle_prev"
+                    else None,
+                )
+                assert child_id not in subagent_work._children_reporting_start
+                if (
+                    event == "settle_unidentified"
+                    or accepted is None
+                    or accepted.acceptance.response_id == previous_response_id
+                ):
+                    assert child_id not in subagent_work._children_accepted_turns
+                else:
+                    assert subagent_work._children_accepted_turns.get(child_id) is accepted
+            elif event == "begin_steer":
+                steer_request = subagent_work.begin_subagent_child_acceptance(child_id)
+            elif event in ("accept_steer", "accept_steer_after_timeout"):
+                if steer_request is None:
+                    steer_request = subagent_work.begin_subagent_child_acceptance(child_id)
+                subagent_work.arm_subagent_child_start_timeout(
+                    child_id,
+                    acceptance=steer_acceptance,
+                    request=steer_request,
+                    now=(
+                        _POST_TIMEOUT_STEER_ACCEPTED_AT
+                        if event == "accept_steer_after_timeout"
+                        else _STEER_ACCEPTED_AT
+                    ),
+                )
+            elif event == "reap_prev":
+                assert fresh is not None
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(
+                        now=_PREVIOUS_ACCEPTED_AT + _START_BUDGET_S - 1.0,
+                        timeout_s=_START_BUDGET_S,
+                    )
+                    == []
+                )
+                assert subagent_work.reap_stalled_subagent_launches(
+                    now=_PREVIOUS_ACCEPTED_AT + _START_BUDGET_S + 1.0,
+                    timeout_s=_START_BUDGET_S,
+                ) == [fresh]
+                assert fresh.status == "failed"
+                assert fresh.launch_timed_out
+                inbox = subagent_work._session_inboxes_ref[parent_id]
+                notice = inbox.get_nowait()
+                assert notice["work_id"] == fresh.work_id
+                assert notice["status"] == "failed"
+                assert "no turn start" in notice["output"]
+                assert inbox.empty()
+            elif event in ("accept_receiptless", "accept_malformed", "accept_other_session"):
+                if steer_request is None:
+                    steer_request = subagent_work.begin_subagent_child_acceptance(child_id)
+                acceptance = {
+                    "accept_receiptless": None,
+                    "accept_malformed": NativeTurnAcceptance(child_id, "", current_response_id),
+                    "accept_other_session": NativeTurnAcceptance(
+                        "conv_other_child", "thread_lifecycle", current_response_id
+                    ),
+                }[event]
+                subagent_work.arm_subagent_child_start_timeout(
+                    child_id,
+                    acceptance=acceptance,
+                    request=steer_request,
+                    now=_PREVIOUS_ACCEPTED_AT + 100.0,
+                )
+            elif event == "drain_old":
+                accepted_at = subagent_work._children_accepted_turns.get(child_id)
+                subagent_work.unregister_subagent_work(
+                    child_id, work_id=previous_work_id, remember_drained_delivery=True
+                )
+                assert subagent_work._children_accepted_turns.get(child_id) == accepted_at
+                assert subagent_work.get_subagent_work(child_id) is fresh
+            elif event == "forget_session" or event == "forget_parent":
+                subagent_work.unregister_subagent_work_for_session(
+                    child_id if event == "forget_session" else parent_id
+                )
+            elif event == "register":
+                fresh = subagent_work.register_subagent_work(
+                    parent_session_id=parent_id,
+                    child_session_id=child_id,
+                    agent="codex",
+                    title="review",
+                )
+                fresh.status = "running"
+                subagent_work.apply_child_start_evidence(fresh)
+            else:
+                raise AssertionError(f"unknown event {event!r}")
+    finally:
+        subagent_work.finish_subagent_child_acceptance(previous_request)
+        assert not previous_request.unidentified_settlement_work_ids
+        if steer_request is not None:
+            subagent_work.finish_subagent_child_acceptance(steer_request)
+            assert not steer_request.unidentified_settlement_work_ids
+        assert child_id not in subagent_work._pending_child_acceptances
+    return fresh
+
+
+@pytest.mark.parametrize(
+    ("events", "previous_response_id", "current_response_id", "expected_start"),
+    [
+        # The steer's acceptance and registration, in each order, with a drain anywhere.
+        pytest.param(
+            ["accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events0-5000.0",
+        ),
+        pytest.param(
+            ["accept_steer", "drain_old", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events1-5000.0",
+        ),
+        pytest.param(
+            ["register", "accept_steer", "drain_old"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events2-5000.0",
+        ),
+        pytest.param(
+            ["register", "drain_old", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events3-5000.0",
+        ),
+        # A previous turn's acceptance that settled, with no report, must not bound the steer.
+        pytest.param(
+            ["accept_prev", "settle_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events4-5000.0",
+        ),
+        pytest.param(
+            ["accept_prev", "settle_prev", "register", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events5-5000.0",
+        ),
+        pytest.param(
+            ["settle_prev", "accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="settled-before-delayed-acceptance",
+        ),
+        pytest.param(
+            ["settle_prev", "accept_prev", "drain_old", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="settled-before-delayed-acceptance-and-drain",
+        ),
+        pytest.param(
+            ["settle_prev", "accept_steer", "accept_prev", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="stale-acceptance-after-current-acceptance",
+        ),
+        pytest.param(
+            ["begin_steer", "settle_prev", "accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="current-request-spans-previous-settlement",
+        ),
+        # A previous turn's running report that settled must not exempt the steered turn.
+        pytest.param(
+            ["accept_prev", "run_prev", "settle_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events10-5000.0",
+        ),
+        pytest.param(
+            ["run_prev", "settle_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events11-5000.0",
+        ),
+        # Deleting the session forgets evidence from the old child lifetime.
+        pytest.param(
+            ["accept_prev", "forget_session", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events12-5000.0",
+        ),
+        pytest.param(
+            ["accept_prev", "forget_session", "accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="deleted-session-rejects-outstanding-finalizer",
+        ),
+        pytest.param(
+            ["accept_prev", "forget_parent", "accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="deleted-parent-rejects-outstanding-finalizer",
+        ),
+        # A previous turn that never settled still owns its silence; the steer joins it.
+        pytest.param(
+            ["accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_previous",
+            _PREVIOUS_ACCEPTED_AT,
+            id="events15-1000.0",
+        ),
+        pytest.param(
+            ["accept_prev", "register", "accept_steer"],
+            "codex_previous",
+            "codex_previous",
+            _PREVIOUS_ACCEPTED_AT,
+            id="events16-1000.0",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "reap_prev", "accept_steer_after_timeout", "register"],
+            "codex_previous",
+            "codex_previous",
+            _PREVIOUS_ACCEPTED_AT,
+            id="post-timeout-same-turn-accept-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "reap_prev", "register", "accept_steer_after_timeout"],
+            "codex_previous",
+            "codex_previous",
+            _PREVIOUS_ACCEPTED_AT,
+            id="post-timeout-same-turn-accept-after-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "reap_prev", "accept_steer_after_timeout", "register"],
+            "codex_previous",
+            "codex_steer",
+            _POST_TIMEOUT_STEER_ACCEPTED_AT,
+            id="post-timeout-distinct-turn-accept-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "reap_prev", "register", "accept_steer_after_timeout"],
+            "codex_previous",
+            "codex_steer",
+            _POST_TIMEOUT_STEER_ACCEPTED_AT,
+            id="post-timeout-distinct-turn-accept-after-registration",
+        ),
+        pytest.param(
+            ["accept_prev", "accept_receiptless", "register"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="receiptless-followup-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "accept_receiptless"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="receiptless-followup-after-registration",
+        ),
+        pytest.param(
+            ["accept_prev", "accept_malformed", "register"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="malformed-followup-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "accept_malformed"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="malformed-followup-after-registration",
+        ),
+        pytest.param(
+            ["accept_prev", "accept_other_session", "register"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="wrong-session-followup-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "accept_other_session"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="wrong-session-followup-after-registration",
+        ),
+        pytest.param(
+            ["begin_steer", "settle_unidentified", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            None,
+            id="unidentified-settlement-during-request-stays-unbounded",
+        ),
+        pytest.param(
+            ["register", "begin_steer", "settle_unidentified", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            None,
+            id="unidentified-settlement-on-current-work-stays-unbounded",
+        ),
+        pytest.param(
+            ["begin_steer", "drain_old", "settle_unidentified", "register", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            None,
+            id="untracked-unidentified-settlement-stays-unbounded",
+        ),
+        pytest.param(
+            ["settle_unidentified", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="new-request-after-unidentified-settlement-is-attributable",
+        ),
+        pytest.param(
+            ["register", "accept_steer", "run_prev"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="stale-running-after-current-acceptance",
+        ),
+        pytest.param(
+            ["register", "run_prev", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="stale-running-before-current-acceptance",
+        ),
+        pytest.param(
+            ["register", "accept_steer", "settle_prev"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="stale-settlement-after-current-acceptance",
+        ),
+        pytest.param(
+            ["register", "run_prev", "settle_prev", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="previous-start-settled-before-current-acceptance",
+        ),
+        pytest.param(
+            ["run_prev", "register", "settle_prev", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="retained-previous-start-settled-before-current-acceptance",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_steered_turn_is_bounded_from_its_own_acceptance(
+    events: list[str],
+    previous_response_id: str,
+    current_response_id: str,
+    expected_start: float | None,
+) -> None:
+    """Only an attributable unresolved acceptance can bound a silent steered turn."""
+    parent_id, child_id = "conv_parent_lifecycle", "conv_child_lifecycle"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    try:
+        fresh = _drive_steer_lifecycle(
+            events,
+            parent_id=parent_id,
+            child_id=child_id,
+            previous_response_id=previous_response_id,
+            current_response_id=current_response_id,
+        )
+        assert fresh is not None
+        assert fresh.child_start_reported is False
+        assert fresh.awaiting_child_start_since == expected_start
+        if expected_start is None:
+            assert (
+                subagent_work.reap_stalled_subagent_launches(
+                    now=_STEER_ACCEPTED_AT + 10 * _START_BUDGET_S, timeout_s=_START_BUDGET_S
+                )
+                == []
+            )
+            assert fresh.status == "running"
+            assert inbox.empty()
+            return
+        if "reap_prev" in events and previous_response_id == current_response_id:
+            assert subagent_work._children_accepted_turns[child_id].accepted_at == expected_start
+            reaped = subagent_work.reap_stalled_subagent_launches(
+                now=_POST_TIMEOUT_STEER_ACCEPTED_AT + 1.0, timeout_s=_START_BUDGET_S
+            )
+        else:
+            # A distinct turn keeps its full budget from its own acceptance.
+            assert (
+                subagent_work.reap_stalled_subagent_launches(
+                    now=expected_start + _START_BUDGET_S - 1.0, timeout_s=_START_BUDGET_S
+                )
+                == []
+            )
+            reaped = subagent_work.reap_stalled_subagent_launches(
+                now=expected_start + _START_BUDGET_S + 1.0, timeout_s=_START_BUDGET_S
+            )
+        assert [entry.child_session_id for entry in reaped] == [child_id]
+        assert fresh.status == "failed"
+        notice = inbox.get_nowait()
+        assert notice["status"] == "failed"
+        assert "no turn start" in notice["output"]
+        assert inbox.empty()
+        assert (
+            subagent_work.reap_stalled_subagent_launches(
+                now=expected_start + 2 * _START_BUDGET_S, timeout_s=_START_BUDGET_S
+            )
+            == []
+        )
+        assert inbox.empty()
+    finally:
+        subagent_work.unregister_subagent_work_for_session(child_id)
+        assert child_id not in subagent_work._children_accepted_turns
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.parametrize(
+    ("events", "previous_response_id", "current_response_id"),
+    [
+        # The steered turn reports running before or after its registration: never bounded.
+        pytest.param(
+            ["accept_steer", "run_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            id="events0",
+        ),
+        pytest.param(
+            ["register", "accept_steer", "run_steer"],
+            "codex_previous",
+            "codex_steer",
+            id="events1",
+        ),
+        pytest.param(
+            ["accept_steer", "register", "run_steer"],
+            "codex_previous",
+            "codex_steer",
+            id="events2",
+        ),
+        pytest.param(
+            ["accept_steer", "drain_old", "run_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            id="events3",
+        ),
+        pytest.param(
+            ["run_steer", "register", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            id="running-before-registration-and-acceptance",
+        ),
+        pytest.param(
+            ["register", "run_unidentified", "settle_unidentified", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            id="unidentified-start-remains-unbounded",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_steered_turn_that_reports_running_is_never_bounded(
+    events: list[str], previous_response_id: str, current_response_id: str
+) -> None:
+    """A steer into a turn whose running report arrived is exempt from the launch bound."""
+    parent_id, child_id = "conv_parent_running", "conv_child_running"
+    subagent_work._session_inboxes_ref[parent_id] = asyncio.Queue()
+    try:
+        fresh = _drive_steer_lifecycle(
+            events,
+            parent_id=parent_id,
+            child_id=child_id,
+            previous_response_id=previous_response_id,
+            current_response_id=current_response_id,
+        )
+        assert fresh is not None
+        assert fresh.child_start_reported is True
+        assert fresh.awaiting_child_start_since is None
+        assert (
+            subagent_work.reap_stalled_subagent_launches(
+                now=_STEER_ACCEPTED_AT + 10 * _START_BUDGET_S, timeout_s=_START_BUDGET_S
+            )
+            == []
+        )
+    finally:
+        subagent_work.unregister_subagent_work_for_session(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)

@@ -35,6 +35,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._helpers.live_server import find_free_port
+
 # Generous cap for one CLI subprocess (imports alone take a few seconds).
 _CLI_TIMEOUT_S = 120
 
@@ -169,7 +171,7 @@ def test_server_rejects_newer_build_database_with_clear_message(
             "--database-uri",
             f"sqlite:///{db_path}",
             "--port",
-            "45799",
+            str(find_free_port()),
         ],
         tmp_path,
     )

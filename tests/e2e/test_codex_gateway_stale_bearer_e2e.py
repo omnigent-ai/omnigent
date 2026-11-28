@@ -45,7 +45,7 @@ FRESH_TOKEN = "fresh-profile-token"
 
 
 class _FakeGateway(http.server.ThreadingHTTPServer):
-    """Loopback stand-in for the Databricks Unity AI Gateway.
+    """Loopback stand-in for the Databricks Unity Gateway.
 
     Accepts only ``Bearer <FRESH_TOKEN>`` (what the profile mints); any other
     Authorization header gets the workspace's real-world rejection shape:

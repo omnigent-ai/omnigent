@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from issue_prioritization.artifacts import RankedIssue
+from issue_prioritization.classification import Classification
 from issue_prioritization.domain import (
     EvidenceKind,
     InformationStatus,
@@ -35,6 +36,32 @@ _EVIDENCE_TEXT = {
     EvidenceKind.DIAGNOSTIC_EVIDENCE: "diagnostic evidence",
     EvidenceKind.CODE_ANALYSIS: "concrete code-path analysis",
 }
+
+
+def build_code_only_comment(classification: Classification, *, skipped: bool = False) -> str:
+    metadata = {
+        "content_hash": classification.content_hash,
+        "close_reason": None if skipped else "code_only",
+    }
+    marker = f"<!-- {COMMENT_MARKER} {json.dumps(metadata, separators=(',', ':'))} -->"
+    if skipped:
+        return marker + "\nAutomatic closure skipped: the issue changed or closed after review."
+    return "\n\n".join(
+        (
+            marker,
+            "🤖 **Automated triage**",
+            "We recommend closing as **not planned** because this report describes only "
+            "an inferred code-path problem, without an observed failure or plausible "
+            "steps through a user workflow.",
+            _safe_reasoning(classification.reasoning),
+            "If you encounter this problem, please open a new issue with what you did, "
+            "what happened, and relevant logs or session details.",
+        )
+    )
+
+
+def is_triage_comment(body: str) -> bool:
+    return _comment_metadata(body.strip()) is not None
 
 
 def build_triage_comment(

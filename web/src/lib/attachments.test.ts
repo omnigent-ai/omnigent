@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ATTACHMENT_SIZE_LIMITS_MB,
+  attachmentAccept,
   attachmentFilename,
   attachmentKey,
   classifyAttachment,
@@ -54,33 +55,146 @@ describe("classifyAttachment", () => {
     expect(classifyAttachment(makeFile("a.ts", "video/mp2t"))).toBe("text");
     expect(classifyAttachment(makeFile("main.rs", ""))).toBe("text");
     expect(classifyAttachment(makeFile("notebook.ipynb", ""))).toBe("text");
+    expect(classifyAttachment(makeFile("data.tsv", ""))).toBe("text");
     // Windows/Excel tags .csv as application/vnd.ms-excel — extension wins.
     expect(classifyAttachment(makeFile("data.csv", "application/vnd.ms-excel"))).toBe("text");
   });
 
-  it("rejects office/binary types", () => {
+  it("classifies archives, Office documents and databases as files", () => {
     const pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
-    expect(classifyAttachment(makeFile("deck.pptx", pptx))).toBeNull();
-    expect(classifyAttachment(makeFile("a.zip", "application/zip"))).toBeNull();
+    expect(classifyAttachment(makeFile("deck.pptx", pptx))).toBe("file");
+    expect(classifyAttachment(makeFile("a.zip", "application/zip"))).toBe("file");
+    // Office files are zip containers, so the browser often mislabels them.
+    expect(classifyAttachment(makeFile("report.docx", "application/zip"))).toBe("file");
+    expect(classifyAttachment(makeFile("sheet.xlsx", "application/octet-stream"))).toBe("file");
+    expect(classifyAttachment(makeFile("app.sqlite3", ""))).toBe("file");
+    // The extension wins over a text MIME, matching the server.
+    expect(classifyAttachment(makeFile("a.zip", "text/plain"))).toBe("file");
+  });
+
+  it("rejects types outside the supported allowlist", () => {
     expect(classifyAttachment(makeFile("a.bin", "application/octet-stream"))).toBeNull();
-    expect(classifyAttachment(makeFile("a.mp4", "video/mp4"))).toBeNull();
+    expect(classifyAttachment(makeFile("a.webm", "video/webm"))).toBeNull();
+    expect(classifyAttachment(makeFile("song.mp3", "audio/mpeg"))).toBeNull();
+    expect(classifyAttachment(makeFile("noext", ""))).toBeNull();
+  });
+
+  it.each(["video/mp4", "application/octet-stream", "text/plain", ""])(
+    "delivers MP4 videos as files when the browser reports %s",
+    (mime) => {
+      expect(classifyAttachment(makeFile("clip.MP4", mime))).toBe("file");
+      expect(
+        classifyAttachment(makeFile("clip.MP4", mime), { extensions: [".zip"], all_types: true }),
+      ).toBe("file");
+      expect(
+        classifyAttachment(makeFile("clip.MP4", mime), { extensions: [], all_types: false }),
+      ).toBeNull();
+    },
+  );
+
+  it("recognizes a text/code extension the MIME mislabels", () => {
+    // .csv tagged as an office MIME still uses the text size limit.
+    expect(classifyAttachment(makeFile("data.csv", "application/vnd.ms-excel"))).toBe("text");
+  });
+
+  it("follows the server's filesystem attachment policy", () => {
+    const allTypes = { extensions: [".zip"], all_types: true };
+    // Inline types stay inline; anything else becomes a file.
+    expect(classifyAttachment(makeFile("notes.txt", "text/plain"), allTypes)).toBe("text");
+    expect(classifyAttachment(makeFile("a.png", "image/png"), allTypes)).toBe("image");
+    expect(classifyAttachment(makeFile("trace.gz", "application/gzip"), allTypes)).toBe("file");
+    expect(classifyAttachment(makeFile("site.har", ""), allTypes)).toBe("file");
+
+    // A listed extension is a file even when it would otherwise be text.
+    const logs = { extensions: [".log"], all_types: false };
+    expect(classifyAttachment(makeFile("big.log", "text/plain"), logs)).toBe("file");
+    // A list replaces the defaults.
+    expect(classifyAttachment(makeFile("a.zip", "application/zip"), logs)).toBeNull();
+    // An excluded default type stays refused when the browser labels it as text.
+    expect(classifyAttachment(makeFile("a.zip", "text/plain"), logs)).toBeNull();
+    const none = { extensions: [], all_types: false };
+    expect(classifyAttachment(makeFile("a.zip", "text/plain"), none)).toBeNull();
+  });
+});
+
+describe("attachmentAccept", () => {
+  it("lists inline types plus the policy's filesystem extensions", () => {
+    expect(attachmentAccept()).toBe(
+      "image/*,application/pdf,text/*,application/json,.tsv,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3,.mp4",
+    );
+    expect(attachmentAccept({ extensions: [".gz"], all_types: false })).toBe(
+      "image/*,application/pdf,text/*,application/json,.tsv,.gz",
+    );
+    expect(attachmentAccept({ extensions: [".zip"], all_types: true })).toBeUndefined();
+  });
+
+  it("names .tsv, which the text/* wildcard does not cover in every browser", () => {
+    // A browser that maps .tsv to no MIME greys it out in the OS picker, so
+    // the filter must name it even though .csv needs no entry.
+    expect(attachmentAccept()?.split(",")).toContain(".tsv");
+    expect(attachmentAccept({ extensions: [".gz"], all_types: false })?.split(",")).toContain(
+      ".tsv",
+    );
   });
 });
 
 describe("validateAttachments", () => {
   it("accepts supported files within their size limit", () => {
-    const files = [makeFile("a.png", "image/png"), makeFile("a.pdf", "application/pdf")];
+    const files = [
+      makeFile("a.png", "image/png"),
+      makeFile("a.pdf", "application/pdf"),
+      makeFile("clip.mp4", "video/mp4"),
+    ];
     const { accepted, errors } = validateAttachments(files);
-    expect(accepted).toHaveLength(2);
+    expect(accepted).toEqual(files);
     expect(errors).toHaveLength(0);
   });
 
   it("rejects unsupported types with a message", () => {
-    const pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
-    const { accepted, errors } = validateAttachments([makeFile("deck.pptx", pptx)]);
+    const { accepted, errors } = validateAttachments([makeFile("clip.webm", "video/webm")]);
     expect(accepted).toHaveLength(0);
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain("deck.pptx");
+    expect(errors[0]).toContain("clip.webm");
+  });
+
+  it("names the types the server accepts when rejecting", () => {
+    const clip = [makeFile("clip.webm", "video/webm")];
+    expect(validateAttachments(clip).errors[0]).toContain("MP4 videos");
+    expect(
+      validateAttachments(clip, { extensions: [".har", ".gz"], all_types: false }).errors[0],
+    ).toContain("only images, PDF, text/code, and .gz, .har files are supported");
+    expect(validateAttachments(clip, { extensions: [], all_types: false }).errors[0]).toContain(
+      "only images, PDF, and text/code files are supported",
+    );
+  });
+
+  it("accepts other files under the file limit when the server allows all types", () => {
+    const trace = makeFile("trace.gz", "application/gzip", 30 * MB);
+    expect(validateAttachments([trace]).accepted).toHaveLength(0);
+    const { accepted, errors } = validateAttachments([trace], {
+      extensions: [".zip"],
+      all_types: true,
+    });
+    expect(accepted).toEqual([trace]);
+    expect(errors).toHaveLength(0);
+  });
+
+  it.each(["bundle.zip", "clip.mp4"])("accepts %s up to the file limit", (name) => {
+    const file = makeFile(name, "application/octet-stream", ATTACHMENT_SIZE_LIMITS_MB.file * MB);
+    const { accepted, errors } = validateAttachments([file]);
+    expect(accepted).toEqual([file]);
+    expect(errors).toHaveLength(0);
+  });
+
+  it.each(["bundle.zip", "clip.mp4"])("rejects %s over the file limit", (name) => {
+    const huge = makeFile(
+      name,
+      "application/octet-stream",
+      ATTACHMENT_SIZE_LIMITS_MB.file * MB + 1,
+    );
+    const { accepted, errors } = validateAttachments([huge]);
+    expect(accepted).toHaveLength(0);
+    expect(errors[0]).toContain("too large");
   });
 
   it("rejects files over their per-type size limit", () => {
@@ -105,10 +219,11 @@ describe("validateAttachments", () => {
 
   it("partitions a mixed batch into accepted + errors", () => {
     const ok = makeFile("a.png", "image/png");
-    const badType = makeFile("a.zip", "application/zip");
+    const zip = makeFile("a.zip", "application/zip");
+    const badType = makeFile("a.webm", "video/webm");
     const tooBig = makeFile("big.pdf", "application/pdf", ATTACHMENT_SIZE_LIMITS_MB.pdf * MB + 1);
-    const { accepted, errors } = validateAttachments([ok, badType, tooBig]);
-    expect(accepted).toEqual([ok]);
+    const { accepted, errors } = validateAttachments([ok, zip, badType, tooBig]);
+    expect(accepted).toEqual([ok, zip]);
     expect(errors).toHaveLength(2);
   });
 });

@@ -13,6 +13,8 @@ equivalents:
   all of its descendants, using the process-group fast path on POSIX and
   :mod:`psutil` walking on every platform.
 * :func:`process_alive` — liveness check that doesn't rely on ``os.kill(pid, 0)``.
+* :func:`run_isolated` — ``subprocess.run`` built on the above, so a timeout
+  kills the child's whole tree instead of only the direct child.
 
 :mod:`psutil` is already a core dependency, so the descendant walk needs no new
 package.
@@ -24,8 +26,13 @@ import logging
 import os
 import signal
 import subprocess
+import sys
+import time
+import weakref
+from collections.abc import Sequence
 from contextlib import suppress
-from typing import Protocol, TypedDict
+from pathlib import Path
+from typing import Any, Protocol, TypedDict
 
 import psutil  # type: ignore[import-untyped]
 
@@ -82,6 +89,13 @@ _killpg_fn = getattr(os, "killpg", None)
 _getpgid_fn = getattr(os, "getpgid", None)
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 _CREATE_NEW_PROCESS_GROUP = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+_owned_process_groups: weakref.WeakKeyDictionary[object, int] = weakref.WeakKeyDictionary()
+_owned_process_identities: weakref.WeakKeyDictionary[object, dict[int, float]] = (
+    weakref.WeakKeyDictionary()
+)
+_CENSUS_MAX_ITERATIONS = 3
+_CENSUS_MAX_SECONDS = 0.05
+_RUN_ISOLATED_REAP_TIMEOUT_S = 2.0
 
 
 class SpawnKwargs(TypedDict, total=False):
@@ -127,7 +141,64 @@ def spawn_kwargs() -> SpawnKwargs:
     return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
 
 
-def _killpg(pid: int, sig: int) -> bool:
+def pipe_supervised_command(command: str, *args: str) -> tuple[str, ...]:
+    """Retain a POSIX group leader while descendants hold captured output pipes.
+
+    Use with ``spawn_kwargs()`` and captured stdout/stderr. The supervisor
+    inherits stdin, cwd and env, and buffers output until EOF, like communicate.
+    Windows retains direct execution and its existing tree-cleanup behavior.
+    """
+    if not IS_POSIX:
+        return (command, *args)
+    return (
+        sys.executable,
+        "-I",
+        str(Path(__file__).with_name("_pipe_supervisor.py")),
+        command,
+        *args,
+    )
+
+
+def remember_process_group(process: _ProcessLike) -> None:
+    """Remember the isolated group while its leader is still observable."""
+    pid = process.pid
+    if not IS_POSIX or pid is None or pid <= 1 or _getpgid_fn is None:
+        return
+    try:
+        pgid = _getpgid_fn(pid)
+        if pgid == pid and pgid != _getpgid_fn(0):
+            _owned_process_groups[process] = pgid
+    except (ProcessLookupError, PermissionError, OSError, TypeError):
+        return
+    identities = _snapshot_identities(pid)
+    if identities:
+        with suppress(TypeError):
+            _owned_process_identities[process] = identities
+
+
+def refresh_process_tree(process: _ProcessLike | None) -> None:
+    """Add currently observable descendants without adopting a reused root PID."""
+    if process is None or process.pid is None or process.returncode is not None:
+        return
+    pid = process.pid
+    remembered = _remember_identities(process, {})
+    current = _snapshot_identities(pid)
+    expected_root = remembered.get(pid)
+    if expected_root is not None and current.get(pid) != expected_root:
+        return
+    _remember_identities(process, current)
+
+
+def _owned_process_group(process: _ProcessLike, *, remove: bool = False) -> int | None:
+    try:
+        if remove:
+            return _owned_process_groups.pop(process, None)
+        return _owned_process_groups.get(process)
+    except TypeError:
+        return None
+
+
+def _killpg(pid: int, sig: int, *, owned_pgid: int | None = None) -> bool:
     """
     POSIX fast path: signal the child's whole process group.
 
@@ -150,7 +221,7 @@ def _killpg(pid: int, sig: int) -> bool:
     if not IS_POSIX or _killpg_fn is None or _getpgid_fn is None:
         return False
     try:
-        target_pgid = _getpgid_fn(pid)
+        target_pgid = owned_pgid if owned_pgid is not None else _getpgid_fn(pid)
         # pgid <= 1 is never a real agent group: killpg(1, sig) is kill(-1,
         # sig) - a broadcast to every process this user may signal (it took
         # down the CI runner when a mocked pid coerced to 1) - and 0/negative
@@ -175,6 +246,128 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def process_create_time(pid: int) -> float | None:
+    """Return the OS start time identifying the process at *pid*, or ``None``.
+
+    Pairs with the PID to detect reuse: a recycled PID reports a different
+    start time, letting a caller reject a stale PID before acting on it.
+    """
+    with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+        return _process_start_stamp(psutil.Process(pid))
+    return None
+
+
+def _process_start_stamp(proc: psutil.Process) -> float:
+    """Return ``proc``'s creation time on a clock that wall-clock steps can't move.
+
+    Linux ``create_time()`` adds ``/proc/stat`` btime, which shifts when NTP or a
+    hypervisor steps the clock; psutil 7 exposes the boot-relative start instead.
+    """
+    platform_create_time = getattr(getattr(proc, "_proc", None), "create_time", None)
+    if callable(platform_create_time):
+        with suppress(TypeError):  # psutil < 7 and non-Linux take no monotonic flag
+            stamp = platform_create_time(monotonic=True)
+            if isinstance(stamp, float):
+                return stamp
+    return proc.create_time()
+
+
+def _snapshot_identities(pid: int) -> dict[int, float]:
+    """Snapshot a process tree using PID plus creation time identity."""
+    identities: dict[int, float] = {}
+    for proc in _walk_descendants(pid):
+        if proc.pid <= 1 or proc.pid == os.getpid():
+            continue
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            identities[proc.pid] = _process_start_stamp(proc)
+    return identities
+
+
+def _remember_identities(
+    process: _ProcessLike,
+    identities: dict[int, float],
+    *,
+    remove: bool = False,
+) -> dict[int, float]:
+    try:
+        if remove:
+            remembered = _owned_process_identities.pop(process, {})
+            remembered.update(identities)
+        else:
+            remembered = _owned_process_identities.get(process, {})
+            remembered.update(identities)
+            _owned_process_identities[process] = remembered
+        return dict(remembered)
+    except TypeError:
+        return dict(identities)
+
+
+def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
+    """Signal only PIDs whose current creation time matches the snapshot."""
+    for pid, create_time in identities.items():
+        if pid <= 1 or pid == os.getpid():
+            continue
+        try:
+            proc = psutil.Process(pid)
+            if _process_start_stamp(proc) != create_time:
+                continue
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
+def _identity_in_group(identities: dict[int, float], pgid: int) -> bool:
+    """Whether the group still contains at least one identity we observed."""
+    if _getpgid_fn is None:
+        return False
+    for pid, create_time in identities.items():
+        try:
+            proc = psutil.Process(pid)
+            if _process_start_stamp(proc) == create_time and _getpgid_fn(pid) == pgid:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return False
+
+
+def _signal_tree_census(
+    process: _ProcessLike,
+    pid: int,
+    *,
+    force: bool,
+    remove: bool,
+    snapshot_root: bool,
+) -> dict[int, float]:
+    """Signal a bounded union of remembered and currently observable descendants."""
+    remembered = _remember_identities(process, {}, remove=False)
+    current = _snapshot_identities(pid) if snapshot_root else {}
+    expected_root = remembered.get(pid)
+    if expected_root is not None and current.get(pid) != expected_root:
+        # The direct child was already reaped and its PID was reused. Never
+        # adopt the replacement process or its descendants into this tree.
+        current = {}
+        snapshot_root = False
+    identities = _remember_identities(process, current, remove=remove)
+    deadline = time.monotonic() + _CENSUS_MAX_SECONDS
+    for _ in range(_CENSUS_MAX_ITERATIONS):
+        current = _snapshot_identities(pid) if snapshot_root else {}
+        if expected_root is not None and current.get(pid) != expected_root:
+            current = {}
+            snapshot_root = False
+        before = len(identities)
+        identities.update(current)
+        _signal_identities(identities, force=force)
+        if len(identities) == before or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    if not remove:
+        _remember_identities(process, identities)
+    return identities
+
+
 def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     """
     Gracefully stop ``process`` and all of its descendants.
@@ -188,7 +381,7 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     :param process: A ``Popen``/``asyncio`` process handle, or ``None``.
     :param grace: Optional seconds to wait for the tree to exit after signaling.
     """
-    if process is None or process.returncode is not None:
+    if process is None:
         return
     pid = process.pid
     if pid is None:
@@ -196,16 +389,26 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
             process.terminate()
         return
 
-    if _killpg(pid, signal.SIGTERM):
-        if grace:
-            _wait_gone(pid, grace)
+    owned_pgid = _owned_process_group(process)
+    if process.returncode is not None and owned_pgid is None:
         return
-
-    procs = _walk_descendants(pid)
-    for proc in procs:
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            proc.terminate()
-    if not procs:
+    leader_live = process.returncode is None
+    observed = _remember_identities(process, {})
+    current = _snapshot_identities(pid) if leader_live else {}
+    if observed.get(pid) is not None and current.get(pid) != observed[pid]:
+        current = {}
+        leader_live = False
+    observed = _remember_identities(process, current)
+    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    identities = _signal_tree_census(
+        process,
+        pid,
+        force=False,
+        remove=False,
+        snapshot_root=leader_live,
+    )
+    group_signaled = group_is_owned and _killpg(pid, signal.SIGTERM, owned_pgid=owned_pgid)
+    if not group_signaled and not identities:
         with suppress(Exception):
             process.terminate()
     if grace:
@@ -219,8 +422,11 @@ def kill_tree(process: _ProcessLike | None) -> None:
     Like :func:`terminate_tree` but with ``SIGKILL`` (POSIX) /
     ``TerminateProcess`` (Windows). Use after a grace period when a graceful
     terminate did not take.
+
+    After the leader exits, unobserved descendants may survive: signaling
+    their former group requires a remembered live identity to avoid PID reuse.
     """
-    if process is None or process.returncode is not None:
+    if process is None:
         return
     pid = process.pid
     if pid is None:
@@ -228,16 +434,101 @@ def kill_tree(process: _ProcessLike | None) -> None:
             process.kill()
         return
 
-    if _killpg(pid, _SIGKILL):
+    owned_pgid = _owned_process_group(process, remove=True)
+    if process.returncode is not None and owned_pgid is None:
         return
-
-    procs = _walk_descendants(pid)
-    for proc in procs:
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            proc.kill()
-    if not procs:
+    leader_live = process.returncode is None
+    observed = _remember_identities(process, {})
+    current = _snapshot_identities(pid) if leader_live else {}
+    if observed.get(pid) is not None and current.get(pid) != observed[pid]:
+        current = {}
+        leader_live = False
+    observed = _remember_identities(process, current)
+    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    identities = _signal_tree_census(
+        process,
+        pid,
+        force=True,
+        remove=True,
+        snapshot_root=leader_live,
+    )
+    group_signaled = group_is_owned and _killpg(pid, _SIGKILL, owned_pgid=owned_pgid)
+    if not group_signaled and not identities:
         with suppress(Exception):
             process.kill()
+
+
+def _kill_surviving_leader(process: subprocess.Popen[Any]) -> None:
+    # If the leader outlived group teardown (a denied killpg, or a kill still
+    # pending), end it directly so Popen.__exit__'s unbounded wait() can't hang.
+    if process.poll() is None:
+        with suppress(Exception):
+            process.kill()
+
+
+def run_isolated(
+    args: Sequence[str],
+    *,
+    timeout: float | None = None,
+    capture_output: bool = False,
+    **popen_kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
+    """
+    Run ``args`` to completion like :func:`subprocess.run`, tearing down its
+    process group and discoverable descendants on timeout.
+
+    ``subprocess.run(timeout=...)`` kills only its direct child, so anything that
+    child spawned (an updater, a ``git fetch``) survives the timeout and is
+    re-parented to this process or to init. Here the child starts in its own
+    session/process group (:func:`spawn_kwargs`) and a timeout runs
+    :func:`kill_tree` over it before re-raising :class:`subprocess.TimeoutExpired`.
+
+    :param args: The argv to execute, e.g. ``["claude", "--version"]``.
+    :param timeout: Seconds to wait before killing the tree; ``None`` waits forever.
+    :param capture_output: Capture stdout and stderr, as in :func:`subprocess.run`.
+    :param popen_kwargs: Remaining :class:`subprocess.Popen` keyword arguments
+        (``stdin``, ``text``, ``env``, ...).
+    :returns: The completed process; a non-zero exit is returned, not raised.
+    :raises ValueError: For ``capture_output`` conflicts or kwargs this helper owns.
+    :raises subprocess.TimeoutExpired: After the tree has been killed.
+    :raises OSError: When the child cannot be started.
+    """
+    if capture_output:
+        if popen_kwargs.get("stdout") is not None or popen_kwargs.get("stderr") is not None:
+            raise ValueError("stdout and stderr arguments may not be used with capture_output.")
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+    isolation = spawn_kwargs()
+    conflicts = popen_kwargs.keys() & isolation.keys()
+    if conflicts:
+        raise ValueError(f"run_isolated manages process isolation; remove {sorted(conflicts)}")
+    with subprocess.Popen(args, **popen_kwargs, **isolation) as process:
+        remember_process_group(process)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                kill_tree(process)
+            finally:
+                # Run teardown even if kill_tree raised: reap the leader without
+                # blocking on a surviving descendant holding the pipes, then end
+                # the leader directly so Popen.__exit__'s wait() cannot hang.
+                with suppress(Exception):
+                    reaped: tuple[Any, Any] = process.communicate(
+                        timeout=_RUN_ISOLATED_REAP_TIMEOUT_S
+                    )
+                    exc.stdout, exc.stderr = reaped
+                _kill_surviving_leader(process)
+            raise
+        except BaseException:
+            try:
+                kill_tree(process)
+            finally:
+                with suppress(Exception):
+                    process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
+                _kill_surviving_leader(process)
+            raise
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 
 def _wait_gone(pid: int, timeout: float) -> None:

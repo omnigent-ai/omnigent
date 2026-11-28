@@ -150,16 +150,14 @@ def validate_pr_body(body: str) -> ValidationResult:
         elif _contains_placeholder(coverage_notes):
             errors.append("Coverage notes still contains template placeholder text.")
 
-    # The Changelog section is optional — an author deletes it (or leaves the
-    # `<…>` placeholder) when the change isn't noteworthy, and the PR is simply
-    # omitted from the changelog. The one exception: a Breaking change is always
-    # noteworthy, so it must carry a real description line.
+    # Most PRs may fall back to their title. Breaking changes need an explicit
+    # description so users can understand the compatibility impact.
     if "Breaking change" in checked_types:
         changelog_section = _section(body, spans, "Changelog") if "changelog" in spans else ""
         if not changelog_description(changelog_section):
             errors.append(
                 "A Breaking change must describe the change in the Changelog section "
-                "(otherwise it would be omitted from the changelog)."
+                "so users can understand the compatibility impact."
             )
 
     return ValidationResult(ok=not errors, errors=errors)

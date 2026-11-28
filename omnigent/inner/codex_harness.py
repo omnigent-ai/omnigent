@@ -20,7 +20,7 @@ Env vars read at startup:
   own default.
 - ``HARNESS_CODEX_GATEWAY``: ``"1"`` / ``"true"`` to route
   through a vendor-neutral gateway (base URL + bearer-token
-  command + model). The Databricks AI gateway (Codex Responses
+  command + model). The Databricks Unity Gateway (Codex Responses
   API at ``/ai-gateway/codex/v1``) is one producer of this
   transport; generic ``key`` / ``gateway`` providers are another.
   Otherwise the executor uses Codex's built-in API path.
@@ -89,15 +89,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI
 
 from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.codex_executor import CodexExecutor
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.inner.executor import Executor
-from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.inner.model_egress import UCODE_SIGNER_BINDING_ID, registered_model_provider_binding
+from omnigent.inner.model_signer import SignerLaunchConfig
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
+from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -108,6 +113,7 @@ _logger = logging.getLogger(__name__)
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_CODEX_MODEL"
 _ENV_GATEWAY = "HARNESS_CODEX_GATEWAY"
+_ENV_BROKERED_GATEWAY = "HARNESS_CODEX_BROKERED_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_CODEX_DATABRICKS_PROFILE"
 _ENV_MODEL_PROVIDER = "HARNESS_CODEX_MODEL_PROVIDER"
 _ENV_GATEWAY_HOST = "HARNESS_CODEX_GATEWAY_HOST"
@@ -121,11 +127,15 @@ _ENV_DISABLE_NATIVE_TOOLS = "HARNESS_CODEX_DISABLE_NATIVE_TOOLS"
 _ENV_OS_ENV = "HARNESS_CODEX_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_CODEX_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_CODEX_SKILLS_FILTER"
+_ENV_SKILLS_DIR = "HARNESS_CODEX_SKILLS_DIR"
 _ENV_BUNDLE_DIR = "HARNESS_CODEX_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_CODEX_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CODEX_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CODEX_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+_ENV_SIGNER_PROVIDER = "HARNESS_CODEX_SIGNER_PROVIDER"
+_ENV_SIGNER_ENDPOINT = "HARNESS_CODEX_SIGNER_ENDPOINT"
+_ENV_MODEL_EGRESS = "HARNESS_CODEX_MODEL_EGRESS"
 
 # Truthy strings the wrap accepts for boolean env vars. Must
 # match the claude-sdk wrap's parser for consistency — operators
@@ -133,7 +143,7 @@ _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTE
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
 
-def _parse_truthy(env_var: str, default: bool) -> bool:
+def _parse_truthy(env_var: str, default: bool, env: Mapping[str, str] | None = None) -> bool:
     """
     Parse a boolean-style env var the same way the claude-sdk
     wrap does.
@@ -143,61 +153,60 @@ def _parse_truthy(env_var: str, default: bool) -> bool:
         empty. Used so each caller can express "unset means
         True" or "unset means False" without duplicating
         empty-string handling.
+    :param env: The environment to read, or ``None`` for this process's.
     :returns: ``True`` if the value is in :data:`_TRUTHY_STRINGS`
         (case-insensitive); ``False`` for any other non-empty
         value; *default* when unset or empty.
     """
-    raw = os.environ.get(env_var, "").strip().lower()
+    raw = (os.environ if env is None else env).get(env_var, "").strip().lower()
     if not raw:
         return default
     return raw in _TRUTHY_STRINGS
 
 
-def _resolve_os_env() -> OSEnvSpec:
-    """
-    Resolve the inner-executor :class:`OSEnvSpec` from env config.
+@dataclass(frozen=True)
+class _CodexRoute:
+    """How a Codex child launched with some environment reaches its model.
 
-    Reads :data:`_ENV_OS_ENV` and decodes the JSON-encoded dict
-    Omnigent serialized via :func:`dataclasses.asdict` on its
-    :class:`OSEnvSpec`. When the env var is missing or
-    malformed, falls back to ``caller_process + sandbox=none``
-    so Codex's natives stay enabled — matches the legacy
-    non-AP path's default.
-
-    :returns: An :class:`OSEnvSpec` to hand to
-        :class:`CodexExecutor`.
+    :param signer: Whether a model signer carries the launch.
+    :param gateway: Whether the gateway transport carries it. Only then do the
+        gateway host, base URL, auth command and Databricks profile apply.
+    :param model_provider: The ``model_provider`` pinned otherwise, e.g. ``"openai"``.
     """
-    raw = os.environ.get(_ENV_OS_ENV, "").strip()
-    if raw:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            _logger.warning(
-                "%s is not valid JSON (%s); falling back to default os_env",
-                _ENV_OS_ENV,
-                exc,
-            )
-            payload = None
-        if isinstance(payload, dict):
-            sandbox_payload = payload.get("sandbox")
-            sandbox = (
-                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
-            )
-            return OSEnvSpec(
-                type=str(payload.get("type", "caller_process")),
-                cwd=payload.get("cwd"),
-                sandbox=sandbox,
-                fork=bool(payload.get("fork", False)),
-            )
-    # Default: enable natives, no sandbox. Matches the simplest
-    # working config; operators who want real sandbox enforcement
-    # configure ``os_env.sandbox`` explicitly in the spec.
-    return OSEnvSpec(
-        type="caller_process",
-        cwd=None,
-        sandbox=OSEnvSandboxSpec(type="none"),
-        fork=False,
+
+    signer: bool
+    gateway: bool
+    model_provider: str | None
+
+
+def _codex_route(env: Mapping[str, str]) -> _CodexRoute:
+    """Read the route :func:`_build_codex_executor` launches with from *env*.
+
+    :param env: The wrap's environment.
+    :returns: The launch's route.
+    """
+    signer = bool(env.get(_ENV_SIGNER_PROVIDER, "").strip())
+    return _CodexRoute(
+        signer=signer,
+        gateway=not signer and _parse_truthy(_ENV_GATEWAY, default=False, env=env),
+        model_provider=None if signer else env.get(_ENV_MODEL_PROVIDER) or None,
     )
+
+
+def codex_child_model_provider(env: Mapping[str, str]) -> str | None:
+    """Return the ``model_provider`` a Codex child launched with *env* pins.
+
+    :param env: The child's environment, e.g. the runner env plus its spawn env.
+    :returns: The pinned provider id, e.g. ``"openai"``; ``""`` when a gateway or
+        model signer carries the launch; ``None`` when ``config.toml`` decides.
+    """
+    route = _codex_route(env)
+    return "" if route.signer or route.gateway else route.model_provider
+
+
+def _resolve_os_env() -> OSEnvSpec:
+    """Decode the supplied policy without downgrading malformed configuration."""
+    return resolve_harness_os_env(_ENV_OS_ENV)
 
 
 def _resolve_retry_policy() -> RetryPolicy:
@@ -266,6 +275,60 @@ def _resolve_skills_filter() -> str | list[str]:
     return "all"
 
 
+def _resolve_signer_launch_config() -> SignerLaunchConfig | None:
+    """Build typed signer authority from the trusted workflow envelope."""
+    provider_id = os.environ.get(_ENV_SIGNER_PROVIDER, "").strip()
+    endpoint = os.environ.get(_ENV_SIGNER_ENDPOINT, "").strip()
+    raw_model_egress = os.environ.get(_ENV_MODEL_EGRESS, "").strip()
+    if not provider_id:
+        if endpoint or raw_model_egress:
+            raise ValueError("partial model signer configuration is not allowed")
+        return None
+    if provider_id != UCODE_SIGNER_BINDING_ID:
+        raise ValueError(f"unsupported model signer provider {provider_id!r}")
+    if _parse_truthy(_ENV_GATEWAY, default=False):
+        raise ValueError("signer-backed Codex conflicts with the legacy gateway mode")
+    if os.environ.get(_ENV_GATEWAY_AUTH_COMMAND):
+        raise ValueError("signer-backed Codex conflicts with a legacy gateway auth command")
+    if any(
+        os.environ.get(name)
+        for name in (
+            _ENV_GATEWAY_BASE_URL,
+            _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS,
+            _ENV_MODEL_PROVIDER,
+        )
+    ):
+        raise ValueError("signer-backed Codex conflicts with legacy provider overrides")
+    host = os.environ.get(_ENV_GATEWAY_HOST, "").strip()
+    profile = os.environ.get(_ENV_DATABRICKS_PROFILE, "").strip()
+    if not endpoint or not host or not profile:
+        raise ValueError("ucode signer requires trusted endpoint, host, and profile")
+    if not raw_model_egress:
+        raise ValueError("signer-backed Codex requires explicit model egress")
+    try:
+        model_egress = json.loads(raw_model_egress)
+    except json.JSONDecodeError as exc:
+        raise ValueError("model egress must be valid JSON") from exc
+    if (
+        not isinstance(model_egress, list)
+        or not model_egress
+        or not all(isinstance(rule, str) and rule for rule in model_egress)
+    ):
+        raise ValueError("model egress must be a non-empty string list")
+    provider = registered_model_provider_binding(
+        binding_id=provider_id,
+        trusted_session_endpoint=endpoint,
+        trusted_host=host,
+    )
+    return SignerLaunchConfig.from_trusted_authority(
+        binding_id=provider_id,
+        provider=provider,
+        trusted_session_endpoint=endpoint,
+        operator_model_egress=model_egress,
+        auth_profile=profile,
+    )
+
+
 def _build_codex_executor() -> Executor:
     """
     Construct a :class:`CodexExecutor` from env-var config.
@@ -288,15 +351,23 @@ def _build_codex_executor() -> Executor:
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
+    signer_launch_config = _resolve_signer_launch_config()
+    route = _codex_route(os.environ)
     return CodexExecutor(
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         codex_path=resolve_harness_path("codex"),
-        gateway=_parse_truthy(_ENV_GATEWAY, default=False),
-        databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
-        model_provider_override=os.environ.get(_ENV_MODEL_PROVIDER) or None,
-        gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
+        gateway=route.gateway,
+        brokered_gateway=_parse_truthy(_ENV_BROKERED_GATEWAY, default=False),
+        databricks_profile=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_DATABRICKS_PROFILE),
+        model_provider_override=route.model_provider,
+        gateway_host=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_HOST) or None,
         # Default ``True`` mirrors the inner CodexExecutor's
         # constructor default, which mirrors Codex's own
         # default. An operator who set the env var to ``"0"``
@@ -305,14 +376,23 @@ def _build_codex_executor() -> Executor:
         # Default ``False`` mirrors the inner executor's default
         # (native tools enabled).
         disable_native_tools=_parse_truthy(_ENV_DISABLE_NATIVE_TOOLS, default=False),
-        base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
-        gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
-        gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
-        or None,
+        base_url_override=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
+        gateway_auth_command=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
+        gateway_auth_refresh_interval_ms=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS) or None,
         retry_policy=_resolve_retry_policy(),
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
+        skills_dir=Path(raw_skills_dir)
+        if (raw_skills_dir := os.environ.get(_ENV_SKILLS_DIR))
+        else None,
+        signer_launch_config=signer_launch_config,
     )
 
 

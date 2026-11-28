@@ -13,7 +13,6 @@ import contextlib
 import os
 import re
 import signal
-import socket
 import subprocess
 import threading
 import time
@@ -26,6 +25,8 @@ import pexpect
 import pytest
 from omnigent_client import OmnigentClient, SessionsChat
 
+from tests._helpers.live_server import find_free_port
+from tests._helpers.polling import poll_until
 from tests.e2e.omnigent._pexpect_harness import (
     PROMPT_READY,
     STATE_SLEEPING,
@@ -130,17 +131,6 @@ class _ServerHandle:
     proc: subprocess.Popen[bytes]
     db_path: Path
     log_path: Path
-
-
-def _free_port() -> int:
-    """
-    Reserve and release a localhost TCP port.
-
-    :returns: A currently free port number.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _write_marker_agent(tmp_path: Path, name: str, marker: str) -> Path:
@@ -311,6 +301,25 @@ def _wait_session_runner_online(
     )
 
 
+def _wait_session_idle(base_url: str, session_id: str, *, timeout: float = 60.0) -> None:
+    """
+    Poll until the session's current turn has finished on the server.
+
+    The REPL can render a reply before the server records the turn as done,
+    so a test that kills the runner waits here first.
+
+    :param base_url: Omnigent server URL.
+    :param session_id: Session id.
+    :param timeout: Max seconds to wait.
+    """
+
+    def idle() -> bool:
+        response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=5.0)
+        return response.status_code == 200 and response.json().get("status") == "idle"
+
+    poll_until(idle, timeout_s=timeout, interval_s=0.25)
+
+
 def _newest_session_id(base_url: str, agent_name: str) -> str:
     """
     Resolve the most recent session id for *agent_name* via the API.
@@ -328,7 +337,7 @@ def _newest_session_id(base_url: str, agent_name: str) -> str:
     """
     resp = httpx.get(
         f"{base_url}/v1/sessions",
-        params={"agent_name": agent_name, "limit": 1},
+        params={"visibility": "all", "agent_name": agent_name, "limit": 1},
         timeout=5.0,
     )
     resp.raise_for_status()
@@ -391,7 +400,7 @@ def _drive_turn(
     # Local flow: parse the lifecycle markers rendered during the turn.
     lifecycle_branch = child.expect(
         [
-            r"POST /v1/sessions multipart bundle",
+            r"POST /v1/sessions json agent_id",
             r"resuming existing session id='([^']+)'",
         ],
         timeout=60,
@@ -564,7 +573,7 @@ def _running_server(
     :param tmp_path: Per-test temp directory.
     :yields: The server handle.
     """
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "server.db"
     artifacts = tmp_path / "artifacts"
@@ -832,16 +841,19 @@ def test_repl_recover_after_runner_death(
                     base_url=server.base_url,
                     agent_name="repl_session_recover",
                 )
+                # Kill between turns: a kill mid-turn fails that turn instead.
+                _wait_session_idle(server.base_url, first_result.session_id)
                 runner_pid = _runner_pid_from_daemon_log(home, first_result.runner_id)
                 os.kill(runner_pid, signal.SIGKILL)
 
+                # A marker of its own, so the first turn's output can't satisfy the match.
                 configure_mock_llm(
                     mock_llm_server_url,
-                    [{"text": "SESSION_RECOVER_OK"}],
+                    [{"text": "SESSION_RECOVERED_AGAIN_OK"}],
                     key=_MODEL,
                 )
                 submit_prompt(child, "respond with the configured marker again")
-                child.expect(re.escape("SESSION_RECOVER_OK"), timeout=_TURN_TIMEOUT)
+                child.expect(re.escape("SESSION_RECOVERED_AGAIN_OK"), timeout=_TURN_TIMEOUT)
                 child.expect([STATE_SLEEPING, PROMPT_READY], timeout=60)
                 recovered_runner_id = _wait_session_runner_online(
                     server.base_url,

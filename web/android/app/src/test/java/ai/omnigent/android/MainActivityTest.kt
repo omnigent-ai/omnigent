@@ -1,23 +1,30 @@
 package ai.omnigent.android
 
 import android.content.Context
+import android.content.Intent
 import android.content.RestrictionsManager
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Bundle
 import android.os.Looper
 import android.text.TextUtils
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.widget.TextView
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
@@ -25,12 +32,153 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
+import org.robolectric.shadows.ShadowPopupMenu
 import org.robolectric.shadows.ShadowRestrictionsManager
 import java.time.Duration
+import java.util.concurrent.Executor
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class MainActivityTest {
+    @Before
+    fun readManifestsWithoutTheNetwork() {
+        MainActivity.manifestReader = { ServerManifest.BASELINE }
+        MainActivity.oidcWorker = Executor { it.run() }
+    }
+
+    @After
+    fun restoreManifestReader() {
+        MainActivity.manifestReader = { ServerManifest.fetch(it) }
+        MainActivity.oidcWorker = null
+    }
+
+    @Test
+    fun `a server offering native sign-in stays covered until it has a session`() {
+        MainActivity.manifestReader = {
+            ServerManifest(
+                1.0,
+                ServerManifest.Auth(
+                    ServerManifest.Mode.OIDC,
+                    "__Host-ap_session",
+                    listOf(OidcRedirect.REDIRECT_URI),
+                ),
+            )
+        }
+        ServerStore(
+            ApplicationProvider.getApplicationContext(),
+        ).connect("https://native.example.test")
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        // Nothing of the server loads; a prompt blanks the page underneath.
+        assertTrue(shadowOf(activity.webView()).lastLoadedUrl in setOf(null, "about:blank"))
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        // Still renewing, or asking: a relaunch never opens the browser by itself.
+        assertTrue(
+            activity.declared<TextView>("connectionMessage").text.toString() in
+                setOf(
+                    activity.getString(R.string.oidc_signing_in),
+                    "Sign in to native.example.test to continue.",
+                ),
+        )
+    }
+
+    @Test
+    fun `switching to a server offering native sign-in stops the previous page under the cover`() {
+        MainActivity.manifestReader = { url ->
+            if (url.contains("native")) {
+                ServerManifest(
+                    1.0,
+                    ServerManifest.Auth(
+                        ServerManifest.Mode.OIDC,
+                        "__Host-ap_session",
+                        listOf(OidcRedirect.REDIRECT_URI),
+                    ),
+                )
+            } else {
+                ServerManifest.BASELINE
+            }
+        }
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        ServerStore(context).connect("https://native.example.test")
+        val activity = launch()
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+
+        activity.invoke(
+            "onSwitchServerRequested",
+            arrayOf(String::class.java),
+            "https://native.example.test",
+        )
+
+        assertEquals("about:blank", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+    }
+
+    @Test
+    fun `a server without native sign-in loads at once, uncovered`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+    }
+
+    @Test
+    fun `main-frame http error opens server selection once and finishes`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val request = request("https://example.com/app")
+        val response = httpError(503)
+        val activityShadow = shadowOf(activity)
+        activityShadow.clearNextStartedActivities()
+
+        webView.webViewClient.onReceivedHttpError(webView, request, response)
+
+        assertEquals(
+            ConnectActivity::class.java.name,
+            activityShadow.nextStartedActivity.component?.className,
+        )
+        assertTrue(activity.isFinishing)
+
+        webView.webViewClient.onReceivedHttpError(webView, request, response)
+
+        assertNull(activityShadow.nextStartedActivity)
+    }
+
+    @Test
+    fun `http error after activity starts finishing does not reopen connect`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val activityShadow = shadowOf(activity)
+        activityShadow.clearNextStartedActivities()
+        activity.finish()
+
+        webView.webViewClient.onReceivedHttpError(
+            webView,
+            request("https://example.com/app"),
+            httpError(503),
+        )
+
+        assertNull(activityShadow.nextStartedActivity)
+    }
+
+    @Test
+    fun `workspace without WebView profile support fails closed before WebView load`() {
+        val workspace = "https://dbc-123.cloud.databricks.com/omnigent?o=42"
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(workspace)
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        assertTrue(activity.isFinishing)
+        val setup = shadowOf(activity).nextStartedActivity
+        assertEquals(ConnectActivity::class.java.name, setup.component!!.className)
+        assertEquals(workspace, setup.getStringExtra(ConnectActivity.EXTRA_SERVER_URL))
+        // Robolectric's WebView has no multi-profile support for workspace cookies.
+        val error = setup.getStringExtra(ConnectActivity.EXTRA_ERROR)!!
+        assertTrue(error.contains("Update Android System WebView"))
+    }
+
     @Test
     fun `webview leaves algorithmic darkening disabled`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
@@ -124,6 +272,43 @@ class MainActivityTest {
         val script = shadowOf(webView).lastEvaluatedJavascript.orEmpty()
         assertTrue(script.contains("__omnigentNativeEmitServerPicker"))
         assertTrue(script.contains("currentOrigin") && script.contains("example.com"))
+        // Only a server whose sign-in the shell owns offers "Sign out of <server>".
+        assertTrue(script.contains("\"canSignOut\":false"))
+    }
+
+    @Test
+    fun `sign-out the shell can't perform answers the page false`() {
+        val activity = launch()
+        val webView = activity.webView()
+
+        activity.invoke("onSignOutOfServerRequested")
+
+        assertEquals(
+            "window.__omnigentNativeEmitSignOutResult && window.__omnigentNativeEmitSignOutResult(false);",
+            shadowOf(webView).lastEvaluatedJavascript,
+        )
+        assertFalse(activity.isFinishing)
+    }
+
+    @Test
+    fun `server menu items above the server entries are never treated as servers`() {
+        val activity = launch()
+        activity.invoke(
+            "showServerSwitcherMenu",
+            arrayOf(View::class.java),
+            activity.switchButton(),
+        )
+        val popup = ShadowPopupMenu.getLatestPopupMenu()
+        val listener = shadowOf(popup).onMenuItemClickListener
+
+        // The debug submenus use ids far above the server entries.
+        val debugRoot = popup.menu.add(3, 20_100, 0, "Debug Authentication")
+
+        assertFalse(listener.onMenuItemClick(debugRoot))
+        assertEquals(
+            "https://example.com",
+            ServerStore(ApplicationProvider.getApplicationContext()).currentServerUrl(),
+        )
     }
 
     @Test
@@ -147,6 +332,75 @@ class MainActivityTest {
         assertEquals("https://second.example.test", ServerStore(context).currentServerUrl())
         assertEquals("https://second.example.test", shadowOf(activity.webView()).lastLoadedUrl)
     }
+
+    // The hand-off a link makes: the store already names the link's server, and the intent
+    // carries the conversation.
+    @Test
+    fun `a link's conversation opens in the page already open on its server`() {
+        val activity = launch()
+        val webView = activity.webView()
+        webView.webViewClient.onPageFinished(webView, "https://example.com/")
+
+        activity.invoke("onNewIntent", arrayOf(Intent::class.java), conversationIntent("/c/abc"))
+
+        assertEquals("https://example.com", shadowOf(webView).lastLoadedUrl)
+        assertEquals(activationScript("/c/abc"), shadowOf(webView).lastEvaluatedJavascript)
+    }
+
+    @Test
+    fun `a link that starts the app opens its conversation once the page has loaded`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity =
+            Robolectric
+                .buildActivity(MainActivity::class.java, conversationIntent("/c/abc"))
+                .setup()
+                .get()
+        val webView = activity.webView()
+
+        // The page is asked for the server, not the conversation: the page's router opens it.
+        assertEquals("https://example.com", shadowOf(webView).lastLoadedUrl)
+        assertEquals("/c/abc", activity.declared<String?>("pendingNavigatePath"))
+
+        webView.webViewClient.onPageFinished(webView, "https://example.com/")
+
+        assertNull(activity.declared<String?>("pendingNavigatePath"))
+    }
+
+    // The old server's page must never be told to open a conversation that belongs to the new one.
+    @Test
+    fun `a link to another server opens its conversation once that server's page has loaded`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val activity = launch()
+        val webView = activity.webView()
+        webView.webViewClient.onPageFinished(webView, "https://example.com/")
+        val before = shadowOf(webView).lastEvaluatedJavascript
+
+        ServerStore(context).connect("https://second.example.test")
+        activity.invoke("onNewIntent", arrayOf(Intent::class.java), conversationIntent("/c/abc"))
+
+        assertEquals("https://second.example.test", shadowOf(webView).lastLoadedUrl)
+        assertEquals(before, shadowOf(webView).lastEvaluatedJavascript)
+        assertEquals("/c/abc", activity.declared<String?>("pendingNavigatePath"))
+
+        // A load of the old server that finishes late is not the page the link meant.
+        webView.webViewClient.onPageFinished(webView, "https://example.com/")
+        assertEquals("/c/abc", activity.declared<String?>("pendingNavigatePath"))
+
+        webView.webViewClient.onPageFinished(webView, "https://second.example.test/")
+
+        // Handed over; the test above shows what the page is sent.
+        assertNull(activity.declared<String?>("pendingNavigatePath"))
+    }
+
+    private fun conversationIntent(path: String) =
+        Intent(
+            ApplicationProvider.getApplicationContext<Context>(),
+            MainActivity::class.java,
+        ).putExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH, path)
+
+    private fun activationScript(path: String) =
+        "window.__omnigentNativeEmitNotificationActivated && " +
+            "window.__omnigentNativeEmitNotificationActivated(\"$path\");"
 
     @Test
     fun `server pill tracks the container width and truncates in the middle`() {
@@ -307,6 +561,31 @@ class MainActivityTest {
             override fun rendererPriorityAtExit(): Int = WebView.RENDERER_PRIORITY_IMPORTANT
         }
 
+    private fun request(url: String) =
+        object : WebResourceRequest {
+            override fun getUrl(): Uri = Uri.parse(url)
+
+            override fun isForMainFrame(): Boolean = true
+
+            override fun isRedirect(): Boolean = false
+
+            override fun hasGesture(): Boolean = false
+
+            override fun getMethod(): String = "GET"
+
+            override fun getRequestHeaders(): Map<String, String> = emptyMap()
+        }
+
+    private fun httpError(statusCode: Int) =
+        WebResourceResponse(
+            "text/html",
+            "UTF-8",
+            statusCode,
+            "HTTP error",
+            emptyMap(),
+            null,
+        )
+
     @Test
     fun `a managed preset never overrides the server the user picked`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -336,6 +615,14 @@ class MainActivityTest {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         return Robolectric.buildActivity(MainActivity::class.java).setup().get()
     }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> MainActivity.declared(name: String): T =
+        MainActivity::class
+            .java
+            .getDeclaredField(name)
+            .apply { isAccessible = true }
+            .get(this) as T
 
     private fun MainActivity.switchButton(): View =
         MainActivity::class

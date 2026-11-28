@@ -123,6 +123,40 @@ def test_classify_non_retryable_http_status(
     assert result.code == "401"
 
 
+def test_classify_http_413_byte_cap_is_context_overflow(
+    retryable_status_codes: list[int],
+) -> None:
+    """A 413 byte-cap rejection classifies as a context-window overflow."""
+    body = (
+        "Server received a request which exceeds maximum allowed content "
+        "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
+    )
+    exc = _make_http_status_error(413, body=body)
+
+    result = classify_llm_error(exc, retryable_status_codes)
+
+    # An edge may report the byte cap as 413 (Payload Too Large); it must still
+    # surface as a context overflow so the workflow can compact-retry.
+    assert isinstance(result, ContextWindowExceededError)
+    assert result.code == "context_length_exceeded"
+    # Byte sizes are carried as approximate tokens (bytes // 4).
+    assert result.max_context_tokens == 33554432 // 4
+    assert result.actual_tokens == 33967957 // 4
+
+
+def test_classify_http_413_without_overflow_stays_permanent(
+    retryable_status_codes: list[int],
+) -> None:
+    """A generic 413 with no byte-cap phrase stays a permanent error."""
+    exc = _make_http_status_error(413, body="payload too large")
+
+    result = classify_llm_error(exc, retryable_status_codes)
+
+    # No content-length phrase — the 413 gate must not over-classify.
+    assert isinstance(result, PermanentLLMError)
+    assert result.code == "413"
+
+
 def test_classify_unknown_exception(
     retryable_status_codes: list[int],
 ) -> None:

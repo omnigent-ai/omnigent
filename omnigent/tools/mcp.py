@@ -49,11 +49,13 @@ from mcp.types import (
     ContentBlock,
     ElicitRequestParams,
     ElicitResult,
+    ImageContent,
     TextContent,
 )
 from mcp.types import Tool as McpToolDef
 
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 
 _T = TypeVar("_T")
@@ -505,6 +507,10 @@ class McpServerConnection:
 
     config: MCPServerConfig
     cwd: Path | None = None
+    # Explicit harness transports must not be inferred from the URL path.
+    http_transport: str = "auto"
+    # Limited discovery follows pagination without populating the shared full-tool cache.
+    discovery_limit: int | None = None
     # Elicitation callback invoked when the MCP server sends
     # ``elicitation/create`` inline during a ``tools/call``.
     # Receives ``(session_id, params)`` and returns an
@@ -625,8 +631,7 @@ class McpServerConnection:
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Forwarded to ``_invoke_tool`` for inline elicitation
             context. ``None`` when no session is available.
-        :returns: The tool result as a string. For multi-content
-            results, text blocks are joined with newlines.
+        :returns: A tagged image result or the legacy newline-joined text.
         :raises RuntimeError: If ``connect()`` has not been called.
         :raises McpServerDisabledError: If the circuit breaker is
             tripped.
@@ -917,7 +922,7 @@ class McpServerConnection:
 
         :returns: List of MCP tool definitions.
         """
-        cached = self._check_cache()
+        cached = self._check_cache() if self.discovery_limit is None else None
         if cached is not None:
             self._discovered_tools = cached
             _logger.debug(
@@ -930,14 +935,26 @@ class McpServerConnection:
         if self._session is None:
             raise RuntimeError("MCP session not initialized — call connect() first")
         tools_result = await self._session.list_tools()
-        self._discovered_tools = tools_result.tools
-        self._update_cache(tools_result.tools)
+        tools = list(tools_result.tools)
+        if self.discovery_limit is not None:
+            seen_cursors: set[str] = set()
+            while tools_result.nextCursor and len(tools) < self.discovery_limit:
+                cursor = tools_result.nextCursor
+                if cursor in seen_cursors:
+                    raise ValueError("MCP discovery repeated a cursor")
+                seen_cursors.add(cursor)
+                tools_result = await self._session.list_tools(cursor=cursor)
+                tools.extend(tools_result.tools)
+            tools = tools[: self.discovery_limit]
+        else:
+            self._update_cache(tools)
+        self._discovered_tools = tools
         _logger.info(
             "MCP server %r: discovered %d tool(s)",
             self.config.name,
-            len(tools_result.tools),
+            len(tools),
         )
-        return tools_result.tools
+        return tools
 
     async def close(self) -> None:
         """
@@ -1167,7 +1184,9 @@ class McpServerConnection:
             )
         timeout = self.config.timeout
         headers = self._resolve_http_headers()
-        if _is_sse_endpoint(self.config.url):
+        if self.http_transport == "sse" or (
+            self.http_transport == "auto" and _is_sse_endpoint(self.config.url)
+        ):
             # Legacy-SSE servers (e.g. crawl4ai's /mcp/sse) hang the
             # Streamable HTTP client in teardown, which would block the
             # except-clause SSE fallback below from ever running. Route
@@ -1181,6 +1200,8 @@ class McpServerConnection:
             # and avoiding the teardown hang takes priority over covering
             # a misnamed-endpoint case that is not known to occur.
             return await self._open_sse_transport(stack, timeout, headers)
+        if self.http_transport == "streamable-http":
+            return await self._open_streamable_http_transport(stack, timeout, headers)
         try:
             return await self._open_streamable_http_transport(stack, timeout, headers)
         except Exception as exc:
@@ -1711,8 +1732,9 @@ def _format_call_result(result: CallToolResult) -> str:
     """
     Convert an MCP ``CallToolResult`` to a plain string.
 
-    Extracts text content blocks and joins them. If the result
-    indicates an error, prefixes the output with ``"Error: "``.
+    Image results use a tagged envelope so terminal adapters can restore
+    native image blocks. Other results retain the joined text format and
+    the ``"Error: "`` prefix on failure.
 
     :param result: The ``CallToolResult`` from
         ``session.call_tool()``.
@@ -1720,10 +1742,34 @@ def _format_call_result(result: CallToolResult) -> str:
         Returns ``"(empty response)"`` when the server sends no
         content blocks.
     """
-    parts: list[str] = []
+    content = []
+    legacy_parts: list[str] = []
+    has_image = False
     for block in result.content:
-        parts.append(_format_content_block(block))
-    joined = "\n".join(parts)
+        canonical = (
+            native_image_payload(block.data, block.mimeType)
+            if isinstance(block, ImageContent)
+            else None
+        )
+        if canonical is not None:
+            # Claude's bundled MCP schema takes optional fields as absent, not
+            # null, so unset ``annotations``/``meta`` must be omitted rather
+            # than serialized as ``null``.
+            content.append({**block.model_dump(mode="json", exclude_none=True), "data": canonical})
+            has_image = True
+        else:
+            text = _format_content_block(block)
+            legacy_parts.append(text)
+            content.append(
+                block.model_dump(mode="json", exclude_none=True)
+                if isinstance(block, ImageContent)
+                and block.data
+                and block.mimeType.startswith("image/")
+                else {"type": "text", "text": text}
+            )
+    if has_image:
+        return encode_mcp_image_result(content, is_error=bool(result.isError))
+    joined = "\n".join(legacy_parts)
     if not joined:
         joined = "(empty response)"
     if result.isError:

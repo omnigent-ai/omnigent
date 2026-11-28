@@ -1,18 +1,18 @@
 import {
-  ArrowDownAZIcon,
-  ArrowDownWideNarrowIcon,
+  ArrowDownUpIcon,
   EyeIcon,
   EyeOffIcon,
-  FileClockIcon,
-  FileTypeIcon,
+  FilterIcon,
   MoonIcon,
+  RefreshCwIcon,
   SearchIcon,
-  SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
+import { CHANGED_SORT_OPTIONS } from "./fileTree/changedSortOptions";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
+import { useSandboxStarting } from "@/hooks/useSessionReconnect";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
@@ -22,13 +22,16 @@ import {
   relativizeToWorkspace,
   useWorkspaceChangedFiles,
   useWorkspaceAllFiles,
+  useWorkspaceAsleep,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { BrowseLocationBar } from "./BrowseLocationBar";
 import { CopyPathButton } from "./CopyPathButton";
+import { OpenInMenu } from "./OpenInMenu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -38,9 +41,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
+import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
+  conversationId?: string;
   onFileSelect: (path: string) => void;
   /**
    * Which scope this panel renders: false = full folder tree, true =
@@ -76,6 +81,26 @@ interface FilesPanelProps {
   frameless?: boolean;
 }
 
+interface QueryStatus {
+  data: unknown;
+  isLoading: boolean;
+  isError: boolean;
+  error: Error | null;
+}
+
+/**
+ * A file list's query waits for the workspace environment, so until either has
+ * data the list reports the environment's load or failure instead of empty.
+ */
+export function fileListStatus(list: QueryStatus, environment: QueryStatus) {
+  const waiting = list.data === undefined && environment.data === undefined;
+  return {
+    isLoading: list.isLoading || (waiting && environment.isLoading),
+    isError: list.isError || (waiting && environment.isError),
+    error: list.error ?? (waiting ? environment.error : null),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // HiddenFilesToggle
 // ---------------------------------------------------------------------------
@@ -83,12 +108,10 @@ interface FilesPanelProps {
 function HiddenFilesToggle({
   showHidden,
   onToggle,
-  size,
   hiddenCount,
 }: {
   showHidden: boolean;
   onToggle: () => void;
-  size: "4" | "3.5";
   hiddenCount: number;
 }) {
   const hasHidden = hiddenCount > 0 && !showHidden;
@@ -98,26 +121,25 @@ function HiddenFilesToggle({
     : hasHidden
       ? `${hiddenCount} file${hiddenCount === 1 ? "" : "s"} in hidden directories. Click to show.`
       : "Show hidden files";
-  const iconSize = size === "4" ? "size-4" : "size-3.5";
   return (
     <TooltipProvider>
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon-sm"
             aria-label={ariaLabel}
             className={cn(
-              "cursor-pointer rounded p-1 hover:bg-muted",
               hasHidden
                 ? "text-warning hover:text-warning/80"
                 : "text-muted-foreground hover:text-foreground",
             )}
             onClick={onToggle}
           >
-            {/* The icon shows the current state, not the action: a plain eye
-                means hidden files are visible, a slashed eye means they are not. */}
-            {showHidden ? <EyeIcon className={iconSize} /> : <EyeOffIcon className={iconSize} />}
-          </button>
+            {/* The icon previews the action: slash to hide, eye to reveal. */}
+            {showHidden ? <EyeOffIcon /> : <EyeIcon />}
+          </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{tooltipLabel}</TooltipContent>
       </Tooltip>
@@ -129,13 +151,6 @@ function HiddenFilesToggle({
 // SortSelector
 // ---------------------------------------------------------------------------
 
-const SORT_OPTIONS: { value: ChangedSort; label: string; Icon: typeof ArrowDownAZIcon }[] = [
-  { value: "alpha", label: "Filename", Icon: ArrowDownAZIcon },
-  { value: "recent", label: "Last edited", Icon: FileClockIcon },
-  { value: "size", label: "Size", Icon: ArrowDownWideNarrowIcon },
-  { value: "type", label: "Type", Icon: FileTypeIcon },
-];
-
 function SortSelector({
   sort,
   onChange,
@@ -143,30 +158,39 @@ function SortSelector({
   sort: ChangedSort;
   onChange: (next: ChangedSort) => void;
 }) {
-  const active = SORT_OPTIONS.find((o) => o.value === sort) ?? SORT_OPTIONS[0];
+  const active = CHANGED_SORT_OPTIONS.find((o) => o.value === sort) ?? CHANGED_SORT_OPTIONS[0];
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label={`Sort: ${active.label}`}
-          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-sm hover:bg-muted hover:text-foreground"
-        >
-          <span>Sort:</span>
-          <active.Icon className="size-3.5" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-40">
-        <DropdownMenuRadioGroup value={sort} onValueChange={(v) => onChange(v as ChangedSort)}>
-          {SORT_OPTIONS.map(({ value, label, Icon }) => (
-            <DropdownMenuRadioItem key={value} value={value}>
-              <Icon className="size-3.5" />
-              {label}
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <TooltipProvider>
+      <DropdownMenu>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-label={`Sort: ${active.label}`}
+                className="shrink-0 gap-[2px] text-muted-foreground hover:text-foreground"
+              >
+                <ArrowDownUpIcon />
+                <span>{active.label}</span>
+              </Button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Sort files</TooltipContent>
+        </Tooltip>
+        <DropdownMenuContent align="end" className="w-40">
+          <DropdownMenuRadioGroup value={sort} onValueChange={(v) => onChange(v as ChangedSort)}>
+            {CHANGED_SORT_OPTIONS.map(({ value, label, Icon }) => (
+              <DropdownMenuRadioItem key={value} value={value}>
+                <Icon className="size-3.5" />
+                {label}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </TooltipProvider>
   );
 }
 
@@ -208,14 +232,18 @@ function SearchFilterInput({
 
 /**
  * Browse location per conversation, surviving unmount/remount within a JS
- * session. Opening a file swaps this panel for the FileViewer (see
- * WorkspacePanel's content slot), which unmounts it — with plain state,
- * closing the viewer snapped the tree back to the workspace root instead of
- * the directory the file was opened from. Same pattern as FolderTree's
- * expandedPathsCache. Keyed by conversation, so a session switch still lands
- * on that session's own last location (or its root), never another's.
+ * session (e.g. a session switch, or the mobile drawer closing). Same pattern
+ * as FolderTree's expandedPathsCache. Keyed by conversation, so a session
+ * switch still lands on that session's own last location (or its root).
  */
 const browseLocationCache = new Map<string, string>();
+const folderRevealListeners = new Set<(conversationId: string, absolutePath: string) => void>();
+
+/** Point a session's Files tree at a folder: live if mounted, else on its next mount. */
+export function revealFolderInFilesPanel(conversationId: string, absolutePath: string): void {
+  browseLocationCache.set(conversationId, absolutePath);
+  folderRevealListeners.forEach((listener) => listener(conversationId, absolutePath));
+}
 
 /**
  * Right-side Files card. Always visible on desktop.
@@ -227,6 +255,7 @@ const browseLocationCache = new Map<string, string>();
  * intentionally not listed here.
  */
 export function FilesPanel({
+  conversationId: sessionId,
   onFileSelect,
   flatView,
   showHidden,
@@ -236,7 +265,8 @@ export function FilesPanel({
   onClose,
   frameless,
 }: FilesPanelProps) {
-  const { conversationId } = useParams<{ conversationId: string }>();
+  const { conversationId: routeId } = useParams<{ conversationId: string }>();
+  const conversationId = sessionId ?? routeId;
   // The runner went offline (e.g. its host restarted): `sessionStatus`
   // is "failed", set by `_on_runner_disconnect` server-side when the
   // runner's tunnel drops (and also client-side in chatStore when the
@@ -249,6 +279,7 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
   // The runner is offline but the host still holds the workspace on disk,
   // so the server serves the panel by reading the workspace over the host
   // tunnel. Show a passive "served from host" badge — the panel keeps
@@ -268,6 +299,8 @@ export function FilesPanel({
   const [treeExclude, setTreeExclude] = useState("");
   const [debouncedTreeExclude, setDebouncedTreeExclude] = useState("");
   const [showSearchFilters, setShowSearchFilters] = useState(false);
+  const [directoryRefreshToken, setDirectoryRefreshToken] = useState(0);
+  const [refreshingFiles, setRefreshingFiles] = useState(false);
   // The drawer (onClose) adds an X close button to the header. Both the drawer
   // and the inline rail (frameless) fill their parent's height and drop the
   // rounded card chrome; only the standalone card caps content at max-h.
@@ -284,8 +317,7 @@ export function FilesPanel({
   // workspace chip uses.
   const { session } = useSession(conversationId);
   // Absolute path currently browsed. Null tracks the workspace root. Seeded
-  // from the per-conversation cache so the location survives the panel
-  // unmounting while a file is open in the viewer.
+  // from the per-conversation cache so the location survives a remount.
   const [browseLocation, setBrowseLocation] = useState<string | null>(
     () => (conversationId && browseLocationCache.get(conversationId)) || null,
   );
@@ -322,8 +354,6 @@ export function FilesPanel({
     [workspaceRoot, conversationId],
   );
 
-  // Stable so memo(TreeNodeRow) isn't busted on every FilesPanel re-render.
-  /** Re-root onto a directory of the current tree (double-click to open). */
   const navigateToChild = useCallback(
     (relativePath: string) => {
       if (!workingDir) return;
@@ -398,6 +428,18 @@ export function FilesPanel({
     setDebouncedTreeSearch("");
   }, []);
 
+  useEffect(() => {
+    const listener = (revealedId: string, absolutePath: string) => {
+      if (revealedId !== conversationId) return;
+      exitTreeSearch();
+      navigateTo(absolutePath);
+    };
+    folderRevealListeners.add(listener);
+    return () => {
+      folderRevealListeners.delete(listener);
+    };
+  }, [conversationId, navigateTo, exitTreeSearch]);
+
   // Only fire search queries on the Explore tab. The include/exclude globs
   // narrow an active text query; globs alone do not search.
   const treeSearchQuery = useWorkspaceFileSearch(
@@ -413,6 +455,31 @@ export function FilesPanel({
   // Highlight the filters toggle when include/exclude carry a value.
   const treeFiltersActive = treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
 
+  const refreshFiles = useCallback(async () => {
+    if (refreshingFiles) return;
+    setRefreshingFiles(true);
+    if (!flatView) setDirectoryRefreshToken((token) => token + 1);
+    try {
+      const refreshes = flatView
+        ? [changedQuery.refetch()]
+        : [
+            allFilesQuery.refetch(),
+            changedQuery.refetch(),
+            ...(debouncedTreeSearch.trim() ? [treeSearchQuery.refetch()] : []),
+          ];
+      await Promise.all(refreshes);
+    } finally {
+      setRefreshingFiles(false);
+    }
+  }, [
+    allFilesQuery,
+    changedQuery,
+    debouncedTreeSearch,
+    flatView,
+    refreshingFiles,
+    treeSearchQuery,
+  ]);
+
   // Persist/restore the list's scroll position across conversation and view
   // switches. Keyed per conversation + view (Changed vs All) since the two
   // lists have independent heights. Readiness is data presence rather than
@@ -424,6 +491,12 @@ export function FilesPanel({
     : null;
   const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
   const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
+  // An idle-stopped managed sandbox is asleep, not failed: its status stays
+  // idle, and with neither a runner nor a host to read the workspace from, the
+  // lists can't load. Say so rather than "No files in workspace"; a list
+  // cached before it slept still renders.
+  const showAsleepHint = sandboxAsleep && !dataReady;
+  const sandboxWaking = useSandboxStarting(conversationId);
 
   return (
     <div
@@ -432,10 +505,10 @@ export function FilesPanel({
         fillHeight ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
       )}
     >
-      {/* Header — single row: [title · workingDir] [eye] [close?] */}
-      <div className="flex shrink-0 items-center gap-2 px-3 py-2">
-        <h2 className="shrink-0 font-medium text-ui">{flatView ? "Changes" : "Working folder"}</h2>
-        {workingDir && workspaceRoot && (
+      {/* Header — single row: [workingDir] [copy] [refresh] [close?] [open in] */}
+      <div className="flex h-11 shrink-0 items-center gap-[2px] px-2">
+        {flatView && <h2 className="shrink-0 pl-1 font-medium text-ui">Changes</h2>}
+        {!flatView && workingDir && workspaceRoot && (
           <BrowseLocationBar
             current={workingDir}
             workspace={workspaceRoot}
@@ -464,20 +537,32 @@ export function FilesPanel({
             </Tooltip>
           </TooltipProvider>
         )}
-        <div className="ml-auto flex items-center gap-1">
-          {workingDir && (
+        <div className="ml-auto flex items-center gap-[2px]">
+          {!flatView && workingDir && (
             // Its own provider: the header has no TooltipProvider ancestor
             // (each control here brings one), unlike the file rows.
             <TooltipProvider>
               <CopyPathButton path={workingDir} label="Copy folder path" />
             </TooltipProvider>
           )}
-          <HiddenFilesToggle
-            showHidden={showHidden}
-            onToggle={() => onShowHiddenChange(!showHidden)}
-            size={isDrawer ? "4" : "3.5"}
-            hiddenCount={hiddenFilesCount}
-          />
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Refresh files"
+                  disabled={refreshingFiles}
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                  onClick={() => void refreshFiles()}
+                >
+                  <RefreshCwIcon className={cn(refreshingFiles && "animate-spin")} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Refresh files</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
           {onClose && (
             <button
               type="button"
@@ -488,69 +573,91 @@ export function FilesPanel({
               <XIcon className="size-4" />
             </button>
           )}
+          {!flatView && workingDir && <OpenInMenu path={workingDir} directory />}
         </div>
       </div>
       {/* Content */}
-      <div className="shrink-0 border-t border-border" />
+      <div className="workspace-panel-header-divider shrink-0 border-t border-border" />
       {/* Search toolbar — the Changed | All scope switch leads, then the
               search field, then the per-view trailing control (Sort for the
               changed list, glob filters for the tree). Lives outside the
               scroll container so negative margins aren't clipped. */}
       {flatView && (
         <div
-          className="shrink-0 flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
+          className="shrink-0 flex items-center gap-2 px-2 py-2 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
           onClick={(e) => e.stopPropagation()}
         >
-          <div className="flex min-w-0 flex-1 items-center gap-2">
-            <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
+          <div className="flex min-w-0 flex-1 items-center gap-[2px]">
+            <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-lg border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
               <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
               <input
                 aria-label="Search changed files"
                 className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                 onChange={(event) => setChangedSearch(event.target.value)}
-                placeholder="Search"
+                placeholder="Find changed files by name"
                 type="search"
                 value={changedSearch}
               />
             </div>
             <SortSelector sort={changedSort} onChange={onSortChange} />
+            <HiddenFilesToggle
+              showHidden={showHidden}
+              onToggle={() => onShowHiddenChange(!showHidden)}
+              hiddenCount={hiddenFilesCount}
+            />
           </div>
         </div>
       )}
       {!flatView && (
         <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
-          <div className="flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
-            <div className="flex min-w-0 flex-1 items-center gap-2">
-              <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
+          <div className="flex items-center gap-2 px-2 py-2 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
+            <div className="flex min-w-0 flex-1 items-center gap-[2px]">
+              <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-lg border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
                 <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
                 <input
                   aria-label="Search all files"
                   className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                   onChange={(event) => setTreeSearch(event.target.value)}
-                  placeholder="Search"
+                  placeholder="Find files by name"
                   type="search"
                   value={treeSearch}
                 />
               </div>
-              <button
-                type="button"
-                aria-label={showSearchFilters ? "Hide search filters" : "Show search filters"}
-                aria-expanded={showSearchFilters}
-                title="Files to include / exclude"
-                className={cn(
-                  "flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] hover:bg-muted",
-                  showSearchFilters || treeFiltersActive
-                    ? "text-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-                onClick={() => setShowSearchFilters((v) => !v)}
-              >
-                <SlidersHorizontalIcon className="size-3.5" />
-                {treeFiltersActive && !showSearchFilters && (
-                  <span className="size-1.5 rounded-full bg-primary" aria-hidden />
-                )}
-              </button>
               <SortSelector sort={changedSort} onChange={onSortChange} />
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={showSearchFilters ? "Hide search filters" : "Show search filters"}
+                      aria-expanded={showSearchFilters}
+                      className={cn(
+                        "shrink-0",
+                        showSearchFilters || treeFiltersActive
+                          ? "text-foreground"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                      onClick={() => setShowSearchFilters((v) => !v)}
+                    >
+                      <FilterIcon />
+                      {treeFiltersActive && !showSearchFilters && (
+                        <span
+                          className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-primary"
+                          aria-hidden
+                        />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">Files to include / exclude</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <HiddenFilesToggle
+                showHidden={showHidden}
+                onToggle={() => onShowHiddenChange(!showHidden)}
+                hiddenCount={hiddenFilesCount}
+              />
             </div>
           </div>
           {showSearchFilters && (
@@ -575,17 +682,16 @@ export function FilesPanel({
         ref={scrollRef}
         className={cn(
           "overflow-y-auto px-2 pb-2",
-          flatView ? "pt-1" : "pt-2",
+          flatView ? "pt-1" : "pt-0",
           fillHeight ? "min-h-0 flex-1" : "max-h-72",
         )}
         onScroll={handleScroll}
       >
-        {flatView ? (
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline waking={sandboxWaking} />}
+        {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
-            isLoading={changedQuery.isLoading}
-            isError={changedQuery.isError}
-            error={changedQuery.error}
+            {...fileListStatus(changedQuery, envQuery)}
             onFileSelect={onFileSelect}
             showHidden={showHidden}
             onShowHidden={() => onShowHiddenChange(true)}
@@ -593,13 +699,13 @@ export function FilesPanel({
             sort={changedSort}
             conversationId={conversationId}
             runnerWentOffline={runnerWentOffline}
+            scrollParentRef={scrollRef}
           />
-        ) : (
+        )}
+        {!showAsleepHint && !flatView && (
           <FolderTree
             files={allFilesQuery.data?.data}
-            isLoading={allFilesQuery.isLoading}
-            isError={allFilesQuery.isError}
-            error={allFilesQuery.error}
+            {...fileListStatus(allFilesQuery, envQuery)}
             onFileSelect={openTreeFile}
             conversationId={conversationId}
             showHidden={showHidden}
@@ -612,7 +718,12 @@ export function FilesPanel({
             // flight React Query returns the PRIOR term's results (isPlaceholderData),
             // which would otherwise render as if they matched the new term. Drop
             // them so the tree shows "Searching…" until the real results land.
-            searchResults={treeSearchQuery.isPlaceholderData ? undefined : treeSearchQuery.data}
+            searchResults={
+              treeSearchQuery.isPlaceholderData ? undefined : treeSearchQuery.data?.files
+            }
+            searchTruncated={
+              !treeSearchQuery.isPlaceholderData && (treeSearchQuery.data?.truncated ?? false)
+            }
             isSearching={treeSearchQuery.isFetching}
             isSearchError={treeSearchQuery.isError}
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
@@ -620,6 +731,7 @@ export function FilesPanel({
             onNavigateDir={navigateToChild}
             onExitSearch={exitTreeSearch}
             scrollParentRef={scrollRef}
+            refreshToken={directoryRefreshToken}
           />
         )}
       </section>

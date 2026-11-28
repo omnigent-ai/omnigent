@@ -2,21 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import logging
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 
 import pytest
+from sqlalchemy import update
+from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import current_workspace_id
+from omnigent.db.db_models import SqlHost, current_workspace_id
+from omnigent.db.enum_codecs import encode_host_status
+from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     ManagedSandboxReaperConfig,
 )
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
-from omnigent.stores.host_store import Host, ManagedSandboxScanCursor, ManagedSandboxScanRow
+from omnigent.stores.host_store import (
+    Host,
+    HostStore,
+    ManagedSandboxScanCursor,
+    ManagedSandboxScanRow,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -233,6 +245,34 @@ def _deployment(
     )
 
 
+class _ParkedSleep:
+    """
+    Stand-in for ``asyncio.sleep`` that records each delay and holds the caller
+    until the test releases it, so the loop's timing is observed without waiting.
+    """
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self._parked: asyncio.Queue[asyncio.Event] = asyncio.Queue()
+
+    async def __call__(self, delay: float) -> None:
+        """
+        Record ``delay`` and wait until the test sets this call's release event.
+
+        :param delay: Seconds the reaper asked to sleep, e.g. ``412.7``.
+        """
+        self.delays.append(delay)
+        release = asyncio.Event()
+        self._parked.put_nowait(release)
+        await release.wait()
+
+    async def next_parked(self) -> asyncio.Event:
+        """
+        Wait for the reaper's next sleep call and return the event that ends it.
+        """
+        return await asyncio.wait_for(self._parked.get(), timeout=5)
+
+
 async def test_sweep_reaps_stale_host_rows_without_scanning_sessions() -> None:
     now = 4_000_000
     modal = _RecordingLauncher("modal")
@@ -409,6 +449,7 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
     hosts = _FakeHostStore(
         {
             7: [
+                _host("host_offline", provider="modal", sandbox_id="sb-offline", updated_at=0),
                 _host(
                     "host_deleted",
                     provider="modal",
@@ -416,13 +457,14 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
                     updated_at=now,
                     status="online",
                     deleted_at=now,
-                )
+                ),
             ]
         }
     )
     reaper = ManagedSandboxReaper(
         host_store=hosts,  # type: ignore[arg-type]
         sandbox_config=_deployment([modal]),
+        reap_offline=False,
     )
 
     assert await reaper.sweep_once(now=now) == 0
@@ -432,6 +474,8 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
     assert await reaper.sweep_once(now=now) == 1
     assert modal.terminated == ["sb-deleted"]
     assert "host_deleted" not in hosts.hosts[7]
+
+    assert "host_offline" in hosts.hosts[7]
 
 
 async def test_provider_identity_failure_does_not_stop_other_sandboxes() -> None:
@@ -533,6 +577,54 @@ async def test_successful_termination_preserves_new_active_generation() -> None:
     assert hosts.hosts[7]["host_modal"].terminating_sandbox_id is None
 
 
+@pytest.mark.parametrize("stale_status", ["offline", "online"])
+async def test_new_binding_gets_reaping_grace_without_reviving_host(
+    db_uri: str, stale_status: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hosts = HostStore(db_uri)
+    host_id = "ab" * 16
+    modal = _RecordingLauncher("modal")
+    reaper = ManagedSandboxReaper(host_store=hosts, sandbox_config=_deployment([modal]))
+    now = now_epoch()
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now)
+    hosts.reserve_sandbox_host(
+        host_id=host_id, name="managed-host", user_id="alice@example.com", provider="modal"
+    )
+    hosts.bind_sandbox(host_id, provider="modal", sandbox_id="old")
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+            .values(updated_at=now - 2 * _DAY_S)
+        )
+        session.commit()
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.terminated == ["old"]
+
+    # A durable row may retain online status after an unclean host disconnect.
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+            .values(status=encode_host_status(stale_status))
+        )
+        session.commit()
+    hosts.reserve_sandbox_host(
+        host_id=host_id, name="managed-host", user_id="alice@example.com", provider="modal"
+    )
+    bound = hosts.bind_sandbox(host_id, provider="modal", sandbox_id="replacement")
+    assert bound is not None
+    assert not hosts.is_online(host_id)
+    assert await reaper.sweep_once(now=now) == 0
+    assert modal.terminated == ["old"]
+    assert hosts.get_host(host_id) == bound
+    # Rebinding the same generation must not extend its lifetime indefinitely.
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now + 3600)
+    assert hosts.bind_sandbox(host_id, provider="modal", sandbox_id="replacement") == bound
+    assert await reaper.sweep_once(now=now + _DAY_S) == 1
+    assert modal.terminated == ["old", "replacement"]
+
+
 async def test_pending_termination_retries_without_detaching_active_generation() -> None:
     now = 4_000_000
     hosts = _FakeHostStore(
@@ -615,3 +707,222 @@ async def test_identity_and_termination_run_off_event_loop_thread() -> None:
     assert await reaper.sweep_once(now=now) == 1
     assert modal.identity_threads == modal.termination_threads
     assert modal.identity_threads[0] != event_loop_thread
+
+
+class _OwnerLauncher(_RecordingLauncher):
+    """An owner-identity launcher: each instance acts as whoever it is bound to."""
+
+    owner_credential_provider = "databricks"
+
+    def __init__(self, built: list[_OwnerLauncher], connected: set[str] | None = None) -> None:
+        super().__init__("databricks")
+        self.owner: str | None = None
+        self.connected = connected
+        built.append(self)
+
+    def bind_owner_credential(self, resolve: Callable[[], object]) -> None:
+        resolve()
+
+    def terminate(self, sandbox_id: str) -> None:
+        # Like the real launcher, an unconnected owner is refused at first use.
+        if self.connected is not None and self.owner not in self.connected:
+            raise OwnerCredentialMissingError("Connect Databricks first")
+        self.terminated.append(f"{self.owner}:{sandbox_id}")
+
+
+def _alice_and_bob_stale_hosts(now: int) -> _FakeHostStore:
+    return _FakeHostStore(
+        {
+            7: [
+                replace(
+                    _host(
+                        "h_a",
+                        provider="databricks",
+                        sandbox_id="sb-a",
+                        updated_at=now - 2 * _DAY_S,
+                    ),
+                    user_id="alice",
+                ),
+                replace(
+                    _host(
+                        "h_b",
+                        provider="databricks",
+                        sandbox_id="sb-b",
+                        updated_at=now - 3 * _DAY_S,
+                    ),
+                    user_id="bob",
+                ),
+            ]
+        }
+    )
+
+
+def _owner_reaper(
+    hosts: _FakeHostStore,
+    *,
+    connected: set[str] | None = None,
+    broken: str | None = None,
+) -> tuple[ManagedSandboxReaper, dict[str, _OwnerLauncher]]:
+    """Build a reaper whose launchers record, per owner, the last one bound to them."""
+    built: list[_OwnerLauncher] = []
+    current: dict[str, _OwnerLauncher] = {}
+
+    def resolve(user: str) -> None:
+        if user == broken:
+            raise RuntimeError("connection store unavailable")
+        built[-1].owner = user
+        current[user] = built[-1]
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                launcher_factory=lambda: _OwnerLauncher(built, connected),  # type: ignore[arg-type]
+                token_ttl_s=3600,
+                provider="databricks",
+            ),
+        ),
+        reaper=ManagedSandboxReaperConfig(enabled=True, terminate_after_offline_days=1),
+        owner_credentials={"databricks": resolve},
+    )
+    reaper = ManagedSandboxReaper(host_store=hosts, sandbox_config=deployment)  # type: ignore[arg-type]
+    return reaper, current
+
+
+async def test_owner_identity_reaps_each_sandbox_as_its_own_owner() -> None:
+    now = 4_000_000
+    reaper, current = _owner_reaper(_alice_and_bob_stale_hosts(now))
+
+    assert await reaper.sweep_once(now=now) == 2
+
+    assert current["alice"].terminated == ["alice:sb-a"]
+    assert current["bob"].terminated == ["bob:sb-b"]
+
+
+@pytest.mark.parametrize("instance_hook", [False, True], ids=["class-hook", "instance-hook"])
+async def test_reaper_binds_each_candidates_owner_for_bind_owner_launchers(
+    instance_hook: bool,
+) -> None:
+    now = 4_000_000
+    terminated: list[str] = []
+
+    class _BoundOwnerLauncher:
+        provider = "databricks"
+        active_owner: str | None = None
+
+        def record_owner(self, owner: str) -> None:
+            self.owner = owner
+
+        @contextlib.contextmanager
+        def reaper_identity(self, workspace_id: int) -> Iterator[None]:
+            self.active_owner = self.owner
+            try:
+                yield
+            finally:
+                self.active_owner = None
+
+        def terminate(self, sandbox_id: str) -> None:
+            terminated.append(f"{self.active_owner}:{sandbox_id}")
+
+    class _ClassHookLauncher(_BoundOwnerLauncher):
+        bind_owner = _BoundOwnerLauncher.record_owner
+
+    class _InstanceHookLauncher(_BoundOwnerLauncher):
+        def __init__(self) -> None:
+            self.bind_owner = self.record_owner
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                launcher_factory=_InstanceHookLauncher if instance_hook else _ClassHookLauncher,  # type: ignore[arg-type]
+                token_ttl_s=3600,
+                provider="databricks",
+            ),
+        ),
+        reaper=ManagedSandboxReaperConfig(enabled=True, terminate_after_offline_days=1),
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=_alice_and_bob_stale_hosts(now),  # type: ignore[arg-type]
+        sandbox_config=deployment,
+    )
+
+    assert await reaper.sweep_once(now=now) == 2
+
+    assert sorted(terminated) == ["alice:sb-a", "bob:sb-b"]
+
+
+async def test_disconnected_owner_stays_pending_while_other_owners_are_reaped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = 4_000_000
+    connected = {"bob"}
+    hosts = _alice_and_bob_stale_hosts(now)
+    reaper, current = _owner_reaper(hosts, connected=connected)
+
+    with caplog.at_level(logging.WARNING):
+        assert await reaper.sweep_once(now=now) == 1
+    # An expected wait for the owner, logged once per sweep without a traceback.
+    (record,) = [r for r in caplog.records if "h_a" in r.getMessage()]
+    assert record.levelno == logging.WARNING and record.exc_info is None
+
+    assert current["bob"].terminated == ["bob:sb-b"]
+    assert current["alice"].terminated == []
+    # Detached but not cleared: the terminating id keeps alice's sandbox queued.
+    assert hosts.hosts[7]["h_a"].terminating_sandbox_id == "sb-a"
+
+    connected.add("alice")
+    assert await reaper.sweep_once(now=now) == 1
+
+    assert current["alice"].terminated == ["alice:sb-a"]
+    assert hosts.hosts[7]["h_a"].terminating_sandbox_id is None
+
+
+async def test_one_owner_launcher_failing_to_build_does_not_stop_the_sweep() -> None:
+    now = 4_000_000
+    reaper, current = _owner_reaper(_alice_and_bob_stale_hosts(now), broken="alice")
+
+    assert await reaper.sweep_once(now=now) == 1
+
+    assert current["bob"].terminated == ["bob:sb-b"]
+    assert "alice" not in current
+
+
+async def test_replicas_started_together_sweep_at_independent_random_times() -> None:
+    """
+    Replicas start their reapers together on every rollout, and each sweep reads
+    every managed host row. No replica may sweep at startup: each waits a random
+    part of one interval, then jitters every later interval within ±10%.
+    """
+    replicas = [(_FakeHostStore({}), _ParkedSleep()) for _ in range(2)]
+    reapers = [
+        ManagedSandboxReaper(
+            host_store=hosts,  # type: ignore[arg-type]
+            sandbox_config=_deployment([_RecordingLauncher("modal")], sweep_interval_s=1000),
+            sleep=sleep,
+        )
+        for hosts, sleep in replicas
+    ]
+    for reaper in reapers:
+        await reaper.start()
+    first_waits = [await sleep.next_parked() for _, sleep in replicas]
+
+    first_delays = [sleep.delays[0] for _, sleep in replicas]
+    assert all(0 <= delay <= 1000 for delay in first_delays), first_delays
+    assert first_delays[0] != first_delays[1]
+    assert [hosts.current_page_queries for hosts, _ in replicas] == [[], []]
+    assert [hosts.terminating_page_queries for hosts, _ in replicas] == [[], []]
+
+    for wait in first_waits:
+        wait.set()
+    for _, sleep in replicas:
+        await sleep.next_parked()
+
+    assert [hosts.current_page_queries for hosts, _ in replicas] == [[(None, 500)]] * 2
+    assert [hosts.terminating_page_queries for hosts, _ in replicas] == [[(None, 500)]] * 2
+    later_delays = [sleep.delays[1] for _, sleep in replicas]
+    assert all(900 <= delay <= 1100 for delay in later_delays), later_delays
+    assert later_delays[0] != later_delays[1]
+
+    for reaper in reapers:
+        await reaper.shutdown()

@@ -2,26 +2,43 @@
 
 from __future__ import annotations
 
+import ast
 import base64
+import contextlib
+import errno
+import importlib.util
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
+import site
+import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import MutableMapping, Sequence
+from collections.abc import Iterator, Mapping, MutableMapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
+from importlib.machinery import all_suffixes
 from pathlib import Path
-from typing import Protocol, cast
+from typing import ClassVar, Protocol, cast
 
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import DESKTOP_SESSION_ENV_VARS
-from .datamodel import CredentialProxySpec, CredentialSourceSpec, OSEnvSandboxSpec, OSEnvSpec
+from .datamodel import (
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    GitSshBinding,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+    TcpEgressRoute,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +48,7 @@ logger = logging.getLogger(__name__)
 # through the executor's tee.
 _SANDBOX_STRACE_ENV = "OMNIGENT_SANDBOX_STRACE"
 
-# Re-exec marker for ``run_launcher``: when set, the script is
-# already running INSIDE a ``bwrap`` / ``sandbox-exec`` wrap and
-# must NOT re-exec itself again. Set right before the re-exec call
-# and inherited by the wrapped process.
+# Inherited markers are not proof of containment.
 _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 
 # Hand-off marker for the spawn-time re-exec: the host pass mints the
@@ -44,12 +58,272 @@ _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 # dir the host pass created, so cleanup can never touch a spec-supplied
 # write root that merely happens to sit under the system tempdir.
 _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
+_LAUNCHER_ENV_MARKER = "# omnigent-launcher-env-v1:"
+
+# Trusted outer-launcher hint consumed before sandbox environment filtering.
+# Active sandbox helpers and launcher targets strip it; unsandboxed children keep it.
+HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 
 # Backends that need a spawn-time wrap (parent-side ``bwrap`` /
 # ``sandbox-exec`` invocation) in addition to whatever in-process
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
+_IMPORT_SUFFIXES = tuple(all_suffixes())
+
+_EDITABLE_PTH_IMPORT = re.compile(r"import (__editable__[A-Za-z0-9_]+_finder); \1\.install\(\)\Z")
+# Setuptools 84.2.0 generates this import hook in editable installs. Keep the executable
+# portion fixed; only the root mappings and finder name vary per install.
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE = """from __future__ import annotations
+import sys
+from importlib.machinery import ModuleSpec, PathFinder
+from importlib.machinery import all_suffixes as module_suffixes
+from importlib.util import spec_from_file_location
+from itertools import chain
+from pathlib import Path
+
+MAPPING: dict[str, str] = {mapping!r}
+NAMESPACES: dict[str, list[str]] = {namespaces!r}
+PATH_PLACEHOLDER = {name!r} + ".__path_hook__"
+
+
+class _EditableFinder:  # MetaPathFinder
+    @classmethod
+    def find_spec(cls, fullname: str, path=None, target=None) -> ModuleSpec | None:  # type: ignore
+        # Top-level packages and modules (we know these exist in the FS)
+        if fullname in MAPPING:
+            pkg_path = MAPPING[fullname]
+            return cls._find_spec(fullname, Path(pkg_path))
+
+        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+        return None
+
+    @classmethod
+    def _find_spec(cls, fullname: str, candidate_path: Path) -> ModuleSpec | None:
+        init = candidate_path / "__init__.py"
+        candidates = (candidate_path.with_suffix(x) for x in module_suffixes())
+        for candidate in chain([init], candidates):
+            if candidate.exists():
+                return spec_from_file_location(fullname, candidate)
+        return None
+
+
+class _EditableNamespaceFinder:  # PathEntryFinder
+    @classmethod
+    def _path_hook(cls, path) -> type[_EditableNamespaceFinder]:
+        if path == PATH_PLACEHOLDER:
+            return cls
+        raise ImportError
+
+    @classmethod
+    def _paths(cls, fullname: str) -> list[str]:
+        paths = NAMESPACES[fullname]
+        if not paths and fullname in MAPPING:
+            paths = [MAPPING[fullname]]
+        # Always add placeholder, for 2 reasons:
+        # 1. __path__ cannot be empty for the spec to be considered namespace.
+        # 2. In the case of nested namespaces, we need to force
+        #    import machinery to query _EditableNamespaceFinder again.
+        return [*paths, PATH_PLACEHOLDER]
+
+    @classmethod
+    def find_spec(cls, fullname: str, target=None) -> ModuleSpec | None:  # type: ignore
+        if fullname in NAMESPACES:
+            spec = ModuleSpec(fullname, None, is_package=True)
+            spec.submodule_search_locations = cls._paths(fullname)
+            return spec
+        return None
+
+    @classmethod
+    def find_module(cls, _fullname) -> None:
+        return None
+
+
+def install():
+    if not any(finder == _EditableFinder for finder in sys.meta_path):
+        sys.meta_path.append(_EditableFinder)
+
+    if not NAMESPACES:
+        return
+
+    if not any(hook == _EditableNamespaceFinder._path_hook for hook in sys.path_hooks):
+        # PathEntryFinder is needed to create NamespaceSpec without private APIS
+        sys.path_hooks.append(_EditableNamespaceFinder._path_hook)
+    if PATH_PLACEHOLDER not in sys.path:
+        sys.path.append(PATH_PLACEHOLDER)  # Used just to trigger the path hook
+"""
+# Setuptools 68.1.2 emits this older finder body. Compare the whole AST so
+# only mapping data and the finder name can vary across installations.
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2 = """import sys
+from importlib.machinery import ModuleSpec, PathFinder
+from importlib.machinery import all_suffixes as module_suffixes
+from importlib.util import spec_from_file_location
+from itertools import chain
+from pathlib import Path
+
+MAPPING = {mapping!r}
+NAMESPACES = {namespaces!r}
+PATH_PLACEHOLDER = {name!r} + ".__path_hook__"
+
+
+class _EditableFinder:  # MetaPathFinder
+    @classmethod
+    def find_spec(cls, fullname, path=None, target=None):
+        # Top-level packages and modules (we know these exist in the FS)
+        if fullname in MAPPING:
+            pkg_path = MAPPING[fullname]
+            return cls._find_spec(fullname, Path(pkg_path))
+
+        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+        return None
+
+    @classmethod
+    def _find_spec(cls, fullname, candidate_path):
+        init = candidate_path / "__init__.py"
+        candidates = (candidate_path.with_suffix(x) for x in module_suffixes())
+        for candidate in chain([init], candidates):
+            if candidate.exists():
+                return spec_from_file_location(fullname, candidate)
+
+
+class _EditableNamespaceFinder:  # PathEntryFinder
+    @classmethod
+    def _path_hook(cls, path):
+        if path == PATH_PLACEHOLDER:
+            return cls
+        raise ImportError
+
+    @classmethod
+    def _paths(cls, fullname):
+        # Ensure __path__ is not empty for the spec to be considered a namespace.
+        return NAMESPACES[fullname] or MAPPING.get(fullname) or [PATH_PLACEHOLDER]
+
+    @classmethod
+    def find_spec(cls, fullname, target=None):
+        if fullname in NAMESPACES:
+            spec = ModuleSpec(fullname, None, is_package=True)
+            spec.submodule_search_locations = cls._paths(fullname)
+            return spec
+        return None
+
+    @classmethod
+    def find_module(cls, fullname):
+        return None
+
+
+def install():
+    if not any(finder == _EditableFinder for finder in sys.meta_path):
+        sys.meta_path.append(_EditableFinder)
+
+    if not NAMESPACES:
+        return
+
+    if not any(hook == _EditableNamespaceFinder._path_hook for hook in sys.path_hooks):
+        # PathEntryFinder is needed to create NamespaceSpec without private APIS
+        sys.path_hooks.append(_EditableNamespaceFinder._path_hook)
+    if PATH_PLACEHOLDER not in sys.path:
+        sys.path.append(PATH_PLACEHOLDER)  # Used just to trigger the path hook
+"""
+# Earlier releases change only these fixed finder bodies. Keep the variants
+# explicit so an edited finder cannot pass by changing arbitrary AST nodes.
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_0 = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2.replace(
+    "from importlib.machinery import ModuleSpec, PathFinder",
+    "from importlib.machinery import ModuleSpec",
+).replace(
+    """        # Top-level packages and modules (we know these exist in the FS)
+        if fullname in MAPPING:
+            pkg_path = MAPPING[fullname]
+            return cls._find_spec(fullname, Path(pkg_path))
+
+        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+""",
+    """        for pkg, pkg_path in reversed(list(MAPPING.items())):
+            if fullname == pkg or fullname.startswith(f"{{pkg}}."):
+                rest = fullname.replace(pkg, "", 1).strip(".").split(".")
+                return cls._find_spec(fullname, Path(pkg_path, *rest))
+
+""",
+)
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_0 = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2.replace(
+    """        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+""",
+    """        # Nested modules (apparently required for namespaces to work)
+        for pkg, pkg_path in reversed(list(MAPPING.items())):
+            if fullname.startswith(f"{{pkg}}."):
+                return cls._find_nested_spec(fullname, pkg, pkg_path)
+
+""",
+).replace(
+    "\n\nclass _EditableNamespaceFinder:",
+    """
+    @classmethod
+    def _find_nested_spec(cls, fullname, parent, parent_path):
+        '''
+        To avoid problems with case sensitivity in the file system we delegate to the
+        importlib.machinery implementation.
+        '''
+        rest = fullname.replace(parent, "", 1).strip(".")
+        nested = PathFinder.find_spec(rest, path=[parent_path])
+        return nested and spec_from_file_location(
+            fullname,
+            nested.origin,
+            submodule_search_locations=nested.submodule_search_locations
+        )
+
+
+class _EditableNamespaceFinder:""",
+)
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_2 = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2.replace(
+    "def find_spec(cls, fullname, path=None, target=None):\n",
+    "def find_spec(cls, fullname, path=None, target=None):\n        extra_path = []\n\n",
+    1,
+).replace(
+    "return PathFinder.find_spec(fullname, path=[MAPPING[parent]])",
+    "return PathFinder.find_spec(fullname, path=[MAPPING[parent], *extra_path])",
+)
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_70 = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE.replace(
+    "def find_spec(cls, fullname: str, path=None, target=None) -> ModuleSpec | None:",
+    "def find_spec(cls, fullname: str, _path=None, _target=None) -> ModuleSpec | None:",
+    1,
+).replace(
+    "def find_spec(cls, fullname: str, target=None) -> ModuleSpec | None:",
+    "def find_spec(cls, fullname: str, _target=None) -> ModuleSpec | None:",
+    1,
+)
+_STARTUP_HOOK_ENV_VARS = ("COVERAGE_PROCESS_START", "COVERAGE_PROCESS_CONFIG")
+_MAX_TRUSTED_RUNTIME_ENTRIES = 250_000
 
 
 def _json_string_list(values: Sequence[object]) -> list[JsonValue]:
@@ -119,6 +393,8 @@ class SandboxPolicy:
         environment cannot leak it into the sandbox.
         ``None`` (the default) skips the prune for spawn sites that
         haven't opted in.
+    :param bind_host_proc: Launcher-local bwrap choice. ``None`` means the
+        process constructing the final launcher has not resolved it yet.
     :param egress_relay_port: TCP port the in-namespace relay listens
         on (loopback). Set when ``egress_rules`` is active; the helper
         starts a relay daemon on this port at activation time. C1
@@ -168,6 +444,8 @@ class SandboxPolicy:
     write_roots: list[Path]
     write_files: list[Path]
     allow_network: bool
+    copy_on_write_roots: list[Path] | None = None
+    copy_on_write_namespace: tuple[int, int, int] | None = None
     cwd_allow_hidden: list[str] | None = None
     cwd_hidden_scan_max_entries: int = 50000
     cwd_hidden_scan_overflow: str = "warn"
@@ -175,8 +453,11 @@ class SandboxPolicy:
     mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
+    bind_host_proc: bool | None = None
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
+    git_ssh_socket_path: str | None = None
+    tcp_egress_socket_path: str | None = None
     deny_unix_socket_paths: list[Path] | None = None
     credential_source_paths: list[Path] | None = None
     # Parent-side only: the resolved credential-proxy policy. Read in
@@ -186,18 +467,10 @@ class SandboxPolicy:
     # non-secret synthetic payload over the config FD, and resolved
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
-    # Parent-side only: write roots the dotfile / escaping-symlink mask
-    # scan must NOT walk. Framework code adds the sandbox's own runtime
-    # scaffolding to ``write_roots`` via
-    # :func:`with_additional_write_roots` (the per-helper scratch tmpdir
-    # holding the egress ``.egress.sock``, the CA bundle, credential-proxy
-    # files, harness state dirs). Those are created fresh by the framework
-    # and never hold pre-existing user secrets, so scanning them is
-    # pointless — and actively harmful: the scan would ``--bind-try
-    # /dev/null`` the dotfile ``.egress.sock``, breaking the egress relay.
-    # Every root recorded here is dropped from the scan set (along with
-    # anything nested under it). Built parent-side during arg emission;
-    # like ``credential_proxy`` it is intentionally NOT serialised.
+    git_ssh: list[GitSshBinding] | None = None
+    tcp_egress: list[TcpEgressRoute] | None = None
+    # Framework scratch roots must survive launcher serialization without
+    # masking their private runtime files, including the egress socket.
     mask_scan_skip_roots: list[Path] | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:
@@ -206,6 +479,12 @@ class SandboxPolicy:
             "active": self.active,
             "read_roots": (
                 _json_string_list(self.read_roots) if self.read_roots is not None else None
+            ),
+            "copy_on_write_roots": _json_string_list(self.copy_on_write_roots or []),
+            "copy_on_write_namespace": (
+                cast(list[JsonValue], list(self.copy_on_write_namespace))
+                if self.copy_on_write_namespace
+                else None
             ),
             "write_roots": _json_string_list(self.write_roots),
             "write_files": _json_string_list(self.write_files),
@@ -231,8 +510,11 @@ class SandboxPolicy:
                 if self.spawn_env_allowlist is not None
                 else None
             ),
+            "bind_host_proc": self.bind_host_proc,
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
+            "git_ssh_socket_path": self.git_ssh_socket_path,
+            "tcp_egress_socket_path": self.tcp_egress_socket_path,
             "deny_unix_socket_paths": (
                 _json_string_list(self.deny_unix_socket_paths)
                 if self.deny_unix_socket_paths is not None
@@ -243,6 +525,7 @@ class SandboxPolicy:
                 if self.credential_source_paths is not None
                 else None
             ),
+            "mask_scan_skip_roots": _json_string_list(self.mask_scan_skip_roots or []),
         }
         return result
 
@@ -273,6 +556,8 @@ class SandboxPolicy:
         overflow = overflow_raw if isinstance(overflow_raw, str) else "warn"
         recursive_raw = data.get("cwd_hidden_scan_recursive", False)
         recursive = recursive_raw if isinstance(recursive_raw, bool) else False
+        bind_host_proc_raw = data.get("bind_host_proc")
+        bind_host_proc = bind_host_proc_raw if isinstance(bind_host_proc_raw, bool) else None
         mask_paths_data = data.get("mask_paths")
         mask_paths: list[Path] | None = None
         if isinstance(mask_paths_data, list):
@@ -293,6 +578,14 @@ class SandboxPolicy:
         egress_socket_path: str | None = (
             str(egress_socket_path_raw) if egress_socket_path_raw is not None else None
         )
+        git_ssh_socket_path_raw = data.get("git_ssh_socket_path")
+        git_ssh_socket_path = (
+            str(git_ssh_socket_path_raw) if git_ssh_socket_path_raw is not None else None
+        )
+        tcp_egress_socket_path_raw = data.get("tcp_egress_socket_path")
+        tcp_egress_socket_path = (
+            str(tcp_egress_socket_path_raw) if tcp_egress_socket_path_raw is not None else None
+        )
         deny_unix_socket_paths_data = data.get("deny_unix_socket_paths")
         deny_unix_socket_paths: list[Path] | None = None
         if isinstance(deny_unix_socket_paths_data, list):
@@ -303,7 +596,23 @@ class SandboxPolicy:
             if isinstance(credential_source_paths_data, list)
             else None
         )
+        mask_scan_skip_data = data.get("mask_scan_skip_roots", [])
+        if not isinstance(mask_scan_skip_data, list) or any(
+            not isinstance(path, str) for path in mask_scan_skip_data
+        ):
+            raise ValueError("Invalid mask_scan_skip_roots")
+        cow_roots = data.get("copy_on_write_roots", [])
+        if not isinstance(cow_roots, list) or any(not isinstance(p, str) for p in cow_roots):
+            raise ValueError("Invalid copy_on_write_roots")
+        cow_namespace = data.get("copy_on_write_namespace")
+        namespace = None
+        if cow_namespace is not None:
+            from omnigent.sandbox.copy_on_write import parse_namespace
+
+            namespace = parse_namespace(cow_namespace)
         return cls(
+            copy_on_write_roots=[Path(str(p)) for p in cow_roots] or None,
+            copy_on_write_namespace=namespace,
             backend_type=str(data.get("backend_type", "none")),
             active=bool(data.get("active", False)),
             read_roots=read_roots,
@@ -317,10 +626,14 @@ class SandboxPolicy:
             mask_paths=mask_paths,
             env_passthrough=env_passthrough,
             spawn_env_allowlist=spawn_env_allowlist,
+            bind_host_proc=bind_host_proc,
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
+            git_ssh_socket_path=git_ssh_socket_path,
+            tcp_egress_socket_path=tcp_egress_socket_path,
             deny_unix_socket_paths=deny_unix_socket_paths,
             credential_source_paths=credential_source_paths,
+            mask_scan_skip_roots=[Path(str(path)) for path in mask_scan_skip_data] or None,
         )
 
 
@@ -413,6 +726,39 @@ class SandboxBackend(ABC):
         del policy, cwd, chdir, target
         return argv
 
+    def prepare_launcher_policy(self, policy: SandboxPolicy) -> SandboxPolicy:
+        """Resolve host-local policy immediately before launcher construction."""
+        return policy
+
+    def prepare_launcher_filesystem(self, policy: SandboxPolicy, cwd: Path) -> None:
+        """Materialize approved bind sources before capturing launch identities."""
+        del policy, cwd
+
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """
+        Return what :meth:`wrap_launcher_argv` derives from the host filesystem.
+
+        Launch-time masks (e.g. dotfiles found by the cwd scan) are fixed
+        for a helper's lifetime, so a long-lived helper is relaunched once
+        this value changes. The default ``None`` does not promise stability,
+        so reusable helpers relaunch before each request. Backends whose launch
+        is independent of filesystem state can return an empty tuple.
+
+        :param argv: The unwrapped argv the helper was launched with.
+        :param policy: The policy the helper was launched with.
+        :param cwd: Workspace directory the helper was launched from.
+        :param chdir: Optional separate start directory.
+        :returns: A comparable value, or ``None``.
+        """
+        del argv, policy, cwd, chdir
+        return None
+
     def post_spawn(self, policy: SandboxPolicy, pid: int) -> ContainmentHandle | None:
         """
         Apply post-spawn containment to a just-launched helper process.
@@ -468,14 +814,223 @@ def _resolve_grant_root(cwd: Path, root: str) -> Path:
             root,
         )
     expanded = os.path.expanduser(root)
-    path = Path(expanded)
-    if not path.is_absolute():
-        path = cwd / path
-    return path.resolve(strict=False)
+    if Path(expanded).is_absolute() or ".." in Path(root).parts:
+        return Path(os.path.realpath(os.path.join(cwd, expanded)))
+    return Path(_contained_relative_grant(cwd, root, expanded))
+
+
+def _check_relative_grant_containment(cwd: Path, root: str) -> None:
+    """Reject a relative grant whose resolved target leaves *cwd*.
+
+    Absolute, ``~``, and ``..`` grants are not checked here.
+    """
+    expanded = os.path.expanduser(root)
+    if Path(expanded).is_absolute() or ".." in Path(root).parts:
+        return
+    _contained_relative_grant(cwd, root, expanded)
+
+
+def _contained_relative_grant(cwd: Path, root: str, expanded: str) -> str:
+    """Return the real path of a relative grant under *cwd*, or raise when it escapes."""
+    base = os.path.realpath(cwd)
+    resolved = contained_realpath(os.path.join(base, expanded), containment_prefix(base))
+    if resolved is None:
+        raise ValueError(
+            f"relative sandbox grant resolves outside its working directory: {root!r}"
+        )
+    return resolved
+
+
+class HarnessSandboxValidationError(ValueError):
+    """A policy rejection with fixed client guidance separate from diagnostic details."""
+
+    _GUIDANCE: ClassVar[dict[str, str]] = {
+        "decode": "The requested sandbox policy is invalid. Check its configuration and retry.",
+        "type": "The selected harness supports only os_env.type=caller_process.",
+        "fork": "The selected harness does not support os_env.fork.",
+        "start_in_scratch": "The selected harness does not support os_env.start_in_scratch.",
+        "cwd": "The working directory conflicts with os_env.cwd.",
+        "cwd_unavailable": (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        ),
+        "windows": (
+            "The selected harness cannot enforce filesystem or network policy "
+            "with windows_jobobject."
+        ),
+        "none_network": "Sandbox type 'none' cannot enforce network restrictions.",
+        "copy_on_write": "The selected harness requires linux_bwrap for copy_on_write.",
+        "egress_rules": "The selected harness does not support os_env.sandbox.egress_rules.",
+        "credential_proxy": (
+            "The selected harness does not support os_env.sandbox.credential_proxy."
+        ),
+        "provider_transport": (
+            "Sandboxed Claude requires an Anthropic-compatible API. "
+            "Disable Bedrock, Vertex or Foundry transport settings and retry."
+        ),
+        "model_access": (
+            "Brokered Claude model access requires an Omnigent-owned worker environment; "
+            "this configuration is not supported."
+        ),
+        "git_ssh": "The selected harness does not support os_env.sandbox.git_ssh.",
+        "tcp_egress": (
+            "Inner harnesses cannot enforce worker-wide os_env.sandbox.tcp_egress. "
+            "sys_os_shell shares the worker policy. Terminal-local tcp_egress applies only "
+            "to terminal traffic; keep the required worker confinement."
+        ),
+        "scan_limit": "os_env.sandbox.cwd_hidden_scan_max_entries must be a positive integer.",
+        "scan_overflow": (
+            "os_env.sandbox.cwd_hidden_scan_overflow must be error, warn or unlimited."
+        ),
+        "sandbox": (
+            "The selected harness cannot enforce os_env.sandbox. Choose a sandbox-capable harness."
+        ),
+    }
+
+    def __init__(self, message: str, *, reason: str = "invalid") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+    @property
+    def client_message(self) -> str:
+        return self._GUIDANCE.get(self.reason, "The requested sandbox policy cannot be enforced.")
+
+
+class HarnessSandboxPreparationError(OSError):
+    """Containment setup failed; keep its diagnostic separate from client guidance."""
+
+    client_message = (
+        "The requested sandbox could not be prepared. "
+        "Check the host sandbox configuration and retry."
+    )
+
+
+@contextlib.contextmanager
+def harness_sandbox_preparation() -> Iterator[None]:
+    """Classify setup diagnostics while preserving policy, authentication, and cancellation."""
+    from .model_auth import ProviderAuthRequired
+
+    try:
+        yield
+    except (HarnessSandboxValidationError, HarnessSandboxPreparationError, ProviderAuthRequired):
+        raise
+    except Exception as exc:
+        raise HarnessSandboxPreparationError(str(exc)) from exc
+
+
+def validate_harness_sandbox(
+    spec: OSEnvSpec,
+    harness: str,
+    *,
+    cwd: Path | None = None,
+    supports_egress_rules: bool = False,
+    supports_credential_proxy: bool = False,
+) -> None:
+    """Reject policy features a harness cannot enforce before starting its worker."""
+    if spec.type != "caller_process":
+        raise HarnessSandboxValidationError(
+            f"{harness} does not support os_env.type={spec.type!r}", reason="type"
+        )
+    for feature in ("fork", "start_in_scratch"):
+        if getattr(spec, feature):
+            raise HarnessSandboxValidationError(
+                f"{harness} does not support os_env.{feature}", reason=feature
+            )
+    sandbox = spec.sandbox or _default_sandbox_for_platform()
+    from .os_env_serialization import validate_sandbox_scan_options
+
+    validate_sandbox_scan_options(sandbox)
+    # Relative declarations do not override the selected session workspace.
+    if (
+        cwd is not None
+        and spec.cwd
+        and Path(spec.cwd).expanduser().is_absolute()
+        and sandbox.type != "none"
+        and not cwd.resolve(strict=False).is_relative_to(_resolve_grant_root(cwd, spec.cwd))
+    ):
+        raise HarnessSandboxValidationError(
+            f"{harness}: working directory conflicts with os_env.cwd", reason="cwd"
+        )
+    if sandbox.type == "windows_jobobject":
+        raise HarnessSandboxValidationError(
+            f"{harness} cannot enforce filesystem or network policy with windows_jobobject",
+            reason="windows",
+        )
+    if sandbox.type == "none" and (
+        not sandbox.allow_network
+        or sandbox.requires_network_enforcement
+        or sandbox.credential_proxy
+    ):
+        raise HarnessSandboxValidationError(
+            f"{harness}: sandbox type 'none' cannot enforce network restrictions",
+            reason="none_network",
+        )
+    if sandbox.type != "linux_bwrap" and any(
+        grant.copy_on_write for grant in sandbox.write_path_specs
+    ):
+        raise HarnessSandboxValidationError(
+            f"{harness} does not support copy_on_write with {sandbox.type!r}",
+            reason="copy_on_write",
+        )
+    if sandbox.tcp_egress is not None:
+        raise HarnessSandboxValidationError(
+            f"{harness} does not support os_env.sandbox.tcp_egress", reason="tcp_egress"
+        )
+    for feature, supported in (
+        ("egress_rules", supports_egress_rules),
+        ("credential_proxy", supports_credential_proxy),
+        ("git_ssh", False),
+    ):
+        if getattr(sandbox, feature) and not supported:
+            raise HarnessSandboxValidationError(
+                f"{harness} does not support os_env.sandbox.{feature}", reason=feature
+            )
+
+
+class UnsupportedHarnessSandboxError(HarnessSandboxValidationError):
+    """The selected adapter cannot install requested process confinement."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason="sandbox")
+
+
+def reject_unsupported_harness_sandbox(spec: OSEnvSpec | None, harness: str) -> None:
+    """Prevent native tools from ignoring a sandbox the adapter cannot install."""
+    if spec is None:
+        return
+    validate_harness_sandbox(spec, harness)
+    if spec.sandbox is None or spec.sandbox.type != "none":
+        raise UnsupportedHarnessSandboxError(
+            f"{harness} cannot enforce os_env.sandbox; choose a sandbox-capable harness"
+        )
 
 
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     sandbox_spec = spec.sandbox or _default_sandbox_for_platform()
+    if sandbox_spec.git_ssh:
+        if sandbox_spec.type not in ("linux_bwrap", "darwin_seatbelt"):
+            raise ValueError("git_ssh requires linux_bwrap or darwin_seatbelt")
+        from .git_ssh import normalize_git_ssh_bindings
+
+        sandbox_spec = replace(
+            sandbox_spec, git_ssh=normalize_git_ssh_bindings(sandbox_spec.git_ssh)
+        )
+        spec = replace(spec, sandbox=sandbox_spec)
+    if sandbox_spec.tcp_egress is not None:
+        if sandbox_spec.type not in ("linux_bwrap", "darwin_seatbelt"):
+            raise ValueError("tcp_egress requires linux_bwrap or darwin_seatbelt")
+        from .tcp_egress_policy import normalize_tcp_egress
+
+        sandbox_spec = replace(
+            sandbox_spec,
+            tcp_egress=normalize_tcp_egress(
+                sandbox_spec.tcp_egress, egress_rules=sandbox_spec.egress_rules or ()
+            ),
+        )
+        spec = replace(spec, sandbox=sandbox_spec)
+    if sandbox_spec.type != "linux_bwrap" and any(
+        grant.copy_on_write for grant in sandbox_spec.write_path_specs
+    ):
+        raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
     if sandbox_spec.type == "none":
         # ``sandbox.type: none`` runs the helper UNSANDBOXED, so path grants
         # cannot *restrict* the (unconfined) shell -- a network restriction is
@@ -494,7 +1049,9 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
             if sandbox_spec.read_paths is not None
             else None
         )
-        write_roots = [_resolve_grant_root(cwd, root) for root in (sandbox_spec.write_paths or [])]
+        write_roots = [
+            _resolve_grant_root(cwd, grant.path) for grant in sandbox_spec.write_path_specs
+        ]
         write_files = [_resolve_grant_root(cwd, root) for root in (sandbox_spec.write_files or [])]
         return SandboxPolicy(
             backend_type="none",
@@ -505,6 +1062,8 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
             allow_network=True,
         )
     policy = _get_backend(sandbox_spec.type).resolve(spec, cwd)
+    if policy.tcp_egress:
+        policy = replace(policy, allow_network=False)
     if policy.credential_proxy is not None:
         for entry in policy.credential_proxy.entries:
             if (
@@ -512,6 +1071,16 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
                 or entry.source.refresh_interval_seconds is not None
             ):
                 protect_credential_source(entry.source, policy, cwd=cwd)
+    if policy.git_ssh:
+        for binding in policy.git_ssh:
+            for path in (binding.identity_file, binding.known_hosts_file):
+                protect_credential_source(
+                    CredentialSourceSpec(kind="file", path=path), policy, cwd=cwd
+                )
+    if policy.copy_on_write_roots:
+        from omnigent.sandbox.copy_on_write import attach_shared_environment
+
+        attach_shared_environment(policy)
     return policy
 
 
@@ -536,11 +1105,24 @@ def protect_credential_source(
     )
     for component in (path, *path.parents):
         for candidate in (component.absolute(), component.resolve()):
-            if any(candidate.is_relative_to(root) for root in roots) or candidate in files:
-                raise ValueError("refresh source must stay outside sandbox-writable paths")
-            if any(candidate.is_relative_to(root) for root in read_roots):
-                raise ValueError("refresh source must stay outside sandbox-readable paths")
-    if path.exists() and path.stat().st_nlink != 1:
+            writable_grant = next(
+                (root for root in roots if candidate.is_relative_to(root)),
+                candidate if candidate in files else None,
+            )
+            if writable_grant is not None:
+                raise ValueError(
+                    "refresh source must stay outside sandbox-writable paths: "
+                    f"source {str(path)!r} conflicts with grant {str(writable_grant)!r}"
+                )
+            readable_grant = next(
+                (root for root in read_roots if candidate.is_relative_to(root)), None
+            )
+            if readable_grant is not None:
+                raise ValueError(
+                    "refresh source must stay outside sandbox-readable paths: "
+                    f"source {str(path)!r} conflicts with grant {str(readable_grant)!r}"
+                )
+    if path.exists() and not path.is_dir() and path.stat().st_nlink != 1:
         raise ValueError("refresh source must not be hard-linked")
     canonical = path.resolve()
     if sandbox.credential_source_paths is None:
@@ -606,10 +1188,9 @@ class ReachableRoot:
     """
     One path an environment's file tools are permitted to reach.
 
-    Produced by :func:`reachable_roots`, which is the single source of
-    truth for the grant boundary: the same list drives enforcement (in
-    :func:`omnigent.inner.os_env._assert_within_reach`) and the reach
-    the file-browsing APIs advertise, so the two cannot drift.
+    Produced from runtime policy by :func:`reachable_roots` or from remote
+    declarations by :func:`declared_filesystem_reach`. Both use the same
+    grant assembly for enforcement and file-browsing metadata.
 
     :param path: Resolved absolute path of the grant, e.g.
         ``Path("/Users/corey/data")``.
@@ -679,6 +1260,39 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     :param policy: Resolved sandbox policy carrying the declared grants.
     :returns: Grants in precedence order, cwd first. Never empty.
     """
+    return _filesystem_reach_roots(
+        cwd, policy.write_roots, policy.write_files, policy.read_roots or []
+    )
+
+
+def declared_filesystem_reach(cwd: Path, spec: OSEnvSpec) -> tuple[list[ReachableRoot], bool]:
+    """Describe declared file grants without preparing a local sandbox.
+
+    Remote metadata readers need neither sandbox binaries nor runtime mounts.
+    Only an explicitly unconfined spec permits browsing beyond these grants.
+
+    :returns: Declared reachable roots and whether the spec is unconfined.
+    """
+    sandbox = spec.sandbox
+    if sandbox is None:
+        return _filesystem_reach_roots(cwd, [], [], []), False
+    return (
+        _filesystem_reach_roots(
+            cwd,
+            [_resolve_grant_root(cwd, grant.path) for grant in sandbox.write_path_specs],
+            [_resolve_grant_root(cwd, root) for root in sandbox.write_files or []],
+            [_resolve_grant_root(cwd, root) for root in sandbox.read_paths or []],
+        ),
+        sandbox.type == "none",
+    )
+
+
+def _filesystem_reach_roots(
+    cwd: Path,
+    write_roots: Sequence[Path],
+    write_files: Sequence[Path],
+    read_roots: Sequence[Path],
+) -> list[ReachableRoot]:
     # Resolving cwd is what makes the grants comparable to a resolved
     # candidate path. Callers pass a root that is already contained — see
     # `_session_workspace` / `compute_default_env_root`, which vet it against
@@ -686,15 +1300,15 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     roots = [ReachableRoot(path=cwd.resolve(), access="write", origin="cwd", kind="tree")]
     roots += [
         ReachableRoot(path=root, access="write", origin="write_paths", kind="tree")
-        for root in policy.write_roots
+        for root in write_roots
     ]
     roots += [
         ReachableRoot(path=grant, access="write", origin="write_files", kind="file")
-        for grant in policy.write_files
+        for grant in write_files
     ]
     roots += [
         ReachableRoot(path=root, access="read", origin="read_paths", kind="tree")
-        for root in (policy.read_roots or [])
+        for root in read_roots
     ]
     return roots
 
@@ -741,6 +1355,8 @@ def is_unconfined(policy: SandboxPolicy) -> bool:
 def activate_sandbox(policy: SandboxPolicy) -> None:
     if not policy.active:
         return
+    if policy.tcp_egress and policy.tcp_egress_socket_path is None:
+        raise ValueError("tcp_egress requires its parent broker before sandbox activation")
     _get_backend(policy.backend_type).activate(policy)
 
 
@@ -763,6 +1379,10 @@ def _clone_policy_with(
     helpers without each one redeclaring every constructor arg.
     """
     return SandboxPolicy(
+        copy_on_write_roots=list(policy.copy_on_write_roots)
+        if policy.copy_on_write_roots
+        else None,
+        copy_on_write_namespace=policy.copy_on_write_namespace,
         backend_type=policy.backend_type,
         active=policy.active,
         read_roots=read_roots,
@@ -782,6 +1402,11 @@ def _clone_policy_with(
         spawn_env_allowlist=(
             list(policy.spawn_env_allowlist) if policy.spawn_env_allowlist is not None else None
         ),
+        bind_host_proc=policy.bind_host_proc,
+        egress_relay_port=policy.egress_relay_port,
+        egress_socket_path=policy.egress_socket_path,
+        git_ssh_socket_path=policy.git_ssh_socket_path,
+        tcp_egress_socket_path=policy.tcp_egress_socket_path,
         deny_unix_socket_paths=(
             list(policy.deny_unix_socket_paths)
             if policy.deny_unix_socket_paths is not None
@@ -797,6 +1422,8 @@ def _clone_policy_with(
         # ``_start_locked``, so dropping it here would silently disable
         # the feature.
         credential_proxy=policy.credential_proxy,
+        git_ssh=policy.git_ssh,
+        tcp_egress=policy.tcp_egress,
         # Preserve (or, when a helper is extending it, override) the set
         # of framework write roots excluded from the mask scan. ``None``
         # from a caller means "keep whatever the source policy carried".
@@ -809,11 +1436,6 @@ def _clone_policy_with(
                 else None
             )
         ),
-        # Egress fields are intentionally NOT preserved here — the
-        # ``with_additional_*`` helpers run BEFORE the egress proxy
-        # starts, so the source policy never carries egress fields.
-        # The egress fields are added later via ``dataclasses.replace``
-        # in ``_HelperProcessClient._start_egress_proxy_locked``.
     )
 
 
@@ -844,6 +1466,19 @@ def with_additional_write_roots(
         write_files=list(policy.write_files),
         mask_scan_skip_roots=skip_roots,
     )
+
+
+def _restore_broker_socket_roots(policy: SandboxPolicy) -> SandboxPolicy:
+    roots = [
+        Path(path).parent
+        for path in (
+            policy.egress_socket_path,
+            policy.git_ssh_socket_path,
+            policy.tcp_egress_socket_path,
+        )
+        if path is not None
+    ]
+    return with_additional_write_roots(policy, roots) if roots else policy
 
 
 def with_additional_read_roots(
@@ -953,8 +1588,7 @@ def _prune_environ_to_spawn_allowlist(sandbox: SandboxPolicy) -> None:
 
     :param sandbox: The decoded launcher policy. No-op when its
         ``spawn_env_allowlist`` is ``None``. The internal launcher
-        markers (:data:`_LAUNCHER_WRAPPED_ENV`,
-        :data:`_SANDBOX_STRACE_ENV`,
+        markers (:data:`_SANDBOX_STRACE_ENV`,
         :data:`_LAUNCHER_PRIVATE_TMPDIR_ENV`) are always retained —
         dropping the tmpdir marker would make the in-wrap pass mint a
         second scratch dir the profile never granted.
@@ -962,7 +1596,6 @@ def _prune_environ_to_spawn_allowlist(sandbox: SandboxPolicy) -> None:
     if sandbox.spawn_env_allowlist is None:
         return
     allowed = set(sandbox.spawn_env_allowlist) | {
-        _LAUNCHER_WRAPPED_ENV,
         _SANDBOX_STRACE_ENV,
         _LAUNCHER_PRIVATE_TMPDIR_ENV,
     }
@@ -995,7 +1628,15 @@ def cleanup_private_tmpdir(tmpdir: Path | None) -> None:
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int:
+def run_launcher(
+    encoded_sandbox: str,
+    target_path: str,
+    argv: list[str],
+    *,
+    cwd: str | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+    _spawn_wrapped: bool = False,
+) -> int:
     """
     Activate the sandbox and exec the wrapped target inside it.
 
@@ -1016,43 +1657,55 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         inside the sandbox, e.g. ``"/usr/bin/python3"``.
     :param argv: Arguments passed to *target_path* (the launcher's own
         ``sys.argv[1:]``).
+    :param env_overrides: Complete sanitized launch environment applied after
+        pruning. Model credential values must be placeholders.
     :returns: The target process's exit code.
     :raises ValueError: If *encoded_sandbox* does not decode to a dict.
     """
+    from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR
+
+    # Only the trusted re-exec program may adopt a previously installed wrap.
+    if not _spawn_wrapped:
+        os.environ.pop(_LAUNCHER_WRAPPED_ENV, None)
+        os.environ.pop(_LAUNCHER_PRIVATE_TMPDIR_ENV, None)
+    os.environ.pop(SHARED_ENVIRONMENT_VAR, None)
     for secret_name in RUNNER_AUTH_SECRET_ENV_VARS:
         os.environ.pop(secret_name, None)
 
     decoded = _decode_json_arg(encoded_sandbox)
     if not isinstance(decoded, dict):
         raise ValueError("Invalid launcher sandbox payload")
-    sandbox = SandboxPolicy.from_jsonable(decoded)
+    # Restore broker exemptions for older launcher payloads before dotfile scans.
+    sandbox = _restore_broker_socket_roots(SandboxPolicy.from_jsonable(decoded))
 
-    # Before any wrap / exec so neither the re-exec'd launcher nor the
-    # target can see env vars the spawner didn't deliberately pass.
+    # Older launcher payloads may not have frozen host-local choices. Resolve
+    # them only on the host-side pass; the re-encoded policy carries the result.
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS and not _spawn_wrapped:
+        sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
+
+    # Before any wrap / exec so neither the re-exec'd launcher nor the target
+    # can see env vars the spawner didn't deliberately pass.
     _prune_environ_to_spawn_allowlist(sandbox)
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+        for name in _STARTUP_HOOK_ENV_VARS:
+            os.environ.pop(name, None)
+    if env_overrides is not None:
+        if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+            _reject_startup_hook_overrides(env_overrides)
+        os.environ.update(env_overrides)
+        if sandbox.spawn_env_allowlist is not None:
+            # Re-exec inherits sanitized values; only their names enter the policy.
+            sandbox = with_spawn_env_allowlist(
+                sandbox, [*sandbox.spawn_env_allowlist, *env_overrides]
+            )
 
-    # Spawn-time wrap re-exec for backends whose sandbox enforcement
-    # is installed by the spawning process (``bwrap`` /
-    # ``sandbox-exec``).
-    # Previously every caller of ``create_exec_launcher`` outside
-    # :class:`_HelperProcessClient` (notably the tmux terminal path)
-    # skipped the wrap entirely — the launcher script ran in the
-    # host namespace with no enforcement.
-    # On macOS seatbelt and Linux bwrap, that collapsed to ZERO
-    # sandboxing for the spawned target.
-    #
-    # We re-exec self under ``backend.wrap_launcher_argv``. The
-    # wrapped invocation re-enters this function (via the launcher
-    # script's ``__main__``) but the marker env var breaks the loop
-    # and we proceed to the in-process ``activate_sandbox`` +
-    # ``subprocess.run`` path. The wrap inherits HTTP_PROXY / CA
-    # env vars set by the parent (terminal path) so the relay
-    # daemon spun up by ``activate_sandbox`` is reachable.
-    if (
-        sandbox.active
-        and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
-        and os.environ.get(_LAUNCHER_WRAPPED_ENV) != "1"
-    ):
+    # Unsandboxed children may launch their own runner and still need the hint.
+    if sandbox.active:
+        os.environ.pop(HOST_SANDBOX_BACKEND_ENV, None)
+
+    # Re-exec under the backend wrap before activating the sandbox or target.
+    # Only the trusted inner pass may skip this step.
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS and not _spawn_wrapped:
         backend = get_backend(sandbox.backend_type)
         # Mint the private scratch tmpdir HERE, on the host, before the
         # wrap is built — the reference pattern from
@@ -1067,9 +1720,11 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         # seatbelt (bwrap masked it via its ``--tmpfs /tmp`` fallback).
         host_tmpdir = create_private_tmpdir()
         try:
+            # Editable installs need the framework package inside the mount
+            # namespace so the re-executed launcher can import itself.
+            sandbox = with_additional_read_roots(sandbox, [Path(__file__).resolve().parents[1]])
             sandbox = with_additional_write_roots(sandbox, [host_tmpdir])
             set_sandbox_env(os.environ, host_tmpdir)
-            encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
             # Name the dir for the in-wrap pass: it adopts this exact
             # path (no second mint) and owns the cleanup on exit.
             os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(host_tmpdir)
@@ -1088,24 +1743,20 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # The inline carries the RE-ENCODED policy so the in-wrap
             # pass decodes the same granted scratch root the profile
             # was built from.
-            project_root = repr(str(_project_root()))
-            inline = (
-                "import sys; "
-                f"sys.path.insert(0, {project_root}); "
-                "from omnigent.inner.sandbox import run_launcher; "
-                f"raise SystemExit(run_launcher({encoded_sandbox!r}, "
-                f"{target_path!r}, sys.argv[1:]))"
-            )
-            launcher_argv = [sys.executable, "-c", inline, *argv]
+            inline = _launcher_inline_source(target_path, sandbox, cwd=cwd, _spawn_wrapped=True)
+            launcher_argv = [sys.executable, "-I", "-c", inline, *argv]
             wrapped = list(
                 backend.wrap_launcher_argv(
                     launcher_argv,
                     sandbox,
-                    Path(os.getcwd()),
+                    Path(cwd or os.getcwd()),
                     target=target_path,
                 )
             )
-            os.environ[_LAUNCHER_WRAPPED_ENV] = "1"
+            if wrapped == launcher_argv:
+                raise OSError(
+                    f"Sandbox backend {sandbox.backend_type!r} did not wrap the launcher"
+                )
             logger.info(
                 "[omnigent-sandbox] spawn-time wrap re-exec backend=%s wrap_head=%s",
                 sandbox.backend_type,
@@ -1172,30 +1823,474 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
     try:
         activate_sandbox(sandbox)
         logger.info("[omnigent-sandbox] activated; spawning target=%s", target_path)
-        completed = subprocess.run(target_argv)
+        completed = subprocess.run(target_argv, cwd=cwd)
         logger.info("[omnigent-sandbox] target exited rc=%s", completed.returncode)
         return int(completed.returncode)
     finally:
         cleanup_private_tmpdir(tmpdir)
 
 
-def _launcher_inline_source(target_path: str, sandbox: SandboxPolicy) -> str:
+def _read_launcher_env_overrides(path: str) -> dict[str, str]:
+    """Load the snapshot from the private launcher, never from process arguments."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags), encoding="utf-8") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or (
+            os.name != "nt" and (info.st_uid != os.getuid() or info.st_mode & 0o077)
+        ):
+            raise OSError("Sandbox launcher environment snapshot must be an owner-only file")
+        payloads = [
+            line[len(_LAUNCHER_ENV_MARKER) :].strip()
+            for line in source
+            if line.startswith(_LAUNCHER_ENV_MARKER)
+        ]
+    if len(payloads) != 1:
+        raise ValueError("Invalid sandbox launcher environment snapshot")
+    decoded = _decode_json_arg(payloads[0])
+    if not isinstance(decoded, dict) or any(
+        not isinstance(value, str) for value in decoded.values()
+    ):
+        raise ValueError("Invalid sandbox launcher environment snapshot")
+    return cast(dict[str, str], decoded)
+
+
+def _launcher_inline_source(
+    target_path: str,
+    sandbox: SandboxPolicy,
+    *,
+    cwd: str | None = None,
+    env_overrides_path: str | None = None,
+    _spawn_wrapped: bool = False,
+) -> str:
     """Build the ``python -c`` program the exec launcher runs.
 
     basicConfig so ``run_launcher``'s INFO records reach stderr; the
     project root goes on ``sys.path`` so the import works from any cwd.
     """
     encoded = _encode_json_arg(sandbox.to_jsonable())
+    overrides = (
+        f"_read_launcher_env_overrides({env_overrides_path!r})"
+        if env_overrides_path is not None
+        else "None"
+    )
     return (
         "import logging, sys; "
         f"sys.path.insert(0, {str(_project_root())!r}); "
         "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr); "
-        "from omnigent.inner.sandbox import run_launcher; "
-        f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:]))"
+        "from omnigent.inner.sandbox import run_launcher, _read_launcher_env_overrides; "
+        f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:], "
+        f"cwd={cwd!r}, env_overrides={overrides}, _spawn_wrapped={_spawn_wrapped!r}))"
     )
 
 
-def create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+def _launcher_path_variants(path: Path) -> set[Path]:
+    """Keep lexical names and every symlink hop that can redirect startup."""
+    current = path.absolute()
+    variants = {current, current.resolve()}
+    for _ in range(40):
+        for entry in [*reversed(current.parents), current]:
+            if entry.is_symlink():
+                target = entry.readlink()
+                if not target.is_absolute():
+                    target = entry.parent / target
+                current = target / current.relative_to(entry)
+                variants.add(current)
+                break
+        else:
+            return variants
+    raise OSError(f"Cannot validate sandbox launcher symlink chain: {path}")
+
+
+def _isolated_launcher_import_roots(
+    interpreter: str, *, sandbox: SandboxPolicy | None = None
+) -> tuple[Path, ...]:
+    """Read isolated startup paths without executing site or its .pth hooks."""
+    program = """
+import json, site, sys
+print(json.dumps({
+    'paths': sys.path,
+    'base_sites': site.getsitepackages([sys.base_prefix]),
+    'venv_sites': site.getsitepackages([sys.argv[1]]),
+}))
+"""
+    try:
+        venv = Path(interpreter).absolute().parent.parent
+        completed = subprocess.run(
+            [interpreter, "-I", "-S", "-c", program, str(venv)],
+            cwd=os.path.abspath(os.sep),
+            env={"PATH": os.defpath},
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        metadata = json.loads(completed.stdout)
+        paths = metadata["paths"]
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or any(not isinstance(path, str) or not Path(path).is_absolute() for path in paths)
+        ):
+            raise ValueError("invalid isolated startup import roots")
+        config = next(
+            (
+                candidate
+                for candidate in (
+                    Path(interpreter).absolute().parent / "pyvenv.cfg",
+                    venv / "pyvenv.cfg",
+                )
+                if candidate.is_file()
+            ),
+            None,
+        )
+        in_venv = config is not None
+        include_system = True
+        if config is not None:
+            for line in config.read_text(encoding="utf-8").splitlines():
+                key, _, value = line.partition("=")
+                if key.strip().lower() == "include-system-site-packages":
+                    include_system = value.strip().lower() == "true"
+        site_paths = metadata["venv_sites"] if in_venv else []
+        if include_system:
+            site_paths += metadata["base_sites"]
+        roots = {Path(path) for path in [*paths, *site_paths]}
+        for site_path in site_paths:
+            site_dir = Path(site_path)
+            if not site_dir.is_dir():
+                continue
+            for pth in sorted(site_dir.glob("*.pth")):
+                if sandbox is not None:
+                    _validate_trusted_hardlink_aliases(
+                        sandbox, _launcher_path_variants(pth), set()
+                    )
+                for line in pth.read_text(encoding="utf-8").splitlines():
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith(("import ", "import\t")):
+                        roots.update(_trusted_pth_import_roots(pth, line))
+                        continue
+                    roots.add(site_dir / line.strip())
+        return tuple(sorted(roots))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        if isinstance(exc, OSError) and (
+            "unsupported .pth" in str(exc) or "mutable hard-link alias" in str(exc)
+        ):
+            raise
+        raise OSError("Cannot validate sandbox launcher isolated startup imports") from None
+
+
+def _trusted_pth_import_roots(pth: Path, line: str) -> set[Path]:
+    """Accept only startup hooks whose import roots can be inspected as data."""
+    if pth.name == "distutils-precedence.pth" and line == (
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') "
+        "== 'local'; enabled and __import__('_distutils_hack').add_shim(); "
+    ):
+        return set()
+    if pth.name == "a1_coverage.pth" and line == (
+        'import sys; exec(\'import os\\n\\nif os.getenv("COVERAGE_PROCESS_START") or '
+        'os.getenv("COVERAGE_PROCESS_CONFIG"):\\n try:\\n  import coverage\\n '
+        'except:\\n  pass\\n else:\\n  coverage.process_startup(slug="pth")\')'
+    ):
+        return set()
+    match = _EDITABLE_PTH_IMPORT.fullmatch(line)
+    if match is None:
+        raise OSError(f"Cannot validate sandbox launcher: unsupported .pth startup form in {pth}")
+    finder = pth.parent / f"{match.group(1)}.py"
+    try:
+        source = ast.parse(finder.read_text(encoding="utf-8"))
+        mapping: object = None
+        namespaces: object = None
+        finder_name: str | None = None
+        for statement in source.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id in ("MAPPING", "NAMESPACES"):
+                        if statement.value is None:
+                            raise ValueError("missing editable finder assignment")
+                        value = ast.literal_eval(statement.value)
+                        if target.id == "MAPPING":
+                            mapping = value
+                        else:
+                            namespaces = value
+                    if isinstance(target, ast.Name) and target.id == "PATH_PLACEHOLDER":
+                        value = statement.value
+                        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+                            finder_name = ast.literal_eval(value.left)
+        if not isinstance(mapping, dict) or not isinstance(namespaces, dict):
+            raise ValueError("missing editable finder roots")
+        if not isinstance(finder_name, str):
+            raise ValueError("missing editable finder name")
+        templates = (
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_70,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_2,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_0,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_0,
+        )
+        actual = ast.dump(source, include_attributes=False)
+        if not any(
+            actual
+            == ast.dump(
+                ast.parse(
+                    template.format(name=finder_name, mapping=mapping, namespaces=namespaces)
+                ),
+                include_attributes=False,
+            )
+            for template in templates
+        ):
+            raise ValueError("editable finder implementation differs from its installed template")
+        values = [*mapping.values(), *(path for group in namespaces.values() for path in group)]
+        if any(not isinstance(path, str) or not Path(path).is_absolute() for path in values):
+            raise ValueError("invalid editable finder root")
+        return {Path(path) for path in values}
+    except (OSError, SyntaxError, ValueError, TypeError, StopIteration, KeyError) as exc:
+        raise OSError(
+            f"Cannot validate sandbox launcher: unsupported .pth editable finder {finder}"
+        ) from exc
+
+
+def _reject_startup_hook_overrides(overrides: Mapping[str, str]) -> None:
+    if any(overrides.get(name) for name in _STARTUP_HOOK_ENV_VARS):
+        raise OSError(
+            "Cannot build sandbox exec launcher: coverage startup environment is unsupported"
+        )
+
+
+def _validate_launcher_write_grants(
+    sandbox: SandboxPolicy, entries: set[Path], trees: set[Path]
+) -> None:
+    for grant in [*sandbox.write_roots, *sandbox.write_files]:
+        for writable in _launcher_path_variants(grant):
+            for trusted in entries | trees:
+                if trusted.is_relative_to(writable) or (
+                    trusted in trees and writable.is_relative_to(trusted)
+                ):
+                    raise OSError(
+                        f"Cannot build sandbox exec launcher: write grant {str(grant)!r} "
+                        f"conflicts with trusted launcher runtime {str(trusted)!r}. "
+                        "The interpreter, runtime libraries, and framework imports must "
+                        "be outside sandbox write grants; run Omnigent from a separate "
+                        "read-only installation (including its venv)."
+                    )
+
+
+def _validate_trusted_hardlink_aliases(
+    sandbox: SandboxPolicy, entries: set[Path], trees: set[Path]
+) -> None:
+    """Reject trusted inodes that a worker could change through any hard link."""
+    visited_directories: set[tuple[int, int]] = set()
+    pending = [(path, False) for path in entries] + [(path, True) for path in trees]
+    entries_seen = 0
+    while pending:
+        entries_seen += 1
+        if entries_seen > _MAX_TRUSTED_RUNTIME_ENTRIES:
+            raise OSError("Cannot validate trusted runtime: too many entries")
+        path, recursive = pending.pop()
+        try:
+            link_info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OSError(f"Cannot validate trusted runtime inode: {path}") from exc
+        if stat.S_ISLNK(link_info.st_mode):
+            variants = _launcher_path_variants(path)
+            try:
+                target_info = path.stat()
+            except FileNotFoundError:
+                target_info = None
+            _validate_launcher_write_grants(
+                sandbox,
+                set() if target_info is None or stat.S_ISDIR(target_info.st_mode) else variants,
+                variants if target_info is None or stat.S_ISDIR(target_info.st_mode) else set(),
+            )
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OSError(f"Cannot validate trusted runtime inode: {path}") from exc
+        if stat.S_ISDIR(info.st_mode):
+            identity = (info.st_dev, info.st_ino)
+            if not recursive or identity in visited_directories:
+                continue
+            visited_directories.add(identity)
+            try:
+                with os.scandir(path) as children:
+                    for child in children:
+                        pending.append((Path(child.path), True))
+                        if len(pending) + entries_seen > _MAX_TRUSTED_RUNTIME_ENTRIES:
+                            raise OSError("Cannot validate trusted runtime: too many entries")
+            except OSError as exc:
+                raise OSError(f"Cannot validate trusted runtime inode: {path}") from exc
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            if (
+                sys.platform == "darwin"
+                or info.st_uid == os.geteuid()
+                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or os.access(path, os.W_OK)
+            ):
+                raise OSError(
+                    "Cannot validate trusted runtime: mutable hard-link alias "
+                    f"for {path}; install trusted runtime files as copies"
+                )
+            if sys.platform == "linux":
+                try:
+                    acl = os.getxattr(path, "system.posix_acl_access")
+                except OSError as exc:
+                    if exc.errno != errno.ENODATA:
+                        raise OSError(f"Cannot validate trusted runtime ACL: {path}") from exc
+                else:
+                    if acl:
+                        raise OSError(
+                            "Cannot validate trusted runtime: mutable hard-link alias "
+                            f"for {path}; install trusted runtime files as copies"
+                        )
+
+
+def _project_import_inode_roots(root: Path) -> tuple[set[Path], set[Path]]:
+    """Find files under an editable root that Python can import before containment."""
+    entries: set[Path] = set()
+    trees = {root / "omnigent", root / "__pycache__"}
+    try:
+        children = list(root.iterdir())
+    except FileNotFoundError:
+        return entries, trees
+    except OSError as exc:
+        raise OSError(f"Cannot validate sandbox launcher import root: {root}") from exc
+    for child in children:
+        if child.name in {"omnigent", "__pycache__"}:
+            continue
+        if any(
+            child.name.endswith(suffix) and child.name[: -len(suffix)].isidentifier()
+            for suffix in _IMPORT_SUFFIXES
+        ):
+            entries.add(child)
+        elif (
+            child.name.isidentifier()
+            and child.is_dir()
+            and any((child / f"__init__{suffix}").exists() for suffix in _IMPORT_SUFFIXES)
+        ):
+            trees.add(child)
+    return entries, trees
+
+
+def _shared_python_runtime_entries(stdlib_roots: set[Path]) -> set[Path]:
+    """Name shared Python binaries beside stdlib roots without scanning whole prefixes."""
+    entries: set[Path] = set()
+    for stdlib in stdlib_roots:
+        if re.fullmatch(r"python\d+\.\d+[a-z]*", stdlib.name) is None:
+            continue
+        prefix = stdlib.parent.parent
+        libraries = {stdlib.parent, prefix / "lib", prefix / "lib64"}
+        for library in libraries:
+            for directory in (library, *library.glob("*-linux-gnu")):
+                for pattern in (f"lib{stdlib.name}*.so*", f"lib{stdlib.name}*.dylib"):
+                    entries.update(directory.glob(pattern))
+        if prefix.parent.name == "Versions" and prefix.parent.parent.name.endswith(".framework"):
+            binary = prefix / prefix.parent.parent.name.removesuffix(".framework")
+            if binary.is_file() or binary.is_symlink():
+                entries.add(binary)
+    return entries
+
+
+def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
+    """Reject writes to code or startup configuration used before containment."""
+    if not sandbox.active or sandbox.backend_type not in _SPAWN_WRAP_BACKENDS:
+        return
+
+    # Prefixes are replacement-sensitive entries, not writable subtrees:
+    # /usr/local/workspace is safe when the interpreter prefix is /usr/local.
+    entries = {
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.exec_prefix),
+        Path(sys.base_exec_prefix),
+    }
+    project_root = _project_root()
+    project_roots = _launcher_path_variants(project_root) | _launcher_path_variants(
+        Path(__file__).absolute().parents[2]
+    )
+    entries.add(project_root)
+    trees = set(project_roots)
+    # Broad paths reject ancestor write grants; scan only code Python may load.
+    startup_trees: set[Path] = set()
+    for prefix in list(entries):
+        entries.add(prefix / "pyvenv.cfg")
+        trees.update(prefix / name for name in ("lib", "lib64", "Lib", "DLLs"))
+    for executable in _launcher_path_variants(Path(sys.executable)):
+        entries.add(executable)
+        entries.add(executable.parent / "pyvenv.cfg")
+        entries.add(executable.parent.parent / "pyvenv.cfg")
+        trees.add(executable.parent.parent / "lib")
+
+    paths = sysconfig.get_paths()
+    startup_trees.update(
+        Path(paths[key]) for key in ("stdlib", "platstdlib", "purelib", "platlib")
+    )
+    startup_trees.update(Path(path) for path in site.getsitepackages())
+    python_library_name = Path(paths["stdlib"]).name
+    runtime_stdlibs = {Path(paths[key]) for key in ("stdlib", "platstdlib")}
+    for prefix in (
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.exec_prefix),
+        Path(sys.base_exec_prefix),
+    ):
+        runtime_stdlibs.update(
+            prefix / library / python_library_name for library in ("lib", "lib64")
+        )
+    for executable in _launcher_path_variants(Path(sys.executable)):
+        runtime_root = executable.parent.parent
+        runtime_stdlibs.update(
+            runtime_root / library / python_library_name for library in ("lib", "lib64")
+        )
+        startup_trees.update(
+            runtime_root / library / python_library_name / "site-packages"
+            for library in ("lib", "lib64")
+        )
+    entries.update(_shared_python_runtime_entries(runtime_stdlibs))
+    # copy_on_write imports _proc (and psutil) before the spawn-time wrap.
+    dependency = importlib.util.find_spec("psutil")
+    if dependency is None or dependency.origin is None:
+        raise OSError("Cannot validate sandbox launcher runtime: psutil has no import path")
+    entries.add(Path(dependency.origin))
+    startup_trees.update(Path(path) for path in dependency.submodule_search_locations or [])
+    trees.update(startup_trees)
+
+    trusted_entries = {variant for path in entries for variant in _launcher_path_variants(path)}
+    trusted_trees = {variant for path in trees for variant in _launcher_path_variants(path)}
+    # Reject mutable interpreter/site files before running the startup probe.
+    _validate_launcher_write_grants(sandbox, trusted_entries, trusted_trees)
+    import_entries, import_trees = _project_import_inode_roots(project_root)
+    inode_entries = trusted_entries | {
+        variant for path in import_entries for variant in _launcher_path_variants(path)
+    }
+    inode_trees = {
+        variant for path in startup_trees for variant in _launcher_path_variants(path)
+    } | {variant for path in import_trees for variant in _launcher_path_variants(path)}
+    _validate_trusted_hardlink_aliases(sandbox, inode_entries, inode_trees)
+    # The parent may add workspaces to sys.path. Only isolated startup roots,
+    # including .pth additions, are imported by the launcher before containment.
+    isolated_trees = {
+        variant
+        for path in _isolated_launcher_import_roots(sys.executable, sandbox=sandbox)
+        for variant in _launcher_path_variants(path)
+    }
+    _validate_launcher_write_grants(sandbox, set(), isolated_trees)
+    _validate_trusted_hardlink_aliases(sandbox, set(), isolated_trees - project_roots)
+
+
+def create_exec_launcher(
+    target_path: str,
+    sandbox: SandboxPolicy,
+    *,
+    cwd: str | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+) -> str:
     """Write an executable launcher that runs ``target_path`` inside ``sandbox``.
 
     Callers hand the returned path to spawners that ``execve`` it
@@ -1205,11 +2300,31 @@ def create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
 
     :param target_path: The real binary the launcher ultimately spawns.
     :param sandbox: Policy baked into the launcher and applied before the spawn.
+    :param env_overrides: Complete sanitized launch environment snapshot, retained
+        in the owner-only script until caller cleanup. Model credential values
+        must be placeholders; ordinary paths, flags, and settings are preserved.
     :returns: Path to the launcher script; the caller owns deleting it.
-    :raises OSError: If the running interpreter cannot be named in the
-        launcher, which would produce an unrunnable script.
+    :raises OSError: If the interpreter cannot be named or write grants could
+        poison the launcher's trusted runtime before containment.
+    :raises ValueError: If a write grant includes the launcher directory.
     """
-    inline = _launcher_inline_source(target_path, sandbox)
+    if sandbox.tcp_egress and sandbox.tcp_egress_socket_path is None:
+        raise ValueError("tcp_egress requires its parent broker before creating a launcher")
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS and env_overrides:
+        _reject_startup_hook_overrides(env_overrides)
+    launcher_dir = Path(tempfile.gettempdir()).resolve(strict=False)
+    if sandbox.active:
+        for root in [*sandbox.write_roots, *sandbox.write_files]:
+            if launcher_dir.is_relative_to(root.resolve(strict=False)):
+                raise ValueError(
+                    f"Sandbox write grant {root} exposes the host launcher directory. "
+                    "Grant a dedicated scratch directory instead of the host temporary root."
+                )
+        if sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+            sandbox = with_additional_read_roots(sandbox, [_project_root() / "omnigent"])
+            # Path-based spawners may filter the launcher environment. Freeze
+            # host-local choices here, immediately before encoding the policy.
+            sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
     interpreter = sys.executable
     if not interpreter:
         raise OSError(
@@ -1218,24 +2333,44 @@ def create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
             "regular Python installation, or disable the CLI sandbox wrap."
         )
 
-    if os.name == "nt":
-        # Windows resolves ``.py`` through PATHEXT; keep the ``#!`` line so
-        # the ``py`` launcher (a common .py association) picks the *current*
-        # interpreter rather than the machine default.
-        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py")
-        script = f"#!{interpreter}\n{inline}\n"
-    else:
-        # ``/bin/sh`` is the only interpreter guaranteed to be a native
-        # executable. Naming ``sys.executable`` in a shebang instead
-        # breaks whenever it is a wrapper script, sits behind a path
-        # too long for the kernel's shebang buffer, or contains spaces —
-        # each of which surfaces as an opaque ENOEXEC from the spawner.
-        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".sh")
-        script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -c {shlex.quote(inline)} "$@"\n'
-
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(script)
-    os.chmod(path, 0o755)
+    _validate_launcher_runtime(sandbox)
+    suffix = ".py" if os.name == "nt" else ".sh"
+    fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=suffix, dir=launcher_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            if sandbox.active:
+                _validate_launcher_write_grants(
+                    sandbox, _launcher_path_variants(Path(path)), set()
+                )
+            inline = (
+                _launcher_inline_source(target_path, sandbox, cwd=cwd, env_overrides_path=path)
+                if env_overrides is not None
+                else _launcher_inline_source(target_path, sandbox, cwd=cwd)
+            )
+            if os.name == "nt":
+                # The py launcher selects this interpreter through the shebang.
+                script = f"#!{interpreter} -I\n{inline}\n"
+            else:
+                # A native shell shebang also supports Python wrapper scripts
+                # and interpreter paths containing spaces.
+                startup_env = (
+                    "unset COVERAGE_PROCESS_START COVERAGE_PROCESS_CONFIG\n"
+                    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
+                    else ""
+                )
+                script = (
+                    f"#!/bin/sh\n{startup_env}exec {shlex.quote(interpreter)} -I -c "
+                    f'{shlex.quote(inline)} "$@"\n'
+                )
+            if env_overrides is not None:
+                snapshot = _encode_json_arg(cast(JsonValue, dict(env_overrides)))
+                script += f"{_LAUNCHER_ENV_MARKER}{snapshot}\n"
+            fh.write(script)
+        os.chmod(path, 0o700)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(path)
+        raise
     return path
 
 

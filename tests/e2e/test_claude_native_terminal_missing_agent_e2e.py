@@ -63,48 +63,31 @@ Run::
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import os
 import re
-import secrets
 import shutil
-import signal
-import socket
-import subprocess
-import sys
-import tarfile
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.native_session import create_native_session
+from tests._helpers.server_runner import server_runner
+from tests._helpers.session import bundle_files, post_session_bundle
 
 # CI shells can carry an egress proxy in the environment; every HTTP call in
 # this test targets 127.0.0.1, so bypass proxy autodetection entirely.
 _http = httpx.Client(trust_env=False)
 
-# The runner imports ``omnigent_client`` / ``omnigent_ui_sdk``; in a worktree
-# they resolve from sdks/, in an installed venv from site-packages.
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
 # First-party sentinel Origin so the multipart create passes the
 # require_trusted_origin guard regardless of which client issues it.
 from omnigent.runner.identity import (  # noqa: E402
     OMNIGENT_INTERNAL_WS_ORIGIN,
-    token_bound_runner_id,
 )
 
-_HEALTH_TIMEOUT_S = 120.0
 _POLL_S = 1.0
 # The ensure fails at spec resolution (one server round-trip), but the server
 # route also runs ensure_runner_connected first; give it a generous budget.
@@ -114,73 +97,6 @@ pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
     reason="claude-native terminals run inside tmux; tmux not installed",
 )
-
-
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports, no proxy, and no leaked runner ctx.
-
-    Starts the spawned ``omnigent server`` / runner from a CLEAN omnigent
-    context: any ``OMNIGENT*`` / ``RUNNER_SERVER_URL`` inherited from a parent
-    runner (e.g. when this test itself runs inside an omnigent runner session)
-    is stripped, then re-supplied only via *extra*. Without this, a leaked
-    ``OMNIGENT_RUNNER_ZYGOTE_HARNESS_FD`` makes the fresh runner try to adopt a
-    non-existent zygote FD, a leaked ``OMNIGENT_PROCESS_LOG_FILE`` /
-    ``OMNIGENT_DATA_DIR`` redirects its logs away from this test's HOME, and a
-    leaked ``OMNIGENT_RUNNER_ID`` collides with the test's identity — so the
-    runner never registers and the log assertions find nothing.
-
-    :param extra: Overrides/additions applied after the base env.
-    :returns: Environment mapping for ``subprocess.Popen``.
-    """
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        # CI shells often carry an egress proxy; localhost must bypass it.
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    # Strip a leaked parent-runner context so the spawned server/runner boot
-    # from a clean slate; the test re-supplies exactly what it needs via extra.
-    for name in list(env):
-        if name.startswith("OMNIGENT") or name == "RUNNER_SERVER_URL":
-            env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
 
 
 def _create_session_with_scoped_agent(base_url: str) -> tuple[str, str]:
@@ -208,24 +124,15 @@ def _create_session_with_scoped_agent(base_url: str) -> tuple[str, str]:
             "",
         ]
     )
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat translator.
-        info = tarfile.TarInfo("missing-agent-fixture.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    # Non-config.yaml arcname routes through the omnigent compat translator.
+    data = yaml_text.encode()
+    bundle_bytes = bundle_files({"missing-agent-fixture.yaml": data})
 
-    create = _http.post(
+    create = post_session_bundle(
+        _http.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={
-            "bundle": (
-                "missing-agent-fixture.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
+        bundle_bytes,
+        filename="missing-agent-fixture.tar.gz",
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         timeout=30.0,
     )
@@ -263,15 +170,6 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
 
     :param tmp_path: Per-test temp dir (server DB, stub claude, runner HOME).
     """
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    db_path = tmp_path / "chat.db"
-    database_uri = f"sqlite:///{db_path}"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    runner_home = tmp_path / "home"
-    runner_home.mkdir()
-
     # Stub Claude CLI on PATH — pure defense. The ensure fails at spec
     # resolution before any ``claude`` process launches, but a stub guarantees
     # the test never blocks on a real (unauthenticated) Claude TUI even if the
@@ -282,70 +180,11 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
     stub.write_text("#!/bin/sh\nexec sleep 600\n")
     stub.chmod(0o755)
 
-    binding_token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(binding_token)
-
-    server_log = (tmp_path / "server.log").open("w")
-    runner_log = (tmp_path / "runner.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({"OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=_localhost_env(
-                {
-                    "OMNIGENT_RUNNER_ID": runner_id,
-                    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                    "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                    "RUNNER_SERVER_URL": base_url,
-                    "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
-                    # Hermetic HOME so provider config / caches resolve off a
-                    # scratch dir, not the real HOME.
-                    "HOME": str(runner_home),
-                    # The stub shadows any real claude on PATH.
-                    "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-                }
-            ),
-            stdout=runner_log,
-            stderr=subprocess.STDOUT,
-        )
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            try:
-                status = _http.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2.0)
-                if status.status_code == 200 and status.json().get("online") is True:
-                    online = True
-                    break
-            except httpx.HTTPError:
-                # The server/runner is still booting; transient connection
-                # errors are expected while polling and simply retried.
-                pass
-            time.sleep(_POLL_S)
-        assert online, (
-            f"runner never came online; log:\n{(tmp_path / 'runner.log').read_text()[-3000:]}"
-        )
+    with server_runner(tmp_path) as stack:
+        base_url, runner_id = stack.base_url, stack.runner_id
+        database_uri = stack.database_uri
+        runner_home = stack.runner_home
+        stack.start_runner(env={"PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}"})
 
         # A launched session bound to a real agent — the state a user is in.
         session_id, agent_id = _create_session_with_scoped_agent(base_url)
@@ -408,7 +247,7 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
         )
         # The corrected client-safe message names the lifecycle cause and the
         # remedy — it must NOT relabel this as a terminal-startup defect.
-        assert "agent is no longer available" in message, message
+        assert "agent no longer exists" in message, message
         assert "Native Claude terminal failed to start" not in message, message
         # The message carries a correlation id for operators to cross-ref the
         # runner log.
@@ -463,68 +302,6 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
         )
         # The client-safe message must NOT leak the raw agent id / cause.
         assert "session spec resolver" not in message, message
-    finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
-        server_log.close()
-        runner_log.close()
-
-
-def _create_claude_native_session_with_agent(base_url: str) -> tuple[str, str]:
-    """Create a claude-native wrapper session exactly like ``omnigent claude``.
-
-    Reuses the production spec materializer and stamps the same wrapper /
-    terminal-first labels the CLI writes, so the server treats the session as
-    a native-terminal session (``_is_native_terminal_session`` is True) and a
-    plain user message drives the native Claude terminal ensure at turn
-    dispatch.
-
-    :param base_url: Spawned server base URL.
-    :returns: ``(session_id, agent_id)`` for the new claude-native session and
-        its session-scoped agent.
-    """
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat translator
-        # (the wrapper spec carries no ``spec_version``).
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={
-            "bundle": (
-                "claude-native-ui.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    body = create.json()
-    return str(body["session_id"]), str(body["agent_id"])
 
 
 def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
@@ -559,20 +336,6 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
 
     :param tmp_path: Per-test temp dir (server DB, stub claude, HOMEs).
     """
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    db_path = tmp_path / "chat.db"
-    database_uri = f"sqlite:///{db_path}"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    runner_home = tmp_path / "home"
-    runner_home.mkdir()
-    # A scratch HOME for the server so its file log — which carries the
-    # ``session turn failed for`` line; the stderr mirror is off for a
-    # non-interactive subprocess — lands somewhere the test can read.
-    server_home = tmp_path / "server-home"
-    server_home.mkdir()
-
     # Stub Claude CLI on PATH — pure defense; the ensure fails at spec
     # resolution before any ``claude`` process launches.
     stub_bin = tmp_path / "bin"
@@ -581,74 +344,17 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
     stub.write_text("#!/bin/sh\nexec sleep 600\n")
     stub.chmod(0o755)
 
-    binding_token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(binding_token)
-
-    server_log = (tmp_path / "server.log").open("w")
-    runner_log = (tmp_path / "runner.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env(
-                {
-                    "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
-                    "HOME": str(server_home),
-                }
-            ),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=_localhost_env(
-                {
-                    "OMNIGENT_RUNNER_ID": runner_id,
-                    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                    "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                    "RUNNER_SERVER_URL": base_url,
-                    "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
-                    "HOME": str(runner_home),
-                    "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-                }
-            ),
-            stdout=runner_log,
-            stderr=subprocess.STDOUT,
-        )
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            try:
-                status = _http.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2.0)
-                if status.status_code == 200 and status.json().get("online") is True:
-                    online = True
-                    break
-            except httpx.HTTPError:
-                # Still booting; transient connection errors are retried.
-                pass
-            time.sleep(_POLL_S)
-        assert online, (
-            f"runner never came online; log:\n{(tmp_path / 'runner.log').read_text()[-3000:]}"
-        )
+    with server_runner(tmp_path) as stack:
+        base_url, runner_id = stack.base_url, stack.runner_id
+        database_uri = stack.database_uri
+        server_home = stack.server_home
+        stack.start_runner(env={"PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}"})
 
         # A launched claude-native session bound to a real agent.
-        session_id, agent_id = _create_claude_native_session_with_agent(base_url)
+        body = create_native_session(
+            _http, base_url, harness="claude", headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        )
+        session_id, agent_id = str(body["session_id"]), str(body["agent_id"])
 
         # PRECONDITION (the reported state): the bound agent is gone from the
         # store before the terminal ever comes up, so the turn's ensure must
@@ -713,7 +419,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         while time.monotonic() < deadline:
             for it in _error_items():
                 blob = json.dumps(it)
-                if "session_agent_missing" in blob and "agent is no longer available" in blob:
+                if "session_agent_missing" in blob and "agent no longer exists" in blob:
                     error_item = it
                     break
             if error_item is not None:
@@ -730,19 +436,14 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         # (``to_api_dict``), so the ``ErrorData`` fields ride there directly.
         assert error_item.get("code") == "session_agent_missing", error_item
         item_message = error_item.get("message") or ""
-        assert "agent is no longer available" in item_message, error_item
+        assert "agent no longer exists" in item_message, error_item
         assert "Native Claude terminal failed to start" not in item_message, error_item
 
         # KPI log signature: the server logs the failed turn at ERROR with
-        # the same message. Depending on the harness' data-dir
-        # wiring the process log lands in the server's captured stdio and/or a
-        # ``server-*.log`` under the data dir (``OMNIGENT_DATA_DIR`` or
-        # ``$HOME/.omnigent``), so read the union and poll for the flush.
+        # the same message. Read captured stdio and the isolated server's
+        # rolling logs, polling for the flush.
         server_stdio_log = tmp_path / "server.log"
         server_log_dirs = [server_home / ".omnigent" / "logs" / "server"]
-        data_dir_env = os.environ.get("OMNIGENT_DATA_DIR")
-        if data_dir_env:
-            server_log_dirs.append(Path(data_dir_env).expanduser() / "logs" / "server")
 
         def _server_log_text() -> str:
             texts: list[str] = []
@@ -770,7 +471,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         )
         # The turn-failed log now carries the lifecycle message, not the
         # generic terminal-startup defect message.
-        assert "agent is no longer available" in server_log_text, (
+        assert "agent no longer exists" in server_log_text, (
             f"server log missing the lifecycle failure message; tail:\n{server_log_text[-3000:]}"
         )
         assert "Native Claude terminal failed to start" not in server_log_text, (
@@ -778,8 +479,3 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
             f"for a missing-agent lifecycle turn failure; tail:\n"
             f"{server_log_text[-3000:]}"
         )
-    finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
-        server_log.close()
-        runner_log.close()

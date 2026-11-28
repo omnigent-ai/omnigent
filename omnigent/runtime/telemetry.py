@@ -30,10 +30,11 @@ concerns:
 from __future__ import annotations
 
 import contextvars
+import functools
 import logging
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -66,6 +67,11 @@ _logs_initialized: bool = False
 # generically, with no per-operation code. Default None = no stamping.
 _session_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "omnigent_session_id", default=None
+)
+
+# Skill active in the current turn; stamped on every span as `omnigent.skill.active`.
+_active_skill_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "omnigent_active_skill", default=None
 )
 
 
@@ -112,6 +118,29 @@ def telemetry_enabled() -> bool:
     :returns: ``True`` when ``OMNIGENT_TELEMETRY_ENABLED`` is truthy.
     """
     return _env_bool("OMNIGENT_TELEMETRY_ENABLED")
+
+
+def telemetry_guarded(func: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Make a best-effort ``record_*`` a no-op when telemetry is off, and never raise.
+
+    :param func: Telemetry function whose return value is ignored.
+    :returns: The wrapped function.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        if not telemetry_enabled():
+            return None
+        try:
+            return func(*args, **kwargs)
+        except Exception:  # pragma: no cover - telemetry must never break callers
+            _logger.debug(
+                "telemetry hook %r failed", getattr(func, "__name__", func), exc_info=True
+            )
+            return None
+
+    return wrapper
 
 
 # Max characters of a serialized payload to attach to a span. Bodies can be
@@ -275,32 +304,53 @@ def session_scope(session_id: str | None) -> Iterator[None]:
         _session_id_var.reset(token)
 
 
-def _make_session_id_processor() -> Any:
+def set_active_skill(skill_name: str) -> contextvars.Token[str | None]:
     """
-    Build a span processor that stamps ``session.id`` from the active
-    :data:`_session_id_var` onto every recording span.
+    Bind *skill_name* as the active skill; spans started until reset carry
+    ``omnigent.skill.active``.
 
-    Registered on the runtime ``TracerProvider`` (:func:`_init_otel_traces`)
-    so the session id flows onto all spans — server, runner, harness, and any
-    future operation — with no per-call-site code. Subclasses the SDK
-    ``SpanProcessor`` so it satisfies the full processor interface (e.g. the
-    internal ``_on_ending`` hook); only ``on_start`` is overridden. Built
-    lazily because the OTel SDK is not a hard import dependency of this module.
+    :param skill_name: The skill name, e.g. ``"code-review"``.
+    :returns: A token for :func:`reset_active_skill`.
+    """
+    return _active_skill_var.set(skill_name)
 
+
+def reset_active_skill(token: contextvars.Token[str | None]) -> None:
+    """Restore the active skill to its value before :func:`set_active_skill`."""
+    _active_skill_var.reset(token)
+
+
+def make_span_attribute_processor(attribute_key: str, get_value: Callable[[], str | None]) -> Any:
+    """
+    Build a span processor that stamps *attribute_key* with ``get_value()`` on
+    every recording span (skipped when the value is empty).
+
+    :param attribute_key: Span attribute to set, e.g. ``"omnigent.skill.active"``.
+    :param get_value: Called at span start, e.g. ``some_context_var.get``.
     :returns: A ``SpanProcessor`` instance.
     """
     from opentelemetry.sdk.trace import SpanProcessor
 
-    class _SessionIdSpanProcessor(SpanProcessor):
+    class _AttributeSpanProcessor(SpanProcessor):
         def on_start(self, span: Any, parent_context: Any = None) -> None:
             try:
-                session_id = _session_id_var.get()
-                if session_id and span.is_recording():
-                    span.set_attribute("session.id", session_id)
+                value = get_value()
+                if value and span.is_recording():
+                    span.set_attribute(attribute_key, value)
             except Exception:  # pragma: no cover - telemetry must never break spans
                 pass
 
-    return _SessionIdSpanProcessor()
+    return _AttributeSpanProcessor()
+
+
+def _make_session_id_processor() -> Any:
+    """Span processor stamping ``session.id`` from :data:`_session_id_var`."""
+    return make_span_attribute_processor("session.id", _session_id_var.get)
+
+
+def _make_active_skill_processor() -> Any:
+    """Span processor stamping ``omnigent.skill.active`` from :data:`_active_skill_var`."""
+    return make_span_attribute_processor("omnigent.skill.active", _active_skill_var.get)
 
 
 def _fastapi_instrumentation_enabled() -> bool:
@@ -1023,6 +1073,8 @@ def _init_otel_traces(endpoint: str) -> None:
             # Enrich every span with session.id from the active context (set via
             # session_scope at the request hook / executor turn / forwarder).
             provider.add_span_processor(_make_session_id_processor())
+            # Tag every span with the skill active in the turn, if any.
+            provider.add_span_processor(_make_active_skill_processor())
             provider.add_span_processor(BatchSpanProcessor(_create_otlp_span_exporter()))
             trace.set_tracer_provider(provider)
 

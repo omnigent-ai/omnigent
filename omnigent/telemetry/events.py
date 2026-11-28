@@ -22,8 +22,8 @@ class SessionCreatedEvent:
         ``params``).
     :param agent_id: The agent bound to this session.
     :param harness: Harness kind, e.g. ``"claude-native"`` or ``"pi"``.
-    :param surface: Client surface: ``"web"``, ``"desktop"``, ``"ios"``,
-        ``"android"``, ``"cli"``, or ``"unknown"``.
+    :param surface: The session's client surface: ``"web"``, ``"desktop"``,
+        ``"ios"``, ``"android"``, ``"cli"``, ``"sdk"``, ``"slack"``, or ``"unknown"``.
     :param anon_user_id: First 16 hex chars of ``sha256("<installation_id>:<user_id>")``.
     :param host_installation_id: Installation ID of the host machine
         (``omnigent host``); ``None`` for CLI sessions.

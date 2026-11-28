@@ -1,10 +1,14 @@
 import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
+import { ARIA_MOD_KEY, VIEW_MODE_TOGGLE_KEYS } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useViewModeToggleHotkey } from "@/hooks/useViewModeToggleHotkey";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "./TerminalFirstContext";
+
+const ignoreViewChange = () => {};
 
 /**
  * Header Chat/Terminal switcher for terminal-first sessions. Two icon
@@ -25,12 +29,26 @@ import { useTerminalFirst } from "./TerminalFirstContext";
  * {@link ViewModeMenuItems}), so the narrow header pill isn't split between a
  * view switch and the "…" menu.
  */
-export function ViewModeToggle() {
+export function ViewModeToggle({
+  hotkeyEnabled = true,
+  alwaysVisible = false,
+  variant = "header",
+}: {
+  hotkeyEnabled?: boolean;
+  alwaysVisible?: boolean;
+  /** "pane": the chat pane strip's recessed track, sized to the strip's row. */
+  variant?: "header" | "pane";
+} = {}) {
   const ctx = useTerminalFirst();
   const isMobile = useIsMobileViewport();
+  useViewModeToggleHotkey({
+    enabled: Boolean(hotkeyEnabled && ctx?.isTerminalFirst && !ctx.isShellView),
+    view: ctx?.view ?? "chat",
+    setView: ctx?.setView ?? ignoreViewChange,
+  });
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
   // Mobile folds the switch into the header kebab (ViewModeMenuItems).
-  if (isMobile) return null;
+  if (isMobile && !alwaysVisible) return null;
 
   const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
@@ -40,32 +58,37 @@ export function ViewModeToggle() {
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
-      // Inset track: p-0.5 around two size-6 segments lands the control at
-      // 32px tall, matching the header's other controls. Desktop-only — on a
-      // mobile viewport the component returns null and the switch folds into
-      // the header kebab instead (ViewModeMenuItems).
-      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
+      // Two 36×24 segments separated by 2px make a flush 74×24 track.
+      // Narrow layouts fold the switch into the header kebab.
+      data-variant={variant}
+      className={
+        variant === "pane"
+          ? "view-mode-track flex shrink-0 items-center gap-0.5"
+          : "flex h-6 w-[74px] mobile-app:h-auto mobile-app:w-auto shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0 dark:bg-[var(--segmented-trough-bg)]"
+      }
     >
       <ViewModeSegment
         label="Chat view"
         active={view === "chat"}
         onClick={() => setView("chat")}
         testId="view-mode-chat"
+        variant={variant}
         componentId="chat.header.view_chat"
       >
-        <MessagesSquareIcon className="size-3.5" />
+        <MessagesSquareIcon className="size-4" />
       </ViewModeSegment>
       <ViewModeSegment
         label={terminalLabel}
         active={view === "terminal"}
         onClick={() => setView("terminal")}
         testId="view-mode-terminal"
+        variant={variant}
         componentId="chat.header.view_terminal"
       >
         {terminalStartingUp ? (
-          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+          <Loader2Icon className="size-4 animate-spin" aria-hidden />
         ) : (
-          <TerminalIcon className="size-3.5" />
+          <TerminalIcon className="size-4" />
         )}
       </ViewModeSegment>
     </div>
@@ -84,6 +107,7 @@ function ViewModeSegment({
   onClick,
   testId,
   componentId,
+  variant,
   children,
 }: {
   label: string;
@@ -91,6 +115,7 @@ function ViewModeSegment({
   onClick: () => void;
   testId: string;
   componentId: string;
+  variant: "header" | "pane";
   children: React.ReactNode;
 }) {
   return (
@@ -103,14 +128,22 @@ function ViewModeSegment({
             size="icon-xs"
             aria-label={label}
             aria-pressed={active}
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+\\`}
             onClick={onClick}
             data-testid={testId}
+            data-active={active ? "" : undefined}
             componentId={componentId}
             className={cn(
-              "border-none",
-              active
-                ? "bg-background text-foreground shadow-sm hover:bg-background"
-                : "text-muted-foreground hover:bg-transparent hover:text-foreground",
+              variant === "pane"
+                ? "view-mode-segment h-5 w-8 rounded-[5px] border-0 p-0 [&_svg]:size-3.5"
+                : "h-6 w-9 mobile-touch-target rounded-[6px] border px-2.5 py-0",
+              variant === "pane"
+                ? active
+                  ? "text-foreground"
+                  : "text-muted-foreground hover:bg-transparent hover:text-foreground"
+                : active
+                  ? "border-border bg-background text-foreground shadow-sm hover:bg-background dark:border-transparent dark:bg-[var(--segmented-active-bg)] dark:hover:bg-[var(--segmented-active-bg)]"
+                  : "border-transparent text-muted-foreground hover:bg-transparent hover:text-foreground dark:bg-[var(--segmented-inactive-bg)] dark:hover:bg-[var(--segmented-inactive-bg)]",
             )}
           >
             {children}
@@ -119,7 +152,9 @@ function ViewModeSegment({
       </TooltipTrigger>
       {/* Bottom placement: the header sits at top-0, so a top-side tooltip
           would render above the viewport edge and get clipped. */}
-      <TooltipContent side="bottom">{label}</TooltipContent>
+      <TooltipContent side="bottom" shortcut={VIEW_MODE_TOGGLE_KEYS}>
+        <span>{label}</span>
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -143,7 +178,7 @@ export function ViewModeMenuItems() {
   return (
     <>
       <DropdownMenuItem
-        className="gap-2.5 px-2.5 py-2 text-ui"
+        className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
         onSelect={() => setView("chat")}
         data-testid="view-mode-menu-chat"
       >
@@ -152,7 +187,7 @@ export function ViewModeMenuItems() {
         {view === "chat" && <CheckIcon className="ml-auto size-4" />}
       </DropdownMenuItem>
       <DropdownMenuItem
-        className="gap-2.5 px-2.5 py-2 text-ui"
+        className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
         onSelect={() => setView("terminal")}
         data-testid="view-mode-menu-terminal"
       >

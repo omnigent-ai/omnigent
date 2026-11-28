@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import re
 import uuid
 
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.sessions._sidebar_helpers import wait_for_sidebar_collapse
 
 # A visible dot glued to the real pointer so recorded failure footage shows
 # the preview drifting away from the cursor. Inert for assertions.
@@ -31,11 +32,8 @@ _CURSOR_DOT_JS = """
 
 
 def _seed_titled_session(base_url: str, title: str) -> str:
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        timeout=30.0,
+    create = post_session_bundle(
+        httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]
@@ -112,6 +110,7 @@ def test_peek_drag_overlay_tracks_pointer(page: Page, seeded_session: tuple[str,
         page.get_by_role("button", name="Close sidebar", exact=True).click()
         toggle = page.get_by_role("button", name="Open sidebar")
         expect(toggle).to_be_visible()
+        wait_for_sidebar_collapse(page)
         toggle_box = toggle.bounding_box()
         assert toggle_box is not None
         page.mouse.move(

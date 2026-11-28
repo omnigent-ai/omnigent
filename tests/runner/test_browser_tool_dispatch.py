@@ -6,10 +6,10 @@ Covers the runner-side half of the feature:
   server ``/browser/action_request`` route — correct URL / ``action`` /
   ``args`` payload, verbatim JSON passthrough, and the clean timeout
   error on ``httpx.ReadTimeout``.
-- Registration in ``omnigent.tools.builtins``: the five ``browser_*``
+- Registration in ``omnigent.tools.builtins``: the ``browser_*``
   names are always registered.
 - Native-relay exposure: ``build_native_relay_tool_schemas`` surfaces the
-  five ``browser_*`` schemas when the spec declares them — native
+  ``browser_*`` schemas when the spec declares them — native
   harnesses see the relay as their only tool surface, so a miss here
   means the feature is dead on the desktop app.
 """
@@ -113,14 +113,8 @@ async def test_browser_tool_posts_action_request_with_stripped_prefix() -> None:
 
 @pytest.mark.asyncio
 async def test_browser_tool_strips_prefix_for_every_action() -> None:
-    """Each of the five tools maps to the correct wire ``action``."""
-    expected = {
-        "browser_navigate": "navigate",
-        "browser_snapshot": "snapshot",
-        "browser_click": "click",
-        "browser_type": "type",
-        "browser_screenshot": "screenshot",
-    }
+    """Each browser tool maps to the correct wire ``action``."""
+    expected = {name: name.removeprefix("browser_") for name in _EXPECTED_BROWSER_NAMES}
     for tool_name, action in expected.items():
         client = _RecordingClient()
         await _execute_browser_tool(tool_name, {}, server_client=client, conversation_id="conv_x")
@@ -192,16 +186,26 @@ async def test_browser_tool_requires_server_and_session() -> None:
 
 _EXPECTED_BROWSER_NAMES = {
     "browser_navigate",
+    "browser_go_back",
+    "browser_go_forward",
+    "browser_reload",
+    "browser_tabs",
     "browser_snapshot",
     "browser_click",
+    "browser_hover",
+    "browser_drag",
+    "browser_scroll",
     "browser_type",
+    "browser_press_key",
+    "browser_select_option",
+    "browser_check",
     "browser_screenshot",
 }
 
 
 def test_browser_names_reserved_framework_owned() -> None:
     """
-    The five ``browser_*`` names are reserved in the builtin registry so
+    The ``browser_*`` names are reserved in the builtin registry so
     user specs can't shadow them, but they are FRAMEWORK-OWNED — like
     ``list_comments`` / ``update_comment``, they are NOT instantiable via
     ``get_builtin_tool`` (registration is ToolManager's job). This pins
@@ -218,7 +222,7 @@ def test_browser_names_reserved_framework_owned() -> None:
 def test_toolmanager_always_registers_browser_tools() -> None:
     """
     EVERY session — even a spec with NO ``tools.builtins`` declared — has
-    all five ``browser_*`` tools registered on its ToolManager. This is
+    all ``browser_*`` tools registered on its ToolManager. This is
     the invariant the earlier per-spec registration missed (agents fell
     back to WebFetch because no shipped spec declared browser_*).
     """
@@ -243,7 +247,7 @@ def test_browser_tools_in_native_relay_union() -> None:
 
 def test_native_relay_includes_browser_for_bare_spec() -> None:
     """
-    A spec with NO ``tools.builtins`` still surfaces all five
+    A spec with NO ``tools.builtins`` still surfaces all the
     ``browser_*`` schemas on the native relay — because ToolManager
     always registers them, the relay (which filters ToolManager's
     schemas by the union) always emits them. The desktop app runs native
@@ -286,8 +290,162 @@ def test_strip_browser_tool_schemas_drops_nested_and_flat_shapes() -> None:
 
 
 def test_strip_browser_tool_schemas_covers_every_browser_name() -> None:
-    """All five ``browser_*`` names are stripped, none survives."""
+    """All ``browser_*`` names are stripped, none survives."""
     schemas = [{"type": "function", "function": {"name": n}} for n in sorted(_BROWSER_TOOLS)]
     schemas.append({"type": "function", "function": {"name": "keepme"}})
     kept = strip_browser_tool_schemas(schemas)
     assert kept == [{"type": "function", "function": {"name": "keepme"}}]
+
+
+@pytest.mark.asyncio
+async def test_screenshot_preserves_image_bytes_and_all_metadata() -> None:
+    """Browser metadata and the decoded screenshot survive delivery and replay."""
+    from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+    from omnigent.runtime.tool_result_replay import tool_result_content_blocks
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    metadata = {
+        "ok": True,
+        "url": "https://example.com/chart",
+        "note": "Correction: South -30",
+        "dimensions": {"width": 1, "height": 1},
+    }
+    body = {**metadata, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}"}
+    client = _RecordingClient(_RecordingResponse(body=body))
+    output = await _execute_browser_tool(
+        "browser_screenshot", {}, server_client=client, conversation_id="image-session"
+    )
+    native = _dynamic_tool_result_payload(json.loads(output))
+    assert native["success"] is True
+    assert [item["type"] for item in native["contentItems"]] == ["inputText", "inputImage"]
+    assert json.loads(native["contentItems"][0]["text"]) == metadata
+    assert native["contentItems"][1]["imageUrl"] == body["data_url"]
+    replay = tool_result_content_blocks(output)
+    assert replay.blocks is not None
+    assert json.loads(replay.blocks[0]["text"]) == metadata
+    assert replay.blocks[1]["source"] == {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": _TINY_PNG_BASE64,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": False, "error": "No browser open", "data_url": "data:image/png;base64,invalid"},
+        {"ok": True, "data_url": "data:image/png;base64,invalid"},
+        {"ok": True, "data_url": "data:image/svg+xml;base64,PHN2Zy8+"},
+        {"ok": True, "data_url": "https://example.com/image.png"},
+        {"ok": True, "data_url": "data:image/png,percent%20encoded"},
+        {"ok": True, "data_url": 123},
+        {"ok": True, "note": "No screenshot supplied"},
+    ],
+)
+async def test_screenshot_invalid_and_error_results_remain_lossless(
+    body: dict[str, object],
+) -> None:
+    response = _RecordingResponse(body=body)
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    assert output == response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool", ["browser_snapshot", "browser_navigate", "browser_click", "browser_type"]
+)
+async def test_other_browser_results_do_not_interpret_image_shaped_json(tool: str) -> None:
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    response = _RecordingResponse(
+        body={"ok": True, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}"}
+    )
+    output = await _execute_browser_tool(
+        tool, {}, server_client=_RecordingClient(response), conversation_id="image-session"
+    )
+    assert output == response.text
+
+
+@pytest.mark.asyncio
+async def test_screenshot_history_cap_keeps_metadata_and_explicit_image_omission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.runtime.tool_output as caps
+    from omnigent.runtime.tool_result_replay import tool_result_content_blocks
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    metadata = {"ok": True, "note": "Required late fact: amber"}
+    response = _RecordingResponse(
+        body={"data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}", **metadata}
+    )
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    # Force only the persisted mirror over its cap; live delivery stays intact.
+    monkeypatch.setattr(caps, "MAX_TOOL_OUTPUT_BYTES", len(output.encode()) - 1)
+    capped = caps.cap_tool_output(output)
+    assert len(capped.encode()) < len(output.encode())
+    replay = tool_result_content_blocks(capped)
+    assert replay.blocks is not None
+    assert json.loads(replay.blocks[0]["text"]) == metadata
+    assert "omitted" in replay.blocks[1]["text"]
+    assert _TINY_PNG_BASE64 not in capped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"error": "No browser"},
+        {"blocked": True},
+        {"cancelled": True},
+        {"result": {"error": "Nested failure"}},
+    ],
+)
+async def test_screenshot_never_overrides_existing_failure_status(
+    status: dict[str, object],
+) -> None:
+    from omnigent.inner.executor import classify_tool_result
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    body = {"ok": True, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}", **status}
+    response = _RecordingResponse(body=body)
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    assert output == response.text
+    assert classify_tool_result(json.loads(output)) == classify_tool_result(body)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_normalizes_base64_without_changing_image_bytes() -> None:
+    from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    wrapped = "\n".join(
+        _TINY_PNG_BASE64[i : i + 12] for i in range(0, len(_TINY_PNG_BASE64), 12)
+    ).rstrip("=")
+    body = {"ok": True, "data_url": "data:image/png;base64," + wrapped}
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(_RecordingResponse(body=body)),
+        conversation_id="image-session",
+    )
+    assert (
+        _dynamic_tool_result_payload(json.loads(output))["contentItems"][1]["imageUrl"]
+        == "data:image/png;base64," + _TINY_PNG_BASE64
+    )
+    assert body["data_url"] == "data:image/png;base64," + wrapped

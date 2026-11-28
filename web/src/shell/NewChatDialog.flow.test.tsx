@@ -1,3 +1,4 @@
+import { peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -15,10 +16,20 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
     error: null,
   })),
 }));
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import {
+  onFirstInputAccepted,
+  onSessionCreatedHere,
+  onSessionCreationAttempt,
+  resetSessionCreations,
+} from "@/lib/sessionCreations";
+import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => useTestConversations(),
+  useOptionalLoadedConversations: () => useTestConversations().data,
+}));
 
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: ({ target, enabled }: { target: { agentId?: string } | null; enabled?: boolean }) => ({
@@ -35,20 +46,43 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
+import { readLastMcpServices, writeLastMcpServices } from "@/lib/mcpPreferences";
+
+vi.mock("@/lib/mcpRegistry", () => ({
+  authorizeRegistryService: vi.fn(),
+  registryRequest: vi.fn(),
+}));
+import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { requestGadgetCreateSessionMenu, resetGadgetRailRequests } from "@/lib/gadgetRailTabs";
+import { GadgetOpenSessionButton } from "@/gadgets/ui/GadgetOpenSessionButton";
+import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { writeLastHostChoice } from "@/lib/hostPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
+import { ARIA_MOD_KEY, ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ComposerPresentationContext, type ComposerPresentation } from "./composerPresentation";
+import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
+import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import {
+  composerTargetOf,
+  isComposerTargetFocused,
+} from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -60,8 +94,10 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // handoff. The host list, agent catalog, conflict hooks, navigation and HTTP
 // layers are stubbed so the test isolates that wiring.
 const navigateMock = vi.fn();
+const replaceSearchParamsMock = vi.fn();
 const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
+const hasPendingLocalMessageMock = vi.fn();
 const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
 let searchParams = new URLSearchParams();
@@ -80,6 +116,8 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // (`@/lib/routing`), not react-router directly — mock that so the create
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -88,6 +126,7 @@ vi.mock("@/lib/routing", () => ({
 // (keyed by conversation id), not router state — assert on that call.
 vi.mock("@/store/chatStore", () => ({
   beginLocalConversation: (...args: unknown[]) => beginLocalConversationMock(...args),
+  hasPendingLocalMessage: (...args: unknown[]) => hasPendingLocalMessageMock(...args),
   hydrateLocalConversation: (...args: unknown[]) => hydrateLocalConversationMock(...args),
   removeLocalConversation: (...args: unknown[]) => removeLocalConversationMock(...args),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
@@ -145,7 +184,7 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
   ...(await importOriginal<typeof HostWorktreesModule>()),
-  useHostWorktrees: (_hostId: string | null, path: string | null) => ({
+  useHostWorktrees: vi.fn((_hostId: string | null, path: string | null) => ({
     data:
       path === "/Users/corey/universe/src/foo"
         ? [
@@ -160,7 +199,7 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
           ? undefined
           : [],
     isPlaceholderData: false,
-  }),
+  })),
   hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
     queryKey: ["host-worktrees", hostId, repoPath],
     queryFn: async () =>
@@ -221,12 +260,20 @@ function host(overrides: Partial<Host> = {}): Host {
 }
 
 function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
+  const name = overrides.name ?? "hello_world";
+  const harnessByName: Record<string, string> = {
+    "antigravity-native-ui": "antigravity-native",
+    "claude-native-ui": "claude-native",
+    "codex-native-ui": "codex-native",
+    "cursor-native-ui": "cursor-native",
+    "opencode-native-ui": "opencode-native",
+  };
   return {
     id: "ag_hello",
-    name: "hello_world",
+    name,
     display_name: "Hello World",
     description: null,
-    harness: null,
+    harness: harnessByName[name] ?? "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -245,7 +292,9 @@ function setAgents(agents: AvailableAgent[]): void {
 function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
-): void {
+  presentation: ComposerPresentation = { kind: "page" },
+  beside?: ReactNode,
+): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -289,12 +338,25 @@ function renderLanding(
     return (
       <QueryClientProvider client={client}>
         <CapabilitiesProvider info={info}>
-          <TooltipProvider>{children}</TooltipProvider>
+          <ComposerPresentationContext.Provider value={presentation}>
+            <TooltipProvider>{children}</TooltipProvider>
+          </ComposerPresentationContext.Provider>
         </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
-  render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  render(
+    beside === undefined ? (
+      <NewChatLandingScreen />
+    ) : (
+      <MobileHeaderControlsProvider>
+        {beside}
+        <NewChatLandingScreen />
+      </MobileHeaderControlsProvider>
+    ),
+    { wrapper: Wrapper },
+  );
+  return client;
 }
 
 /**
@@ -382,17 +444,24 @@ beforeEach(() => {
   setPendingInitialPromptMock.mockReset();
   beginLocalConversationMock.mockReset();
   beginLocalConversationMock.mockReturnValue(null);
+  hasPendingLocalMessageMock.mockReset();
+  hasPendingLocalMessageMock.mockReturnValue(true);
   hydrateLocalConversationMock.mockReset();
   removeLocalConversationMock.mockReset();
   removeLocalConversationMock.mockReturnValue(false);
   pushMatchers.length = 0;
   announcePushedSession = null;
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(registryRequest).mockReset();
+  vi.mocked(authorizeRegistryService).mockReset();
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
+  vi.mocked(useHostWorktrees).mockReset();
   clearOptimisticTitles();
+  clearSessionDrafts();
   localStorage.clear();
+  sessionStorage.clear();
   searchParams = new URLSearchParams();
   projects = [];
   vi.mocked(useHostModelOptions).mockReturnValue({
@@ -411,11 +480,1298 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetGadgetRailRequests();
   cleanup();
   localStorage.clear();
 });
 
+describe("NewChatLandingScreen in the floating panel", () => {
+  function floatingPanel() {
+    const shownListeners = new Set<() => void>();
+    return {
+      kind: "floating" as const,
+      launch: vi.fn(),
+      onFilePicker: vi.fn(),
+      openAppPage: vi.fn(),
+      subscribeShown: (listener: () => void) => {
+        shownListeners.add(listener);
+        return () => {
+          shownListeners.delete(listener);
+        };
+      },
+      /** The panel came on screen or took the keyboard again. */
+      shown: () =>
+        act(() => {
+          for (const listener of shownListeners) listener();
+        }),
+    };
+  }
+
+  it("keeps the keyboard in the prompt when the CodeMirror editor arrives after the panel took it", async () => {
+    let loaded: (() => void) | undefined;
+    resetCodeMirrorComposerLoadForTests(
+      () =>
+        new Promise((resolve) => {
+          loaded = () => resolve(CodeMirrorModule);
+        }),
+    );
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    const panel = floatingPanel();
+    renderLanding([], { features: { chat_composer_codemirror: true } }, panel);
+    // The editor is still loading, so the textarea stands in and takes the keyboard.
+    typeMessage("early words");
+    panel.shown();
+    expect(document.activeElement).toBe(screen.getByTestId("new-chat-landing-input"));
+
+    // The import starts a moment after the flag asks for it.
+    await waitFor(() => expect(loaded).toBeTypeOf("function"));
+    await act(async () => loaded!());
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = composerTargetOf(screen.getByTestId("new-chat-landing-input"))!;
+    expect(isComposerTargetFocused(editor)).toBe(true);
+    expect(editor.value).toBe("early words");
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([11, 11]);
+  });
+
+  for (const engine of ["textarea", "codemirror"] as const) {
+    it(`gives the ${engine} prompt the keyboard each time the panel takes it, after the kept draft`, async () => {
+      if (engine === "codemirror") {
+        resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+        onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+      }
+      const panel = floatingPanel();
+      renderLanding(
+        [],
+        engine === "codemirror" ? { features: { chat_composer_codemirror: true } } : {},
+        panel,
+      );
+      if (engine === "codemirror") {
+        await waitFor(() =>
+          expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+        );
+      }
+      const target = () => composerTargetOf(screen.getByTestId("new-chat-landing-input"))!;
+      if (engine === "codemirror") act(() => insertComposerText(target(), "half a thought"));
+      else typeMessage("half a thought");
+      // The keyboard went elsewhere, with the caret back at the start.
+      act(() => {
+        target().setSelectionRange(0, 0);
+        target().blur();
+      });
+      expect(isComposerTargetFocused(target())).toBe(false);
+
+      panel.shown();
+
+      expect(isComposerTargetFocused(target())).toBe(true);
+      expect(target().value).toBe("half a thought");
+      expect([target().selectionStart, target().selectionEnd]).toEqual([14, 14]);
+
+      // Another control the user moves to keeps the keyboard, across renders, until the next show.
+      const other = screen.getByTestId("new-chat-landing-submit");
+      act(() => other.focus());
+      if (engine === "codemirror") act(() => insertComposerText(target(), "!"));
+      else typeMessage("half a thought!");
+      expect(document.activeElement).toBe(other);
+      panel.shown();
+      expect(isComposerTargetFocused(target())).toBe(true);
+      expect(target().value).toBe("half a thought!");
+      expect([target().selectionStart, target().selectionEnd]).toEqual([15, 15]);
+    });
+  }
+
+  /** The desktop shell answers which host is this Mac, as it does in the panel. */
+  function inDesktopShell(identity: { cliInstalled: boolean; hostId: string | null } | null): void {
+    const shell = window as unknown as { omnigentDesktop?: unknown };
+    shell.omnigentDesktop = {
+      kind: "electron",
+      getHostIdentity: async () => identity,
+    };
+    onTestFinished(() => {
+      delete shell.omnigentDesktop;
+    });
+  }
+
+  it("hands a host create to the panel instead of opening a temp chat or navigating", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    expect(screen.getByTestId("new-chat-landing").dataset.presentation).toBe("floating");
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith({
+        sessionId: "conv_new",
+        text: "inspect the repo",
+        skill: null,
+        files: [],
+        inputAccepted: false,
+      }),
+    );
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
+    expect(beginLocalConversationMock).not.toHaveBeenCalled();
+    expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it("starts the session from a full screen gadget's Create session menu as Start does", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+    const onOpenSession = vi.fn();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} onOpenSession={onOpenSession} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    act(() => {
+      requestGadgetCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    // The menu holds New session's own controls.
+    expect(
+      within(screen.getByTestId("gadget-open-session-popover")).getByTestId(
+        "new-chat-landing-agent-select",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "inspect the repo" }),
+      ),
+    );
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
+    expect(onOpenSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps a full screen gadget's Create session off while the host can't run the harness", async () => {
+    // The host reports the selected agent's harness as not set up there.
+    setHosts([host({ configured_harnesses: { "claude-sdk": false } })]);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    act(() => {
+      requestGadgetCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    // New session only warns under its composer, which full screen hides: the menu says why
+    // and doesn't start a session that can't run.
+    expect(await screen.findByTestId("gadget-create-session-harness")).toHaveTextContent(
+      "Pick another harness",
+    );
+    expect(create).toBeDisabled();
+    fireEvent.click(create);
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(panel.launch).not.toHaveBeenCalled();
+  });
+
+  it("shows a prompt link's message in a full screen gadget's Create session menu before it is sent", async () => {
+    // A link that fills the composer and opens a gadget full screen over it: nothing the
+    // gadget wrote, so only the composer's own text can say what Create session sends.
+    searchParams = new URLSearchParams("prompt=LINK_PREFILL_PROBE&gadget_start=g1&gadget=g1");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g1" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    act(() => {
+      requestGadgetCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    const popover = screen.getByTestId("gadget-open-session-popover");
+    expect(within(popover).getByTestId("gadget-create-session-draft")).toHaveTextContent(
+      "LINK_PREFILL_PROBE",
+    );
+    await waitFor(() => expect(create).toBeEnabled());
+    // Focus stays on the menu, so a stray Enter doesn't send text the viewer hasn't read.
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+    expect(document.activeElement).not.toBe(create);
+    fireEvent.click(create);
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "LINK_PREFILL_PROBE" }),
+      ),
+    );
+  });
+
+  it("shows a message the gadget wrote in its Create session menu before Create session sends it", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g1" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    // Gadget code filled the composer, which full screen hides.
+    typeMessage("delete every branch");
+    act(() => {
+      requestGadgetCreateSessionMenu({
+        prompt: "delete every branch",
+        gadgetId: "g1",
+        gadgetName: "Synthetic board",
+      });
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    const popover = screen.getByTestId("gadget-open-session-popover");
+    // The viewer can read exactly what will be sent, and from which gadget, before sending it.
+    const review = within(popover).getByTestId("gadget-open-session-review");
+    expect(review).toHaveTextContent("Written by the gadget “Synthetic board”");
+    expect(review).toHaveTextContent("delete every branch");
+    // Shown once: the menu's own copy of the draft stays out while the review shows it.
+    expect(screen.queryByTestId("gadget-create-session-draft")).toBeNull();
+    await waitFor(() => expect(document.activeElement).not.toBe(create));
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "delete every branch" }),
+      ),
+    );
+  });
+
+  it("still shows what Create session sends after switching from the gadget that wrote it to another", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    // Gadget A wrote the message and its menu was dismissed; the viewer opened gadget B, whose
+    // menu shows no review of A's text.
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g2" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("delete every branch");
+    act(() => {
+      requestGadgetCreateSessionMenu({
+        prompt: "delete every branch",
+        gadgetId: "g1",
+        gadgetName: "Synthetic board",
+      });
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    expect(screen.queryByTestId("gadget-open-session-review")).toBeNull();
+    // New session's own copy shows it instead: Create session never sends unseen text.
+    expect(await screen.findByTestId("gadget-create-session-draft")).toHaveTextContent(
+      "delete every branch",
+    );
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "delete every branch" }),
+      ),
+    );
+  });
+
+  it("names the session a gadget's Create session made, but not its first message accepted before it is sent", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Earlier cases created conv_new too; this tab forgets them.
+    resetSessionCreations();
+    // The panel has the session but hasn't sent its first message, or the send fails.
+    const panel = floatingPanel();
+    const outcomes: string[] = [];
+    const stopCreated = onSessionCreatedHere((sessionId) => outcomes.push(`created:${sessionId}`));
+    const stopAccepted = onFirstInputAccepted((sessionId) =>
+      outcomes.push(`accepted:${sessionId}`),
+    );
+    try {
+      renderLanding(
+        [],
+        {},
+        panel,
+        <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+      );
+      await waitForWorkspaceSeed();
+      typeMessage("inspect the repo");
+      act(() => {
+        requestGadgetCreateSessionMenu();
+      });
+      const create = await screen.findByTestId("gadget-create-session");
+      await waitFor(() => expect(create).toBeEnabled());
+      fireEvent.click(create);
+      await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+      expect(outcomes).toEqual(["created:conv_new"]);
+    } finally {
+      stopCreated();
+      stopAccepted();
+    }
+  });
+
+  it("tells a gadget's Create session its create failed, and names no session", async () => {
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new Error("offline"));
+    const panel = floatingPanel();
+    const outcomes: string[] = [];
+    const stopAttempts = onSessionCreationAttempt((attempt, outcome) =>
+      outcomes.push(`${outcome}:${attempt}`),
+    );
+    const stopCreated = onSessionCreatedHere((sessionId) => outcomes.push(`created:${sessionId}`));
+    try {
+      renderLanding(
+        [],
+        {},
+        panel,
+        <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+      );
+      await waitForWorkspaceSeed();
+      typeMessage("inspect the repo");
+      act(() => {
+        requestGadgetCreateSessionMenu();
+      });
+      const create = await screen.findByTestId("gadget-create-session");
+      await waitFor(() => expect(create).toBeEnabled());
+      fireEvent.click(create);
+      // The gadget's requests stay undelivered: its attempt fails and no session is noted.
+      await waitFor(() => expect(outcomes.some((o) => o.startsWith("failed:"))).toBe(true));
+      expect(outcomes.filter((o) => o.startsWith("created:"))).toEqual([]);
+      expect(panel.launch).not.toHaveBeenCalled();
+    } finally {
+      stopAttempts();
+      stopCreated();
+    }
+  });
+
+  // The panel keeps the prompt when delivery fails, and remounts the composer when it succeeds.
+  it("keeps the prompt in the composer after it hands a create to the panel", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("inspect the repo");
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+  });
+
+  it.each([true, undefined])(
+    "says whether a sandbox create took the first message (durable input %s)",
+    async (durable) => {
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_sandbox" }),
+      } as unknown as Response);
+      const panel = floatingPanel();
+
+      renderLanding([], { managed_sandboxes_enabled: true, durable_initial_input: durable }, panel);
+      typeMessage("start a sandbox");
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+      await waitFor(() =>
+        expect(panel.launch).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: "conv_sandbox", inputAccepted: durable === true }),
+        ),
+      );
+      const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.host_type).toBe("managed");
+      // Accepted only when the create carried it.
+      expect(body.initial_input).toEqual(
+        durable
+          ? {
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: "start a sandbox" }] },
+            }
+          : undefined,
+      );
+      expect(navigateMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("offers only this Mac's host, and doesn't start on a remembered other host", async () => {
+    inDesktopShell({ cliInstalled: true, hostId: "host_1" });
+    setHosts([host(), host({ host_id: "host_2", name: "build-box" })]);
+    writeLastHostChoice("host_2");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-host-host_1")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
+  });
+
+  it.each([
+    ["a null identity", null],
+    ["an identity without a host", { cliInstalled: true, hostId: null }],
+  ])(
+    "never takes the only online host for this Mac when the shell gives %s",
+    async (_label, identity) => {
+      inDesktopShell(identity);
+      setHosts([host({ host_id: "host_other", name: "build-box" })]);
+      const panel = floatingPanel();
+
+      renderLanding([], {}, panel);
+      // Let the shell's answer land, so what follows isn't just the wait for it.
+      await act(async () => {});
+      typeMessage("inspect the repo");
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      expect(screen.queryByTestId("new-chat-landing-host-host_other")).toBeNull();
+      // With the CLI installed, this Mac isn't a host yet, so the panel offers to start it.
+      if (identity?.cliInstalled) {
+        expect(screen.getByTestId("new-chat-landing-run-on-this-machine")).toBeInTheDocument();
+      }
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+        key: "Enter",
+        metaKey: true,
+      });
+      expect(authenticatedFetch).not.toHaveBeenCalled();
+      expect(panel.launch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("moves a restored draft off a host the panel can't start on", async () => {
+    setHosts([host(), host({ host_id: "host_2", name: "build-box" })]);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_2"));
+    typeMessage("inspect the repo");
+    // Leaving parks the draft, host_2 included.
+    cleanup();
+
+    inDesktopShell({ cliInstalled: true, hostId: "host_1" });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      host_id: "host_1",
+      workspace: SEEDED_WORKSPACE,
+    });
+  });
+
+  it("starts nowhere until the desktop shell names this Mac's host", async () => {
+    let answer!: (identity: { cliInstalled: boolean; hostId: string }) => void;
+    const shell = window as unknown as { omnigentDesktop?: unknown };
+    shell.omnigentDesktop = {
+      kind: "electron",
+      getHostIdentity: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    };
+    onTestFinished(() => {
+      delete shell.omnigentDesktop;
+    });
+
+    renderLanding([], {}, floatingPanel());
+    typeMessage("inspect the repo");
+    await waitFor(() => expect(answer).toBeDefined());
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+
+    await act(async () => answer({ cliInstalled: true, hostId: "host_1" }));
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
+  it("keeps desktop controls in a window narrower than the page's mobile layout", async () => {
+    // The panel is narrower than the mobile breakpoint by design.
+    const real = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: /max-width/.test(query),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    onTestFinished(() => {
+      window.matchMedia = real;
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toBeInTheDocument();
+    typeMessage("inspect the repo");
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+      key: "Enter",
+      metaKey: true,
+    });
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+  });
+
+  it("sends with ⌘↵ and keeps plain ↵ for a new line", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    // Not prevented, so the textarea inserts its newline.
+    expect(fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" })).toBe(
+      true,
+    );
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+      key: "Enter",
+      metaKey: true,
+    });
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+  });
+
+  it("fills the panel with a borderless composer and keeps its send chord in view", async () => {
+    renderLanding([], {}, floatingPanel());
+    await waitForWorkspaceSeed();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).toHaveAttribute("data-composer-appearance", "panel");
+    expect(composer).toHaveClass("flex-1");
+    expect(composer).not.toHaveClass("composer-reference-surface");
+    expect(composer).not.toHaveClass("border");
+    expect(composer).not.toHaveClass("rounded-2xl");
+    // The prompt takes the panel's height and scrolls inside it.
+    expect(composer.querySelector("[data-composer-input-area]")).toHaveClass(
+      "flex-1",
+      "overflow-y-auto",
+    );
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveClass("flex-1", "max-h-none");
+    expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("border-t");
+    expect(screen.getByTestId("new-chat-landing-send-shortcut")).toHaveTextContent(
+      `${MOD_KEY}${ENTER_KEY}`,
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toHaveAttribute(
+      "aria-keyshortcuts",
+      `${ARIA_MOD_KEY}+Enter`,
+    );
+    // The prompt sits under the panel's top edge, so suggestions open below it.
+    typeMessage("/");
+    expect(await screen.findByTestId("slash-command-menu")).toHaveClass("top-11");
+  });
+
+  it("keeps the main window's composer card, with no chord hint", async () => {
+    renderLanding([]);
+    await waitForWorkspaceSeed();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).not.toHaveAttribute("data-composer-appearance");
+    expect(composer).toHaveClass("composer-reference-surface", "border", "rounded-2xl");
+    expect(screen.getByTestId("new-chat-landing-actions")).not.toHaveClass("border-t");
+    expect(screen.queryByTestId("new-chat-landing-send-shortcut")).not.toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-submit")).not.toHaveAttribute("aria-keyshortcuts");
+    typeMessage("/");
+    expect(await screen.findByTestId("slash-command-menu")).toHaveClass("bottom-full");
+  });
+
+  it("tells the panel when the native file picker opens and closes", async () => {
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-attach"), { button: 0 });
+    fireEvent.click(await screen.findByText("Files and images"));
+    expect(panel.onFilePicker).toHaveBeenCalledWith("open");
+    const input = screen.getByTestId("new-chat-landing-file-input");
+    fireEvent(input, new Event("cancel"));
+    expect(panel.onFilePicker).toHaveBeenLastCalledWith("closed");
+    panel.onFilePicker.mockClear();
+    fireEvent.change(input, {
+      target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+    });
+    expect(panel.onFilePicker).toHaveBeenCalledWith("closed");
+  });
+});
+
 describe("NewChatLandingScreen create flow", () => {
+  it.each([
+    { provider: undefined, sourceBranch: "main", linked: false, action: "reuse" },
+    { provider: undefined, sourceBranch: "master", linked: false, action: "new" },
+    { provider: "test-sandbox", sourceBranch: "master", linked: false, action: "reuse" },
+    { provider: "test-sandbox", sourceBranch: "feature/source", linked: true, action: "reuse" },
+    { provider: "test-sandbox", sourceBranch: "master", linked: false, action: "new" },
+    { provider: "test-sandbox", sourceBranch: "feature/source", linked: true, action: "new" },
+    { provider: "test-sandbox", sourceBranch: "master", linked: false, action: "override" },
+    { provider: "test-sandbox", sourceBranch: "feature/source", linked: true, action: "existing" },
+    { provider: "test-sandbox", sourceBranch: "feature/source", linked: true, action: "switch" },
+  ])(
+    "inherits the nested checkout with provider=$provider, branch=$sourceBranch, action=$action",
+    async ({ provider, sourceBranch, linked, action }) => {
+      const sourceRoot = linked ? "/work/repo-worktrees/source" : "/work/repo";
+      const sourceDirectory = `${sourceRoot}/src`;
+      const otherWorktree = "/work/repo-worktrees/other";
+      const otherDirectory = "/work/other-repo";
+      const worktrees = [
+        { path: sourceRoot, branch: sourceBranch, is_main: !linked, detached: false },
+        { path: otherWorktree, branch: "feature/other", is_main: false, detached: false },
+        ...(linked
+          ? [{ path: "/work/repo", branch: "master", is_main: true, detached: false }]
+          : []),
+      ];
+      searchParams = new URLSearchParams("sibling=source");
+      localStorage.setItem("omnigent:always-use-worktree", "true");
+      writeDefaultBaseBranch("main");
+      setHosts([
+        host({ sandbox_provider: provider }),
+        host({ host_id: "other-host", name: "Other computer" }),
+      ]);
+      localStorage.setItem(
+        RECENT_KEY,
+        JSON.stringify({ host_1: [SEEDED_WORKSPACE], "other-host": [otherDirectory] }),
+      );
+      vi.mocked(useHostWorktrees).mockImplementation(
+        (hostId, path) =>
+          ({
+            data:
+              hostId === "other-host"
+                ? [{ path: otherDirectory, branch: "main", is_main: true, detached: false }]
+                : path?.startsWith("/work/")
+                  ? worktrees
+                  : undefined,
+            isPlaceholderData: false,
+          }) as ReturnType<typeof useHostWorktrees>,
+      );
+      vi.mocked(authenticatedFetch).mockImplementation(
+        async (url) =>
+          new Response(
+            JSON.stringify(
+              String(url).startsWith("/v1/sessions/source?")
+                ? {
+                    id: "source",
+                    title: "Source",
+                    host_id: "host_1",
+                    workspace: sourceDirectory,
+                    agent_id: "ag_hello",
+                    permission_level: 4,
+                    labels: {},
+                    items: [],
+                  }
+                : { id: "conv_new" },
+            ),
+          ),
+      );
+      renderLanding([], { sibling_sessions: true });
+      await screen.findByTestId("new-chat-landing-input");
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+        `Working directory: ${sourceDirectory}`,
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveAccessibleName(
+          expect.stringContaining(sourceBranch),
+        ),
+      );
+      openWorktree();
+      expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue("");
+      const selectedOption = linked
+        ? screen.getAllByTestId("new-chat-landing-worktree-option")[0]
+        : screen.getByTestId("new-chat-landing-no-worktree-option");
+      expect(within(selectedOption).getByRole("radio")).toBeChecked();
+      if (action === "existing") {
+        const options = screen.getAllByTestId("new-chat-landing-worktree-option");
+        fireEvent.click(within(options[options.length - 1]).getByRole("radio"));
+      } else {
+        if (action === "new" || action === "override") {
+          fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+            target: { value: "feature/nested" },
+          });
+          await waitFor(() =>
+            expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue(
+              sourceBranch,
+            ),
+          );
+          if (action === "override") {
+            fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+              target: { value: "release/manual" },
+            });
+          }
+        }
+        fireEvent.keyDown(document, { key: "Escape" });
+      }
+      if (action === "switch") {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-host-other-host"));
+        await waitFor(() =>
+          expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+            `Working directory: ${otherDirectory}`,
+          ),
+        );
+        openWorktree();
+        fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+          target: { value: "feature/unrelated" },
+        });
+        fireEvent.keyDown(document, { key: "Escape" });
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+        await waitFor(() =>
+          expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveAccessibleName(
+            `Existing worktree branch: ${sourceBranch}`,
+          ),
+        );
+      }
+      typeMessage("Research this change");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+      const create = vi
+        .mocked(authenticatedFetch)
+        .mock.calls.find(([url, init]) => url === "/v1/sessions" && init?.method === "POST")!;
+      const body = JSON.parse(create[1]!.body as string);
+      expect(body).toMatchObject({
+        sibling_source_id: "source",
+        host_id: "host_1",
+        workspace: action === "existing" ? otherWorktree : sourceDirectory,
+      });
+      const expectedGit =
+        action === "new" || action === "override"
+          ? {
+              branch_name: "feature/nested",
+              base_branch: action === "override" ? "release/manual" : sourceBranch,
+            }
+          : linked || action === "existing"
+            ? {
+                branch_name: action === "existing" ? "feature/other" : sourceBranch,
+                existing_worktree: true,
+              }
+            : undefined;
+      expect(body.git).toEqual(expectedGit);
+    },
+  );
+
+  it("moves the new session to its real id with the requests in its URL, such as a cited file", async () => {
+    const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_file",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([]);
+    await waitForWorkspaceSeed();
+    typeMessage("Open the readme");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalledOnce());
+
+    const hydrateNavigate = hydrateLocalConversationMock.mock.calls[0][7];
+    const previousUrl = window.location.href;
+    try {
+      window.history.replaceState(
+        {},
+        "",
+        `/c/${encodeURIComponent(tempConvId)}?file=README.md&line=4`,
+      );
+      hydrateNavigate("/c/conv_new", { replace: true });
+      expect(navigateMock).toHaveBeenLastCalledWith("/c/conv_new?file=README.md&line=4", {
+        replace: true,
+      });
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
+  it.each([
+    { query: "canvas=main", canvasId: "main", project: undefined },
+    {
+      query: "canvas=proj_alpha&project=Alpha",
+      canvasId: "proj_alpha",
+      project: { id: "proj_alpha", name: "Alpha" },
+    },
+  ])(
+    "keeps a Canvas create on its board through temporary and real routes ($canvasId)",
+    async ({ query, canvasId, project }) => {
+      searchParams = new URLSearchParams(query);
+      projects = project ? [project] : [];
+      const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId,
+        pendingMsgTempId: "pend_canvas",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Create a session from Canvas");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+      const search = canvasId === "main" ? "" : `?canvas=${canvasId}`;
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenCalledWith({
+          pathname: `/canvas/c/${encodeURIComponent(tempConvId)}`,
+          search,
+        }),
+      );
+      await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalledOnce());
+      const hydrateNavigate = hydrateLocalConversationMock.mock.calls[0][7];
+      hydrateNavigate("/c/conv_new", { replace: true });
+      expect(navigateMock).toHaveBeenLastCalledWith(
+        { pathname: "/canvas/c/conv_new", search },
+        { replace: true },
+      );
+      const stillViewing = hydrateLocalConversationMock.mock.calls[0][8];
+      const previousUrl = window.location.href;
+      try {
+        window.history.replaceState({}, "", `/canvas/c/${encodeURIComponent(tempConvId)}${search}`);
+        expect(stillViewing()).toBe(true);
+        window.history.replaceState({}, "", "/canvas");
+        expect(stillViewing()).toBe(false);
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
+
+  it("returns a server-first Canvas create to its project", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([], { features: { canvas: true } });
+    await waitForWorkspaceSeed();
+    typeMessage("Create from the project board");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith({
+        pathname: "/canvas/c/conv_new",
+        search: "?canvas=proj_alpha",
+      }),
+    );
+  });
+
+  it("ignores a Canvas return parameter when the feature is off", async () => {
+    searchParams = new URLSearchParams("canvas=main");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("Create a regular session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("returns a failed page create to the gadget's New session, gadget and full screen kept", async () => {
+    // Build opened New session for a gadget; the temporary create then fails. Going back
+    // to a plain New session would read as leaving the gadget and delete it.
+    const query = "gadget_start=0123456789abcdef0123456789abcdef&gadget_full=1";
+    searchParams = new URLSearchParams(query);
+    const previousUrl = window.location.href;
+    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+    });
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_gadget",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    removeLocalConversationMock.mockReturnValue(true);
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new Error("offline"));
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("Build the gadget");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
+      );
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
+  it.each([
+    { query: "canvas=proj_alpha&project=Alpha", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: true },
+  ])(
+    "keeps the composer draft after a temporary create fails: $query, sourceDeleted=$sourceDeleted",
+    async ({ query, sourceDeleted }) => {
+      searchParams = new URLSearchParams(query);
+      projects = [{ id: "proj_alpha", name: "Alpha" }];
+      const previousUrl = window.location.href;
+      navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+        window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+      });
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId: "temp:1234567890abcdef1234567890abcdef",
+        pendingMsgTempId: "pend_scoped",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      removeLocalConversationMock.mockReturnValue(true);
+      let resolveCreate!: (response: Response) => void;
+      let sourceUnavailable = false;
+      let sourceTitle = "Source";
+      vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+        if (String(url).startsWith("/v1/sessions/source?")) {
+          if (sourceUnavailable) {
+            return new Response(JSON.stringify({ detail: "Not found" }), { status: 404 });
+          }
+          return new Response(
+            JSON.stringify({
+              id: "source",
+              title: sourceTitle,
+              host_id: "host_1",
+              workspace: SEEDED_WORKSPACE,
+              agent_id: "ag_hello",
+              permission_level: 4,
+              labels: {},
+              items: [],
+            }),
+          );
+        }
+        return new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        });
+      });
+      const info = { features: { canvas: true }, sibling_sessions: true };
+      try {
+        const client = renderLanding([], info);
+        await waitForWorkspaceSeed();
+        typeMessage("Keep this scoped draft");
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+        });
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(resolveCreate).toBeDefined());
+        if (query.startsWith("sibling=")) {
+          sourceTitle = "Renamed source";
+          await act(async () => {
+            await client.invalidateQueries({ queryKey: ["sibling-source", "source"] });
+          });
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: true, created: false }),
+          ]);
+        }
+        cleanup();
+        sourceUnavailable = sourceDeleted;
+        await act(async () => {
+          resolveCreate(
+            new Response(JSON.stringify({ detail: "Source unavailable" }), { status: 403 }),
+          );
+        });
+        if (query.startsWith("sibling=")) {
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: false, created: false }),
+          ]);
+        }
+        await waitFor(() =>
+          expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
+        );
+        searchParams = new URLSearchParams(window.location.search);
+        const reopenedClient = renderLanding([], info);
+        if (sourceDeleted) {
+          expect(await screen.findByText("Source session is unavailable.")).toBeVisible();
+          fireEvent.click(screen.getByRole("button", { name: "Continue in a new session" }));
+          cleanup();
+          searchParams = new URLSearchParams(window.location.search);
+          expect(searchParams.has("sibling")).toBe(false);
+          renderLanding([], info);
+        }
+        await waitForWorkspaceSeed();
+        expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this scoped draft");
+        expect(screen.getByText("notes.txt")).toBeVisible();
+        expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+        if (query.startsWith("sibling=") && !sourceDeleted) {
+          cleanup();
+          expect(reopenedClient.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: false, created: false }),
+          ]);
+        }
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
+
+  it("keeps a created nested session and its prompt when local hydration fails", async () => {
+    const previousUrl = window.location.href;
+    onTestFinished(() => window.history.replaceState({}, "", previousUrl));
+    navigateMock.mockImplementation((to: string) => window.history.replaceState({}, "", to));
+    searchParams = new URLSearchParams("sibling=source");
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async (url) =>
+        new Response(
+          JSON.stringify(
+            String(url).startsWith("/v1/sessions/source?")
+              ? {
+                  id: "source",
+                  host_id: "host_1",
+                  workspace: SEEDED_WORKSPACE,
+                  agent_id: "ag_hello",
+                  permission_level: 4,
+                  labels: {},
+                  items: [],
+                }
+              : { id: "created" },
+          ),
+        ),
+    );
+    const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pending",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    hydrateLocalConversationMock.mockImplementationOnce(() => {
+      throw new Error("local setup failed");
+    });
+    const client = renderLanding([], { sibling_sessions: true });
+    await waitForWorkspaceSeed();
+    typeMessage("Keep this task");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+    expect(setPendingInitialPromptMock).toHaveBeenCalledWith("created", {
+      text: "Keep this task",
+      skill: null,
+      files: [],
+    });
+    expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+      expect.objectContaining({ id: "created", created: true }),
+    ]);
+    expect(navigateMock).toHaveBeenLastCalledWith("/c/created");
+  });
+
+  it("includes selected registry services in the sandbox creation request", async () => {
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [{ id: "tracker", title: "Tracker", auth: "none", connected: true }],
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_managed" }),
+    } as Response);
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    fireEvent.click(screen.getByRole("button", { name: "MCP services: 0 selected" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Tracker" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Tracker" })).toBeChecked());
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    typeMessage("use the tracker");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [url, init] = vi.mocked(authenticatedFetch).mock.calls[0];
+    expect(url).toBe("/v1/sessions");
+    expect(JSON.parse(init!.body as string)).toMatchObject({
+      host_type: "managed",
+      mcp_registry_services: ["tracker"],
+    });
+  });
+
+  it("waits for MCP OAuth before allowing launch and preserves the draft selection", async () => {
+    const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
+    vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+    let finish!: () => void;
+    vi.mocked(authorizeRegistryService).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    writeLastHostChoice("host_1");
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    typeMessage("use the tracker");
+    fireEvent.click(screen.getByRole("button", { name: "MCP services: 0 selected" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Tracker" }));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    const signInSignal = vi.mocked(authorizeRegistryService).mock.calls[0][1];
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    expect(signInSignal.aborted).toBe(false);
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
+    await act(async () => finish());
+    await waitFor(() => expect(readLastMcpServices()).toEqual(["tracker"]));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled();
+    cleanup();
+    writeLastMcpServices([]);
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    expect(await screen.findByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("use the tracker");
+  });
+
+  it.each([false, true])(
+    "ignores remembered MCPs without the admin opt-in (hosted: %s)",
+    async (managed) => {
+      writeLastMcpServices(["system.ai.github"]);
+      vi.mocked(authenticatedFetch).mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding([], { managed_sandboxes_enabled: managed });
+      if (!managed) await waitForWorkspaceSeed();
+      expect(screen.queryByTestId("new-chat-landing-mcp-registry-chip")).toBeNull();
+      expect(registryRequest).not.toHaveBeenCalled();
+      typeMessage("Start without managed registry");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+      expect(
+        JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+      ).not.toHaveProperty("mcp_registry_services");
+      expect(readLastMcpServices()).toEqual(["system.ai.github"]);
+    },
+  );
+
+  it("restores remembered MCPs on a fresh draft and launches only available services without opening the picker", async () => {
+    writeLastMcpServices(["tracker", "removed"]);
+    let finish!: (value: unknown) => void;
+    vi.mocked(registryRequest).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    vi.mocked(authenticatedFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderLanding([], { enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    typeMessage("Use my remembered tools");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "MCP services: 2 selected" })).toBeVisible();
+    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+    await act(async () => finish({ data: [{ id: "tracker", title: "Tracker", connected: true }] }));
+    expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+    expect(
+      JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+    ).toMatchObject({ mcp_registry_services: ["tracker"] });
+    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+  });
+
+  it.each(["retry", "opt out"])(
+    "keeps preferences on a catalog failure and allows %s",
+    async (recovery) => {
+      writeLastMcpServices(["tracker"]);
+      vi.mocked(registryRequest).mockRejectedValue(new Error("Catalog unavailable"));
+      renderLanding([], { enabled_connections: ["mcp"] });
+      await waitForWorkspaceSeed();
+      typeMessage("Use my tools");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Catalog unavailable");
+      expect(readLastMcpServices()).toEqual(["tracker"]);
+      expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+      expect(screen.queryByText(/No longer available/)).toBeNull();
+      if (recovery === "opt out") {
+        fireEvent.click(screen.getByRole("switch", { name: "tracker" }));
+        expect(readLastMcpServices()).toEqual([]);
+        fireEvent.keyDown(document, { key: "Escape" });
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        vi.mocked(authenticatedFetch).mockResolvedValue({
+          ok: true,
+          json: async () => ({ id: "conv_without_mcp" }),
+        } as Response);
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+        expect(
+          JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+        ).not.toHaveProperty("mcp_registry_services");
+        expect(authorizeRegistryService).not.toHaveBeenCalled();
+        return;
+      }
+      const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
+      vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByRole("switch", { name: "Tracker" })).toBeChecked();
+      expect(
+        screen.getByRole("button", { name: "MCP services: 1 selected, 1 needs sign-in" }),
+      ).toBeVisible();
+      vi.mocked(authorizeRegistryService).mockResolvedValue();
+      vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
+      fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+      await screen.findByText("Connected");
+      expect(readLastMcpServices()).toEqual(["tracker"]);
+      fireEvent.click(screen.getByRole("switch", { name: "Tracker" }));
+      expect(readLastMcpServices()).toEqual([]);
+      cleanup();
+      resetLandingDraft();
+      renderLanding([], { enabled_connections: ["mcp"] });
+      fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+      expect(await screen.findByRole("switch", { name: "Tracker" })).not.toBeChecked();
+    },
+  );
+
   it("keeps project placement on the provisional and rekeyed conversation", async () => {
     searchParams = new URLSearchParams("project=Alpha");
     projects = [{ id: "proj_alpha", name: "Alpha" }];
@@ -453,9 +1809,11 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_1",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         project,
+        false,
       ),
     );
   });
@@ -488,6 +1846,10 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.id).toBeUndefined();
     expect(body.labels).toEqual({
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
 
     // On success the screen routes to the freshly created session.
@@ -556,9 +1918,11 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_1",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
+        false,
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -602,9 +1966,11 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_managed",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
+        false,
       ),
     );
   });
@@ -641,6 +2007,201 @@ describe("NewChatLandingScreen create flow", () => {
       ),
     );
     expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["original task", "corrected task", ""])(
+    "returns only the canceled draft after creation fails: %j",
+    async (corrected) => {
+      const tempConvId = "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+      let resolveCreate!: (response: Response) => void;
+      vi.mocked(authenticatedFetch).mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        }) as ReturnType<typeof authenticatedFetch>,
+      );
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId,
+        pendingMsgTempId: "pend_cancel",
+        createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      });
+      // The original task arrives through a prompt link, so a reload-recovery copy is kept.
+      searchParams = new URLSearchParams("prompt=original+task");
+      renderLanding();
+      await waitForWorkspaceSeed();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("original task");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      cleanup();
+      searchParams = new URLSearchParams();
+
+      hasPendingLocalMessageMock.mockReturnValue(false);
+      setSessionDraft(tempConvId, { text: corrected, files: [] });
+      await act(async () => {
+        resolveCreate({
+          ok: false,
+          status: 503,
+          json: async () => ({ detail: "host unavailable" }),
+        } as unknown as Response);
+      });
+      await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(corrected);
+      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+
+      // Editing the recovered draft and reloading never brings the link's text back.
+      typeMessage(`${corrected} edited`);
+      cleanup();
+      resetLandingDraft();
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    },
+  );
+
+  it("sends a pasted chip's file once after its create fails and the prompt is resubmitted", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    const tempConvId = "temp:cccccccccccccccccccccccccccccccc";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_chip",
+      createToken: "cccccccccccccccccccccccccccccccc",
+    });
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    // Stop leaves the submitted message as the temporary draft, its file in the tray.
+    setSessionDraft(tempConvId, { text: "@shot.png", files: [shot] });
+    hasPendingLocalMessageMock.mockReturnValue(false);
+    await act(async () => {
+      resolveCreate({
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: "host unavailable" }),
+      } as unknown as Response);
+    });
+    await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitForWorkspaceSeed();
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:dddddddddddddddddddddddddddddddd",
+      pendingMsgTempId: "pend_retry",
+      createToken: "dddddddddddddddddddddddddddddddd",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_retry" }),
+    } as unknown as Response);
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
+    const sentCall = hydrateLocalConversationMock.mock.calls.at(-1)!;
+    expect(sentCall[3]).toBe("@shot.png");
+    const sentFiles = sentCall[4] as File[];
+    expect(sentFiles).toHaveLength(1);
+    expect(sentFiles[0]).toBe(shot);
+  });
+
+  it("does not restore a submitted prompt while creation is pending", async () => {
+    const tempConvId = "temp:dddddddddddddddddddddddddddddddd";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_inflight",
+      createToken: "dddddddddddddddddddddddddddddddd",
+    });
+    searchParams = new URLSearchParams("prompt=First+request");
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("First request");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    // "New session" while the first create is still pending: nothing to restore.
+    searchParams = new URLSearchParams();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    await act(async () => {
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_first" }) } as unknown as Response);
+    });
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+  });
+
+  it("restores the recovered temp-draft files onto the still-mounted landing after a failed create", async () => {
+    // The create is rejected while the landing is still on screen, and the
+    // optimistic temp conversation accumulated its own draft meanwhile. The
+    // recovered draft (submitted draft + temp draft) must be restored onto
+    // the live composer — a missing restore would leave only the submitted
+    // chip and go red here, unlike the unmount path where the remount
+    // re-seeds from the stashed draft either way.
+    const tempConvId = "temp:cccccccccccccccccccccccccccccccc";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_restore",
+      createToken: "cccccccccccccccccccccccccccccccc",
+    });
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("original task");
+    const submitted = new File(["hello"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [submitted] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+    // A file the landing composer never had lands in the temp draft.
+    const carried = new File(["world"], "extra.txt", { type: "text/plain" });
+    act(() => {
+      setSessionDraft(tempConvId, { text: "more context", files: [carried] });
+    });
+    await act(async () => {
+      resolveCreate({
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: "host unavailable" }),
+      } as unknown as Response);
+    });
+
+    await waitFor(() => expect(screen.getByText("extra.txt")).toBeTruthy());
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "original task\n\nmore context",
+    );
   });
 
   it("keeps a failed create's restored draft when a newer create succeeds", async () => {
@@ -722,9 +2283,11 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_b",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
+        false,
       ),
     );
 
@@ -967,7 +2530,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     // Surrounding whitespace + an embedded control char (\x07 bell) prove the
     // screen sanitizes the message before handing it off.
-    typeMessage("  read the README\x07 and refactor  ");
+    typeMessage("  - read the README\x07\n  - refactor  ");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -985,16 +2548,129 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.initial_items).toBeUndefined();
 
     // It's stashed in the chatStore (keyed by the new conversation id),
-    // trimmed + control-char-stripped, for ChatPage to auto-send. Plain
-    // text (no leading "/") carries no skill invocation.
+    // control-char-stripped with list indentation intact, for ChatPage to send.
     await waitFor(() =>
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
-        text: "read the README and refactor",
+        text: "  - read the README\n  - refactor",
         skill: null,
         files: [],
       }),
     );
     expect(navigateMock).toHaveBeenCalledWith("/c/conv_new");
+  });
+
+  it("hands a pasted chip's file to the first message on the CodeMirror prompt", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    const items = [{ kind: "file", type: "image/png", getAsFile: () => shot }];
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: { items, getData: () => "" },
+    });
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@shot.png");
+    expect(screen.queryByAltText("shot.png")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ files: [shot] }),
+      ),
+    );
+  });
+
+  it("keeps one file per pasted chip when creation fails with the launcher still mounted", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    // No temporary conversation: the failure returns the draft to the launcher that is still mounted.
+    beginLocalConversationMock.mockReturnValue(null);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      json: async () => ({ detail: "host unavailable" }),
+    } as unknown as Response);
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getAllByAltText("shot.png").length).toBeGreaterThan(0));
+    // The restored draft keeps the typed @shot.png text and one tray file for the chip.
+    expect(composerTargetOf(screen.getByTestId("new-chat-landing-input"))!.value.trim()).toBe(
+      "@shot.png",
+    );
+    expect(screen.getAllByAltText("shot.png")).toHaveLength(1);
+  });
+
+  it("carries a pasted chip's file into a new session from an unavailable sibling", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    searchParams = new URLSearchParams("sibling=source");
+    let sourceGone = false;
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      if (String(url).startsWith("/v1/sessions/source?")) {
+        if (sourceGone)
+          return new Response(JSON.stringify({ detail: "Not found" }), { status: 404 });
+        return new Response(
+          JSON.stringify({
+            id: "source",
+            title: "Source",
+            host_id: "host_1",
+            workspace: SEEDED_WORKSPACE,
+            agent_id: "ag_hello",
+            permission_level: 4,
+            labels: {},
+            items: [],
+          }),
+        );
+      }
+      return new Promise<Response>(() => {});
+    });
+    const info = { features: { chat_composer_codemirror: true }, sibling_sessions: true };
+    renderLanding([], info);
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    // Leaving the unsubmitted sibling launcher keeps its draft, chip included, for the source.
+    cleanup();
+
+    sourceGone = true;
+    renderLanding([], info);
+    fireEvent.click(await screen.findByRole("button", { name: "Continue in a new session" }));
+
+    const handoffUrl = String(navigateMock.mock.calls.at(-1)![0]);
+    const token = new URL(handoffUrl, "http://localhost").searchParams.get("handoff");
+    expect(token).not.toBeNull();
+    expect(peekNewSessionHandoff(token)!.text.trim()).toBe("@shot.png");
+    expect(peekNewSessionHandoff(token)!.files).toEqual([shot]);
+    expect(peekNewSessionHandoff(token)!.files[0]!.name).toBe("shot.png");
   });
 
   it("stashes the first prompt as the session's optimistic label", async () => {
@@ -1102,6 +2778,32 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("runs a workflow from the + menu as the session's first message", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    setAgents([agent({ skills: [{ name: "workflow", description: "Plan and run a workflow" }] })]);
+
+    renderLanding([], { features: { workflows: true } });
+    await waitForWorkspaceSeed();
+    typeMessage("Add retries");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+    fireEvent.click(screen.getByTestId("composer-workflow-action"));
+    // The draft becomes the description, since the workflow message replaces it.
+    expect(await screen.findByTestId("workflow-dialog-description")).toHaveValue("Add retries");
+    fireEvent.click(screen.getByTestId("workflow-dialog-run"));
+
+    const args = `Add retries\n\n${REVIEW_PLAN_FIRST}`;
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
+        text: `/workflow ${args}`,
+        skill: { name: "workflow", args },
+        files: [],
+      }),
+    );
+  });
+
   it("keeps an unknown slash command as plain text (no skill payload)", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -1169,7 +2871,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Same sanitization vehicle as the chatStore handoff test — the history
-    // entry must be the SENT prompt (control-char stripped, trimmed), so a
+    // entry must be the SENT prompt (control-char stripped), so a
     // recall + resend reproduces exactly what was sent.
     typeMessage("  read the README\x07 and refactor  ");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -1180,10 +2882,10 @@ describe("NewChatLandingScreen create flow", () => {
     const history = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) ?? "[]");
     // The stored entry is the SANITIZED prompt: the \x07 bell is gone (proving
     // sanitizeInitialPrompt ran — a bare trim would have kept it) and the
-    // surrounding whitespace is trimmed. So a recall + resend reproduces
+    // indentation is preserved. So a recall + resend reproduces
     // exactly what was sent, not the raw keystrokes.
     expect(history[0]).not.toContain("\x07");
-    expect(history).toEqual(["read the README and refactor"]);
+    expect(history).toEqual(["  read the README and refactor"]);
   });
 
   it("attaches terminal-wrapper labels when the claude-native agent is chosen", async () => {
@@ -1209,6 +2911,10 @@ describe("NewChatLandingScreen create flow", () => {
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "claude-code-native-ui",
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
   });
 
@@ -1237,6 +2943,10 @@ describe("NewChatLandingScreen create flow", () => {
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "antigravity-native-ui",
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
   });
 
@@ -1699,12 +3409,8 @@ describe("NewChatLandingScreen create flow", () => {
       '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
-    expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
-    fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
-      target: { value: "gpt sol" },
-    });
-    expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
-    expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
+    expect(fullNameRow).toHaveTextContent("GPT 5.6 Sol");
+    expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
     fireEvent.click(screen.getByText("GPT 5.6 Sol"));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
@@ -2251,7 +3957,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Pick the non-default agent (Radix opens on pointerdown). "second_agent"
-    // is a custom agent, so it lives in the "Custom agents" submenu.
+    // is a custom agent, so it lives in the "Other..." submenu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_two"));
@@ -2300,7 +4006,8 @@ describe("NewChatLandingScreen create flow", () => {
 
 describe("sanitizeInitialPrompt", () => {
   it.each([
-    ["trims surrounding whitespace", "  hello  ", "hello"],
+    ["trims trailing whitespace and preserves indentation", "  hello  ", "  hello"],
+    ["still trims native slash commands", "  /side explain this  ", "/side explain this"],
     // \n and \t must survive — multi-line prompts depend on it.
     ["preserves newlines and tabs", "line1\n\tline2", "line1\n\tline2"],
     // C0/C1 controls (bell \x07, NUL \x00, DEL \x7f) corrupt tmux
@@ -2311,56 +4018,5 @@ describe("sanitizeInitialPrompt", () => {
     ["returns empty for empty input", "", ""],
   ])("%s", (_label, input, expected) => {
     expect(sanitizeInitialPrompt(input)).toBe(expected);
-  });
-});
-
-describe("create-session input on touch-primary devices", () => {
-  it("Enter inserts a newline instead of submitting when the pointer is coarse", async () => {
-    // Phones have no practical Shift+Enter, so an Enter-submit in the
-    // create-session composer was an unrecoverable accidental send. On
-    // coarse-pointer devices the composer must let Enter fall through to the
-    // textarea's native newline; sending stays an explicit tap.
-    const matchMediaSpy = vi.spyOn(window, "matchMedia").mockImplementation((query: string) =>
-      query.includes("pointer: coarse")
-        ? ({
-            matches: true,
-            media: query,
-            onchange: null,
-            addListener: () => {},
-            removeListener: () => {},
-            addEventListener: () => {},
-            removeEventListener: () => {},
-            dispatchEvent: () => false,
-          } as MediaQueryList)
-        : ({
-            matches: false,
-            media: query,
-            onchange: null,
-            addListener: () => {},
-            removeListener: () => {},
-            addEventListener: () => {},
-            removeEventListener: () => {},
-            dispatchEvent: () => false,
-          } as MediaQueryList),
-    );
-
-    try {
-      renderLanding();
-      await waitForWorkspaceSeed();
-      const input = screen.getByTestId("new-chat-landing-input");
-      fireEvent.change(input, { target: { value: "first line of a long prompt" } });
-
-      fireEvent.keyDown(input, { key: "Enter" });
-
-      // No session was created and no navigation happened: Enter was not
-      // intercepted, so the composer still holds the user's draft.
-      expect(authenticatedFetch).not.toHaveBeenCalled();
-      expect(navigateMock).not.toHaveBeenCalled();
-
-      fireEvent.focus(screen.getByTestId("new-chat-landing-submit"));
-      expect(screen.queryByRole("tooltip")).toBeNull();
-    } finally {
-      matchMediaSpy.mockRestore();
-    }
   });
 });

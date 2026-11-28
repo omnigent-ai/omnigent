@@ -71,7 +71,7 @@ def checked_labels(section_raw: str, expected_labels: tuple[str, ...]) -> set[st
 # author may hard-wrap it — we take the first line). The category/tag is NOT
 # written here; it is derived from the "Type of change" checkboxes via TYPE_TAGS.
 # The section is optional: an author deletes it (or leaves the `<…>` placeholder)
-# when the change isn't noteworthy, and the PR is then omitted from the changelog.
+# when the change isn't noteworthy; the changelog then uses the PR title.
 # The same parser backs the PR gate (validate.py) and the harvester (generate.py).
 
 # "Type of change" checkbox label -> bracket tag rendered in CHANGELOG.md.

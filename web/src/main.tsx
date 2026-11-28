@@ -1,31 +1,37 @@
 import { appConfig } from "./appConfig";
 import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
+import { PageLoading } from "./components/PageLoading";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
+import { prefetchSessionHostChain } from "./hooks/useSession";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { getBasePath, withBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
-import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
+import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
+import { applyDesktopAppAttribute } from "./lib/desktopAppLayout";
+import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
+import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
-  applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
-  readUiFontSizePx,
 } from "./lib/uiFontPreferences";
+import { migrateLegacyProjectFolderPagination } from "./lib/projectFolderPaginationPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -46,7 +52,7 @@ initBrowserTelemetry();
 // `refetchOnWindowFocus: true` on that specific `useQuery`.
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { staleTime: 30_000, refetchOnWindowFocus: false },
+    queries: APP_QUERY_DEFAULTS,
   },
 });
 
@@ -54,6 +60,13 @@ const queryClient = new QueryClient({
 // invalidate cached queries (e.g. the conversations list when a new
 // conversation is created server-side).
 initChatStore(queryClient);
+
+// Let a host-scoped request resolve its session's routing host on demand,
+// walking a hostless sub-agent child up to its host-bound ancestor (a cold
+// /c/<child> open) before the request is keyed.
+setSessionHostResolver((sessionId, options) =>
+  prefetchSessionHostChain(queryClient, sessionId, options),
+);
 
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
@@ -73,14 +86,21 @@ const bootIdentity = resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
+// Scope the macOS frameless-window CSS from <html> before first paint.
+applyMacElectronShellAttribute();
+// Keep the desktop layout in the desktop app, whatever its window width.
+applyDesktopAppAttribute();
+applyMobileAppTargetAttribute();
+
 // The Chat/Terminal switcher lives in the header (ViewModeToggle) on every
 // shell; assert the iOS shell's legacy bottom pill hidden before the router
 // mounts, so stale shell state (a page served before the pill's retirement)
 // can never float it — on any route, chat or auth. No-op off the iOS shell.
 hideNativeChatTerminalBar();
 
-// Apply the saved desktop UI font size and family before first paint so there's no flash.
-applyDesktopUiFontSize(readUiFontSizePx());
+// Apply saved font preferences before first paint. Without a saved size, CSS
+// keeps its viewport-specific default.
+applyStoredUiFontSize();
 applyUiFontFamily(readUiFontFamily());
 
 // The standalone sidebar font size control was removed. Clear its legacy value
@@ -92,6 +112,7 @@ if (typeof window !== "undefined") {
     // localStorage access errors are non-fatal.
   }
 }
+migrateLegacyProjectFolderPagination();
 
 // Apply the saved color palette (data-theme on <html>) before first paint too,
 // so the app renders in the chosen theme rather than flashing the brand default.
@@ -174,9 +195,9 @@ root.render(
 );
 
 // `/v1/me` came back 401 with a login page and we're already on our way
-// there. Unmount to stop the shell's queries firing against an invalid
+// there. Replace the shell to stop its queries firing against an invalid
 // session mid-redirect. Header mode never lands here (no login page), so
 // a proxy-less deploy is unaffected.
 void bootIdentityGate.then(() => {
-  if (isLoginRedirectPending()) root.unmount();
+  if (isLoginRedirectPending()) root.render(<PageLoading label="Opening sign-in…" />);
 });

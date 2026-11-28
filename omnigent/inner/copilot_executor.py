@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.util.reasoning_effort import COPILOT_EFFORTS, validate_effort
 
 from .datamodel import OSEnvSpec
@@ -85,6 +86,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
 )
+from .sandbox import reject_unsupported_harness_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -245,15 +247,18 @@ def _build_copilot_prompt(messages: list[Message], *, is_first_turn: bool) -> st
 def _encode_tool_result(result: object) -> object:
     """Encode a bridged-tool result as a :class:`copilot.ToolResult`.
 
-    A dict carrying a truthy ``error`` or ``blocked`` is a dispatch failure or a
-    policy block (the shapes ``_bridge_one_dispatch`` / the policy layer return):
-    surface it as a ``failure`` result so the Copilot model sees the failure —
-    parity with the claude-sdk / cursor handlers. Everything else is a success:
-    a ``str`` is passed through; anything else is JSON-encoded.
+    Top-level dispatch failures, policy blocks, and errored image envelopes
+    surface as failures. Payloads remain text-only: strings pass through and
+    other values are JSON-encoded, preserving the complete tool evidence.
     """
     from copilot import ToolResult  # lazy: optional dependency
 
-    if isinstance(result, dict) and (result.get("error") or result.get("blocked")):
+    image_result = decode_mcp_image_result(result)
+    if isinstance(result, dict) and (
+        result.get("error")
+        or result.get("blocked")
+        or (image_result is not None and image_result.is_error)
+    ):
         text = json.dumps(result, default=str)
         return ToolResult(text_result_for_llm=text, result_type="failure", error=text)
     if isinstance(result, str):
@@ -333,6 +338,7 @@ class CopilotExecutor(Executor):
         :param skills_filter: Accepted for parity; copilot has no skill
             mechanism wired here.
         """
+        reject_unsupported_harness_sandbox(os_env, "Copilot")
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
         self._model_override = model

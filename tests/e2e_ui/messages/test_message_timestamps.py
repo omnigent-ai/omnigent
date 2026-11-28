@@ -1,14 +1,14 @@
 """E2E: hover-revealed timestamps on chat message bubbles.
 
 Chat bubbles show their send/receive time next to the Copy/Fork controls.
-Earlier rows reveal on hover; the final message row stays partially visible.
+Earlier rows reveal on hover; the final message row stays fully visible.
 This drives the full browser → SPA → server stack: send a message, wait for
 the mock-LLM reply, and assert for both the user and the assistant bubble that
 
-  - the timestamp rides inside the existing 24px action row (no new row),
+  - the timestamp shares the compact action row (no new row),
   - it matches a locale time format (``h:MM AM`` style),
   - the earlier user row is transparent at rest, while the final assistant
-    row rests at 40% opacity; both reach full opacity on hover,
+    row rests at full opacity,
   - the ordering matches the design target (user: timestamp → Copy at the
     right edge; assistant: Copy/Fork → timestamp at the left edge),
   - the stamp survives a full page reload (server-stamped path, not a
@@ -19,8 +19,8 @@ the mock-LLM reply, and assert for both the user and the assistant bubble that
 Selectors:
   - bubbles: ``data-testid="message-bubble"`` + ``data-role="user|assistant"``
   - timestamp: ``data-testid="message-timestamp"`` inside the action row
-  - action row: the timestamp's parent div (``opacity-0``/``opacity-40`` base
-    with ``md:group-hover:opacity-100`` reveal)
+  - action row: the timestamp's parent div (hover-revealed on earlier rows;
+    ``opacity-100`` on the final assistant row)
 """
 
 from __future__ import annotations
@@ -109,8 +109,9 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     # At rest on a desktop viewport the row is fully transparent — the
     # timestamp must not permanently occupy visual space.
     expect(user_row).to_have_css("opacity", "0")
-    # The row exists at the design's 24px height even while hidden.
-    assert round(user_row.bounding_box()["height"]) == 24
+    # The compact user footer, which also holds the always-visible steering
+    # note, reserves its 20px height while the actions are hidden.
+    assert round(user_row.locator("..").bounding_box()["height"]) == 20
 
     user_bubble.hover()
     expect(user_row).to_have_css("opacity", "1")
@@ -128,10 +129,10 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     expect(assistant_ts).to_have_text(_TIME_RE)
     assistant_row = _action_row(assistant_ts)
 
-    # The assistant response is the final message, so its actions remain
-    # partially visible without hover.
-    expect(assistant_row).to_have_css("opacity", "0.4")
-    assert round(assistant_row.bounding_box()["height"]) == 24
+    # The assistant response is the final message, so its actions use their
+    # fully visible hover color at rest.
+    expect(assistant_row).to_have_css("opacity", "1")
+    assert round(assistant_row.bounding_box()["height"]) == 16
 
     assistant_bubble.hover()
     expect(assistant_row).to_have_css("opacity", "1")
@@ -249,12 +250,7 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Below the md breakpoint the action row rests at 40% opacity.
-
-    Touch devices have no hover; a permanently invisible row would hide the
-    Copy action and the timestamp entirely. A failure means the
-    ``opacity-40`` touch fallback regressed.
-    """
+    """Taps toggle user actions; the latest assistant keeps its timestamp visible."""
     base_url, session_id = seeded_session
     _seed_assistant_text(base_url, session_id, "Touch probe assistant reply.")
     ctx = browser.new_context(viewport={"width": 375, "height": 812}, has_touch=True)
@@ -264,7 +260,7 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
 
         # The seeded reply is already on screen; the composer send still
         # exercises the real touch UI path for the user bubble.
-        assistant_bubble = page.locator(_ASSISTANT_BUBBLE).first
+        assistant_bubble = page.locator(_ASSISTANT_BUBBLE).last
         expect(assistant_bubble).to_be_visible(timeout=30_000)
 
         _send(page, "Touch timestamp probe: say anything.")
@@ -275,12 +271,16 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
         expect(user_ts).to_have_count(1)
         expect(user_ts).to_have_text(_TIME_RE)
 
-        # No hover performed: the row must still be partially visible.
-        assert _opacity(_action_row(user_ts)) == "0.4"
+        user_row = _action_row(user_ts)
+        expect(user_row).to_have_css("opacity", "0")
+        user_bubble.tap()
+        expect(user_row).to_have_css("opacity", "1")
+        user_bubble.tap()
+        expect(user_row).to_have_css("opacity", "0")
 
         assistant_ts = assistant_bubble.locator(_TIMESTAMP)
         expect(assistant_ts).to_have_count(1)
         expect(assistant_ts).to_have_text(_TIME_RE)
-        assert _opacity(_action_row(assistant_ts)) == "0.4"
+        expect(_action_row(assistant_ts)).to_have_css("opacity", "1")
     finally:
         ctx.close()

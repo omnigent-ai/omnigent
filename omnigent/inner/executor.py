@@ -15,6 +15,8 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
 # ---------------------------------------------------------------------------
@@ -117,6 +119,16 @@ class ExecutorEvent:
 
 
 @dataclass
+class ExecutorWait(ExecutorEvent):
+    """A checked external prerequisite is still pending before input delivery.
+
+    Yield after each successful prerequisite check to refresh only the idle
+    watchdog. This is neither model progress nor user-visible output, and must
+    not extend the absolute turn limit or acknowledge delivery.
+    """
+
+
+@dataclass
 class TextChunk(ExecutorEvent):
     """Streaming text output.
 
@@ -164,6 +176,19 @@ class ToolCallRequest(ExecutorEvent):
     metadata: ToolCallMetadata = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class NativeTurnAcceptance:
+    """Native RPC acceptance, scoped to the real session and thread.
+
+    ``response_id`` uses the native status identity, independently of the
+    generic harness request's response ID.
+    """
+
+    session_id: str
+    thread_id: str
+    response_id: str
+
+
 @dataclass
 class TurnComplete(ExecutorEvent):
     """The LLM has finished its turn with a final text response.
@@ -191,6 +216,7 @@ class TurnComplete(ExecutorEvent):
     modified_by_policy: bool = False
     continue_turn: bool = False
     usage: ExecutorUsage | None = None
+    native_acceptance: NativeTurnAcceptance | None = None
 
 
 class ToolCallStatus(str, enum.Enum):
@@ -320,10 +346,17 @@ class SubAgentToolCall(ExecutorEvent):
 
 @dataclass
 class TurnCancelled(ExecutorEvent):
-    """The current assistant turn was cancelled before completion."""
+    """The current assistant turn was cancelled before completion.
+
+    :param usage: Token usage of the model calls the turn made before it was
+        cancelled, or ``None`` when nothing was observed. Same shape as
+        :attr:`TurnComplete.usage`. The calls were spent, so the session's
+        cost counts them.
+    """
 
     reason: str = "user_cancelled"
     phase: str = "model"
+    usage: ExecutorUsage | None = None
 
 
 @dataclass
@@ -341,20 +374,35 @@ class ExecutorError(ExecutorEvent):
         :class:`RetryableLLMError` and :class:`PermanentLLMError`.
     :param usage: Token usage the executor observed before the turn
         failed, or ``None`` when nothing was observed. Same shape as
-        :attr:`TurnComplete.usage`. ``context_tokens`` (window fill) is
-        the meaningful field here: a turn that dies after the model
-        call started has already reported its prompt size, and
-        discarding it freezes the context-occupancy meter at the
-        previous turn's value exactly when the session is in trouble.
-    :param preserve_session: The executor is idle and safe to reuse after this
-        failure. Set only when no prompt or tool work remains in progress.
-        Defaults to ``False`` so failed turns receive normal teardown.
+        :attr:`TurnComplete.usage`. The session's cost counts it, and
+        ``context_tokens`` (window fill) keeps the context-occupancy meter
+        from freezing at the previous turn's value when a turn dies after
+        the model call started.
+    :param preserve_session: The executor released its per-call resources and is
+        safe to reuse without teardown. Native submission bridges may preserve
+        independently running work after a lost reply. Defaults to ``False``.
+    :param code: Semantic failure code the turn error should carry, e.g.
+        ``"databricks_sign_in_pending"``. ``None`` lets the harness adapter
+        fall back to its generic classification of the failure.
+    :param title: Short headline for the error card, e.g. ``"Codex is waiting
+        for a sign-in"``, or ``None``.
+    :param remediation: Concrete next step for the user, e.g. the sign-in link
+        and code, or ``None``.
+    :param undelivered: ``True`` when the failure happened before the harness
+        received the message (a launcher sign-in prompt, a missing bridge, a
+        prompt that never rendered), so the message never reached the
+        transcript and its sender's queued copy is the only record of it.
+        ``False`` (default) once the harness may have accepted it.
     """
 
     message: str
     retryable: bool = False
     usage: ExecutorUsage | None = None
     preserve_session: bool = False
+    code: str | None = None
+    title: str | None = None
+    remediation: str | None = None
+    undelivered: bool = False
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:
@@ -451,6 +499,48 @@ class MessageSplit:
     transient: list[Message]
 
 
+def without_tool_history(messages: list[Message]) -> list[Message]:
+    """Drop ``tool_call`` / ``tool_result`` items, which only a fresh-session replay uses."""
+    return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
+
+
+# The user message the runner appends to history after an interrupted turn.
+INTERRUPTION_MARKER_TEXT = (
+    "[System: interrupted]\n"
+    "The user interrupted and abandoned their previous request (the user "
+    "message immediately before this one). Do not resume or act on that "
+    "interrupted request unless the user asks for it again; treat the next "
+    "user message as the current instruction. The preceding assistant "
+    "message may be incomplete."
+)
+
+
+def is_interruption_marker(message: Message) -> bool:
+    """Whether *message* is the runner's :data:`INTERRUPTION_MARKER_TEXT` message."""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict):
+        content = content[0].get("text")
+    return content == INTERRUPTION_MARKER_TEXT
+
+
+def pending_interruption_marker(messages: list[Message]) -> str | None:
+    """Return the interruption marker when a trailing user message before the latest is one.
+
+    A native session kept across an interrupt has not received the marker, so a
+    resumed turn must send it ahead of the latest user input.
+    """
+    if not messages or messages[-1].get("role") != "user":
+        return None
+    for message in reversed(messages[:-1]):
+        if message.get("role") != "user":
+            return None
+        if is_interruption_marker(message):
+            return INTERRUPTION_MARKER_TEXT
+    return None
+
+
 def split_transient_tail(
     messages: list[Message],
 ) -> MessageSplit:
@@ -544,6 +634,17 @@ def classify_tool_result(
                 status=ToolCallStatus.BLOCKED,
                 error=str(result.get("reason", "BLOCKED")),
             )
+        image_result = decode_mcp_image_result(result)
+        if image_result is not None:
+            if not image_result.is_error:
+                return ToolResultClassification(status=ToolCallStatus.SUCCESS, error="")
+            text = "\n".join(
+                str(block["text"]) for block in image_result.content if block["type"] == "text"
+            )
+            return ToolResultClassification(
+                status=ToolCallStatus.ERROR,
+                error=text or "MCP tool returned an error",
+            )
         for key in ("content", "result", "output", "text"):
             if key in result:
                 nested = classify_tool_result(
@@ -612,6 +713,43 @@ def classify_tool_result(
 # ---------------------------------------------------------------------------
 
 
+class InjectionDeliveryAmbiguous(Exception):
+    """A live message may already have reached the harness, so it must not be resent.
+
+    :meth:`Executor.enqueue_session_message` raises this when the harness's reply
+    to a submission it may have accepted was lost.
+    """
+
+
+@dataclass(frozen=True)
+class LiveMcpServerStatus:
+    """One MCP server's connection as a running harness reports it.
+
+    :param name: The harness's name for the server, e.g. ``"plugin:notes:notes"``.
+    :param status: ``"connected"``, ``"failed"``, ``"needs-auth"``, ``"pending"``
+        or ``"disabled"``.
+    :param error: Why the server failed, when the harness says.
+    :param scope: Where the server is configured, e.g. ``"user"`` or ``"managed"``.
+    """
+
+    name: str
+    status: str
+    error: str | None = None
+    scope: str | None = None
+
+
+class LiveMcpServerUnknown(LookupError):
+    """The running harness reports no MCP server with the requested name."""
+
+
+class LiveMcpHarnessNotRunning(RuntimeError):
+    """The session has no running harness to ask about its MCP servers."""
+
+
+class LiveMcpReconnectRefused(RuntimeError):
+    """The harness answered a reconnect with its own reason; the message is safe to show."""
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -651,6 +789,14 @@ class Executor:
         """
         return False
 
+    def replays_tool_history(self) -> bool:
+        """Whether history handed to this executor keeps recorded tool calls and outputs.
+
+        Off by default: an executor that renders history as prompt text would
+        inline every tool output on each fresh session.
+        """
+        return False
+
     def max_context_tokens(self) -> int | None:
         return None
 
@@ -667,12 +813,52 @@ class Executor:
         """Ask the executor to interrupt a currently running turn, if supported."""
         return False
 
+    def resumes_after_interrupt(self) -> bool:
+        """Whether ``interrupt_session()`` keeps the native session for the next turn.
+
+        The interrupted ``run_turn`` keeps yielding until the harness ends that turn,
+        and the next turn sends the runner's interruption marker with its input.
+        """
+        return False
+
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
-        """Send a new user message to a live session without interrupting it, if supported."""
+        """Send a new user message to a live session without interrupting it, if supported.
+
+        :raises InjectionDeliveryAmbiguous: The harness may have accepted the message.
+        """
         return False
 
     def supports_live_message_queue(self) -> bool:
         """Whether ``enqueue_session_message()`` is expected to work during a running turn."""
+        return False
+
+    def supports_live_mcp_control(self) -> bool:
+        """Whether ``live_mcp_statuses()`` and ``reconnect_live_mcp_server()`` are implemented."""
+        return False
+
+    async def live_mcp_statuses(self, session_key: str) -> list[LiveMcpServerStatus] | None:
+        """Return the session's MCP connections, or ``None`` when its harness is not running.
+
+        :raises TimeoutError: The harness did not answer in time.
+        """
+        raise NotImplementedError
+
+    async def reconnect_live_mcp_server(self, session_key: str, name: str) -> None:
+        """Ask the session's running harness to reconnect one MCP server.
+
+        :raises LiveMcpHarnessNotRunning: The harness is not running.
+        :raises LiveMcpServerUnknown: The harness reports no server named *name*.
+        :raises LiveMcpReconnectRefused: The harness tried and gave its reason.
+        :raises TimeoutError: The harness did not answer in time.
+        """
+        raise NotImplementedError
+
+    def preserves_message_content_blocks(self) -> bool:
+        """Whether fresh and queued input must retain original content block boundaries."""
+        return False
+
+    def preserves_empty_initiating_message(self) -> bool:
+        """Whether an empty final user message must survive history filtering."""
         return False
 
     def supports_tool_boundary_interrupt(self) -> bool:
@@ -682,6 +868,10 @@ class Executor:
     def supports_stepwise_internal_turns(self) -> bool:
         """Whether the executor can pause and resume its own agent loop between turns."""
         return False
+
+    def close_timeout(self) -> float:
+        """Budget in seconds for background resource cleanup."""
+        return 3.0
 
     async def close(self) -> None:
         """Release executor-wide resources.

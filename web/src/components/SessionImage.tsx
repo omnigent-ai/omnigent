@@ -15,6 +15,8 @@ export interface SessionImageProps {
   path?: string;
   alt: string;
   className?: string;
+  /** Compact square preview used by user message attachments. */
+  variant?: "preview" | "userAttachment";
 }
 
 // Size the box to the image so short screenshots don't leave empty rows.
@@ -26,11 +28,51 @@ const PREVIEW_IMAGE = "max-h-64 max-w-full";
 /** Placeholder width, so the box holds a slot on the row before its image lands. */
 const PREVIEW_PLACEHOLDER_BOX = "flex h-64 w-40 shrink-0 items-center justify-center";
 
-/**
- * Fallback for an image that can't be shown: a compact labelled chip, so an
- * unusable attachment costs a line rather than a tall box of broken glyph.
- */
-function UnavailableImage({ alt, className }: { alt: string; className?: string }) {
+const USER_ATTACHMENT_BOX =
+  "flex size-20 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-background ring-1 ring-inset ring-border/60";
+const USER_ATTACHMENT_IMAGE = "max-h-20 max-w-20 object-contain";
+const USER_ATTACHMENT_BUTTON = "size-20 items-center justify-center";
+
+/** Fixed-size slot for an uploading or unavailable user attachment. */
+export function ImageAttachmentPlaceholder({
+  label,
+  pending = false,
+  className,
+}: {
+  label: string;
+  pending?: boolean;
+  className?: string;
+}) {
+  return (
+    <div
+      role={pending ? "status" : "img"}
+      aria-label={pending ? `Uploading image: ${label}` : label}
+      className={cn(
+        USER_ATTACHMENT_BOX,
+        "flex-col gap-1 p-1 text-xs text-muted-foreground",
+        className,
+      )}
+    >
+      {pending ? (
+        <Spinner aria-hidden="true" />
+      ) : (
+        <ImageIcon className="size-3.5 shrink-0" aria-hidden="true" />
+      )}
+      <span className="w-full truncate text-center">{label}</span>
+    </div>
+  );
+}
+
+/** Label a failed image without leaving a broken image control. */
+function UnavailableImage({
+  alt,
+  className,
+  variant = "preview",
+}: Pick<SessionImageProps, "alt" | "className" | "variant">) {
+  if (variant === "userAttachment") {
+    return <ImageAttachmentPlaceholder label={alt} className={className} />;
+  }
+
   return (
     <div
       role="img"
@@ -40,7 +82,7 @@ function UnavailableImage({ alt, className }: { alt: string; className?: string 
         className,
       )}
     >
-      <ImageIcon className="size-3.5 shrink-0" />
+      <ImageIcon className="size-3.5 shrink-0" aria-hidden="true" />
       <span className="truncate">{alt}</span>
     </div>
   );
@@ -56,14 +98,22 @@ function UnavailableImage({ alt, className }: { alt: string; className?: string 
  * bytes through the host fetcher — which handles both — and render an object
  * URL, with explicit loading and error states.
  */
-export function SessionImage({ path, alt, className }: SessionImageProps) {
+export function SessionImage({ path, alt, className, variant }: SessionImageProps) {
   // Host config is installed once at embed startup and never changes, so it's
   // safe to branch on it before any hooks. Hooks live in the embedded child.
   if (!getOmnigentHostConfig().fetcher) {
     // Share sizing and error handling with transcript-carried images.
-    return <InlineImage src={path ? withBasePath(path) : path} alt={alt} className={className} />;
+    return (
+      <InlineImage
+        src={path ? withBasePath(path) : path}
+        alt={alt}
+        className={className}
+        variant={variant}
+        downloadPath={path}
+      />
+    );
   }
-  return <EmbeddedSessionImage path={path} alt={alt} className={className} />;
+  return <EmbeddedSessionImage path={path} alt={alt} className={className} variant={variant} />;
 }
 
 /**
@@ -77,10 +127,15 @@ export function InlineImage({
   src,
   alt,
   className,
+  variant = "preview",
+  downloadPath,
 }: {
   src?: string;
   alt: string;
   className?: string;
+  variant?: SessionImageProps["variant"];
+  /** App API path `src` loads, for saving a source the page holds no bytes for. */
+  downloadPath?: string;
 }) {
   // Tracked by source rather than as a bare flag, so a later block swapping in a
   // different `src` on the same slot retries instead of staying stuck failed.
@@ -89,15 +144,33 @@ export function InlineImage({
   // A truncated or corrupt `data:` URI decodes to nothing; showing the chip
   // keeps it off the lightbox.
   if (src !== undefined && failedSrc === src) {
-    return <UnavailableImage alt={alt} className={className} />;
+    return <UnavailableImage alt={alt} className={className} variant={variant} />;
+  }
+
+  if (variant === "userAttachment" && !src) {
+    return (
+      <div
+        role="status"
+        aria-label={`Loading image: ${alt}`}
+        className={cn(USER_ATTACHMENT_BOX, "text-muted-foreground", className)}
+      >
+        <Spinner aria-hidden="true" />
+      </div>
+    );
   }
 
   return (
-    <div className={PREVIEW_BOX}>
+    <div className={variant === "userAttachment" ? USER_ATTACHMENT_BOX : PREVIEW_BOX}>
       <ZoomableImage
         src={src}
         alt={alt}
-        className={cn(PREVIEW_IMAGE, className)}
+        className={cn(
+          variant === "userAttachment" ? USER_ATTACHMENT_IMAGE : PREVIEW_IMAGE,
+          className,
+        )}
+        buttonClassName={variant === "userAttachment" ? USER_ATTACHMENT_BUTTON : undefined}
+        downloadName={alt}
+        downloadPath={downloadPath}
         // Offscreen history images cost nothing until scrolled to, and decoding
         // off the main thread keeps the swap from blocking paint.
         loading="lazy"
@@ -125,23 +198,30 @@ type LoadState = "loading" | "loaded" | "error";
  * created them, so nothing else would ever release them.
  */
 const MAX_CACHED_IMAGES = 32;
-const blobUrlCache = new Map<string, string>();
+
+/** The bytes ride along so a download still works after eviction revokes the URL. */
+interface CachedImage {
+  url: string;
+  blob: Blob;
+}
+
+const blobUrlCache = new Map<string, CachedImage>();
 
 /** In-flight fetches, so concurrent mounts of one path share a single download. */
-const inFlight = new Map<string, Promise<string>>();
+const inFlight = new Map<string, Promise<CachedImage>>();
 
-function cacheBlobUrl(path: string, url: string): void {
-  blobUrlCache.set(path, url);
+function cacheBlobUrl(path: string, image: CachedImage): void {
+  blobUrlCache.set(path, image);
   while (blobUrlCache.size > MAX_CACHED_IMAGES) {
     const oldest = blobUrlCache.keys().next();
     if (oldest.done) break;
     const evicted = blobUrlCache.get(oldest.value);
     blobUrlCache.delete(oldest.value);
-    if (evicted) URL.revokeObjectURL(evicted);
+    if (evicted) URL.revokeObjectURL(evicted.url);
   }
 }
 
-function loadBlobUrl(path: string): Promise<string> {
+function loadBlobUrl(path: string): Promise<CachedImage> {
   const cached = blobUrlCache.get(path);
   if (cached) {
     // Re-insert to mark it most-recently-used.
@@ -159,9 +239,9 @@ function loadBlobUrl(path: string): Promise<string> {
   const request = authenticatedFetch(path)
     .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(`HTTP ${res.status}`))))
     .then((blob) => {
-      const url = URL.createObjectURL(blob);
-      cacheBlobUrl(path, url);
-      return url;
+      const image = { url: URL.createObjectURL(blob), blob };
+      cacheBlobUrl(path, image);
+      return image;
     })
     .finally(() => {
       inFlight.delete(path);
@@ -170,10 +250,10 @@ function loadBlobUrl(path: string): Promise<string> {
   return request;
 }
 
-function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
+function EmbeddedSessionImage({ path, alt, className, variant = "preview" }: SessionImageProps) {
   // Seed from cache so a revisited image paints on the first frame instead of
   // flashing the placeholder.
-  const [blobUrl, setBlobUrl] = useState<string | null>(() =>
+  const [image, setImage] = useState<CachedImage | null>(() =>
     path ? (blobUrlCache.get(path) ?? null) : null,
   );
   const [state, setState] = useState<LoadState>(() =>
@@ -187,17 +267,17 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
     }
     const cached = blobUrlCache.get(path);
     if (cached) {
-      setBlobUrl(cached);
+      setImage(cached);
       setState("loaded");
       return;
     }
     setState("loading");
-    setBlobUrl(null);
+    setImage(null);
     let cancelled = false;
     loadBlobUrl(path)
-      .then((url) => {
+      .then((loaded) => {
         if (cancelled) return;
-        setBlobUrl(url);
+        setImage(loaded);
         setState("loaded");
       })
       .catch(() => {
@@ -209,31 +289,39 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
   }, [path]);
 
   if (state === "error") {
-    return <UnavailableImage alt={alt} className={className} />;
+    return <UnavailableImage alt={alt} className={className} variant={variant} />;
   }
 
-  if (state === "loading" || !blobUrl) {
+  if (state === "loading" || !image) {
     return (
       <div
         role="status"
-        aria-label="Loading image"
+        aria-label={variant === "userAttachment" ? `Loading image: ${alt}` : "Loading image"}
         className={cn(
-          PREVIEW_PLACEHOLDER_BOX,
-          "rounded-md border border-border bg-muted text-muted-foreground",
+          variant === "userAttachment"
+            ? USER_ATTACHMENT_BOX
+            : `${PREVIEW_PLACEHOLDER_BOX} rounded-md border border-border bg-muted`,
+          "text-muted-foreground",
           className,
         )}
       >
-        <Spinner />
+        <Spinner aria-hidden="true" />
       </div>
     );
   }
 
   return (
-    <div className={PREVIEW_BOX}>
+    <div className={variant === "userAttachment" ? USER_ATTACHMENT_BOX : PREVIEW_BOX}>
       <ZoomableImage
-        src={blobUrl}
+        src={image.url}
         alt={alt}
-        className={cn(PREVIEW_IMAGE, className)}
+        className={cn(
+          variant === "userAttachment" ? USER_ATTACHMENT_IMAGE : PREVIEW_IMAGE,
+          className,
+        )}
+        buttonClassName={variant === "userAttachment" ? USER_ATTACHMENT_BUTTON : undefined}
+        downloadName={alt}
+        downloadBlob={image.blob}
         decoding="async"
       />
     </div>

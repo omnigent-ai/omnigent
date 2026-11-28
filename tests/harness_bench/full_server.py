@@ -50,10 +50,10 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 _HEALTH_TIMEOUT_S = 45.0
 _POLL_INTERVAL_S = 0.2
 
-# The builtin the tool/policy probes drive: read-only, zero setup, server-
+# The system tool the tool/policy probes drive: read-only, zero setup, server-
 # dispatched, and gated at the tool_call phase. Its denial output carries
 # _DENY_REASON so a blocked call is unambiguous.
-_TOOL_NAME = "list_files"
+_TOOL_NAME = "sys_files_list"
 _DENY_REASON = "bench-policy-deny"
 
 
@@ -167,10 +167,10 @@ def _build_bench_agent_config(
         "name": name,
         "prompt": "You are a helpful assistant used for capability testing.",
         "executor": executor,
-        # A read-only builtin the server dispatches (and gates at the tool_call
-        # phase). The tool/policy probes drive a call to it; harmless for basic
-        # turns (the model just won't call it).
-        "tools": {"builtins": [_TOOL_NAME]},
+        # The tool/policy probes drive a call to _TOOL_NAME, which only an agent
+        # that turns the files group on gets; harmless for basic turns (the
+        # model just won't call it).
+        "tool_groups": {"files": True},
     }
     if policy_action:
         config["guardrails"] = {
@@ -283,7 +283,9 @@ class SharedFullServer:
     def create_session(self, agent_name: str) -> str:
         """Create a runner-bound session for a registered agent name."""
         assert self.client is not None
-        listing = self.client.get("/v1/sessions", params={"agent_name": agent_name, "limit": 1})
+        listing = self.client.get(
+            "/v1/sessions", params={"visibility": "all", "agent_name": agent_name, "limit": 1}
+        )
         listing.raise_for_status()
         agent_id = str(listing.json()["data"][0]["agent_id"])
         created = self.client.post("/v1/sessions", json={"agent_id": agent_id})

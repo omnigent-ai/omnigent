@@ -47,6 +47,7 @@ vi.mock("@/store/chatStore", () => ({
     selector({ sessionStatus: h.sessionStatus }),
 }));
 
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { executionLogTabKey } from "@/hooks/useChildSessions";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 
@@ -106,6 +107,8 @@ describe("ExecutionLogsPanel open/close gating", () => {
     renderPanel({ open: true });
     const panel = screen.getByTestId("execution-logs-panel");
     expect(panel).toHaveAttribute("data-state", "open");
+    expect(panel).toHaveClass("shadow-lg");
+    expect(panel).not.toHaveClass("shadow-none");
     expect(screen.getByText("main")).toBeInTheDocument();
   });
 
@@ -113,7 +116,10 @@ describe("ExecutionLogsPanel open/close gating", () => {
     // WHY: when closed the panel collapses (data-state=closed) and skips the
     // dropdown/items entirely — the `!open || !activeEntry` branch.
     renderPanel({ open: false, initialKey: null });
-    expect(screen.getByTestId("execution-logs-panel")).toHaveAttribute("data-state", "closed");
+    const panel = screen.getByTestId("execution-logs-panel");
+    expect(panel).toHaveAttribute("data-state", "closed");
+    expect(panel).toHaveClass("shadow-none");
+    expect(panel).not.toHaveClass("shadow-lg");
     expect(screen.queryByText("No items")).toBeNull();
   });
 
@@ -123,6 +129,46 @@ describe("ExecutionLogsPanel open/close gating", () => {
     const { onClose } = renderPanel({ open: true });
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes on Escape from the page without declining a pending question", () => {
+    const onReject = vi.fn();
+    render(
+      <AskUserQuestionForm
+        elicitationId="elic_logs"
+        questions={[
+          { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+        ]}
+        onSubmit={vi.fn()}
+        onReject={onReject}
+        keyboardActive
+      />,
+    );
+    const { onClose } = renderPanel({ open: true });
+    fireEvent.click(screen.getByText("No items"));
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    // Also with focus in the question's own text field.
+    const custom = screen.getByTestId("ask-user-question-custom-input");
+    custom.focus();
+    fireEvent.keyDown(custom, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(2);
+    expect(onReject).not.toHaveBeenCalled();
+  });
+
+  it("marks itself as closing on Escape only while open", () => {
+    // Page-wide Escape shortcuts (declining an approval) leave keys inside it alone.
+    const { rerender } = renderPanel({ open: true });
+    expect(screen.getByTestId("execution-logs-panel")).toHaveAttribute("data-escape-owner");
+    rerender(
+      <ExecutionLogsPanel
+        open={false}
+        conversationId="conv_main"
+        initialKey={executionLogTabKey("main")}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("execution-logs-panel")).not.toHaveAttribute("data-escape-owner");
   });
 
   it("fires onClose when the header close button is clicked", () => {

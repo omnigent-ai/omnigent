@@ -30,6 +30,13 @@ backend — no real provider creds.
   isolated `userData` dir. `launchDesktop({ serverUrl })` pre-seeds a saved
   server so the app boots straight into the shell (skip connect); omit it to
   film the connect journey.
+- `desktop_oidc_browser_sign_in.e2e.js` — OIDC sign-in through the system
+  browser against an OIDC-mode server and `fixtures/fakeOidcIdp.js`. The
+  "system browser" is `fixtures/fakeSystemBrowser.cjs`, preloaded before
+  `main.js` (`launchDesktop({ preload })`), which replaces `shell.openExternal`
+  with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
+  connect, silent renewal, relaunch, and sign-out, and asserts the app window
+  never loads the IdP.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.
@@ -69,7 +76,11 @@ right interpreter with `OMNIGENT_PYTHON` when your `omnigent` lives in a venv:
 OMNIGENT_PYTHON=/path/to/.venv/bin/python node --test e2e/desktop_connect.e2e.js
 ```
 
-The recorded video lands in `e2e/recordings/<slug>/`. Playwright writes one raw
+The recorded video normally lands in `e2e/recordings/<slug>/`.
+The cookie-isolation test instead uses `OMNIGENT_DESKTOP_RECORD_DIR`, or prints
+the temporary directory where it retains recordings when that variable is unset.
+
+Playwright writes one raw
 `page@<hash>.webm` per page context — the main shell window, plus any OAuth
 popup or in-window IdP view, which record separately. Call
 `saveRecording(recordDir, "<name>")` after `electronApp.close()` (as the
@@ -101,7 +112,9 @@ OMNIGENT_PYTHON="$PWD/.venv/bin/python" \
 ```
 
 Run on an interactive desktop and keep the test app foregrounded for its native
-focus assertions. `OMNIGENT_DESKTOP_EXECUTABLE` may point to a packaged binary.
+focus assertions. `OMNIGENT_DESKTOP_EXECUTABLE` may point to a packaged
+**Omnigent Dev** binary (`pnpm run build`); a release build accepts no debugger,
+so Playwright can't attach to it.
 `OMNIGENT_DESKTOP_COMPOSITED_VIDEO=1` records the native window on macOS (requires
 Screen Recording permission). Set `OMNIGENT_DESKTOP_RECORD_DIR` outside the
 checkout; each fixture's subdirectory receives `design-prompt-native.mov`.
@@ -113,7 +126,56 @@ into the nearby floating editor, and confirm the field remains `W41`. Escape
 should close only the editor. Reopen it and use Send or Enter to submit an
 instruction to chat. No instruction bar should appear below the browser URL.
 
+## SSH localhost previews
+
+`desktop_ssh_preview.e2e.js` covers the address bar, `dev.localhost`, agent
+navigation/read/input, host isolation, and decline after a fresh app launch.
+The SPA, Python server, runner, native preload/main, and browser policy are
+real. Host-list/session provenance responses and the external SSH executable
+are fixtures; no permission records or URL-policy decisions are seeded.
+CI substitutes only the native dialog's answer, asserting that the preview
+receives no request before consent. This is not a real remote-machine test.
+Preview identity proofs are stored separately from SSH file-access approvals;
+localhost permission lasts only until the desktop app restarts.
+
+```sh
+# From the repository root, after installing Python and desktop dependencies:
+pnpm --filter web run build
+pnpm --filter omnigent-desktop-electron run build:overlay
+OMNIGENT_PYTHON="$PWD/.venv/bin/python" \
+  node --test web/electron/e2e/desktop_ssh_preview.e2e.js
+```
+
+The full UI CI lane runs this on shard 0 under Xvfb and uploads recordings.
+On macOS, set `OMNIGENT_DESKTOP_NATIVE_DIALOGS=1` for real dialogs and
+`OMNIGENT_DESKTOP_COMPOSITED_VIDEO=1` for native window recordings. Grant
+Accessibility and Screen Recording permissions to the test terminal. Keep
+`OMNIGENT_DESKTOP_RECORD_DIR` outside tracked files. To compare revisions,
+copy the test and its two `fixtures/preview*.cjs` files unchanged to each
+checkout and build each checkout's own SPA and overlays.
+
+Human check with a real remote host: run a dev server bound to its loopback,
+forward that port with SSH, then open the forwarded URL in the session's
+Browser tab. Allow the named destination and verify the remote page and its
+interactions. Restart the desktop and choose **Not now**: the page and agent
+browser tools must remain blocked without repeated prompts.
+
 ## Authoring a desktop reproduction
+
+For macOS titlebar clearance, build the SPA and run
+`OMNIGENT_PYTHON="$PWD/.venv/bin/python" node --test web/electron/e2e/desktop_titlebar_zoom.e2e.js`
+from the repository root. This checks real Electron zoom from 50% to 150%,
+14px/16px roots, sidebar toggling, and reloading at 80%. Set
+`OMNIGENT_DESKTOP_RECORD_DIR` outside the checkout to retain the recording.
+Native traffic lights require a human visual check: use View → Zoom Out and
+Actual Size, then collapse/reopen the sidebar and open Settings.
+
+`desktop_find_selection_prefill.e2e.js` selects words in a chat reply and opens
+find with Ctrl+F (bar closed and open, and inside the bar) and Edit → Find…,
+checking the bar's query and match count. It needs Linux, an X display with
+XTEST, and a built SPA:
+`OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_find_selection_prefill.e2e.js`
+from `web/electron`.
 
 1. Copy `desktop_connect.e2e.js` to `e2e/desktop_<slug>.e2e.js`.
 2. If the bug's failure is **past** connect, pass `serverUrl` to
@@ -130,3 +192,44 @@ instruction to chat. No instruction bar should appear below the browser URL.
    footage. Use `saveRecording(RECORD_DIR, "before-<facet>")` (or
    `fixed-<facet>`), then write the journey `caption` for the handoff exactly as
    the other lanes do (see `dev/repro-agent/AGENTS.md`, Step 4).
+
+## Security-key notice
+
+`desktop_browser_webauthn_prompt.e2e.js` opens an Okta-style verify page in a
+session's Browser tab. That page requests a WebAuthn assertion that nothing can
+answer. The test checks that the shell's security-key notice appears for the
+page's origin while the request is still pending. Its **Open in browser** button
+must hand the same URL to `fixtures/fakeSystemBrowser.cjs`. It runs on Linux
+under `xvfb-run` and needs no security key.
+
+## Navigation policy runtime boundary
+
+`desktop_navigation_policy.e2e.js` uses the production partition hooks in a real
+Electron process. It checks public HTTPS navigation twice, an HSTS HTTP-to-HTTPS
+upgrade after learning a real server policy, a refused loopback
+alias, and a trusted localhost preview twice. The public and preview response
+assertions check connected addresses and view IDs; the HSTS assertions check
+Chromium’s HTTP-to-HTTPS redirect metadata and final URL. Internal-resolving
+iframe and object destinations must be classified as `subFrame` and `object`,
+attributed to the preview view, and cancelled through production request hooks.
+A main-frame redirect and page-created `window.open` to that alias must also
+retain the owning view ID and be cancelled. A main-only
+fixture bypasses preflight for one local request to isolate response cancellation;
+its real network metadata must trigger the production response guard. Preview
+eligibility is supplied by the main-only fixture rather than live Arca enrollment.
+The test requires outbound HTTPS access to `example.com` and `hsts.badssl.com`,
+and public DNS resolution of `lvh.me` to loopback. Repeated local-fixture loads must report HTTP 200 because
+the document guard skips cache reads.
+
+Run with the prerequisites above:
+
+```sh
+OMNIGENT_DESKTOP_RECORD_DIR=/absolute/path/outside/repo \
+  OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_navigation_policy.e2e.js
+```
+
+The recording and `network-evidence.json` are retained together, including partial
+network evidence when an assertion fails. Temporary server fixtures and the desktop
+profile are removed separately from the recording directory. Renderer
+URL-bar navigation also passes through the policy; it has no local-network
+opt-out.

@@ -20,6 +20,7 @@ description: >-
 
 executor:
   type: omnigent
+  reasoning_effort: high
   config:
     harness: claude-sdk
 
@@ -68,6 +69,12 @@ prompt: |
   or config key, or a changed user-facing default lean needs-doc; pure internal
   refactors, perf, tests, CI, build, and bugfixes that don't alter documented
   behavior lean no-doc.
+
+  The primary purpose of the documentation is to encourage people to use the
+  product. Judge documentation impact at the product-feature level: focus on what
+  a feature is and why a user would care about it. Do not treat low-level
+  implementation details or opportunities for in-depth usage walkthroughs as
+  reasons for a documentation update.
 
   ## Security
   You are running in CI with access to secrets. Never echo secrets, tokens, or

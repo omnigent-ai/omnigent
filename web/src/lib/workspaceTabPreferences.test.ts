@@ -1,12 +1,23 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_WORKSPACE_TAB,
+  defaultWorkspaceTabs,
   normalizeDefaultWorkspaceTab,
+  notifyWorkspaceTabPreferencesChanged,
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
+  readInitialWorkspaceTab,
+  readPinnedWorkspaceTabs,
+  subscribeWorkspaceTabPreferences,
   writeDefaultWorkspaceTab,
+  writePinnedWorkspaceTabs,
 } from "./workspaceTabPreferences";
 
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
+import {
+  type SessionWorkspaceState,
+  readSessionWorkspaceState,
+  writeSessionWorkspaceState,
+} from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 
@@ -15,6 +26,73 @@ afterEach(() => {
 });
 
 describe("workspaceTabPreferences — read/write", () => {
+  it("persists pins, clears stale selections, and never defaults to an unpinned page", () => {
+    expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
+    writeSessionWorkspaceState("conv", { rightRailTab: "files", open: true });
+    writePinnedWorkspaceTabs(["subagents", "github", "github"]);
+    expect(readPinnedWorkspaceTabs()).toEqual(["github", "subagents"]);
+    expect(readInitialWorkspaceTab()).toBe("github");
+    expect(readSessionWorkspaceState("conv")).toEqual({ open: true });
+
+    writeDefaultWorkspaceTab("subagents");
+    expect(readInitialWorkspaceTab()).toBe("subagents");
+    writePinnedWorkspaceTabs([]);
+    expect(readPinnedWorkspaceTabs()).toEqual([]);
+    expect(readInitialWorkspaceTab()).toBeNull();
+
+    writePinnedWorkspaceTabs(defaultWorkspaceTabs);
+    expect(localStorage.getItem(PINNED_WORKSPACE_TABS_STORAGE_KEY)).toBeNull();
+    expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
+  });
+
+  it.each([
+    ["invalid-json", defaultWorkspaceTabs],
+    ["null", defaultWorkspaceTabs],
+    ["{}", defaultWorkspaceTabs],
+    ['"files"', defaultWorkspaceTabs],
+    ["[]", []],
+    ['["unknown"]', []],
+    ['["github","unknown","changes","github",null]', ["changes", "github"]],
+  ] as const)("reads supported pins from storage: %s", (stored, expected) => {
+    localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, stored);
+    expect(readPinnedWorkspaceTabs()).toEqual(expected);
+  });
+
+  it("preserves an opened page when pinning it and other opened pages when unpinning it again", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const state: SessionWorkspaceState = {
+      rightRailTab: "changes",
+      openPanels: ["changes", "github"],
+      open: false,
+    };
+    writeSessionWorkspaceState("conv", state);
+
+    writePinnedWorkspaceTabs(["files", "changes", "subagents"]);
+    expect(readSessionWorkspaceState("conv")).toEqual(state);
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    expect(readSessionWorkspaceState("conv")).toEqual({ openPanels: ["github"], open: false });
+  });
+
+  it("uses a pinned fallback without changing the preferred default or unrelated selections", () => {
+    const state: SessionWorkspaceState = {
+      rightRailTab: "files",
+      selectedFilePath: "README.md",
+      openFiles: ["README.md"],
+    };
+    writeSessionWorkspaceState("conv", state);
+
+    writePinnedWorkspaceTabs(["changes", "github", "subagents"]);
+
+    expect(readDefaultWorkspaceTab()).toBe("files");
+    expect(readInitialWorkspaceTab()).toBe("changes");
+    expect(readSessionWorkspaceState("conv")).toEqual({
+      selectedFilePath: "README.md",
+      openFiles: ["README.md"],
+    });
+    writePinnedWorkspaceTabs(defaultWorkspaceTabs);
+    expect(readInitialWorkspaceTab()).toBe("files");
+  });
+
   it("returns files when nothing is stored", () => {
     expect(readDefaultWorkspaceTab()).toBe(DEFAULT_WORKSPACE_TAB);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
@@ -67,6 +145,30 @@ describe("workspaceTabPreferences — read/write", () => {
 
     writeDefaultWorkspaceTab("files");
     expect(readSessionWorkspaceState("conv_files").rightRailTab).toBeUndefined();
+  });
+});
+
+describe("workspaceTabPreferences — change notifications", () => {
+  it("tells subscribers about a changed setting here or in another window, until they stop", () => {
+    const heard = vi.fn();
+    const stop = subscribeWorkspaceTabPreferences(heard);
+    writePinnedWorkspaceTabs(["github"]);
+    writeDefaultWorkspaceTab("github");
+    expect(heard).toHaveBeenCalledTimes(2);
+    // Writing the same default again changes nothing.
+    writeDefaultWorkspaceTab("github");
+    expect(heard).toHaveBeenCalledTimes(2);
+    window.dispatchEvent(new StorageEvent("storage", { key: STORAGE_KEY }));
+    window.dispatchEvent(new StorageEvent("storage", { key: PINNED_WORKSPACE_TABS_STORAGE_KEY }));
+    window.dispatchEvent(new StorageEvent("storage", { key: null }));
+    expect(heard).toHaveBeenCalledTimes(5);
+    window.dispatchEvent(new StorageEvent("storage", { key: "omnigent:something-else" }));
+    expect(heard).toHaveBeenCalledTimes(5);
+    notifyWorkspaceTabPreferencesChanged();
+    expect(heard).toHaveBeenCalledTimes(6);
+    stop();
+    notifyWorkspaceTabPreferencesChanged();
+    expect(heard).toHaveBeenCalledTimes(6);
   });
 });
 

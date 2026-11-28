@@ -127,9 +127,11 @@ class _StubConversationStore:
     def __init__(self) -> None:
         """Initialize empty conversation table."""
         self._conversations: dict[str, Conversation] = {}
+        self.read_ids: list[str] = []
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """Look up a conversation by ID."""
+        self.read_ids.append(conversation_id)
         return self._conversations.get(conversation_id)
 
     def add(self, conv: Conversation) -> None:
@@ -249,6 +251,54 @@ def test_sub_agent_delegates_to_parent(
         "If False, the recursive delegation via parent_conversation_id "
         "is not working."
     )
+
+
+def test_preloaded_sub_agent_skips_child_read_and_still_delegates(
+    perm_store: _StubPermissionStore,
+    conv_store: _StubConversationStore,
+) -> None:
+    """Preloading a child removes only its read; parent ACL stays authoritative."""
+    parent = _make_conversation("conv_parent")
+    child = _make_conversation(
+        "conv_child",
+        kind="sub_agent",
+        parent_conversation_id="conv_parent",
+    )
+    conv_store.add(parent)
+    perm_store.add_grant("alice@example.com", "conv_parent", LEVEL_OWNER)
+
+    result = check_session_access(
+        user_id="alice@example.com",
+        conversation_id="conv_child",
+        required_level=LEVEL_OWNER,
+        permission_store=perm_store,  # type: ignore[arg-type]
+        conversation_store=conv_store,  # type: ignore[arg-type]
+        conversation=child,
+    )
+
+    assert result is True
+    assert conv_store.read_ids == ["conv_parent"]
+
+
+def test_mismatched_preloaded_conversation_is_never_authoritative(
+    perm_store: _StubPermissionStore,
+    conv_store: _StubConversationStore,
+) -> None:
+    """A caller cannot authorize one id with a preloaded row for another."""
+    wrong = _make_conversation("conv_wrong")
+    perm_store.add_admin("admin@example.com")
+
+    result = check_session_access(
+        user_id="admin@example.com",
+        conversation_id="conv_target",
+        required_level=LEVEL_OWNER,
+        permission_store=perm_store,  # type: ignore[arg-type]
+        conversation_store=conv_store,  # type: ignore[arg-type]
+        conversation=wrong,
+    )
+
+    assert result is False
+    assert conv_store.read_ids == []
 
 
 # ── 3. Unauthenticated (user_id=None) -> deny ───────────────────
@@ -890,21 +940,13 @@ def test_resolved_allows_public_grant_satisfies_access() -> None:
     assert resolved_allows(access, LEVEL_EDIT) is False
 
 
-def test_resolved_level_prefers_user_grant_over_public() -> None:
-    """The displayed level is the user's own grant, NOT a higher public one.
-
-    This is the asymmetry between access and displayed level: with a low
-    user grant and a higher public grant, ``resolved_allows`` is satisfied
-    by the public grant, but ``resolved_level`` reports the user's own
-    grant — exactly matching ``get_permission_level`` so the combined
-    helper does not change the displayed level.
-    """
+def test_resolved_level_caps_corrupt_public_grant() -> None:
+    """A malformed public Manage grant cannot bypass the default Read ceiling."""
     access = ResolvedAccess(
         is_admin=False, user_grant_level=LEVEL_READ, public_grant_level=LEVEL_MANAGE
     )
-    # Access at EDIT is granted via the public (manage) grant ...
-    assert resolved_allows(access, LEVEL_EDIT) is True
-    # ... but the level shown to the UI is the user's own read grant.
+    assert resolved_allows(access, LEVEL_EDIT) is False
+    assert resolved_allows(access, LEVEL_MANAGE) is False
     assert resolved_level(access) == LEVEL_READ
 
 

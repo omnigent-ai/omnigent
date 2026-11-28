@@ -50,7 +50,7 @@ export function CommandGoalDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg max-h-[85dvh] grid-rows-[auto_1fr_auto]">
         <form className="contents" onSubmit={submit}>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -63,7 +63,8 @@ export function CommandGoalDialog({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-1.5">
+          {/* Leave room for the field's focus ring inside the scrollable region. */}
+          <div className="-m-1 min-h-0 space-y-1.5 overflow-y-auto p-1">
             <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-condition">
               Completion condition
             </label>

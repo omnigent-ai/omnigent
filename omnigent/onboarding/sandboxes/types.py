@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -68,7 +68,11 @@ class SandboxCapabilities:
         ``host_type="managed"`` sessions (``prepare`` / ``provision`` /
         ``start_host``).
     :param local_port_forward: Provider can bridge a local port into the
-        sandbox for the App OAuth callback flow.
+        sandbox (``ssh -L`` semantics). Used for the App OAuth callback
+        flow, and for previewing sandbox-local services — e.g. a dev
+        server on the sandbox's loopback, viewed in the desktop
+        browser. The primitive itself is not OAuth-specific: see
+        :meth:`SandboxLauncher.forward_local_port`.
     :param resume_stopped: Provider can resume a stopped sandbox in place
         with its persistent volume.
     :param programmatic_terminate: Provider can terminate a sandbox
@@ -92,6 +96,13 @@ class SandboxCapabilities:
         single session's workspace. Off by default, so a provider that
         clones only one repo (and every out-of-tree provider) is never
         handed a multi-repo request; providers opt in explicitly.
+    :param git_clone_options: Provider honors ``RepoWorkspace.git_clone``
+        when creating checkouts. Custom materializers must opt in.
+    :param resume_preserves_host: Resuming a stopped sandbox brings back the
+        running ``omnigent host`` process itself, still holding its launch
+        token, so the wake path keeps that token and does not restart the host
+        (a second host would race the thawed one). Only meaningful alongside
+        ``resume_stopped``.
     """
 
     cli_bootstrap: bool = False
@@ -107,6 +118,8 @@ class SandboxCapabilities:
     # compatibility for out-of-tree providers.
     snapshot_restore: bool = False
     multi_repo: bool = False
+    git_clone_options: bool = False
+    resume_preserves_host: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,6 +145,45 @@ class SandboxInfo:
 
 
 @dataclass(frozen=True)
+class GitCloneOptions:
+    """Admin policy for new checkouts; defaults preserve existing Git behavior."""
+
+    depth: int | None = None
+    single_branch: bool | None = None
+    filter: Literal["blob:none"] | None = None
+    tags: bool = True
+
+    def __post_init__(self) -> None:
+        if self.depth is not None and (type(self.depth) is not int or self.depth <= 0):
+            raise ValueError("sandbox.git_clone.depth must be null or a positive integer")
+        if self.single_branch is not None and type(self.single_branch) is not bool:
+            raise ValueError("sandbox.git_clone.single_branch must be null or a boolean")
+        if self.filter is not None and self.filter != "blob:none":
+            raise ValueError("sandbox.git_clone.filter must be null or 'blob:none'")
+        if type(self.tags) is not bool:
+            raise ValueError("sandbox.git_clone.tags must be a boolean")
+
+    def clone_args(self, branch: str | None) -> list[str]:
+        """Return only allowlisted options; callers quote URL and destination."""
+        args = ["--branch", branch] if branch is not None else []
+        single_branch = (
+            self.single_branch if self.single_branch is not None else branch is not None
+        )
+        if single_branch:
+            args.append("--single-branch")
+        elif self.single_branch is False or self.depth is not None:
+            # --depth implies --single-branch unless explicitly countermanded.
+            args.append("--no-single-branch")
+        if self.depth is not None:
+            args.extend(["--depth", str(self.depth)])
+        if self.filter is not None:
+            args.append(f"--filter={self.filter}")
+        if not self.tags:
+            args.append("--no-tags")
+        return args
+
+
+@dataclass(frozen=True)
 class RepoWorkspace:
     """
     A single repository to materialize in a managed sandbox's workspace.
@@ -150,11 +202,13 @@ class RepoWorkspace:
     :param repo_name: Directory the clone lands in under the sandbox
         workspace, derived from the URL's last path segment, e.g.
         ``"repo"``.
+    :param git_clone: Admin clone policy for fresh checkouts only.
     """
 
     url: str
     branch: str | None
     repo_name: str
+    git_clone: GitCloneOptions = field(default_factory=GitCloneOptions)
 
 
 def _owner_segment(url: str) -> str:

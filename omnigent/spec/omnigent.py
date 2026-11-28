@@ -49,6 +49,7 @@ from omnigent.inner.tools import (
     _schema_from_callable,
 )
 from omnigent.llms.routing import infer_harness_from_model as _infer_harness_from_model
+from omnigent.spec.parser import parse_tool_groups, resolve_memory_tool_group
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorAuth,
@@ -58,6 +59,7 @@ from omnigent.spec.types import (
     LocalToolInfo,
     MCPServerConfig,
     SharePolicy,
+    ToolGroupsConfig,
     ToolRuntime,
     ToolsConfig,
 )
@@ -157,6 +159,8 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
         model=spec.executor.model,
         harness=_raw_harness,
         profile=spec.executor.config.get("profile"),
+        context_files=spec.executor.config.get("context_files"),
+        system_prompt_mode=spec.executor.config.get("system_prompt_mode"),
     )
 
     # ``AgentDef.name`` / ``AgentDef.prompt`` are ``str | None`` — pass
@@ -181,6 +185,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
         tools=_translate_tools_to_omnigent(spec),
         executor=executor_spec,
         os_env=spec.os_env,
+        model_egress=spec.model_egress,
         bundle_dir=bundle_dir,
         skills_filter=spec.skills_filter,
     )
@@ -389,6 +394,8 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
         required field for its declared transport (a programmatic
         construction path that bypassed the validator).
     """
+    if config.transport == "registry":
+        return MCPTool(registry=True, tools=config.tools)
     if config.transport == "stdio":
         if config.command is None:
             raise OmnigentError(
@@ -449,6 +456,8 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
             model=model,
             harness=harness,
             profile=profile,
+            context_files=sub.executor.config.get("context_files"),
+            system_prompt_mode=sub.executor.config.get("system_prompt_mode"),
         ),
     )
 
@@ -1141,6 +1150,16 @@ def agent_def_to_agent_spec(
     # spec-side parser does so a typo here surfaces the same
     # error regardless of which spec format the user is on.
     skills_filter = _translate_skills_filter_from_yaml(raw_yaml)
+    # ``tool_groups:`` is not on AgentDef either; parse it from the raw YAML
+    # with the native parser so both dialects reject the same typos.
+    raw_tool_groups = raw_yaml.get("tool_groups") if raw_yaml else None
+    tool_groups = resolve_memory_tool_group(
+        parse_tool_groups(raw_tool_groups, spawn=agent_def.spawn),
+        raw_tool_groups,
+        builtins=(),
+        own_tool_names=[t.name for t in local_tools] + [m.name for m in mcp_servers],
+        agent_name=name,
+    )
 
     return AgentSpec(
         spec_version=_SYNTHETIC_SPEC_VERSION,
@@ -1154,9 +1173,11 @@ def agent_def_to_agent_spec(
         guardrails=guardrails,
         mcp_servers=mcp_servers,
         os_env=agent_def.os_env,
+        model_egress=agent_def.model_egress,
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,
+        tool_groups=tool_groups,
         # AgentDef.agent_session_sharing is the raw YAML string
         # ("none"/"non-public"/"public"); map it to the SharePolicy enum
         # AgentSpec expects.
@@ -1425,6 +1446,13 @@ def _agent_tool_to_sub_spec(
         sub_agents=child_sub_agents,
         local_tools=child_local_tools,
         tools=child_tools_config,
+        tool_groups=resolve_memory_tool_group(
+            ToolGroupsConfig(),
+            None,
+            builtins=(),
+            own_tool_names=[t.name for t in child_local_tools],
+            agent_name=tool_name,
+        ),
     )
 
 
@@ -1749,6 +1777,10 @@ def _translate_executor_from_def(
         "harness": harness,
         "profile": profile,
     }
+    if oa_executor is not None and oa_executor.context_files is not None:
+        config["context_files"] = oa_executor.context_files
+    if oa_executor is not None and oa_executor.system_prompt_mode is not None:
+        config["system_prompt_mode"] = oa_executor.system_prompt_mode
     # These are not fields on the omnigent inner ExecutorSpec, so read them
     # from the raw YAML dict and carry them forward explicitly.
     # The openai-agents harness spawn-env builder reads
@@ -1826,6 +1858,24 @@ def _translate_mcp_tool_from_def(
         ``databricks_server`` shape is caught upstream by
         :func:`_fail_on_unsupported_tool`).
     """
+    if tool.registry:
+        if any(
+            (
+                tool.url,
+                tool.command,
+                tool.args,
+                tool.env,
+                tool.headers,
+                tool.profile,
+                tool.databricks_server,
+                tool.tool_name,
+            )
+        ):
+            raise OmnigentError(
+                "registry MCP tools cannot override server connection settings",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return MCPServerConfig(name=tool_name, transport="registry", tools=tool.tools)
     if tool.url is not None:
         return MCPServerConfig(
             name=tool_name,

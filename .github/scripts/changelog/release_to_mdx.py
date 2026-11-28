@@ -30,7 +30,7 @@ from pathlib import Path
 _AUTOLINK_RE = re.compile(r"<((?:https?://)[^>\s]+)>")
 # A bare "#1234" not already part of a word, path, or link. Headings are
 # "# Title" (space after #), so they never match.
-_PR_REF_RE = re.compile(r"(?<![\w/#])#(\d+)\b")
+_PR_REF_RE = re.compile(r"(?<![\w/#\[])#(\d+)\b")
 
 AUTHOR = "Omnigent maintainers"
 # Average adult reading speed; used only for the "N min read" byline estimate.
@@ -41,7 +41,7 @@ WHATS_NEXT = """## What's Next
 Install or upgrade Omnigent:
 
 ```bash
-uv tool install --python 3.12 omnigent   # or: pip install "omnigent"
+curl -fsSL https://omnigent.ai/install.sh | sh
 ```
 
 - Star the project and file issues on [GitHub](https://github.com/omnigent-ai/omnigent).

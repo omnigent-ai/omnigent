@@ -544,7 +544,11 @@ def test_to_api_dict_function_call() -> None:
         response_id="resp_1",
         created_at=1,
         data=FunctionCallData(
-            agent="my-agent", name="search", arguments='{"q": "test"}', call_id="call_1"
+            agent="my-agent",
+            name="search",
+            arguments='{"q": "test"}',
+            call_id="call_1",
+            namespace="container",
         ),
     )
     api = item.to_api_dict()
@@ -554,6 +558,7 @@ def test_to_api_dict_function_call() -> None:
     assert api["model"] == "my-agent"  # alias
     assert api["name"] == "search"
     assert api["call_id"] == "call_1"
+    assert api["namespace"] == "container"
     assert "created_by" not in api
 
 

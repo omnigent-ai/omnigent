@@ -154,7 +154,7 @@ final answer lands server-side — read it over the AP API
    `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`. Classic `ghp_` rejected.
 4. **No Databricks gateway.** Copilot talks only to GitHub's backend, so a
    `databricks-*` model is silently resolved to Copilot's auto-select — it will
-   *not* route through the AI Gateway like claude-sdk/codex/pi.
+   *not* route through the Unity Gateway like claude-sdk/codex/pi.
 5. **Use a model id from the account's catalog.** free_limited offers `auto`,
    `claude-haiku-4.5`, `gpt-5-mini`. Run `.venv/bin/python` + `client.list_models()`
    to discover the live set; an unknown id fails loud (server-side failed session).

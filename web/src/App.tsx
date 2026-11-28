@@ -1,13 +1,19 @@
-import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
+import { lazy, Suspense, useEffect, type ComponentType, type ReactNode } from "react";
+import { Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
-import { Spinner } from "@/components/ui/spinner";
+import { PageLoading, PaneLoading } from "@/components/PageLoading";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
+import { Outlet, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
+import { useProjectKanbanBoardPreference } from "@/lib/projectKanbanPreferences";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
+import { isElectronShell } from "@/lib/nativeBridge";
+import { CANVAS_SESSION_ROUTE, CHAT_SESSION_ROUTE } from "@/lib/sessionRoutes";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -16,12 +22,25 @@ import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 // kept mounted across a param change (ChatPage across `/` ↔ `/c/:id`) still emits
 // one view per destination under the same id.
 //
-// SettingsPage opts out (stays unwrapped): its id is param-derived
-// (`settings.<section>`), so it calls useOmnigentPageView itself.
+// SettingsPage and TasksPage own their page-view IDs because their section
+// depends on route/query parameters.
 function withPageView<P extends object>(id: string, Component: ComponentType<P>): ComponentType<P> {
   return function WithPageView(props: P) {
     useOmnigentPageView(id);
     return <Component {...props} />;
+  };
+}
+
+// A lazy page inside the shell gets its own boundary. A router transition keeps
+// already-visible content, but a newly mounted boundary shows its fallback, so
+// an in-app click shows the pane spinner instead of leaving the old page up.
+function withPaneLoading<P extends object>(Page: ComponentType<P>): ComponentType<P> {
+  return function WithPaneLoading(props: P) {
+    return (
+      <Suspense fallback={<PaneLoading />}>
+        <Page {...props} />
+      </Suspense>
+    );
   };
 }
 
@@ -47,39 +66,111 @@ const ApprovePage = withPageView(
   "approve",
   lazy(() => import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage }))),
 );
+const FloatingComposerPage = withPageView(
+  "floating_composer",
+  lazy(() =>
+    import("@/shell/floatingComposer/FloatingComposerPage").then((m) => ({
+      default: m.FloatingComposerPage,
+    })),
+  ),
+);
 const InboxPage = withPageView(
   "inbox",
-  lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
+  withPaneLoading(lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })))),
 );
-const CanvasPage = withPageView(
-  "canvas",
-  lazy(() => import("@/pages/CanvasPage").then((m) => ({ default: m.CanvasPage }))),
+// The shell owns the board so selecting a conversation never unmounts it.
+const CanvasLandingPage = withPageView("canvas", () => null);
+const GridPage = withPageView("grid", () => null);
+const ProjectHomePage = withPageView(
+  "project_home",
+  withPaneLoading(
+    lazy(() => import("@/pages/ProjectHomePage").then((m) => ({ default: m.ProjectHomePage }))),
+  ),
 );
-const TasksPage = withPageView(
-  "tasks",
+const TasksPage = withPaneLoading(
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
 );
 const UsagePage = withPageView(
   "usage",
-  lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+  withPaneLoading(lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage })))),
 );
-const SettingsPage = lazy(() =>
-  import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+const TaskDetailPage = withPageView(
+  "tasks.detail",
+  withPaneLoading(
+    lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
+  ),
+);
+const WorkflowsPage = withPageView(
+  "workflows",
+  withPaneLoading(
+    lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+  ),
+);
+const WorkflowDetailPage = withPageView(
+  "workflows.detail",
+  withPaneLoading(
+    lazy(() =>
+      import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage })),
+    ),
+  ),
+);
+const GadgetListPage = withPageView(
+  "gadgets",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetListPage").then((m) => ({ default: m.GadgetListPage }))),
+  ),
+);
+const GadgetStartPage = withPageView(
+  "gadgets.new",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetStart").then((m) => ({ default: m.GadgetStartPage }))),
+  ),
+);
+const GadgetOpenPage = withPageView(
+  "gadgets.open",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetOpenPage").then((m) => ({ default: m.GadgetOpenPage }))),
+  ),
+);
+const SettingsPage = withPaneLoading(
+  lazy(() => import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage }))),
 );
 
 // A release-feature route stays registered so a hard load never falls through
 // to the catch-all "Page not found" while the /v1/info probe is in flight; the
 // gate is decided inside once the probe resolves.
-function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children: ReactNode }) {
+function FeatureGatedPage({
+  feature,
+  children,
+  loading,
+}: {
+  feature: FeatureKey;
+  children: ReactNode;
+  loading?: ReactNode;
+}) {
   const info = useServerInfo();
-  if (info === "loading") {
-    return (
-      <div className="flex min-h-0 flex-1 items-center justify-center">
-        <Spinner className="size-5 text-muted-foreground" aria-label="Loading" />
-      </div>
-    );
-  }
+  if (info === "loading") return loading !== undefined ? loading : <PaneLoading />;
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
+}
+
+// With the board turned off in Settings, a project link opens that project's composer.
+function ProjectHomeRoute() {
+  const boardEnabled = useProjectKanbanBoardPreference();
+  const { projectName = "" } = useParams<{ projectName: string }>();
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (!boardEnabled) navigate(`/?project=${encodeURIComponent(projectName)}`, { replace: true });
+  }, [boardEnabled, navigate, projectName]);
+  return boardEnabled ? <ProjectHomePage /> : null;
+}
+
+function AppRedirect({ to }: { to: string }) {
+  const navigate = useNavigate();
+  const { search, hash } = useLocation();
+  useEffect(() => {
+    navigate({ pathname: to, search, hash }, { replace: true });
+  }, [navigate, to, search, hash]);
+  return null;
 }
 
 interface AppProps {
@@ -148,7 +239,7 @@ function AppRoutes({ basename }: AppProps) {
   // after the first admin exists.
   if (info !== "loading" && info.accounts_enabled && info.needs_setup) {
     return (
-      <Suspense fallback={null}>
+      <Suspense fallback={<PageLoading />}>
         <Routes>
           <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
         </Routes>
@@ -157,7 +248,7 @@ function AppRoutes({ basename }: AppProps) {
   }
 
   return (
-    <Suspense fallback={null}>
+    <Suspense fallback={<PageLoading />}>
       <Routes>
         {info !== "loading" && info.accounts_enabled && (
           <>
@@ -166,19 +257,126 @@ function AppRoutes({ basename }: AppProps) {
           </>
         )}
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
+        {/* The desktop's floating New Agent panel: the composer alone, without the shell. */}
+        <Route
+          path={`${prefix}${FLOATING_COMPOSER_PATH}`}
+          element={
+            <FeatureGatedPage
+              feature="floating_composer"
+              loading={isElectronShell() ? <PageLoading quiet /> : undefined}
+            >
+              {isElectronShell() ? (
+                // The panel boots out of sight, so it shows no loading screen of its own.
+                <Suspense fallback={<PageLoading quiet />}>
+                  <FloatingComposerPage />
+                </Suspense>
+              ) : (
+                <NotFoundPage />
+              )}
+            </FeatureGatedPage>
+          }
+        />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route path={`${prefix}${CHAT_SESSION_ROUTE}`} element={<ChatPage />} />
+          <Route
+            path={`${prefix}/grid/:gridId`}
+            element={
+              <FeatureGatedPage feature="grid_sessions_display_ui">
+                <GridPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route
+            path={`${prefix}/projects/:projectName`}
+            element={
+              <FeatureGatedPage feature="project_kanban">
+                <ProjectHomeRoute />
+              </FeatureGatedPage>
+            }
+          />
           <Route
             path={`${prefix}/canvas`}
             element={
               <FeatureGatedPage feature="canvas">
-                <CanvasPage />
+                <CanvasLandingPage />
               </FeatureGatedPage>
             }
           />
-          <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+          <Route
+            path={`${prefix}${CANVAS_SESSION_ROUTE}`}
+            element={
+              <FeatureGatedPage feature="canvas">
+                <ChatPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            element={
+              info === "loading" ? (
+                <PaneLoading />
+              ) : info.automations_enabled === false ? (
+                <NotFoundPage />
+              ) : (
+                <Outlet />
+              )
+            }
+          >
+            <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+            <Route
+              path={`${prefix}/tasks/templates`}
+              element={<TasksPage key="templates" templatesOnly />}
+            />
+            <Route
+              path={`${prefix}/tasks/:taskId`}
+              element={
+                <FeatureGatedPage feature="automations_v2">
+                  <TaskDetailPage />
+                </FeatureGatedPage>
+              }
+            />
+          </Route>
+          <Route
+            path={`${prefix}/workflows`}
+            element={
+              <FeatureGatedPage feature="workflows">
+                <WorkflowsPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/workflows/:workflowId`}
+            element={
+              <FeatureGatedPage feature="workflows">
+                <WorkflowDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetListPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget/new`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetStartPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget/:gadgetId`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetOpenPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route
             path={`${prefix}/usage`}
             element={
@@ -194,9 +392,9 @@ function AppRoutes({ basename }: AppProps) {
               redirects to the canonical General section. */}
           <Route
             path={`${prefix}/settings`}
-            element={<Navigate to={`${prefix}/settings/general`} replace />}
+            element={<AppRedirect to={`${prefix}/settings/general`} />}
           />
-          <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+          <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
@@ -207,11 +405,11 @@ function AppRoutes({ basename }: AppProps) {
               the sections self-gate to admins. */}
           <Route
             path={`${prefix}/members`}
-            element={<Navigate to={`${prefix}/settings/members`} replace />}
+            element={<AppRedirect to={`${prefix}/settings/members`} />}
           />
           <Route
             path={`${prefix}/policies`}
-            element={<Navigate to={`${prefix}/settings/policies`} replace />}
+            element={<AppRedirect to={`${prefix}/settings/policies`} />}
           />
           <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
         </Route>
@@ -221,9 +419,12 @@ function AppRoutes({ basename }: AppProps) {
 }
 
 export default function App(props: AppProps = {}) {
+  const { pathname } = useLocation();
   return (
     <ChunkLoadErrorBoundary>
-      <AppRoutes {...props} />
+      <RenderErrorBoundary name="this page" resetKey={pathname}>
+        <AppRoutes {...props} />
+      </RenderErrorBoundary>
     </ChunkLoadErrorBoundary>
   );
 }

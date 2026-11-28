@@ -2,6 +2,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { Host } from "@/hooks/useHosts";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
 import { HarnessCredentialForm } from "./HarnessCredentialForm";
+import { HarnessSubscriptionSignIn } from "./HarnessSubscriptionSignIn";
 
 const host: Host = {
   host_id: "host-credential-story",
@@ -28,7 +29,11 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const AllPathsOffered: Story = {
-  args: { harness: "codex", label: "Codex", command: "codex login" },
+  args: {
+    harness: "codex",
+    label: "Codex",
+    subscription: <HarnessSubscriptionSignIn command="codex login" hostName={host.name} />,
+  },
   decorators: [
     (Story) => (
       <StoryQueryRouter
@@ -46,7 +51,7 @@ export const AllPathsOffered: Story = {
 };
 
 export const KeyAndGatewayOnly: Story = {
-  args: { harness: "pi", label: "Pi", command: null },
+  args: { harness: "pi", label: "Pi" },
   decorators: [
     (Story) => (
       <StoryQueryRouter

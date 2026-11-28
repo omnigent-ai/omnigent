@@ -62,10 +62,12 @@ class _DispatchCall:
 
     :param session_id: Session the event was dispatched to.
     :param text: The ``input_text`` body the wake injected.
+    :param agent_revision: The parent agent's bundle the wake named.
     """
 
     session_id: str
     text: str
+    agent_revision: str | None = None
 
 
 @pytest_asyncio.fixture
@@ -126,10 +128,16 @@ async def test_record_publish_delivers_wake_message_to_parent(
     the dispatch targeted the *parent* (not the child) with a notice
     naming the child and carrying the approval reason.
     """
-    parent = conv_store.create_conversation(kind="default", title="parent")
+    parent_agent_id = "0123456789abcdef0123456789abcdef"
+    parent = conv_store.create_conversation(
+        kind="default", title="parent", agent_id=parent_agent_id
+    )
     child = conv_store.create_conversation(
         kind="sub_agent", title="codex:demo", parent_conversation_id=parent.id
     )
+    # The parent's agent was reinstalled since its last turn.
+    agents = {parent_agent_id: type("Agent", (), {"bundle_location": f"{parent_agent_id}/v2"})()}
+    agent_store = type("Agents", (), {"get": staticmethod(agents.get)})()
 
     delivered: list[_DispatchCall] = []
     fired = asyncio.Event()
@@ -154,11 +162,13 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # The wake passes runner_router through; without it the stub
         # TypeErrors inside the notifier task and no wake lands.
         runner_router: Any | None = None,
+        agent_revision: str | None = None,
     ) -> str:
         delivered.append(
             _DispatchCall(
                 session_id=session_id,
                 text=body.data["content"][0]["text"],
+                agent_revision=agent_revision,
             )
         )
         fired.set()
@@ -167,7 +177,9 @@ async def test_record_publish_delivers_wake_message_to_parent(
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     monkeypatch.setattr(sessions_module, "_dispatch_session_event_to_runner", _record_dispatch)
 
-    uninstall = sessions_module.configure_subagent_block_notifier(conv_store, None)
+    uninstall = sessions_module.configure_subagent_block_notifier(
+        conv_store, None, agent_store=agent_store
+    )
     try:
         pending_elicitations.record_publish(
             child.id,
@@ -188,6 +200,9 @@ async def test_record_publish_delivers_wake_message_to_parent(
         assert call.text.startswith("[System:")
         assert "codex/demo" in call.text
         assert "git fetch" in call.text
+        # The wake names the parent's current bundle, so its runner drops a
+        # spec cached before the reinstall.
+        assert call.agent_revision == f"{parent_agent_id}/v2"
 
         # Resolving the block sends the woken parent a follow-up through
         # the same wiring, so it stops acting on the stale block notice.

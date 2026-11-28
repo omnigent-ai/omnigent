@@ -58,10 +58,11 @@ from typing import Any
 _MODEL_ROUTE_PREFIX = "system.ai."
 _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", _MODEL_ROUTE_PREFIX)
 
-#: A bare gpt id, split into family, version digits, and optional tier —
-#: ``gpt-5-6-luna`` → ``("gpt", "5", "6", "luna")``. Codex spells the
-#: version with a dot and keeps the tier hyphenated.
-_GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)-(\d+)(?:-([a-z0-9]+))?$")
+#: A bare gpt id, split into family, major, optional minor, and optional
+#: tier — ``gpt-5-6-luna`` → ``("gpt", "5", "6", "luna")``. Codex dots the
+#: version only when there is a minor, and keeps the tier hyphenated, so an
+#: arm whose tier hangs off a major alone carries no dot at all.
+_GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)(?:-(\d+))?(?:-([a-z0-9]+))?$")
 
 #: Models the gateway serves that codex's bundled catalog does not carry, so
 #: omnigent adds them to the session's own catalog (``model_catalog_json``)
@@ -69,6 +70,9 @@ _GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)-(\d+)(?:-([a-z0-9]+))?$")
 #: under, which is also the id the gateway serves the model as.
 _GLM_ARM = "glm-5-2"
 EXTENDED_CATALOG_MODELS: dict[str, str] = {_GLM_ARM: f"{_MODEL_ROUTE_PREFIX}{_GLM_ARM}"}
+# MLflow reports this arm as text-only. Codex otherwise clones the GPT image
+# capability into its extended catalog and lets view_image poison the next turn.
+EXTENDED_MODEL_INPUT_MODALITIES: dict[str, tuple[str, ...]] = {_GLM_ARM: ("text",)}
 
 #: Efforts each extended model's catalog entry declares. Codex refuses any
 #: other value for that model, so this is both the entry's ladder and the
@@ -116,9 +120,9 @@ def codex_spawn_model(model: str) -> str | None:
 
     :param model: Servable catalog id, e.g. ``"databricks-gpt-5-6-luna"``.
     :returns: The slug codex's spawn tool accepts, e.g.
-        ``"gpt-5.6-luna"``; ``None`` when the id has no slug in codex's
-        catalog (Kimi), so the caller can fall open instead of sending a
-        value the CLI rejects.
+        ``"gpt-5.6-luna"``, or ``"gpt-6-tier"`` for an arm with no minor;
+        ``None`` when the id has no slug in codex's catalog (Kimi), so the
+        caller can fall open instead of sending a value the CLI rejects.
     """
     bare = comparable_model_id(model)
     extended = EXTENDED_CATALOG_MODELS.get(bare)
@@ -128,7 +132,7 @@ def codex_spawn_model(model: str) -> str | None:
     if match is None:
         return None
     family, major, minor, tier = match.groups()
-    slug = f"{family}-{major}.{minor}"
+    slug = f"{family}-{major}.{minor}" if minor else f"{family}-{major}"
     return f"{slug}-{tier}" if tier else slug
 
 

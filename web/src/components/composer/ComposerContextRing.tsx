@@ -1,4 +1,5 @@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { formatTokenCount } from "@/lib/formatCost";
 import { cn } from "@/lib/utils";
 
 /** Circumference of the progress ring (r=5.5). */
@@ -65,9 +66,10 @@ export function ComposerContextRing({
           </svg>
         </button>
       </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-44 text-center text-sm">
-        <p className="tabular-nums">
-          {tokensUsed.toLocaleString()} / {contextWindow.toLocaleString()} tokens ({usedPct}% used)
+      <TooltipContent side="top" className="flex-col items-start gap-0 px-3 py-2 text-left text-sm">
+        <p className="tabular-nums text-ui leading-tight">{usedPct}% context used</p>
+        <p className="tabular-nums text-neutral-400 leading-tight dark:text-muted-foreground">
+          {formatTokenCount(tokensUsed)} / {formatTokenCount(contextWindow)} tokens
         </p>
       </TooltipContent>
     </Tooltip>

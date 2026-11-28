@@ -33,6 +33,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 # Same liveness-race flake mitigation as test_hosts_filesystem: the
 # mock-WS host can be deregistered under parallel CI load, yielding a
@@ -44,26 +45,6 @@ pytestmark = [
 
 _HOST_ID = "7f6bda8f5e302e51cee65f7094f3d49e"
 _HOST_NAME = "wt-test-laptop"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build a minimal ASGI WebSocket scope.
-
-    :param path: WebSocket path, e.g. ``"/v1/hosts/X/tunnel"``.
-    :returns: ASGI scope dict.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 def _hello_text(name: str = _HOST_NAME) -> str:
@@ -127,15 +108,11 @@ async def wt_setup(
         await asyncio.sleep(0.01)
 
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
         """Drain outbound WS frames and feed back the configured reply."""
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -166,19 +143,30 @@ async def wt_setup(
     try:
         yield app, registry, comm, replies
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
-        # Send an explicit disconnect so the tunnel endpoint's finally-block
-        # calls host_store.set_offline() and registry.deregister() before
-        # this fixture returns. Without this, those calls happen whenever the
-        # comm is GC'd — potentially during the next test's setup window.
-        # Swallow CancelledError: the asgiref communicator may already be done
-        # if the event loop cancelled its internal future during teardown.
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+            with contextlib.suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
             await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
+
+
+async def test_list_worktrees_survives_idle_mock_host(
+    wt_setup: tuple[FastAPI, HostRegistry, ApplicationCommunicator, dict[str, dict[str, Any]]],
+) -> None:
+    """The mock host remains connected while no requests are in flight."""
+    app, registry, comm, replies = wt_setup
+    replies["/projects/repo"] = {"worktrees": []}
+    await asyncio.sleep(0.75)
+    assert not comm.future.done()
+    assert registry.get(_HOST_ID) is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/worktrees", params={"path": "/projects/repo"}
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["data"] == []
 
 
 @pytest.mark.parametrize("legacy_provider", [False, True])

@@ -1,21 +1,117 @@
 """
-Shared helpers for exposing an agent bundle's skills to a Claude harness.
+Expose bundle and portable skills to Claude harnesses.
 
-Both the Claude Agent SDK executor (in-process, ``claude_sdk_executor``)
-and the ``claude-native`` CLI launch path expose a bundle's
-``skills/<dir>/SKILL.md`` files to Claude Code through its plugin
-convention (``--plugin-dir <bundle>``). This module centralizes the two
-pieces that wiring needs so the SDK and native paths stay in lockstep:
-writing the bundle's ``.claude-plugin/plugin.json`` manifest, and
-translating the spec's ``skills_filter`` into the Claude Code CLI args
-(``--plugin-dir`` + ``--setting-sources``) that the native path passes
-to the real ``claude`` binary.
+Both SDK and native Claude load bundled skills as plugins. Native Claude
+also loads portable ``.agents`` skills through a session-owned additional
+directory, preserving their bare command names and supporting files.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
+import stat
+from dataclasses import replace
 from pathlib import Path
+
+from omnigent.spec.skill_sources import (
+    _claude_code_skills,
+    select_claude_portable_skills,
+    skill_source_context_from_env,
+)
+
+_log = logging.getLogger(__name__)
+
+
+def _copy_contained_skill(
+    skills_root: Path,
+    root_fd: int,
+    relative: Path,
+    destination: Path,
+    ancestors: frozenset[tuple[int, int]] = frozenset(),
+) -> None:
+    """Materialize a skill entry using only descriptors beneath the pinned root."""
+    try:
+        resolved = (skills_root / relative).resolve(strict=True).relative_to(skills_root)
+    except (ValueError, RuntimeError) as exc:
+        raise ValueError("Skill symlinks must stay inside the skills tree without cycles") from exc
+
+    source_fd = os.dup(root_fd)
+    try:
+        for index, component in enumerate(resolved.parts):
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            if index < len(resolved.parts) - 1:
+                flags |= os.O_DIRECTORY
+            info = os.stat(component, dir_fd=source_fd, follow_symlinks=False)
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise ValueError("Skills may contain only regular files and directories")
+            next_fd = os.open(component, flags, dir_fd=source_fd)
+            os.close(source_fd)
+            source_fd = next_fd
+        info = os.fstat(source_fd)
+        if stat.S_ISDIR(info.st_mode):
+            identity = (info.st_dev, info.st_ino)
+            if identity in ancestors:
+                raise ValueError("Skill symlinks must not create directory cycles")
+            destination.mkdir(mode=0o700)
+            for name in os.listdir(source_fd):
+                _copy_contained_skill(
+                    skills_root,
+                    root_fd,
+                    resolved / name,
+                    destination / name,
+                    ancestors | {identity},
+                )
+        elif stat.S_ISREG(info.st_mode):
+            # Any extra link could expose bundle configuration outside skills/.
+            if info.st_nlink != 1:
+                raise ValueError("Skill source files must not be hard-linked")
+            with os.fdopen(os.dup(source_fd), "rb") as source, destination.open("xb") as target:
+                shutil.copyfileobj(source, target)
+            destination.chmod(info.st_mode & 0o777)
+        else:
+            raise ValueError("Skills may contain only regular files and directories")
+    finally:
+        os.close(source_fd)
+
+
+def stage_contained_bundle_skills(
+    bundle_dir: Path, destination: Path, agent_name: str | None
+) -> Path:
+    """Copy only bundled skills and a generated manifest into a fresh private plugin.
+
+    The destination's parent must be owned by the trusted runtime. Internal
+    symlinks are materialized; escaping links, root skills links, special files,
+    and multiply linked files are rejected. Script execute permissions survive.
+    The caller must separately prevent sandbox access to original bundle config.
+    """
+    bundle_root = bundle_dir.resolve(strict=True)
+    if destination.resolve().is_relative_to(bundle_root):
+        raise ValueError("Contained skill destination must stay outside the original bundle")
+    skills_root = bundle_root / "skills"
+    if skills_root.is_symlink():
+        raise ValueError("The bundle skills root must not be a symlink")
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        raise OSError("Contained bundle skills require directory-relative no-follow file access")
+
+    destination.mkdir(mode=0o700, parents=True)
+    try:
+        try:
+            root_fd = os.open(skills_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            root_fd = None
+        if root_fd is not None:
+            try:
+                _copy_contained_skill(skills_root, root_fd, Path(), destination / "skills")
+            finally:
+                os.close(root_fd)
+        ensure_bundle_plugin_manifest(destination, agent_name or bundle_dir.name)
+    except BaseException:
+        _remove_skill_overlay(destination)
+        raise
+    return destination
 
 
 def ensure_bundle_plugin_manifest(
@@ -112,3 +208,83 @@ def claude_native_skill_args(
         # skills ride --plugin-dir and are unaffected.
         args.extend(["--setting-sources", ""])
     return args
+
+
+def _remove_skill_overlay(path: Path) -> None:
+    """Remove owned copies, including read-only files, without following skill links."""
+    if path.is_symlink():
+        path.unlink()
+        return
+    if not path.exists():
+        return
+    path.chmod(path.stat().st_mode | 0o700)
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for names, owner_permissions in ((dirs, 0o700), (files, 0o600)):
+            for name in names:
+                entry = Path(root) / name
+                if not entry.is_symlink():
+                    entry.chmod(entry.stat().st_mode | owner_permissions)
+    shutil.rmtree(path)
+
+
+def claude_agents_skill_overlay(bridge_dir: Path) -> Path:
+    """Return the session-owned directory :func:`claude_agents_skill_args` adds.
+
+    :param bridge_dir: Session-owned bridge directory.
+    :returns: The overlay path, e.g. ``bridge_dir / "agent-skills"``.
+    """
+    return bridge_dir / "agent-skills"
+
+
+def claude_agents_skill_args(
+    bridge_dir: Path,
+    roots: tuple[Path, ...],
+    skills_filter: str | list[str],
+) -> list[str]:
+    """Expose portable skills through Claude's additional-directory discovery.
+
+    :param bridge_dir: Session-owned directory for the skill links.
+    :param roots: Workspace and optional bundle discovery roots, in priority order.
+    :param skills_filter: Host skill selection from the agent spec.
+    :returns: Claude CLI arguments loading the selected portable skills.
+    """
+    overlay = claude_agents_skill_overlay(bridge_dir)
+    _remove_skill_overlay(overlay)
+    ctx = skill_source_context_from_env(
+        roots=roots,
+        harness="claude-native",
+        skills_filter=skills_filter,
+        bundle_dir=roots[1] if len(roots) > 1 else None,
+    )
+    skills = _claude_code_skills(ctx, ".agents")
+    if not skills:
+        return []
+    skills = select_claude_portable_skills(
+        skills, _claude_code_skills(replace(ctx, is_native=True, skills_filter="all"))
+    )
+    if not skills:
+        return []
+    target = overlay / ".claude" / "skills"
+    target.mkdir(parents=True)
+    staged = False
+    for skill in skills:
+        if skill.skill_dir is None:
+            continue
+        # Claude uses the link's directory basename as the command name.
+        destination = target / skill.name
+        try:
+            destination.symlink_to(skill.skill_dir.resolve(), target_is_directory=True)
+        except FileExistsError:
+            _log.warning("Skipping portable skill %s: destination already exists", skill.skill_dir)
+            continue
+        except OSError:
+            # Windows may require privileges to create directory symlinks.
+            try:
+                shutil.copytree(skill.skill_dir, destination, symlinks=True)
+            except OSError as exc:
+                if not isinstance(exc, FileExistsError):
+                    _remove_skill_overlay(destination)
+                _log.warning("Skipping portable skill %s: %s", skill.skill_dir, exc)
+                continue
+        staged = True
+    return ["--add-dir", str(overlay)] if staged else []

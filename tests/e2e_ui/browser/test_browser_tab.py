@@ -4,9 +4,9 @@ The browser pane is desktop-only: ``AppShell`` marks the Browser rail tab
 available when ``supportsBrowser()`` is true, i.e. when the Electron preload
 exposes ``window.omnigentDesktop.kind === "electron"`` *and* the embedded-
 browser bridge method ``browserOpenOrNavigate`` (an older desktop build that
-predates the feature lacks it) — see ``web/src/lib/nativeBridge.ts``. The tab
-is deliberately the LAST tab in the rail (Files · Agents · Shells · Tasks ·
-Browser).
+predates the feature lacks it) — see ``web/src/lib/nativeBridge.ts``. Browser
+is offered only from ``+`` and opens as a closable soft tab; there is no fixed
+Browser navigation icon.
 
 The e2e_ui harness runs the SPA in a plain Chromium browser, not Electron, so
 by default the tab is absent. To exercise the desktop path end-to-end we inject
@@ -14,8 +14,8 @@ a minimal ``window.omnigentDesktop`` stub via ``add_init_script`` *before any
 app script runs* — the same feature-detection stubbing
 ``sessions/test_pinned_session_hotkeys.py`` uses. That covers the chain the
 component/unit tests can't reach end to end: the injected bridge ->
-``supportsBrowser()`` -> ``AppShell`` marking the tab available -> the
-``WorkspacePanel`` rendering it last -> selecting it mounting the pane.
+``supportsBrowser()`` -> ``WorkspacePanel`` offering Browser from ``+`` ->
+creating a soft tab -> selecting it mounting the pane.
 
 No LLM turn is involved; the assertions are DOM-based.
 """
@@ -58,18 +58,16 @@ window.omnigentDesktop = {
 """
 
 
-def test_browser_tab_is_last_and_opens_pane(
+def test_browser_is_soft_tab_only_and_opens_pane(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Under the Electron stub, the Browser tab shows LAST and opens the pane.
+    """Under the Electron stub, Browser opens only as a soft tab.
 
     Asserts the desktop-only chain end to end:
 
-    1. With the Electron bridge stubbed, the "Browser" tab appears in the
-       Workspace rail (``supportsBrowser()`` -> tab available).
-    2. It is the LAST tab in the rail (the deliberate ordering — after
-       Files / Agents / Shells / Tasks).
+    1. No permanent Browser navigation tab is present.
+    2. ``+`` offers Browser and creates it as the last, closable soft tab.
     3. Selecting it mounts the browser pane region.
 
     :param page: Playwright page fixture (fresh context per test).
@@ -84,22 +82,23 @@ def test_browser_tab_is_last_and_opens_pane(
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
 
-    # (1) The Browser tab is present under the Electron stub.
-    browser_tab = rail.get_by_role("tab", name=re.compile("Browser"))
+    # (1) Browser has no permanent icon-only navigation tab.
+    expect(rail.get_by_role("tab", name="Browser", exact=True)).to_have_count(0)
+
+    # (2) The new-tab menu creates the Browser soft tab.
+    rail.get_by_role("button", name="Open new", exact=True).click()
+    page.get_by_role("menuitem", name="Browser", exact=True).click()
+    browser_tab = rail.get_by_role("tab", name="Browser 1", exact=True)
     expect(browser_tab).to_be_visible()
 
-    # (2) It is the LAST tab. Read every rail tab's accessible name in DOM
-    # order and confirm "Browser" is the final entry.
+    # It is the LAST tab. Read every rail tab's accessible name in DOM order.
     tab_names = rail.get_by_role("tab").all_inner_texts()
     assert tab_names, "expected at least one Workspace rail tab"
     assert re.search("Browser", tab_names[-1]), (
         f"Browser tab must be last; rail tab order was {tab_names!r}"
     )
 
-    # (3) Selecting it mounts the pane. The tab becomes the selected one
-    # (aria-selected), which is what drives WorkspacePanel to render the
-    # browser content region.
-    browser_tab.click()
+    # (3) The soft tab is selected and mounts the browser content region.
     expect(browser_tab).to_have_attribute("aria-selected", "true")
 
 
@@ -172,6 +171,4 @@ def test_multiple_browser_soft_tabs(page: Page, seeded_session: tuple[str, str])
         "aria-selected", "true"
     )
     rail.get_by_role("button", name="Close Browser 1", exact=True).click()
-    expect(rail.get_by_role("tab", name="Browser", exact=True)).to_have_attribute(
-        "aria-selected", "true"
-    )
+    expect(rail.get_by_role("tab", name=re.compile("Browser"))).to_have_count(0)

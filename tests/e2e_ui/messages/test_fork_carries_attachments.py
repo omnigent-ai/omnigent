@@ -52,6 +52,7 @@ from tests.e2e_ui.conftest import (
     _temp_omnigent_mock_config,
     seed_committed_items,
 )
+from tests.helpers.ui_configuration import validate_native_claude_mock_routing
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 # Checked-in 100x100 red square with a blue center.
@@ -59,9 +60,14 @@ _TEST_IMAGE_PATH = _REPO_ROOT / "tests" / "resources" / "test_image.png"
 
 # Runner-log lines that mean the attachment did NOT survive the fork: the
 # native executor received the raw file_id (resolver never inlined it), or
-# the resolver's fetch through the fork's file endpoint failed.
+# the resolver's fetch through the fork's file endpoint failed after retries.
+# The resolver's failure lines deliberately omit the file id, so they are
+# asserted absent globally rather than paired with a specific file.
 _UNRESOLVED_SIGNATURE = "Native executor received unresolved file_id"
-_RESOLVE_FAILED_SIGNATURE = "failed to resolve file_id"
+_RESOLVE_FAILED_SIGNATURES = (
+    "Attachment metadata read failed",
+    "Attachment content read failed",
+)
 
 # claude-native built-in seeded unconditionally at server startup; forking
 # onto it switches the fork's harness (SDK -> Claude Code).
@@ -260,11 +266,13 @@ def test_fork_into_claude_native_carries_image_attachment(
     page: Page,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
+    claude_managed_settings: None,
 ) -> None:
     """Fork an SDK chat (with an uploaded image) into Claude Code → the fork
     owns a copy of the attachment, the chat renders it, and the native
     transcript rebuild resolves it instead of logging an unresolved file_id.
     """
+    validate_native_claude_mock_routing(mock_llm_server_url)
     base_url, source_id = seeded_session
     runner_id = str(_server_state["runner_id"])
     target_agent_id = _agent_id_by_name(base_url, _CLAUDE_NATIVE_TARGET)
@@ -341,13 +349,17 @@ def test_fork_into_claude_native_carries_image_attachment(
         #    source's or the fork's file id.
         time.sleep(_LOG_SETTLE_S)
         log_text = _read_runner_logs()
-        for signature in (_UNRESOLVED_SIGNATURE, _RESOLVE_FAILED_SIGNATURE):
-            for file_id in (source_file_id, fork_file_id):
-                assert not (signature in log_text and file_id in log_text), (
-                    f"runner logged {signature!r} for file {file_id!r} — the forked "
-                    f"transcript rebuild did not resolve the attachment; last 4000 "
-                    f"chars:\n{log_text[-4000:]}"
-                )
+        for file_id in (source_file_id, fork_file_id):
+            assert not (_UNRESOLVED_SIGNATURE in log_text and file_id in log_text), (
+                f"runner logged {_UNRESOLVED_SIGNATURE!r} for file {file_id!r} — the "
+                f"forked transcript rebuild did not resolve the attachment; last 4000 "
+                f"chars:\n{log_text[-4000:]}"
+            )
+        for signature in _RESOLVE_FAILED_SIGNATURES:
+            assert signature not in log_text, (
+                f"runner logged {signature!r} — an attachment fetch failed during the "
+                f"forked transcript rebuild; last 4000 chars:\n{log_text[-4000:]}"
+            )
 
         # -- End on the user-visible outcome: back in the chat, the
         #    attachment still renders. (Also leaves a recording's final

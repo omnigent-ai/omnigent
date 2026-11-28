@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -61,6 +62,15 @@ class _GatedPolicy:
     name: str
     policy: FunctionPolicy
     phases: frozenset[Phase]
+    # True when ``policy`` is the fail-closed stand-in for a spec policy that
+    # could not be resolved. Its DENY is a load failure, not a real verdict, so
+    # the start probe refuses to launch instead of silently dropping a transform.
+    fail_closed: bool = False
+    # True when the policy declared TOOL_CALL (or self-selects via ``on=None``).
+    # Only such a policy can transform the start probe, so only its unresolved
+    # sentinel gates agent start; a tool_result-only policy still fails tool
+    # dispatch closed but must not block session init.
+    start_gated: bool = True
 
 
 @dataclass(frozen=True)
@@ -105,6 +115,26 @@ class PolicyVerdict:
 # Singleton ALLOW verdict — frozen dataclass, no state, allocate
 # once and share across every fast-path tool call.
 _ALLOW: PolicyVerdict = PolicyVerdict(action="allow")
+
+# Synthetic tool name the runner probes before spawning an agent; start-aware
+# policies such as ``enforce_sandbox`` key on it to transform the launch.
+AGENT_START_TOOL = "sys_agent_start"
+
+
+class AgentStartPolicyError(RuntimeError):
+    """A guardrails policy could not be evaluated for the start probe.
+
+    Raised when a tool-phase policy raised or failed to resolve while the
+    runner probed ``sys_agent_start``. Such a policy might have restricted the
+    launch (e.g. ``enforce_sandbox``), so the runner fails session init closed
+    rather than starting the agent with the un-transformed spec.
+    """
+
+    def __init__(self, policy_name: str, reason: str) -> None:
+        """Record the offending policy name and why it could not be evaluated."""
+        self.policy_name = policy_name
+        self.reason = reason
+        super().__init__(f"guardrails policy {policy_name!r} {reason}; refusing agent start")
 
 
 def _resolve_failure_diagnostic(ps: FunctionPolicySpec, exc: BaseException) -> str:
@@ -170,6 +200,10 @@ class RunnerToolPolicyGate:
                 phases = frozenset(s.phase for s in ps.on if _selector_covers_tools(s.phase))
             if not phases:
                 continue
+            # Capture start-probe participation from the declared phases before a
+            # resolution failure broadens them: only a TOOL_CALL (or on=None)
+            # policy can transform the launch and gate agent start.
+            start_gated = Phase.TOOL_CALL in phases
             try:
                 policy = resolve_function_policy(ps)
             except Exception as exc:  # noqa: BLE001 - all resolution failures deny
@@ -179,7 +213,18 @@ class RunnerToolPolicyGate:
                 )
                 policy = _unresolved_policy_sentinel(ps, exc)
                 phases = frozenset([Phase.TOOL_CALL, Phase.TOOL_RESULT])
-            out.append(_GatedPolicy(name=ps.name, policy=policy, phases=phases))
+                fail_closed = True
+            else:
+                fail_closed = False
+            out.append(
+                _GatedPolicy(
+                    name=ps.name,
+                    policy=policy,
+                    phases=phases,
+                    fail_closed=fail_closed,
+                    start_gated=start_gated,
+                )
+            )
         return cls(out)
 
     def reset_turn(self) -> None:
@@ -216,6 +261,91 @@ class RunnerToolPolicyGate:
             tool_name=tool_name,
         )
         return await self._evaluate_policies(ctx, Phase.TOOL_CALL)
+
+    async def evaluate_agent_start(
+        self,
+        arguments: dict[str, object],
+    ) -> Mapping[str, object] | None:
+        """
+        Run TOOL_CALL policies over the synthetic ``sys_agent_start`` probe.
+
+        The probe lets start-aware policies such as ``enforce_sandbox``
+        transform the launch: an ALLOW result's ``data`` composes into the
+        next policy's input, as in :meth:`evaluate_tool_call`. It is not a real
+        tool call, so a clean DENY or ASK from a resolved policy does not gate
+        agent start -- the verdict is logged and skipped, and (unlike
+        :meth:`evaluate_tool_call`, which still composes ASK ``data``) any
+        transform it carries is dropped. A generic allowlist that rejects the
+        probe name therefore cannot block the launch, and the remaining
+        policies still contribute their ALLOW transforms.
+
+        A policy the runner could not evaluate is treated differently from a
+        clean verdict. If a start-capable policy (declared on ``tool_call`` or
+        self-selecting via ``on=None``) raised, failed to resolve and was
+        replaced by the fail-closed sentinel, or returned a transform that does
+        not preserve the probe's ``name``/``arguments`` shape, its intended
+        effect is unknown, so the probe fails closed rather than launching with
+        a possibly-dropped sandbox restriction. A ``tool_result``-only policy
+        that fails to resolve still denies tool dispatch but cannot have
+        transformed the launch, so it does not block session init.
+
+        :param arguments: Probe arguments, e.g. ``{"agent_name": "...",
+            "harness": "claude-sdk", "sandbox": {...}}``.
+        :returns: The composed replacement payload, or ``None`` when no
+            policy transformed the probe.
+        :raises AgentStartPolicyError: When a tool-phase policy raised, failed
+            to resolve, or returned a malformed start transform while
+            evaluating the probe.
+        """
+        ctx = EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            content={"name": AGENT_START_TOOL, "arguments": arguments},
+            tool_name=AGENT_START_TOOL,
+        )
+        composed_data: Mapping[str, object] | None = None
+        for gated in self._policies:
+            if Phase.TOOL_CALL not in gated.phases:
+                continue
+            if gated.fail_closed:
+                if not gated.start_gated:
+                    # Declared on tool_result only, so it could never transform
+                    # the launch; its load failure fails tool dispatch closed but
+                    # must not block agent start.
+                    continue
+                # The configured policy never resolved, so its intended launch
+                # transform is unknown. Refuse to start rather than risk running
+                # the agent with a sandbox restriction silently dropped.
+                raise AgentStartPolicyError(gated.name, "failed to resolve")
+            try:
+                result: PolicyResult = await gated.policy.evaluate(ctx, {})
+            except Exception as exc:
+                # Same fail-closed reasoning: a transform policy such as
+                # enforce_sandbox that raised here would otherwise be dropped,
+                # launching the agent with its weaker declared sandbox.
+                raise AgentStartPolicyError(gated.name, "raised on the start probe") from exc
+            if result.action != PolicyAction.ALLOW:
+                _logger.warning(
+                    "runner policy %r returned %s for the %s probe; ignoring it, "
+                    "tool_call policies do not gate agent start",
+                    gated.name,
+                    result.action.value,
+                    AGENT_START_TOOL,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                continue
+            if result.data is not None:
+                if (
+                    not isinstance(result.data, Mapping)
+                    or result.data.get("name") != AGENT_START_TOOL
+                    or not isinstance(result.data.get("arguments"), Mapping)
+                ):
+                    # A malformed transform would chain into the next policy and
+                    # the sandbox override as a silent no-op, dropping the
+                    # restriction. Fail closed to keep the start transform honest.
+                    raise AgentStartPolicyError(gated.name, "returned a malformed start transform")
+                composed_data = result.data
+                ctx = replace(ctx, content=composed_data)
+        return composed_data
 
     async def evaluate_tool_result(
         self,

@@ -34,6 +34,8 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
         "OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET",
         "OMNIGENT_SLACK_DATABRICKS_SCOPES",
         "OMNIGENT_SLACK_DATABRICKS_APP_URL",
+        "OMNIGENT_SLACK_DEFAULT_AGENT_ID",
+        "OMNIGENT_SLACK_DEFAULT_HOST_TYPE",
         "DATABRICKS_HOST",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -299,3 +301,62 @@ def test_webauth_port_defaults_to_8000(monkeypatch: pytest.MonkeyPatch) -> None:
     # Laptop run without the platform var: fall back to the 8000 convention.
     _set_env(monkeypatch)
     assert _load().databricks_webauth_port == 8000
+
+
+# ── Operator-set setup defaults ──────────────────────────────────────
+
+
+def test_setup_defaults_are_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deployment that sets neither var gets no defaults at all."""
+    _set_env(monkeypatch)
+    settings = _load()
+    assert settings.default_agent_id is None
+    assert settings.default_host_type is None
+
+
+def test_setup_defaults_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(
+        monkeypatch,
+        OMNIGENT_SLACK_DEFAULT_AGENT_ID="ag_standard",
+        OMNIGENT_SLACK_DEFAULT_HOST_TYPE="managed",
+    )
+    settings = _load()
+    assert settings.default_agent_id == "ag_standard"
+    assert settings.default_host_type == "managed"
+
+
+def test_setup_defaults_strip_surrounding_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A deploy template that pads the value must still name a real agent id.
+    _set_env(monkeypatch, OMNIGENT_SLACK_DEFAULT_AGENT_ID="  ag_standard  ")
+    assert _load().default_agent_id == "ag_standard"
+
+
+def test_blank_setup_defaults_are_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `OMNIGENT_SLACK_DEFAULT_HOST_TYPE=` in a compose file means "off", not a
+    # bad value — and a blank agent id is no agent, not one named "".
+    _set_env(
+        monkeypatch,
+        OMNIGENT_SLACK_DEFAULT_AGENT_ID="   ",
+        OMNIGENT_SLACK_DEFAULT_HOST_TYPE="",
+    )
+    settings = _load()
+    assert settings.default_agent_id is None
+    assert settings.default_host_type is None
+
+
+def test_unknown_default_host_type_fails_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the managed sandbox is defaultable; anything else is a config error.
+
+    An external host id can't be honored (``/v1/hosts`` is owner-scoped, so one
+    user's host is invisible to the rest), so a value naming one must fail loudly
+    at startup rather than be silently ignored for every user.
+    """
+    _set_env(monkeypatch, OMNIGENT_SLACK_DEFAULT_HOST_TYPE="external")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    msg = str(excinfo.value)
+    assert "Invalid configuration" in msg
+    assert "OMNIGENT_SLACK_DEFAULT_HOST_TYPE" in msg
+    assert "managed" in msg

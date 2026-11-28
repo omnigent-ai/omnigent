@@ -66,11 +66,13 @@ impl Pod {
         Ok(pod)
     }
 
+    /// The pod server's SQLite database.
+    pub fn chat_db(&self) -> PathBuf {
+        self.dir.join("data/omnigent/chat.db")
+    }
+
     pub fn db_uri(&self) -> String {
-        format!(
-            "sqlite:///{}",
-            self.dir.join("data/omnigent/chat.db").display()
-        )
+        format!("sqlite:///{}", self.chat_db().display())
     }
 
     pub fn artifacts_dir(&self) -> PathBuf {
@@ -113,15 +115,6 @@ impl Pod {
     /// Profiles select their web directory and dependency manifests.
     pub fn needs_web_prepare(&self) -> bool {
         let web = self.web_dir();
-        let modules = web.join("node_modules");
-        if !modules.is_dir() {
-            return true;
-        }
-        let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        let Some(installed) = mtime(modules) else {
-            return true;
-        };
-        // Reinstall if either manifest is newer than node_modules.
         let manifests = self
             .profile
             .as_ref()
@@ -132,16 +125,8 @@ impl Pod {
                     .map(|path| web.join(path))
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_else(|| {
-                vec![
-                    self.repo_root.join("pnpm-lock.yaml"),
-                    web.join("package.json"),
-                ]
-            });
-        manifests
-            .into_iter()
-            .filter_map(mtime)
-            .any(|t| t > installed)
+            .unwrap_or_else(|| oss_web_manifests(&self.repo_root));
+        web_deps_stale(&web, manifests)
     }
 
     /// Directory to watch for backend source changes.
@@ -214,6 +199,30 @@ impl Pod {
     }
 }
 
+/// The OSS checkout's web dependency manifests: the root lockfile and `web/package.json`.
+pub fn oss_web_manifests(repo_root: &Path) -> Vec<PathBuf> {
+    vec![
+        repo_root.join("pnpm-lock.yaml"),
+        repo_root.join("web").join("package.json"),
+    ]
+}
+
+/// Whether `<web>/node_modules` is missing or older than any manifest.
+pub fn web_deps_stale(web: &Path, manifests: Vec<PathBuf>) -> bool {
+    let modules = web.join("node_modules");
+    if !modules.is_dir() {
+        return true;
+    }
+    let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let Some(installed) = mtime(modules) else {
+        return true;
+    };
+    manifests
+        .into_iter()
+        .filter_map(mtime)
+        .any(|t| t > installed)
+}
+
 /// Remove a pod directory (for `--clean`). No-op if it does not exist.
 pub fn clean(dir: &Path) -> Result<()> {
     if dir.exists() {
@@ -254,11 +263,7 @@ fn seed_config_file(src: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // `real_config_path` reads process-global env; serialize the tests that
-    // set it so parallel runs don't observe each other's overrides.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::paths::lock_test_env;
 
     fn tempdir() -> PathBuf {
         let unique = format!(
@@ -290,9 +295,9 @@ mod tests {
 
     /// Point `OMNIGENT_CONFIG_HOME` at `home` for the duration of `f`, restoring
     /// the previous value afterwards. Serialized against other env-touching
-    /// tests via `ENV_LOCK`.
+    /// tests via `lock_test_env`.
     fn with_config_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_test_env();
         let prev = std::env::var_os("OMNIGENT_CONFIG_HOME");
         std::env::set_var("OMNIGENT_CONFIG_HOME", home);
         let out = f();
@@ -366,7 +371,7 @@ mod tests {
     fn real_config_path_falls_back_to_home_dot_omnigent() {
         // With no OMNIGENT_CONFIG_HOME, the real config resolves under
         // `$HOME/.omnigent/` — the path a normal pod run seeds from.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_test_env();
         let prev_cfg = std::env::var_os("OMNIGENT_CONFIG_HOME");
         let prev_home = std::env::var_os("HOME");
 

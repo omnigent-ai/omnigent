@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from alembic import command
+from packaging.version import Version
 from sqlalchemy import Engine, inspect, text
 
 from omnigent.db.cockroachdb import (
@@ -33,6 +36,14 @@ def _crdb_engine(db_uri: str) -> Engine:
 def test_cockroachdb_bootstrap_is_at_head(db_uri: str) -> None:
     engine = _crdb_engine(db_uri)
     assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+
+
+def test_cockroachdb_server_matches_matrix_version(db_uri: str) -> None:
+    engine = _crdb_engine(db_uri)
+    expected = os.environ.get("OMNIGENT_TEST_CRDB_VERSION")
+    if not expected:
+        pytest.skip("requires OMNIGENT_TEST_CRDB_VERSION from the compatibility matrix")
+    assert _crdb_server_version(engine) == Version(expected)
 
 
 def test_cockroachdb_uses_read_committed(db_uri: str) -> None:
@@ -159,3 +170,62 @@ def test_account_generation_backfill_resumes_after_schema_commit(db_uri) -> None
     grant = grants.authorize_access("migration-grant")
     assert grant is not None and grant.account_generation == account.account_generation
     assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+
+
+@pytest.mark.parametrize("failed_attempts", [2, 3])
+def test_project_preferences_copy_retries_serialization_failures(
+    db_uri: str, failed_attempts: int, capfd: pytest.CaptureFixture[str]
+) -> None:
+    from sqlalchemy import event
+
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    engine = _crdb_engine(db_uri)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("ordering-user", "existing-password-hash")
+    config = _build_alembic_config(db_uri)
+    with engine.connect() as connection:
+        _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        command.downgrade(config, "ii1a2b3c4d5e")
+        connection.commit()
+
+    payload = b"legacy project order bytes"
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE users SET project_order = :value WHERE id = 'ordering-user'"),
+            {"value": payload},
+        )
+
+    attempts = 0
+
+    def fail_copy(conn, cursor, statement, parameters, context, executemany):
+        nonlocal attempts
+        if statement.startswith("INSERT INTO preferences"):
+            attempts += 1
+            if attempts <= failed_attempts:
+                # Observed results prevent transparent server retries of a fresh transaction.
+                cursor.execute("SELECT id FROM users WHERE id = 'ordering-user'")
+                cursor.fetchone()
+                return "SELECT crdb_internal.force_retry('10s')", ()
+        return statement, parameters
+
+    event.listen(engine, "before_cursor_execute", fail_copy, retval=True)
+    try:
+        _initialize_or_verify_schema(engine, db_uri)
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_copy)
+
+    assert attempts == 3
+    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+    assert "project_order" not in {c["name"] for c in inspect(engine).get_columns("users")}
+    with engine.connect() as connection:
+        saved = connection.execute(
+            text(
+                "SELECT value FROM preferences "
+                "WHERE user_id = 'ordering-user' AND key = 'project_order'"
+            )
+        ).scalar_one_or_none()
+    assert saved == (payload if failed_attempts == 2 else None)
+    warning = "Could not migrate project order preferences after 3 attempts"
+    assert (warning in capfd.readouterr().err) == (failed_attempts == 3)

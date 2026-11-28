@@ -241,7 +241,8 @@ def test_host_start_recovers_from_recycled_pid_record(
             if record_path.exists():
                 try:
                     current = json.loads(record_path.read_text())
-                except json.JSONDecodeError:
+                except (FileNotFoundError, json.JSONDecodeError):
+                    # Startup can remove the stale record between exists() and read_text().
                     current = {}
                 if current.get("pid") == host.pid:
                     reclaimed = True

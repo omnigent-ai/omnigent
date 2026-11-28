@@ -15,7 +15,7 @@ from tests.e2e_ui.start_session.test_start_session import (
 )
 
 
-@pytest.mark.parametrize("width", [929, 1600])
+@pytest.mark.parametrize("width", [1181, 1600])
 @pytest.mark.parametrize("theme", ["light", "dark"])
 def test_model_selector_stays_adjacent_and_reachable(
     seeded_session: tuple[str, str], width: int, theme: str
@@ -58,7 +58,8 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             hovered_background = await harness_row.evaluate(
                 "el => getComputedStyle(el).backgroundColor"
             )
-            other = page.get_by_role("menu").get_by_role("menuitem", name="Other...", exact=True)
+            assert hovered_background != "rgba(0, 0, 0, 0)"
+            other = page.get_by_test_id("new-chat-landing-custom-agents")
             await other.hover()
             await expect(harness_row).to_have_css("background-color", "rgba(0, 0, 0, 0)")
             await expect(other).to_have_css("background-color", hovered_background)
@@ -117,13 +118,15 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
                 child_box["x"] + child_box["width"],
             ) - max(trigger_box["x"], child_box["x"])
             assert overlap <= 4, (trigger_box, child_box)
-            await expect(child).to_have_attribute("data-side", "left" if width == 929 else "right")
+            await expect(child).to_have_attribute(
+                "data-side", "left" if width == 1181 else "right"
+            )
 
             await edit.hover()
             await page.mouse.move(parent_box["x"] + parent_box["width"] / 2, parent_box["y"] + 2)
             await page.wait_for_timeout(500)
             await expect(models).to_be_visible()
-            await parent.get_by_role("menuitem", name="Other...", exact=True).hover()
+            await other.hover()
             await page.wait_for_timeout(500)
             await expect(models).to_be_visible()
             await edit.hover()
@@ -167,7 +170,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             await trigger.click()
             await edit.click()
             await expect(models).to_be_visible()
-            await parent.get_by_role("menuitem", name="Other...", exact=True).click()
+            await other.click()
             await expect(models).not_to_be_visible()
             await expect(page.get_by_role("menuitem", name="Create custom agent")).to_be_visible()
             await page.mouse.click(20, 20)

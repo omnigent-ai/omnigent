@@ -42,6 +42,7 @@ from omnigent.inner.cursor_native_executor import (
     _latest_user_text,
 )
 from omnigent.inner.executor import ExecutorError
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 
 class TestContentExtraction:
@@ -67,7 +68,7 @@ class TestContentExtraction:
         )
         out = _content_to_text([{"type": "input_image", "image_url": png}], tmp_path)
         assert out.startswith("[Attached: ")
-        assert str(tmp_path) in out
+        assert str(attachment_cache_dir(tmp_path)) in out
 
     def test_empty_and_none(self, tmp_path: Path) -> None:
         assert _content_to_text(None, tmp_path) == ""
@@ -271,6 +272,9 @@ class TestBridge:
         ]
         assert "sys_session_send" in server["autoApprove"]
         assert "sys_os_shell" in server["autoApprove"]
+        assert "sys_project_list" in server["autoApprove"]
+        assert "sys_session_update" in server["autoApprove"]
+        assert "sys_project_update" in server["autoApprove"]
         assert server["autoApprove"] == sorted(server["autoApprove"])
         assert server["env"]["TMPDIR"]
 

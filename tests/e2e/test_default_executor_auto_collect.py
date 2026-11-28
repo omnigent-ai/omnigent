@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any
 
 import httpx
 import pytest
@@ -36,23 +35,6 @@ from tests.e2e.conftest import (
 # test-infra gap, not a product regression. The backwards-compat matrix skips
 # this against servers < 0.3.0; it runs unchanged on main.
 pytestmark = pytest.mark.min_server_version("0.3.0")
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """
-    Concatenate all output_text blocks from a response body.
-
-    :param body: The terminal response body.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def _wait_for_markers(

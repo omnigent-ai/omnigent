@@ -79,6 +79,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -114,6 +115,10 @@ describe("newChatPickerCache", () => {
 
   it("isolates and expires cached menu choices just like their labels", () => {
     writeNewChatPickerOptionsCache(key, options);
+    document.cookie = "omnigent_admin_view=off; Path=/";
+    expect(getNewChatPickerCacheKey("")).not.toBe(key);
+    expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey(""))).toBeNull();
+    document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
     expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey("another-project"))).toBeNull();
     expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey("", "another-user"))).toBeNull();
     vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
@@ -397,7 +402,7 @@ describe("directory and permission previews", () => {
     hostId: "host_1",
     workspace: "/work/repo",
     repositoryLabel: "repo",
-    branchLabel: "New worktree",
+    branchLabel: "Choose",
     branchDescription: "Create or select a worktree from main repository branch: main",
   };
 

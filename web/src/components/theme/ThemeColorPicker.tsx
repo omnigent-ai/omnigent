@@ -3,6 +3,10 @@ import { DicesIcon } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { isHexColor } from "@/lib/customTheme";
 import { cn } from "@/lib/utils";
+import {
+  SETTINGS_NO_TOOLTIP,
+  useSettingsOwnership,
+} from "@/pages/settings/search/settingsOwnership";
 
 interface HsvColor {
   hue: number;
@@ -79,6 +83,8 @@ export function ThemeColorPicker({
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  // Under a Settings owner the trigger is that part, named by its value; the popover is its overlay.
+  const owned = useSettingsOwnership();
   const [dragging, setDragging] = useState(false);
   const [draft, setDraft] = useState(value.toUpperCase());
   const color = useMemo(() => hexToHsv(value), [value]);
@@ -110,15 +116,19 @@ export function ThemeColorPicker({
 
   return (
     <div className="flex items-center justify-between gap-4 border-b border-border/70 py-3 last:border-b-0">
-      <span className="text-ui font-medium">{label}</span>
+      <span className="text-ui font-normal md:font-medium">{label}</span>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
             type="button"
-            aria-label={`${label}: ${value.toUpperCase()}`}
+            {...owned.control({
+              name: { runtime: value.toUpperCase() },
+              ...SETTINGS_NO_TOOLTIP,
+              outside: { "aria-label": `${label}: ${value.toUpperCase()}` },
+            })}
             data-testid={`${testId}-trigger`}
             className={cn(
-              "group flex h-10 w-44 items-center gap-2 rounded-xl border bg-background p-1.5 text-left shadow-xs outline-none transition-[border-color,box-shadow,transform]",
+              "group flex h-10 w-44 items-center gap-2 rounded-xl border border-input bg-background p-1.5 text-left shadow-xs outline-none transition-[border-color,box-shadow,transform] dark:bg-input",
               "hover:border-border-strong hover:shadow-sm focus-visible:ring-2 focus-visible:ring-ring/40 active:scale-[0.99]",
               open && "border-primary/60 ring-2 ring-primary/15",
             )}
@@ -134,6 +144,7 @@ export function ThemeColorPicker({
           </button>
         </PopoverTrigger>
         <PopoverContent
+          {...owned.overlay()}
           align="end"
           sideOffset={8}
           className="w-72 gap-0 overflow-hidden rounded-2xl border border-border/70 bg-popover p-0 shadow-xl ring-1 ring-black/5"

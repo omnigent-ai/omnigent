@@ -20,6 +20,8 @@ import type {
 } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
+import { parseEvent } from "./sse";
+import { itemsToBlocks } from "./itemsToBlocks";
 import type { Response } from "./types";
 
 function makeResponse(opts?: {
@@ -73,6 +75,35 @@ describe("BlockStream — response_start", () => {
 });
 
 describe("BlockStream — block ctx carries response_id and item_id", () => {
+  it("does not adopt lifecycle notice ids as the parent stream identity", () => {
+    const blocks = reduce([
+      {
+        type: "native_tool_call",
+        toolType: "subagent_activity",
+        data: {},
+        itemId: "notice_1",
+        responseId: "subagent_returned",
+      },
+      { type: "text_delta", delta: "Before identity\n" },
+      {
+        type: "tool_call",
+        name: "Read",
+        arguments: {},
+        callId: "call_1",
+        status: "completed",
+        agentName: "parent",
+        itemId: "tool_1",
+        responseId: "parent_turn",
+      },
+      { type: "text_delta", delta: "After identity\n" },
+    ]);
+
+    expect(blocks[0]?.ctx.responseId).toBe("subagent_returned");
+    expect(
+      blocks.filter((block) => block.type === "text_chunk").map((block) => block.ctx.responseId),
+    ).toEqual(["", "parent_turn"]);
+  });
+
   it("every block ctx.responseId is the active response id from response.created", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_xyz" }) },
@@ -291,6 +322,33 @@ describe("BlockStream — text", () => {
     expect(textDone.ctx.itemId).toBe("msg_terminal_1");
     expect(textDone.ctx.responseId).toBe("resp_terminal_1");
     expect(textDone.fullText).toBe("Hello from transcript");
+  });
+
+  it("message_done phase lands on the text_done it closes or emits", () => {
+    const streamed = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_1" }) },
+      { type: "text_delta", delta: "Checking." },
+      {
+        type: "message_done",
+        content: [],
+        itemId: "msg_1",
+        responseId: "resp_1",
+        phase: "commentary",
+      },
+    ]);
+    const closed = streamed.find((b): b is TextDone => b.type === "text_done");
+    expect(closed?.phase).toBe("commentary");
+
+    const [emitted] = reduce([
+      {
+        type: "message_done",
+        content: [{ type: "output_text", text: "Done." }],
+        itemId: "msg_2",
+        responseId: "resp_2",
+        phase: "final_answer",
+      },
+    ]);
+    expect((emitted as TextDone).phase).toBe("final_answer");
   });
 
   it("simple text response → start, text, done, end", () => {
@@ -773,12 +831,16 @@ describe("BlockStream — multi-response (session-lifetime reducer)", () => {
         content: [{ type: "output_text", text: "Hi! 👋" }],
         itemId: "msg_X",
         responseId: "resp_X",
+        phase: "commentary",
       },
     ]);
 
     const textDones = blocks.filter((b): b is TextDone => b.type === "text_done");
     expect(textDones).toHaveLength(1);
     expect(textDones[0]!.fullText).toBe("Hi! 👋");
+    // The deduped message keeps its identity, so live and reloaded folds agree.
+    expect(textDones[0]!.ctx.itemId).toBe("msg_X");
+    expect(textDones[0]!.phase).toBe("commentary");
   });
 
   it("response_in_progress sets the responseId when response.created is absent", () => {
@@ -1362,6 +1424,81 @@ describe("BlockStream — terminal lifecycles", () => {
     }
   });
 
+  it.each([
+    {
+      previousModel: null,
+      previousId: "",
+      failureModel: "polly",
+      code: "executor_error",
+      source: undefined,
+    },
+    {
+      previousModel: "codex-native-ui",
+      previousId: "resp_other",
+      failureModel: "polly",
+      code: "ValueError",
+      source: "harness",
+    },
+    {
+      previousModel: "polly",
+      previousId: "resp_failed",
+      failureModel: "",
+      code: "executor_error",
+      source: undefined,
+    },
+  ])(
+    "names a turn failure from its response identity ($previousId, $failureModel, $code)",
+    ({ previousModel, previousId, failureModel, code, source }) => {
+      const events: StreamEvent[] = previousModel
+        ? [
+            {
+              type: "response_created",
+              response: makeResponse({ responseId: previousId, model: previousModel }),
+            },
+          ]
+        : [];
+      events.push({
+        type: "response_failed",
+        ...(source ? { source } : {}),
+        response: {
+          ...makeResponse({ responseId: "resp_failed", status: "failed", model: failureModel }),
+          error: {
+            code,
+            message: "The executor stopped before producing output.",
+          },
+        },
+      });
+
+      const error = reduce(events).find((block) => block.type === "error");
+      expect(error).toMatchObject({
+        code,
+        source: source ?? "",
+        message: "The executor stopped before producing output.",
+        title: "Polly ran into an error during this turn.",
+      });
+    },
+  );
+
+  it("names a runner failure without id or model using the active turn", () => {
+    const failure = parseEvent("response.failed", {
+      source: "harness",
+      response: {
+        status: "failed",
+        error: { code: "RuntimeError", message: "Harness stopped." },
+      },
+    });
+    expect(failure).not.toBeNull();
+    const blocks = reduce([
+      { type: "response_in_progress", response: makeResponse({ model: "release-reviewer" }) },
+      failure!,
+    ]);
+    expect(blocks.find((block) => block.type === "error")).toMatchObject({
+      title: "Release-reviewer ran into an error during this turn.",
+      message: "Harness stopped.",
+      ctx: { responseId: "resp_1" },
+    });
+  });
+
   it("failure without error does not emit ErrorBlock", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },
@@ -1380,14 +1517,18 @@ describe("BlockStream — terminal lifecycles", () => {
 describe("BlockStream — status events", () => {
   it("error event → ErrorBlock with both message and code", () => {
     const blocks = reduce([
-      { type: "response_created", response: makeResponse() },
+      { type: "response_created", response: makeResponse({ model: "polly" }) },
       {
         type: "error",
         source: "llm",
         toolName: null,
         error: { code: "llm_auth_failed", message: "API key invalid" },
       },
-      { type: "response_failed", response: makeResponse({ status: "failed" }) },
+      { type: "response_failed", response: makeResponse({ status: "failed", model: "polly" }) },
+      {
+        type: "response_created",
+        response: makeResponse({ responseId: "resp_switched", model: "codex-native-ui" }),
+      },
     ]);
 
     const err = blocks.find((b) => b.type === "error");
@@ -1396,8 +1537,37 @@ describe("BlockStream — status events", () => {
       expect(err.message).toBe("API key invalid");
       expect(err.code).toBe("llm_auth_failed");
       expect(err.source).toBe("llm");
+      expect(err.title).toBe("Polly ran into an error during this turn.");
     }
   });
+
+  it.each(["error", "response_failed"] as const)(
+    "does not label a delayed %s with a different response's agent",
+    (type) => {
+      const error = { code: "RuntimeError", message: "The old turn failed." };
+      const delayed: StreamEvent =
+        type === "error"
+          ? { type, source: "execution", toolName: null, error, responseId: "resp_old" }
+          : {
+              type,
+              response: {
+                ...makeResponse({ responseId: "resp_old", status: "failed", model: "" }),
+                error,
+              },
+            };
+      const blocks = reduce([
+        {
+          type: "response_created",
+          response: makeResponse({ responseId: "resp_new", model: "polly" }),
+        },
+        delayed,
+      ]);
+
+      const errorBlock = blocks.find((block) => block.type === "error");
+      expect(errorBlock).toMatchObject(error);
+      expect(errorBlock?.title).toBeUndefined();
+    },
+  );
 
   it("output_item.done error event preserves persisted ids", () => {
     const blocks = reduce([
@@ -1684,6 +1854,46 @@ describe("BlockStream — elicitation", () => {
     });
   });
 
+  it("marks only a card the server sends with is_blocking=false as non-blocking", () => {
+    const blockFor = (extra: Record<string, unknown>) => {
+      const event = parseEvent("response.elicitation_request", {
+        elicitation_id: "elic_async",
+        params: {
+          mode: "form",
+          message: "Codex needs input",
+          phase: "codex_request_user_input",
+          policy_name: "codex_native_request_user_input",
+          ...extra,
+        },
+      });
+      if (event === null) throw new Error("expected an elicitation request");
+      const card = reduce([event]).find((b): b is ElicitationBlock => b.type === "elicitation");
+      if (card === undefined) throw new Error("expected an elicitation card");
+      return card;
+    };
+
+    expect(blockFor({ is_blocking: false }).isBlocking).toBe(false);
+    expect(blockFor({})).not.toHaveProperty("isBlocking");
+    expect(blockFor({ is_blocking: true })).not.toHaveProperty("isBlocking");
+  });
+
+  it("keeps the task a workflow question is about on its card", () => {
+    const card = (params: Record<string, unknown>) => {
+      const event = parseEvent("response.elicitation_request", {
+        elicitation_id: "elicit_journal_1",
+        params: { mode: "form", message: "Waiting for you on Deploy", ...params },
+      });
+      if (event === null) throw new Error("expected an elicitation request");
+      return reduce([event]).find((b): b is ElicitationBlock => b.type === "elicitation");
+    };
+
+    expect(card({ phase: "workflow_request_input", journal_step: "deploy" })).toMatchObject({
+      phase: "workflow_request_input",
+      journalStep: "deploy",
+    });
+    expect(card({ phase: "workflow_request_input" })).not.toHaveProperty("journalStep");
+  });
+
   it("flushes pending text before an elicitation prompt", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_plan" }) },
@@ -1851,5 +2061,67 @@ describe("BlockStream — naming a turn already in flight", () => {
 
     // Exactly one reasoning section was opened for the whole thought.
     expect(blocks.filter((b) => b.type === "reasoning_start")).toHaveLength(1);
+  });
+});
+
+describe("BlockStream — Claude sub-agent handback", () => {
+  it("streams the handed-back report as the answer and drops the delivery receipt", () => {
+    const handback = {
+      type: "tool_call",
+      name: "SubagentHandback",
+      arguments: { message: "**Audit** done." },
+      callId: "c1",
+      status: "completed",
+      agentName: "agent",
+      itemId: "fc_1",
+      responseId: "resp_1",
+    } satisfies StreamEvent;
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      handback,
+      // The runner can deliver the same call twice; it must render once.
+      handback,
+      {
+        type: "tool_result",
+        callId: "c1",
+        output: "delivered",
+        itemId: "fco_1",
+        responseId: "resp_1",
+      },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+    expect(
+      blockTypes(blocks).filter((t) => t !== "response_start" && t !== "response_end"),
+    ).toEqual(["text_done"]);
+    const answer = blocks.find((b): b is TextDone => b.type === "text_done");
+    expect(answer?.fullText).toBe("**Audit** done.");
+    expect(answer?.ctx.itemId).toBe("fc_1");
+  });
+});
+
+describe("terminal command submission identity", () => {
+  it.each([
+    {
+      wire: { pending_id: "pending_shell", stable_id: "submit_shell" },
+      expected: { pendingId: "pending_shell", stableId: "submit_shell" },
+    },
+    { wire: {}, expected: {} },
+    { wire: undefined, expected: undefined },
+  ])("preserves $wire through live and saved items", ({ wire, expected }) => {
+    const item = {
+      id: "shell",
+      response_id: "resp_shell",
+      status: "completed",
+      type: "terminal_command" as const,
+      kind: "input" as const,
+      input: "ls",
+      submission: wire,
+    };
+    const event = parseEvent("response.output_item.done", { item, response_id: item.response_id });
+    expect(event?.type).toBe("terminal_command");
+    const live = reduce([event!]).find((block) => block.type === "terminal_command");
+    const saved = itemsToBlocks([item])[0];
+    expect(live).toMatchObject({ type: "terminal_command", submission: expected });
+    expect(saved).toMatchObject({ type: "terminal_command", submission: expected });
   });
 });

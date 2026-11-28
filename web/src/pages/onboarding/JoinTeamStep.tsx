@@ -4,7 +4,14 @@
 import { ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
-export function JoinTeamStep({ onAccept }: { onAccept: () => void }) {
+export function JoinTeamStep({
+  onAccept,
+  serverUrl,
+}: {
+  onAccept: () => void;
+  /** The inviting server's URL, shown under the subtitle (design mock). */
+  serverUrl?: string;
+}) {
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col items-center gap-1 text-center">
@@ -12,6 +19,11 @@ export function JoinTeamStep({ onAccept }: { onAccept: () => void }) {
         <p className="text-ui text-muted-foreground">
           Connect to their Omnigent server to start collaborating.
         </p>
+        {serverUrl && (
+          <p className="text-ui font-medium text-foreground">
+            {serverUrl.replace(/^https?:\/\//i, "").replace(/\/$/, "")}
+          </p>
+        )}
       </div>
       <Button className="w-full gap-1 py-5" onClick={onAccept} componentId="register.accept_invite">
         Accept invitation

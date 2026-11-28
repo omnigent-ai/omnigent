@@ -1,13 +1,75 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import type * as NativeBridge from "@/lib/nativeBridge";
+import type * as Identity from "@/lib/identity";
+import { resolveIdentity } from "@/lib/identity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { BrowserPane } from "./BrowserPane";
+
+const getSessionSlim = vi.fn();
+const identity = vi.hoisted(() => ({
+  userId: "user-a" as string | null,
+  listeners: new Set<() => void>(),
+}));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof Identity>()),
+  getCurrentUserId: () => identity.userId,
+  resolveIdentity: vi.fn(async () => identity.userId),
+  subscribeIdentity: (listener: () => void) => {
+    identity.listeners.add(listener);
+    return () => identity.listeners.delete(listener);
+  },
+}));
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
+// Host discovery is external; these tests exercise the pane's navigation requests.
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
+
+// Desktop menu commands (Reload, Focus Address Bar); off unless a test turns them on.
+const desktop = vi.hoisted(() => ({
+  enabled: false,
+  send: (_event: { command: string; browserViewId: string | null }) => {},
+}));
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
 // unsupported-shell (returns null) path is covered by reading the early return.
-vi.mock("@/lib/nativeBridge", () => ({
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
   isElectronShell: () => true,
   supportsBrowser: () => true,
+  supportsDesktopCommands: () => desktop.enabled,
+  shellRoutesDesktopCommands: () => desktop.enabled,
+  onDesktopCommand: (callback: typeof desktop.send) => {
+    desktop.send = callback;
+    return () => {};
+  },
+  setDesktopCommandState: () => {},
+  // DialogContent sizes itself for the iOS keyboard and asks for the shell.
+  isIOSShell: () => false,
+  // Delegate to the per-test bridge stub so a test can assert the call.
+  getDesktopFeatures: async () => {
+    const api = (window as unknown as { omnigentDesktop?: Record<string, unknown> })
+      .omnigentDesktop;
+    const read = api?.getDesktopFeatures as (() => Promise<unknown>) | undefined;
+    return read ? await read() : null;
+  },
 }));
+
+// The cookie-import flows report outcomes through toasts; capture them instead
+// of rendering a Toaster.
+const toast = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn(), info: vi.fn() }));
+vi.mock("sonner", () => ({ toast }));
 
 /**
  * Minimal `window.omnigentDesktop` stub. The empty-state tests only need the
@@ -19,6 +81,7 @@ vi.mock("@/lib/nativeBridge", () => ({
 function installBridge(overrides: Record<string, unknown> = {}) {
   const noopUnsub = () => {};
   const bridge = {
+    getDesktopFeatures: vi.fn().mockResolvedValue({}),
     browserHasView: vi.fn().mockResolvedValue({ exists: false }),
     onBrowserViewCreated: vi.fn().mockReturnValue(noopUnsub),
     onBrowserHostActiveChanged: vi.fn().mockReturnValue(noopUnsub),
@@ -35,12 +98,19 @@ function installBridge(overrides: Record<string, unknown> = {}) {
     browserEnableDesignMode: vi.fn().mockResolvedValue({ ok: true }),
     browserDisableDesignMode: vi.fn().mockResolvedValue({ ok: true }),
     ...overrides,
-  };
+    // Overrides add methods the base stub doesn't declare (older shells lack
+    // them), so the recorded mocks are reached through a loose index type.
+  } as unknown as Record<string, ReturnType<typeof vi.fn>>;
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = bridge;
   return bridge;
 }
 
 beforeEach(() => {
+  getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
+    id,
+    hostId: null,
+    parentSessionId: null,
+  }));
   // jsdom has no ResizeObserver; the measuring-container effect (viewActive path)
   // constructs one. Stub it so mounting the container doesn't throw.
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
@@ -53,7 +123,15 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  resetDesktopCommandsForTests();
+  desktop.enabled = false;
   vi.clearAllMocks();
+  localStorage.clear();
+  identity.userId = "user-a";
+  identity.listeners.clear();
+  vi.mocked(resolveIdentity)
+    .mockReset()
+    .mockImplementation(async () => identity.userId);
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
 
@@ -85,6 +163,180 @@ describe("BrowserPane cold-start (no view yet)", () => {
     );
     cleanup();
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
+  });
+
+  const savedReport = (owner = "user-a", url = "https://example.com/report") =>
+    writeSessionWorkspaceState("conv_a", {
+      openBrowsers: ["two"],
+      browserPages: { two: { url, title: "Report", owner } },
+    });
+  it.each(["Reload", "Enter"] as const)(
+    "keeps the saved address unloaded until %s, including on older shells",
+    async (action) => {
+      getSessionSlim.mockResolvedValue({
+        id: "conv_a",
+        hostId: "local-host",
+        parentSessionId: null,
+      });
+      savedReport();
+      const bridge = installBridge({
+        getDesktopFeatures: action === "Enter" ? undefined : vi.fn().mockResolvedValue({}),
+      });
+      await act(async () => {
+        render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+      });
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      expect(bar).toHaveValue("https://example.com/report");
+      expect(screen.getByText(/Click Reload or press Enter/)).toBeInTheDocument();
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+      expect(getSessionSlim).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
+
+      if (action === "Reload") fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+      else fireEvent.keyDown(bar, { key: "Enter" });
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+          "browser-tab:conv_a:two",
+          "https://example.com/report",
+          undefined,
+          { force: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
+        ),
+      );
+      expect(bridge.browserReload).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["another account", "another window"])(
+    "does not prefill a page for %s",
+    async (reason) => {
+      savedReport(reason === "another account" ? "user-b" : "user-a");
+      const bridge = installBridge({
+        browserHasView: vi
+          .fn()
+          .mockResolvedValue({ exists: false, elsewhere: reason === "another window" }),
+      });
+      await act(async () => {
+        render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+      });
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
+      expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["delayed", "unchanged"],
+    ["delayed", "focused"],
+    ["delayed", "edited"],
+    ["delayed", "cleared"],
+    ["delayed", "navigated"],
+    ["delayed", "created"],
+    ["delayed", "unmounted"],
+    ["retried", "unchanged"],
+    ["retried", "edited"],
+    ["retried", "navigated"],
+    ["retried", "unmounted"],
+  ] as const)(
+    "handles %s saved-address identity when the pane is %s",
+    async (resolution, change) => {
+      savedReport();
+      let finishIdentity!: (userId: string) => void;
+      const pendingIdentity = new Promise<string>((resolve) => {
+        finishIdentity = resolve;
+      });
+      identity.userId = null;
+      vi.mocked(resolveIdentity).mockReturnValue(
+        resolution === "retried" ? Promise.resolve(null) : pendingIdentity,
+      );
+      const bridge = installBridge();
+      const { unmount } = render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+      await waitFor(() => expect(resolveIdentity).toHaveBeenCalled());
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      expect(bar).toHaveValue("");
+      if (change === "focused") {
+        fireEvent.focus(bar);
+      } else if (change === "edited" || change === "cleared") {
+        fireEvent.focus(bar);
+        fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
+        if (change === "cleared") fireEvent.change(bar, { target: { value: "" } });
+        fireEvent.blur(bar);
+      } else if (change === "navigated") {
+        act(() =>
+          bridge.onBrowserUrlChanged.mock.calls.at(-1)![0]({
+            conversationId: "browser-tab:conv_a:two",
+            url: "https://example.org/chosen",
+          }),
+        );
+      } else if (change === "created") {
+        act(() =>
+          bridge.onBrowserViewCreated.mock.calls.at(-1)![0]({
+            conversationId: "browser-tab:conv_a:two",
+          }),
+        );
+      } else if (change === "unmounted") {
+        unmount();
+        expect(identity.listeners.size).toBe(0);
+      }
+      await act(async () => {
+        identity.userId = "user-a";
+        finishIdentity("user-a");
+        await pendingIdentity;
+        if (resolution === "retried") {
+          for (const listener of identity.listeners) listener();
+        }
+      });
+      if (change !== "unmounted") {
+        expect(bar).toHaveValue(
+          change === "unchanged" || change === "focused"
+            ? "https://example.com/report"
+            : change === "edited" || change === "navigated"
+              ? "https://example.org/chosen"
+              : "",
+        );
+      }
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+      expect(getSessionSlim).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reattaches the retained page without navigating when its rail is reopened", async () => {
+    let fireActive: ((p: { conversationId: string | null }) => void) | undefined;
+    const bridge = installBridge({
+      onBrowserHostActiveChanged: vi.fn((cb) => {
+        fireActive = cb;
+        return () => {};
+      }),
+      browserSetActive: vi.fn(async (conversationId: string | null) => {
+        // The real shell broadcasts null when detaching, without destroying the page.
+        fireActive?.({ conversationId });
+        return { ok: true };
+      }),
+      browserHasView: vi.fn().mockResolvedValue({
+        exists: true,
+        url: "https://example.com",
+        canGoBack: false,
+        canGoForward: false,
+      }),
+    });
+    const { rerender } = render(<BrowserPane conversationId="conv_hidden" active />);
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_hidden"));
+
+    rerender(<BrowserPane conversationId="conv_hidden" active={false} />);
+
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null));
+    const resizeCount = bridge.browserResize.mock.calls.length;
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
+    expect(bridge.browserResize).toHaveBeenCalledTimes(resizeCount);
+
+    rerender(<BrowserPane conversationId="conv_hidden" active />);
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenLastCalledWith("conv_hidden"));
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("https://example.com");
+    expect(bridge.browserHasView).toHaveBeenCalledTimes(1);
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
   });
 
   it("reports native view-cap failures instead of silently leaving a blank tab", async () => {
@@ -160,6 +412,75 @@ describe("BrowserPane cold-start (no view yet)", () => {
   });
 });
 
+describe("BrowserPane focus requests", () => {
+  it("focuses the address bar once for a tab just opened", () => {
+    const onFocused = vi.fn();
+    render(<BrowserPane conversationId="conv_f" focus="address" onFocused={onFocused} />);
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveFocus();
+    expect(onFocused).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses the page of a tab returned to once its view is attached", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/" }),
+    });
+    const onFocused = vi.fn();
+    render(<BrowserPane conversationId="conv_g" focus="page" onFocused={onFocused} />);
+    expect(onFocused).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_g", { focus: true }),
+    );
+    expect(onFocused).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("BrowserPane retained-view lifecycle", () => {
+  it("does not reattach a view closed while the pane is hidden", async () => {
+    let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "http://localhost:5173" }),
+      onBrowserViewClosed: vi.fn((cb) => {
+        fireClosed = cb;
+        return () => {};
+      }),
+    });
+    const { rerender } = render(<BrowserPane conversationId="conv_closed" />);
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_closed"));
+    rerender(<BrowserPane conversationId="conv_closed" active={false} />);
+    act(() => fireClosed?.({ conversationId: "conv_closed", reason: "user" }));
+    bridge.browserSetActive.mockClear();
+
+    rerender(<BrowserPane conversationId="conv_closed" />);
+    expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
+    expect(bridge.browserSetActive).not.toHaveBeenCalled();
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+  });
+
+  it("ignores an existence probe that arrives after the view was closed", async () => {
+    let resolveProbe: ((r: { exists: boolean; url: string }) => void) | undefined;
+    let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
+    const bridge = installBridge({
+      browserHasView: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveProbe = resolve;
+          }),
+      ),
+      onBrowserViewClosed: vi.fn((cb) => {
+        fireClosed = cb;
+        return () => {};
+      }),
+    });
+    render(<BrowserPane conversationId="conv_closed" />);
+    act(() => fireClosed?.({ conversationId: "conv_closed", reason: "user" }));
+    await act(async () => resolveProbe?.({ exists: true, url: "http://localhost:5173" }));
+
+    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
+    expect(bridge.browserSetActive).not.toHaveBeenCalled();
+  });
+});
+
 describe("BrowserPane design-mode toggle", () => {
   it("renders the design-mode toggle in the toolbar", async () => {
     render(<BrowserPane conversationId="conv_dm1" />);
@@ -220,6 +541,30 @@ describe("BrowserPane design-mode toggle", () => {
 });
 
 describe("BrowserPane toolbar navigation + URL bar", () => {
+  it("sends the owning session host and protocol for a manually typed localhost preview", async () => {
+    getSessionSlim.mockResolvedValue({
+      id: "conv_preview",
+      hostId: "local-host",
+      parentSessionId: null,
+    });
+    const bridge = installBridge();
+    render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+    const bar = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.change(bar, { target: { value: "localhost:5273/preview" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        "browser-tab:conv_preview:two",
+        "http://localhost:5273/preview",
+        undefined,
+        { force: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
+      ),
+    );
+    expect(getSessionSlim).toHaveBeenCalledWith("conv_preview");
+    expect(bar).toHaveValue("http://localhost:5273/preview");
+  });
+
   /** Render the pane, activate a view (so toolbar buttons enable), and return
    *  the bridge + handles to the captured event callbacks. */
   async function renderActive(conversationId: string, overrides: Record<string, unknown> = {}) {
@@ -253,6 +598,125 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /reload/i })).not.toBeDisabled());
     return { bridge, fireUrl: () => fireUrl, fireNav: () => fireNav };
   }
+
+  it("resolves the current host on address-bar navigation after the session moves", async () => {
+    getSessionSlim
+      .mockResolvedValueOnce({ id: "conv_preview", hostId: "local-host", parentSessionId: null })
+      .mockResolvedValue({ id: "conv_preview", hostId: "remote-host", parentSessionId: null });
+    const bridge = installBridge();
+    render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+    const bar = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.change(bar, { target: { value: "http://127.0.0.1:5173/before" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await waitFor(() => expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+    fireEvent.change(bar, { target: { value: "http://127.0.0.1:5173/after" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+        "browser-tab:conv_preview:two",
+        "http://127.0.0.1:5173/after",
+        undefined,
+        { force: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
+      ),
+    );
+    expect(getSessionSlim).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["host lookup", "navigation result"])(
+    "keeps the latest URL submission while the earlier %s is pending",
+    async (pendingStage) => {
+      let resolveFirstHost!: (host: unknown) => void;
+      const firstHost = new Promise((resolve) => {
+        resolveFirstHost = resolve;
+      });
+      let resolveFirstNavigation!: (result: { ok: boolean; error?: string }) => void;
+      const firstNavigation = new Promise<{ ok: boolean; error?: string }>((resolve) => {
+        resolveFirstNavigation = resolve;
+      });
+      getSessionSlim
+        .mockReturnValueOnce(
+          pendingStage === "host lookup"
+            ? firstHost
+            : Promise.resolve({ id: "conv_preview", hostId: "local-host" }),
+        )
+        .mockResolvedValue({ id: "conv_preview", hostId: "remote-host" });
+      const bridge = installBridge({
+        browserOpenOrNavigate: vi
+          .fn()
+          .mockImplementationOnce(() =>
+            pendingStage === "navigation result" ? firstNavigation : Promise.resolve({ ok: true }),
+          )
+          .mockResolvedValue({ ok: true }),
+      });
+      render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      fireEvent.change(bar, { target: { value: "https://first.example" } });
+      fireEvent.keyDown(bar, { key: "Enter" });
+      if (pendingStage === "navigation result") {
+        await waitFor(() => expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+      }
+      fireEvent.change(bar, { target: { value: "https://latest.example" } });
+      fireEvent.keyDown(bar, { key: "Enter" });
+      await waitFor(() => expect(bar).toHaveValue("https://latest.example"));
+      if (pendingStage === "host lookup") {
+        expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+        await act(async () => {
+          resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
+        });
+      }
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+          "browser-tab:conv_preview:two",
+          "https://latest.example",
+          undefined,
+          {
+            force: true,
+            sourceHostId: pendingStage === "host lookup" ? "local-host" : "remote-host",
+            sessionHostProtocol: 1,
+          },
+        ),
+      );
+      expect(getSessionSlim).toHaveBeenCalledTimes(pendingStage === "host lookup" ? 1 : 2);
+      await act(async () => {
+        resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
+        resolveFirstNavigation({ ok: false, error: "stale failure" });
+      });
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(
+        pendingStage === "host lookup" ? 1 : 2,
+      );
+      expect(bar).toHaveValue("https://latest.example");
+      expect(screen.queryByText("stale failure")).not.toBeInTheDocument();
+    },
+  );
+
+  it("reloads the page for desktop Reload from its toolbar, and passes it on elsewhere", async () => {
+    desktop.enabled = true;
+    const appReload = vi.fn();
+    renderHook(() => useDesktopCommand("reload", appReload));
+    const { bridge } = await renderActive("conv_cmd_r");
+    const bar = screen.getByRole("textbox", { name: /address bar/i });
+    expect(bar).toHaveAttribute("title", "Address bar (Ctrl+L)");
+    expect(screen.getByRole("button", { name: /reload/i })).toHaveAttribute(
+      "title",
+      "Reload (Ctrl+R)",
+    );
+
+    act(() => bar.focus());
+    act(() => desktop.send({ command: "reload", browserViewId: null }));
+    expect(bridge.browserReload).toHaveBeenCalledWith("conv_cmd_r");
+    expect(appReload).not.toHaveBeenCalled();
+
+    act(() => bar.blur());
+    act(() => desktop.send({ command: "reload", browserViewId: null }));
+    expect(appReload).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses and selects the address for desktop Focus Address Bar", async () => {
+    desktop.enabled = true;
+    await renderActive("conv_cmd_l");
+    act(() => desktop.send({ command: "focus-address-bar", browserViewId: null }));
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: /address bar/i }));
+  });
 
   it("reload button calls the reload IPC once a view is active", async () => {
     const { bridge } = await renderActive("conv_reload");
@@ -314,5 +778,483 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
         { force: true },
       ),
     );
+  });
+});
+
+describe("BrowserPane Chrome cookie import", () => {
+  const HOST = "mail.google.com";
+  const PARENT = "google.com";
+  const PREVIEW = {
+    ok: true as const,
+    host: HOST,
+    scopes: [HOST, PARENT],
+    profiles: [
+      {
+        id: "Default",
+        name: "Work",
+        cookieCount: 4,
+        scopes: [
+          { host: HOST, cookieCount: 4 },
+          { host: PARENT, cookieCount: 6 },
+        ],
+      },
+    ],
+  };
+
+  /** Bridge whose cookie methods exist; `features` is what the shell reports. */
+  function installCookieBridge({
+    features = { chromeCookieImport: true },
+    preview = PREVIEW,
+    importResult = {
+      ok: true as const,
+      host: HOST,
+      profileId: "Default",
+      imported: 4,
+      skipped: 0,
+      failed: 0,
+    },
+  }: {
+    features?: { chromeCookieImport?: boolean } | null;
+    preview?: unknown;
+    importResult?: unknown;
+  } = {}) {
+    return installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: `https://${HOST}/mail/u/0` }),
+      getDesktopFeatures: vi.fn().mockResolvedValue(features),
+      browserChromeCookiePreview: vi.fn().mockResolvedValue(preview),
+      browserChromeCookieImport: vi.fn().mockResolvedValue(importResult),
+    });
+  }
+
+  const importButton = () => screen.queryByRole("button", { name: "Import cookies from Chrome" });
+
+  it("hides the button on a shell that doesn't expose the bridge methods", async () => {
+    // An older shell: no cookie methods at all, so the pane must not offer a
+    // button that would reject. This is the compat boundary, not an error path.
+    installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: `https://${HOST}/` }),
+    });
+    render(<BrowserPane conversationId="conv_old_shell" />);
+    await screen.findByRole("textbox", { name: "Address bar" });
+    expect(importButton()).toBeNull();
+  });
+
+  it("hides the button when the shell reports the feature off", async () => {
+    const bridge = installCookieBridge({ features: { chromeCookieImport: false } });
+    render(<BrowserPane conversationId="conv_flag_off" />);
+    await waitFor(() => expect(bridge.getDesktopFeatures).toHaveBeenCalled());
+    // Wait for the probe to resolve, so this can't pass before the flag lands.
+    await act(async () => {
+      await bridge.getDesktopFeatures.mock.results[0].value;
+    });
+    expect(importButton()).toBeNull();
+  });
+
+  it("previews the current site and imports the picked profile into this tab", async () => {
+    const bridge = installCookieBridge();
+    render(<BrowserPane conversationId="conv_cookie" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getAllByText(HOST).length).toBeGreaterThan(0);
+    expect(within(dialog).getByText("Work (4)")).toBeInTheDocument();
+    expect(bridge.browserChromeCookiePreview).toHaveBeenCalledWith("conv_cookie");
+    // The preview alone must never write cookies.
+    expect(bridge.browserChromeCookieImport).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+    await waitFor(() =>
+      expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_cookie", {
+        profileId: "Default",
+        expectedHost: HOST,
+        scope: HOST,
+      }),
+    );
+    // A reload makes the site pick up the new session cookies.
+    await waitFor(() => expect(bridge.browserReload).toHaveBeenCalledWith("conv_cookie"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(toast.success).toHaveBeenCalledWith("Imported 4 cookies from Chrome.");
+  });
+
+  it("offers the page's host and its parent domain, and imports the picked one", async () => {
+    const bridge = installCookieBridge();
+    render(<BrowserPane conversationId="conv_scope" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    const dialog = await screen.findByRole("dialog");
+
+    // Counts follow the scope: the narrow scope is a subset of the wider one's
+    // tree, not a copy of it.
+    const scopePicker = within(dialog).getByRole("combobox", { name: "Site scope" });
+    fireEvent.click(scopePicker);
+    fireEvent.click(await screen.findByRole("option", { name: `${PARENT} (6)` }));
+
+    expect(dialog).toHaveTextContent("Work (6)");
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+    await waitFor(() =>
+      expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_scope", {
+        profileId: "Default",
+        expectedHost: HOST,
+        scope: PARENT,
+      }),
+    );
+  });
+
+  it("shows the site as plain text when the host has no parent domain", async () => {
+    installCookieBridge({
+      preview: {
+        ok: true,
+        host: "example.com",
+        scopes: ["example.com"],
+        profiles: [{ id: "Default", name: "Work", cookieCount: 2 }],
+      },
+    });
+    render(<BrowserPane conversationId="conv_noparent" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByRole("combobox", { name: "Site scope" })).toBeNull();
+    expect(dialog).toHaveTextContent("Work (2)");
+  });
+
+  it("says so instead of opening a dialog when Chrome has nothing for the site", async () => {
+    const bridge = installCookieBridge({ preview: { ok: true, host: HOST, profiles: [] } });
+    render(<BrowserPane conversationId="conv_nocookie" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+    await waitFor(() => expect(bridge.browserChromeCookiePreview).toHaveBeenCalled());
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(toast.info).toHaveBeenCalledWith(`No Chrome cookies found for ${HOST}.`);
+    // The button returns to its normal (clickable) state.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Import cookies from Chrome" })).toBeEnabled(),
+    );
+  });
+
+  it("shows the shell's preview error rather than a dialog", async () => {
+    installCookieBridge({
+      preview: { ok: false, error: "Could not read Chrome's cookie database." },
+    });
+    render(<BrowserPane conversationId="conv_unreadable" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Could not read Chrome's cookie database."),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("always warns that the conversation's tabs share the jar", async () => {
+    // Even a user-controlled tab shares the conversation's partition with any
+    // tab the agent opens, so the warning is not conditional on agentBrowser.
+    installCookieBridge();
+    render(<BrowserPane conversationId="conv_agent" agentBrowser={false} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByText(/Agent-controlled tabs share these cookies and can act as you/),
+    ).toBeInTheDocument();
+  });
+
+  it("stays silent when the user declines the shell's confirmation", async () => {
+    const bridge = installCookieBridge({ importResult: { ok: false, cancelled: true } });
+    render(<BrowserPane conversationId="conv_cancel" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Import cookies" }),
+    );
+
+    await waitFor(() => expect(bridge.browserChromeCookieImport).toHaveBeenCalled());
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.info).not.toHaveBeenCalled();
+    expect(bridge.browserReload).not.toHaveBeenCalled();
+    // Still open so the user can retry without reopening the pane's dialog.
+    expect(screen.queryByRole("dialog")).not.toBeNull();
+  });
+
+  it("narrows the scope when the picked profile can't cover the wider one", async () => {
+    const bridge = installCookieBridge({
+      preview: {
+        ok: true,
+        host: HOST,
+        scopes: [HOST, PARENT],
+        profiles: [
+          {
+            id: "Default",
+            name: "Work",
+            cookieCount: 4,
+            scopes: [
+              { host: HOST, cookieCount: 4 },
+              { host: PARENT, cookieCount: 6 },
+            ],
+          },
+          // Profile 2 has nothing on the parent domain, so picking it must not
+          // leave the wider scope selected.
+          {
+            id: "Profile 2",
+            name: "Personal",
+            cookieCount: 1,
+            scopes: [{ host: HOST, cookieCount: 1 }],
+          },
+        ],
+      },
+    });
+    render(<BrowserPane conversationId="conv_reset" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+    fireEvent.click(await screen.findByRole("option", { name: `${PARENT} (6)` }));
+    fireEvent.click(within(dialog).getByRole("combobox", { name: "Chrome profile" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Personal (1)" }));
+
+    // The wider scope is gone from the picker, so the import targets the host.
+    expect(within(dialog).queryByRole("combobox", { name: "Site scope" })).toBeNull();
+    expect(dialog).toHaveTextContent("Personal (1)");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+    await waitFor(() =>
+      expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_reset", {
+        profileId: "Profile 2",
+        expectedHost: HOST,
+        scope: HOST,
+      }),
+    );
+  });
+
+  describe("on a shell that offers every website", () => {
+    const ALL_SITES_PREVIEW = {
+      ...PREVIEW,
+      allSitesProfiles: [
+        { id: "Default", name: "Work", cookieCount: 40 },
+        // Holds nothing for this page's site, so only every website is on offer.
+        { id: "Profile 2", name: "Personal", cookieCount: 7 },
+      ],
+    };
+
+    it("imports every website's cookies by default", async () => {
+      const bridge = installCookieBridge({
+        preview: ALL_SITES_PREVIEW,
+        importResult: { ok: true, scope: "*", profileId: "Default", imported: 38, skipped: 2 },
+      });
+      render(<BrowserPane conversationId="conv_all" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+
+      expect(within(dialog).getByRole("combobox", { name: "Site scope" })).toHaveTextContent(
+        "All websites",
+      );
+      expect(within(dialog).getByRole("combobox", { name: "Chrome profile" })).toHaveTextContent(
+        "Work (40)",
+      );
+      // The consent text has to say the agent gets every imported site, not one.
+      expect(dialog).toHaveTextContent("can act as you on every imported site.");
+
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all", {
+          profileId: "Default",
+          expectedHost: HOST,
+          scope: "*",
+        }),
+      );
+      await waitFor(() => expect(bridge.browserReload).toHaveBeenCalledWith("conv_all"));
+      expect(toast.success).toHaveBeenCalledWith(
+        "Imported 38 cookies from Chrome (2 couldn't be used).",
+      );
+    });
+
+    it("still imports only the current site when the user picks it", async () => {
+      const bridge = installCookieBridge({ preview: ALL_SITES_PREVIEW });
+      render(<BrowserPane conversationId="conv_all_site" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      expect(screen.getByRole("option", { name: "All websites (40)" })).toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: `${HOST} (4)` }));
+
+      expect(within(dialog).getByRole("combobox", { name: "Chrome profile" })).toHaveTextContent(
+        "Work (4)",
+      );
+      expect(dialog).toHaveTextContent("can act as you on this site.");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_site", {
+          profileId: "Default",
+          expectedHost: HOST,
+          scope: HOST,
+        }),
+      );
+    });
+
+    it("narrows a picked site scope to the host, not to every website", async () => {
+      const bridge = installCookieBridge({
+        preview: {
+          ok: true,
+          host: HOST,
+          scopes: [HOST, PARENT],
+          profiles: [
+            {
+              id: "Default",
+              name: "Work",
+              cookieCount: 4,
+              scopes: [
+                { host: HOST, cookieCount: 4 },
+                { host: PARENT, cookieCount: 6 },
+              ],
+            },
+            {
+              id: "Profile 2",
+              name: "Personal",
+              cookieCount: 1,
+              scopes: [{ host: HOST, cookieCount: 1 }],
+            },
+          ],
+          allSitesProfiles: [
+            { id: "Default", name: "Work", cookieCount: 40 },
+            { id: "Profile 2", name: "Personal", cookieCount: 7 },
+          ],
+        },
+      });
+      render(<BrowserPane conversationId="conv_all_narrow" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      fireEvent.click(await screen.findByRole("option", { name: `${PARENT} (6)` }));
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Chrome profile" }));
+      fireEvent.click(await screen.findByRole("option", { name: /^Personal/ }));
+
+      expect(within(dialog).getByRole("combobox", { name: "Site scope" })).toHaveTextContent(HOST);
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_narrow", {
+          profileId: "Profile 2",
+          expectedHost: HOST,
+          scope: HOST,
+        }),
+      );
+    });
+
+    it("offers a profile that has no cookies for the current site", async () => {
+      const bridge = installCookieBridge({ preview: ALL_SITES_PREVIEW });
+      render(<BrowserPane conversationId="conv_all_profile" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      // Pick the site first: the other profile can't cover it, so the scope
+      // must fall back to every website rather than import nothing.
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      fireEvent.click(await screen.findByRole("option", { name: `${HOST} (4)` }));
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Chrome profile" }));
+      fireEvent.click(await screen.findByRole("option", { name: "Personal (7)" }));
+
+      expect(within(dialog).queryByRole("combobox", { name: "Site scope" })).toBeNull();
+      expect(within(dialog).getByRole("combobox", { name: "Chrome profile" })).toHaveTextContent(
+        "Personal (7)",
+      );
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_profile", {
+          profileId: "Profile 2",
+          expectedHost: HOST,
+          scope: "*",
+        }),
+      );
+    });
+
+    it("opens for every website when Chrome has no cookies for the current site", async () => {
+      installCookieBridge({
+        preview: {
+          ok: true,
+          host: HOST,
+          scopes: [],
+          profiles: [],
+          allSitesProfiles: [{ id: "Default", name: "Work", cookieCount: 1 }],
+        },
+      });
+      render(<BrowserPane conversationId="conv_all_only" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+      const dialog = await screen.findByRole("dialog");
+      expect(dialog).toHaveTextContent("Work (1)");
+      expect(toast.info).not.toHaveBeenCalled();
+    });
+
+    it("says so when Chrome has no cookies at all", async () => {
+      installCookieBridge({
+        preview: { ok: true, host: HOST, scopes: [], profiles: [], allSitesProfiles: [] },
+      });
+      render(<BrowserPane conversationId="conv_all_none" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+      await waitFor(() => expect(toast.info).toHaveBeenCalledWith("No Chrome cookies found."));
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+  });
+
+  it("explains a zero-cookie import that the session rejected", async () => {
+    installCookieBridge({
+      importResult: {
+        ok: true,
+        host: HOST,
+        profileId: "Default",
+        imported: 0,
+        skipped: 0,
+        failed: 2,
+      },
+    });
+    render(<BrowserPane conversationId="conv_rejected" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Import cookies" }),
+    );
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        `Chrome's cookies for ${HOST} couldn't be saved in this browser session.`,
+      ),
+    );
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("keeps the dialog open and explains a zero-cookie import", async () => {
+    // Chrome had rows, but none could be decrypted/replayed for this host.
+    installCookieBridge({
+      importResult: {
+        ok: true,
+        host: HOST,
+        profileId: "Default",
+        imported: 0,
+        skipped: 3,
+        failed: 0,
+      },
+    });
+    render(<BrowserPane conversationId="conv_zero" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Import cookies" }),
+    );
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(`Chrome had no usable cookies for ${HOST}.`),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeNull();
   });
 });

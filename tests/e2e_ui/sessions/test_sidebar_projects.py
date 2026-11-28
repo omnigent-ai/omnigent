@@ -26,9 +26,11 @@ import re
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -75,25 +77,30 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
     row.get_by_test_id("conversation-actions").click()
     # Open the submenu flyout, then pick the just-created project by name.
     page.get_by_test_id("move-to-project").click()
+    page.get_by_role("menuitem", name="Projects", exact=True).hover()
     page.get_by_role("menuitem", name=name, exact=True).click()
 
 
 def test_move_session_into_new_project(
     page: Page,
-    seeded_session: tuple[str, str],
+    seeded_session_pair: tuple[str, str, str],
 ) -> None:
     """Filing a session into a freshly-created project moves the row into it.
 
     The session starts under "Sessions"; after creating the project (+ button)
     and picking it from "Add to project", a project folder with that name
     appears under the "Projects" group and the row lives under it (once
-    expanded) and no longer under "Sessions".
+    expanded) and no longer under "Sessions". With Custom ordering available,
+    dropping another session over a member row still files it, and releasing a
+    row over itself neither navigates nor blocks the next click.
     """
-    base_url, session_id = seeded_session
+    base_url, session_id, other_id = seeded_session_pair
     title = f"e2e-proj-{uuid.uuid4().hex[:8]}"
     _set_title(base_url, session_id, title)
+    _set_title(base_url, other_id, f"{title}-other")
     project = f"Project {uuid.uuid4().hex[:6]}"
 
+    enable_grouping_ui(page)
     page.goto(f"{base_url}/c/{session_id}")
 
     row = _row(page, session_id)
@@ -110,6 +117,43 @@ def test_move_session_into_new_project(
 
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+    other = _row(page, other_id)
+    other.scroll_into_view_if_needed()
+    box = other.bounding_box()
+    assert box
+    x, y = box["x"] + 30, box["y"] + box["height"] / 2
+    time_origin = page.evaluate("performance.timeOrigin")
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 12, y)
+    expect(other).to_have_class(re.compile("opacity-40"))
+    page.mouse.move(x, y)
+    page.mouse.up()
+    expect(other).not_to_have_class(re.compile("opacity-40"))
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    assert page.evaluate("performance.timeOrigin") == time_origin
+
+    page.mouse.down()
+    page.mouse.move(x + 12, y)
+    expect(other).to_have_class(re.compile("opacity-40"))
+    target = _row(page, session_id).bounding_box()
+    assert target
+    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith(f"/v1/sessions/{other_id}")
+        )
+    ) as filed:
+        page.mouse.up()
+    assert filed.value.ok
+    expect(_section(page, project).locator(f'a[href="/c/{other_id}"]')).to_be_visible()
+    view = page.evaluate('JSON.parse(localStorage.getItem("omnigent:sidebar-view"))') or {}
+    assert view.get("ordering", "updated") == "updated"
+
+    _row(page, other_id).get_by_role("link").click()
+    expect(page).to_have_url(f"{base_url}/c/{other_id}")
 
 
 def test_fork_of_filed_session_joins_the_folder_without_reload(
@@ -215,6 +259,7 @@ def test_remove_session_from_project(
     project_row.hover()
     project_row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("move-to-project").click()
+    page.get_by_role("menuitem", name="Projects", exact=True).hover()
     # The kebab item names the project it removes from ("Remove from <name>").
     # It unfiles immediately — no confirmation, since a first-class project
     # persists when emptied (nothing is deleted).
@@ -227,11 +272,8 @@ def test_remove_session_from_project(
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
 
 
-# A phone-width viewport, below the 768px `md` breakpoint, so the sidebar
-# renders as the mobile overlay — a genuine layout/width concern. It does NOT
-# by itself hide the folder's new-session pencil: that reveal is gated on input
-# capability (a hover+fine pointer), not width, so tests that need the pencil
-# gone pair this viewport with a `has_touch` context.
+# Below the 1181px breakpoint the shell uses the mobile layout. The phone
+# sidebar is an overlay; the 3:4 tablet docks it beside the page.
 _MOBILE_VIEWPORT = {"width": 390, "height": 780}
 _TABLET_VIEWPORT = {"width": 834, "height": 1112}
 
@@ -255,12 +297,12 @@ def test_project_header_action_is_clickable_on_touch_tablet(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The Projects header action stays visible above ``md`` without hover."""
+    """The Projects header action stays visible on a tablet in the mobile layout."""
     base_url, session_id = seeded_session
     context = browser.new_context(viewport=_TABLET_VIEWPORT, has_touch=True)
     page = context.new_page()
     try:
-        page.goto(f"{base_url}/c/{session_id}")
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
         assert page.evaluate("matchMedia('(hover: none)').matches")
         new_project = page.get_by_test_id("new-project")
         expect(new_project).to_be_visible()
@@ -271,67 +313,118 @@ def test_project_header_action_is_clickable_on_touch_tablet(
         context.close()
 
 
-def test_project_new_session_folds_into_kebab_on_touch(
-    browser: Browser,
+def test_project_actions_are_keyboard_accessible_on_desktop(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Without a fine hover pointer the folder pencil is gone; its action lives
-    in the kebab menu.
-
-    The pencil reveal is gated on input capability, not viewport width: it shows
-    only where ``(hover: hover) and (pointer: fine)`` holds. On a touch device
-    (``has_touch`` → ``hover: none``, ``pointer: coarse``) that never matches, so
-    the pencil is ``display:none`` — genuinely absent, not merely clipped — while
-    the same "New session" action stays in the folder kebab's menu, linking to
-    the pre-filed composer (``/?project=<name>``). The kebab (sr-only on touch)
-    is reached by keyboard, the assistive-tech path a long-press can't cover.
-    """
+    """The desktop shortcut opens a session; the menu omits the duplicate."""
     base_url, session_id = seeded_session
-    title = f"e2e-proj-touch-{uuid.uuid4().hex[:8]}"
-    _set_title(base_url, session_id, title)
-    project = f"Project {uuid.uuid4().hex[:6]}"
-
-    # File the session into a fresh project on the (hover-capable) default page —
-    # the row kebab's affordances are hover-revealed, so a touch context can't
-    # drive the move. The folder is server-persisted, so the touch context below
-    # sees it.
+    page.set_viewport_size({"width": 1280, "height": 800})
+    project = f"Keyboard project {uuid.uuid4().hex[:6]}"
     page.goto(f"{base_url}/c/{session_id}")
     _move_to_new_project(page, _row(page, session_id), project)
-    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
+    page.reload()
+    page.mouse.move(1279, 0)
+    assert page.evaluate("matchMedia('(hover: hover) and (pointer: fine)').matches")
 
-    # A genuine touch profile: has_touch flips the capability media the pencil
-    # gate keys on. The mobile sidebar starts closed, so reopen it via the
-    # one-shot ``?sidebar=open`` param (the notification-tap destination).
-    context = browser.new_context(viewport=_MOBILE_VIEWPORT, has_touch=True)
+    header = page.get_by_role("button", name=project, exact=True)
+    kebab = page.get_by_role("button", name=f"Project actions for {project}")
+    shortcut = page.get_by_role("link", name=f"New session in {project}", exact=True)
+    actions = kebab.locator("xpath=../..")
+    expect(actions).to_have_css("opacity", "0")
+    header.hover()
+    expect(actions).to_have_css("opacity", "1")
+    page.mouse.move(1279, 0)
+    expect(actions).to_have_css("opacity", "0")
+
+    # The shortcut precedes the menu in the browser's real Tab order.
+    header.focus()
+    page.keyboard.press("Tab")
+    expect(shortcut).to_be_focused()
+    expect(actions).to_have_css("opacity", "1")
+    page.keyboard.press("Tab")
+    expect(kebab).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(page.get_by_test_id("project-new-session-menu")).to_be_hidden()
+    expect(page.get_by_test_id("rename-project")).to_be_focused()
+    page.keyboard.press("Escape")
+    expect(kebab).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(shortcut).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(page).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
+
+
+@pytest.mark.parametrize(
+    "viewport,has_touch",
+    [
+        ({"width": 390, "height": 780}, True),
+        ({"width": 834, "height": 1194}, True),
+        ({"width": 500, "height": 780}, False),
+    ],
+    ids=["phone", "ipad-portrait", "narrow-mouse"],
+)
+def test_project_menu_is_visible_without_hover(
+    browser: Browser,
+    page: Page,
+    seeded_session: tuple[str, str],
+    viewport: dict[str, int],
+    has_touch: bool,
+) -> None:
+    """Mobile folders expose a menu containing New session without a long press."""
+    base_url, session_id = seeded_session
+    project = f"Project with a long name to check action overlap {uuid.uuid4().hex[:6]}"
+    page.goto(f"{base_url}/c/{session_id}")
+    _move_to_new_project(page, _row(page, session_id), project)
+    page.get_by_role("button", name=project, exact=True).hover()
+    expect(page.get_by_role("link", name=f"New session in {project}", exact=True)).to_be_visible()
+
+    context = browser.new_context(viewport=viewport, has_touch=has_touch)
     touch = context.new_page()
     try:
         touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
-        # Establish the flip empirically rather than assuming it: this is the
-        # exact media the pencil/kebab reveal keys on, and it must be false here.
-        assert not touch.evaluate("matchMedia('(hover: hover) and (pointer: fine)').matches")
-
         header = touch.get_by_role("button", name=project, exact=True)
         expect(header).to_be_visible()
-
-        # Scope to THIS project's controls by their per-project accessible names —
-        # the shared server carries other tests' folders, so bare test-ids match
-        # multiple pencils/kebabs (strict-mode violation).
-        pencil = touch.get_by_role("link", name=f"New session in {project}")
+        shortcut = touch.get_by_role(
+            "link", name=f"New session in {project}", exact=True, include_hidden=True
+        )
+        expect(shortcut).to_be_hidden()
         kebab = touch.get_by_role("button", name=f"Project actions for {project}")
 
-        # The pencil is display:none here — genuinely absent, no duplicate of the
-        # kebab's "New session" item in the a11y tree.
-        expect(pencil).to_be_hidden()
+        for expanded in [True, False]:
+            if header.get_attribute("aria-expanded") != str(expanded).lower():
+                header.locator("[data-section-toggle]").first.click()
+                touch.mouse.move(viewport["width"] - 1, 0)
+            expect(kebab).to_be_visible()
+            assert kebab.evaluate("""element => {
+                for (let node = element; node; node = node.parentElement) {
+                    if (getComputedStyle(node).opacity === '0') return false;
+                }
+                const box = element.getBoundingClientRect();
+                return box.width >= 24 && box.height >= 24 && element.contains(
+                    document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+                );
+            }""")
+            title_box = header.locator("span.truncate").bounding_box()
+            action_box = kebab.bounding_box()
+            assert title_box is not None and action_box is not None
+            assert title_box["x"] + title_box["width"] <= action_box["x"]
 
-        # The kebab is sr-only on touch: reached by keyboard (focus un-clips it
-        # via focus-visible), then opened with Enter — the AT path a long-press
-        # can't reliably dispatch.
-        kebab.focus()
-        kebab.press("Enter")
-        # asChild renders the item as the <a> itself, so the href lives on it.
+        before = header.get_attribute("aria-expanded")
+        if has_touch:
+            kebab.tap()
+        else:
+            kebab.click()
         menu_item = touch.get_by_test_id("project-new-session-menu")
         expect(menu_item).to_be_visible()
-        expect(menu_item).to_have_attribute("href", f"/?project={project.replace(' ', '%20')}")
+        expect(
+            touch.get_by_role("button", name=project, exact=True, include_hidden=True)
+        ).to_have_attribute("aria-expanded", before)
+        if has_touch:
+            menu_item.tap()
+        else:
+            menu_item.click()
+        expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
+        expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
     finally:
         context.close()

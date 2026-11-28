@@ -11,6 +11,7 @@
 		B10000000000000000000002 /* AppRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* AppRootView.swift */; };
 		B10000000000000000000003 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* ConnectView.swift */; };
 		B10000000000000000000004 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* DesignTokens.swift */; };
+		B1000000000000000000002A /* WelcomeBlobBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000002A /* WelcomeBlobBackground.swift */; };
 		B10000000000000000000005 /* SettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* SettingsStore.swift */; };
 		B10000000000000000000006 /* ServerURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* ServerURL.swift */; };
 		B10000000000000000000014 /* DeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* DeepLink.swift */; };
@@ -30,6 +31,7 @@
 		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
 		B10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* PrivacyInfo.xcprivacy */; };
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
+		B20000000000000000000108 /* WelcomeBlobBackgroundTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */; };
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
@@ -44,6 +46,9 @@
 		B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000003 /* RedirectConsentUITests.swift */; };
 		B40000000000000000000005 /* ManagedServersUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000005 /* ManagedServersUITests.swift */; };
 		B2000000000000000000000A /* ConnectionErrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* ConnectionErrorTests.swift */; };
+		B20000000000000000000105 /* KeyboardViewportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000105 /* KeyboardViewportTests.swift */; };
+		B20000000000000000000106 /* ServerSwitcherVisibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000106 /* ServerSwitcherVisibilityTests.swift */; };
+		B20000000000000000000107 /* ThemeBackgroundTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000107 /* ThemeBackgroundTests.swift */; };
 		B10000000000000000000019 /* DatabricksOAuthConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* DatabricksOAuthConfiguration.swift */; };
 		B1000000000000000000001A /* DatabricksOAuthAttempt.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001A /* DatabricksOAuthAttempt.swift */; };
 		B1000000000000000000001B /* DatabricksOAuthClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001B /* DatabricksOAuthClient.swift */; };
@@ -60,9 +65,20 @@
 		B10000000000000000000021 /* DatabricksWebContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* DatabricksWebContext.swift */; };
 		B10000000000000000000022 /* DatabricksSessionClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000022 /* DatabricksSessionClient.swift */; };
 		B10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */; };
+		B10000000000000000000024 /* WebAuthenticationBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000024 /* WebAuthenticationBrowser.swift */; };
+		B10000000000000000000025 /* ServerManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000025 /* ServerManifest.swift */; };
+		B10000000000000000000026 /* OAuthSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000026 /* OAuthSupport.swift */; };
+		B10000000000000000000027 /* OidcCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000027 /* OidcCredentialStore.swift */; };
+		B10000000000000000000028 /* OidcCredentials.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000028 /* OidcCredentials.swift */; };
+		B10000000000000000000029 /* OidcWebSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000029 /* OidcWebSession.swift */; };
 		B20000000000000000000010 /* DatabricksWebContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* DatabricksWebContextTests.swift */; };
 		B20000000000000000000011 /* DatabricksSessionClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* DatabricksSessionClientTests.swift */; };
 		B20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */; };
+		B20000000000000000000013 /* WebAuthenticationBrowserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* WebAuthenticationBrowserTests.swift */; };
+		B20000000000000000000014 /* ServerManifestTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* ServerManifestTests.swift */; };
+		B20000000000000000000015 /* OidcCredentialsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* OidcCredentialsTests.swift */; };
+		B20000000000000000000016 /* OidcCredentialStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* OidcCredentialStoreTests.swift */; };
+		B20000000000000000000017 /* OidcWebSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* OidcWebSessionTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -87,6 +103,7 @@
 		A10000000000000000000002 /* AppRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRootView.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* ConnectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectView.swift; sourceTree = "<group>"; };
 		A10000000000000000000004 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
+		A1000000000000000000002A /* WelcomeBlobBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeBlobBackground.swift; sourceTree = "<group>"; };
 		A10000000000000000000005 /* SettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000006 /* ServerURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURL.swift; sourceTree = "<group>"; };
 		A10000000000000000000014 /* DeepLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLink.swift; sourceTree = "<group>"; };
@@ -108,6 +125,7 @@
 		A10000000000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		A10000000000000000000018 /* OidcLoginManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcLoginManager.swift; sourceTree = "<group>"; };
 		A20000000000000000000001 /* ServerURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURLTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeBlobBackgroundTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* SettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStoreTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000004 /* DeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkTests.swift; sourceTree = "<group>"; };
@@ -124,6 +142,9 @@
 		A30000000000000000000001 /* Omnigent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Omnigent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A30000000000000000000002 /* OmnigentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A2000000000000000000000A /* ConnectionErrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionErrorTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000105 /* KeyboardViewportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardViewportTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000106 /* ServerSwitcherVisibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerSwitcherVisibilityTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000107 /* ThemeBackgroundTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeBackgroundTests.swift; sourceTree = "<group>"; };
 		A10000000000000000000019 /* DatabricksOAuthConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthConfiguration.swift; sourceTree = "<group>"; };
 		A1000000000000000000001A /* DatabricksOAuthAttempt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthAttempt.swift; sourceTree = "<group>"; };
 		A1000000000000000000001B /* DatabricksOAuthClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthClient.swift; sourceTree = "<group>"; };
@@ -141,9 +162,20 @@
 		A10000000000000000000021 /* DatabricksWebContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWebContext.swift; sourceTree = "<group>"; };
 		A10000000000000000000022 /* DatabricksSessionClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksSessionClient.swift; sourceTree = "<group>"; };
 		A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWorkspaceBootstrap.swift; sourceTree = "<group>"; };
+		A10000000000000000000024 /* WebAuthenticationBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebAuthenticationBrowser.swift; sourceTree = "<group>"; };
+		A10000000000000000000025 /* ServerManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerManifest.swift; sourceTree = "<group>"; };
+		A10000000000000000000026 /* OAuthSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuthSupport.swift; sourceTree = "<group>"; };
+		A10000000000000000000027 /* OidcCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcCredentialStore.swift; sourceTree = "<group>"; };
+		A10000000000000000000028 /* OidcCredentials.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcCredentials.swift; sourceTree = "<group>"; };
+		A10000000000000000000029 /* OidcWebSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcWebSession.swift; sourceTree = "<group>"; };
 		A20000000000000000000010 /* DatabricksWebContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWebContextTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000011 /* DatabricksSessionClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksSessionClientTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWorkspaceBootstrapTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000013 /* WebAuthenticationBrowserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebAuthenticationBrowserTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000014 /* ServerManifestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerManifestTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000015 /* OidcCredentialsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcCredentialsTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000016 /* OidcCredentialStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcCredentialStoreTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000017 /* OidcWebSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcWebSessionTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -199,6 +231,7 @@
 				A10000000000000000000002 /* AppRootView.swift */,
 				A10000000000000000000003 /* ConnectView.swift */,
 				A10000000000000000000004 /* DesignTokens.swift */,
+				A1000000000000000000002A /* WelcomeBlobBackground.swift */,
 				A10000000000000000000005 /* SettingsStore.swift */,
 				A10000000000000000000006 /* ServerURL.swift */,
 				A10000000000000000000014 /* DeepLink.swift */,
@@ -224,6 +257,12 @@
 				A10000000000000000000021 /* DatabricksWebContext.swift */,
 				A10000000000000000000022 /* DatabricksSessionClient.swift */,
 				A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */,
+				A10000000000000000000024 /* WebAuthenticationBrowser.swift */,
+				A10000000000000000000025 /* ServerManifest.swift */,
+				A10000000000000000000026 /* OAuthSupport.swift */,
+				A10000000000000000000027 /* OidcCredentialStore.swift */,
+				A10000000000000000000028 /* OidcCredentials.swift */,
+				A10000000000000000000029 /* OidcWebSession.swift */,
 				A1000000000000000000001D /* Omnigent.entitlements */,
 				A1000000000000000000000D /* Assets.xcassets */,
 				A10000000000000000000013 /* PrivacyInfo.xcprivacy */,
@@ -237,6 +276,7 @@
 			isa = PBXGroup;
 			children = (
 				A20000000000000000000001 /* ServerURLTests.swift */,
+				A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */,
 				A20000000000000000000002 /* SettingsStoreTests.swift */,
 				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
 				A20000000000000000000004 /* DeepLinkTests.swift */,
@@ -246,6 +286,9 @@
 				A20000000000000000000006 /* MockHTTPServer.swift */,
 				A20000000000000000000009 /* OidcLoginManagerTests.swift */,
 				A2000000000000000000000A /* ConnectionErrorTests.swift */,
+				A20000000000000000000105 /* KeyboardViewportTests.swift */,
+				A20000000000000000000106 /* ServerSwitcherVisibilityTests.swift */,
+				A20000000000000000000107 /* ThemeBackgroundTests.swift */,
 				A20000000000000000000020 /* DatabricksOAuthTests.swift */,
 				A2000000000000000000000B /* DatabricksOAuthClientTests.swift */,
 				A2000000000000000000000C /* DatabricksLoginManagerTests.swift */,
@@ -255,6 +298,11 @@
 				A20000000000000000000010 /* DatabricksWebContextTests.swift */,
 				A20000000000000000000011 /* DatabricksSessionClientTests.swift */,
 				A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */,
+				A20000000000000000000013 /* WebAuthenticationBrowserTests.swift */,
+				A20000000000000000000014 /* ServerManifestTests.swift */,
+				A20000000000000000000015 /* OidcCredentialsTests.swift */,
+				A20000000000000000000016 /* OidcCredentialStoreTests.swift */,
+				A20000000000000000000017 /* OidcWebSessionTests.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -413,6 +461,7 @@
 				B10000000000000000000002 /* AppRootView.swift in Sources */,
 				B10000000000000000000003 /* ConnectView.swift in Sources */,
 				B10000000000000000000004 /* DesignTokens.swift in Sources */,
+				B1000000000000000000002A /* WelcomeBlobBackground.swift in Sources */,
 				B10000000000000000000005 /* SettingsStore.swift in Sources */,
 				B10000000000000000000006 /* ServerURL.swift in Sources */,
 				B10000000000000000000014 /* DeepLink.swift in Sources */,
@@ -438,6 +487,12 @@
 				B10000000000000000000021 /* DatabricksWebContext.swift in Sources */,
 				B10000000000000000000022 /* DatabricksSessionClient.swift in Sources */,
 				B10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift in Sources */,
+				B10000000000000000000024 /* WebAuthenticationBrowser.swift in Sources */,
+				B10000000000000000000025 /* ServerManifest.swift in Sources */,
+				B10000000000000000000026 /* OAuthSupport.swift in Sources */,
+				B10000000000000000000027 /* OidcCredentialStore.swift in Sources */,
+				B10000000000000000000028 /* OidcCredentials.swift in Sources */,
+				B10000000000000000000029 /* OidcWebSession.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -446,6 +501,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B20000000000000000000001 /* ServerURLTests.swift in Sources */,
+				B20000000000000000000108 /* WelcomeBlobBackgroundTests.swift in Sources */,
 				B20000000000000000000002 /* SettingsStoreTests.swift in Sources */,
 				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
 				B20000000000000000000004 /* DeepLinkTests.swift in Sources */,
@@ -455,6 +511,9 @@
 				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
 				B20000000000000000000009 /* OidcLoginManagerTests.swift in Sources */,
 				B2000000000000000000000A /* ConnectionErrorTests.swift in Sources */,
+				B20000000000000000000105 /* KeyboardViewportTests.swift in Sources */,
+				B20000000000000000000106 /* ServerSwitcherVisibilityTests.swift in Sources */,
+				B20000000000000000000107 /* ThemeBackgroundTests.swift in Sources */,
 				B20000000000000000000020 /* DatabricksOAuthTests.swift in Sources */,
 				B2000000000000000000000B /* DatabricksOAuthClientTests.swift in Sources */,
 				B2000000000000000000000C /* DatabricksLoginManagerTests.swift in Sources */,
@@ -464,6 +523,11 @@
 				B20000000000000000000010 /* DatabricksWebContextTests.swift in Sources */,
 				B20000000000000000000011 /* DatabricksSessionClientTests.swift in Sources */,
 				B20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift in Sources */,
+				B20000000000000000000013 /* WebAuthenticationBrowserTests.swift in Sources */,
+				B20000000000000000000014 /* ServerManifestTests.swift in Sources */,
+				B20000000000000000000015 /* OidcCredentialsTests.swift in Sources */,
+				B20000000000000000000016 /* OidcCredentialStoreTests.swift in Sources */,
+				B20000000000000000000017 /* OidcWebSessionTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -615,7 +679,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = Omnigent/Omnigent.entitlements;
-				DATABRICKS_OAUTH_CLIENT_ID = "";
+				DATABRICKS_OAUTH_CLIENT_ID = omnigent;
 				DATABRICKS_OAUTH_REDIRECT_URL = "https://login.databricks.com/mobile-redirect";
 				APP_DISPLAY_NAME = Omnigent;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -633,7 +697,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.2.0;
+				MARKETING_VERSION = 0.3.2;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -649,7 +713,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = Omnigent/Omnigent.entitlements;
-				DATABRICKS_OAUTH_CLIENT_ID = "";
+				DATABRICKS_OAUTH_CLIENT_ID = omnigent;
 				DATABRICKS_OAUTH_REDIRECT_URL = "https://login.databricks.com/mobile-redirect";
 				APP_DISPLAY_NAME = Omnigent;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -667,7 +731,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.2.0;
+				MARKETING_VERSION = 0.3.2;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
