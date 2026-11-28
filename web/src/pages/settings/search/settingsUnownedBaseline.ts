@@ -24,6 +24,10 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 2,
     reason: "Theme color picker popover internals, not named by a row.",
   },
+  "src/pages/SettingsPage.tsx › ArchivedSection › CommandInput": {
+    count: 1,
+    reason: "added after the Settings catalog; no section entry yet",
+  },
   "src/pages/settings/HarnessCatalog.tsx › CatalogRow › button": {
     count: 1,
     reason:

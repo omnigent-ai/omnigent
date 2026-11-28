@@ -265,6 +265,8 @@ const ROUTES: readonly SettingsRoute[] = [
     url: "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=archived&expand_families=true&include_archived=true",
     body: ARCHIVED_PAGE,
   },
+  // The Archived project filter names its options from the caller's projects.
+  { url: "/v1/sessions/projects", body: [{ id: null, name: "Docs site" }] },
 ];
 
 /** What shows the section has loaded its data: text it renders, a catalog row, or a labelled control. */
