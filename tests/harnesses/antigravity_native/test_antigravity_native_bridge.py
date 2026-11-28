@@ -2174,7 +2174,10 @@ def test_seed_isolated_agy_home_drops_stale_model_for_launch_model(
 
     seed_isolated_agy_home(bridge_dir, launch_model="gemini-3.1-pro-high")
 
-    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {"theme": "dark"}
+    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {
+        "permissions": {"allow": ["mcp(omnigent/*)"]},
+        "theme": "dark",
+    }
     assert json.loads(real_settings.read_text(encoding="utf-8"))["model"] == "Real Home Pick"
 
 
@@ -2193,7 +2196,10 @@ def test_seed_isolated_agy_home_keeps_seeded_model_without_launch_model(
     seed_isolated_agy_home(bridge_dir, launch_model=None)
 
     iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
-    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {"model": "Real Home Pick"}
+    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {
+        "model": "Real Home Pick",
+        "permissions": {"allow": ["mcp(omnigent/*)"]},
+    }
 
 
 def test_seed_isolated_agy_home_prefers_real_onboarding_marker(
