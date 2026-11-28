@@ -258,7 +258,8 @@ it("reads a sub-agent's row through the session that links it", () => {
     .getQueryCache()
     .findAll({ queryKey: ["pr-page-github-info"] })
     .map((query) => query.queryKey)
-    .filter((key) => key.includes(PR));
+    // A key part equal to the PR's URL, compared whole.
+    .filter((key) => key.some((part) => part === PR));
   expect(rowKeys).toContainEqual(expect.arrayContaining(["pr-page-github-info", CHILD.id, PR]));
   expect(rowKeys.some((key) => key[1] === SESSION)).toBe(false);
 });
