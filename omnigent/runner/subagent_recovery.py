@@ -90,6 +90,8 @@ def build_subagent_recovery(
             snapshot = await _session_snapshot(conv_id)
         except Exception:  # noqa: BLE001 — best-effort recovery
             return None
+        if snapshot.status_code is None or snapshot.status_code >= 500:
+            raise _SubagentRecoveryReadError(f"session {conv_id} returned {snapshot.status_code}")
         parent_id = snapshot.parent_session_id
         if not parent_id or parent_id == conv_id:
             return None

@@ -207,6 +207,7 @@ from omnigent.runner.subagent_work import (
     _subagent_work_by_child,
     _subagent_work_by_parent,
     _SubagentDeliveryAck,
+    _SubagentRecoveryReadError,
     _SubagentWorkEntry,
     _truncate_child_preview,
     arm_subagent_child_start_timeout,
@@ -8572,12 +8573,16 @@ def create_runner_app(
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
+            identity_unreadable = False
             terminal_status = None
             if status in ("idle", "failed"):
                 recovered_entry = get_subagent_work(conversation_id)
                 turn_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
                 if turn_outcome in ("completed", "cancelled", "failed"):
-                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    try:
+                        recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    except _SubagentRecoveryReadError:
+                        identity_unreadable = True
                     terminal_status = turn_outcome
                 elif (
                     status == "idle"
@@ -8677,7 +8682,10 @@ def create_runner_app(
                     _schedule_subagent_wake(entry)
             else:
                 if status in ("idle", "failed"):
-                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    try:
+                        recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    except _SubagentRecoveryReadError:
+                        identity_unreadable = True
                 if status == "idle" and interrupt_pending:
                     # Interrupt with no confirming edge, resolved to the CURRENT
                     # dispatch (``resolve_pending_interrupt`` only reports pending
@@ -8717,8 +8725,11 @@ def create_runner_app(
                     # entry stays terminal and undelivered; it is handed over
                     # only if this runner ever creates the parent's inbox.
                     return Response(status_code=204)
+                # An unreadable child may be a sub-agent, so its sender must retry.
                 is_known = (
-                    conversation_id in _session_sub_agent_names or recovered_entry is not None
+                    conversation_id in _session_sub_agent_names
+                    or recovered_entry is not None
+                    or identity_unreadable
                 )
                 not_confirmed = _subagent_delivery_not_confirmed_response(
                     delivery_ack,

@@ -25,7 +25,7 @@ import re
 import tarfile
 import threading
 from collections.abc import AsyncIterator, Callable
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn
 from unittest.mock import AsyncMock
@@ -2585,6 +2585,46 @@ async def test_unconfirmed_subagent_idle_refused_by_its_own_runner_stays_off_par
         )
 
     assert confirmed.status_code == 202, confirmed.text
+    assert family.child_events_at_parent_runner() == [
+        {"status": "idle", "turn_completed": True, "output": "Found 3 issues."}
+    ]
+
+
+async def test_relaunched_subagent_result_replaces_pending_lost_runner_report(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _child_apart_from_parent(
+        client,
+        app,
+        db_uri,
+        monkeypatch,
+        name="apart-relaunched",
+        child_runner_handler=_runner_without_parent_inbox,
+    ) as family:
+        resolve_bound_runner = sessions_module._get_runner_client
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+        await orchestration_module._report_lost_subagent_to_parent_runner(
+            family.child_id,
+            family.store,
+            {"status": "failed", "output": _RUNNER_DISCONNECTED.message},
+        )
+        pending_report = orchestration_module._parent_report_retries[family.child_id].task
+        assert pending_report is not None
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve_bound_runner)
+        resp = await client.post(
+            f"/v1/sessions/{family.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "turn_completed": True, "output": "Found 3 issues."},
+            },
+        )
+        with suppress(asyncio.CancelledError):
+            await pending_report
+
+    assert resp.status_code == 202, resp.text
     assert family.child_events_at_parent_runner() == [
         {"status": "idle", "turn_completed": True, "output": "Found 3 issues."}
     ]

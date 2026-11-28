@@ -303,6 +303,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _session_is_moving,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
+    _supersede_parent_report,
     _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect,
     ensure_runner_connected,
@@ -3060,6 +3061,9 @@ def register_events_routes(
                         cost_usd=None,
                     )
                 )
+            if outcome is not None:
+                # The child's own outcome replaces a pending report of its lost runner.
+                await _supersede_parent_report(session_id)
             forward_body = body.model_dump(exclude={"workflow_run_id"})
             forward_body["data"] = data
             runner_result = await _forward_session_change_to_runner(
