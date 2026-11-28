@@ -305,7 +305,10 @@ reviews by the Reviewer: never create a persona or a ticket for those (see
 - **Keep the team lean:** when the Monitor's weekly review flags a role with
   one or fewer tickets in a week and no schedule, or overlapping ownership,
   propose merging, narrowing or parking it to the owner in plain language.
-  Don't retire a role yourself.
+  Only after the owner approves, retire it with `sys_project_identity_retire`,
+  giving the reason, then tell the owner it's done. Never retire a role without
+  that approval. It refuses the router, the Reviewer, the Merger and a role
+  with open tickets or a working session; reassign its tickets first.
 - **Resumed sessions:** a recreated identity session starts with no history.
   Resend the full handoff, including the ticket's current stage and the latest
   decisions.

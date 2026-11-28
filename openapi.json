@@ -9962,6 +9962,23 @@
         "title": "ResponseObject",
         "type": "object"
       },
+      "RetireIdentityRequest": {
+        "additionalProperties": false,
+        "description": "Why a role is being retired; shown to the owner in their Inbox notice.",
+        "properties": {
+          "reason": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "RetireIdentityRequest",
+        "type": "object"
+      },
       "RetryErrorDetail": {
         "description": "Error block carried by `RetryEvent` and `ErrorEvent`.\n\nMirrors the shape that `llm_retry.py` and `tool_retry.py`\nemit today \u2014 flat `code` / `message` plus an optional\n`detail` for provider-specific structured fields.",
         "properties": {
@@ -26069,6 +26086,124 @@
           }
         },
         "summary": "Set Role Kpis",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities/{identity_id}/restore": {
+      "post": {
+        "description": "Bring a retired role back with its persona, defaults and agent. Owner only.",
+        "operationId": "restore_identity_v1_projects__project_id__identities__identity_id__restore_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "identity_id",
+            "required": true,
+            "schema": {
+              "title": "Identity Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Restore Identity V1 Projects  Project Id  Identities  Identity Id  Restore Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restore Identity",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities/{identity_id}/retire": {
+      "post": {
+        "description": "Park a role: archive it and close its session, keeping its history. Reversible.\n\nThe owner, or the project's Lead session, may retire a role. The Lead can't retire\nitself, the router, the Reviewer or the Merger, and nobody can retire a role that\nstill has open tickets or a running session.",
+        "operationId": "retire_identity_v1_projects__project_id__identities__identity_id__retire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "identity_id",
+            "required": true,
+            "schema": {
+              "title": "Identity Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Retire Identity V1 Projects  Project Id  Identities  Identity Id  Retire Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retire Identity",
         "tags": [
           "projects"
         ]

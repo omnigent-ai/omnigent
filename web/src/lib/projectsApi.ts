@@ -451,6 +451,34 @@ export async function updateProjectIdentity(
   return (await res.json()) as ProjectIdentity;
 }
 
+/** A role the Lead or the owner retired; the owner can restore it. */
+export interface RetiredProjectRole {
+  id: string;
+  name: string;
+  retired_at: number | null;
+  retired_by: "lead" | "owner" | null;
+  reason: string | null;
+}
+
+/** The project's retired roles, most recently retired first. */
+export async function listRetiredProjectRoles(projectId: string): Promise<RetiredProjectRole[]> {
+  const res = await authenticatedFetch(identitiesPath(projectId));
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return ((await res.json()) as { retired?: RetiredProjectRole[] }).retired ?? [];
+}
+
+/** Bring a retired role back with its persona and agent. Owner only. */
+export async function restoreProjectIdentity(
+  projectId: string,
+  identityId: string,
+): Promise<ProjectIdentity> {
+  const res = await authenticatedFetch(`${identitiesPath(projectId, identityId)}/restore`, {
+    method: "POST",
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectIdentity;
+}
+
 export async function deleteProjectIdentity(projectId: string, identityId: string): Promise<void> {
   const res = await authenticatedFetch(identitiesPath(projectId, identityId), {
     method: "DELETE",

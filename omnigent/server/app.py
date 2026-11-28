@@ -4766,6 +4766,7 @@ def create_app(
                 ),
                 agent_store=agent_store,
                 artifact_store=artifact_store,
+                inbox_item_store=inbox_item_store,
             ),
             prefix="/v1",
             tags=["projects"],

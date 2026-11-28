@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronRightIcon, PlusIcon, Trash2Icon, UserIcon } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
@@ -19,6 +19,8 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   createProjectIdentity,
   deleteProjectIdentity,
+  listRetiredProjectRoles,
+  restoreProjectIdentity,
   PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
   updateProjectIdentity,
   type ProjectIdentity,
@@ -140,6 +142,21 @@ export function ProjectTeamDialog({
       void refresh();
       setSelected(null);
       setDraft(EMPTY_DRAFT);
+    },
+  });
+  // Only the owner restores retired roles, so only the owner sees them.
+  const retired = useQuery({
+    queryKey: ["project-retired-roles", projectId],
+    queryFn: () => listRetiredProjectRoles(projectId),
+    enabled: project !== undefined && !shared,
+  });
+  const restore = useMutation({
+    mutationFn: (identityId: string) => restoreProjectIdentity(projectId, identityId),
+    onSuccess: (identity) => {
+      void refresh();
+      void client.invalidateQueries({ queryKey: ["project-retired-roles", projectId] });
+      setSelected(identity.id);
+      setDraft(draftOf(identity));
     },
   });
   const all = identities.data ?? [];
@@ -265,6 +282,39 @@ export function ProjectTeamDialog({
                   <span className="truncate">{identity.name}</span>
                 </Button>
               ))}
+              {(retired.data?.length ?? 0) > 0 && (
+                <div
+                  className="mt-2 flex flex-col gap-1 border-t border-border/60 pt-2"
+                  data-testid="project-team-retired"
+                >
+                  <span className="px-2 text-xs font-medium text-muted-foreground">Retired</span>
+                  {retired.data?.map((role) => (
+                    <div
+                      key={role.id}
+                      className="flex items-center gap-2 px-2 py-1 text-sm"
+                      title={role.reason ?? undefined}
+                    >
+                      <PersonaAvatar name={role.name} size="xs" />
+                      <span className="truncate text-muted-foreground">{role.name}</span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="ml-auto h-7 px-2"
+                        disabled={restore.isPending}
+                        onClick={() => restore.mutate(role.id)}
+                      >
+                        Restore
+                      </Button>
+                    </div>
+                  ))}
+                  {restore.isError && (
+                    <p role="alert" className="px-2 text-xs text-destructive">
+                      {restore.error.message}
+                    </p>
+                  )}
+                </div>
+              )}
               {canRoute && (
                 <div className="mt-2 flex flex-col border-t border-border/60 pt-2">
                   <Button

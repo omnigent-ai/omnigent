@@ -415,7 +415,7 @@ async def test_read_only_tools_only_send_gets(name, args):
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 30
+    assert len(TICKET_TOOLS) == 31
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (

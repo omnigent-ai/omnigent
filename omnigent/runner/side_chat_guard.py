@@ -17,6 +17,7 @@ ROLE_SIDE_CHAT_BLOCKED_TOOLS = frozenset(
         "sys_project_identity_session",
         "sys_project_identity_create",
         "sys_project_identity_update",
+        "sys_project_identity_retire",
         "sys_project_update",
         "sys_project_mandate_propose",
         "sys_project_kpis_set",

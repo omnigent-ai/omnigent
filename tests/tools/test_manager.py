@@ -103,6 +103,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_project_identity_list",
         "sys_project_identity_create",
         "sys_project_identity_update",
+        "sys_project_identity_retire",
         "sys_project_identity_session",
         "sys_project_artifact_save",
         "sys_project_artifact_list",

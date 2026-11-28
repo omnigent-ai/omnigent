@@ -549,6 +549,34 @@ class SysProjectIdentityUpdateTool(_TicketTool):
     arguments = UpdateIdentity
 
 
+class RetireIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    identity: str = Field(
+        min_length=1,
+        max_length=64,
+        description="The role's current name (case-insensitive) or ID.",
+    )
+    reason: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Why, in plain language, e.g. which role takes over its work and that "
+        "the owner approved it. It's shown to the owner.",
+    )
+
+
+class SysProjectIdentityRetireTool(_TicketTool):
+    tool_name = "sys_project_identity_retire"
+    help_text = (
+        "As the project's Lead, retire (park) a role once the owner has approved merging or "
+        "parking it. It archives the role and closes its session; its history, tickets and "
+        "spend stay, and the owner can restore it from the Team dialog. The owner gets an "
+        "Inbox notice with your reason. Only the Lead may call it. It refuses the router, "
+        "the Reviewer and the Merger, and any role with open assigned tickets or a session "
+        "still working: reassign or wait first."
+    )
+    arguments = RetireIdentity
+
+
 class SysProjectIdentityListTool(_TicketTool):
     tool_name = "sys_project_identity_list"
     read_only = True
@@ -939,6 +967,7 @@ TICKET_TOOL_CLASSES = (
     SysProjectIdentityListTool,
     SysProjectIdentityCreateTool,
     SysProjectIdentityUpdateTool,
+    SysProjectIdentityRetireTool,
     SysProjectIdentitySessionTool,
     SysProjectArtifactSaveTool,
     SysProjectArtifactListTool,

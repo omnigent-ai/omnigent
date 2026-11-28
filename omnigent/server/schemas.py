@@ -6768,6 +6768,13 @@ class ProjectRoleScope(BaseModel):
     excludes: list[str] = Field(default_factory=list, max_length=12)
 
 
+class RetireIdentityRequest(BaseModel):
+    """Why a role is being retired; shown to the owner in their Inbox notice."""
+
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class ProjectIdentityRequest(BaseModel):
     """Create or edit a project identity (a named persistent role).
 

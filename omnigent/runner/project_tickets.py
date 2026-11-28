@@ -235,6 +235,8 @@ async def execute_ticket_tool(
             return await _create_identity(body, project_id, request)
         if name == "sys_project_identity_update":
             return await _update_identity(body, project_id, request)
+        if name == "sys_project_identity_retire":
+            return await _retire_identity(body, project_id, request)
         if name == "sys_project_identity_session":
             return await _open_identity_session(body, project_id, request, client, source_id)
         if name == "sys_project_ticket_file":
@@ -546,6 +548,18 @@ def _deploy_status_here(status: dict[str, Any]) -> dict[str, Any]:
             "Set OMNIGENT_BUILD_COMMIT when deploying it."
         )
     return result
+
+
+async def _retire_identity(body: dict[str, Any], project_id: str, request: Any) -> str:
+    """Retire a role by name or ID; the server enforces who may and when."""
+    base = f"/v1/projects/{project_id}/identities"
+    identity, error = await _resolve_identity(body["identity"], base, request)
+    if identity is None:
+        return error
+    retired = await request(
+        "POST", f"{base}/{identity['id']}/retire", json={"reason": body["reason"]}
+    )
+    return json.dumps({"retired": retired}, ensure_ascii=False)
 
 
 async def _open_identity_session(

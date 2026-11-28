@@ -81,6 +81,7 @@ from omnigent.server.schemas import (
     ProjectOrderResponse,
     ProjectRoutingRequest,
     ProposeMandateRequest,
+    RetireIdentityRequest,
     ShareProjectRequest,
     UpdateProjectRequest,
     UpdateProjectShareRequest,
@@ -91,6 +92,7 @@ from omnigent.server.usage_events import record_usage_event
 from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.inbox_item_store import InboxItemStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
 from omnigent.util.uuid import InvalidUuidError, normalize_uuid, uuid_to_bytes
@@ -365,6 +367,52 @@ async def _record_role_event(
     )
 
 
+RETIRED_ROLES_CONFIG_KEY = "retired_roles"
+# Roles the mandate requires; only the owner may retire them.
+_OWNER_RETIRED_ROLE_NAMES = frozenset({"reviewer", "merger"})
+
+
+def _retired_summary(retired: dict[str, Any]) -> dict[str, Any]:
+    """What a listing shows of a retired role."""
+    return {key: retired.get(key) for key in ("id", "name", "retired_at", "retired_by", "reason")}
+
+
+def _retired_roles(project: Project) -> list[dict[str, Any]]:
+    """The project's retired roles, most recently retired first."""
+    stored = (project.config or {}).get(RETIRED_ROLES_CONFIG_KEY) or {}
+    rows = [_retired_summary(row) for row in stored.values() if isinstance(row, dict)]
+    return sorted(rows, key=lambda row: row.get("retired_at") or 0, reverse=True)
+
+
+def _open_assigned_titles(tickets: Any, project: Project, name: str) -> list[str]:
+    """Titles of tickets assigned to *name* that aren't in a completed stage."""
+    stages = tickets.stages(project.id, user_id=project.user_id)["stages"]
+    done = {stage["id"] for stage in stages if stage.get("is_complete")}
+    wanted = name.strip().casefold()
+    titles: list[str] = []
+    after: str | None = None
+    while True:
+        page = tickets.list(project.id, user_id=project.user_id, after=after, limit=100)
+        for ticket in page.get("data", []):
+            assignee = next(
+                (
+                    label.get("value")
+                    for label in ticket.get("labels") or []
+                    if label.get("key") == "assignee"
+                ),
+                None,
+            )
+            if (
+                isinstance(assignee, str)
+                and assignee.strip().casefold() == wanted
+                and ticket.get("stage_id") not in done
+            ):
+                titles.append(ticket.get("title") or ticket["id"])
+        if not page.get("has_more"):
+            return titles
+        after = page.get("last_id")
+
+
 def create_projects_router(
     project_store: ProjectStore,
     auth_provider: AuthProvider | None = None,
@@ -374,6 +422,7 @@ def create_projects_router(
     register_mention_targets: Callable[[PersonaMentionTargets], None] | None = None,
     agent_store: AgentStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    inbox_item_store: InboxItemStore | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
@@ -614,6 +663,10 @@ def create_projects_router(
         if body.config is not None:
             stored = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
             is_owner = stored is None or stored.user_id == user_id
+            # Retired roles are written only by the retire and restore routes.
+            body.config.pop(RETIRED_ROLES_CONFIG_KEY, None)
+            if stored is not None and stored.config.get(RETIRED_ROLES_CONFIG_KEY):
+                body.config[RETIRED_ROLES_CONFIG_KEY] = stored.config[RETIRED_ROLES_CONFIG_KEY]
             _refuse_owner_config_write(
                 request, body.config, stored.config if stored else None, is_owner=is_owner
             )
@@ -814,7 +867,7 @@ def create_projects_router(
         router_id = choose_router(project, identities).identity_id
         for entry in data:
             entry["router"] = entry["id"] == router_id
-        return {"object": "list", "data": data}
+        return {"object": "list", "data": data, "retired": _retired_roles(project)}
 
     @router.put("/projects/{project_id}/routing")
     async def set_project_routing(
@@ -1055,6 +1108,216 @@ def create_projects_router(
         await _record_role_event(request, project, user_id, "role.deleted", normalized, None)
         announce_projects_changed(user_id)
         return {"id": normalized, "object": "project.identity.deleted", "deleted": True}
+
+    @router.post("/projects/{project_id}/identities/{identity_id}/retire")
+    async def retire_identity(
+        request: Request, project_id: str, identity_id: str, body: RetireIdentityRequest
+    ) -> dict[str, Any]:
+        """Park a role: archive it and close its session, keeping its history. Reversible.
+
+        The owner, or the project's Lead session, may retire a role. The Lead can't retire
+        itself, the router, the Reviewer or the Merger, and nobody can retire a role that
+        still has open tickets or a running session.
+        """
+        user_id = require_user(request, auth_provider)
+        await _require_private_source(request, user_id)
+        await _refuse_role_side_chat(request, user_id, "Retiring project roles")
+        project = await _owned_project(project_id, user_id)
+        source = normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
+        if source is not None and source != project.main_session_id:
+            raise OmnigentError(
+                "Only the project's Lead can retire a role", code=ErrorCode.FORBIDDEN
+            )
+        if source is None and project.user_id != user_id:
+            raise OmnigentError(
+                "Only the project owner or its Lead can retire a role", code=ErrorCode.FORBIDDEN
+            )
+        if identity_id == LEAD_IDENTITY_ID:
+            raise OmnigentError("The Lead can't be retired", code=ErrorCode.INVALID_INPUT)
+        normalized = _identity_id(identity_id)
+        identities = await asyncio.to_thread(
+            project_store.list_identities, project.id, user_id=project.user_id
+        )
+        identity = next((item for item in identities if item.id == normalized), None)
+        if identity is None:
+            raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+        if choose_router(project, identities).identity_id == identity.id:
+            raise OmnigentError(
+                "This role routes the project's events; choose another router first",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if source is not None and identity.name.casefold() in _OWNER_RETIRED_ROLE_NAMES:
+            raise OmnigentError(
+                f"Only the project owner can retire the {identity.name}",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if source is not None and identity.active_session_id == source:
+            raise OmnigentError("A role can't retire itself", code=ErrorCode.FORBIDDEN)
+        blockers = await _retire_blockers(request, project, identity)
+        if blockers:
+            raise OmnigentError(
+                f"{identity.name} can't be retired yet: " + "; ".join(blockers),
+                code=ErrorCode.CONFLICT,
+            )
+        retired = {
+            "id": identity.id,
+            "name": identity.name,
+            "instructions": identity.instructions,
+            "agent_id": identity.agent_id,
+            "model": identity.model,
+            "effort": identity.effort,
+            "scope": identity.scope,
+            "project_agent_id": identity.project_agent_id,
+            "created_by_session_id": identity.created_by_session_id,
+            "created_at": identity.created_at,
+            "last_session_id": identity.active_session_id,
+            "retired_at": int(time.time()),
+            "retired_by": "lead" if source is not None else "owner",
+            "reason": body.reason.strip(),
+        }
+        config = dict(project.config or {})
+        config[RETIRED_ROLES_CONFIG_KEY] = {
+            **(config.get(RETIRED_ROLES_CONFIG_KEY) or {}),
+            identity.id: retired,
+        }
+        await asyncio.to_thread(
+            project_store.update, project.id, user_id=project.user_id, config=config
+        )
+        await asyncio.to_thread(
+            project_store.delete_identity, project.id, identity.id, user_id=project.user_id
+        )
+        if identity.active_session_id and conversation_store is not None:
+            await asyncio.to_thread(
+                conversation_store.update_conversation, identity.active_session_id, archived=True
+            )
+        await _record_role_event(request, project, user_id, "role.retired", identity.id, None)
+        await _tell_owner_retired(project, retired, source)
+        announce_projects_changed(project.user_id)
+        return {"object": "project.identity.retired", **_retired_summary(retired)}
+
+    @router.post("/projects/{project_id}/identities/{identity_id}/restore")
+    async def restore_identity(
+        request: Request, project_id: str, identity_id: str
+    ) -> dict[str, Any]:
+        """Bring a retired role back with its persona, defaults and agent. Owner only."""
+        user_id = require_user(request, auth_provider)
+        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            raise OmnigentError(
+                "Only the project owner can restore a role", code=ErrorCode.FORBIDDEN
+            )
+        project = await _owned_project(project_id, user_id)
+        if project.user_id != user_id:
+            raise OmnigentError(
+                "Only the project owner can restore a role", code=ErrorCode.FORBIDDEN
+            )
+        normalized = _identity_id(identity_id)
+        config = dict(project.config or {})
+        retired_roles = dict(config.get(RETIRED_ROLES_CONFIG_KEY) or {})
+        retired = retired_roles.get(normalized)
+        if not isinstance(retired, dict):
+            raise OmnigentError("No retired role with that ID", code=ErrorCode.NOT_FOUND)
+        identity = await asyncio.to_thread(
+            project_store.create_identity,
+            project.id,
+            normalized,
+            user_id=user_id,
+            name=retired["name"],
+            instructions=retired.get("instructions") or "",
+            agent_id=retired.get("agent_id"),
+            model=retired.get("model"),
+            effort=retired.get("effort"),
+            created_by_session_id=retired.get("created_by_session_id"),
+            scope=retired.get("scope"),
+        )
+        if retired.get("project_agent_id"):
+            identity = await asyncio.to_thread(
+                project_store.set_identity_project_agent,
+                project.id,
+                identity.id,
+                retired["project_agent_id"],
+                user_id=user_id,
+                expected=None,
+            )
+        retired_roles.pop(normalized, None)
+        config[RETIRED_ROLES_CONFIG_KEY] = retired_roles
+        await asyncio.to_thread(project_store.update, project.id, user_id=user_id, config=config)
+        await _record_role_event(request, project, user_id, "role.restored", identity.id, None)
+        announce_projects_changed(user_id)
+        return await _identity_payload(project, identity)
+
+    async def _retire_blockers(
+        request: Request, project: Project, identity: ProjectIdentity
+    ) -> list[str]:
+        """What keeps a role from retiring: open tickets assigned to it, or a running session."""
+        blockers: list[str] = []
+        notifications = getattr(request.app.state, "project_ticket_notifications", None)
+        tickets = getattr(notifications, "tickets", None)
+        if tickets is not None:
+            open_titles = await asyncio.to_thread(
+                _open_assigned_titles, tickets, project, identity.name
+            )
+            if open_titles:
+                shown = ", ".join(f'"{title}"' for title in open_titles[:3])
+                more = f" and {len(open_titles) - 3} more" if len(open_titles) > 3 else ""
+                blockers.append(
+                    f"{len(open_titles)} open ticket(s) are assigned to it ({shown}{more}); "
+                    "reassign them first"
+                )
+        if identity.active_session_id and conversation_store is not None:
+            session = await asyncio.to_thread(
+                conversation_store.get_conversation, identity.active_session_id
+            )
+            if (
+                session is not None
+                and not session.archived
+                and session.live_status not in (None, "idle", "failed")
+            ):
+                blockers.append("its session is still working; wait for it to finish")
+        return blockers
+
+    async def _tell_owner_retired(
+        project: Project, retired: dict[str, Any], source: str | None
+    ) -> None:
+        """Put a notice of a Lead's retirement in the owner's Inbox; best effort."""
+        if source is None or inbox_item_store is None or agent_store is None:
+            return
+        session = (
+            await asyncio.to_thread(conversation_store.get_conversation, source)
+            if conversation_store is not None
+            else None
+        )
+        if session is None or session.agent_id is None:
+            return
+        from omnigent.server.inbox_dedupe import DedupeInputs, dedupe_key, normalize_topic
+        from omnigent.stores.inbox_item_store import DuplicateInboxItemError, NewInboxItem
+
+        inputs = DedupeInputs(
+            kind="info",
+            primary_link=None,
+            topic=normalize_topic(f"retired role {retired['name']} {retired['retired_at']}"),
+        )
+        item = NewInboxItem(
+            user_id=project.user_id or RESERVED_USER_LOCAL,
+            source_session_id=source,
+            agent_id=session.agent_id,
+            kind="info",
+            title=f"The Lead retired {retired['name']} in {project.name}",
+            body_md=(
+                f"**Reason:** {retired['reason']}\n\n"
+                "Its history, tickets and spend stay in the project. You can restore it "
+                "from the Team dialog's retired roles."
+            ),
+            links=[],
+            actions=[],
+            media=[],
+            primary_link=None,
+            topic=inputs.topic,
+            dedupe_key=dedupe_key(inputs),
+        )
+        try:
+            await asyncio.to_thread(inbox_item_store.create, item)
+        except (DuplicateInboxItemError, OmnigentError):
+            logger.info("Retired-role notice for %s not posted", retired["id"], exc_info=True)
 
     def _discard_role_agent(agent_id: str) -> None:
         """Delete a role's project agent once no session uses it; in-use ones stay hidden."""

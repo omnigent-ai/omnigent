@@ -15,7 +15,15 @@ vi.mock("@/lib/projectsApi", () => ({
   })),
   updateProjectIdentity: vi.fn(),
   deleteProjectIdentity: vi.fn(),
+  listRetiredProjectRoles: vi.fn(async () => retiredRoles.rows),
+  restoreProjectIdentity: vi.fn(async (_projectId: string, identityId: string) => ({
+    id: identityId,
+    name: "zz Designer",
+    builtin: false,
+    instructions: "",
+  })),
 }));
+const retiredRoles = vi.hoisted(() => ({ rows: [] as Record<string, unknown>[] }));
 const identities = vi.hoisted(() => ({
   extra: [] as Record<string, unknown>[],
 }));
@@ -38,6 +46,7 @@ vi.mock("./ProjectRoutingSection", () => ({
 
 afterEach(() => {
   identities.extra = [];
+  retiredRoles.rows = [];
 });
 
 describe("ProjectTeamDialog", () => {
@@ -76,6 +85,29 @@ describe("ProjectTeamDialog", () => {
       "scope",
     );
     expect(screen.queryByRole("group", { name: "Start from a role (optional)" })).toBeNull();
+  });
+
+  it("lists retired roles for the owner and restores one", async () => {
+    retiredRoles.rows = [
+      {
+        id: "role-1",
+        name: "zz Designer",
+        retired_at: 1,
+        retired_by: "lead",
+        reason: "Merged into the Product Designer",
+      },
+    ];
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    const retired = await screen.findByTestId("project-team-retired");
+    expect(retired).toHaveTextContent("zz Designer");
+    fireEvent.click(within(retired).getByRole("button", { name: "Restore" }));
+    await waitFor(() =>
+      expect(projectsApi.restoreProjectIdentity).toHaveBeenCalledWith("project", "role-1"),
+    );
   });
 
   it("starts blank and lets Blank clear a role's prefilled fields", () => {
