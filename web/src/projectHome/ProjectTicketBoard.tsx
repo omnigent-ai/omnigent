@@ -748,11 +748,16 @@ function TicketCardContent({
 }
 
 /**
- * The card's second line: the newest comment for the human, so a later move or label
- * edit doesn't hide it. Without one (older servers, or one past the server's scan), the
- * last update shows unless it is an event line.
+ * The card's second line. While an ask is open it shows the question the ticket waits on,
+ * so a later note doesn't bury it. Otherwise the newest comment for the human, so a later
+ * move or label edit doesn't hide it; without one (older servers, or one past the server's
+ * scan), the last update shows unless it is an event line.
  */
 function TicketStatusLine({ ticket }: { ticket: ProjectTicket }) {
+  const question = ticket.waiting_on?.question?.trim();
+  if (question) {
+    return <TicketOpenQuestion question={question} raisedAt={ticket.waiting_on?.raised_at} />;
+  }
   const comment = ticket.latest_comment;
   const source =
     comment?.text ||
@@ -775,6 +780,27 @@ function TicketStatusLine({ ticket }: { ticket: ProjectTicket }) {
           ? `Latest comment${author ? ` by ${author}` : ""}, ${absoluteTime(comment.created_at * 1000)}`
           : undefined
       }
+      className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere"
+    >
+      {text}
+    </p>
+  );
+}
+
+function TicketOpenQuestion({
+  question,
+  raisedAt,
+}: {
+  question: string;
+  raisedAt?: number | null;
+}) {
+  const text = markdownPlainText(question);
+  if (!text) return null;
+  return (
+    <p
+      data-testid="ticket-status-line"
+      data-open-question=""
+      title={raisedAt ? `Open question, asked ${absoluteTime(raisedAt * 1000)}` : "Open question"}
       className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere"
     >
       {text}

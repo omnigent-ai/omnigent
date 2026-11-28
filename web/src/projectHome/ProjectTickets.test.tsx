@@ -566,6 +566,33 @@ describe("Project ticket board", () => {
     expect(within(card).queryByText("Moved to Review")).toBeNull();
   });
 
+  it("shows the open question, not a later note, while an ask is open", async () => {
+    // WHY: a worker's later note ("Attached the log") must not bury what the card waits on.
+    ticket.comment_count = 3;
+    ticket.latest_comment = {
+      text: "Attached the verification log",
+      user_id: null,
+      session_id: "sess_worker",
+      by_person: false,
+      position: 5,
+      created_at: 1_700_000_100,
+    };
+    ticket.waiting_on = {
+      reason: "owner",
+      responders: ["alice@example.com"],
+      raised_by_user_id: null,
+      raised_at: 1_700_000_000,
+      ask_position: 4,
+      question: "Should this ship **Friday** or Monday?",
+    };
+    renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+    const line = within(card).getByTestId("ticket-status-line");
+    expect(line).toHaveTextContent("Should this ship Friday or Monday?");
+    expect(line.title).toMatch(/^Open question, asked /);
+    expect(within(card).queryByText("Attached the verification log")).toBeNull();
+  });
+
   it("falls back to the last real update when the server found no comment", async () => {
     ticket.latest_update = "Confirmed the issue is resolved";
     ticket.comment_count = 1;
