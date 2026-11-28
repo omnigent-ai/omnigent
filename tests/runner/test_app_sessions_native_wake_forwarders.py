@@ -447,6 +447,48 @@ async def test_required_cursor_terminal_exit_cancels_transcript_forwarder(
         subagent_work.unregister_child_session(session_id)
 
 
+@pytest.mark.asyncio
+async def test_queued_cursor_exit_cleanup_keeps_a_replacement_forwarder() -> None:
+    """A forwarder registered before the queued exit cleanup runs belongs to the new pane."""
+    session_id = uuid.uuid4().hex
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    process_manager._sessions.add(session_id)
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+    exited = asyncio.create_task(asyncio.Event().wait())
+    replacement = asyncio.create_task(asyncio.Event().wait())
+    runner_app_mod._register_auto_forwarder_task(session_id, exited)
+    try:
+        before_exit = asyncio.all_tasks()
+        publish_exit(
+            TerminalExitEvent(
+                session_id=session_id,
+                terminal_id="terminal_cursor_main",
+                terminal_name="cursor",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                session_was_idle=True,
+            )
+        )
+        exit_cleanup = asyncio.all_tasks() - before_exit
+        runner_app_mod._register_auto_forwarder_task(session_id, replacement)
+        await asyncio.wait(exit_cleanup, timeout=budget(5.0))
+
+        assert not replacement.done()
+        assert runner_app_mod._AUTO_FORWARDER_TASKS.get(session_id) is replacement
+    finally:
+        for task in (exited, replacement):
+            task.cancel()
+        await asyncio.gather(exited, replacement, return_exceptions=True)
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        runner_app_mod._session_event_queues_ref.pop(session_id, None)
+        subagent_work.unregister_child_session(session_id)
+
+
 @pytest.mark.parametrize(
     ("scenario", "same_path"),
     [
