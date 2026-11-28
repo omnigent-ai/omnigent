@@ -117,6 +117,8 @@ export interface ShortcutPageContext {
   desktopCommands: boolean;
   /** Always steer is on, so ⌘↵ queues a follow-up instead of sending now. */
   alwaysSteer: boolean;
+  /** quick_pick_palette is on, so Ctrl+Tab steps to the next session instead of switching. */
+  quickPick: boolean;
 }
 
 /** What a page row's keys may depend on. */
@@ -441,7 +443,7 @@ const APP_BINDINGS = {
     chords: (environment) =>
       sessionStepChords(environment, { ctrl: true, key: "Tab", exactKey: true }, "ArrowDown"),
     flag: "quick_pick_palette",
-    shownWhen: NOT_LISTED,
+    shownWhen: (context) => context.electron && context.quickPick,
   },
   "session.previous": {
     group: "navigation",
@@ -453,8 +455,9 @@ const APP_BINDINGS = {
         "ArrowUp",
       ),
     flag: "quick_pick_palette",
-    shownWhen: NOT_LISTED,
+    shownWhen: (context) => context.electron && context.quickPick,
   },
+  // With quick_pick_palette on, Ctrl+Tab is Next session instead.
   "sessions.recent": {
     group: "navigation",
     label: "Switch recent sessions",
@@ -463,7 +466,7 @@ const APP_BINDINGS = {
       { ctrl: true, key: "Tab", exactKey: true },
       { ctrl: true, shift: true, key: "Tab", exactKey: true },
     ],
-    shownWhen: (context) => context.electron,
+    shownWhen: (context) => context.electron && !context.quickPick,
   },
   "history.back": {
     group: "navigation",

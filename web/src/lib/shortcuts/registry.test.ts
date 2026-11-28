@@ -685,6 +685,7 @@ describe("Keyboard shortcuts page metadata", () => {
     siblingSessions: false,
     desktopCommands: false,
     alwaysSteer: false,
+    quickPick: false,
   };
   const resolved = (environment: Partial<ShortcutEnvironment>) =>
     currentShortcutEnvironment({ submitWithModEnter: false, ...environment });

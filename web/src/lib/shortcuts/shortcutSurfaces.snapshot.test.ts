@@ -48,6 +48,7 @@ const EVERYTHING_SUPPORTED: ShortcutPageContext = {
   siblingSessions: true,
   desktopCommands: true,
   alwaysSteer: false,
+  quickPick: false,
 };
 
 const environmentName = ({ mac, native, desktopMenu, submitWithModEnter }: ShortcutEnvironment) =>
@@ -123,10 +124,12 @@ describe("shortcut surfaces", () => {
   });
 
   it("read as recorded in every environment", async () => {
-    // Every row the page can list somewhere: all it reads but those it never lists.
+    // Every row the page can list somewhere, with quick_pick_palette on or off.
     const listed = new Set<ShortcutId>(
-      APP_SHORTCUT_BINDINGS.filter(
-        (binding) => binding.shownWhen?.(EVERYTHING_SUPPORTED) ?? true,
+      APP_SHORTCUT_BINDINGS.filter((binding) =>
+        [false, true].some(
+          (quickPick) => binding.shownWhen?.({ ...EVERYTHING_SUPPORTED, quickPick }) ?? true,
+        ),
       ).map((binding) => binding.id),
     );
     const lines = ENVIRONMENTS.flatMap((environment) => [
