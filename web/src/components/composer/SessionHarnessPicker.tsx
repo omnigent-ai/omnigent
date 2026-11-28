@@ -124,6 +124,7 @@ export function SessionHarnessPicker({
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [focusConfig, setFocusConfig] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
   const [cycleDraft, setCycleDraft] = useState<{
     sessionId: string | null;
@@ -142,6 +143,7 @@ export function SessionHarnessPicker({
     [],
   );
   const appliedOpenNonce = useRef(0);
+  const pendingConfigOpen = useRef(false);
   const conversationId = useTargetConversationId(sessionId);
   // The live target: a fixed session, or the conversation active at the time of the call.
   const currentConversationId = () => sessionId ?? useChatStore.getState().conversationId;
@@ -214,14 +216,36 @@ export function SessionHarnessPicker({
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
       cancelCycle();
-      setMenuOpen(true);
-      setConfigOpen(true);
+      setFocusConfig(true);
+      if (isMobile || menuOpen) {
+        pendingConfigOpen.current = false;
+        setMenuOpen(true);
+        setConfigOpen(true);
+      } else {
+        // Wait one frame on desktop so Radix mounts and measures the parent menu
+        // before anchoring the model submenu.
+        pendingConfigOpen.current = true;
+        setMenuOpen(true);
+      }
     }
-  }, [openNonce, disabled, configurable, cancelCycle]);
+  }, [openNonce, disabled, configurable, cancelCycle, isMobile, menuOpen]);
+  useEffect(() => {
+    if (!menuOpen) {
+      pendingConfigOpen.current = false;
+      setFocusConfig(false);
+      return;
+    }
+    if (!pendingConfigOpen.current) return;
+    pendingConfigOpen.current = false;
+    const frame = requestAnimationFrame(() => setConfigOpen(true));
+    return () => cancelAnimationFrame(frame);
+  }, [menuOpen]);
   useEffect(() => {
     cancelCycle();
+    pendingConfigOpen.current = false;
     setMenuOpen(false);
     setConfigOpen(false);
+    setFocusConfig(false);
   }, [conversationId, cancelCycle]);
   const apply = async (change: () => Promise<unknown>, wakesSession = false) => {
     if (disabled || busyRef.current || pendingModelChange !== null) return;
@@ -531,9 +555,14 @@ export function SessionHarnessPicker({
       }
       onDismissCyclePreview={dismissPreview}
       open={menuOpen}
+      configOpen={configOpen}
       onOpenChange={(next) => {
         if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-        if (!next) setConfigOpen(false);
+        if (!next) {
+          pendingConfigOpen.current = false;
+          setConfigOpen(false);
+          setFocusConfig(false);
+        }
       }}
       trigger={{
         appearance,
@@ -589,6 +618,8 @@ export function SessionHarnessPicker({
           valueTestId="composer-agent-model-summary"
           testId="composer-agent-edit"
           configTestId="composer-agent-config-menu"
+          focusSelected={focusConfig}
+          onSelectedFocus={() => setFocusConfig(false)}
         >
           {configContent}
         </HarnessPickerConfigRow>
@@ -712,6 +743,7 @@ function useResolvedComposerModel(
   // ``model_options`` field. Claude's rows are the aliases pinned to the
   // launch-time Databricks catalog; Codex carries richer effort metadata.
   const usesServerModelOptions =
+    modelPickerKind === "antigravity" ||
     modelPickerKind === "claude" ||
     modelPickerKind === "codex" ||
     modelPickerKind === "cursor" ||
@@ -745,15 +777,19 @@ function useResolvedComposerModel(
   );
   const effectiveModel = sessionModelSeeded
     ? (sessionModelOverride ?? llmModel)
-    : nativeVendorOwnsModel
-      ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-        ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
-          ? (sessionModelOverride ?? llmModel)
-          : null
-      : isReportedModelPicker
-        ? llmModel
-        : (sessionModelOverride ?? llmModel);
+    : modelPickerKind === "antigravity"
+      ? (llmModel ?? sessionModelOverride)
+      : nativeVendorOwnsModel
+        ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
+          ? sessionModelOverride
+          : modelPickerKind === "opencode" ||
+              modelPickerKind === "pi" ||
+              modelPickerKind === "devin"
+            ? (sessionModelOverride ?? llmModel)
+            : null
+        : isReportedModelPicker
+          ? llmModel
+          : (sessionModelOverride ?? llmModel);
   const {
     label: modelLabel,
     loading: modelLabelLoading,

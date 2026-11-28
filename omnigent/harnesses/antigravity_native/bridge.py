@@ -461,6 +461,26 @@ def agy_conversation_db(bridge_dir: Path, cascade_id: str) -> Path:
     return agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
 
 
+def agy_settings_path(bridge_dir: Path) -> Path:
+    """Return the session-isolated ``settings.json`` path under ``--gemini_dir``."""
+    return agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+
+
+def read_agy_settings_model(bridge_dir: Path) -> str | None:
+    """Return the active ``model`` recorded in this session's isolated ``settings.json``."""
+    try:
+        raw = agy_settings_path(bridge_dir).read_text(encoding="utf-8")
+        loaded = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    model = loaded.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return None
+
+
 def build_mcp_config(
     bridge_dir: Path,
     *,
@@ -1309,6 +1329,8 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 _PASTE_SETTLE_S = 0.2
 # How long one submit Enter is given to start a turn before it is re-sent.
 _SUBMIT_VERIFY_TIMEOUT_S = 5.0
+# How long to wait for agy to persist a ``/model <slug>`` switch to settings.json.
+_MODEL_CONFIRM_TIMEOUT_S = 5.0
 # Re-send budget for a submit Enter that the TUI folded into the paste burst.
 _MAX_SUBMIT_ATTEMPTS = 3
 # Named tmux buffer used to stream the paste (avoids the ~16KB send-keys argv cap).
@@ -2045,6 +2067,143 @@ def inject_user_message_via_tui(
             _VERIFY_RETRY_INTERVAL_S,
         )
         time.sleep(_VERIFY_RETRY_INTERVAL_S)
+
+
+def _live_antigravity_model_options() -> list[dict[str, object]]:
+    """Read the live ``agy models`` catalog used by the Web UI picker."""
+    from omnigent.harnesses.antigravity_native.main import list_antigravity_cli_model_options
+
+    return [dict(option) for option in list_antigravity_cli_model_options()]
+
+
+def _agy_model_matches(
+    observed: str | None,
+    *,
+    model: str,
+    expected_display_name: str | None,
+) -> bool:
+    """Return whether *observed* from ``settings.json`` matches the target model."""
+    if not observed:
+        return False
+    normalized = " ".join(observed.casefold().split())
+    if normalized == " ".join(model.casefold().split()):
+        return True
+    if expected_display_name:
+        return normalized == " ".join(expected_display_name.casefold().split())
+    return False
+
+
+def _agy_footer_region(pane: str) -> str:
+    """Return the bottom footer rows so transcript text cannot spoof idle/busy markers."""
+    non_empty = [line for line in pane.splitlines() if line.strip()]
+    return "\n".join(non_empty[-6:])
+
+
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model: str,
+    expected_display_name: str | None = None,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    confirm_timeout_s: float = _MODEL_CONFIRM_TIMEOUT_S,
+) -> str:
+    """Switch the live agy model via non-interactive ``/model <slug>`` and confirm it.
+
+    Types ``/model <slug>`` into the idle agy tmux pane and polls the session's
+    isolated ``settings.json["model"]`` until agy confirms the target slug or
+    display name, failing loudly if the TUI is busy, dead, or rejects the slug.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param model: Exact ``agy models`` slug, e.g. ``"claude-sonnet-4-6"``.
+    :param expected_display_name: Display name from the cached catalog; ``None``
+        queries ``agy models`` to verify the slug and resolve its display name.
+    :param timeout_s: Readiness budget for ``tmux.json`` and prompt mount.
+    :param confirm_timeout_s: Budget to observe the updated model in ``settings.json``.
+    :returns: The confirmed ``settings.json["model"]`` string.
+    :raises ValueError: If *model* fails conservative model-id validation.
+    :raises RuntimeError: If the model is unavailable, the pane is dead/busy/modal,
+        tmux fails, or agy does not confirm the switch within *confirm_timeout_s*.
+    """
+    from omnigent.models.model_override import validate_model_override
+
+    model = validate_model_override(model)
+    if expected_display_name is None:
+        try:
+            expected_display_name = next(
+                str(option["displayName"])
+                for option in _live_antigravity_model_options()
+                if option.get("id") == model and option.get("displayName")
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+            raise RuntimeError(
+                "antigravity-native could not verify the live model catalog"
+            ) from exc
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"antigravity model {model!r} is not available in the live catalog"
+            ) from exc
+
+    deadline = time.monotonic() + timeout_s
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "the agy terminal is no longer running (the TUI exited); restart the session"
+        )
+    _wait_for_agy_prompt_ready(
+        socket_path, tmux_target, timeout_s=max(0.0, deadline - time.monotonic())
+    )
+    pane = _capture_pane(socket_path, tmux_target)
+    footer = _agy_footer_region(pane)
+    if _AGY_VERIFYING_MARKER in pane.lower():
+        raise RuntimeError(
+            "agy is still verifying the Antigravity account; try switching models again shortly"
+        )
+    if _AGY_ACTIVE_MARKER in footer:
+        raise RuntimeError(
+            "cannot switch antigravity model while a turn is running; wait for the turn to finish"
+        )
+    if _AGY_IDLE_MARKER not in footer:
+        raise RuntimeError(
+            "antigravity terminal is not at an idle prompt "
+            "(starting up or a modal dialog may be open)"
+        )
+    command = f"/model {model}"
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "-l", "--", command)
+    time.sleep(_PASTE_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+
+    confirm_deadline = time.monotonic() + confirm_timeout_s
+    while True:
+        if not _session_alive(socket_path, tmux_target):
+            raise RuntimeError(
+                "the agy terminal exited before confirming the model switch; restart the session"
+            )
+        current_pane = _capture_pane(socket_path, tmux_target)
+        command_still_in_box = bool(current_pane) and _draft_in_input_region(
+            current_pane, command, baseline_region
+        )
+        observed = read_agy_settings_model(bridge_dir)
+        if not command_still_in_box and _agy_model_matches(
+            observed, model=model, expected_display_name=expected_display_name
+        ):
+            assert observed is not None
+            return observed
+        if time.monotonic() >= confirm_deadline:
+            if command_still_in_box:
+                with contextlib.suppress(RuntimeError):
+                    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+                    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+                    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+            raise RuntimeError(
+                f"agy did not confirm switching to model {model!r} within "
+                f"{confirm_timeout_s:.0f}s (current={observed!r})"
+            )
+        time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
 def send_interaction_keys_via_tui(

@@ -1520,3 +1520,133 @@ async def test_cli_cold_start_falls_back_when_port_unattributable(
 
     assert len(started) == 1
     assert started[0][0] == 52548  # safe candidate fallback (agy is up in the pane)
+
+
+def test_parse_antigravity_cli_model_options_handles_tabs_spaces_and_spinner() -> None:
+    """Parser handles tab-separated, space-padded, CR spinner overwrites, and table headers."""
+    raw = (
+        "\r\x1b[2K⠋ Fetching available models...\r\n"
+        "Models:\n"
+        "ID\tNAME\n"
+        "\rLoading...\rgemini-3.8-flash-high\tGemini 3.8 Flash (High)\n"
+        "gemini-3.8-flash-low   Gemini 3.8 Flash (Low)\n"
+        "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n"
+        "claude-sonnet-4-6\tDuplicate Should Be Ignored\n"
+        "Not a valid model header line\n"
+        "gpt-oss-120b-medium\n"
+    )
+    options = _mod.parse_antigravity_cli_model_options(raw)
+    assert options == [
+        {
+            "id": "gemini-3.8-flash-high",
+            "displayName": "Gemini 3.8 Flash (High)",
+            "isDefault": False,
+            "isCurrent": False,
+        },
+        {
+            "id": "gemini-3.8-flash-low",
+            "displayName": "Gemini 3.8 Flash (Low)",
+            "isDefault": False,
+            "isCurrent": False,
+        },
+        {
+            "id": "claude-sonnet-4-6",
+            "displayName": "Claude Sonnet 4.6 (Thinking)",
+            "isDefault": False,
+            "isCurrent": False,
+        },
+        {
+            "id": "gpt-oss-120b-medium",
+            "displayName": "gpt-oss-120b-medium",
+            "isDefault": False,
+            "isCurrent": False,
+        },
+    ]
+
+
+def test_parse_antigravity_cli_model_options_rejects_empty_output() -> None:
+    """Empty or prose-only output raises ValueError so the route returns 503."""
+    with pytest.raises(ValueError, match="did not contain any valid models"):
+        _mod.parse_antigravity_cli_model_options("Fetching available models...\n\n")
+
+
+def test_list_antigravity_cli_model_options_runs_agy_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery invokes ``<agy> models`` and parses its stdout."""
+    seen_cmd: list[list[str]] = []
+
+    def _fake_run(
+        cmd: list[str],
+        *,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        env: dict[str, str] | None,
+    ) -> object:
+        del check, capture_output, text, timeout, env
+        seen_cmd.append(cmd)
+        return type(
+            "_Completed",
+            (),
+            {"stdout": "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n"},
+        )()
+
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "/usr/local/bin/agy")
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+    options = _mod.list_antigravity_cli_model_options(env={"PATH": "/usr/local/bin"})
+    assert seen_cmd == [["/usr/local/bin/agy", "models"]]
+    assert options == [
+        {
+            "id": "claude-sonnet-4-6",
+            "displayName": "Claude Sonnet 4.6 (Thinking)",
+            "isDefault": False,
+            "isCurrent": False,
+        }
+    ]
+
+
+def test_list_antigravity_cli_model_options_skips_databricks_placeholder_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Databricks gateway placeholder env must not be forwarded to ``agy models``."""
+    from omnigent.harnesses.antigravity_native.gateway import PROFILE_ENV
+    from omnigent.harnesses.antigravity_native.launch import NativeAntigravityLaunch
+
+    seen_envs: list[dict[str, str] | None] = []
+
+    def _fake_run(
+        cmd: list[str],
+        *,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        env: dict[str, str] | None,
+    ) -> object:
+        del cmd, check, capture_output, text, timeout
+        seen_envs.append(env)
+        return type(
+            "_Completed",
+            (),
+            {"stdout": "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n"},
+        )()
+
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "/usr/local/bin/agy")
+    monkeypatch.setattr(
+        _mod,
+        "resolve_native_antigravity_launch",
+        lambda: NativeAntigravityLaunch(
+            auth_mode="api-key",
+            model=None,
+            extra_env={
+                "GEMINI_API_KEY": "omnigent-adapter-pending",
+                PROFILE_ENV: "default",
+            },
+        ),
+    )
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+    options = _mod.list_antigravity_cli_model_options()
+    assert seen_envs == [None]
+    assert options[0]["id"] == "gemini-3.8-flash-high"

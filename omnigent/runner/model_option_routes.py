@@ -58,6 +58,7 @@ def register_model_option_routes(
         [str], Coroutine[Any, Any, ClaudeNativeUcodeConfig | None]
     ],
     _resolve_session_skills: Callable[[str], Coroutine[Any, Any, list[SkillSpec]]],
+    _session_antigravity_model_names: dict[str, dict[str, str]],
     _session_cursor_model_names: dict[str, dict[str, str]],
     _session_harness_name: Callable[[str], str | None],
     _session_spec_cache: dict[str, _SpecEntry | None],
@@ -236,6 +237,42 @@ def register_model_option_routes(
             content={"models": _with_model_configuration_source(session_id, models)},
         )
 
+    @app.get("/v1/sessions/{session_id}/antigravity-model-options")
+    async def get_session_antigravity_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "antigravity-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.harnesses.antigravity_native.main import (
+            list_antigravity_cli_model_options,
+        )
+
+        try:
+            models = await asyncio.to_thread(list_antigravity_cli_model_options)
+        except Exception as exc:  # picker failures are retryable.
+            _logger.warning(
+                "Antigravity-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_model_options_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native model options"
+                    ),
+                },
+            )
+        _session_antigravity_model_names[session_id] = {
+            str(option["id"]): str(option["displayName"])
+            for option in models
+            if option.get("id") and option.get("displayName")
+        }
+        return JSONResponse(
+            status_code=200,
+            content={"models": _with_model_configuration_source(session_id, models)},
+        )
+
     def _model_configuration_source(session_id: str) -> dict[str, str] | None:
         """Return the session's non-secret model-provider coordinates."""
         from omnigent.models.model_catalog import (
@@ -383,6 +420,8 @@ def register_model_option_routes(
             return await get_session_kiro_model_options(session_id)
         if harness == "devin-native":
             return await get_session_devin_model_options(session_id)
+        if harness == "antigravity-native":
+            return await get_session_antigravity_model_options(session_id)
         return JSONResponse(status_code=200, content={"models": []})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")

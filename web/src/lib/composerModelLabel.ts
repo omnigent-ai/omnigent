@@ -66,6 +66,11 @@ export function findModelLabelOption(
   const exact =
     options.find((option) => option.id === raw) ?? options.find((option) => option.model === raw);
   if (exact) return exact;
+  const normalized = raw.replace(/\s+/g, " ").toLowerCase();
+  const byDisplayName = options.find(
+    (option) => option.displayName?.trim().replace(/\s+/g, " ").toLowerCase() === normalized,
+  );
+  if (byDisplayName) return byDisplayName;
   const extendedContext = raw.toLowerCase().endsWith("[1m]");
   return findNativeModelOption(
     options.filter(

@@ -1561,6 +1561,7 @@ def create_runner_app(
     _session_reasoning_effort: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec], bool]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    _session_antigravity_model_names: dict[str, dict[str, str]] = {}
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -4345,6 +4346,7 @@ def create_runner_app(
             await spec_workdir_cleanup(session_id)
         _session_harness_overrides.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _session_antigravity_model_names.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
@@ -8806,6 +8808,7 @@ def create_runner_app(
         if body_type == "model_change":
             harness = _session_harness_name(conversation_id)
             if harness in (
+                "antigravity-native",
                 "claude-native",
                 "codex-native",
                 "cursor-native",
@@ -8841,6 +8844,11 @@ def create_runner_app(
                     if "effort" in settings and 200 <= response.status_code < 300:
                         return JSONResponse({"codex_settings_applied": True})
                     return response
+                if harness == "antigravity-native":
+                    return await _handle_antigravity_native_model_change(
+                        conversation_id,
+                        model,
+                    )
                 if harness == "cursor-native":
                     return await _handle_cursor_native_model_change(
                         conversation_id,
@@ -9327,6 +9335,7 @@ def create_runner_app(
         _resolve_session_claude_launch_config=_resolve_session_claude_launch_config,
         _run_turn_bg=_run_turn_bg,
         _sdk_compact_inprogress=_sdk_compact_inprogress,
+        _session_antigravity_model_names=_session_antigravity_model_names,
         _session_cursor_model_names=_session_cursor_model_names,
         _session_harness_name=_session_harness_name,
         _session_histories=_session_histories,
@@ -9337,6 +9346,9 @@ def create_runner_app(
         server_client=server_client,
     )
     _codex_native_model_options = _native_controls.codex_native_model_options
+    _handle_antigravity_native_model_change = (
+        _native_controls.handle_antigravity_native_model_change
+    )
     _handle_claude_native_btw_dismiss = _native_controls.handle_claude_native_btw_dismiss
     _handle_claude_native_clear = _native_controls.handle_claude_native_clear
     _handle_claude_native_compact = _native_controls.handle_claude_native_compact
@@ -9388,6 +9400,7 @@ def create_runner_app(
         _resolve_session_agent_spec=_resolve_session_agent_spec,
         _resolve_session_claude_launch_config=_resolve_session_claude_launch_config,
         _resolve_session_skills=_resolve_session_skills,
+        _session_antigravity_model_names=_session_antigravity_model_names,
         _session_cursor_model_names=_session_cursor_model_names,
         _session_harness_name=_session_harness_name,
         _session_spec_cache=_session_spec_cache,
@@ -9485,6 +9498,7 @@ def create_runner_app(
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
         _session_snapshot_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _session_antigravity_model_names.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)

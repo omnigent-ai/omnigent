@@ -595,6 +595,8 @@ export function HarnessPickerConfigRow({
   testId,
   valueTestId,
   configTestId,
+  focusSelected = false,
+  onSelectedFocus,
   children,
 }: {
   label: string;
@@ -606,6 +608,8 @@ export function HarnessPickerConfigRow({
   testId: string;
   valueTestId?: string;
   configTestId: string;
+  focusSelected?: boolean;
+  onSelectedFocus?: () => void;
   children: ReactNode;
 }) {
   const content = (
@@ -659,6 +663,8 @@ export function HarnessPickerConfigRow({
         className="composer-agent-menu composer-agent-config-menu max-h-[min(clamp(20rem,40vh,36rem),var(--radix-dropdown-menu-content-available-height))] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
         sideOffset={-4}
         data-testid={configTestId}
+        focusSelected={focusSelected}
+        onSelectedFocus={onSelectedFocus}
         onFocusOutside={(event) => {
           if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
             event.preventDefault();

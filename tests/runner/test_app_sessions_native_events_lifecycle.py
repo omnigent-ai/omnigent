@@ -47,6 +47,7 @@ from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
+    _spec_resolver_returning,
 )
 from tests.runner.helpers import NullServerClient
 from tests.runner.native_helpers import _harness_spec
@@ -1188,6 +1189,148 @@ async def test_cursor_native_model_options_failure_is_retryable(
 
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "cursor_native_model_options_failed"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_model_options_and_model_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Antigravity model options populate cached display names and drive ``/model`` switches."""
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+    from omnigent.harnesses.antigravity_native import main as agy_main
+
+    conv_id = "a1b2c3d4e5f647a89b0c1d2e3f4a5b6c"
+    expected = [
+        {
+            "id": "claude-sonnet-4-6",
+            "displayName": "Claude Sonnet 4.6 (Thinking)",
+            "isDefault": False,
+            "isCurrent": False,
+        }
+    ]
+    monkeypatch.setattr(agy_main, "list_antigravity_cli_model_options", lambda: expected)
+    injected: list[tuple[Path, str, str | None]] = []
+
+    def _inject_model(
+        bridge_dir: Path,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> str:
+        del timeout_s
+        injected.append((bridge_dir, model, expected_display_name))
+        return "Claude Sonnet 4.6 (Thinking)"
+
+    monkeypatch.setattr(agy_bridge, "inject_model_command", _inject_model)
+    spec = _harness_spec("antigravity-native")
+    recorded_posts: list[tuple[str, object]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> Any:
+            if f"/v1/sessions/{conv_id}" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": conv_id,
+                        "labels": {
+                            agy_bridge.ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge_rotated"
+                        },
+                    },
+                )
+            return await super().get(url, **kwargs)
+
+        async def post(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            recorded_posts.append((url, kwargs.get("json")))
+            return await super().post(url, **kwargs)
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        legacy_response = await client.get(f"/v1/sessions/{conv_id}/antigravity-model-options")
+        unified_response = await client.get(f"/v1/sessions/{conv_id}/model-options")
+        event_response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "claude-sonnet-4-6"},
+        )
+
+    assert legacy_response.status_code == 200
+    assert unified_response.status_code == 200
+    assert legacy_response.json()["models"][0]["id"] == "claude-sonnet-4-6"
+    assert legacy_response.json()["models"][0]["displayName"] == "Claude Sonnet 4.6 (Thinking)"
+    assert unified_response.json() == legacy_response.json()
+    assert event_response.status_code == 204
+    assert injected == [
+        (
+            agy_bridge.bridge_dir_for_bridge_id("bridge_rotated"),
+            "claude-sonnet-4-6",
+            "Claude Sonnet 4.6 (Thinking)",
+        )
+    ]
+    assert any(
+        url == f"/v1/sessions/{conv_id}/events"
+        and payload
+        == {
+            "type": "external_model_change",
+            "data": {"model": "Claude Sonnet 4.6 (Thinking)"},
+        }
+        for url, payload in recorded_posts
+    )
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_model_options_and_change_failures_return_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery and TUI switch failures return 503 with distinct error codes."""
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+    from omnigent.harnesses.antigravity_native import main as agy_main
+
+    conv_id = "b2c3d4e5f6a748b90c1d2e3f4a5b6c7d"
+
+    def _fail_discovery() -> list[dict[str, object]]:
+        raise RuntimeError("agy models failed")
+
+    def _fail_inject(
+        _bridge_dir: Path,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> str:
+        del model, expected_display_name, timeout_s
+        raise RuntimeError("agy did not confirm")
+
+    monkeypatch.setattr(agy_main, "list_antigravity_cli_model_options", _fail_discovery)
+    monkeypatch.setattr(agy_bridge, "inject_model_command", _fail_inject)
+    spec = _harness_spec("antigravity-native")
+
+    app, _ = await _build_app_for_spec(spec)
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        options_response = await client.get(f"/v1/sessions/{conv_id}/antigravity-model-options")
+        change_response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "claude-sonnet-4-6"},
+        )
+
+    assert options_response.status_code == 503, options_response.text
+    assert options_response.json()["error"] == "antigravity_native_model_options_failed"
+    assert change_response.status_code == 503, change_response.text
+    assert change_response.json()["error"] == "antigravity_native_model_failed"
 
 
 @pytest.mark.asyncio
