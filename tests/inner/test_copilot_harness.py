@@ -2,7 +2,7 @@
 
 The wrap reads ``HARNESS_COPILOT_*`` env vars and constructs a
 :class:`CopilotExecutor` lazily. Constructing the executor does NOT import the
-``github-copilot-sdk`` package (that import is deferred to the first turn), so
+``microsoft-copilot-sdk`` package (that import is deferred to the first turn), so
 these tests run without the optional SDK installed. Mirrors
 ``test_cursor_harness.py``.
 """

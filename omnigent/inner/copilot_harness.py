@@ -7,7 +7,7 @@ resolves ``"copilot"`` to this module via
 :data:`omnigent.runtime.harnesses._HARNESS_MODULES`.
 
 Wraps a :class:`omnigent.inner.copilot_executor.CopilotExecutor`, which drives
-a persistent GitHub Copilot SDK (``github-copilot-sdk``) session. Mirrors the
+a persistent Microsoft Copilot SDK (``microsoft-copilot-sdk``) session. Mirrors the
 cursor / antigravity wraps' env-var config flow.
 
 Like cursor and antigravity, copilot has NO gateway / Databricks-profile env
@@ -23,7 +23,7 @@ Env vars read at startup:
 - ``HARNESS_COPILOT_CWD``: working directory the session operates in.
   ``None`` falls back to ``os_env.cwd`` then the process cwd.
 - ``HARNESS_COPILOT_GITHUB_TOKEN``: GitHub token carrying Copilot access, used
-  as the SDK ``github_token``. ``None`` falls back to an inherited
+  as the SDK ``github.token``. ``None`` falls back to an inherited
   ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``, then the ``gh``
   CLI's stored login.
 - ``HARNESS_COPILOT_GITHUB_HOST``: GitHub Enterprise hostname (e.g.
@@ -96,10 +96,10 @@ def _build_copilot_executor() -> Executor:
     """Construct a :class:`CopilotExecutor` from env-var config.
 
     Called lazily by the :class:`ExecutorAdapter` on the first turn, so a
-    missing ``github-copilot-sdk`` install surfaces as a request-time error
+    missing ``microsoft-copilot-sdk`` install surfaces as a request-time error
     rather than an app-boot crash.
 
-    :raises ImportError: If the ``github-copilot-sdk`` package isn't installed.
+    :raises ImportError: If the ``microsoft-copilot-sdk`` package isn't installed.
     """
     bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None

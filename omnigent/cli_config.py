@@ -2934,7 +2934,7 @@ def _manage_kimi_harness() -> None:
 def _prompt_install_copilot() -> str | None:
     """Offer to install the missing ``copilot`` extra; return a status line.
 
-    Shown atop the Copilot drill-in when the optional-extra ``github-copilot-sdk``
+    Shown atop the Copilot drill-in when the optional-extra ``microsoft-copilot-sdk``
     is absent. Three-choice ``select`` like :func:`_prompt_install_cursor` /
     :func:`_prompt_install_antigravity` (install now / set token anyway / show
     command), and like them does NOT gate token management on the SDK: the
@@ -2957,7 +2957,7 @@ def _prompt_install_copilot() -> str | None:
     # ``[copilot]`` so it renders verbatim.
     cmd_markup = _rich_escape(cmd)
     choice = select(
-        "Copilot's SDK (github-copilot-sdk) isn't installed. Install it now?",
+        "Copilot's SDK (microsoft-copilot-sdk) isn't installed. Install it now?",
         [
             f"Install it now ({cmd_markup})",
             "Set the GitHub token anyway",
@@ -2974,8 +2974,8 @@ def _prompt_install_copilot() -> str | None:
     if choice == 0:
         console.print(f"  [dim]Installing the copilot extra — running `{cmd_markup}`…[/dim]")
         if install_copilot_sdk():
-            console.print("  [green]✓ github-copilot-sdk installed[/green]")
-            return "✓ github-copilot-sdk installed"
+            console.print("  [green]✓ microsoft-copilot-sdk installed[/green]")
+            return "✓ microsoft-copilot-sdk installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the token anyway, or install by hand"
     if choice < 0:
@@ -2990,14 +2990,14 @@ def _prompt_install_copilot() -> str | None:
 def _manage_copilot_harness() -> None:
     """Run the level-2 loop for Copilot: manage its GitHub token.
 
-    Copilot runs via the ``github-copilot-sdk`` package and authenticates against
+    Copilot runs via the ``microsoft-copilot-sdk`` package and authenticates against
     GitHub's Copilot backend with a GitHub token — the SDK requires one and it
     has no provider/gateway family. So this manages exactly that credential:
     set / replace / remove a token stored in the omnigent secret store, mirroring
     how cursor / antigravity persist theirs (the secret in the store, a
     ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
 
-    When the optional ``github-copilot-sdk`` is missing, the drill-in first
+    When the optional ``microsoft-copilot-sdk`` is missing, the drill-in first
     offers to install it (:func:`_prompt_install_copilot`). Unlike the CLI-backed
     harnesses (which gate on the CLI), declining still drops into the token
     menu — the ``copilot:`` token is independently storable. Mirrors cursor /
@@ -4276,7 +4276,7 @@ def _run_configure_harnesses_interactive() -> None:
                     )
                 )
 
-        # Copilot — GitHub token (github-copilot-sdk extra is soft).
+        # Copilot — GitHub token (microsoft-copilot-sdk extra is soft).
         if copilot_github_token_configured(config) or any(
             os.environ.get(v) for v in COPILOT_TOKEN_ENV_VARS
         ):

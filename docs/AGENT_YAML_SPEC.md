@@ -291,23 +291,57 @@ apply on the next terminal launch; explicit native CLI arguments remain availabl
 ### GitHub Copilot
 
 `harness: copilot` runs the agent through the
-[GitHub Copilot SDK](https://pypi.org/project/github-copilot-sdk/)
-(`pip install "omnigent[copilot]"`). The SDK bundles the Copilot CLI it drives
-as a backing server, so no separate CLI install is needed. Like cursor and
-antigravity it talks only to GitHub's Copilot backend — there is no Databricks
-gateway / `auth.type: databricks` path. Authenticate with a **GitHub token** that
-carries Copilot access: a fine-grained PAT with the "Copilot Requests"
-permission, or an OAuth token from the GitHub CLI (`gh auth token`) / Copilot
-CLI. Resolution: spec `auth.api_key` → a token registered via `omnigent setup`
-(the `copilot:` config block) → ambient `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` /
-`GITHUB_TOKEN`. Choose a Copilot model id (e.g. `claude-haiku-4.5`, `gpt-5-mini`,
-or omit for auto-select) rather than a `databricks-*` id. Classic `ghp_` PATs are
-not accepted by Copilot.
+[Microsoft Copilot SDK](https://pypi.org/project/microsoft-copilot-sdk/)
+(`pip install "omnigent[copilot]"`). Unlike SDK 1.x (`github-copilot-sdk`), the
+SDK 2.x wheel does not bundle the Copilot runtime binary. Instead, the SDK
+downloads and caches the matching native Copilot runtime on first use (under
+`~/.cache/copilot-sdk/cli/` on Linux, `~/Library/Caches/copilot-sdk/cli/` on
+macOS, or `%LOCALAPPDATA%\copilot-sdk\cli\` on Windows), and Omnigent spawns it
+out-of-process over stdio. No separate CLI install is needed on hosts with
+network access to GitHub Releases.
+
+Upgrading from SDK 1.x: `github-copilot-sdk` and `microsoft-copilot-sdk` both
+install the `copilot` package. `uv sync` removes the old distribution
+automatically. With manual `pip` or `uv pip` installs, uninstall
+`github-copilot-sdk` first, then reinstall the `copilot` extra. Setup reports
+mixed installations as not installed. Removing the old distribution after
+installing the new one deletes shared `copilot` files, so reinstall the extra
+after removing the old distribution.
+
+For pre-warmed or offline environments:
+
+- Pre-provision the runtime bundle after installing the extra with
+  `python -m copilot download-runtime`.
+- Set `COPILOT_CLI_PATH` to point to an explicit extracted SDK 2 runtime binary
+  (not an old standalone interactive Copilot CLI binary).
+- Set `COPILOT_SKIP_CLI_DOWNLOAD=1` to disable automatic runtime downloads.
+- Set `COPILOT_CLI_EXTRACT_DIR` to override the version-specific cache
+  directory.
+- When running under the `omnigent host` daemon, the runner strips ambient
+  environment variables by default. Operators who rely on `COPILOT_CLI_PATH`,
+  `COPILOT_SKIP_CLI_DOWNLOAD`, `COPILOT_CLI_EXTRACT_DIR`,
+  `COPILOT_CLI_DOWNLOAD_BASE_URL`, or proxy variables (`HTTPS_PROXY`,
+  `HTTP_PROXY`, `NO_PROXY`) must forward the exact variable names via
+  `OMNIGENT_RUNNER_ENV_PASSTHROUGH` (comma-separated).
+
+Like cursor and antigravity it talks only to GitHub's Copilot backend, with no
+Databricks gateway or `auth.type: databricks` path. Authenticate with a
+**GitHub token** that carries Copilot access: a fine-grained PAT with the
+"Copilot Requests" permission, or an OAuth token from the GitHub CLI
+(`gh auth token`) / Copilot CLI. Resolution: spec `auth.api_key` → a token
+registered via `omnigent setup` (the `copilot:` config block) → ambient
+`COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`. Choose a Copilot model id
+(e.g. `claude-haiku-4.5`, `gpt-5-mini`, or `auto`) rather than a
+`databricks-*` id. Omitting the model uses the runtime's configured default.
+Classic `ghp_` PATs are not accepted by Copilot.
+
+The runtime may auto-approve read-only native commands without calling the SDK
+permission handler. Omnigent can only review the permission requests it receives.
 
 ```yaml
 executor:
   harness: copilot             # alias: github-copilot
-  model: claude-haiku-4.5      # a Copilot model id; omit for auto-select
+  model: claude-haiku-4.5      # a Copilot model id
   auth:
     type: api_key
     api_key: ${GH_TOKEN}       # a GitHub token with Copilot access

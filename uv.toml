@@ -30,4 +30,6 @@ exclude-newer = "P7D"
 #   past P7D.
 # - nimble-python: the verified Agent API V2 1.2 contract release, required by
 #   nimble_research for typed run fields. Drop once it has aged past P7D.
-exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z" }
+# - microsoft-copilot-sdk: pin the tested SDK 2.0.3 release without raising
+#   the installable floor above 2.0.0. Drop once aged past P7D.
+exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", microsoft-copilot-sdk = "2026-11-26T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z" }

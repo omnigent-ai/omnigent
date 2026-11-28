@@ -2,7 +2,7 @@
 
 Copilot is deliberately outside the anthropic/openai provider-family + gateway
 machinery (see :func:`omnigent.runtime.workflow._build_copilot_spawn_env`): the
-GitHub Copilot SDK (``github-copilot-sdk``) talks only to GitHub's Copilot
+Microsoft Copilot SDK (``microsoft-copilot-sdk``) talks only to GitHub's Copilot
 backend, authenticated by a **GitHub token** — never the Databricks Unity Gateway.
 It therefore has no ``providers:`` family entry, but a user should still be able
 to register a Copilot token once through ``omnigent setup`` rather than
@@ -30,6 +30,7 @@ accepted by Copilot.
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import subprocess
 
@@ -97,7 +98,7 @@ def looks_like_github_copilot_token(value: str) -> bool:
     return value.startswith(_GITHUB_TOKEN_PREFIXES)
 
 
-# The OPTIONAL pip extra that ships the Copilot SDK (``github-copilot-sdk``,
+# The OPTIONAL pip extra that ships the Copilot SDK (``microsoft-copilot-sdk``,
 # imported as ``copilot``) — not in the default install, so the ``copilot:``
 # token can be set with no SDK present. Setup surfaces the command verbatim when
 # the extra is missing. Mirrors cursor's ``CURSOR_EXTRA`` / antigravity's
@@ -106,21 +107,39 @@ def looks_like_github_copilot_token(value: str) -> bool:
 COPILOT_EXTRA = "copilot"
 
 
+def _dist_version(name: str) -> str | None:
+    """Return the installed version of distribution ``name``, or ``None``."""
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
 def copilot_sdk_installed() -> bool:
     """Return whether the Copilot SDK (the optional extra) is importable.
 
     The executor imports it lazily on the first turn
     (:mod:`omnigent.inner.copilot_executor`), so a token can be set with no SDK;
     setup uses this to detect that and offer to install it. The
-    ``github-copilot-sdk`` package is imported as ``copilot``. Mirrors
+    ``microsoft-copilot-sdk`` package is imported as ``copilot``. Mirrors
     :func:`omnigent.onboarding.cursor_auth.cursor_sdk_installed` /
     :func:`omnigent.onboarding.antigravity_auth.antigravity_sdk_installed`:
     :func:`importlib.util.find_spec` avoids importing the heavy SDK, and the
     guard catches the ``ModuleNotFoundError`` it raises when a parent package is
     absent.
 
-    :returns: ``True`` when ``copilot`` is importable.
+    The legacy ``github-copilot-sdk`` 1.x also provides ``copilot``, so the
+    ``microsoft-copilot-sdk`` distribution must be installed at major version 2
+    and the legacy distribution must be absent.
+
+    :returns: ``True`` when SDK 2 is installed and ``copilot`` is importable.
     """
+    sdk_version = _dist_version("microsoft-copilot-sdk")
+    if sdk_version is None or sdk_version.split(".", 1)[0] != "2":
+        return False
+    if _dist_version("github-copilot-sdk") is not None:
+        # A legacy install alongside SDK 2 may have overwritten shared files.
+        return False
     try:
         return importlib.util.find_spec("copilot") is not None
     except ModuleNotFoundError:

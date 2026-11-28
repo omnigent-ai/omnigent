@@ -5,11 +5,12 @@ description: Spin up a live local Omnigent server and exercise the GitHub Copilo
 
 # Copilot SDK harness: end-to-end dev & testing
 
-The `copilot` harness drives the **GitHub Copilot SDK** (`github-copilot-sdk`,
+The `copilot` harness drives the **Microsoft Copilot SDK** (`microsoft-copilot-sdk`,
 imported as `copilot`) — a persistent `CopilotClient` + `CopilotSession` per
 Omnigent conversation — and bridges Omnigent's `sys_*` tools into Copilot as SDK
-`Tool`s. The Python SDK **bundles the Copilot CLI binary it drives** as a backing
-server, so there is no separate `@github/copilot` install. This skill is the
+`Tool`s. The Python SDK **downloads and caches the native Copilot runtime** on
+first use (or ahead of time with `python -m copilot download-runtime`), so there
+is no separate `@github/copilot` install. This skill is the
 proven recipe for running it **for real** against a live local server — not just
 the unit tests.
 
@@ -63,9 +64,9 @@ name: copilot-dev
 description: Copilot SDK dev/test agent.
 executor:
   type: omnigent
+  model: auto
   config:
     harness: copilot
-    # model: gpt-5-mini      # optional; omit for Copilot auto-select
 prompt: |
   You are a terse test agent. Answer in as few words as possible.
 YAML
@@ -86,7 +87,7 @@ timeout 280 .venv/bin/omni run /tmp/copilot-dev \
 ```
 
 A healthy run prints connection lines then the reply (`PONG`). If that works,
-the full stack is good: token, egress, bundled CLI, harness.
+the full stack is good: token, egress, cached Copilot runtime, harness.
 
 - **Shell / file tools:** add `--tools coding`.
 - **Specific model:** add `--model gpt-5-mini` (or `claude-haiku-4.5`, `auto`).
@@ -99,7 +100,7 @@ the full stack is good: token, egress, bundled CLI, harness.
 | Bridged `sys_*` / sub-agent dispatch | declare a sub-agent (harness `copilot` so auth is satisfied), prompt the parent to delegate — exercises the SDK `Tool` async-handler bridge into `_tool_executor` |
 | Model routing | run the same bundle with several `--model` values; an unknown id fails **loud**, a `databricks-*` id is dropped to auto with a warning |
 | LLM-phase policy | add a guardrail that denies a keyword; confirm `PHASE_LLM_REQUEST`/`PHASE_LLM_RESPONSE` blocks it |
-| Concurrency / leaks | fire several `omni run … &` at once; then `pgrep -af "copilot/bin/copilot"` to check for orphaned bundled-CLI subprocesses |
+| Concurrency / leaks | fire several `omni run … &` at once; then `pgrep -af "copilot-runtime|copilot-sdk/cli"` to check for orphaned runtime subprocesses |
 
 ## Running polly (or any orchestrator) on a copilot brain
 
