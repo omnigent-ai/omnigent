@@ -9,7 +9,7 @@
 #
 # Usage:
 #   dev/branch-server.sh up [WORKTREE] [--port N] [--with-host] [--no-build] [--rebuild]
-#                           [--auth-header]
+#                           [--auth-header] [--features LIST] [--env KEY[=VALUE]]...
 #   dev/branch-server.sh down RUN_DIR|--all [--keep]
 #   dev/branch-server.sh list
 #
@@ -19,6 +19,14 @@
 # it also prints AUTH=header. `down` stops the instance's process groups and deletes
 # its run dir (--keep leaves the dir for post-mortem). `--all` stops every
 # instance started from the current worktree. See dev/branch-server.md for the e2e recipe.
+#
+# Every inherited OMNIGENT_* variable is cleared before launch. To test a change
+# behind a flag or setting, opt in explicitly: `--features memory` sets
+# OMNIGENT_FEATURES, and `--env OMNIGENT_X=value` (or `--env OMNIGENT_X` to pass
+# the caller's current value, e.g. a token) sets one variable. Only the names
+# given pass through, for the server and the host. Variables that define the
+# instance's isolation are refused, as is any value pointing at ~/.omnigent,
+# a chat.db outside the run dir, or the shared ports.
 set -euo pipefail
 
 RUN_ROOT=${TMPDIR:-/tmp}
@@ -62,6 +70,24 @@ check_run_dir() {
   echo "$dir"
 }
 
+# Variables `--env` may not set: the launcher owns them, or (auth) has a flag.
+PROTECTED_ENV=" OMNIGENT_DATA_DIR OMNIGENT_CONFIG_HOME OMNIGENT_DATABASE_URI OMNIGENT_WEB_UI_DIST OMNIGENT_WRAPPER_BYPASS OMNIGENT_FEATURES "
+
+# Refuse an opt-in variable that would break the instance's isolation.
+check_opt_in() {
+  local key=$1 value=$2
+  [[ $key =~ ^OMNIGENT_[A-Z0-9_]+$ ]] || die "--env takes OMNIGENT_* names only: $key"
+  [[ $PROTECTED_ENV != *" $key "* ]] || die "$key is set by the launcher; use its flag instead"
+  [[ $key != OMNIGENT_AUTH_* ]] || die "$key: use --auth-header for auth"
+  [[ $value != *$'\n'* ]] || die "$key: value must be one line"
+  case $value in
+    *"$HOME/.omnigent"*|*"~/.omnigent"*) die "$key points at the shared data dir" ;;
+    *chat.db*) die "$key points at a chat.db; the instance has its own" ;;
+    *:6767|*:6767/*|*:6768|*:6768/*) die "$key points at a shared server port" ;;
+  esac
+  return 0
+}
+
 web_needs_build() {
   local wt=$1 index=$1/omnigent/server/static/web-ui/index.html
   [[ -f $index ]] || return 0
@@ -69,7 +95,8 @@ web_needs_build() {
 }
 
 cmd_up() {
-  local wt="" port="" with_host=0 build=auto auth=none
+  local wt="" port="" with_host=0 build=auto auth=none features="" arg key
+  local -a opt_in=()
   while (($#)); do
     case $1 in
       --port) port=$2; shift 2 ;;
@@ -77,6 +104,20 @@ cmd_up() {
       --no-build) build=never; shift ;;
       --rebuild) build=always; shift ;;
       --auth-header) auth=header; shift ;;
+      --features)
+        (($# >= 2)) || die "--features needs a value"
+        [[ $2 =~ ^-?[a-z0-9_]+(,-?[a-z0-9_]+)*$ ]] || die "--features takes comma-separated names: $2"
+        features=$2; shift 2 ;;
+      --env)
+        (($# >= 2)) || die "--env needs KEY or KEY=VALUE"
+        arg=$2; key=${arg%%=*}
+        # A bare name passes the caller's current value, so secrets stay out of argv.
+        if [[ $arg != *=* ]]; then
+          [[ -v $key ]] || die "--env $key: not set in this environment"
+          arg="$key=${!key}"
+        fi
+        check_opt_in "$key" "${arg#*=}"
+        opt_in+=("$arg"); shift 2 ;;
       -*) die "unknown option: $1" ;;
       *) wt=$1; shift ;;
     esac
@@ -125,6 +166,9 @@ cmd_up() {
   # or the new processes would write to and act as part of that session.
   local var
   for var in $(compgen -e | grep '^OMNIGENT_' || true); do unset "$var"; done
+  # Then add back only what the caller named.
+  [[ -z $features ]] || export OMNIGENT_FEATURES="$features"
+  for arg in "${opt_in[@]}"; do export "$arg"; done
   export OMNIGENT_WRAPPER_BYPASS=1 \
     OMNIGENT_DATA_DIR="$run/data" \
     OMNIGENT_CONFIG_HOME="$run/config" \
@@ -171,6 +215,9 @@ cmd_up() {
   fi
 
   printf 'RUN_DIR=%s\nPORT=%s\nSERVER_PID=%s\nHOST_PID=%s\n' "$run" "$port" "$server_pid" "$host_pid"
+  # Names only: values may be secrets.
+  [[ -z $features ]] || printf 'FEATURES=%s\n' "$features"
+  ((${#opt_in[@]} == 0)) || printf 'ENV=%s\n' "$(printf '%s\n' "${opt_in[@]%%=*}" | paste -sd, -)"
   [[ $auth == none ]] || printf 'AUTH=%s\n' "$auth"
   printf 'URL=%s\n' "$url"
 }

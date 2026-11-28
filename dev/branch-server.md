@@ -37,6 +37,23 @@ login. It never reads or writes `~/.omnigent`, and it refuses the shared ports
 from an agent session, so the new processes don't log into or act as part of
 that session. Logs are in `$RUN_DIR/logs/` and `$RUN_DIR/data/logs/`.
 
+To test a change behind a release feature or a setting, opt in by name. Only
+the variables you name reach the server and host; everything else stays
+cleared:
+
+```bash
+dev/branch-server.sh up --features memory          # sets OMNIGENT_FEATURES
+dev/branch-server.sh up --env OMNIGENT_SLACK_AUTOMATION_API_URL=http://127.0.0.1:9000
+dev/branch-server.sh up --env OMNIGENT_SLACK_BOT_TOKEN  # pass your current value
+```
+
+`--env` is repeatable and takes `OMNIGENT_*` names only. A bare name passes
+the caller's current value, which keeps secrets out of the command line. It
+refuses the variables the launcher sets itself (data dir, config, database,
+web UI, features) and `OMNIGENT_AUTH_*` (use `--auth-header`). It also refuses
+any value that points at `~/.omnigent`, a `chat.db` or the shared ports. `up`
+prints the opted-in names (never values) as `FEATURES=` and `ENV=`.
+
 Python dependencies come from the main checkout's venv. If your branch adds or
 changes a dependency, install it there first.
 
