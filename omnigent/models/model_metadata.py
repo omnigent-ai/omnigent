@@ -56,6 +56,8 @@ class ModelReasoningMode(str, Enum):
 
     ADAPTIVE = "adaptive"
     FIXED_BUDGET = "fixed-budget"
+    # Thinking switches on or off; the model has no effort ladder.
+    TOGGLE = "toggle"
 
 
 @dataclass(frozen=True)
@@ -102,3 +104,36 @@ class ModelMetadata:
         if capability in self.unsupported_capabilities:
             return False
         return None
+
+
+def merge_model_metadata(live: ModelMetadata, fallback: ModelMetadata) -> ModelMetadata:
+    """Combine two descriptions of one model, preferring *live* per field.
+
+    *live* is what the serving endpoint reports; *fallback* (e.g. a catalog)
+    fills only the fields and capabilities *live* leaves unknown.
+
+    :param live: Endpoint-reported metadata.
+    :param fallback: Metadata used where *live* is silent.
+    :returns: The merged metadata.
+    """
+    return ModelMetadata(
+        supported_capabilities=(
+            live.supported_capabilities
+            | (fallback.supported_capabilities - live.unsupported_capabilities)
+        ),
+        unsupported_capabilities=(
+            live.unsupported_capabilities
+            | (fallback.unsupported_capabilities - live.supported_capabilities)
+        ),
+        context_window=(
+            live.context_window if live.context_window is not None else fallback.context_window
+        ),
+        max_output_tokens=(
+            live.max_output_tokens
+            if live.max_output_tokens is not None
+            else fallback.max_output_tokens
+        ),
+        cost_tier=live.cost_tier if live.cost_tier is not None else fallback.cost_tier,
+        wire_apis=live.wire_apis or fallback.wire_apis,
+        reasoning=live.reasoning or fallback.reasoning,
+    )

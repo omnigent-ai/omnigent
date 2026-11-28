@@ -1640,8 +1640,27 @@ def _inline_family_pi_provider(
             # Catalog access) keeps the configured model on its own surface.
             if enumerated.extra_models or enumerated.additional_providers:
                 return enumerated
+        listing_provider = model_catalog.ResolvedModelProvider(
+            kind=entry.kind,
+            family=family_name,
+            base_url=family.base_url,
+            api_key=family.api_key,
+            auth_command=family.auth_command,
+            detail=f"provider {entry.name!r}",
+        )
+        # A local endpoint (Ollama) reports which of its models reason; the
+        # catalog does not know locally pulled models.
+        reported = (
+            model_catalog.fetch_ollama_model_metadata(
+                listing_provider,
+                list(dict.fromkeys([resolved_model, *(tier_ids if curated_models else ())])),
+            )
+            if entry.kind == LOCAL_KIND
+            else {}
+        )
         model_entry = pi_generic_model_json_entry(
             resolved_model,
+            provider_metadata=reported.get(resolved_model),
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
         )
@@ -1654,6 +1673,7 @@ def _inline_family_pi_provider(
                 shortlist.append(
                     pi_generic_model_json_entry(
                         tier_id,
+                        provider_metadata=reported.get(tier_id),
                         configured_context_window=family.context_window,
                         configured_max_output_tokens=family.max_output_tokens,
                     )
@@ -1670,16 +1690,9 @@ def _inline_family_pi_provider(
             credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
             extra_models=shortlist,
             curated_models=curated_models,
-            # Record the endpoint the pre-launch picker can enumerate live; no
-            # I/O happens here so session launch stays off the network.
-            listing_provider=model_catalog.ResolvedModelProvider(
-                kind=entry.kind,
-                family=family_name,
-                base_url=family.base_url,
-                api_key=family.api_key,
-                auth_command=family.auth_command,
-                detail=f"provider {entry.name!r}",
-            ),
+            # The pre-launch picker enumerates this endpoint live; launch only
+            # makes the short, best-effort local-endpoint probe above.
+            listing_provider=listing_provider,
         )
     return None
 

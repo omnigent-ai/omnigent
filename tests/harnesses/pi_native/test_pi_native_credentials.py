@@ -23,6 +23,7 @@ from omnigent.harnesses.pi_native import credentials as creds
 from omnigent.inner._proc import process_alive
 from omnigent.onboarding.providers import ModelInfo
 from tests._helpers.pi_native import seed_pi_own_login_catalog
+from tests._helpers.providers import isolate_provider_resolution
 
 
 @pytest.fixture(autouse=True)
@@ -2598,6 +2599,108 @@ def test_local_kind_override_passes_through_verbatim() -> None:
     )
     assert provider is not None
     assert provider.model == "databricks-gpt-5-4"
+
+
+def _local_ollama_config(kind: str = "local") -> dict[str, object]:
+    return {
+        "providers": {
+            "ollama": {
+                "kind": kind,
+                "default": True,
+                "openai": {
+                    "base_url": "http://ollama.example.test:11434/v1",
+                    "api_key": "local",
+                    "models": {"default": "thinker:27b", "toggle": "switcher:31b"},
+                },
+            }
+        }
+    }
+
+
+def test_local_provider_marks_models_its_endpoint_says_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A local endpoint's model details reach Pi for the launch model and its tiers."""
+    isolate_provider_resolution(monkeypatch, tmp_path)
+    from omnigent.models.model_metadata import (
+        ModelCapability,
+        ModelMetadata,
+        ModelReasoningMetadata,
+        ModelReasoningMode,
+    )
+
+    reasoning = frozenset({ModelCapability.REASONING})
+    asked: list[tuple[str | None, list[str]]] = []
+
+    def _fake_probe(provider, model_ids, **_kwargs):
+        asked.append((provider.base_url, list(model_ids)))
+        return {
+            "thinker:27b": ModelMetadata(
+                supported_capabilities=reasoning,
+                reasoning=ModelReasoningMetadata(efforts=frozenset({"none", "low", "medium"})),
+            ),
+            "switcher:31b": ModelMetadata(
+                supported_capabilities=reasoning,
+                reasoning=ModelReasoningMetadata(
+                    modes=frozenset({ModelReasoningMode.TOGGLE}), efforts=frozenset({"none"})
+                ),
+            ),
+        }
+
+    monkeypatch.setattr(creds.model_catalog, "fetch_ollama_model_metadata", _fake_probe)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_local_ollama_config)
+
+    assert provider is not None
+    assert asked == [("http://ollama.example.test:11434/v1", ["thinker:27b", "switcher:31b"])]
+    models = {
+        model["id"]: model
+        for model in provider.to_models_config()["providers"]["omnigent"]["models"]
+    }
+    assert models["thinker:27b"]["reasoning"] is True
+    assert models["thinker:27b"]["thinkingLevelMap"] == {
+        "off": "none",
+        "minimal": None,
+        "high": None,
+    }
+    assert models["switcher:31b"]["thinkingLevelMap"] == {
+        "off": "none",
+        "minimal": None,
+        "low": None,
+        "high": None,
+    }
+
+
+def test_local_provider_keeps_catalog_metadata_when_endpoint_says_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolate_provider_resolution(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        creds.model_catalog, "fetch_ollama_model_metadata", lambda *_args, **_kwargs: {}
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_local_ollama_config)
+
+    assert provider is not None
+    for model in provider.to_models_config()["providers"]["omnigent"]["models"]:
+        assert "reasoning" not in model
+        assert "thinkingLevelMap" not in model
+
+
+@pytest.mark.parametrize("kind", ["key", "gateway"])
+def test_non_local_providers_are_never_probed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    isolate_provider_resolution(monkeypatch, tmp_path)
+
+    def _unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("only local providers are probed")
+
+    monkeypatch.setattr(creds.model_catalog, "fetch_ollama_model_metadata", _unexpected_probe)
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: _local_ollama_config(kind))
+
+    assert provider is not None
 
 
 def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPatch) -> None:

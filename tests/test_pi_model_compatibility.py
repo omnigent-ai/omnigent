@@ -9,6 +9,7 @@ from omnigent.models.model_metadata import (
     ModelCapability,
     ModelMetadata,
     ModelReasoningMetadata,
+    ModelReasoningMode,
     ModelWireAPI,
 )
 from omnigent.models.pi_model_compatibility import (
@@ -209,6 +210,97 @@ def test_generic_model_catalog_outage_keeps_existing_fallbacks(
     assert entry["id"] == model
     assert (entry.get("reasoning") is True) is (model != "unknown-model")
     assert "contextWindow" not in entry and "maxTokens" not in entry
+
+
+@pytest.mark.parametrize(
+    ("reasoning", "expected"),
+    [
+        pytest.param(
+            ModelReasoningMetadata(
+                efforts=frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+            ),
+            {"off": "none", "xhigh": "xhigh", "max": "max"},
+            id="full-ladder",
+        ),
+        pytest.param(
+            ModelReasoningMetadata(efforts=frozenset({"none", "low", "medium", "xhigh"})),
+            {"off": "none", "minimal": None, "high": None, "xhigh": "xhigh"},
+            id="partial-ladder",
+        ),
+        pytest.param(
+            ModelReasoningMetadata(efforts=frozenset({"low", "high"})),
+            {"off": None, "minimal": None, "medium": None},
+            id="cannot-switch-off",
+        ),
+        pytest.param(
+            ModelReasoningMetadata(
+                modes=frozenset({ModelReasoningMode.TOGGLE}), efforts=frozenset({"none"})
+            ),
+            {"off": "none", "minimal": None, "low": None, "high": None},
+            id="on-off-toggle",
+        ),
+        pytest.param(
+            ModelReasoningMetadata(modes=frozenset({ModelReasoningMode.TOGGLE})),
+            {"off": None, "minimal": None, "low": None, "high": None},
+            id="always-on-toggle",
+        ),
+        pytest.param(None, {"off": "none", "minimal": None}, id="levels-not-reported"),
+    ],
+)
+def test_reported_reasoning_controls_become_pi_level_map(
+    reasoning: ModelReasoningMetadata | None, expected: dict[str, str | None]
+) -> None:
+    from omnigent.models.pi_model_compatibility import pi_reported_thinking_level_map
+
+    assert pi_reported_thinking_level_map(reasoning) == expected
+
+
+def test_endpoint_reported_reasoning_beats_a_catalog_miss(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.models.pi_model_compatibility import pi_generic_model_json_entry
+
+    monkeypatch.setattr("omnigent.onboarding.providers.find_catalog_models", lambda _: [])
+    reported = ModelMetadata(
+        supported_capabilities=_REASONING,
+        reasoning=ModelReasoningMetadata(efforts=frozenset({"none", "low", "medium", "xhigh"})),
+    )
+
+    entry = pi_generic_model_json_entry("local-thinker:27b", provider_metadata=reported)
+
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"] == {
+        "off": "none",
+        "minimal": None,
+        "high": None,
+        "xhigh": "xhigh",
+    }
+
+
+def test_endpoint_saying_no_reasoning_beats_the_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.models.pi_model_compatibility import pi_generic_model_json_entry
+
+    catalog = ModelInfo(name="local-chat:8b", provider="openai", supports_reasoning=True)
+    monkeypatch.setattr("omnigent.onboarding.providers.find_catalog_models", lambda _: [catalog])
+    reported = ModelMetadata(unsupported_capabilities=_REASONING)
+
+    entry = pi_generic_model_json_entry("local-chat:8b", provider_metadata=reported)
+
+    assert "reasoning" not in entry
+    assert "thinkingLevelMap" not in entry
+
+
+@pytest.mark.parametrize("model", ["claude-opus-test", "catalog-reasoner"])
+def test_entries_without_endpoint_metadata_get_no_level_map(
+    monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    from omnigent.models.pi_model_compatibility import pi_generic_model_json_entry
+
+    catalog = ModelInfo(name="catalog-reasoner", provider="openai", supports_reasoning=True)
+    monkeypatch.setattr("omnigent.onboarding.providers.find_catalog_models", lambda _: [catalog])
+
+    entry = pi_generic_model_json_entry(model)
+
+    assert entry["reasoning"] is True
+    assert "thinkingLevelMap" not in entry
 
 
 def test_generic_catalog_programming_errors_surface(monkeypatch):

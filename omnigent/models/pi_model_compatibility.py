@@ -15,7 +15,13 @@ from omnigent.models.model_fallbacks import (
     PI_ANTHROPIC_BUDGET_THINKING,
     PI_ANTHROPIC_THINKING_REQUIRED,
 )
-from omnigent.models.model_metadata import ModelCapability, ModelMetadata
+from omnigent.models.model_metadata import (
+    ModelCapability,
+    ModelMetadata,
+    ModelReasoningMetadata,
+    ModelReasoningMode,
+    merge_model_metadata,
+)
 
 if TYPE_CHECKING:
     from omnigent.models.model_catalog import ModelEntry
@@ -171,9 +177,47 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
     return entry
 
 
+# When the endpoint lists no levels, Pi offers off, low, medium and high only:
+# xhigh and max stay hidden because nothing says the model supports them, and
+# minimal is left out because not every server accepts it.
+_PI_UNREPORTED_LEVELS: dict[str, str | None] = {"off": "none", "minimal": None}
+
+
+def pi_reported_thinking_level_map(
+    reasoning: ModelReasoningMetadata | None,
+) -> dict[str, str | None]:
+    """Map Pi's thinking levels onto the reasoning controls an endpoint reported.
+
+    Pi offers ``off`` through ``high`` unless a level maps to ``None``, and offers
+    ``xhigh``/``max`` only when mapped. ``off`` is sent as ``"none"`` explicitly
+    because Pi's Chat Completions client otherwise omits it and the model thinks.
+
+    :param reasoning: The endpoint-reported controls, or ``None`` when they are
+        unknown.
+    :returns: A ``thinkingLevelMap``, e.g. ``{"off": "none", "high": None,
+        "xhigh": "xhigh"}`` for a model without a ``high`` level.
+    """
+    efforts = reasoning.efforts if reasoning is not None else frozenset()
+    if reasoning is not None and ModelReasoningMode.TOGGLE in reasoning.modes:
+        # One "on" level; medium is Pi's default, so new sessions need no clamp.
+        off = "none" if "none" in efforts else None
+        return {"off": off, "minimal": None, "low": None, "high": None}
+    if not efforts - {"none"}:
+        return dict(_PI_UNREPORTED_LEVELS)
+    level_map: dict[str, str | None] = {"off": "none" if "none" in efforts else None}
+    for level in ("minimal", "low", "medium", "high"):
+        if level not in efforts:
+            level_map[level] = None
+    for level in ("xhigh", "max"):
+        if level in efforts:
+            level_map[level] = level
+    return level_map
+
+
 def pi_generic_model_json_entry(
     model_id: str,
     *,
+    provider_metadata: ModelMetadata | None = None,
     configured_context_window: int | None = None,
     configured_max_output_tokens: int | None = None,
 ) -> PiModelEntry:
@@ -181,12 +225,22 @@ def pi_generic_model_json_entry(
 
     Native and SDK providers share the same metadata even when the user supplies
     both limits. Configured limits override catalog values; an unavailable
-    catalog retains the model and Pi's defaults.
+    catalog retains the model and Pi's defaults. Metadata the serving endpoint
+    reports (*provider_metadata*) wins over the catalog, and its reasoning
+    controls become the entry's ``thinkingLevelMap``.
     """
     from omnigent.models.model_catalog import ModelEntry
 
     metadata = _pi_catalog_metadata(model_id)
+    if provider_metadata is not None:
+        metadata = merge_model_metadata(provider_metadata, metadata)
     entry = pi_model_json_entry(ModelEntry(id=model_id, family="other", metadata=metadata))
+    if (
+        provider_metadata is not None
+        and provider_metadata.supports(ModelCapability.REASONING) is True
+        and "thinkingLevelMap" not in entry
+    ):
+        entry["thinkingLevelMap"] = pi_reported_thinking_level_map(provider_metadata.reasoning)
     if configured_context_window is not None:
         entry["contextWindow"] = configured_context_window
     if configured_max_output_tokens is not None:
@@ -266,35 +320,5 @@ def enrich_databricks_model_catalog(
         )
         if metadata is None:
             metadata = _pi_catalog_metadata(model.id)
-        live = model.metadata
-        enriched.append(
-            replace(
-                model,
-                metadata=ModelMetadata(
-                    supported_capabilities=(
-                        live.supported_capabilities
-                        | (metadata.supported_capabilities - live.unsupported_capabilities)
-                    ),
-                    unsupported_capabilities=(
-                        live.unsupported_capabilities
-                        | (metadata.unsupported_capabilities - live.supported_capabilities)
-                    ),
-                    context_window=(
-                        live.context_window
-                        if live.context_window is not None
-                        else metadata.context_window
-                    ),
-                    max_output_tokens=(
-                        live.max_output_tokens
-                        if live.max_output_tokens is not None
-                        else metadata.max_output_tokens
-                    ),
-                    cost_tier=(
-                        live.cost_tier if live.cost_tier is not None else metadata.cost_tier
-                    ),
-                    wire_apis=live.wire_apis or metadata.wire_apis,
-                    reasoning=live.reasoning or metadata.reasoning,
-                ),
-            )
-        )
+        enriched.append(replace(model, metadata=merge_model_metadata(model.metadata, metadata)))
     return tuple(enriched)
