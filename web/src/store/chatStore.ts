@@ -5752,6 +5752,18 @@ export async function retryConversationLoad(id: string): Promise<void> {
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
 }
 
+// A send can rebind without loadingConversation; a foreground read mid-bind
+// could consume another writer's input and drop the new optimistic bubble.
+const entriesWithBindInFlight = new WeakSet<ConversationEntry>();
+
+function bindStream(id: string, set: Setter, get: Getter, hydratePending = false): Promise<void> {
+  const entry = conversationRegistry.peek(id);
+  if (entry !== undefined) entriesWithBindInFlight.add(entry);
+  return bindStreamAndHydrate(id, set, get, hydratePending).finally(() => {
+    if (entry !== undefined) entriesWithBindInFlight.delete(entry);
+  });
+}
+
 /**
  * Start the session SSE stream, kick off the pump in the background
  * once the stream connects, then fetch metadata plus the most recent
@@ -5766,7 +5778,7 @@ export async function retryConversationLoad(id: string): Promise<void> {
  * connecting. Dedupe by item id on merge so stream-delivered
  * persisted items don't double-render alongside hydrated ones.
  */
-async function bindStream(
+async function bindStreamAndHydrate(
   id: string,
   set: Setter,
   get: Getter,
@@ -6850,6 +6862,7 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   statusPatchFor: (s: ChatState) => Partial<ChatState>,
+  onRecovered?: (count: number) => void,
 ): Promise<ReconnectBackfill> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -6866,6 +6879,7 @@ async function rehydrateWindowOnReconnect(
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
+  let recoveredItems = 0;
   const freshItemIds = new Set(fresh.items.map((it) => it.id));
   const gapUserTexts = committedUserTextsOf(
     freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
@@ -6887,6 +6901,10 @@ async function rehydrateWindowOnReconnect(
     const tailIds = new Set(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
+    const seen = new Set(currentBlocks.map((block) => block.ctx.itemId));
+    recoveredItems = freshBlocks.filter(
+      (block) => block.ctx.itemId && !seen.has(block.ctx.itemId),
+    ).length;
     const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
     const merged = mergeReconnectWindow(
       windowBlocks,
@@ -6919,6 +6937,7 @@ async function rehydrateWindowOnReconnect(
   });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
+  if (recoveredItems > 0) onRecovered?.(recoveredItems);
   return "applied";
 }
 
@@ -7003,6 +7022,7 @@ async function reconcileOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
   settleStatus = true,
+  onRecovered?: (count: number) => void,
 ): Promise<ReconnectBackfill> {
   if (queryClient === null) return "skipped";
   const stateBeforeFetch = get();
@@ -7099,12 +7119,14 @@ async function reconcileOnReconnect(
       get,
       ignoredNativeMessageIds,
       statusPatchFor,
+      onRecovered,
     );
   }
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const snapshotItemIds = new Set(items.map((it) => it.id));
+  let recoveredItems = 0;
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
@@ -7137,6 +7159,7 @@ async function reconcileOnReconnect(
     }
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
+      recoveredItems = unseen.length;
       // Splice the gap's committed items ahead of the active turn's
       // replayed in-flight region (its itemId-less blocks, rebuilt by the
       // pump at the tail). With no replay region yet, anchor AFTER the
@@ -7185,6 +7208,7 @@ async function reconcileOnReconnect(
   });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
+  if (recoveredItems > 0) onRecovered?.(recoveredItems);
   return "applied";
 }
 
@@ -7213,6 +7237,7 @@ const presenceIdle = createPresenceIdleTracker({
 // probably dead — tracked per attempt, since background conversations
 // hold streams of their own.
 const streamAttemptActivity = new Map<AbortController, number>();
+const streamActivityByController = new WeakMap<AbortController, number>();
 
 // Two missed 15 s server heartbeats plus slack. Deliberately shorter than
 // the stall guard's own window (`SSE_STALL_TIMEOUT_MS`): the guard is the
@@ -7244,14 +7269,75 @@ function recycleStreamIfStale(): void {
   }
 }
 
+let foregroundRecoveryArmed = true;
+
+function armForegroundRecovery(): void {
+  foregroundRecoveryArmed = true;
+}
+
+type ForegroundTrigger = "visible" | "pageshow" | "online";
+
+function reconcileLiveEntry(entry: ConversationEntry, trigger: ForegroundTrigger): void {
+  const { abortController, loadingConversation, activeResponse, sendLatchedAt } = entry.getState();
+  // Reconnect merging assumes live chunks were dropped for replay. Keep a live
+  // turn or pending send intact; stale streams still recycle through the pump.
+  if (
+    abortController === null ||
+    loadingConversation ||
+    entriesWithBindInFlight.has(entry) ||
+    activeResponse?.state === "streaming" ||
+    sendLatchedAt !== null
+  )
+    return;
+  foregroundRecoveryArmed = false;
+  // A read started while hidden can predate items committed before this edge.
+  void reconcileOnReconnect(
+    entry.id,
+    entrySetter(entry),
+    entryGetter(entry),
+    nativePreviewTombstonesByController.get(abortController),
+    true,
+    (recoveredItems) => {
+      const lastActivityAt = streamActivityByController.get(abortController);
+      console.warn("Foreground transcript recovery", {
+        trigger,
+        recoveredItems,
+        secondsSinceLastByte:
+          lastActivityAt === undefined ? null : (Date.now() - lastActivityAt) / 1000,
+      });
+    },
+  ).then((outcome) => {
+    if (outcome === "failed") armForegroundRecovery();
+  });
+}
+
+function reconcileForegroundConversation(trigger: ForegroundTrigger): void {
+  if (!foregroundRecoveryArmed || (typeof document !== "undefined" && document.hidden)) return;
+  const id = useChatStore.getState().conversationId;
+  if (id === null || isTempConvId(id)) return;
+  const entry = conversationRegistry.peek(id);
+  if (entry === undefined || entry.disposed) return;
+  reconcileLiveEntry(entry, trigger);
+}
+
 if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => {
     presenceIdle.handleVisibilityChange(document.hidden);
-    if (!document.hidden) recycleStreamIfStale();
+    if (document.hidden) {
+      armForegroundRecovery();
+      return;
+    }
+    recycleStreamIfStale();
+    reconcileForegroundConversation("visible");
   });
 }
 if (typeof window !== "undefined") {
-  window.addEventListener("online", () => recycleStreamIfStale());
+  window.addEventListener("offline", armForegroundRecovery);
+  window.addEventListener("online", () => {
+    recycleStreamIfStale();
+    reconcileForegroundConversation("online");
+  });
+  window.addEventListener("pageshow", () => reconcileForegroundConversation("pageshow"));
 }
 
 /**
@@ -7405,6 +7491,7 @@ export async function startStreamPump(
       // Stamped from attempt start so the wake fast-path can also recycle
       // an open that has hung past the stale window, not just a dead body.
       streamAttemptActivity.set(attempt, Date.now());
+      streamActivityByController.set(controller, Date.now());
       openedHost = getSessionHost(id);
       liveAttempt = attempt;
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -7513,6 +7600,7 @@ export async function startStreamPump(
         nonSseAnswersSince = null;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
+        streamActivityByController.set(controller, Date.now());
         maxAgeTimer = setTimeout(() => attempt.abort(), SSE_MAX_STREAM_AGE_MS);
         if (reconnecting) {
           if (previousStreamEpoch === null || streamEpoch === null) {
@@ -7550,6 +7638,7 @@ export async function startStreamPump(
         const guardedBody = withStallGuard(streamRes.body, {
           onActivity: () => {
             streamAttemptActivity.set(attempt, Date.now());
+            streamActivityByController.set(controller, Date.now());
           },
           onStall: () =>
             console.warn(
