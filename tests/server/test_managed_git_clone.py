@@ -19,13 +19,60 @@ from omnigent.stores.host_store import HostStore
 from tests.server.helpers import FakeSandboxLauncher, HostStartInvocation
 
 
-@pytest.mark.parametrize("block", [None, {}, {"depth": None, "single_branch": None}])
-def test_default_clone_policy(block: object) -> None:
+def test_omitted_clone_policy_is_unset() -> None:
+    config = parse_sandbox_config(
+        {"provider": "agent_sandbox", "server_url": "https://example.test"}
+    )
+    assert config is not None
+    assert config.for_provider(None).git_clone is None
+
+
+@pytest.mark.parametrize("block", [{}, {"depth": None, "single_branch": None}])
+def test_empty_clone_policy_restores_full_clones(block: object) -> None:
     config = parse_sandbox_config(
         {"provider": "agent_sandbox", "server_url": "https://example.test", "git_clone": block}
     )
     assert config is not None
     assert config.for_provider(None).git_clone == GitCloneOptions()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("git_clone", "honors_options", "expected_clone"),
+    [
+        (None, True, "git clone --branch main --single-branch --filter=blob:none -- "),
+        (None, False, "git clone --branch main --single-branch -- "),
+        (GitCloneOptions(), True, "git clone --branch main --single-branch -- "),
+    ],
+)
+async def test_omitted_policy_defaults_to_blobless_where_supported(
+    db_uri: str,
+    git_clone: GitCloneOptions | None,
+    honors_options: bool,
+    expected_clone: str,
+) -> None:
+    class Launcher(FakeSandboxLauncher):
+        @property
+        def capabilities(self) -> SandboxCapabilities:
+            return replace(super().capabilities, git_clone_options=honors_options)
+
+    store = HostStore(db_uri)
+
+    def connected(invocation: HostStartInvocation) -> None:
+        store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id="alice"
+        )
+
+    fake = Launcher(on_host_start=connected)
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig("https://example.test", lambda: fake, 3600, git_clone=git_clone)
+    )
+    repos = [parse_repo_workspace("https://github.com/org/repo.git#main")]
+    await launch_managed_host(config=config, owner="alice", host_store=store, repos=repos)
+    clones = [cmd for cmd in fake.commands if cmd.startswith("git clone")]
+    assert len(clones) == 1
+    assert clones[0].startswith(expected_clone)
+    assert repos[0].git_clone == GitCloneOptions()
 
 
 @pytest.mark.parametrize(

@@ -24,9 +24,18 @@ Providers whose sandbox boots running the host directly (Kubernetes), or whose
 control plane owns host startup (Gensee), inherit `SandboxHostLauncher` and
 override `start_host` without exposing a general-purpose exec transport.
 
-## Faster initial Git clones
+## Initial Git clones
 
-Admins can reduce the history downloaded for new managed sandbox checkouts:
+New managed sandbox checkouts default to a blobless partial clone
+(`git clone --filter=blob:none`): the sandbox downloads the full commit graph
+and every file of the checked-out revision, and fetches other revisions' file
+contents from the remote on first use. Spin-up time and disk use then follow
+the size of the working tree rather than the repository's history, so a
+repository whose history exceeds what the sandbox can hold still launches.
+When the remote does not support object filters, Git warns and falls back to
+an unfiltered clone.
+
+Admins can replace this policy for new managed sandbox checkouts:
 
 ```yaml
 sandbox:
@@ -50,22 +59,27 @@ its configuration and create a new sandbox to try it.
 | `filter` | `null` | `blob:none` enables partial cloning: keep commit history and fetch file contents as needed. The initial checkout still includes all files. Requires remote filter support; Git can warn and fall back to an unfiltered clone. |
 | `tags` | `true` | Normal Git tag following. `false` uses `--no-tags`, which persists for later fetches. `true` does not promise to fetch every remote tag. |
 
-Omitting `git_clone` preserves existing commands and behavior. Setting only
-`depth` preserves the existing branch selection, explicitly countering Git's
-implicit single-branch default for shallow clones. Fetching every branch of a
-repository with many branch tips can erase most of the speed benefit; configure
-`single_branch: true` when that tradeoff fits the workload.
+A configured `git_clone` block replaces the default policy entirely, so the
+table's defaults apply to any key it omits: setting only `depth` yields a
+shallow, unfiltered clone, and `git_clone: {}` restores plain full-history
+clones. Setting only `depth` preserves the existing branch selection,
+explicitly countering Git's implicit single-branch default for shallow clones.
+Fetching every branch of a repository with many branch tips can erase most of
+the speed benefit; configure `single_branch: true` when that tradeoff fits the
+workload.
 
 Settings apply only when a checkout needs to be created. Retained checkouts are
 not reset, truncated, or reconfigured when a session wakes. An agent-sandbox
 wake that lost its ephemeral workspace recreates it using the current policy.
 Each entry in `sandbox.providers` can override the entire shared `git_clone`
-mapping; use `git_clone: {}` on an entry to restore compatibility defaults.
+mapping; use `git_clone: {}` on an entry to restore full-history clones.
 
 Kubernetes, Agent Sandbox (including warm pools), and providers using the
-standard exec clone implementation support these options. Gensee, Islo, and
-custom workspace materializers must explicitly implement support; nondefault
-settings otherwise fail before sandbox provisioning, replacement, or resume.
+standard exec clone implementation support these options and apply the default
+policy. Gensee, Islo, and custom workspace materializers must explicitly
+implement support: they keep their own clone behavior when `git_clone` is
+omitted, and nondefault settings otherwise fail before sandbox provisioning,
+replacement, or resume.
 Third-party providers advertise `SandboxCapabilities.git_clone_options=True`
 and honor `RepoWorkspace.git_clone`. Exec providers that override
 `materialize_workspace` must accept its optional `git_clone` argument when
@@ -105,10 +119,11 @@ actionable error rather than showing a misleading branch-tip comparison.
 Unfetched base branches and failed lazy file retrieval also produce errors;
 unavailable content is not treated as an added or deleted file.
 
-Keep full-history defaults for history-heavy development, offline work, or tools
-that expect broad history. `blob:none` is opt-in because it moves work to later
+Configure `git_clone: {}` for history-heavy development, offline work, or tools
+that expect every object locally. A blobless checkout moves work to later
 reads: a first historical `git show` or `git blame` can fetch more data and take
-longer. Sparse checkout, submodule recursion, and LFS behavior are unchanged.
+longer, and needs continuing access to the remote. Sparse checkout, submodule
+recursion, and LFS behavior are unchanged.
 
 ## Creating a community sandbox provider
 
