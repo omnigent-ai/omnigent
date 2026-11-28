@@ -93,6 +93,7 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
+import { runSessionTimerMutation, stopSupersededSessionLoop } from "@/lib/sessionTimersApi";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
@@ -844,6 +845,11 @@ export interface ConversationState {
     stableId?: string;
     contentKey?: string;
   }[];
+  /**
+   * Pending ids that command receipts named before any bubble here had adopted
+   * them: a send still posting settles when its reply returns one of these.
+   */
+  settledCommandIds: string[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -2490,6 +2496,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   pendingUserMessages: [],
   failedUploads: [],
   settledShellInputs: [],
+  settledCommandIds: [],
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -3390,15 +3397,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
         setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId
-              ? {
-                  ...p,
-                  posted: true,
-                  ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
-                }
-              : p,
-          ),
+          // A command whose receipt beat this reply is already in the transcript.
+          pendingUserMessages:
+            postResult.pendingId && s.settledCommandIds.includes(postResult.pendingId)
+              ? s.pendingUserMessages.filter((p) => p.tempId !== tempId)
+              : s.pendingUserMessages.map((p) =>
+                  p.tempId === tempId
+                    ? {
+                        ...p,
+                        posted: true,
+                        ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                      }
+                    : p,
+                ),
           settledShellInputs: s.settledShellInputs.map((entry) =>
             entry.tempId === tempId && postResult.pendingId
               ? { ...entry, pendingId: postResult.pendingId }
@@ -4204,11 +4215,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // `session.superseded` redirect was missed, unless the user moved on or a
     // redirect is already pending. A native clear names none.
     if (!sessionId || sessionId === conversationId) return;
+    const { conversationId: viewed, redirectToConversationId: pending } = get();
+    const followsHere = viewed === conversationId && pending === null;
     useChatStore.setState((s) =>
       s.conversationId === conversationId && s.redirectToConversationId === null
         ? { redirectToConversationId: sessionId }
         : {},
     );
+    // The live redirect, which reports a stopped loop, was missed.
+    if (followsHere) reportLoopStoppedBySupersession(conversationId);
   },
 
   rewindToPrompt: async (itemId) => {
@@ -4224,10 +4239,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const untouched = !sessionDraftWasWritten(target);
     const text: SessionDraft = { text: rewound.prompt, files: [] };
     if (untouched) setSessionDraft(target, text);
+    const { conversationId: viewed, redirectToConversationId: pending } = get();
+    const followsHere = viewed === conversationId && pending !== target;
     useChatStore.setState((s) => ({
       ...(untouched ? { rewindPrefill: { ...text, conversationId: target } } : {}),
       ...(s.conversationId === conversationId ? { redirectToConversationId: target } : {}),
     }));
+    // The live redirect, which reports a stopped loop, has not arrived first.
+    if (followsHere) reportLoopStoppedBySupersession(conversationId);
     if (!untouched || rewound.attachments.length === 0) return;
     // The text is in; the attachments follow once they download, unless the
     // draft has changed since.
@@ -7128,13 +7147,20 @@ async function reconcileOnReconnect(
       ...shellSettlement,
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
-    // the durable equivalent of its FIFO acknowledgement.
-    const recoveredUserInputs = unseen.filter(
-      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
-    ).length;
-    if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = shellSettlement.pendingUserMessages.slice(recoveredUserInputs);
+    // the durable equivalent of its FIFO acknowledgement. A message no human
+    // typed (a /loop run) settles its own replayed entry, never the FIFO head.
+    let pending = shellSettlement.pendingUserMessages;
+    for (const block of unseen) {
+      if (block.type !== "user_message" || isSystemUserContent(block.content)) continue;
+      if (block.origin === undefined) {
+        pending = pending.slice(1);
+        continue;
+      }
+      const key = contentKeyOf(block.content);
+      const at = pending.findIndex((p) => p.replayed && contentKeyOf(p.content) === key);
+      if (at >= 0) pending = [...pending.slice(0, at), ...pending.slice(at + 1)];
     }
+    if (pending !== shellSettlement.pendingUserMessages) patch.pendingUserMessages = pending;
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
@@ -9160,6 +9186,7 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  origin?: string,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -9180,7 +9207,33 @@ function committedUserBlock(
     },
     content,
     stableKey,
+    ...(origin !== undefined ? { origin } : {}),
   };
+}
+
+/**
+ * A superseded session runs no loop, and the one that continues it starts without
+ * one, so stop this user's loop there now and say so. Best-effort.
+ */
+function reportLoopStoppedBySupersession(sessionId: string): void {
+  // Queued behind a /loop this tab is still arming in that session.
+  runSessionTimerMutation(sessionId, () => stopSupersededSessionLoop(sessionId))
+    .then((hadLoop) => {
+      if (!hadLoop) return;
+      toast.info(
+        "Your loop stopped when this chat moved to a new session. Run /loop again to restart it.",
+        { id: `loop-stopped-${sessionId}` },
+      );
+    })
+    .catch(() => {
+      // An older server or a session that is gone has no loop to report.
+    });
+}
+
+/** The `origin` a consumed user message carries, e.g. `"loop"` for a /loop run. */
+function consumedMessageOrigin(event: SessionInputConsumedEvent): string | undefined {
+  const origin = event.data.origin;
+  return typeof origin === "string" ? origin : undefined;
 }
 
 interface RefetchRunnerBackedSessionStateOptions {
@@ -10144,6 +10197,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation((s) => {
         const eventContent = userContentFromEvent(event);
         const pendingHead = s.pendingUserMessages[0];
+        // A message no human typed (a /loop run) was never an optimistic bubble here, so
+        // it may only clear the entry the server names, never the FIFO head.
+        const origin = consumedMessageOrigin(event);
+        const ownsNoBubble = origin !== undefined;
         // Bare envelopes typed in the terminal must not consume unrelated web input.
         const unmatchedEnvelope =
           eventContent !== null &&
@@ -10189,7 +10246,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // by user]` record) is synthesized by the CLI, owns no pending entry,
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
-          if (unmatchedEnvelope || (eventContent !== null && isSystemUserContent(eventContent))) {
+          if (
+            ownsNoBubble ||
+            unmatchedEnvelope ||
+            (eventContent !== null && isSystemUserContent(eventContent))
+          ) {
             return {};
           }
           if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
@@ -10222,6 +10283,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  origin,
                 ),
               ],
             };
@@ -10238,6 +10300,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    branch 1 and never reaches this fallback.
         const head =
           settledShell ||
+          ownsNoBubble ||
           unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
           s.pendingUserMessages[0]?.initialDraft
@@ -10269,7 +10332,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              origin,
+            ),
           ],
         };
       });
@@ -10283,10 +10353,31 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // persistence for these (no `session.input.consumed` fires),
       // so the optimistic bubble in `pendingUserMessages` would
       // otherwise linger next to the rendered SlashCommandBlock
-      // until refresh. Pop the FIFO head here to ack the local
-      // send; observing clients and drafts still held locally cannot
-      // acknowledge a send, so they just render the block.
+      // until refresh. The receipt names the pending entry it settles,
+      // and only that bubble goes: a command nobody queued here (typed
+      // in the terminal, a /loop run) leaves every bubble alone.
       applyToConversation((s) => {
+        const named = event.clearedPendingId;
+        if (named === null) return {};
+        if (named !== undefined) {
+          const at = s.pendingUserMessages.findIndex(
+            (p) => p.tempId === named || p.pendingId === named,
+          );
+          if (at < 0) {
+            // Its send may still be posting; the reply settles it (see `send`).
+            return {
+              settledCommandIds: [...s.settledCommandIds, named].slice(-MAX_SETTLED_SHELL_INPUTS),
+            };
+          }
+          return {
+            pendingUserMessages: [
+              ...s.pendingUserMessages.slice(0, at),
+              ...s.pendingUserMessages.slice(at + 1),
+            ],
+          };
+        }
+        // No owner named (a composer skill's receipt, an older server): pop the
+        // FIFO head to ack the local send, unless it is a draft still held here.
         if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
@@ -10359,11 +10450,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // `applyToConversation`: the redirect only makes sense for the
       // conversation on screen, and a background conversation that gets
       // superseded should redirect when the user switches to it, not before.
+      const viewed = useChatStore.getState().conversationId;
+      const movedOn = viewed === event.conversationId && event.targetConversationId !== viewed;
       useChatStore.setState((s) => {
         if (s.conversationId !== event.conversationId) return {};
         if (event.targetConversationId === s.conversationId) return {};
         return { redirectToConversationId: event.targetConversationId };
       });
+      // The user is being moved on from this session, so their loop here ends.
+      if (movedOn) reportLoopStoppedBySupersession(event.conversationId);
       // The rotation happened mid-input: the `/clear` (or whatever the user just
       // sent) never gets a `session.input.consumed` on THIS conversation — the
       // runner moved to the new one — so its optimistic bubble would otherwise

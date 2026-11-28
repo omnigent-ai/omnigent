@@ -89,8 +89,11 @@ from omnigent.server.scheduled.rrule import (
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.schedule import (
+    LOOP_MAX_INTERVAL_SECONDS,
+    LOOP_TIMER_NAME,
     continued_sandbox_host_id,
     is_trigger_automation,
+    timer_origin,
     timer_rule,
 )
 from omnigent.server.scheduled.telemetry import log_task_created
@@ -116,7 +119,11 @@ from omnigent.server.session_mcp_selection import (
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    LOOP_TIMER_SUPERSEDED_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    loop_timer_label_key,
+)
 from omnigent.stores.permission_store import MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
@@ -2525,6 +2532,32 @@ def create_scheduled_tasks_router(
             raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
         return (None if user_id == RESERVED_USER_LOCAL else user_id), conv
 
+    # A session remembers each user's running /loop in a label holding its timer's id,
+    # changed by compare-and-swap, so clients arming or stopping at once, on any
+    # replica, agree on which loop runs without listing timers.
+    _LOOP_STOP_ATTEMPTS = 5
+    _LOOP_SUPERSEDED = (
+        "This chat continued in a new session, so a loop can't run here; run /loop there"
+    )
+
+    async def _running_loop(
+        conv: Conversation, user_id: str | None, timer_id: str | None
+    ) -> ScheduledTask | None:
+        """The loop *timer_id* names, if it is still the caller's running loop in *conv*."""
+        if not timer_id:
+            return None
+        task = await asyncio.to_thread(store.get, timer_id)
+        if (
+            task is None
+            or task.kind != "timer"
+            or task.state != "active"
+            or task.session_id != conv.id
+            or task.user_id != user_id
+            or timer_origin(task.name) != "loop"
+        ):
+            return None
+        return task
+
     # Called by the runner's timer tools, so hidden from the public API reference.
     @timers.post(
         "/sessions/{session_id}/timers",
@@ -2547,10 +2580,16 @@ def create_scheduled_tasks_router(
         ``reason``, tells the runner to keep it in memory.
 
         :param body: ``{"seconds": number, "repeat": bool, "note": str | null}``, checked
-            like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``.
+            like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``, plus an
+            optional ``origin``: ``"loop"`` marks the web composer's ``/loop`` timer, whose
+            ``note`` (required) is the prompt each firing sends visibly and which replaces
+            the caller's running loop in this session (``docs/AUTOMATIONS.md``). A loop
+            must repeat, at most every ``LOOP_MAX_INTERVAL_SECONDS``; any other origin
+            is refused.
         :returns: ``durable`` true, ``timer_id``, ``status`` ``"scheduled"``, the UTC
             ``fire_at`` of the first firing, ``interval_seconds`` for a repeating timer
-            (else ``None``), and the ``seconds``, ``repeat`` and ``note`` it was set with.
+            (else ``None``), the ``seconds``, ``repeat``, ``note`` and ``origin`` it was
+            set with, and for a loop the ``replaced_timer_id`` it replaced (or ``None``).
         :raises OmnigentError: 400 for bad arguments, a delay under
             ``DURABLE_TIMER_MIN_SECONDS``, an archived or closed session, or a server with
             timers off (no database scheduler, or the ``session_timers`` feature off);
@@ -2562,15 +2601,31 @@ def create_scheduled_tasks_router(
                 "session_timers feature",
                 code=ErrorCode.INVALID_INPUT,
             )
-        unknown = sorted(set(body) - {"seconds", "repeat", "note"})
+        unknown = sorted(set(body) - {"seconds", "repeat", "note", "origin"})
         if unknown:
             raise OmnigentError(
                 f"unknown timer fields: {', '.join(unknown)}", code=ErrorCode.INVALID_INPUT
             )
-        validated = validate_timer_set_args(body)
+        origin = body.get("origin")
+        if origin is not None and origin != "loop":
+            raise OmnigentError("origin must be 'loop'", code=ErrorCode.INVALID_INPUT)
+        validated = validate_timer_set_args({k: v for k, v in body.items() if k != "origin"})
         if isinstance(validated, str):
             raise OmnigentError(validated, code=ErrorCode.INVALID_INPUT)
         seconds, repeat, note = validated
+        if origin is not None and not note:
+            raise OmnigentError(
+                "a loop needs a note: the prompt it repeats", code=ErrorCode.INVALID_INPUT
+            )
+        if origin is not None and not repeat:
+            raise OmnigentError(
+                "a loop repeats: repeat must be true", code=ErrorCode.INVALID_INPUT
+            )
+        if origin is not None and seconds > LOOP_MAX_INTERVAL_SECONDS:
+            raise OmnigentError(
+                f"a loop repeats at most every {LOOP_MAX_INTERVAL_SECONDS} seconds (7 days)",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if seconds < DURABLE_TIMER_MIN_SECONDS:
             raise OmnigentError(
                 f"The server saves timers of at least {DURABLE_TIMER_MIN_SECONDS} seconds; "
@@ -2588,6 +2643,8 @@ def create_scheduled_tasks_router(
                 "This session is closed to new messages, so it can't take timers",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if origin is not None and LOOP_TIMER_SUPERSEDED_LABEL_KEY in conv.labels:
+            raise OmnigentError(_LOOP_SUPERSEDED, code=ErrorCode.INVALID_INPUT)
         if conv.agent_id is None:
             raise OmnigentError(
                 "This session has no agent for a timer to wake", code=ErrorCode.INVALID_INPUT
@@ -2602,26 +2659,73 @@ def create_scheduled_tasks_router(
         agent_id = conv.agent_id
         interval = max(1, math.ceil(seconds))
         fire_at = math.ceil(time.time() + seconds)
-        async with _allocated_task_id(user_id, "Timer") as task_id:
-            # Synchronous, so a cancel can't land after the save and release the saved ID.
-            task = store.create(
-                scheduled_task_id=task_id,
-                name=f"Timer: {note}"[:256] if note else "Timer",
-                # The hidden message each firing sends into the session.
-                prompt=f"[System: timer {task_id} fired]" + (f"\nnote: {note!r}" if note else ""),
-                rrule=timer_rule(interval, repeat=repeat),
-                user_id=user_id,
-                agent_id=agent_id,
-                timezone="UTC",
-                session_mode="continue",
-                session_id=conv.id,
-                # Runs route to the replica holding the session's host.
-                host_id=conv.host_id,
-                first_run_at=fire_at,
-                kind="timer",
-                # Firings fall at the anchor plus whole intervals, the first at fire_at.
-                schedule_anchor=fire_at - interval,
-            )
+
+        async def save() -> ScheduledTask:
+            async with _allocated_task_id(user_id, "Timer") as task_id:
+                # Synchronous, so a cancel can't land after the save and release the saved ID.
+                return store.create(
+                    scheduled_task_id=task_id,
+                    name=(
+                        f"{LOOP_TIMER_NAME}: {note}"
+                        if origin
+                        else (f"Timer: {note}" if note else "Timer")
+                    )[:256],
+                    # What each firing sends the session: a loop's prompt as a message the
+                    # transcript shows; an agent timer's hidden wake.
+                    prompt=(note if origin else None)
+                    or f"[System: timer {task_id} fired]" + (f"\nnote: {note!r}" if note else ""),
+                    rrule=timer_rule(interval, repeat=repeat),
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    timezone="UTC",
+                    session_mode="continue",
+                    session_id=conv.id,
+                    # Runs route to the replica holding the session's host.
+                    host_id=conv.host_id,
+                    first_run_at=fire_at,
+                    kind="timer",
+                    # Firings fall at the anchor plus whole intervals, the first at fire_at.
+                    schedule_anchor=fire_at - interval,
+                )
+
+        replaced: ScheduledTask | None = None
+        task = await save()
+        if origin is not None:
+            # Point the session at the new loop; whatever the label held is the loop this
+            # one replaces, however many clients arm at once. The swap and its undo run in
+            # one thread, so a request cancelled meanwhile can't undo a swap that commits.
+            def record() -> str | None:
+                label = loop_timer_label_key(user_id)
+                try:
+                    previous = conversation_store.swap_label(conv.id, label, task.id)
+                    # Superseded while this loop was being saved: its viewers moved on.
+                    if conversation_store.get_labels(conv.id, (LOOP_TIMER_SUPERSEDED_LABEL_KEY,)):
+                        conversation_store.replace_label_if(
+                            conv.id, label, expected=task.id, value=None
+                        )
+                        raise OmnigentError(_LOOP_SUPERSEDED, code=ErrorCode.INVALID_INPUT)
+                    return previous
+                except Exception:
+                    # A loop the session can't find could never be stopped.
+                    store.delete(task.id)
+                    raise
+
+            previous_id = await asyncio.to_thread(record)
+            # The label names the new loop, so it is armed whatever happens next. Retiring
+            # the loop it replaced is best-effort: one the label no longer names retires
+            # itself at its next firing, which never sends.
+            try:
+                replaced = await _running_loop(conv, user_id, previous_id)
+                if replaced is not None:
+                    await asyncio.to_thread(store.delete, replaced.id)
+            except Exception:
+                _logger.warning(
+                    "loop %s replaced %s in session %s, which its next firing retires instead",
+                    task.id,
+                    previous_id,
+                    conv.id,
+                    exc_info=True,
+                )
         return {
             "durable": True,
             "timer_id": task.id,
@@ -2631,7 +2735,65 @@ def create_scheduled_tasks_router(
             "seconds": seconds,
             "repeat": repeat,
             "note": note,
+            "origin": origin,
+            **(
+                {"replaced_timer_id": replaced.id if replaced is not None else None}
+                if origin
+                else {}
+            ),
         }
+
+    @timers.delete("/sessions/{session_id}/timers", include_in_schema=False)
+    async def cancel_session_loop(
+        request: Request, session_id: str, origin: str | None = None
+    ) -> dict[str, Any]:
+        """Stop the caller's ``/loop`` in this session, if one runs.
+
+        Only ``origin=loop`` is accepted: the loop is the timer the session remembers
+        for the caller, so the agent's own timers are never touched. Repeating is safe.
+
+        :returns: ``{"timer_id": "...", "status": "cancelled"}``. With a ``None``
+            ``timer_id``: ``status`` ``"none"`` when the session remembered no loop,
+            or ``"retired"`` when the one it remembered had already ended, e.g. at a
+            firing after the session was superseded.
+        :raises OmnigentError: 400 for any other ``origin``; 403/404 as for posting a
+            message.
+        """
+        if origin != "loop":
+            raise OmnigentError("origin must be 'loop'", code=ErrorCode.INVALID_INPUT)
+        user_id, conv = await _timer_session(request, session_id)
+        label = loop_timer_label_key(user_id)
+        # Clear the label only while it still names the loop read, then cancel that loop;
+        # an arm that moved the label meanwhile keeps its loop and the stop looks again.
+        for _ in range(_LOOP_STOP_ATTEMPTS):
+            named = await asyncio.to_thread(conversation_store.get_labels, conv.id, (label,))
+            timer_id = named.get(label)
+            if not timer_id:
+                return {"timer_id": None, "status": "none"}
+            cleared = await asyncio.to_thread(
+                conversation_store.replace_label_if,
+                conv.id,
+                label,
+                expected=timer_id,
+                value=None,
+            )
+            if cleared:
+                # The label no longer names the loop, so it is stopped: a firing it still
+                # gets retires it without sending. Deleting it now is best-effort.
+                try:
+                    running = await _running_loop(conv, user_id, timer_id)
+                    if running is None:
+                        return {"timer_id": None, "status": "retired"}
+                    await asyncio.to_thread(store.delete, running.id)
+                except Exception:
+                    _logger.warning(
+                        "loop %s stopped in session %s but not deleted; its firing retires it",
+                        timer_id,
+                        conv.id,
+                        exc_info=True,
+                    )
+                return {"timer_id": timer_id, "status": "cancelled"}
+        raise OmnigentError("The loop kept changing; try again", code=ErrorCode.CONFLICT)
 
     @timers.delete("/sessions/{session_id}/timers/{timer_id}", include_in_schema=False)
     async def cancel_session_timer(
@@ -2657,6 +2819,23 @@ def create_scheduled_tasks_router(
             or not await asyncio.to_thread(store.delete, task.id)
         ):
             raise OmnigentError("Timer not found", code=ErrorCode.NOT_FOUND)
+        if timer_origin(task.name) == "loop":
+            # Forget the loop too, unless a newer one has taken its place.
+            try:
+                await asyncio.to_thread(
+                    conversation_store.replace_label_if,
+                    conv.id,
+                    loop_timer_label_key(user_id),
+                    expected=task.id,
+                    value=None,
+                )
+            except Exception:
+                _logger.warning(
+                    "cancelled loop %s is still named by session %s",
+                    task.id,
+                    conv.id,
+                    exc_info=True,
+                )
         return {"timer_id": task.id, "status": "cancelled"}
 
     combined = APIRouter()

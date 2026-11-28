@@ -71,6 +71,13 @@ export interface PostEventResponse {
    *  denial text via SSE but did not start a turn or persist the
    *  user message, so no `session.input.consumed` will follow. */
   denied?: boolean;
+  /** True when the session could not take the message: its harness cannot
+   *  start (a native terminal or runner failed to launch, or the host refused
+   *  the launch), so the message was consumed into a failed turn and nothing
+   *  will deliver it. `reason` says why. */
+  rejected?: boolean;
+  /** Why the input was denied or rejected, for the user. */
+  reason?: string;
   /**
    * Server-assigned pending-input id for a native-terminal web
    * message, e.g. ``"pending_a1b2c3"``. It identifies the snapshot's
@@ -537,6 +544,8 @@ function postEventResponseFromWire(wire: {
   queued: boolean;
   item_id?: string;
   denied?: boolean;
+  rejected?: boolean;
+  reason?: string;
   pending_id?: string;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
@@ -546,6 +555,8 @@ function postEventResponseFromWire(wire: {
     queued: wire.queued,
     itemId: wire.item_id,
     denied: wire.denied,
+    rejected: wire.rejected,
+    reason: wire.reason,
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,

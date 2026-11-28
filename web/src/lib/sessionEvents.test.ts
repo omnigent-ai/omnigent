@@ -582,6 +582,28 @@ describe("response.output_item.done (slash_command)", () => {
     const ev = out[0] as SlashCommand;
     expect(ev.kind).toBe("skill");
   });
+
+  it.each<[string, Record<string, unknown>, string | null | undefined]>([
+    ["the entry a native receipt names", { cleared_pending_id: "pending_1" }, "pending_1"],
+    ["a native receipt that names none", { cleared_pending_id: null }, null],
+    ["a receipt with no owner field", {}, undefined],
+  ])("carries %s as the pending entry the command settles", (_, envelope, expected) => {
+    const out = parse("response.output_item.done", {
+      type: "response.output_item.done",
+      ...envelope,
+      item: {
+        id: "sc_named",
+        type: "slash_command",
+        status: "completed",
+        response_id: "resp_named",
+        model: "claude-native-ui",
+        kind: "skill",
+        name: "review",
+        arguments: "",
+      },
+    });
+    expect((out[0] as SlashCommand).clearedPendingId).toBe(expected);
+  });
 });
 
 describe("response.output_item.done (routing_decision)", () => {

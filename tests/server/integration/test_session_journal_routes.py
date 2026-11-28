@@ -666,6 +666,8 @@ async def test_a_full_journal_refuses_new_entries_with_journal_full(
         "omnigent.scheduled_task_activity",
         "omnigent.scheduled_task_initial_run",
         "omnigent.pending_scheduled_run.reserved",
+        # The label naming a user's running /loop: an editor can't redirect it.
+        "omnigent.loop_timer.reserved",
     ],
 )
 @pytest.mark.parametrize("user", [ALICE, BOB])

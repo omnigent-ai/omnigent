@@ -463,9 +463,15 @@ instead of saving.
   (`next_timer_time`), skipping missed ones, and timers are exempt from the automation
   minimum interval. A firing comes up to one poll (15 seconds by default) late.
 - **Delivery.** The executor skips budgets, sharing and run labels, and sends the
-  hidden (`is_meta`) wake through the continued-session dispatch, in the session's
+  hidden (`is_meta`) wake, or a `/loop` timer's prompt as a visible message tagged
+  `origin: "loop"`, through the continued-session dispatch, in the session's
   current permission mode. A session that was deleted, archived or closed, or that
-  the owner can no longer send to, stops the timer (`timer_session_unavailable`).
+  the owner can no longer send to, stops the timer (`timer_session_unavailable`). A
+  `/loop` timer fires only while the session's per-user loop label still names it;
+  one the label no longer names, left behind when replacing or stopping it failed
+  partway, retires itself instead (`loop_superseded`). So does every loop in a
+  session that `/clear` or `/rewind` superseded, which is marked for it before its
+  viewers are redirected; a mark that can't be saved fails the supersession.
   The wake meets the session's REQUEST-phase input policies first: a deny, or an ASK
   no one can answer, skips that firing (`timer_policy_denied`). A runner that can't
   be reached or declines the wake fails the firing (`launch_failed`), which is not

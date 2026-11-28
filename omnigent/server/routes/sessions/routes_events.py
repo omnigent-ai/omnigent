@@ -263,6 +263,7 @@ from omnigent.server.routes._sessions.helpers import (
     _set_background_work_running,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
+    _stop_superseded_loops,
     _stream_live_events,
     _wait_for_runner_client,
     reconcile_orphaned_running_status,
@@ -282,6 +283,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
+    _host_launch_failure_message,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
@@ -438,6 +440,13 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
         and item_data.get("kind") == "input"
     )
     return item_type != "slash_command" and not is_user_message and not is_shell_input
+
+
+def _rejected_reply(item_id: str, reason: str) -> dict[str, Any]:
+    """The accepted reply for a message consumed into a turn that failed before any harness
+    ran: it is queued, with its item, and ``rejected`` with the reason, so a sender that
+    needs the prompt to run (the composer's /loop first run) doesn't count it as sent."""
+    return {"queued": True, "item_id": item_id, "rejected": True, "reason": reason}
 
 
 def _event_body_too_large() -> HTTPException:
@@ -2743,6 +2752,8 @@ def register_events_routes(
                     "data.target_conversation_id",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            # The loops end first: viewers are not sent away from ones still running.
+            await _stop_superseded_loops(session_id, conversation_store)
             _publish_session_superseded(session_id, target_conversation_id.strip())
             return {"queued": False}
         if body.type == _EXTERNAL_BTW_SIDECHAT_TYPE:
@@ -3509,7 +3520,7 @@ def register_events_routes(
                     created_by=created_by,
                     host_error_code=refusal_code,
                 )
-                return {"queued": True, "item_id": item_id}
+                return _rejected_reply(item_id, str(exc))
             if runner_client is not None:
                 # The source's runner has never initialized this side chat.
                 _runner_needs_session_init = True
@@ -3698,7 +3709,9 @@ def register_events_routes(
                             created_by=created_by,
                             host_error_code=host_error_code,
                         )
-                        return {"queued": True, "item_id": item_id}
+                        return _rejected_reply(
+                            item_id, _host_launch_failure_message(host_error, host_error_code)
+                        )
                     relaunched_runner_id = launch_attempt.runner_id
                     relaunched_launch_acknowledged = launch_attempt.acknowledged
                     if launch_attempt.error or launch_attempt.error_code:
@@ -3872,7 +3885,7 @@ def register_events_routes(
                     runner_router,
                     created_by=created_by,
                 )
-                return {"queued": True, "item_id": item_id}
+                return _rejected_reply(item_id, offline_error.message)
             # Raise so the Omnigent server doesn't persist an item the
             # harness will never see. Other event paths (interrupt,
             # approval) are best-effort and silently skip when no
@@ -4202,6 +4215,9 @@ def register_events_routes(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
+        if dispatch.rejected is not None:
+            assert dispatch.item_id is not None  # the consumed message
+            return {**response, **_rejected_reply(dispatch.item_id, dispatch.rejected)}
         return response
 
     if register_startup_dispatch is not None:

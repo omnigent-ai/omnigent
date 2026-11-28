@@ -366,6 +366,16 @@ export interface ServerInfo {
   /** True when `POST /v1/sessions/{id}/rewind` exists; absent on older servers (off). */
   session_rewind?: boolean;
   /**
+   * True when the server saves session timers (`POST /v1/sessions/{id}/timers`),
+   * which the composer's `/loop` arms; absent on older servers (off).
+   */
+  session_timers?: boolean;
+  /**
+   * True when a `/loop` timer replaces the caller's running loop in the session and
+   * `DELETE /v1/sessions/{id}/timers?origin=loop` stops it; absent on older servers (off).
+   */
+  session_loops?: boolean;
+  /**
    * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
@@ -820,6 +830,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_rewind: data.session_rewind === true,
+          session_timers: data.session_timers === true,
+          session_loops: data.session_loops === true,
           session_pull_requests: data.session_pull_requests === true,
           session_journal: data.session_journal === true,
           workflows: data.workflows === true,

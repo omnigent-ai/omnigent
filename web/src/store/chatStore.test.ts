@@ -37,6 +37,7 @@ import { toast } from "sonner";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import { useSetConversationMuted } from "@/hooks/useConversations";
 import { clearSessionMuteState, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import * as sessionTimersApi from "@/lib/sessionTimersApi";
 import type {
   AnyBlock,
   ElicitationBlock,
@@ -181,6 +182,19 @@ vi.mock("@/lib/identity", async (importOriginal) => {
     subscribeIdentity: vi.fn(actual.subscribeIdentity),
   };
 });
+
+/** Stub whether the session a viewer was moved on from had a loop of theirs to stop. */
+function stubLoopStop(hadLoop: boolean | Error) {
+  const stop = vi.spyOn(sessionTimersApi, "stopSupersededSessionLoop");
+  if (hadLoop instanceof Error) stop.mockRejectedValue(hadLoop);
+  else stop.mockResolvedValue(hadLoop);
+  const info = vi.spyOn(toast, "info").mockReturnValue("loop-stopped");
+  onTestFinished(() => {
+    stop.mockRestore();
+    info.mockRestore();
+  });
+  return { stop, info };
+}
 
 function userMessage(responseId: string, text: string): ConversationItem {
   return {
@@ -610,6 +624,7 @@ beforeEach(() => {
     blocks: [],
     pendingUserMessages: [],
     settledShellInputs: [],
+    settledCommandIds: [],
     queuedMessages: [],
     activeResponse: null,
     status: "idle",
@@ -9323,6 +9338,57 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().redirectToConversationId).toBeNull();
     });
+
+    it.each(["clear", "rewind"] as const)(
+      "stops the viewer's loop in a session a /%s moved them on from, and says so",
+      async (reason) => {
+        const { stop, info } = stubLoopStop(true);
+        useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+        handleSessionEvent({
+          type: "session_superseded",
+          conversationId: "conv_old",
+          targetConversationId: "conv_new",
+          reason,
+        });
+        await vi.waitFor(() => expect(info).toHaveBeenCalledTimes(1));
+        expect(stop).toHaveBeenCalledExactlyOnceWith("conv_old");
+        expect(info.mock.calls[0]?.[0]).toBe(
+          "Your loop stopped when this chat moved to a new session. Run /loop again to restart it.",
+        );
+      },
+    );
+
+    it.each([
+      ["the viewer had no loop there", false],
+      ["the server can't say, as an older one can't", new Error("Not Found")],
+    ])("says nothing about a loop when %s", async (_, answer) => {
+      const { stop, info } = stubLoopStop(answer);
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      handleSessionEvent({
+        type: "session_superseded",
+        conversationId: "conv_old",
+        targetConversationId: "conv_new",
+        reason: "clear",
+      });
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(1));
+      await tick();
+      expect(info).not.toHaveBeenCalled();
+      // The redirect never waits on it.
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+    });
+
+    it("leaves a loop alone in a session the viewer is not being moved on from", async () => {
+      const { stop } = stubLoopStop(true);
+      useChatStore.setState({ conversationId: "conv_current", redirectToConversationId: null });
+      handleSessionEvent({
+        type: "session_superseded",
+        conversationId: "conv_other",
+        targetConversationId: "conv_new",
+        reason: "clear",
+      });
+      await tick();
+      expect(stop).not.toHaveBeenCalled();
+    });
   });
 
   describe("clearContext", () => {
@@ -9403,6 +9469,46 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       expect(useChatStore.getState().redirectToConversationId).toBeNull();
     });
+
+    it.each([
+      ["once, from the reply, when the live redirect was missed", false, 1],
+      ["once more, to no effect, when the live redirect lands after the reply", true, 2],
+    ])("reports the viewer's stopped loop %s", async (_, lateRedirect, asked) => {
+      const { stop, info } = stubLoopStop(true);
+      // A second ask finds the loop already stopped.
+      stop.mockResolvedValueOnce(true).mockResolvedValue(false);
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerClear({ queued: false, session_id: "conv_new" })();
+
+      await useChatStore.getState().clearContext();
+      if (lateRedirect) {
+        handleSessionEvent({
+          type: "session_superseded",
+          conversationId: "conv_old",
+          targetConversationId: "conv_new",
+          reason: "clear",
+        });
+      }
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(asked));
+      await tick();
+
+      expect(stop).toHaveBeenCalledWith("conv_old");
+      expect(info).toHaveBeenCalledTimes(1);
+    });
+
+    it("says nothing about a loop for a clear the viewer switched away from", async () => {
+      const { stop } = stubLoopStop(true);
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      const acknowledge = answerClear({ queued: false, session_id: "conv_new" });
+
+      const clearing = useChatStore.getState().clearContext();
+      useChatStore.setState({ conversationId: "conv_other" });
+      acknowledge();
+      await clearing;
+      await tick();
+
+      expect(stop).not.toHaveBeenCalled();
+    });
   });
 
   describe("rewindToPrompt", () => {
@@ -9453,6 +9559,26 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         });
       },
     );
+
+    it.each([
+      ["from its reply", null, 1],
+      ["only once when the live redirect already did", "conv_new", 0],
+    ])("reports the viewer's stopped loop %s", async (_, pending, asked) => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      const { stop, info } = stubLoopStop(true);
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: pending });
+      answerRewind(Response.json({ session_id: "conv_new", prompt: "Add parser tests" }));
+
+      await useChatStore.getState().rewindToPrompt("msg_second");
+      await tick();
+
+      expect(stop).toHaveBeenCalledTimes(asked);
+      expect(info).toHaveBeenCalledTimes(asked);
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+    });
 
     it("stays put when the user switched away before the rewind was acknowledged", async () => {
       onTestFinished(() => {
@@ -11693,6 +11819,25 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(promoted.stableKey).toBe("pend_1");
     });
 
+    it("keeps a consumed message's origin, so a /loop tick's bubble can be labelled", () => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_tick",
+        itemType: "message",
+        data: {
+          role: "user",
+          origin: "loop",
+          user_authored: true,
+          content: [{ type: "input_text", text: "check CI" }],
+        },
+      });
+
+      const [tickBlock] = useChatStore.getState().blocks as UserMessageBlock[];
+      expect(tickBlock).toMatchObject({ type: "user_message", origin: "loop" });
+    });
+
     it("promotes using server file_ids, replacing 'pending:' placeholders", () => {
       // When the user attaches an image, the optimistic pending block carries
       // a "pending:<filename>" file_id as a placeholder. Once the server
@@ -12033,7 +12178,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         itemId: "msg_newer",
         itemType: "message",
         clearedPendingId: "pending_new",
-        data: { role: "user", content: [{ type: "input_text", text: "newer" }] },
+        data: {
+          role: "user",
+          origin: "loop",
+          content: [{ type: "input_text", text: "newer" }],
+        },
       });
 
       const state = useChatStore.getState();
@@ -12044,6 +12193,8 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const promoted = state.blocks[0] as UserMessageBlock;
       expect(promoted.ctx.itemId).toBe("msg_newer");
       expect(promoted.content).toEqual([{ type: "input_text", text: "newer" }]);
+      // A /loop run's label survives the promotion.
+      expect(promoted.origin).toBe("loop");
     });
 
     it("drops the matched entry by id even when the consumed text was reformatted", () => {
@@ -12121,6 +12272,58 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.blocks).toHaveLength(1);
       expect((state.blocks[0] as UserMessageBlock).ctx.itemId).toBe("msg_hi");
     });
+
+    it.each([
+      ["names no pending entry", null],
+      ["names an entry this client never held", "pending_tick"],
+    ])("a /loop run that %s leaves the user's own pending message alone", (_, cleared) => {
+      // A tick queued behind a busy turn is consumed before the message the user sent
+      // after it. It was never an optimistic bubble here, so the FIFO head is not its.
+      const mine = {
+        tempId: "pend_mine",
+        content: [
+          { type: "input_image" as const, file_id: "file_1", filename: "shot.png" },
+          { type: "input_text" as const, text: "look at this" },
+        ],
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [mine] });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_tick",
+        itemType: "message",
+        clearedPendingId: cleared,
+        data: { role: "user", origin: "loop", content: [{ type: "input_text", text: "check CI" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([mine]);
+      const [tickBlock] = state.blocks as UserMessageBlock[];
+      expect(tickBlock).toMatchObject({ type: "user_message", origin: "loop" });
+      expect(tickBlock?.content).toEqual([{ type: "input_text", text: "check CI" }]);
+    });
+
+    it("a replayed /loop run leaves the user's own pending message alone", () => {
+      // The run is already committed, e.g. its mirrored item beat this event through the
+      // stream. Acknowledging it again must not drop the message the user has pending.
+      const tickEvent: SessionInputConsumedEvent = {
+        type: "session_input_consumed",
+        itemId: "msg_tick",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", origin: "loop", content: [{ type: "input_text", text: "check CI" }] },
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+      handleSessionEvent(tickEvent);
+      const mine = { tempId: "pend_mine", content: [{ type: "input_text" as const, text: "hi" }] };
+      useChatStore.setState({ pendingUserMessages: [mine] });
+
+      handleSessionEvent(tickEvent);
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([mine]);
+      expect(state.blocks).toHaveLength(1);
+    });
   });
 
   describe("slash_command (claude-native skill / surfaced command)", () => {
@@ -12169,6 +12372,87 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent(event);
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    const command = (clearedPendingId: string | null): StreamEvent => ({
+      type: "slash_command",
+      kind: "skill",
+      name: "review",
+      arguments: "the parser",
+      output: null,
+      agentName: "claude-native-ui",
+      clearedPendingId,
+      itemId: "item_slash_named",
+      responseId: "resp_slash_named",
+    });
+    const mine: PendingUserMessage = {
+      tempId: "pend_mine",
+      pendingId: "pending_mine",
+      posted: true,
+      content: [{ type: "input_text", text: "also check the logs" }],
+    };
+    const queuedRun: PendingUserMessage = {
+      tempId: "pending_loop",
+      replayed: true,
+      content: [{ type: "input_text", text: "/review the parser" }],
+    };
+
+    it.each<[string, PendingUserMessage[], string | null]>([
+      // The run has no bubble here, so the message the user sent meanwhile is not its.
+      ["a /loop run recorded as a command", [mine], "pending_loop"],
+      ["a /loop run this tab replayed as pending", [mine, queuedRun], "pending_loop"],
+      ["a command typed in the terminal", [mine], null],
+    ])("%s leaves the user's own pending message alone", (_, pending, cleared) => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(command(cleared));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([mine]);
+    });
+
+    it("settles the bubble the receipt names, not the oldest one", () => {
+      const typedCommand: PendingUserMessage = {
+        tempId: "pend_command",
+        pendingId: "pending_command",
+        posted: true,
+        content: [{ type: "input_text", text: "/review the parser" }],
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [mine, typedCommand] });
+
+      handleSessionEvent(command("pending_command"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([mine]);
+    });
+
+    it("settles a command whose receipt beat its POST acknowledgement", async () => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+        pendingUserMessages: [mine],
+      });
+      let resolvePost: (() => void) | null = null;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/v1/sessions/conv_existing/events") &&
+          init?.method === "POST"
+        ) {
+          return new Promise<Response>((resolve) => {
+            resolvePost = () =>
+              resolve(mockResponse({ queued: true, pending_id: "pending_command" }));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const sending = useChatStore.getState().send("/review the parser", "agent_xyz");
+      await vi.waitFor(() => expect(resolvePost).not.toBeNull());
+
+      // The bubble has no server id yet, so the receipt can't name it: nothing moves.
+      handleSessionEvent(command("pending_command"));
+      expect(useChatStore.getState().pendingUserMessages).toHaveLength(2);
+
+      resolvePost!();
+      await sending;
+      expect(useChatStore.getState().pendingUserMessages).toEqual([mine]);
     });
   });
 
@@ -20311,6 +20595,56 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await teardown(controller, loop);
       setSessionHost(id, null);
     });
+
+    it.each<[string, PendingUserMessage[]]>([
+      ["that had no bubble here", []],
+      [
+        "this tab replayed as pending",
+        [
+          {
+            tempId: "pending_loop",
+            replayed: true,
+            content: [{ type: "input_text", text: "check CI" }],
+          },
+        ],
+      ],
+    ])(
+      "a /loop run %s, committed in the gap, acks no message the user typed",
+      async (_, queued) => {
+        workspaceMode();
+        const id = "conv_rekey_loop";
+        const before = userMessage("loop_pre", "before the gap");
+        seedSession(id, [before]);
+        const extras = new Map<string, Record<string, unknown>>([[id, { host_id: null }]]);
+        routeKeyedStreamOpens({ snapshotExtras: extras });
+        const controller = new AbortController();
+        const mine = postedBubble("pend_mine", "still on its way");
+        useChatStore.setState({
+          conversationId: id,
+          abortController: controller,
+          blocks: itemsToBlocks([before]),
+          pendingUserMessages: [...queued, mine],
+        });
+
+        const loop = startStreamPump(id, controller, setState, getState);
+        await drainAsync();
+
+        // The run was delivered while this stream sat on the wrong replica.
+        const run = { ...userMessage("loop_gap", "check CI"), origin: "loop" };
+        seedSessionItems(id, [before, run]);
+        extras.set(id, { host_id: "host_b" });
+        setSessionHost(id, "host_b");
+        await drainAsync(50);
+
+        // The run settles its own replayed entry, if this tab had one, and nothing else.
+        const state = useChatStore.getState();
+        expect(state.pendingUserMessages).toEqual([mine]);
+        expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, run.id]);
+
+        await teardown(controller, loop);
+        setSessionHost(id, null);
+      },
+    );
 
     it("forces gap reconciliation when the host is learned while the first open is still pending", async () => {
       workspaceMode();

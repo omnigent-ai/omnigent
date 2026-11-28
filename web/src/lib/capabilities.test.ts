@@ -416,21 +416,23 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   });
 });
 
-describe.each(["session_claude_sdk_clear", "session_rewind"] as const)(
-  "resolveServerInfo %s",
-  (capability) => {
-    it.each([
-      [true, true],
-      [false, false],
-      [undefined, false],
-      ["true", false],
-      [1, false],
-    ])("parses %s strictly as %s", async (advertised, expected) => {
-      const parsed = await probe({ [capability]: advertised });
-      expect(parsed[capability]).toBe(expected);
-    });
-  },
-);
+describe.each([
+  "session_claude_sdk_clear",
+  "session_rewind",
+  "session_timers",
+  "session_loops",
+] as const)("resolveServerInfo %s", (capability) => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+    [1, false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ [capability]: advertised });
+    expect(parsed[capability]).toBe(expected);
+  });
+});
 
 describe("resolveServerInfo session_event_types", () => {
   it.each([

@@ -31,6 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
+    ErrorData,
     FunctionCallData,
     MessageData,
     NewConversationItem,
@@ -458,6 +459,38 @@ async def test_client_meta_and_external_messages_do_not_infer_user_authorship(
     assert message["content"] == item_data["content"]
     assert message.get("is_meta", False) is (event_type == "message")
     assert "user_authored" not in message
+    assert "origin" not in message
+
+
+async def test_a_user_message_keeps_the_origin_its_client_set(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A /loop run arrives tagged ``origin: "loop"``; the items API echoes the tag."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "origin": "loop",
+                    "content": [{"type": "input_text", "text": "check CI"}],
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    [message] = [item for item in items if item["type"] == "message"]
+    assert message["content"] == [{"type": "input_text", "text": "check CI"}]
+    assert (message["origin"], message["user_authored"]) == ("loop", True)
+    assert not message.get("is_meta")
 
 
 async def test_sidebar_rename_wins_in_flight_background_title(
@@ -778,6 +811,71 @@ async def test_native_transcript_preserves_browser_title_preference(
         finally:
             for pending in pending_inputs.snapshot_for(session_id):
                 pending_inputs.resolve(session_id, pending["pending_id"])
+
+
+async def test_a_message_a_native_terminal_cannot_take_is_reported_rejected(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native terminal that definitively can't start consumes the message into a failed
+    turn, and the accepted reply says so: a sender that needs the prompt to run, like the
+    composer's /loop first run, would otherwise count it as sent."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    failure = ErrorData(
+        source="execution",
+        code="native_terminal_start_failed",
+        message="Native Codex requires the 'codex' CLI on PATH.",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=failure)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=False)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+        )
+        posted = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "origin": "loop",
+                    "content": [{"type": "input_text", "text": "check CI"}],
+                },
+            },
+        )
+    assert posted.status_code == 202, posted.text
+    body = posted.json()
+    assert body == {
+        "queued": True,
+        "item_id": body["item_id"],
+        "rejected": True,
+        "reason": failure.message,
+    }
+    # The message is consumed beside the error it met, not held for a later delivery.
+    assert not pending_inputs.has_pending(session["id"])
+    items = (await client.get(f"/v1/sessions/{session['id']}")).json()["items"]
+    assert [(item["id"] == body["item_id"], item["type"]) for item in items[-2:]] == [
+        (True, "message"),
+        (False, "error"),
+    ]
+    assert items[-1]["data"]["code"] == failure.code
 
 
 @pytest.mark.parametrize(
@@ -14027,11 +14125,13 @@ async def test_native_message_persisted_when_runner_offline(
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
         },
     )
-    # Queued (not RUNNER_UNAVAILABLE) and the persisted user item is returned.
+    # Queued (not RUNNER_UNAVAILABLE) and the persisted user item is returned, marked
+    # rejected: the turn failed before any harness ran, so nothing will deliver it.
     assert resp.status_code == 202, resp.text
     body = resp.json()
     assert body["queued"] is True
     assert body.get("item_id"), f"expected a persisted item_id, got {body}"
+    assert body["rejected"] is True
 
     items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
     # The user's message is durable history — the whole point of the fix.
@@ -14045,6 +14145,7 @@ async def test_native_message_persisted_when_runner_offline(
     error_items = [i for i in items if i["type"] == "error"]
     assert len(error_items) == 1, f"expected one error item, got {items}"
     assert error_items[0]["code"] == "runner_failed_to_start"
+    assert body["reason"] == error_items[0]["message"]
 
     # The turn settles failed (not 5xx); the durable error item above is
     # what the web re-renders on reload via itemsToBlocks. (The separate

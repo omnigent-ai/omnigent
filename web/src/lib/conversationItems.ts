@@ -35,6 +35,8 @@ export interface MessageItem extends BaseItem {
   /** Explicit user action, possibly server-expanded skill instructions.
    * Independent of is_meta; client-settable by convention, not a trust signal. */
   user_authored?: boolean;
+  /** What sent a user message no human typed, e.g. `"loop"` for a /loop run. Display-only. */
+  origin?: string;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */

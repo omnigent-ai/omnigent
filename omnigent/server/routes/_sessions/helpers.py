@@ -3476,9 +3476,9 @@ def _publish_external_conversation_item(
 
     :param session_id: Session/conversation identifier.
     :param item: Persisted conversation item.
-    :param cleared_pending_id: For a native user message, the id of the
-        optimistic pending-input entry the caller drained for it (so
-        clients drop that bubble by id), or ``None``. The drain happens
+    :param cleared_pending_id: For a native user message or slash command,
+        the id of the optimistic pending-input entry the caller drained for
+        it (so clients drop that bubble by id), or ``None``. The drain happens
         at the persist site — see :func:`_persist_external_conversation_item`
         — because it also folds the entry's file blocks into the durable
         item before append.
@@ -3503,6 +3503,10 @@ def _publish_external_conversation_item(
     payload = event.model_dump()
     if message_id is not None:
         payload["message_id"] = message_id
+    if item.type == _SLASH_COMMAND_TYPE:
+        # A command has no consumed receipt, so its item names the queued entry it
+        # settles: ``None`` when no client queued it (typed in the terminal).
+        payload["cleared_pending_id"] = cleared_pending_id
     session_stream.publish(session_id, payload)
 
 
@@ -6103,6 +6107,53 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
         if isinstance(data, dict):
             data.pop("response_id", None)
     session_stream.publish(session_id, payload)
+
+
+async def _stop_superseded_loops(session_id: str, conversation_store: ConversationStore) -> None:
+    """
+    End every user's ``/loop`` in a session another one is superseding.
+
+    Its viewers follow to the successor, where a loop left ticking here would run
+    unseen and out of reach of ``/loop stop``. The session is marked, and a marked
+    session neither arms a loop nor fires one, so a loop being armed at this moment
+    ends too. Call it before announcing the supersession.
+
+    :param session_id: The superseded session, e.g. ``"conv_old"``.
+    :param conversation_store: Store holding the session's labels.
+    :raises Exception: Whatever the store raised. The mark was not saved, so the
+        caller must not move the session's viewers away.
+    """
+    from omnigent.stores.conversation_store import LOOP_TIMER_SUPERSEDED_LABEL_KEY
+
+    await asyncio.to_thread(
+        conversation_store.set_labels, session_id, {LOOP_TIMER_SUPERSEDED_LABEL_KEY: "1"}
+    )
+
+
+async def _resume_unsuperseded_loops(
+    session_id: str, conversation_store: ConversationStore
+) -> None:
+    """
+    Undo :func:`_stop_superseded_loops` for a supersession that then failed.
+
+    Best-effort: a mark it can't remove leaves the session refusing loops, which
+    is the safe side of a session its viewers never left.
+
+    :param session_id: The session that was not superseded, e.g. ``"conv_old"``.
+    :param conversation_store: Store holding the session's labels.
+    """
+    from omnigent.stores.conversation_store import LOOP_TIMER_SUPERSEDED_LABEL_KEY
+
+    try:
+        await asyncio.to_thread(
+            conversation_store.delete_label, session_id, LOOP_TIMER_SUPERSEDED_LABEL_KEY
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Session %s was not superseded but stays marked, so it takes no loop",
+            session_id,
+            exc_info=True,
+        )
 
 
 def _publish_session_superseded(
@@ -9219,11 +9270,16 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param rejected: Why the session could not take the message, when its
+        native terminal definitively cannot start: the message is consumed
+        into a failed turn and nothing will deliver it. Told to the sender,
+        which otherwise reads the reply as a send that went through.
     """
 
     item_id: str | None
     pending_id: str | None
     accepted: bool = True
+    rejected: str | None = None
 
 
 def _extract_persistent_item_from_sse(
@@ -11743,6 +11799,7 @@ def _reject_server_reserved_label_seed(
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
+        LOOP_TIMER_LABEL_PREFIX,
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         SCHEDULED_TASK_LAUNCH_LABEL_KEY,
@@ -11756,6 +11813,8 @@ def _reject_server_reserved_label_seed(
 
     if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
+    if any(key.startswith(LOOP_TIMER_LABEL_PREFIX) for key in labels):
+        raise OmnigentError("Loop labels are server-internal", code=ErrorCode.INVALID_INPUT)
     if any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels):
         raise OmnigentError(
             "Scheduled run labels are server-internal", code=ErrorCode.INVALID_INPUT
@@ -13592,6 +13651,7 @@ __all__ = [
     "_resolve_skill_meta_text_via_runner",
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
+    "_resume_unsuperseded_loops",
     "_routing_decision_item_from_sse",
     "_same_provider_family",
     "_same_provider_family_impl",
@@ -13610,6 +13670,7 @@ __all__ = [
     "_start_managed_launch_task",
     "_stop_session_host_runner",
     "_stop_session_via_runner",
+    "_stop_superseded_loops",
     "_stored_file_to_resource",
     "_stream_live_events",
     "_structured_ask_user_question",

@@ -213,6 +213,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
     _resolve_harness,
+    _resume_unsuperseded_loops,
     _runner_supports_side_chat_settings,
     _RunnerForwardResult,
     _same_provider_family,
@@ -220,6 +221,7 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
     _set_read_state,
     _start_managed_launch_task,
+    _stop_superseded_loops,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
@@ -6228,6 +6230,8 @@ def register_core_routes(
                 # Set once the fork is sent to the runner, which may set it up
                 # (or still be doing so) even when the bind then fails.
                 runner_dispatched = False
+                # Set once the source may carry the superseded mark.
+                source_marked = False
                 try:
                     fork = await _fork_session(
                         request,
@@ -6306,6 +6310,11 @@ def register_core_routes(
                                 await asyncio.to_thread(
                                     conversation_store.clear_runner_id, fork.id
                                 )
+                    # The source's loops end before its viewers leave. Marked while the
+                    # source is still whole, so a mark that can't be saved fails the move
+                    # with nothing to restore.
+                    source_marked = True
+                    await _stop_superseded_loops(source.id, conversation_store)
                     if runner_bound and host_bound:
                         # As native /clear does: the fork now holds the runner, so
                         # stopping or archiving the source must not stop it. The
@@ -6322,6 +6331,9 @@ def register_core_routes(
                             if exc.code != ErrorCode.NOT_FOUND:
                                 raise
                 except Exception:
+                    # The source was not superseded after all, so it runs loops again.
+                    if source_marked:
+                        await _resume_unsuperseded_loops(source.id, conversation_store)
                     # Leave no fork for a retry to duplicate, nor its runner session.
                     if runner_dispatched:
                         await _release_unreturned_runner_session(

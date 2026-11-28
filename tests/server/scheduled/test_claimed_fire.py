@@ -23,7 +23,7 @@ import httpx
 import pytest
 
 from omnigent.db.account_authority import account_checks_scope
-from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.entities import ErrorData, ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -53,6 +53,10 @@ from omnigent.server.scheduled.schedule import (
 from omnigent.server.session_journal import open_store as open_journal_store
 from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.server.workflows import open_store as open_workflow_store
+from omnigent.stores.conversation_store import (
+    LOOP_TIMER_SUPERSEDED_LABEL_KEY,
+    loop_timer_label_key,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
@@ -318,7 +322,11 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
             "_ensure_native_terminal_ready",
             AsyncMock(
                 return_value=sessions._NativeTerminalEnsureOutcome(
-                    error=RuntimeError("terminal failed")
+                    error=ErrorData(
+                        source="execution",
+                        code="native_terminal_start_failed",
+                        message="terminal failed",
+                    )
                 )
             ),
         )
@@ -2248,18 +2256,23 @@ def _timer_deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDe
 
 
 def _set_timer(
-    store: SqlAlchemyScheduledTaskStore, *, repeat: bool, host_id: str | None = _HOST_ID
+    store: SqlAlchemyScheduledTaskStore,
+    *,
+    repeat: bool,
+    host_id: str | None = _HOST_ID,
+    loop_prompt: str | None = None,
 ) -> ScheduledTask:
     """Save a 30-second timer due now for the test session, as its route does.
 
     :param host_id: The session's host when the timer was set, or ``None`` if it had none.
+    :param loop_prompt: Save a ``/loop`` timer repeating this prompt instead of an agent's.
     """
     now = int(time.time())
     task_id = uuid.uuid4().hex
     store.create(
         task_id,
-        "Timer",
-        f"[System: timer {task_id} fired]",
+        "Timer" if loop_prompt is None else f"Loop: {loop_prompt}",
+        f"[System: timer {task_id} fired]" if loop_prompt is None else loop_prompt,
         timer_rule(30, repeat=repeat),
         None,
         _AGENT_ID,
@@ -2276,9 +2289,11 @@ def _set_timer(
     return task
 
 
-def _claim_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> _Claimed:
+def _claim_timer(
+    store: SqlAlchemyScheduledTaskStore, *, repeat: bool, loop_prompt: str | None = None
+) -> _Claimed:
     """Save a 30-second timer due now for the test session, then claim it as a poll would."""
-    task = _set_timer(store, repeat=repeat)
+    task = _set_timer(store, repeat=repeat, loop_prompt=loop_prompt)
     now = task.next_run_at
     assert now is not None
     clock = FakeClock(now)
@@ -2493,6 +2508,59 @@ async def test_a_timer_stops_without_waking_a_session_it_may_no_longer_wake(
     # The timer is gone, so no later tick tries the session again.
     assert store.get(claimed.task.id) is None
     assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []
+
+
+@pytest.mark.parametrize("names", ["another loop", "no loop", "this loop, but superseded"])
+async def test_a_loop_the_session_no_longer_names_retires_instead_of_ticking(
+    store, caplog, names
+) -> None:
+    """The session's labels, not the timer rows, say which loop runs for its user.
+
+    A replace or stop that failed after moving the label, or a server that died between
+    the two, leaves a timer the label no longer names; nothing else can reach it. Nor
+    does any loop run in a session another has superseded, even one armed as it was.
+    """
+    caplog.set_level(logging.INFO)
+    claimed = _claim_timer(store, repeat=True, loop_prompt="check CI")
+    labels = {
+        "another loop": {loop_timer_label_key(None): "st_other"},
+        "no loop": {},
+        "this loop, but superseded": {
+            loop_timer_label_key(None): claimed.task.id,
+            LOOP_TIMER_SUPERSEDED_LABEL_KEY: "1",
+        },
+    }[names]
+    dispatch = AsyncMock()
+    await ClaimedRunExecutor(
+        _timer_deps(
+            store, conversation_store=_ExistingConversationStore(_timer_session(labels=labels))
+        ),
+        launch_dispatch=dispatch,
+    ).fire(claimed.task, claimed.lease)
+    dispatch.assert_not_awaited()
+    assert _startup_outcomes(caplog) == [("skipped", "loop_superseded")]
+    assert store.get(claimed.task.id) is None
+    assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []
+
+
+async def test_the_loop_the_session_names_ticks_and_an_agents_timer_needs_no_label(
+    store, caplog
+) -> None:
+    caplog.set_level(logging.INFO)
+    loop = _claim_timer(store, repeat=True, loop_prompt="check CI")
+    timer = _claim_timer(store, repeat=True)
+    sessions = _ExistingConversationStore(
+        _timer_session(labels={loop_timer_label_key(None): loop.task.id})
+    )
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _timer_deps(store, conversation_store=sessions), launch_dispatch=dispatch
+    )
+    await executor.fire(loop.task, loop.lease)
+    await executor.fire(timer.task, timer.lease)
+    assert [call.args[1].id for call in dispatch.await_args_list] == [loop.task.id, timer.task.id]
+    assert _startup_outcomes(caplog) == [("succeeded", None), ("succeeded", None)]
+    assert store.get(loop.task.id).state == "active"
 
 
 @pytest.mark.parametrize("delivery", ["raises", "declined"])

@@ -252,6 +252,46 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   attachment that could not be restored (a warning asks the user to attach it
   again, including missing files and failed server lookups; failed downloads
   name the affected files).
+- `slash-loop`: `/loop <interval> <prompt>` repeats a prompt on an interval by
+  saving a repeating session timer on the server (`POST /v1/sessions/{id}/timers`
+  with `origin: "loop"`, named `Loop: <prompt>`), so it survives runner and server
+  restarts. The prompt is sent once right away and again on every tick, each
+  time as a user message tagged `origin: "loop"`, which the transcript shows as
+  a user bubble with a "Loop" label beside it. The first run and every tick
+  start or join a turn like a typed message, steering a running one, so a task
+  that outlasts its interval accumulates ticks. One loop per user per session,
+  kept by the server: a new `/loop` replaces the caller's running loop in that
+  session however many tabs arm one, and `/loop stop` (no arguments) stops it
+  (`DELETE /v1/sessions/{id}/timers?origin=loop`). A loop ticks only while the
+  session still names it as the caller's loop, so one a failed replace or stop
+  left behind retires itself at its next firing. A loop stays with its session:
+  when `/clear` or `/rewind` continues in a new session the old one's loops stop
+  and it takes no new one ("This chat continued in a new session, so a loop
+  can't run here; run /loop there"), and a fork starts with none. A tab moved on
+  from a session where its user had a loop shows a toast: "Your loop stopped when
+  this chat moved to a new session. Run /loop again to restart it." (also when
+  the scheduler had already retired the loop there). The agent's own
+  `sys_timer_set` timers are never touched, and in a shared session each
+  collaborator's loop is their own. Intervals are a leading `5m`, `2h` or `1d`
+  token, from 2 minutes (the server's saved-timer floor) to 7 days. A prompt
+  starting with `/` or `$` is sent as a message like any other, so the hint
+  warns it may not run as a command. Offered in Claude Code native, claude-sdk,
+  Codex native and codex sessions, top-level only (a sub-agent's or side chat's
+  timers aren't saved), when `/v1/info` reports `session_loops`; arming also
+  needs `session_timers`, and without it the hint says loops can't be armed while
+  `/loop stop` still works. Otherwise a typed `/loop` is sent as text, so Claude
+  Code's own `/loop` runs in a native session. A prompt that a native harness
+  records as a command (`/loop 5m /some-skill`) comes back as a command item,
+  which carries no "Loop" label; it names the queued entry it settles, so it
+  never clears a message the user has pending. Selecting **/loop** in Commands fills
+  `/loop ` to complete. States: "Loop armed: every 5m, next run at …", "Loop
+  stopped.", "No loop is running in this session.", usage and interval errors
+  under the composer with the text kept, a server refusal with the text
+  restored (to the session's saved draft if the user has switched away), and a
+  refused first run ("… The loop was not armed."), which cancels the timer just
+  saved. A refusal is an error reply, a policy denial, or a session whose harness
+  cannot start (a native terminal or runner that fails to launch, or a host launch
+  the server refuses), which the server reports on the accepted reply as `rejected`.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -516,6 +556,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   page in the same project. Selecting **/new** in Commands also opens it.
 - In a claude-sdk session, type `/cl` and click **/clear**, or type the whole
   `/clear` and press Enter; either opens a new, empty chat on the same machine.
+- In a Claude Code native, claude-sdk, Codex native or codex session on a
+  server with saved timers (`OMNIGENT_FEATURES=automations_v2,session_timers`),
+  type `/lo` and click **/loop**, complete `/loop 2m Say tick`, and press
+  Enter: "Loop armed: every 2m" shows under the composer and `Say tick` is sent
+  as a user bubble with a "Loop" label beside it; two minutes later the same
+  labelled bubble appears again and the agent replies to it. Type `/loop stop`
+  and press Enter to end it.
 - In a claude-sdk or Claude Code native session with a few prompts sent,
   type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
   pick a prompt (search, or **Load older prompts** in a long session). The new

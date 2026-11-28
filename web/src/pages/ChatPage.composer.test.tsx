@@ -84,6 +84,7 @@ import {
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { ApiError } from "@/lib/sessionsApi";
 import * as sessionsApi from "@/lib/sessionsApi";
+import * as sessionTimersApi from "@/lib/sessionTimersApi";
 import * as filesApi from "@/lib/filesApi";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
@@ -1689,18 +1690,21 @@ describe("Composer slash-command menu", () => {
   function renderSessionComposer(
     harness: "claude-native" | "codex-native" | "claude-sdk",
     advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
+    strict = false,
   ) {
     const { sessionHarness } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness }));
     useChatStore.setState({ sessionHarness: harness });
     const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
-    render(
+    const composer = (
       <CapabilitiesProvider
         info={advertised === "loading" ? "loading" : { ...FALLBACK_SERVER_INFO, ...advertised }}
       >
         <Composer {...props} />
-      </CapabilitiesProvider>,
+      </CapabilitiesProvider>
     );
+    // StrictMode replays effects the way the development app does.
+    render(strict ? <StrictMode>{composer}</StrictMode> : composer);
     return props;
   }
 
@@ -1751,6 +1755,257 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(clearContext).not.toHaveBeenCalled();
     expect(onSend).toHaveBeenCalledExactlyOnceWith("/clear", undefined);
+  });
+
+  const savedLoop = {
+    timerId: "st_loop",
+    fireAt: "2026-11-25T10:05:00+00:00",
+    intervalSeconds: 300,
+    replacedTimerId: null,
+  };
+  function renderLoopComposer(
+    harness: "claude-native" | "claude-sdk" | "codex-native",
+    advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
+    running: string | null = null,
+    strict = false,
+  ) {
+    const props = renderSessionComposer(harness, advertised, strict);
+    const stopLoop = vi.spyOn(sessionTimersApi, "stopSessionLoop").mockResolvedValue(running);
+    const cancelTimer = vi.spyOn(sessionTimersApi, "cancelSessionTimer").mockResolvedValue(true);
+    const setTimer = vi.spyOn(sessionTimersApi, "setSessionTimer").mockResolvedValue(savedLoop);
+    const sendPrompt = vi.spyOn(sessionTimersApi, "sendLoopPrompt").mockResolvedValue(undefined);
+    return { stopLoop, cancelTimer, setTimer, sendPrompt, onSend: props.onSend };
+  }
+  const savesTimers = { session_timers: true, session_loops: true };
+  const armed = { seconds: 300, repeat: true, note: "check CI", origin: "loop" };
+  function submitLoop(text: string) {
+    fireEvent.change(textarea(), { target: { value: text } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+  }
+  /** A promise the test settles by hand, to order overlapping commands. */
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  // Which harness and server combinations offer /loop is unit-tested on
+  // composerOffersLoop (ChatPage.test.ts); these cover the composer's entry points,
+  // which are the same on every harness, so one native wrapper stands for all.
+  it("/loop from the menu fills the command so the user types the interval and prompt", () => {
+    const { setTimer, onSend } = renderLoopComposer("claude-native", savesTimers);
+    fireEvent.change(textarea(), { target: { value: "/lo" } });
+    fireEvent.click(screen.getByTestId("slash-menu-item-loop"));
+    expect(textarea()).toHaveValue("/loop ");
+    expect(setTimer).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("/loop <interval> <prompt> arms a loop-tagged timer and runs the prompt now", async () => {
+    const { stopLoop, cancelTimer, setTimer, sendPrompt, onSend } = renderLoopComposer(
+      "claude-native",
+      savesTimers,
+    );
+    submitLoop("/loop 5m check CI");
+    await waitFor(() => expect(setTimer).toHaveBeenCalledExactlyOnceWith("conv_test", armed));
+    // The server replaces a running loop itself; nothing is listed or cancelled first.
+    expect(stopLoop).not.toHaveBeenCalled();
+    expect(cancelTimer).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("");
+    expect(await screen.findByText(/^Loop armed: every 5m/)).toBeVisible();
+    // The command itself never reaches the agent; the prompt runs once now as the
+    // same loop-tagged message every tick sends, not as composer input.
+    expect(sendPrompt).toHaveBeenCalledExactlyOnceWith("conv_test", "check CI");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("a new /loop says when the server replaced the session's running loop", async () => {
+    const { cancelTimer, setTimer } = renderLoopComposer("claude-sdk", savesTimers);
+    setTimer.mockResolvedValueOnce({ ...savedLoop, replacedTimerId: "st_old" });
+    submitLoop("/loop 10m check CI");
+    expect(await screen.findByText(/replacing the previous loop/)).toBeVisible();
+    expect(cancelTimer).not.toHaveBeenCalled();
+  });
+
+  it("/loop warns when the prompt reads as a command, which a message may not run", async () => {
+    const { setTimer } = renderLoopComposer("claude-sdk", savesTimers);
+    submitLoop("/loop 5m /babysit-prs");
+    await waitFor(() => expect(setTimer).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/so it may not run as one/)).toBeVisible();
+  });
+
+  it.each([
+    ["one loop", "st_old", "Loop stopped."],
+    ["no loop", null, "No loop is running in this session."],
+  ] as const)(
+    "/loop stop asks the server to stop the session's loop (%s)",
+    async (_, running, hint) => {
+      const { stopLoop, setTimer, onSend } = renderLoopComposer("claude-sdk", savesTimers, running);
+      submitLoop("/loop stop");
+      expect(await screen.findByText(hint)).toBeVisible();
+      expect(stopLoop).toHaveBeenCalledExactlyOnceWith("conv_test");
+      expect(setTimer).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it("overlapping /loop commands run one at a time, so a stop waits for the arm", async () => {
+    const { stopLoop, setTimer, sendPrompt } = renderLoopComposer(
+      "claude-sdk",
+      savesTimers,
+      "st_loop",
+    );
+    const arming = deferred<typeof savedLoop>();
+    setTimer.mockImplementationOnce(() => arming.promise);
+    submitLoop("/loop 5m check CI");
+    submitLoop("/loop stop");
+    // The stop has not started while the arm is still saving.
+    await Promise.resolve();
+    expect(setTimer).toHaveBeenCalledOnce();
+    expect(stopLoop).not.toHaveBeenCalled();
+    arming.resolve(savedLoop);
+    await waitFor(() =>
+      expect(sendPrompt).toHaveBeenCalledExactlyOnceWith("conv_test", "check CI"),
+    );
+    // Only then does the stop run, and it finds the loop just armed.
+    await waitFor(() => expect(stopLoop).toHaveBeenCalledExactlyOnceWith("conv_test"));
+    expect(await screen.findByText("Loop stopped.")).toBeVisible();
+  });
+
+  it("shows a /loop command's problem under the composer and arms nothing", async () => {
+    // What is wrong with a command is loopCommand.test.ts's; this is where it shows.
+    const typed = "/loop 90s check CI";
+    const { setTimer, onSend } = renderLoopComposer("claude-sdk", savesTimers);
+    submitLoop(typed);
+    expect(await screen.findByText(/The shortest loop is 2m; 90s is too short\./)).toBeVisible();
+    expect(setTimer).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    // The typed command stays for the user to fix.
+    expect(textarea()).toHaveValue(typed);
+  });
+
+  it.each([false, true])(
+    "/loop shows the error and gives the command back when the timer is refused (StrictMode: %s)",
+    async (strict) => {
+      const { setTimer, sendPrompt, onSend } = renderLoopComposer(
+        "claude-sdk",
+        savesTimers,
+        null,
+        strict,
+      );
+      setTimer.mockRejectedValueOnce(
+        new Error("This session is archived, so it can't take timers"),
+      );
+      submitLoop("/loop 5m check CI");
+      expect(await screen.findByText(/archived/)).toBeVisible();
+      expect(sendPrompt).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+      // Back in the visible composer, not parked in the session's saved draft.
+      expect(textarea()).toHaveValue("/loop 5m check CI");
+    },
+  );
+
+  it("/loop cancels the timer it just saved when the first run is refused", async () => {
+    const { cancelTimer, sendPrompt } = renderLoopComposer("claude-sdk", savesTimers);
+    sendPrompt.mockRejectedValueOnce(new Error("A session policy refused the prompt"));
+    submitLoop("/loop 5m check CI");
+    expect(
+      await screen.findByText("A session policy refused the prompt. The loop was not armed."),
+    ).toBeVisible();
+    // Every tick would meet the same refusal, so nothing is left running.
+    expect(cancelTimer).toHaveBeenCalledExactlyOnceWith("conv_test", "st_loop");
+    expect(textarea()).toHaveValue("/loop 5m check CI");
+  });
+
+  it("/loop cannot arm, but still stops, once the server has stopped saving timers", async () => {
+    const { stopLoop, setTimer } = renderLoopComposer(
+      "claude-sdk",
+      { session_loops: true },
+      "st_old",
+    );
+    submitLoop("/loop 5m check CI");
+    expect(await screen.findByText(/Saving timers is off on this server/)).toBeVisible();
+    expect(setTimer).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("/loop 5m check CI");
+    submitLoop("/loop stop");
+    expect(await screen.findByText("Loop stopped.")).toBeVisible();
+    expect(stopLoop).toHaveBeenCalledExactlyOnceWith("conv_test");
+  });
+
+  it("/loop says when the refused first run's cleanup failed, or what it had replaced", async () => {
+    const { cancelTimer, setTimer, sendPrompt } = renderLoopComposer("claude-sdk", savesTimers);
+    sendPrompt.mockRejectedValue(new Error("The host for this session is offline"));
+    cancelTimer.mockRejectedValueOnce(new Error("Session not found"));
+    submitLoop("/loop 5m check CI");
+    expect(
+      await screen.findByText(/offline\. The loop could not be cancelled and may still be running/),
+    ).toBeVisible();
+    setTimer.mockResolvedValueOnce({ ...savedLoop, replacedTimerId: "st_old" });
+    submitLoop("/loop 5m check CI");
+    expect(
+      await screen.findByText(/The loop was not armed\. The loop it replaced is already stopped\./),
+    ).toBeVisible();
+  });
+
+  it("/loop gives a failed command back to the session's draft after the composer unmounted", async () => {
+    const { setTimer } = renderLoopComposer("claude-sdk", savesTimers);
+    const pending = deferred<never>();
+    setTimer.mockImplementationOnce(() => pending.promise);
+    submitLoop("/loop 5m check CI");
+    await waitFor(() => expect(setTimer).toHaveBeenCalledOnce());
+    // Switching to the terminal view unmounts the chat surface, composer included.
+    cleanup();
+    pending.reject(new Error("This session is archived, so it can't take timers"));
+    await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe("/loop 5m check CI"));
+  });
+
+  it("/loop stop shows the error and gives the command back when the stop fails", async () => {
+    const { stopLoop } = renderLoopComposer("claude-sdk", savesTimers);
+    stopLoop.mockRejectedValueOnce(new Error("Session not found"));
+    submitLoop("/loop stop");
+    expect(await screen.findByText("Session not found")).toBeVisible();
+    expect(textarea()).toHaveValue("/loop stop");
+  });
+
+  it("/loop keeps newer input when a failure lands after the user typed again", async () => {
+    const { setTimer } = renderLoopComposer("claude-sdk", savesTimers);
+    const pending = deferred<never>();
+    setTimer.mockImplementationOnce(() => pending.promise);
+    submitLoop("/loop 5m check CI");
+    await waitFor(() => expect(setTimer).toHaveBeenCalledOnce());
+    fireEvent.change(textarea(), { target: { value: "something else" } });
+    pending.reject(new Error("This session is archived, so it can't take timers"));
+    expect(await screen.findByText(/archived/)).toBeVisible();
+    expect(textarea()).toHaveValue("something else");
+  });
+
+  it("/loop gives a failed command back to its own session's draft after switching away", async () => {
+    const { setTimer } = renderLoopComposer("claude-sdk", savesTimers);
+    const pending = deferred<never>();
+    setTimer.mockImplementationOnce(() => pending.promise);
+    submitLoop("/loop 5m check CI");
+    await waitFor(() => expect(setTimer).toHaveBeenCalledOnce());
+    // Leaving saves the emptied composer as the session's draft.
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    pending.reject(new Error("This session is archived, so it can't take timers"));
+    await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe("/loop 5m check CI"));
+    // The hint and the restored text belong to the source session, not this one.
+    expect(screen.queryByText(/archived/)).toBeNull();
+    expect(textarea()).toHaveValue("");
+    act(() => useChatStore.setState({ conversationId: "conv_test" }));
+  });
+
+  it("sends a typed /loop as text on an older server that saves timers but not loops", () => {
+    const { setTimer, onSend } = renderLoopComposer("claude-native", { session_timers: true });
+    expect(screen.queryByTestId("slash-menu-item-loop")).toBeNull();
+    submitLoop("/loop 5m check CI");
+    expect(setTimer).not.toHaveBeenCalled();
+    // Claude Code's own /loop still runs on claude-native when ours is not offered.
+    expect(onSend).toHaveBeenCalledExactlyOnceWith("/loop 5m check CI", undefined);
   });
 
   function renderRewindComposer(

@@ -4076,6 +4076,8 @@ class SessionMessageItem(_SessionItemCommon):
         transcripts; omitted when ``False``.
     :param user_authored: ``True`` for confirmed or conservatively
         preserved user input; omitted when ``False``.
+    :param origin: What sent a user message no human typed, e.g. ``"loop"``
+        for a run of the web composer's ``/loop``; omitted when unset.
     :param subagent_return_id: Native task id of an explicitly completed
         child; omitted when unset.
     :param interrupted: ``True`` for a partial assistant response from an
@@ -4094,6 +4096,7 @@ class SessionMessageItem(_SessionItemCommon):
     model: str | None = None
     is_meta: bool = False
     user_authored: bool = False
+    origin: str | None = None
     subagent_return_id: str | None = None
     interrupted: bool = False
     stream_message_id: str | None = None

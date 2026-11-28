@@ -1357,6 +1357,13 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       agentName: String(rec.model ?? ""),
       // Present only on human-authored receipts (server exclude_none).
       ...(typeof rec.created_by === "string" ? { createdBy: rec.created_by } : {}),
+      // A native command's receipt always says which pending entry it settles.
+      ...("cleared_pending_id" in data
+        ? {
+            clearedPendingId:
+              typeof data.cleared_pending_id === "string" ? data.cleared_pending_id : null,
+          }
+        : {}),
       itemId,
       responseId,
     } satisfies SlashCommand;

@@ -5687,6 +5687,18 @@
             ],
             "title": "Model"
           },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What sent a user message no human typed, e.g. `\"loop\"` for a run of the web composer's `/loop`. Display-only and client-settable by convention, like `user_authored`; `None` for ordinary input.",
+            "title": "Origin"
+          },
           "phase": {
             "anyOf": [
               {
@@ -8488,6 +8500,11 @@
           "session_list_scoped_archives": {
             "default": true,
             "title": "Session List Scoped Archives",
+            "type": "boolean"
+          },
+          "session_loops": {
+            "default": false,
+            "title": "Session Loops",
             "type": "boolean"
           },
           "session_message_max_chars": {
@@ -11851,6 +11868,18 @@
             ],
             "description": "Agent name; present on assistant messages, absent on user messages.",
             "title": "Model"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What sent a user message no human typed, e.g. `\"loop\"` for a run of the web composer's `/loop`; omitted when unset.",
+            "title": "Origin"
           },
           "phase": {
             "anyOf": [

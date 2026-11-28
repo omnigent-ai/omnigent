@@ -26,11 +26,13 @@ import {
   Link2Icon,
   Loader2Icon,
   PencilIcon,
+  RepeatIcon,
   SplitIcon,
   SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { LOOP_TIMER_ORIGIN } from "@/lib/sessionTimersApi";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { askUserQuestionPayloadOf } from "@/lib/askUserQuestion";
@@ -1211,6 +1213,20 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* Keep the avatar beside the attachments and text as one aligned message. */}
         <div className="flex w-fit max-w-full items-end gap-1.5">
+          {bubble.origin === LOOP_TIMER_ORIGIN && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  data-testid="message-origin"
+                  className="flex shrink-0 items-center gap-1 text-muted-foreground text-xs"
+                >
+                  <RepeatIcon className="size-3.5" aria-hidden="true" />
+                  Loop
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>Sent by /loop</TooltipContent>
+            </Tooltip>
+          )}
           {showAuthorBadge && author && (
             <Tooltip>
               <TooltipTrigger asChild>

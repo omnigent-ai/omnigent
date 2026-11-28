@@ -64,11 +64,14 @@ function assistantBubble(
 }
 
 function renderBubble(bubble: Bubble) {
-  // File mention pills check the workspace through a query.
+  // File mention pills check the workspace through a query; a /loop run's label
+  // explains itself in a tooltip.
   return render(
     <QueryClientProvider client={new QueryClient()}>
       <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-        <BubbleView bubble={bubble} />
+        <TooltipProvider>
+          <BubbleView bubble={bubble} />
+        </TooltipProvider>
       </FileViewerContext.Provider>
     </QueryClientProvider>,
   );
@@ -208,6 +211,19 @@ describe("/btw answer pull request references", () => {
       "href",
       "https://github.com/acme/app/pull/4242",
     );
+  });
+});
+
+describe("UserBubble loop runs", () => {
+  it("labels a message a /loop sent, beside the bubble", () => {
+    renderBubble(userBubble("check CI", { origin: "loop" }));
+    expect(screen.getByTestId("message-origin")).toHaveTextContent("Loop");
+    expect(screen.getByText("check CI")).toBeInTheDocument();
+  });
+
+  it("leaves a typed message unlabelled", () => {
+    renderBubble(userBubble("check CI"));
+    expect(screen.queryByTestId("message-origin")).toBeNull();
   });
 });
 

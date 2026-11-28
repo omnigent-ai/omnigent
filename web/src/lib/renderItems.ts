@@ -200,6 +200,8 @@ export type Bubble =
       content: MessageContentBlock[];
       /** Shell input is literal command text, not Markdown or attachment markers. */
       shellCommand?: string;
+      /** What sent the message when no human typed it, e.g. `"loop"` for a /loop run. */
+      origin?: string;
       /** Human author email, when known. */
       createdBy?: string;
       /** Epoch seconds of this message, when known — server-stamped from
@@ -927,6 +929,7 @@ function walkBubbles(
         content:
           b.type === "user_message" ? b.content : [{ type: "input_text", text: `!${b.input}` }],
         ...(b.type === "terminal_command" ? { shellCommand: b.input } : {}),
+        ...(b.type === "user_message" && b.origin !== undefined ? { origin: b.origin } : {}),
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
         // Server stamp on cold load, client stamp while live — display
         // only, so either clock is correct here.
@@ -2075,6 +2078,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.uploadFailure?.fileId !== b.uploadFailure?.fileId ||
       a.uploadFailure?.message !== b.uploadFailure?.message ||
       a.shellCommand !== b.shellCommand ||
+      a.origin !== b.origin ||
       a.content.length !== b.content.length
     )
       return false;

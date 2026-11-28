@@ -116,6 +116,7 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    LOOP_TIMER_LABEL_PREFIX,
     MAX_PENDING_INPUTS,
     MAX_SESSION_FAMILY_MEMBERS,
     MUTED_LABEL_KEY,
@@ -4033,6 +4034,13 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
 
+    def get_labels(self, conversation_id: str, keys: tuple[str, ...]) -> dict[str, str]:
+        """Select only the named label rows. See base class for contract."""
+        if not keys:
+            return {}
+        with self._conv_session("read_labels_by_key") as session:
+            return _fetch_labels(session, conversation_id, keys=keys)
+
     def replace_label_if(
         self,
         conversation_id: str,
@@ -7357,6 +7365,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
                 and not key.startswith(f"{MUTED_LABEL_KEY}.")
                 and not key.startswith(FAMILY_PIN_LABEL_PREFIX)
+                # A loop's timer stays with its session; the fork has none.
+                and not key.startswith(LOOP_TIMER_LABEL_PREFIX)
                 and not key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX)
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))

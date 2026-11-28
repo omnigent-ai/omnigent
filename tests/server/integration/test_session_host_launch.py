@@ -4974,6 +4974,11 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
 
     assert first.status_code in (200, 202), first.text
     assert second.status_code in (200, 202), second.text
+    # Each message was consumed into a turn the refusal failed, and its accepted reply
+    # says so, so a sender that needs the prompt to run doesn't count it as sent.
+    for response in (first, second):
+        assert response.json()["rejected"] is True, response.text
+        assert "omnigent setup" in response.json()["reason"], response.text
     # Reaching here at all is the guard: a rider that loses the refusal falls
     # into the 30s connect wait and the wait_for above fires. What the
     # transcript must show is that every banner carries the actionable

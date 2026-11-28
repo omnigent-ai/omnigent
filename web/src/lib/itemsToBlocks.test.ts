@@ -209,6 +209,14 @@ describe("itemsToBlocks — flat shape", () => {
     }
   });
 
+  it("carries a message's origin onto its block, so a /loop run can be labelled", () => {
+    const typed = { ...userMessage("resp_user", "check CI"), user_authored: true };
+    expect(itemsToBlocks([{ ...typed, origin: "loop" }])).toMatchObject([
+      { type: "user_message", origin: "loop" },
+    ]);
+    expect(itemsToBlocks([typed])[0]).not.toHaveProperty("origin");
+  });
+
   it("keeps legacy teammate handbacks out of the transcript while preserving user discussion", () => {
     const envelope =
       '<teammate-message teammate_id="reviewer" summary="Review complete">Ready</teammate-message>';
