@@ -51,6 +51,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 const ROW_HEIGHT = 30;
 
@@ -434,6 +435,75 @@ describe("dropping an unpinned session onto a pinned row", () => {
   });
 });
 
+describe("moving a pinned session from ⌘K", () => {
+  const QUICK_PICK = { quick_pick_palette: true };
+  beforeEach(() => {
+    mocks.pinned = [
+      conv("conv_a", { labels: { "omnigent.pinned": "1000" } }),
+      conv("conv_b", { labels: { "omnigent.pinned": "2000" } }),
+      conv("conv_e", { labels: { "omnigent.pinned": "3000" } }),
+    ];
+  });
+  afterEach(() => usePaletteCommandsStore.setState({ groups: {} }));
+
+  const pinOrderCommands = () =>
+    usePaletteCommandsStore.getState().groups["sidebar-pin-order"]?.commands ?? [];
+  const pinOrderLabels = () =>
+    pinOrderCommands()
+      .filter((command) => command.availability?.available !== false)
+      .map((command) => command.label);
+  const run = (label: string) =>
+    act(() =>
+      pinOrderCommands()
+        .find((command) => command.label === label)!
+        .run(),
+    );
+
+  it("moves the open pin up through the same order write as a drop", async () => {
+    renderSidebar({ route: "/c/conv_b", routePattern: "/c/:conversationId", features: QUICK_PICK });
+    await waitFor(() =>
+      expect(pinOrderLabels()).toEqual(["Move up in Pinned", "Move down in Pinned"]),
+    );
+    run("Move up in Pinned");
+    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 999 }]);
+  });
+
+  it("moves the last pin to the top", async () => {
+    renderSidebar({ route: "/c/conv_e", routePattern: "/c/:conversationId", features: QUICK_PICK });
+    await waitFor(() =>
+      expect(pinOrderLabels()).toEqual(["Move to top of Pinned", "Move up in Pinned"]),
+    );
+    run("Move to top of Pinned");
+    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_e", pinnedAt: 999 }]);
+  });
+
+  it("offers no moves for an unpinned session, without server-stored pins, or with the flag off", async () => {
+    const { unmount } = renderSidebar({
+      route: "/c/conv_c",
+      routePattern: "/c/:conversationId",
+      features: QUICK_PICK,
+    });
+    await screen.findByRole("link", { name: "conv_c" });
+    expect(pinOrderLabels()).toEqual([]);
+    unmount();
+
+    mocks.filterHonored = false;
+    const second = renderSidebar({
+      route: "/c/conv_b",
+      routePattern: "/c/:conversationId",
+      features: QUICK_PICK,
+    });
+    await screen.findByRole("link", { name: "conv_b" });
+    expect(pinOrderLabels()).toEqual([]);
+    second.unmount();
+
+    mocks.filterHonored = true;
+    renderSidebar({ route: "/c/conv_b", routePattern: "/c/:conversationId", features: {} });
+    await screen.findByRole("link", { name: "conv_b" });
+    expect(pinOrderLabels()).toEqual([]);
+  });
+});
+
 describe("unpinning from a sidebar row", () => {
   const row = (id: string) => screen.getByRole("link", { name: id }).closest("li")!;
 
@@ -572,6 +642,8 @@ describe("Custom session order", () => {
 
       cleanup();
       renderGrouping();
+      expect(rowOrder()).toEqual(["conv_d", ...familyRows]);
+      if (collapsed) fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
       expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_peer"]);
       fireEvent.contextMenu(link("conv_peer"));
       expect(screen.queryByTestId("move-session-up")).toBeNull();

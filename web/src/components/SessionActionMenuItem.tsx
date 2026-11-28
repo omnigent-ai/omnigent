@@ -4,6 +4,7 @@ import { DisabledActionTooltip } from "./DisabledActionTooltip";
 import { cn } from "@/lib/utils";
 
 interface ItemProps {
+  asChild?: boolean;
   children?: ReactNode;
   className?: string;
   onSelect?: (event: Event) => void;
@@ -17,14 +18,37 @@ export function SessionActionMenuItem({
   disabledReason,
   Item = DropdownMenuItem,
   onSelect,
+  link,
   className,
+  children,
   ...props
-}: Omit<ItemProps, "aria-disabled"> & {
+}: Omit<ItemProps, "aria-disabled" | "asChild"> & {
   disabledReason?: string;
   /** A Radix-compatible menu item that activates exclusively through onSelect. */
   Item?: ComponentType<ItemProps>;
+  /**
+   * Makes the row a link to `href`, which a click or Enter follows through `follow`;
+   * `onSelect` doesn't run, so it opens once. A disabled row is never a link.
+   */
+  link?: { href: string; follow: (event: MouseEvent) => void };
 }) {
   const descriptionId = useId();
+  if (link && !disabledReason) {
+    return (
+      <Item {...props} className={className} asChild>
+        <a
+          href={link.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          // The native event: preventing it stops the browser following the link too,
+          // while the menu, which skips closing for a click React saw prevented, still closes.
+          onClick={(event) => link.follow(event.nativeEvent)}
+        >
+          {children}
+        </a>
+      </Item>
+    );
+  }
   return (
     <DisabledActionTooltip reason={disabledReason}>
       <Item
@@ -39,7 +63,9 @@ export function SessionActionMenuItem({
           if (disabledReason) event.preventDefault();
           else onSelect?.(event);
         }}
-      />
+      >
+        {children}
+      </Item>
       {disabledReason && (
         <span id={descriptionId} hidden>
           {disabledReason}

@@ -66,6 +66,8 @@ from omnigent.extensions.assets import (
     parse_dev_bundle_overrides,
 )
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
+from omnigent.gadgets.access import GadgetAccess, PermissionStoreGadgetAccess
+from omnigent.gadgets.accounts import DeletedAccountGadgets
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
@@ -84,6 +86,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
+    gadgets,
     managed_host_keepalive,
     session_journal,
     session_live_state,
@@ -102,6 +105,9 @@ from omnigent.server.auth import (
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
+)
+from omnigent.server.background_session_titles import (
+    install_coordinator as install_background_title_coordinator,
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
@@ -139,6 +145,7 @@ from omnigent.server.routes.default_policies import create_default_policies_rout
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.extension_assets import create_extension_assets_router
 from omnigent.server.routes.extensions import create_extensions_router
+from omnigent.server.routes.gadget_permissions import stores_gadget_grants
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.inbox_items import create_inbox_items_router
@@ -204,6 +211,7 @@ from omnigent.stores.conversation_store import (
     SessionConnectivity,
     runner_seen_is_fresh,
 )
+from omnigent.stores.gadget_store import GadgetStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.inbox_item_store import InboxItemStore
 from omnigent.stores.memory_store import MemoryStore
@@ -330,6 +338,9 @@ class ServerInfoResponse(BaseModel):
     # PATCH stores the ``omnigent.muted`` label per viewer; older servers would
     # store it as an ordinary label every collaborator sees.
     session_mute: bool = True
+    # GET /v1/sessions/projects reports ``config.muted``; older servers drop it,
+    # so a saved project mute would never read back.
+    project_mute: bool = True
     # GET /v1/sessions applies ``include_archived`` to ``visibility=mine`` and
     # ``shared``; older servers drop archived rows there.
     session_list_scoped_archives: bool = True
@@ -343,8 +354,14 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_source_sessions: bool = True
     # Scheduled tasks accept ``mcp_services``; older servers reject it.
     scheduled_task_mcp_services: bool = True
+    # Scheduled tasks accept ``workflow_id`` and ``workflow_details`` and write the prompt
+    # that runs the saved workflow; older servers reject them.
+    scheduled_task_workflow_id: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
+    # A sandbox that starts a new session each run also accepts ten-minute schedules;
+    # older servers require an hour.
+    scheduled_task_subhour_new_sandbox: bool = True
     # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
     # a reminder, and ``first_run_at``. Needs the database scheduler and the
     # ``one_time_automations`` release feature; absent on older servers.
@@ -352,6 +369,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
+    # ``POST /v1/sessions/{id}/timers`` saves sys_timer_set timers as scheduled tasks,
+    # which needs the database scheduler; absent on older servers.
+    session_timers: bool = False
     automation_trigger_poll_minutes: int = 10
     # Longest session message this server delivers; older servers omit it and
     # deliver at most 8,000 characters.
@@ -414,6 +434,15 @@ class ServerInfoResponse(BaseModel):
     # ``GET /v1/workflows/shared`` lists those shared with the caller: needs
     # ``workflows`` and a store that keeps workflow grants.
     workflow_sharing: bool = False
+    # /v1/gadgets, with the ``gadgets`` feature and a gadget store; absent on older
+    # servers, which clients treat as unsupported.
+    gadgets: bool = False
+    # Gadgets can be shared through ``/v1/gadgets/{id}/permissions``: needs
+    # ``gadgets`` and a store that keeps gadget grants.
+    gadget_sharing: bool = False
+    # POST /v1/gadgets/{id}/copy makes a copy; needs ``gadgets``. Absent on older servers,
+    # which clients treat as unsupported.
+    gadget_copy: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -446,6 +475,9 @@ class ServerInfoResponse(BaseModel):
     # Every other agent-tool organizing write checks it too: session title, pin
     # and archive, and project rename, icon and delete.
     session_organize_source_checks: bool = False
+    # Sub-agent archives check runner ownership and route through inherited hosts;
+    # runner tools require this capability before archiving a sub-agent.
+    session_archive_runner_checks: bool = False
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
@@ -1940,6 +1972,8 @@ def create_app(
     host_session_recovery: DeploymentGate = False,
     proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
     memory_store: MemoryStore | None = None,
+    gadget_store: GadgetStore | None = None,
+    gadget_access: GadgetAccess | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1983,6 +2017,10 @@ def create_app(
         automation access without deleting saved tasks.
     :param preference_store: Optional shared-preference API; no launcher adoption.
     :param memory_store: Optional long-term memory backend; mounts ``/v1/memory`` when set.
+    :param gadget_store: Where gadgets are kept; mounts ``/v1/gadgets`` when set. The
+        routes and the ``sys_gadget_*`` tools also need the ``gadgets`` release feature.
+    :param gadget_access: Who may do what with a gadget; ``None`` gives the owner
+        everything and everyone else their gadget grants in ``permission_store``.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
@@ -2147,6 +2185,7 @@ def create_app(
         load_branding_snapshot,
         load_picker_curation,
         load_server_config,
+        read_only_code_hosts,
         session_title_instructions,
     )
 
@@ -2155,6 +2194,7 @@ def create_app(
     picker_curation = load_picker_curation(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     trigger_poll_minutes = automation_trigger_poll_minutes(resolved_server_config)
+    read_only_hosts = read_only_code_hosts(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     if harness_install is None:
         app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
@@ -2445,6 +2485,14 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # A deleted account's gadget cleanup noted while gadgets were off goes on once they
+        # are on, without waiting for the next account deletion or registration.
+        deleted_account_gadgets = getattr(app_inst.state, "deleted_account_gadgets", None)
+        if deleted_account_gadgets is not None and app_inst.state.gadgets_available():
+            try:
+                await asyncio.to_thread(deleted_account_gadgets.resume)
+            except Exception:
+                _logger.exception("Gadget cleanup of deleted accounts deferred at startup")
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -2589,10 +2637,12 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        install_background_title_coordinator(background_title_coordinator)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            install_background_title_coordinator(None)
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:
@@ -2778,6 +2828,9 @@ def create_app(
     app.state.proactive_agent_available = proactive_agent_available
     app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
 
+    app.state.gadgets_available = lambda: (
+        gadget_store is not None and app.state.feature_flags.enabled(Feature.GADGETS)
+    )
     app.state.memory_available = lambda: (
         memory_store is not None and app.state.feature_flags.enabled(Feature.MEMORY)
     )
@@ -2785,6 +2838,14 @@ def create_app(
         app.state.memory_available() and memory_store is not None and memory_store.supports_search
     )
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    # Agent timers are scheduled tasks only the database scheduler fires. Creating them
+    # waits for the release feature, until every server on the database reads them.
+    app.state.session_timers_enabled = (
+        automations_enabled
+        and automations_v2_enabled
+        and scheduled_task_store is not None
+        and resolved_feature_flags.enabled(Feature.SESSION_TIMERS)
+    )
     # Separate from dispatch: schedulers accept one-time rules from this release on,
     # and creating them waits until every scheduler on the database does.
     app.state.one_time_automations_enabled = automations_v2_enabled and (
@@ -4117,6 +4178,8 @@ def create_app(
         current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
         frontend_features = app.state.feature_flags.frontend_dict()
         frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
+        # The flag alone doesn't mount the gadget routes; the web reads this to show gadgets.
+        frontend_features[Feature.GADGETS.value] = app.state.gadgets_available()
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -4172,6 +4235,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_mute": True,
+                "project_mute": True,
                 "session_list_scoped_archives": True,
                 "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
@@ -4199,6 +4263,10 @@ def create_app(
                 "workflows": workflows_available,
                 "workflow_sharing": workflows_available
                 and stores_workflow_grants(permission_store),
+                "gadgets": app.state.gadgets_available(),
+                "gadget_sharing": app.state.gadgets_available()
+                and stores_gadget_grants(permission_store),
+                "gadget_copy": app.state.gadgets_available(),
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
@@ -4213,8 +4281,10 @@ def create_app(
                 "scheduled_task_shared_with_me": automation_sharing,
                 "scheduled_task_clone": automations_enabled
                 and bool(app.state.scheduled_task_dispatch_enabled),
+                "session_timers": bool(app.state.session_timers_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
+                "session_archive_runner_checks": True,
                 "sibling_other_project_standalone": True,
                 "memory": app.state.memory_available(),
                 "automations_enabled": automations_enabled,
@@ -4313,6 +4383,7 @@ def create_app(
         create_sessions_router(
             conversation_store,
             agent_store,
+            read_only_code_hosts=read_only_hosts,
             file_store=file_store,
             artifact_store=artifact_store,
             runner_router=runner_router,
@@ -4493,6 +4564,7 @@ def create_app(
             conversation_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            scheduled_task_store=scheduled_task_store,
         ),
         prefix="/v1",
         tags=["workflows"],
@@ -4586,6 +4658,27 @@ def create_app(
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
+        )
+    if gadget_store is not None:
+        resolved_gadget_access = gadget_access or PermissionStoreGadgetAccess(
+            gadget_store, permission_store
+        )
+        # Deleting an account deletes its gadgets, which live outside the database.
+        if account_store is not None and hasattr(account_store, "attach_gadgets"):
+            app.state.deleted_account_gadgets = DeletedAccountGadgets(
+                gadget_store, resolved_gadget_access, enabled=app.state.gadgets_available
+            )
+            account_store.attach_gadgets(app.state.deleted_account_gadgets)
+        app.include_router(
+            gadgets.create_gadgets_router(
+                gadget_store,
+                resolved_gadget_access,
+                conversation_store=conversation_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["gadgets"],
         )
     if memory_store is not None:
         app.include_router(
@@ -5407,8 +5500,8 @@ def create_app(
                         else:
                             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
                         # A crash can leave a persisted count absent from the live index.
-                        session_live_state.persist_pending_count(
-                            conv.id, pending_elicitations.count_for(conv.id)
+                        session_live_state.reconcile_pending_count(
+                            conv.id, conv.pending_elicitation_count, runner_id=runner_id
                         )
                         cached_sandbox = _session_sandbox_status_cache.get(conv.id)
                         # A reconnect proves readiness only for a launch already marked failed.

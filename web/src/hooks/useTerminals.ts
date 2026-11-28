@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { isPageHiding } from "@/lib/pageLifecycle";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { randomUUID } from "@/lib/randomUUID";
 import {
@@ -227,10 +228,37 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
   return (await fetchTerminalList(conversationId)) ?? [];
 }
 
+/**
+ * How long a shell-list read may take, body included, before it fails. Longer than a shell tab's
+ * wait, so a Try Again then joins the read, and the next one after it fails starts afresh.
+ */
+export const TERMINAL_LIST_TIMEOUT_MS = 30_000;
+
 /** {@link fetchTerminals}, but null when the runner could not answer (a soft status). */
 async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[] | null> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`terminals fetch timed out after ${TERMINAL_LIST_TIMEOUT_MS} ms`);
+      controller.abort(error);
+      reject(error);
+    }, TERMINAL_LIST_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([readTerminalList(conversationId, controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readTerminalList(
+  conversationId: string,
+  signal: AbortSignal,
+): Promise<TerminalInfo[] | null> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals?order=asc&limit=1000`,
+    { signal },
   );
   if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return null;
   if (!res.ok) throw new Error(`terminals fetch failed: ${res.status} ${res.statusText}`);
@@ -421,6 +449,8 @@ export function useCreateTerminal(conversationId: string) {
       })
       .catch((error: unknown) => {
         clearClosedDuringLaunch(predicted.id);
+        // A page going away cuts the create off, but the shell may exist; leave its tab saved.
+        if (isPageHiding()) return;
         removeFromCache(predicted.id);
         callbacks.onError?.(error instanceof Error ? error : new Error(String(error)), predicted);
       })
@@ -463,9 +493,14 @@ export async function deleteTerminal(conversationId: string, terminalId: string)
  * dedupes as a no-op).
  *
  * :param conversationId: Session/conversation identifier.
+ * :param options: ``reportsFailure: false`` leaves a failed close for the caller to report,
+ *   such as a surface that names the shells one close couldn't end in a single message.
  * :returns: TanStack mutation taking the terminal resource id.
  */
-export function useDeleteTerminal(conversationId: string) {
+export function useDeleteTerminal(
+  conversationId: string,
+  { reportsFailure = true }: { reportsFailure?: boolean } = {},
+) {
   const queryClient = useQueryClient();
   return useMutation({
     // A shell still being created has nothing to DELETE yet: its launch
@@ -486,7 +521,9 @@ export function useDeleteTerminal(conversationId: string) {
     // a non-editor, 500). Surface it — otherwise the tab silently reappears
     // once ``isPending`` clears and the user has no idea the shell survived.
     onError: () => {
-      showToast("Couldn't close the shell — it's still running.", { duration: 0 });
+      if (reportsFailure) {
+        showToast("Couldn't close the shell — it's still running.", { duration: 0 });
+      }
     },
   });
 }

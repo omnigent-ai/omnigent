@@ -40,14 +40,18 @@ describe.each([
     expect(approve.DECLINE_KEYS).toEqual(["Esc"]);
   });
 
-  it("keep the browser chords for the fixed sidebar and Settings arrays in any shell", async () => {
+  it("keep the fixed sidebar, Settings, Back and Forward arrays in any shell", async () => {
     vi.doMock("@/lib/nativeBridge", async (importOriginal) => ({
       ...(await importOriginal<typeof NativeBridge>()),
       isNativeShell: () => true,
       supportsDesktopCommands: () => true,
+      shellRoutesDesktopCommands: () => true,
     }));
     const { shortcut } = await loadKeyArrays(mac);
     vi.doUnmock("@/lib/nativeBridge");
+    // The Go menu takes Back and Forward there, on the same keys.
+    expect(shortcut.BACK_KEYS).toEqual([mod, "["]);
+    expect(shortcut.FORWARD_KEYS).toEqual([mod, "]"]);
     expect(shortcut.SIDEBAR_TOGGLE_KEYS).toEqual([mod, alt, "["]);
     expect(shortcut.RIGHT_SIDEBAR_TOGGLE_KEYS).toEqual([mod, alt, "]"]);
     expect(shortcut.SETTINGS_KEYS).toEqual([mod, alt, ","]);

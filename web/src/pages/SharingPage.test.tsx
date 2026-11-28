@@ -2,7 +2,7 @@
 //
 // Mock identity and sharing hooks to cover admin gating and disabled controls.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { SharingPage } from "./SharingPage";
@@ -27,10 +27,20 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   }),
 }));
 
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof identity>()),
   resolveIdentity: vi.fn(),
   getCurrentIsAdmin: vi.fn(),
+  getCurrentUserId: vi.fn(),
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
+
+beforeEach(() => identityUpdates.clear());
 vi.mock("@/hooks/useSharing", () => ({
   useSharing: vi.fn(),
   useSetSharing: vi.fn(),
@@ -273,6 +283,30 @@ describe("SharingPage", () => {
     fireEvent.click(trigger);
     expect(screen.queryByRole("option")).not.toBeInTheDocument();
     expect(setModeMutate).not.toHaveBeenCalled();
+  });
+
+  it("shows sharing controls when identity recovers while the page stays open", async () => {
+    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
+    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    setSharingState(state());
+    const view = renderPage();
+    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
+    expect(
+      screen.queryByRole("combobox", { name: "Session sharing mode" }),
+    ).not.toBeInTheDocument();
+
+    vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(
+      await screen.findByRole("combobox", { name: "Session sharing mode" }),
+    ).toBeInTheDocument();
+    view.unmount();
+    expect(identityUpdates.size).toBe(0);
   });
 
   it("shows a no-permission message to a non-admin", async () => {

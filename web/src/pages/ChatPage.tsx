@@ -1,5 +1,6 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
+import { useWarmSwitchConversationId } from "@/lib/warmSessionSwitch";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -104,10 +105,11 @@ import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   takeFailedSendDraft,
-  composerAttachmentKey,
   consumePendingInitialPrompt,
   holdsInitialDraft,
   isStaleTempConvId,
+  onPendingInitialPrompt,
+  returnPendingInitialPrompt,
   isTempConvId,
   retryConversationLoad,
   type ChatState,
@@ -133,15 +135,13 @@ import {
   supportsSideChat,
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
-import { shouldQueueSend } from "@/lib/messageQueue";
+import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerInlineMentions,
-  fileMentionToken,
   findMentionTokens,
-  newFileMentionToken,
   mergeTaggedDrafts,
   presentMentions,
   recallSessionMentions,
@@ -158,6 +158,7 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { quoteTextStart, settleQuoteLines } from "@/lib/replyDraftDocument";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -213,8 +214,10 @@ import {
   computeIsTurnActive,
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
+import { useReportConversationShown } from "@/hooks/useReportConversationShown";
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
+import { useTabsSidebar } from "@/shell/useTabsSidebar";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useReleaseHostHeldSends } from "@/hooks/useReleaseHostHeldSends";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
@@ -227,6 +230,11 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
+import {
+  GADGET_FULL_SCREEN_PARAM,
+  gadgetCoversConversation,
+  useGadgetRailRequest,
+} from "@/lib/gadgetRailTabs";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -250,7 +258,7 @@ import {
   subscribeSessionHostChanges,
 } from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
-import { MobileHeaderControlPortal } from "@/shell/MobileHeaderControlsSlot";
+import { MobileHeaderControlPortal, SessionControlPortal } from "@/shell/MobileHeaderControlsSlot";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -280,7 +288,11 @@ import { formatStatusModelLabel, formatModelEffortStatusLabel } from "@/lib/comp
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { RewindPicker } from "@/components/RewindPicker";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
-import { MainTerminalView } from "@/shell/MainTerminalView";
+import { ChatPaneBody } from "@/shell/ChatPaneBody";
+import { MainTerminalSurface } from "@/shell/MainTerminalSurface";
+import { LoneChatPaneDropPreview } from "@/shell/PaneDropPreview";
+import { useFloatingPanesShown } from "@/shell/useFloatingPanes";
+import { useChatInPanes } from "@/shell/panesViewGate";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
@@ -289,6 +301,11 @@ import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWa
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import {
+  type GadgetComposerQuote,
+  retryGadgetComposerQuotes,
+  useGadgetComposerQuotes,
+} from "@/lib/gadgetComposerQuotes";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
@@ -333,6 +350,7 @@ import {
 } from "@/components/composer/useSessionHarnessPickerProps";
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
+import { canStopResponse, useStopResponsePaletteCommand } from "@/components/chat/stopResponse";
 
 /**
  * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
@@ -429,6 +447,15 @@ function truncateTitle(raw: string, max = 60): string {
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
 
+/** A /btw side question's answer, an agent reply like any other. */
+export function BtwSidechatAnswer({ answer }: { answer: string }) {
+  return (
+    <FilePathAwareMessageResponse mode="static" linkPullRequestRefs>
+      {answer}
+    </FilePathAwareMessageResponse>
+  );
+}
+
 /**
  * Single component that drives the chat surface. Streaming + history
  * state lives in `useChatStore` (a Zustand store at module scope), so
@@ -438,53 +465,29 @@ function truncateTitle(raw: string, max = 60): string {
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
-  // The id for every server-scoped fetch/hook — `undefined` while the URL holds
-  // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
-  // the session exists. `switchTo` still gets the raw `urlConvId`.
-  const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
+  const activeConversationId = useChatStore((s) => s.conversationId);
+  const rebasePath = useRebasePath();
+  const effectiveConvId = useWarmSwitchConversationId(urlConvId);
+  const warmSwitchPending = effectiveConvId !== urlConvId;
+  const [sessionUi, setSessionUi] = useState({ conversationId: effectiveConvId, key: 0 });
+  if (sessionUi.conversationId !== effectiveConvId) {
+    // Session creation promotes the same draft; every other switch starts fresh local UI.
+    const promoting =
+      isTempConvId(sessionUi.conversationId) &&
+      effectiveConvId !== undefined &&
+      !isTempConvId(effectiveConvId);
+    setSessionUi({ conversationId: effectiveConvId, key: sessionUi.key + (promoting ? 0 : 1) });
+  }
+  // Client-only temp ids must not reach server-scoped hooks before the session exists.
+  const sessionConvId = isTempConvId(effectiveConvId) ? undefined : effectiveConvId;
   const navigate = useNavigate();
   const { pathname, search } = useLocation();
-  const rebasePath = useRebasePath();
   const appName = useAppName();
-  // Optional first message handed off by the landing composer through the
-  // shared chatStore (keyed by conversation id), not router state — router state
-  // doesn't survive the embed's host-provided routing. Consumed read-once
-  // in the effect below so a refresh/back can't replay it, then held here
-  // so the auto-send effect re-runs once it's resolved.
-  // Bundled with the conversation id it was consumed for so the auto-send
-  // gate can reject a prompt that no longer matches the active session (the
-  // session-switch leak — see shouldSendInitialPrompt). `null` until the
-  // consume effect runs (or when no prompt was carried).
-  const [initialPrompt, setInitialPrompt] = useState<{
-    conversationId: string;
-    prompt: PendingInitialPrompt;
-  } | null>(null);
-  // The conversation id we already auto-sent an initial prompt for, or
-  // null. NOT a bare boolean: ChatPage stays mounted across `/c/:a` →
-  // `/c/:b` (no route `key`), so a boolean once-guard would latch true
-  // after the first auto-send and silently drop the prompt for every
-  // subsequent new chat created without a full page reload. Keying the
-  // guard by conversation id resets it per session while still covering
-  // StrictMode's double-invoke and re-renders within one session.
-  const initialPromptSentForConvRef = useRef<string | null>(null);
-  // Caches the consumed prompt keyed by conversation id so the consume
-  // effect is idempotent under StrictMode's setup→cleanup→setup
-  // double-invoke. `consumePendingInitialPrompt` is destructive (get +
-  // delete): the first invocation drains the store map, so a naive second
-  // invocation would read null and last-write-wins would settle
-  // `initialPrompt` to null — silently dropping the prompt in dev. By
-  // memoizing the first result per conv id, the second invocation reuses
-  // it. Keyed by id (not a bare value) so it still re-consumes for the
-  // next conversation when ChatPage stays mounted across `/c/:a` → `/c/:b`.
-  const consumedInitialPromptRef = useRef<{
-    conversationId: string;
-    prompt: PendingInitialPrompt | null;
-  } | null>(null);
   const {
     data: agents,
     error: agentsError,
     refetch: refetchAgents,
-  } = useAgents({ enabled: !urlConvId });
+  } = useAgents({ enabled: !effectiveConvId });
   const { data: conversationsData } = useLoadedConversations();
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
@@ -493,9 +496,21 @@ export function ChatPage() {
 
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
-  // (every 4 s) so messages arriving while viewing are marked seen.
+  // (every 4 s) so messages arriving while viewing are marked seen. A gadget
+  // filling the screen hides the conversation, so its new messages stay new.
+  // That holds from the start: a URL naming the gadget hides the conversation until the side
+  // panel shows the gadget or finds it can't (then the conversation shows and is read).
+  const pageServerInfo = useServerInfo();
+  const gadgetsMaybeOn =
+    pageServerInfo === "loading" || isFeatureEnabled(pageServerInfo, "gadgets");
+  const urlGadget = gadgetsMaybeOn
+    ? new URLSearchParams(search).get(GADGET_FULL_SCREEN_PARAM)
+    : null;
+  const gadgetCoversChat = useGadgetRailRequest((state) =>
+    gadgetCoversConversation(state, sessionConvId, urlGadget),
+  );
   useMarkConversationSeen(
-    sessionConvId,
+    gadgetCoversChat ? undefined : sessionConvId,
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 
@@ -510,6 +525,7 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    if (warmSwitchPending) return;
     // A temporary route has no client session after a reload. Return to its
     // board or the landing page so it cannot strand a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {
@@ -523,31 +539,9 @@ export function ChatPage() {
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate, pathname, search, rebasePath]);
+  }, [urlConvId, warmSwitchPending, navigate, pathname, search, rebasePath]);
 
-  useConversationRedirect(urlConvId);
-
-  // Pull the first message the landing composer stashed for this conversation,
-  // if any. Read-once (consume deletes), so a refresh/back can't replay
-  // it. Runs in an effect (not render) because consume mutates the store
-  // map — calling it during render would double-consume under StrictMode.
-  // The per-conv-id cache (consumedInitialPromptRef) makes the consume
-  // idempotent across StrictMode's double-invoke: the first run drains the
-  // map and caches the result; the second run reuses the cache instead of
-  // re-consuming (which would read null and drop the prompt). Resetting to
-  // null when no prompt is pending clears a prior conversation's value
-  // when ChatPage stays mounted across `/c/:a` → `/c/:b`.
-  useEffect(() => {
-    if (!urlConvId) {
-      setInitialPrompt(null);
-      return;
-    }
-    const cached = consumedInitialPromptRef.current;
-    const prompt =
-      cached?.conversationId === urlConvId ? cached.prompt : consumePendingInitialPrompt(urlConvId);
-    consumedInitialPromptRef.current = { conversationId: urlConvId, prompt };
-    setInitialPrompt(prompt === null ? null : { conversationId: urlConvId, prompt });
-  }, [urlConvId]);
+  useConversationRedirect(effectiveConvId);
 
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
@@ -580,7 +574,6 @@ export function ChatPage() {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
-  const activeConversationId = useChatStore((s) => s.conversationId);
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
@@ -617,49 +610,27 @@ export function ChatPage() {
     }
   }, [boundAgentId, agents, refetchAgents]);
 
-  // Auto-send the first message the landing composer stashed in the chatStore,
-  // exactly once per conversation. Wait until the session is hydrated
-  // (stream bound) — sending before bindStream connects would lose the
-  // turn's events on the no-replay live-tail stream ("no response"). We do
-  // NOT wait for the runner to be online: chatStore.send pushes the
-  // optimistic bubble synchronously, so it renders the instant the stream
-  // binds, and the server's POST /events handler holds the request open
-  // while a host-bound runner spins up (connect grace + relaunch), 503ing
-  // only if no runner ever appears. So a slow runner shows the bubble
-  // immediately and resolves when it connects; a genuinely dead host
-  // surfaces a failed send instead of a silently-dropped prompt on an
-  // empty composer. Posting through chatStore.send is
-  // agent-agnostic: event agents run a turn; native terminal agents
-  // (Claude Code / Codex) have the runner inject the text into their
-  // CLI. The consume effect above already read-once-deleted the prompt
-  // from the store, so a refresh/back has nothing to replay. The ref
-  // guard (set synchronously before send, keyed by conversation id) also
-  // covers StrictMode's setup→cleanup→setup double-invoke: it persists
-  // across the remount, so the second setup short-circuits and the prompt
-  // sends once — while still resetting for the next conversation, since
-  // ChatPage stays mounted across `/c/:a` → `/c/:b`.
-  useEffect(() => {
-    if (
-      !shouldSendInitialPrompt({
-        initialPrompt: initialPrompt?.prompt.text ?? null,
-        initialPromptFileCount: initialPrompt?.prompt.files?.length ?? 0,
-        promptConversationId: initialPrompt?.conversationId ?? null,
-        sentForConversationId: initialPromptSentForConvRef.current,
-        conversationId: urlConvId,
-        loadingConversation,
-        agentId,
-      })
-    ) {
-      return;
-    }
-    // TypeScript can't see through the predicate's boolean return, so
-    // re-check to narrow the types for send()/the template literal. The
-    // predicate already guarantees these, so this never fires at runtime.
-    if (initialPrompt === null || !agentId || !urlConvId) return;
-    initialPromptSentForConvRef.current = urlConvId;
-    const { send, sendSlashCommand } = useChatStore.getState();
-    dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
-  }, [initialPrompt, urlConvId, loadingConversation, agentId]);
+  const sendAgentId = initialPromptAgentId({ urlConvId: effectiveConvId, boundAgentId, agentId });
+  const dispatchFirstMessage = useCallback(
+    (prompt: PendingInitialPrompt, agent: string) => {
+      if (!effectiveConvId) return;
+      const { send, sendSlashCommand } = useChatStore.getState();
+      dispatchInitialPrompt(
+        prompt,
+        agent,
+        (text, id, files) => send(text, id, files, { pinnedConversationId: effectiveConvId }),
+        (name, args, id) =>
+          sendSlashCommand(name, args, id, { pinnedConversationId: effectiveConvId }),
+      );
+    },
+    [effectiveConvId],
+  );
+  useInitialPromptDispatch({
+    conversationId: effectiveConvId,
+    agentId: sendAgentId,
+    loadingConversation: loadingConversation || activeConversationId !== effectiveConvId,
+    dispatch: dispatchFirstMessage,
+  });
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
   // survives a re-mount of the chat surface. Declared BEFORE the
@@ -689,13 +660,15 @@ export function ChatPage() {
   // effect uses. If the user switched away before the clone started, the
   // prompt stays pinned and waits; it never floats into another session.
   useEffect(() => {
-    if (pendingResumePrompt === null || !agentId || !urlConvId) return;
-    if (pendingResumePrompt.sessionId !== urlConvId) return;
+    if (pendingResumePrompt === null || !agentId || !effectiveConvId) return;
+    if (pendingResumePrompt.sessionId !== effectiveConvId) return;
     if (runnerOnline !== true) return;
     const { text, files, replyDraft } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files, { replyDraft });
-  }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
+    void useChatStore
+      .getState()
+      .send(text, agentId, files, { replyDraft, pinnedConversationId: effectiveConvId });
+  }, [pendingResumePrompt, runnerOnline, agentId, effectiveConvId]);
 
   // A pending blocking card parks the turn, so suppress shimmer. Must sit before the
   // early returns (Rules of Hooks); a boolean selector avoids re-rendering on every
@@ -707,6 +680,13 @@ export function ChatPage() {
   // the hook is skipped on renders that hit the loading/error branches,
   // tripping React's "rendered fewer hooks than expected".
   const { session: activeSession, isLoading: sessionLoading } = useSession(sessionConvId ?? null);
+  useReportConversationShown({
+    conversationId: sessionConvId,
+    loadedSessionId: activeSession?.id,
+    activeConversationId,
+    loading: loadingConversation,
+    loadError: conversationLoadError,
+  });
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
@@ -887,10 +867,10 @@ export function ChatPage() {
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
       : (activeSession?.title ?? null);
   useEffect(() => {
-    const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
+    const fallback = effectiveConvId ? UNTITLED_CONVERSATION_LABEL : appName;
     const base = truncateTitle(activeConv?.title || sessionTabTitle || fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, sessionTabTitle, showsWorking, urlConvId, appName]);
+  }, [activeConv?.title, sessionTabTitle, showsWorking, effectiveConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const fallbackPickerKind = modelPickerKindForConv({
@@ -961,18 +941,18 @@ export function ChatPage() {
     activeSession,
     sessionLoading,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     conversationsData !== undefined,
   );
   const permissionPending = isPermissionLevelPending(
     activeSession,
     sessionLoading,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     conversationsData !== undefined,
   );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
-  const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);
+  const reconnectHostOnline = useSessionHostOnline(effectiveConvId ?? undefined);
   const {
     reconnect,
     reconnectsArca,
@@ -982,7 +962,7 @@ export function ChatPage() {
     localReconnect,
     arcaReconnect,
   } = useSessionReconnect({
-    sessionId: urlConvId ?? null,
+    sessionId: effectiveConvId ?? null,
     hostId: reconnectHostId,
     hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
     hostResumable: activeSession?.hostResumable ?? false,
@@ -994,28 +974,38 @@ export function ChatPage() {
   const sendReconnectsArca = isUnreachable && liveness.kind === "host_offline" && reconnectsArca;
 
   const onSend = useCallback(
-    (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
+    (
+      text: string,
+      files?: File[],
+      replyDraft?: StoredReplyDraft,
+      options?: ComposerSendOptions,
+    ) => {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
-      if (isTempConvId(urlConvId)) return;
+      if (isTempConvId(effectiveConvId)) return;
       // An unbound coding clone (fork-source label) needs a directory before
       // it can run: open the picker and stash this message to replay after
       // the bind. Pin the prompt to THIS session so it replays here, never
       // into a session the user may switch to first; carry any attachments
       // so the replay sends the same payload.
-      if (urlConvId && runnerOnline === false && routesToResumePicker) {
-        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [], replyDraft });
+      if (effectiveConvId && runnerOnline === false && routesToResumePicker) {
+        setPendingResumePrompt({
+          sessionId: effectiveConvId,
+          text,
+          files: files ?? [],
+          replyDraft,
+        });
         setResumeDirDialogOpen(true);
         return;
       }
       // Recover the unreachable host before dispatching another turn.
-      if (urlConvId && isUnreachable) {
+      if (effectiveConvId && isUnreachable) {
         void reconnect();
         // Posting now could record a failed turn, so the message waits for the host.
         if (sendReconnectsArca) {
           useChatStore
             .getState()
-            .enqueueMessage(text, files, replyDraft, urlConvId, { waitingForHost: true });
+            .enqueueMessage(text, files, replyDraft, effectiveConvId, { waitingForHost: true });
         }
         return;
       }
@@ -1036,15 +1026,16 @@ export function ChatPage() {
           chat.status,
           chat.sessionStatus,
           chat.queuedMessages,
-          readAlwaysSteer(),
+          readAlwaysSteer() && options?.queue !== true,
           opensSideChat,
           holdsInitialDraft(chat),
         )
       ) {
-        chat.enqueueMessage(text, files, replyDraft);
+        chat.enqueueMessage(text, files, replyDraft, effectiveConvId);
         return;
       }
       void useChatStore.getState().send(text, agentId, files, {
+        pinnedConversationId: effectiveConvId,
         replyDraft,
         onConversationCreated: (newId) => {
           // Eager URL update: the moment the server tells us this
@@ -1057,7 +1048,7 @@ export function ChatPage() {
     },
     [
       agentId,
-      urlConvId,
+      effectiveConvId,
       runnerOnline,
       routesToResumePicker,
       isUnreachable,
@@ -1072,21 +1063,30 @@ export function ChatPage() {
       if (!agentId) return;
       // Slash commands aren't replayed (an edge), but still route an unbound
       // coding clone to the directory picker so it isn't a dead end.
-      if (urlConvId && runnerOnline === false && routesToResumePicker) {
+      if (effectiveConvId && runnerOnline === false && routesToResumePicker) {
         setResumeDirDialogOpen(true);
         return;
       }
-      if (urlConvId && isUnreachable) {
+      if (effectiveConvId && isUnreachable) {
         void reconnect();
         return;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        pinnedConversationId: effectiveConvId,
         onConversationCreated: (newId) => {
           navigate(`/c/${newId}`, { replace: true });
         },
       });
     },
-    [agentId, urlConvId, runnerOnline, routesToResumePicker, isUnreachable, reconnect, navigate],
+    [
+      agentId,
+      effectiveConvId,
+      runnerOnline,
+      routesToResumePicker,
+      isUnreachable,
+      reconnect,
+      navigate,
+    ],
   );
 
   const onStop = useCallback(() => {
@@ -1096,7 +1096,7 @@ export function ChatPage() {
   // A client-only conversation has no server session to POST to yet. Keep the
   // composer editable so the user can draft the next message during creation,
   // but gate submission until the temp id is promoted below.
-  const sendDisabledReason = isTempConvId(urlConvId) ? "Starting the session…" : null;
+  const sendDisabledReason = isTempConvId(effectiveConvId) ? "Starting the session…" : null;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Opening an asleep sandbox's session presses Reconnect host for the user. The
   // snapshot's launch stage counts too: the chat store may not have loaded it yet.
@@ -1121,8 +1121,8 @@ export function ChatPage() {
     // Keep the seeded native identity through the temp-to-real ID handoff,
     // until the session snapshot can supply its wrapper label and harness.
     if (
-      isTempConvId(urlConvId) ||
-      (composerSessionModelSeeded && activeConversationId === urlConvId)
+      isTempConvId(effectiveConvId) ||
+      (composerSessionModelSeeded && activeConversationId === effectiveConvId)
     ) {
       const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
       const seededLabels: Record<string, string | null> = nativeAgent
@@ -1138,7 +1138,7 @@ export function ChatPage() {
   }, [
     activeSession,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     composerSessionHarness,
     composerSessionModelSeeded,
     activeConversationId,
@@ -1209,22 +1209,27 @@ export function ChatPage() {
 
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
-  if (urlConvId) {
+  if (effectiveConvId) {
     const promotingTempConversation =
-      isTempConvId(urlConvId) &&
+      isTempConvId(effectiveConvId) &&
       activeConversationId !== null &&
       !isTempConvId(activeConversationId);
-    if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
+    if (
+      loadingConversation ||
+      (activeConversationId !== effectiveConvId && !promotingTempConversation)
+    )
       return <HydratingPlaceholder />;
     if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+      return (
+        <ConversationLoadError conversationId={effectiveConvId} error={conversationLoadError} />
+      );
     }
   }
 
   const mainAgent = (
     <MainAgentSurface
-      conversationId={urlConvId ?? null}
-      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
+      sessionUiKey={sessionUi.key}
+      conversationId={effectiveConvId ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1277,7 +1282,7 @@ export function ChatPage() {
   // first message and silently create a session — but sessions are
   // bound 1:1 to a local runner that only the CLI can launch. Show
   // the CLI instructions instead so users learn the right entry point.
-  if (!urlConvId) return <NewChatLandingScreen />;
+  if (!effectiveConvId) return <NewChatLandingScreen />;
 
   // Pick the reconnect dialog's state from the session's host binding, not
   // from liveness: the dialog opens both from an unreachable send AND from the
@@ -1298,7 +1303,7 @@ export function ChatPage() {
         onOpenChange={setDialogOpen}
         localReconnect={localReconnect}
         arcaReconnect={arcaReconnect}
-        conversationId={urlConvId}
+        conversationId={effectiveConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}
         harness={activeSession?.harness}
@@ -1316,7 +1321,7 @@ export function ChatPage() {
         <ResumeWithDirectoryDialog
           open={resumeDirDialogOpen}
           onOpenChange={setResumeDirDialogOpen}
-          sessionId={urlConvId}
+          sessionId={effectiveConvId}
           // Fork clone prefills from its source; a host-less session has none
           // and prefills from its own recorded host/workspace/branch instead.
           sourceSessionId={isUnboundFork ? forkSourceId : null}
@@ -1361,6 +1366,7 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 }
 
 interface MainAgentSurfaceProps {
+  sessionUiKey: number;
   onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
@@ -1368,7 +1374,6 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
-  hostId: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1387,7 +1392,12 @@ interface MainAgentSurfaceProps {
   liveness: SessionLiveness;
   agentsError: unknown;
   disabled: boolean;
-  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  onSend: (
+    text: string,
+    files?: File[],
+    replyDraft?: StoredReplyDraft,
+    options?: ComposerSendOptions,
+  ) => void;
   /**
    * Invoke a skill via the `slash_command` event path. Gated off inside
    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
@@ -1563,8 +1573,8 @@ export function updateWarmTerminalSurfaces(
  * see ViewModeToggle) so the user can flip back to Chat.
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+  sessionUiKey,
   conversationId,
-  hostId,
   status,
   isWorking,
   showsWorking,
@@ -1625,6 +1635,12 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // including stopped/resumable sessions, and the connection indicator
   // remains below it for offline sessions.
   const showTerminal = shouldShowTerminalSurface(conversationId, terminalFirst, runnerOnline);
+  // With the panes view, a split beside the chat stays on screen in Chat, the chat in its pane.
+  const {
+    inPanes: chatInPanes,
+    host: chatPaneHost,
+    marked: chatMarked,
+  } = useChatInPanes(conversationId, !showTerminal);
   useMessageDeepLinkChatView(conversationId);
 
   // All hook calls below must run on every render regardless of
@@ -1801,6 +1817,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // Hidden overlays retain layout so FitAddon geometry stays stable; the chat
   // surface unmounts while Terminal is shown.
   const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
+  // As MainTerminalSurface reads it: floating panes leave a hidden split's tab drop preview here.
+  const floatingPanesShown = useFloatingPanesShown();
   // Non-owners attach read-only: a shared PTY can't attribute input
   // per-user, so only the owner may type. They drive the agent via the
   // composer instead. Server enforces this too.
@@ -1835,7 +1853,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   }, [conversationId, liveness.kind, onShowReconnectHelp]);
   const terminalSurfaces = renderedTerminals.map((entry) => {
     const isActive = mountTerminal && entry.conversationId === conversationId;
-    const isShown = isActive && showTerminal;
+    const isShown = isActive && (showTerminal || chatInPanes);
     return (
       <div
         key={entry.conversationId}
@@ -1844,7 +1862,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
         className={cn("absolute inset-0 flex flex-col", !isShown && "invisible opacity-0")}
         aria-hidden={!isShown}
       >
-        <MainTerminalView
+        <MainTerminalSurface
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
           visible={isShown}
@@ -1855,8 +1873,10 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
           splittable
+          chatShown={isActive && !showTerminal}
         />
-        {isShown && (
+        {/* With the chat in its pane, the chat's own indicator shows below it. */}
+        {isShown && !chatInPanes && (
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         )}
       </div>
@@ -1864,6 +1884,18 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   });
 
   const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
+  // A gadget's Reply and Ask in side chat land here like the transcript's own; the
+  // terminal view switches to chat first.
+  useGadgetComposerQuotes(conversationId ?? null, (quote) =>
+    takeGadgetComposerQuote(quote, {
+      permissionPending: !!permissionPending,
+      composerReadOnly,
+      showTerminal,
+      showChat: () => terminalFirst?.setView("chat"),
+      composer: composerRef.current,
+      sideChat: supportsSideChat(selectionSessionHarness, canStartSideChat),
+    }),
+  );
 
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
@@ -1873,14 +1905,17 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   return (
     <>
       {terminalSurfaces}
+      {/* A tab dragged over a chat shown alone: its panes wait hidden, so it previews here. */}
+      {floatingPanesShown && !showTerminal && !chatInPanes && conversationId && mountTerminal && (
+        <LoneChatPaneDropPreview conversationId={conversationId} />
+      )}
       {!showTerminal && (
-        <>
+        <ChatPaneBody sessionId={conversationId ?? ""} host={chatPaneHost} marked={chatMarked}>
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
             <Transcript
-              hostId={hostId}
               setConversationEl={setConversationEl}
               containerEl={containerEl}
               scroller={scroller}
@@ -1900,6 +1935,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           structurally non-interactive session), as SideChatPane does. */}
           {!composerReadOnly && (
             <SelectionPopup
+              key={`selection:${sessionUiKey}`}
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
               onAskInSideChat={
@@ -1911,6 +1947,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           )}
 
           <Composer
+            key={sessionUiKey}
             ref={composerRef}
             disabled={disabled}
             status={status}
@@ -1965,7 +2002,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           Sits below the composer so its position is consistent with the
           terminal view. */}
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
-        </>
+        </ChatPaneBody>
       )}
     </>
   );
@@ -2024,11 +2061,45 @@ export function ConversationLoadError({
   );
 }
 
+/**
+ * Adds a quote a gadget queued for this session's composer, as Reply and Ask in side chat do
+ * for a transcript selection. False keeps it queued, to be tried on a later render.
+ */
+export function takeGadgetComposerQuote(
+  quote: GadgetComposerQuote,
+  page: {
+    /** The session's permissions are still loading; a loaded session without any isn't. */
+    permissionPending: boolean;
+    composerReadOnly: boolean;
+    showTerminal: boolean;
+    showChat: () => void;
+    composer: Pick<ComposerHandle, "appendReplyQuote" | "canTakeQuote" | "startSideChat"> | null;
+    sideChat: boolean;
+  },
+): boolean {
+  if (page.permissionPending) return false;
+  // A read-only session can't use the quote, so it isn't kept.
+  if (page.composerReadOnly) return true;
+  if (page.showTerminal) {
+    page.showChat();
+    return false;
+  }
+  // The composer restores this session's saved draft first, which would replace the quote.
+  if (!page.composer?.canTakeQuote()) return false;
+  // A composer that can't take it yet (offline, read-only) keeps the quote queued.
+  if (quote.kind === "side_chat" && page.sideChat) return page.composer.startSideChat(quote.text);
+  return page.composer.appendReplyQuote(quote.text);
+}
+
 interface ComposerHandle {
-  appendReplyQuote: (text: string) => void;
+  /** Whether the quote went in; a blocked composer refuses it. */
+  appendReplyQuote: (text: string) => boolean;
+  /** Whether a quote added now stays: this session's saved draft has been restored. */
+  canTakeQuote: () => boolean;
   /** Load a sent message into the composer, confirming before replacing a draft. */
   editSentMessage: (message: SentMessage) => void;
-  startSideChat: (selectedText: string) => void;
+  /** Quote in a side chat; whether the quote was taken (not while offline or read-only). */
+  startSideChat: (selectedText: string) => boolean;
   /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
   focus: () => void;
 }
@@ -2039,7 +2110,12 @@ interface ComposerProps {
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
   disabled: boolean;
-  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  onSend: (
+    text: string,
+    files?: File[],
+    replyDraft?: StoredReplyDraft,
+    options?: ComposerSendOptions,
+  ) => void;
   /**
    * Send a recognised skill as a `slash_command` event (the REPL's wire
    * shape) instead of plaintext. When present and the typed command names
@@ -2422,19 +2498,24 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  const composerEngine = useRequestedComposerEngine();
+  // On the CodeMirror engine the whole draft is one document; ChatComposer says when it switches.
   const {
     draft,
     value,
     setValue,
     fullText,
     storedReplyDraft,
+    replyDocument,
+    setReplyDocument,
+    setSingleDocument,
     activeTextId,
     focusText,
     editText,
     replaceText,
     appendQuote,
     removeQuote,
-  } = useReplyDraft();
+  } = useReplyDraft(composerEngine === "codemirror");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   useDismissOnEscape(commandError !== null, () => setCommandError(null));
@@ -2516,14 +2597,53 @@ function ComposerImpl(
     setTailTextareaNode(element);
     if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
   }, []);
-  const composerEngine = useRequestedComposerEngine();
   // An engine switch replaces every input; keep the active one current even without focus.
   const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
     textareaRef.current = target;
   }, []);
+  // A take in the one document: the document before it, the one dictation last left, and
+  // whether anything else edited it since. See onVoiceDiscard.
+  const voiceTakeRef = useRef<{ before: string; last: string; clean: boolean } | null>(null);
+  // Set while dictation writes through the editor, so its own change doesn't count as another edit.
+  const writingDictationRef = useRef(false);
+  // In the one document dictation writes through the editor, so its card rules apply.
+  // Only a final is an undo step, so undo takes back a whole utterance and never shows a partial.
+  const writeDictation = (
+    next: string,
+    change: { from: number; to: number; insert: string },
+    final: boolean,
+  ) => {
+    const target = textareaRef.current;
+    if (replyDocument === null) return setValue(next);
+    if (!target || isComposerTextarea(target)) {
+      // No editor to apply the card rules, so the document is settled here.
+      const settled = settleQuoteLines(next);
+      setReplyDocument(settled);
+      return settled;
+    }
+    const take = voiceTakeRef.current;
+    if (take && target.value !== take.last) take.clean = false;
+    writingDictationRef.current = true;
+    try {
+      target.insertText(change.insert, change.from, change.to, { history: final });
+    } finally {
+      writingDictationRef.current = false;
+    }
+    if (take) take.last = target.value;
+    return target.value;
+  };
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(value, setValue, textareaRef);
+  const dictation = useDictationInsert(
+    replyDocument ?? value,
+    writeDictation,
+    textareaRef,
+    // The editor holds the whole document, and a keystroke there can beat its render.
+    () => {
+      const target = textareaRef.current;
+      return replyDocument !== null && target && !isComposerTextarea(target) ? target.value : null;
+    },
+  );
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -2583,6 +2703,12 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  useStopResponsePaletteCommand({
+    conversationId: composerSessionId,
+    working: isWorking,
+    readOnly: isReadOnly,
+    stop: onStop,
+  });
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
@@ -2714,7 +2840,20 @@ function ComposerImpl(
   const hasQueuedComposerMessages = composerQueuedMessages.length > 0;
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
-  const openComposerGithubTab = useOpenGithubTab();
+  const openGithubTab = useOpenGithubTab();
+  const tabsSidebar = useTabsSidebar();
+  const lonePrUrl =
+    composerGit.prCount === 1 && composerGit.prs.length === 1 ? composerGit.prs[0]!.url : null;
+  // The tabs sidebar shows a lone PR in its own tab; the classic panel shows it by itself
+  // and keeps the section it was on, so it gets the plain open.
+  const openComposerGithubTab = useMemo(() => {
+    if (!openGithubTab) return null;
+    return (prUrl?: string) => {
+      const url = prUrl ?? (tabsSidebar ? lonePrUrl : null);
+      if (url) openGithubTab(url);
+      else openGithubTab();
+    };
+  }, [openGithubTab, tabsSidebar, lonePrUrl]);
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
   let permissionKind: PermissionChipKind = "codex";
@@ -2829,6 +2968,12 @@ function ComposerImpl(
   const preventsKeyboardSubmit = isMobile;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
+  // Mobile moves a bound host's button, with its Reconnect host item, into the
+  // header; a session with no host still reconnects from the banner below.
+  const offlinePlaceholder =
+    isMobile && composerSession?.hostId
+      ? "Session offline — reconnect from the host menu"
+      : "Session offline — reconnect below to continue";
 
   // Ctrl+Shift+L focuses the composer input from anywhere in the session view.
   // No-op on mobile, where programmatic focus would pop the software keyboard.
@@ -2836,6 +2981,11 @@ function ComposerImpl(
     if (!isMobileRef.current) textareaRef.current?.focus({ preventScroll: true });
   });
 
+  // Filled in once useMentionBrowser is set up below.
+  const attachPastedFilesRef = useRef<
+    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => File[]
+  >(() => []);
+  const chipTokensRef = useRef<() => readonly string[]>(() => []);
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
   // callbacks so the hook never learns about sessions or focus.
@@ -2846,6 +2996,7 @@ function ComposerImpl(
     removeFile,
     replaceFiles,
     restoreFiles,
+    appendFiles,
     onPaste,
     clearError,
     clear: clearAttachments,
@@ -2860,9 +3011,16 @@ function ComposerImpl(
     onRemoved: () => {
       dirtyRef.current = true;
     },
+    onPasteChips:
+      composerEngine === "codemirror"
+        ? (pasted, target, trayFiles) => attachPastedFilesRef.current(pasted, target, trayFiles)
+        : undefined,
+    chipTokens: () => chipTokensRef.current(),
   });
   const filesRef = useRef(files);
   filesRef.current = files;
+  // What a saved draft carries: the tray plus the live chips, which leave the composer as tray files.
+  const draftFilesRef = useRef<File[]>([]);
   // The restore effects below key off conversation state and reach the
   // attachment actions through a ref rather than widening their dependency
   // lists.
@@ -2897,7 +3055,7 @@ function ComposerImpl(
       if (!conversationId || !dirtyRef.current) return;
       setSessionDraft(conversationId, {
         text: valueRef.current,
-        files: filesRef.current,
+        files: draftFilesRef.current,
         replyDraft: replyDraftRef.current,
         mentions: taggedMentionsRef.current,
       });
@@ -2940,7 +3098,7 @@ function ComposerImpl(
     if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
     setSessionDraft(conversationId, {
       text: fullText,
-      files,
+      files: draftFilesRef.current,
       replyDraft: storedReplyDraft,
       // Tagging always edits the text too, so fullText re-runs this effect.
       mentions: taggedMentionsRef.current,
@@ -3027,7 +3185,7 @@ function ComposerImpl(
   }, [conversationId]);
   useEffect(() => {
     if (!canStartWorkflow || composerSessionId === null) return;
-    return registerStartWorkflow(composerSessionId, () => openWorkflowDialog());
+    return registerStartWorkflow(composerSessionId, openWorkflowDialog);
   }, [canStartWorkflow, composerSessionId, openWorkflowDialog]);
   useEffect(() => {
     if (!canSaveWorkflow || composerSessionId === null) return;
@@ -3176,9 +3334,15 @@ function ComposerImpl(
     attachMention,
     openMentionDir,
     mentionedSessions,
-    setMentionedSessions,
     attachSession,
+    attachPastedFiles,
+    mentionedAttachments,
     mentionTokens,
+    tagFiles,
+    ownedMentionTokens,
+    ownedChipTokens,
+    resetMentions,
+    noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
@@ -3194,6 +3358,7 @@ function ComposerImpl(
     },
     textareaRef,
     isMobile,
+    onDemoteChips: appendFiles,
     segments: [draft.text, ...draft.quotes.map((quote) => quote.before)],
   });
 
@@ -3201,13 +3366,28 @@ function ComposerImpl(
   // Tagged items whose token is still in the draft; deleting a token untags it.
   const liveMentions = useMemo(
     () =>
-      presentMentions(composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness), [
-        draft.text,
-        ...draft.quotes.map((quote) => quote.before),
-      ]),
-    [mentionedItems, mentionedSessions, sessionHarness, draft],
+      presentMentions(
+        composerInlineMentions(
+          { files: mentionedItems, sessions: mentionedSessions, attachments: mentionedAttachments },
+          sessionHarness,
+        ),
+        [draft.text, ...draft.quotes.map((quote) => quote.before)],
+      ),
+    [mentionedItems, mentionedSessions, mentionedAttachments, sessionHarness, draft],
   );
   const hasMentions = liveMentions.length > 0;
+  attachPastedFilesRef.current = attachPastedFiles;
+  chipTokensRef.current = ownedChipTokens;
+  // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the draft.
+  // Chips are read from the same live scan as liveMentions, so an overlapping longer token counts once.
+  const liveTokens = new Set(liveMentions.map((liveMention) => liveMention.token));
+  const attachedFiles = [
+    ...files,
+    ...mentionedAttachments
+      .filter((attachment) => liveTokens.has(attachment.token))
+      .map((attachment) => attachment.file),
+  ];
+  draftFilesRef.current = attachedFiles;
   const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
   // Review comments are appended at send, which can make a bare `!` a command.
   const outgoingClassifyText = useMemo(
@@ -3221,10 +3401,13 @@ function ComposerImpl(
   const highlight = useComposerHighlight({
     value,
     commandNames: slashCommandNames,
-    anyCaseCommandNames: anyCaseBuiltinNames,
-    enabled: draft.quotes.length === 0 && files.length === 0,
+    // With context the text goes out as typed, so only exact-case commands run.
+    anyCaseCommandNames: carriesMessageContext(draft, attachedFiles, sendContext)
+      ? []
+      : anyCaseBuiltinNames,
+    enabled: draft.quotes.length === 0 && attachedFiles.length === 0,
     // Files go out as separate blocks, so the message is no longer a lone `!` text.
-    shellEnabled: files.length === 0,
+    shellEnabled: attachedFiles.length === 0,
     nativeShell,
     refusedNativeShell: permissionPending
       ? null
@@ -3236,7 +3419,10 @@ function ComposerImpl(
     sendContext: { ...sendContext, quotes: draft.quotes },
   });
   const hasDraft =
-    fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
+    fullText.trim().length > 0 ||
+    attachedFiles.length > 0 ||
+    hasMentions ||
+    localReviewComments.length > 0;
   const showInterruptButton =
     isWorking &&
     (!hasDraft ||
@@ -3246,38 +3432,19 @@ function ComposerImpl(
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // tagged items and inline tokens, deduping against what's already tagged,
-  // then clear the store queue so they aren't re-applied. Placed after
-  // ``useMentionBrowser`` since it owns ``setMentionedItems``.
+  // then clear the store queue so they aren't re-applied.
   taggedMentionsRef.current = { files: mentionedItems, sessions: mentionedSessions };
-  restoreTaggedMentionsRef.current = (mentions) => {
-    setMentionedItems(mentions?.files ?? []);
-    setMentionedSessions(mentions?.sessions ?? []);
-  };
+  restoreTaggedMentionsRef.current = resetMentions;
   // Read at drain time without re-running the effect on every keystroke.
-  const mentionedItemsRef = useRef(mentionedItems);
-  mentionedItemsRef.current = mentionedItems;
-  const mentionTokensRef = useRef(mentionTokens);
-  mentionTokensRef.current = mentionTokens;
+  const tagFilesRef = useRef(tagFiles);
+  tagFilesRef.current = tagFiles;
+  const ownedMentionTokensRef = useRef(ownedMentionTokens);
+  ownedMentionTokensRef.current = ownedMentionTokens;
   useEffect(() => {
     if (pendingComposerAttachments.length === 0) return;
-    // Dedup against already-tagged items AND within this batch, and give each
-    // new item a token no tagged file or session already uses.
-    const known = new Map(mentionedItemsRef.current.map((it) => [composerAttachmentKey(it), it]));
-    const taken = [...mentionTokensRef.current];
-    const fresh: MentionItem[] = [];
-    const tokens: string[] = [];
-    for (const attachment of pendingComposerAttachments) {
-      const key = composerAttachmentKey(attachment);
-      let item = known.get(key);
-      if (!item) {
-        item = { ...attachment, token: newFileMentionToken(attachment, taken) };
-        known.set(key, item);
-        fresh.push(item);
-        taken.push(fileMentionToken(item));
-      }
-      tokens.push(fileMentionToken(item));
-    }
-    if (fresh.length > 0) setMentionedItems((prev) => [...prev, ...fresh]);
+    const tokens = tagFilesRef.current(pendingComposerAttachments);
+    // The hook's own scan set, released spellings included, so both agree on what's present.
+    const taken = [...ownedMentionTokensRef.current(), ...tokens];
     // Each attachment lands as an inline token at the end of the draft.
     editText(null, (prev) => {
       // Scan with every known token at once, longest first, so a file token is
@@ -3297,8 +3464,7 @@ function ComposerImpl(
     // the next-mounted composer doesn't drain a stale chip. ``switchTo`` also
     // resets the queue, but this closes the non-switch unmount paths too.
     return () => useChatStore.getState().clearPendingComposerAttachments();
-    // setMentionedItems is a stable useState setter (from useMentionBrowser).
-  }, [pendingComposerAttachments, setMentionedItems, editText]);
+  }, [pendingComposerAttachments, editText]);
 
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
@@ -3364,6 +3530,7 @@ function ComposerImpl(
       filesRef.current.every((f) => restoredSendDraft.files.includes(f));
     if (valueRef.current !== expected || !filesUnedited) return;
     replaceText("");
+    restoreTaggedMentionsRef.current(undefined);
     attachmentsRef.current.replaceFiles([]);
     dirtyRef.current = false;
     if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
@@ -3782,7 +3949,7 @@ function ComposerImpl(
     mobile: isMobile,
     mobileEnterCompletes: false,
     escapeClearsOnlyWithContent: true,
-    allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
+    allowOpen: inputFocused && draft.quotes.length === 0 && attachedFiles.length === 0,
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
     clearText: () => setValue(""),
@@ -3887,14 +4054,24 @@ function ComposerImpl(
   });
 
   const replyQuoteInsertedRef = useRef(false);
+  // A quote a gadget queued while this composer couldn't take one (its draft still
+  // restoring, a Quick Answer open, the host unreachable) is tried again once it can.
+  const canTakeQuoteNow = settledConversationId === conversationId && !inputDisabled;
+  useEffect(() => {
+    if (canTakeQuoteNow) retryGadgetComposerQuotes();
+  }, [canTakeQuoteNow]);
   useImperativeHandle(ref, () => ({
     focus() {
       if (isMobileRef.current || composerLockedByBtw) return;
       textareaRef.current?.focus({ preventScroll: true });
     },
+    canTakeQuote() {
+      // The saved draft must be restored first, or it would replace the quote.
+      return settledConversationId === conversationId && !composerLockedByBtw;
+    },
     appendReplyQuote(text) {
       const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
-      if (blocked || composerLockedByBtw || !text.trim()) return;
+      if (blocked || composerLockedByBtw || !text.trim()) return false;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
@@ -3903,6 +4080,7 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+      return true;
     },
     editSentMessage(message) {
       editSentMessage(message);
@@ -3912,7 +4090,7 @@ function ComposerImpl(
       // A pending tab creates its fork only when the user sends.
       const sourceId = useChatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
-        return;
+        return false;
       }
       const store = useChatStore.getState();
       const target = store.sideChatSelectionTarget;
@@ -3924,6 +4102,7 @@ function ComposerImpl(
       } else {
         store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
       }
+      return true;
     },
   }));
 
@@ -3933,8 +4112,10 @@ function ComposerImpl(
     replyQuoteInsertedRef.current = false;
     const textarea = tailTextareaRef.current;
     if (!textarea) return;
+    // Under the new card, set before focus, or the editor would take focus at its start.
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
     if (!isMobileRef.current) textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(0, 0);
+    if (!isComposerTextarea(textarea)) textarea.revealCaret();
     const inputArea = composerTargetElement(textarea).closest("[data-composer-input-area]");
     if (inputArea) inputArea.scrollTop = inputArea.scrollHeight;
     onGrowthRef.current?.();
@@ -3966,13 +4147,17 @@ function ComposerImpl(
 
   const submit = ({
     resetNativeInputSession = false,
-  }: { resetNativeInputSession?: boolean } = {}) => {
+    queue = false,
+  }: { resetNativeInputSession?: boolean } & ComposerSendOptions = {}) => {
     // The /btw overlay locks the composer — never send while it's open.
     if (composerLockedByBtw) return;
     const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
-      (!trimmed && files.length === 0 && !hasMentions && localReviewComments.length === 0) ||
+      (!trimmed &&
+        attachedFiles.length === 0 &&
+        !hasMentions &&
+        localReviewComments.length === 0) ||
       disabled ||
       sendDisabledReason !== null ||
       hasPendingElicitation
@@ -3991,7 +4176,7 @@ function ComposerImpl(
     const opensGenericSideChat =
       cmd === "/side" &&
       !usesNativeSideChatFork(sessionHarness) &&
-      !carriesMessageContext(draft, files, sendContext) &&
+      !carriesMessageContext(draft, attachedFiles, sendContext) &&
       (skill === null || skill.command === parts[0]);
     if (
       opensGenericSideChat &&
@@ -4038,7 +4223,7 @@ function ComposerImpl(
     let goalMessage: string | null = null;
     if (
       (skill !== null || isSlashCommandText(trimmed)) &&
-      !carriesMessageContext(draft, files, sendContext)
+      !carriesMessageContext(draft, attachedFiles, sendContext)
     ) {
       const arg = parts[1] ?? "";
       const sendSkill = (match: { command: string; args: string }) => {
@@ -4133,18 +4318,20 @@ function ComposerImpl(
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
     if (trimmed) appendEntry(fullText, storedReplyDraft);
-    const sendFiles = files.length > 0 ? files : undefined;
-    if (draft.quotes.length > 0) {
+    const sendFiles = attachedFiles.length > 0 ? attachedFiles : undefined;
+    if (queue) {
+      onSend(outgoing.text, sendFiles, outgoing.replyDraft, { queue });
+    } else if (draft.quotes.length > 0) {
       onSend(outgoing.text, sendFiles, outgoing.replyDraft);
     } else {
       onSend(outgoing.text, sendFiles);
-      if (goalMessage) refreshGoalAfterActivity();
     }
+    if (draft.quotes.length === 0 && goalMessage) refreshGoalAfterActivity();
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
+    // Reset first: a chip the reset drops goes to the tray, which the clear then empties.
+    resetMentions();
     clearAttachments();
-    setMentionedItems([]);
-    setMentionedSessions([]);
     if (conversationId) clearLocalReviewContexts(conversationId);
     setMention(null);
   };
@@ -4229,8 +4416,7 @@ function ComposerImpl(
   const restoreRecalledText = (text: string, replyDraft?: StoredReplyDraft) => {
     const recalled = recallComposerDraft(text, replyDraft);
     replaceText(recalled.text, recalled.replyDraft);
-    setMentionedSessions(recalled.sessions);
-    setMentionedItems([]);
+    resetMentions({ files: [], sessions: recalled.sessions });
   };
 
   const applyRecall = (ta: ComposerTextTarget, recalled: ComposerDraft) => {
@@ -4249,7 +4435,10 @@ function ComposerImpl(
 
   // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
   const composerEmptyForRecall =
-    fullText === "" && files.length === 0 && !hasMentions && localReviewComments.length === 0;
+    fullText === "" &&
+    attachedFiles.length === 0 &&
+    !hasMentions &&
+    localReviewComments.length === 0;
   // The queued row ↑ recalls: the queue tail, only while the composer takes input and
   // is empty and quote-free.
   const arrowUpRecallQueueId =
@@ -4265,12 +4454,16 @@ function ComposerImpl(
       shouldSteerAllFromKeyboard,
     }: ComposerKeyIntent,
   ) => {
-    // Mod+Enter (Mod+Shift+Enter when Mod+Enter is already the send chord)
-    // steers everything: the draft, if any, is submitted first so it joins the
-    // queue tail (or sends directly when idle), then every queued message is
-    // sent into the running turn in FIFO order instead of draining one per idle.
+    // Mod+Enter inverts Always steer mid-turn: with it on, the draft waits in the
+    // queue; otherwise the draft joins the queue tail (or sends when idle) and the
+    // whole queue is steered into the running turn.
     if (conversationId !== null && !hasPendingElicitation && shouldSteerAllFromKeyboard) {
       e.preventDefault();
+      // An empty composer has nothing to queue, so it still steers the backlog.
+      if (hasDraft && isWorking && readAlwaysSteer()) {
+        if (!mentionListingPending) submit({ queue: true });
+        return;
+      }
       if (!mentionListingPending) submit();
       // While unreachable the queue waits for the host, so nothing is steered.
       if (!unreachable) steerAllQueuedMessages(conversationId);
@@ -4318,7 +4511,7 @@ function ComposerImpl(
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isWorking && !isReadOnly) {
+    if (e.key === "Escape" && canStopResponse({ working: isWorking, readOnly: isReadOnly })) {
       e.preventDefault();
       onStop();
       return;
@@ -4333,7 +4526,9 @@ function ComposerImpl(
       !e.altKey
     ) {
       const ta = e.currentTarget;
-      if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+      // In the one document the caret's top is under any cards that open it.
+      const top = replyDocument === null ? 0 : quoteTextStart(ta.value);
+      if (e.key === "ArrowUp" && ta.selectionStart === top) {
         // Empty-composer recall takes the last queued row before browsing history.
         if (composerEmptyForRecall) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
@@ -4363,8 +4558,12 @@ function ComposerImpl(
 
   const handleTextChange = (id: string | null, e: ComposerInputEvent) => {
     const input = e.currentTarget;
+    noteMentionTextChange(e);
     slashCompletion.onSelectionChange(input);
-    editText(id, input.value);
+    // Any edit but dictation's own keeps the take from being discarded, even one undone by hand.
+    if (voiceTakeRef.current && !writingDictationRef.current) voiceTakeRef.current.clean = false;
+    if (replyDocument !== null) setReplyDocument(input.value);
+    else editText(id, input.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
@@ -4495,7 +4694,7 @@ function ComposerImpl(
       <ChatComposer
         appearance={isMobile ? "glass" : "default"}
         hasContent={
-          files.length > 0 ||
+          attachedFiles.length > 0 ||
           hasMentions ||
           attachmentError !== null ||
           commandError !== null ||
@@ -4515,9 +4714,11 @@ function ComposerImpl(
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
+        onRenderedEngineChange={(engine) => setSingleDocument(engine === "codemirror")}
         input={{
           ref: bindTailTextarea,
-          value: draft.text,
+          value: replyDocument ?? draft.text,
+          replyQuotes: true,
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
@@ -4545,7 +4746,7 @@ function ComposerImpl(
               : isReadOnly
                 ? "You have read-only access to this session"
                 : unreachable && !sendReconnectsArca && sendDisabledReason === null
-                  ? "Session offline — reconnect below to continue"
+                  ? offlinePlaceholder
                   : hasPendingElicitation
                     ? "Respond to the pending request above to continue"
                     : disabled && sendDisabledReason === null
@@ -4554,7 +4755,7 @@ function ComposerImpl(
                         ? "Send a follow-up (queued) — Esc to stop"
                         : readyPlaceholder,
           rows: 1,
-          heightMode: draft.quotes.length > 0 ? "unbounded" : "compact",
+          heightMode: draft.quotes.length > 0 && replyDocument === null ? "unbounded" : "compact",
           disabled: inputDisabled,
           "data-slash-command": highlight.input["data-slash-command"],
           "data-shell-command": highlight.input["data-shell-command"],
@@ -4566,7 +4767,7 @@ function ComposerImpl(
         }}
         slots={{
           inputPrefix:
-            draft.quotes.length > 0 ? (
+            draft.quotes.length > 0 && replyDocument === null ? (
               <ReplyDraftBlocks
                 quotes={draft.quotes}
                 activeTextId={activeTextId}
@@ -4684,9 +4885,7 @@ function ComposerImpl(
                   <div className="mb-2">
                     <p className="mb-1 text-xs text-muted-foreground">Answer:</p>
                     <div className="prose prose-sm dark:prose-invert max-w-none text-sm">
-                      <FilePathAwareMessageResponse mode="static">
-                        {btwSidechat.answer}
-                      </FilePathAwareMessageResponse>
+                      <BtwSidechatAnswer answer={btwSidechat.answer} />
                     </div>
                   </div>
                   {btwSidechat.truncated && (
@@ -4725,6 +4924,7 @@ function ComposerImpl(
                   disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw
                 }
                 onAttach={() => fileInputRef.current?.click()}
+                paletteSource={composerSessionId ? `composer:${composerSessionId}` : undefined}
                 showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
                 onGoal={() => setGoalDialogOpen(true)}
                 goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
@@ -4769,7 +4969,7 @@ function ComposerImpl(
                 onOpen={savedWorkflows.refresh}
               />
               {!subAgentLabel && composerSessionId && (
-                <MobileHeaderControlPortal sessionId={composerSessionId}>
+                <MobileHeaderControlPortal sessionId={composerSessionId} popoverSlot="host">
                   <HostBadge
                     sessionId={composerSessionId}
                     appearance={isMobile ? "header" : "composer"}
@@ -4785,31 +4985,40 @@ function ComposerImpl(
                 </MobileHeaderControlPortal>
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
-                <ComposerPermissionPicker
-                  label="Permission mode"
-                  value={permissionLabel || "Permission mode"}
-                  harness={sessionHarness}
-                  selectedValue={selectedPermissionMode}
-                  options={permissionOptions}
-                  disabled={!permissionControlInteractive || configBusy}
-                  disabledReason={
-                    isOwnerLevel(permissionLevel)
-                      ? undefined
-                      : "Only the session owner can change the permission mode"
-                  }
-                  // The message box takes ⇧Tab, so not while it's disabled.
-                  shortcut={
-                    nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
-                  }
-                  onSelect={(mode) => void changePermission(mode)}
-                  openNonce={permissionPickerOpenNonce}
-                />
+                <SessionControlPortal
+                  sessionId={composerSessionId}
+                  slot="permission"
+                  offered={composerSessionId !== null}
+                >
+                  <ComposerPermissionPicker
+                    label="Permission mode"
+                    value={permissionLabel || "Permission mode"}
+                    harness={sessionHarness}
+                    selectedValue={selectedPermissionMode}
+                    options={permissionOptions}
+                    disabled={!permissionControlInteractive || configBusy}
+                    disabledReason={
+                      isOwnerLevel(permissionLevel)
+                        ? undefined
+                        : "Only the session owner can change the permission mode"
+                    }
+                    // The message box takes ⇧Tab, so not while it's disabled.
+                    shortcut={
+                      nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
+                    }
+                    onSelect={(mode) => void changePermission(mode)}
+                    openNonce={permissionPickerOpenNonce}
+                  />
+                </SessionControlPortal>
               )}
             </>
           ),
           trailing: (
             <>
-              <MobileHeaderControlPortal sessionId={composerSessionId}>
+              <MobileHeaderControlPortal
+                sessionId={composerSessionId}
+                popoverSlot={composerSessionId === null ? undefined : "harness"}
+              >
                 <div className="flex min-w-0 items-center rounded-lg">
                   <SessionHarnessPicker
                     appearance={isMobile ? "header" : "composer"}
@@ -4818,6 +5027,22 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    renderIcon={(icon) => (
+                      <SessionControlPortal
+                        sessionId={composerSessionId}
+                        slot="icon"
+                        inPlace={false}
+                        offered={composerSessionId !== null}
+                      >
+                        {icon}
+                      </SessionControlPortal>
+                    )}
+                    paletteSettingsSource={
+                      composerSessionId &&
+                      isFeatureEnabled(composerServerInfo, "quick_pick_palette")
+                        ? `composer:${composerSessionId}`
+                        : undefined
+                    }
                     {...sessionHarnessPicker}
                   />
                 </div>
@@ -4827,14 +5052,43 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
+                  dictation.release();
                   voiceSnapshotRef.current = value;
+                  voiceTakeRef.current =
+                    replyDocument === null
+                      ? null
+                      : { before: replyDocument, last: replyDocument, clean: true };
                 }}
                 onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
+                  const take = voiceTakeRef.current;
+                  voiceTakeRef.current = null;
+                  // A take belongs to the engine it began on; after a switch the draft stays.
+                  if (replyDocument === null) {
+                    if (take === null) setValue(voiceSnapshotRef.current);
+                    return;
+                  }
+                  // Only a take nothing else edited goes back, so a quote or edit made in it stays.
+                  const untouched = take?.clean && textareaRef.current?.value === take.last;
+                  if (untouched && take.last !== take.before) setReplyDocument(take.before);
                 }}
-                onListeningChange={setDictating}
+                onListeningChange={(listening) => {
+                  setDictating(listening);
+                  // However a take ends, a partial it leaves is the user's text from now on.
+                  if (!listening) dictation.release();
+                  // A take leaves focus on the mic button, where the editor's undo and redo keys
+                  // don't reach; give it back to the editor once the take ends.
+                  const active = document.activeElement;
+                  const onOwnButton =
+                    active instanceof HTMLButtonElement &&
+                    composerFormRef.current?.contains(active);
+                  if (!listening && replyDocument !== null && onOwnButton && !isMobileRef.current) {
+                    textareaRef.current?.focus({ preventScroll: true });
+                  }
+                }}
                 inputRef={textareaRef}
                 onTranscript={(text) => {
+                  // In the editor the partial goes first, so the final is inserted as one step.
+                  if (replyDocument !== null) dictation.replaceInterim("");
                   dictation.appendFinal(text);
                   dirtyRef.current = true;
                   // Dictation is a user-driven edit — exit prompt-recall mode
@@ -5073,11 +5327,6 @@ export function computeShowsWorking(
  *   consumed for, or ``null``. Must equal ``conversationId`` — a mismatch
  *   means the user switched sessions before the auto-send fired, so the
  *   prompt would leak into the now-active session.
- * @param params.sentForConversationId The conversation id the guard ref
- *   already auto-sent for, or ``null``. When it equals ``conversationId``
- *   the prompt was already dispatched for this session and must not
- *   resend; a different id (a later new chat reusing the mounted
- *   ChatPage) does not block.
  * @param params.conversationId Active session id from the URL, or
  *   ``null``/``undefined`` on the new-chat landing, e.g. ``"conv_abc"``.
  * @param params.loadingConversation ``true`` while the snapshot hydrates.
@@ -5089,7 +5338,6 @@ export function shouldSendInitialPrompt(params: {
   initialPrompt: string | null;
   initialPromptFileCount: number;
   promptConversationId: string | null;
-  sentForConversationId: string | null;
   conversationId: string | null | undefined;
   loadingConversation: boolean;
   agentId: string | null;
@@ -5108,10 +5356,6 @@ export function shouldSendInitialPrompt(params: {
   // :b) and the prompt leaks into the other session. Pinning the prompt to
   // the conversation it was consumed for closes that window.
   if (params.promptConversationId !== params.conversationId) return false;
-  // Already dispatched for THIS conversation — don't resend. A different
-  // (or null) id means a later new chat reusing the mounted ChatPage, so
-  // it falls through and sends.
-  if (params.sentForConversationId === params.conversationId) return false;
   if (!params.conversationId || params.loadingConversation || !params.agentId) {
     return false;
   }
@@ -5152,6 +5396,96 @@ export function dispatchInitialPrompt(
   } else {
     void send(prompt.text, agentId, prompt.files ?? []);
   }
+}
+
+/**
+ * The agent a stashed first message is sent with. On a session route that's the session's bound
+ * agent, since the selected one can belong to the previous chat; elsewhere, the selected agent.
+ */
+export function initialPromptAgentId({
+  urlConvId,
+  boundAgentId,
+  agentId,
+}: {
+  urlConvId: string | null | undefined;
+  boundAgentId: string | null;
+  agentId: string | null;
+}): string | null {
+  return (urlConvId ? boundAgentId : null) ?? agentId;
+}
+
+interface HeldPrompt {
+  conversationId: string;
+  prompt: PendingInitialPrompt;
+}
+
+/**
+ * Dispatches a stashed first message once after the session hydrates; a prompt not yet sent when
+ * the page leaves goes back to the store.
+ */
+export function useInitialPromptDispatch({
+  conversationId,
+  agentId,
+  loadingConversation,
+  dispatch,
+}: {
+  conversationId: string | null | undefined;
+  agentId: string | null;
+  loadingConversation: boolean;
+  dispatch: (prompt: PendingInitialPrompt, agentId: string) => void;
+}): void {
+  // The prompt taken from the store for this page but not yet sent. The ref is the current one:
+  // a dispatched prompt is no longer in it, so a stale effect closure can't send it again.
+  const [held, setHeld] = useState<HeldPrompt | null>(null);
+  const heldRef = useRef<HeldPrompt | null>(null);
+
+  // Takes the next stashed prompt, unless one is already held; the rest wait in the store.
+  const takeNext = useCallback(() => {
+    if (!conversationId || heldRef.current !== null) return;
+    const prompt = consumePendingInitialPrompt(conversationId);
+    if (prompt === null) return;
+    heldRef.current = { conversationId, prompt };
+    setHeld(heldRef.current);
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    takeNext();
+    const stopListening = onPendingInitialPrompt(conversationId, takeNext);
+    return () => {
+      stopListening();
+      const unsent = heldRef.current;
+      heldRef.current = null;
+      setHeld(null);
+      if (unsent?.conversationId === conversationId) {
+        returnPendingInitialPrompt(conversationId, unsent.prompt);
+      }
+    };
+  }, [conversationId, takeNext]);
+
+  useEffect(() => {
+    if (held === null || heldRef.current !== held) return;
+    // A held prompt hasn't been sent, so the predicate's sent-check doesn't apply.
+    if (
+      !shouldSendInitialPrompt({
+        initialPrompt: held.prompt.text,
+        initialPromptFileCount: held.prompt.files?.length ?? 0,
+        promptConversationId: held.conversationId,
+        conversationId,
+        loadingConversation,
+        agentId,
+      })
+    ) {
+      return;
+    }
+    // The predicate guarantees these; the re-check narrows the types for dispatch().
+    if (!agentId || !conversationId) return;
+    heldRef.current = null;
+    setHeld(null);
+    dispatch(held.prompt, agentId);
+    // A prompt stashed while this one was held is next.
+    takeNext();
+  }, [held, conversationId, loadingConversation, agentId, dispatch, takeNext]);
 }
 
 /**

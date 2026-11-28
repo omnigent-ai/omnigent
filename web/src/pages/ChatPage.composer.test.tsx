@@ -1,3 +1,4 @@
+import type { Comment } from "@/hooks/useComments";
 import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
@@ -17,6 +18,7 @@ import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as ComposerSectionSettingsModule from "@/components/composer/composerSectionSettings";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
@@ -33,10 +35,19 @@ import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorCompos
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
+import { quoteLine } from "@/lib/replyDraftDocument";
+import type * as ComposerMicButtonModule from "@/components/ComposerMicButton";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import {
+  createElement,
+  createRef,
+  StrictMode,
+  useRef,
+  type ComponentRef,
+  type ReactElement,
+} from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setSessionHost } from "@/lib/sessionHost";
@@ -61,6 +72,8 @@ import {
 import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
@@ -83,6 +96,32 @@ import {
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
 // to avoid needing a QueryClientProvider around every bare render.
+// Counts renders of the composer's ⌘K settings, which render nothing themselves.
+const composerPaletteSettings = vi.hoisted(() => ({ renders: 0 }));
+// The dictation handlers the composer gives its mic button, which renders as usual.
+const mic = vi.hoisted(() => ({
+  current: null as ComposerMicButtonModule.ComposerMicButtonProps | null,
+}));
+vi.mock("@/components/ComposerMicButton", async (importOriginal) => {
+  const actual = await importOriginal<typeof ComposerMicButtonModule>();
+  return {
+    ...actual,
+    ComposerMicButton: (props: ComposerMicButtonModule.ComposerMicButtonProps) => {
+      mic.current = props;
+      return createElement(actual.ComposerMicButton, props);
+    },
+  };
+});
+vi.mock("@/components/composer/composerSectionSettings", async (importOriginal) => {
+  const original = await importOriginal<typeof ComposerSectionSettingsModule>();
+  return {
+    ...original,
+    ComposerPaletteSettings: (props: Parameters<typeof original.ComposerPaletteSettings>[0]) => {
+      composerPaletteSettings.renders += 1;
+      return original.ComposerPaletteSettings(props);
+    },
+  };
+});
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
@@ -136,6 +175,8 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
   },
 }));
 const { openGithubTabMock } = vi.hoisted(() => ({ openGithubTabMock: vi.fn() }));
+const tabsSidebar = vi.hoisted(() => ({ shows: false }));
+vi.mock("@/shell/useTabsSidebar", () => ({ useTabsSidebar: () => tabsSidebar.shows }));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: (args: unknown) => {
     composerGitStatusArgsSpy(args);
@@ -161,13 +202,17 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       prCount: 0,
       prNumber: null,
       prNumberPrefix: "#",
+      prs: [],
       refreshing: false,
     },
     overrides,
   );
 }
 
-afterEach(() => setComposerGitStatus());
+afterEach(() => {
+  setComposerGitStatus();
+  tabsSidebar.shows = false;
+});
 // SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
 // so the indicator self-hides (no active children) in isolated composer renders.
 const { childSessionsArgsSpy, composerChildSessions } = vi.hoisted(() => ({
@@ -264,7 +309,12 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, computeIsWorking } from "./ChatPage";
+import { Composer, computeIsWorking, takeGadgetComposerQuote } from "./ChatPage";
+import {
+  queueGadgetComposerQuote,
+  resetGadgetComposerQuotes,
+  useGadgetComposerQuotes,
+} from "@/lib/gadgetComposerQuotes";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { withSessionMentionHint } from "@/lib/composerMentions";
@@ -283,6 +333,34 @@ import {
 // through to the browser's default focus move and Enter sent the message.
 
 /** Minimal ComposerProps for an interactive (writable, idle) composer. */
+const LOCAL_REVIEW_ANCHOR = {
+  pr_url: "https://github.com/acme/repo/pull/1",
+  side: "RIGHT" as const,
+  line: 12,
+  start_line: null,
+  head_sha: "a".repeat(40),
+  base_sha: "b".repeat(40),
+};
+
+/** A draft local review comment on `src/example.ts`, as the review panel queues it. */
+function localReviewComment(overrides: Partial<Comment> = {}): Comment {
+  return {
+    id: "123",
+    conversation_id: "conv_test",
+    path: "src/example.ts",
+    start_index: 0,
+    end_index: 0,
+    body: "Preserve the public API.",
+    status: "draft",
+    created_at: 1,
+    updated_at: 1,
+    anchor_content: null,
+    created_by: null,
+    anchor_metadata: LOCAL_REVIEW_ANCHOR,
+    ...overrides,
+  };
+}
+
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
     status: "idle" as const,
@@ -333,6 +411,11 @@ const CLAUDE_MODEL_OPTIONS = [
 /** The composer textarea, located by its aria-label. */
 function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
+}
+
+/** An onSend that queues every message, as ChatPage does while the agent works. */
+function enqueueFromComposer(text: string, files?: File[], replyDraft?: StoredReplyDraft) {
+  useChatStore.getState().enqueueMessage(text, files, replyDraft);
 }
 
 function forceMobileViewport(): () => void {
@@ -807,9 +890,10 @@ describe("Composer send shortcut", () => {
     [true, "metaKey"],
     [true, "ctrlKey"],
   ] as const)(
-    "steers the draft and backlog (alternate send: %s, modifier: %s)",
+    "steers the draft and backlog with Always steer off (alternate send: %s, modifier: %s)",
     (alternate, modifier) => {
       localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(false);
       const onSend = vi.fn((text: string, files?: File[]) => {
         useChatStore.getState().enqueueMessage(text, files);
       });
@@ -854,6 +938,64 @@ describe("Composer send shortcut", () => {
           sendQueued.mock.invocationCallOrder[0]!,
         );
         expect(useChatStore.getState().queuedMessages).toEqual([]);
+      } finally {
+        act(() =>
+          useChatStore.setState({
+            boundAgentId: originalState.boundAgentId,
+            queuedMessages: [],
+            send: originalState.send,
+            sessionStatus: originalState.sessionStatus,
+            status: originalState.status,
+          }),
+        );
+      }
+    },
+  );
+
+  it.each([
+    [false, "metaKey"],
+    [false, "ctrlKey"],
+    [true, "metaKey"],
+    [true, "ctrlKey"],
+  ] as const)(
+    "queues the draft behind the turn with Always steer on (alternate send: %s, modifier: %s)",
+    (alternate, modifier) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(true);
+      const sendNow = vi.fn().mockResolvedValue(undefined);
+      const originalState = useChatStore.getState();
+      setComposerState({
+        boundAgentId: "agent_shortcut",
+        queuedMessages: [{ queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" }],
+        sessionStatus: "running",
+        send: sendNow,
+        status: "streaming",
+      });
+      const onSend = vi.fn();
+
+      try {
+        renderWithTooltips(
+          <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
+        );
+        fireEvent.change(textarea(), { target: { value: "after this turn" } });
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+
+        expect(onSend).toHaveBeenCalledExactlyOnceWith("after this turn", undefined, undefined, {
+          queue: true,
+        });
+        expect(textarea()).toHaveValue("");
+        // The existing backlog stays queued; nothing is steered into the turn.
+        expect(sendNow).not.toHaveBeenCalled();
+        expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+          "queued first",
+        ]);
+
+        // With nothing to queue, the chord still steers the backlog.
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+        expect(onSend).toHaveBeenCalledOnce();
+        expect(sendNow.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+          ["queued first", "agent_shortcut"],
+        ]);
       } finally {
         act(() =>
           useChatStore.setState({
@@ -3420,6 +3562,37 @@ describe("Composer shared visible controls", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it.each([
+    ["the classic sidebar, which keeps the section it shows", false, []],
+    [
+      "the tabs sidebar, which shows the PR in its own tab",
+      true,
+      ["https://github.com/omnigent-ai/omnigent/pull/42"],
+    ],
+  ])("opens a lone PR's link in %s", (_, shows, args) => {
+    tabsSidebar.shows = shows;
+    setComposerGitStatus({
+      githubState: "ready",
+      prCount: 1,
+      prNumber: 42,
+      prs: [
+        {
+          url: "https://github.com/omnigent-ai/omnigent/pull/42",
+          host: "github.com",
+          repository: "omnigent-ai/omnigent",
+          number: 42,
+          relationship: "created",
+          title: "Add the tabs sidebar",
+          state: "OPEN",
+        },
+      ],
+    });
+    openGithubTabMock.mockClear();
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.click(screen.getByTestId("composer-pr-link"));
+    expect(openGithubTabMock.mock.calls).toEqual([args]);
   });
 
   it("transitions PR and worktree visibility across ready, empty, loading, and unknown GitHub states", () => {
@@ -6047,27 +6220,7 @@ describe("Composer native shell mode", () => {
         shellBeforeReview,
       );
 
-      const comment = {
-        id: "shell-review",
-        conversation_id: "conv_shell",
-        path: "src/example.ts",
-        start_index: 0,
-        end_index: 0,
-        body: "Preserve the public API.",
-        status: "draft" as const,
-        created_at: 1,
-        updated_at: 1,
-        anchor_content: null,
-        created_by: null,
-        anchor_metadata: {
-          pr_url: "https://github.com/acme/repo/pull/1",
-          side: "RIGHT" as const,
-          line: 12,
-          start_line: null,
-          head_sha: "a".repeat(40),
-          base_sha: "b".repeat(40),
-        },
-      };
+      const comment = localReviewComment({ id: "shell-review", conversation_id: "conv_shell" });
       // A refused send keeps the context; drop it so later tests don't render its chips.
       onTestFinished(() => clearLocalReviewContexts("conv_shell"));
       act(() => requestLocalReviewContext(comment));
@@ -6126,6 +6279,34 @@ describe("Composer placeholder", () => {
     render(<Composer {...composerProps({ status: "streaming" })} />);
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
+
+  it.each([
+    {
+      viewport: "desktop",
+      hostId: "host-a",
+      copy: "Session offline — reconnect below to continue",
+    },
+    {
+      viewport: "mobile",
+      hostId: "host-a",
+      copy: "Session offline — reconnect from the host menu",
+    },
+    { viewport: "mobile", hostId: null, copy: "Session offline — reconnect below to continue" },
+  ])(
+    "points an offline $viewport session with host $hostId at its reconnect control",
+    ({ viewport, hostId, copy }) => {
+      // Mobile moves a bound host's button into the header; a session with no
+      // host reconnects from the banner below the composer instead.
+      if (viewport === "mobile") onTestFinished(forceMobileViewport());
+      composerSessionSnapshot.hostId = hostId;
+      onTestFinished(() => {
+        composerSessionSnapshot.hostId = null;
+      });
+      render(<Composer {...composerProps({ unreachable: true })} />);
+      expect(textarea()).toBeDisabled();
+      expect(textarea().placeholder).toBe(copy);
+    },
+  );
 
   it("resets the native text input when the Send button moves focus first", () => {
     const props = composerProps({ status: "streaming", isWorking: true });
@@ -6436,6 +6617,25 @@ describe("Composer reply quotes", () => {
     act(() => ref.current?.appendReplyQuote("Not editable"));
     expect(textarea()).toHaveValue("");
     expect(hasSessionDraft("conv_test")).toBe(false);
+  });
+
+  it("takes a queued quote only when the composer keeps it", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { unmount } = render(<Composer {...composerProps()} ref={ref} />);
+    expect(ref.current?.canTakeQuote()).toBe(true);
+    let taken: boolean | undefined;
+    act(() => {
+      taken = ref.current?.appendReplyQuote("Quoted from a gadget");
+    });
+    expect(taken).toBe(true);
+    unmount();
+
+    // A read-only composer refuses the quote, so the queue keeps it.
+    render(<Composer {...composerProps({ permissionLevel: 1 })} ref={ref} />);
+    act(() => {
+      taken = ref.current?.appendReplyQuote("Quoted from a gadget");
+    });
+    expect(taken).toBe(false);
   });
 
   it("inserts into an unreachable composer whose send reconnects Arca", () => {
@@ -7052,9 +7252,7 @@ describe("Composer reply quotes", () => {
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.
-    renderWithTooltips(
-      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
-    );
+    renderWithTooltips(<Composer {...composerProps({ onSend: enqueueFromComposer })} />);
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
@@ -7130,27 +7328,7 @@ describe("Composer reply quotes", () => {
     );
     act(() => ref.current?.appendReplyQuote("Existing quote"));
     fireEvent.change(textarea(), { target: { value: "My instructions" } });
-    const comment = {
-      id: "123",
-      conversation_id: "conv_test",
-      path: "src/example.ts",
-      start_index: 0,
-      end_index: 0,
-      body: "Preserve the public API.",
-      status: "draft" as const,
-      created_at: 1,
-      updated_at: 1,
-      anchor_content: null,
-      created_by: null,
-      anchor_metadata: {
-        pr_url: "https://github.com/acme/repo/pull/1",
-        side: "RIGHT" as const,
-        line: 12,
-        start_line: null,
-        head_sha: "a".repeat(40),
-        base_sha: "b".repeat(40),
-      },
-    };
+    const comment = localReviewComment();
     act(() => requestLocalReviewContext({ ...comment, conversation_id: "other-session" }));
     expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
     act(() => requestLocalReviewContext(comment));
@@ -7232,7 +7410,7 @@ describe("Composer reply quotes", () => {
         ...comment,
         id: "1011",
         body: "Keep the old behavior for this range.",
-        anchor_metadata: { ...comment.anchor_metadata, side: "LEFT" as const, start_line: 7 },
+        anchor_metadata: { ...LOCAL_REVIEW_ANCHOR, side: "LEFT" as const, start_line: 7 },
       },
     ];
     expect(textarea()).toHaveValue("");
@@ -7331,6 +7509,54 @@ describe("Composer built-in tint by case", () => {
     expect(screen.queryByText(token, { selector: `.${COMMAND_TOKEN_CLASS}` }) !== null).toBe(
       tinted,
     );
+  });
+});
+
+describe("Composer built-in tint with message context", () => {
+  beforeEach(() => {
+    setComposerState({
+      conversationId: "conv_case_ctx",
+      sessionHarness: "codex-native",
+      skills: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    clearLocalReviewContexts("conv_case_ctx");
+  });
+  const goalTint = () => screen.queryByText("/Goal", { selector: `.${COMMAND_TOKEN_CLASS}` });
+
+  // A tag or review comment sends `/Goal` as typed, where nothing runs it.
+  it.each([
+    {
+      label: "an inline tag",
+      draft: "@src/example.ts",
+      add: () =>
+        useChatStore.setState({
+          pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+        }),
+    },
+    {
+      label: "a review comment",
+      draft: "/Goal review",
+      add: () =>
+        requestLocalReviewContext(
+          localReviewComment({ id: "goal-review", conversation_id: "conv_case_ctx" }),
+        ),
+    },
+  ])("drops a mixed-case built-in's tint once $label rides along", ({ draft, add }) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Composer {...composerProps({ showGoalControl: true })} />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/Goal review" } });
+    expect(goalTint()).not.toBeNull();
+
+    act(add);
+    expect(textarea().value).toContain(draft);
+    expect(goalTint()).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-slash-command");
   });
 });
 
@@ -7620,6 +7846,40 @@ describe("Composer workflow entry point", () => {
     expect(onSendSlashCommand).not.toHaveBeenCalled();
   });
 
+  it("opens the Tasks tab's choice in the dialog: a new workflow's text, or a saved workflow", async () => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: "openai-agents",
+      skills: workflowSkills,
+    });
+    const onSendSlashCommand = vi.fn();
+    renderWithWorkflows(<Composer {...composerProps({ onSendSlashCommand })} />);
+    const startWorkflow = useSessionTasksActions.getState().startWorkflow.conv_test;
+
+    act(() => startWorkflow?.("Bump deps"));
+    expect(await screen.findByTestId("workflow-dialog-description")).toHaveValue("Bump deps");
+    fireEvent.keyDown(screen.getByTestId("workflow-dialog-description"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("workflow-dialog")).toBeNull());
+
+    const workflow = {
+      id: "a".repeat(32),
+      name: "Triage flaky tests",
+      description: "Finds and fixes flaky tests.",
+    };
+    act(() => startWorkflow?.("", workflow));
+    expect(
+      await screen.findByRole("heading", { name: "Run Triage flaky tests" }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("workflow-dialog-description"), {
+      target: { value: "The upload tests" },
+    });
+    fireEvent.click(screen.getByTestId("workflow-dialog-run"));
+    expect(onSendSlashCommand).toHaveBeenCalledWith(
+      "workflow",
+      `Run the saved workflow "Triage flaky tests" (ID ${workflow.id}).\n\nThe upload tests`,
+    );
+  });
+
   it("runs or continues a task for the Tasks tab, or says why it can't", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onSend = vi.fn();
@@ -7706,7 +7966,7 @@ describe("Composer workflow entry point", () => {
         usePlanStops.setState({ requests: {}, settledStops: {} });
       });
       const onStop = vi.fn();
-      const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+      const onSend = vi.fn(enqueueFromComposer);
       const error = vi.spyOn(toast, "error");
       const { rerender } = renderWithWorkflows(
         <Composer {...composerProps({ onStop, onSend, isWorking })} />,
@@ -7805,6 +8065,93 @@ describe("Composer workflow entry point", () => {
     renderWithWorkflows(<Composer {...composerProps()} />);
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     expect(screen.queryByTestId("composer-workflow-action")).toBeNull();
+  });
+});
+
+// The page's gadget quote consumer, wired as ChatPage wires it, with the real composer.
+function GadgetQuoteHarness({
+  composer,
+  permissionPending,
+}: {
+  composer: Parameters<typeof Composer>[0];
+  permissionPending: boolean;
+}) {
+  const ref = useRef<ComponentRef<typeof Composer>>(null);
+  useGadgetComposerQuotes("conv_test", (quote) =>
+    takeGadgetComposerQuote(quote, {
+      permissionPending,
+      composerReadOnly: false,
+      showTerminal: false,
+      showChat: () => {},
+      composer: ref.current,
+      sideChat: true,
+    }),
+  );
+  return <Composer {...composer} ref={ref} />;
+}
+
+describe("gadget quotes in the composer", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    resetGadgetComposerQuotes();
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      queuedMessages: [],
+      sessionHarness: "codex-native",
+      sideChatToOpen: null,
+      sideChatDrafts: {},
+      sideChatComposers: {},
+      sideChatSelectionTarget: null,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    resetGadgetComposerQuotes();
+    vi.restoreAllMocks();
+  });
+
+  it("waits while permissions load, then takes a quote in a session that has none", () => {
+    // A server with permissions off loads every session with no level at all.
+    const composer = composerProps({ permissionLevel: null });
+    const view = render(<GadgetQuoteHarness composer={composer} permissionPending />);
+    act(() => queueGadgetComposerQuote("conv_test", "reply", "Quoted from a gadget"));
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+
+    view.rerender(<GadgetQuoteHarness composer={composer} permissionPending={false} />);
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted from a gadget");
+  });
+
+  it("takes a quote once a Quick Answer closes, without the page re-rendering", () => {
+    useChatStore.setState({ btwSidechat: { question: "q", answer: "a", truncated: false } });
+    render(<GadgetQuoteHarness composer={composerProps()} permissionPending={false} />);
+    act(() => queueGadgetComposerQuote("conv_test", "reply", "Quoted from a gadget"));
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+
+    // Only the composer sees the overlay close; the harness is not re-rendered by the test.
+    act(() => useChatStore.setState({ btwSidechat: null }));
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted from a gadget");
+  });
+
+  it("keeps a side-chat quote while offline and opens one side chat once reachable", () => {
+    const offline = composerProps({ unreachable: true });
+    const view = render(<GadgetQuoteHarness composer={offline} permissionPending={false} />);
+    act(() => queueGadgetComposerQuote("conv_test", "side_chat", "Ask about this"));
+    expect(useChatStore.getState().sideChatToOpen).toBeNull();
+
+    const openSideChat = vi.spyOn(useChatStore.getState(), "openSideChatWithDraft");
+    view.rerender(<GadgetQuoteHarness composer={composerProps()} permissionPending={false} />);
+    const { sideChatToOpen, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBe("Ask about this");
+    // Later renders find nothing left to add.
+    view.rerender(<GadgetQuoteHarness composer={composerProps()} permissionPending={false} />);
+    expect(openSideChat).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -8053,7 +8400,7 @@ describe("Composer file-attachment focus", () => {
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [bad] } });
 
     expect(document.activeElement).not.toBe(ta);
@@ -8108,7 +8455,7 @@ describe("Composer file-attachment focus", () => {
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
     render(<Composer {...composerProps()} />);
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [bad] } });
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
 
@@ -8123,7 +8470,7 @@ describe("Composer file-attachment focus", () => {
     // composer's mixed-drop behavior).
     render(<Composer {...composerProps()} />);
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [ok, bad] } });
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
@@ -8236,7 +8583,7 @@ describe("Composer failed-send attachment restore", () => {
   it("restores the retriable files and flags the ones current limits reject", () => {
     render(<Composer {...composerProps()} />);
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
@@ -8244,7 +8591,7 @@ describe("Composer failed-send attachment restore", () => {
     );
 
     expect(screen.getByText("notes.txt")).toBeTruthy();
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText("clip.webm")).toBeNull();
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
     // The store entry drained on restore, so the draft can't come back twice.
     expect(useChatStore.getState().failedSendDraft).toBeNull();
@@ -8282,7 +8629,7 @@ describe("Composer failed-send attachment restore", () => {
         failedSendDraft: {
           conversationId: "conv_test",
           text: "",
-          files: [new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" })],
+          files: [new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" })],
         },
       }),
     );
@@ -8490,7 +8837,7 @@ describe("Composer — editing queued messages", () => {
 
   it("dequeues the recalled message so re-sending can't duplicate it", async () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     renderWithTooltips(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
@@ -8563,7 +8910,7 @@ describe("Composer — editing queued messages", () => {
     useChatStore.setState({
       queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
     });
-    const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+    const onSend = vi.fn(enqueueFromComposer);
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
     const strip = screen.getByTestId("composer-queued-strip");
@@ -8617,7 +8964,7 @@ describe("Composer — editing queued messages", () => {
 
   it.each([false, true])("recalls queued path mentions with quotes: %s", (quoted) => {
     useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...props} ref={ref} />);
     act(() =>
@@ -10163,8 +10510,34 @@ describe("saved sandbox inference policy", () => {
   );
 });
 
+type ServerInfo = typeof FALLBACK_SERVER_INFO;
+const codeMirrorServerInfo: ServerInfo = {
+  ...FALLBACK_SERVER_INFO,
+  features: { chat_composer_codemirror: true },
+};
+
+/** The composer under `info`'s features, with its handle and a rerender under other features. */
+function renderComposerWith(props: ReturnType<typeof composerProps>, info: ServerInfo) {
+  const ref = createRef<ComponentRef<typeof Composer>>();
+  const ui = (serverInfo: ServerInfo) => (
+    <CapabilitiesProvider info={serverInfo}>
+      <TooltipProvider>
+        <Composer {...props} ref={ref} />
+      </TooltipProvider>
+    </CapabilitiesProvider>
+  );
+  const view = render(ui(info));
+  return { ...view, ref, switchTo: (next: ServerInfo) => view.rerender(ui(next)) };
+}
+
+/** The message box once the CodeMirror editor has taken it over. */
+async function editorReady() {
+  await waitFor(() => expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"));
+  return screen.getByLabelText("Message the agent");
+}
+
 describe("Composer with the CodeMirror release flag on", () => {
-  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  const codeMirrorInfo = codeMirrorServerInfo;
   beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
   afterEach(() => resetCodeMirrorComposerLoadForTests());
 
@@ -10193,15 +10566,8 @@ describe("Composer with the CodeMirror release flag on", () => {
       mark.className,
     ]);
   async function renderEditor(props: ReturnType<typeof composerProps>) {
-    render(
-      <CapabilitiesProvider info={codeMirrorInfo}>
-        <Composer {...props} />
-      </CapabilitiesProvider>,
-    );
-    await waitFor(() =>
-      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
-    );
-    return screen.getByLabelText("Message the agent");
+    renderComposerWith(props, codeMirrorInfo);
+    return editorReady();
   }
 
   it("tints a built-in typed in another case in the editor, as it still runs", async () => {
@@ -10243,5 +10609,442 @@ describe("Composer with the CodeMirror release flag on", () => {
 
     fireEvent.keyDown(editor, { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git status", undefined);
+  });
+});
+
+describe("Composer model and effort in ⌘K", () => {
+  const settingLabels = () =>
+    registeredPaletteCommands()
+      .filter((command) => command.setting)
+      .map((command) => command.label);
+
+  function renderOpenSessionComposer(quickPickPalette: boolean) {
+    const previous = useChatStore.getState();
+    onTestFinished(() => {
+      useChatStore.setState(previous, true);
+      usePaletteCommandsStore.setState({ groups: {} });
+    });
+    composerPaletteSettings.renders = 0;
+    useChatStore.setState({ conversationId: "conv_models", llmModel: "opus" });
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: quickPickPalette } }}
+      >
+        <TooltipProvider>
+          <Composer
+            {...composerProps({
+              showModels: true,
+              showEffort: true,
+              modelPickerKind: "claude",
+              codexModelOptions: CLAUDE_MODEL_OPTIONS,
+            })}
+          />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("offers the open session's Model and Reasoning Effort with quick_pick_palette on", () => {
+    renderOpenSessionComposer(true);
+    expect(settingLabels()).toEqual(expect.arrayContaining(["Model", "Reasoning Effort"]));
+  });
+
+  it("mounts neither with quick_pick_palette off", () => {
+    renderOpenSessionComposer(false);
+    expect(composerPaletteSettings.renders).toBe(0);
+    expect(settingLabels()).not.toContain("Model");
+    expect(settingLabels()).not.toContain("Reasoning Effort");
+  });
+});
+
+describe("Composer reply quotes in the CodeMirror editor", () => {
+  const codeMirrorInfo = codeMirrorServerInfo;
+  const plainInfo: ServerInfo = { ...FALLBACK_SERVER_INFO, features: {} };
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    setComposerState({
+      conversationId: "conv_cm_quotes",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      restoredSendDraft: null,
+      queuedMessages: [],
+    });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+  });
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    composerSessionSnapshot.sideChatAllowed = null;
+    resetCodeMirrorComposerLoadForTests();
+  });
+
+  const editor = () => composerTargetOf(screen.getByLabelText("Message the agent"))!;
+  const cards = () => screen.queryAllByTestId("composer-reply-quote");
+  const type = (text: string) => act(() => void insertComposerText(editor(), text));
+  function renderComposer(props = composerProps(), info = codeMirrorInfo) {
+    const rendered = renderComposerWith(props, info);
+    const reply = (text: string) => act(() => rendered.ref.current?.appendReplyQuote(text));
+    return { ...rendered, reply };
+  }
+  async function renderEditor(props = composerProps()) {
+    const rendered = renderComposer(props);
+    await editorReady();
+    return rendered;
+  }
+  /** A loader the test finishes, so the editor takes over when the test says. */
+  function deferEditorLoad() {
+    let finish: ((module: typeof CodeMirrorModule) => void) | undefined;
+    resetCodeMirrorComposerLoadForTests(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    return async () => {
+      await waitFor(() => expect(finish).toBeDefined());
+      await act(async () => finish!(CodeMirrorModule));
+      await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    };
+  }
+
+  it("holds the whole reply in one editor, with the caret under each new card", async () => {
+    const { reply } = await renderEditor();
+    type("My introduction");
+    reply("First point");
+    type("My answer");
+    reply("Second point");
+    expect(document.querySelectorAll(".cm-content")).toHaveLength(1);
+    expect(cards()).toHaveLength(2);
+    expect(editor().value.split("\n")).toEqual([
+      "My introduction",
+      expect.any(String),
+      "My answer",
+      expect.any(String),
+      "",
+    ]);
+    expect(editor().selectionStart).toBe(editor().value.length);
+    expect(screen.getByLabelText("Message the agent")).toHaveFocus();
+  });
+
+  it("sends a reply exactly as the textarea engine does", async () => {
+    const send = async (info: ServerInfo) => {
+      const props = composerProps();
+      const { reply } = renderComposer(props, info);
+      if (info === codeMirrorInfo) {
+        await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+      }
+      type("My introduction");
+      reply("First point");
+      type("My answer");
+      fireEvent.keyDown(screen.getByLabelText("Message the agent"), { key: "Enter" });
+      cleanup();
+      return vi.mocked(props.onSend).mock.calls;
+    };
+    const textareaCalls = await send(plainInfo);
+    expect(textareaCalls).toEqual([
+      [
+        "My introduction\n\n> First point\n\nMy answer",
+        undefined,
+        {
+          version: 1,
+          quotes: [{ before: "My introduction", text: "First point" }],
+          text: "My answer",
+        },
+      ],
+    ]);
+    expect(await send(codeMirrorInfo)).toEqual(textareaCalls);
+  });
+
+  it("keeps the quotes and text when the engine switches mid-draft, either way", async () => {
+    const finishLoad = deferEditorLoad();
+    const { reply, switchTo } = renderComposer();
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    reply("First point");
+    fireEvent.change(textarea(), { target: { value: "My answer" } });
+    // While the editor loads, the textarea shows the tail and its quote blocks.
+    expect(textarea()).toHaveValue("My answer");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(cards()).toHaveLength(1);
+    act(() => textarea().setSelectionRange(3, 3));
+    await finishLoad();
+    const lines = editor().value.split("\n");
+    expect([lines[0], lines[2]]).toEqual(["My introduction", "My answer"]);
+    expect(cards()).toHaveLength(1);
+    // A caret in the text after the last card keeps its place in it, on either engine.
+    expect(editor().selectionStart).toBe(editor().value.length - "answer".length);
+
+    switchTo(plainInfo);
+    await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+    expect(textarea()).toHaveValue("My answer");
+    expect(textarea().selectionStart).toBe(3);
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(cards()).toHaveLength(1);
+
+    // A caret the other engine's input can't hold goes to the end of the draft: one in a quote's
+    // input, which the editor lacks, and one before the last card, outside the textarea's tail.
+    const quoteInput = screen.getByLabelText<HTMLTextAreaElement>("Reply text before quote 1");
+    act(() => {
+      quoteInput.focus();
+      quoteInput.setSelectionRange(2, 2);
+    });
+    switchTo(codeMirrorInfo);
+    await editorReady();
+    expect(editor().selectionStart).toBe(editor().value.length);
+    act(() => editor().setSelectionRange(2, 2));
+    switchTo(plainInfo);
+    await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+    expect(textarea().selectionStart).toBe("My answer".length);
+
+    // A switch waits out a composition; the layout and the draft's form change only together.
+    fireEvent.compositionStart(textarea());
+    switchTo(codeMirrorInfo);
+    expect(document.querySelector(".cm-content")).toBeNull();
+    expect(textarea()).toHaveValue("My answer");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    fireEvent.compositionEnd(textarea());
+    await editorReady();
+    expect(editor().value.split("\n")).toEqual([
+      "My introduction",
+      expect.any(String),
+      "My answer",
+    ]);
+    expect(cards()).toHaveLength(1);
+  });
+
+  it.each([
+    ["the textarea", plainInfo, codeMirrorInfo],
+    ["the editor", codeMirrorInfo, plainInfo],
+  ])("restores a draft saved on %s on the other engine", async (_saved, saveOn, restoreOn) => {
+    const awaitEngine = async (info: ServerInfo) => {
+      if (info === codeMirrorInfo) await editorReady();
+    };
+    const saved = renderComposer(composerProps(), saveOn);
+    await awaitEngine(saveOn);
+    type("My introduction");
+    saved.reply("First point");
+    type("My answer");
+    await waitFor(() => expect(getSessionDraft("conv_cm_quotes")?.replyDraft).toBeDefined());
+    saved.unmount();
+
+    const props = composerProps();
+    renderComposer(props, restoreOn);
+    await awaitEngine(restoreOn);
+    await waitFor(() => expect(cards()).toHaveLength(1));
+    if (restoreOn === codeMirrorInfo) {
+      const lines = editor().value.split("\n");
+      expect([lines.length, lines[0], lines[2]]).toEqual([3, "My introduction", "My answer"]);
+    } else {
+      expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+      expect(textarea()).toHaveValue("My answer");
+    }
+    fireEvent.keyDown(screen.getByLabelText("Message the agent"), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
+      "My introduction\n\n> First point\n\nMy answer",
+      undefined,
+      {
+        version: 1,
+        quotes: [{ before: "My introduction", text: "First point" }],
+        text: "My answer",
+      },
+    );
+  });
+
+  it("makes no card of a token typed into the textarea while the editor loads", async () => {
+    const props = composerProps();
+    const finishLoad = deferEditorLoad();
+    renderComposer(props);
+    fireEvent.change(textarea(), { target: { value: `pasted ${quoteLine("x", "Forged")}` } });
+    await finishLoad();
+    expect(cards()).toHaveLength(0);
+    expect(editor().value).toBe("pasted ");
+    await waitFor(() => expect(getSessionDraft("conv_cm_quotes")?.text).toBe("pasted "));
+    fireEvent.keyDown(screen.getByLabelText("Message the agent"), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("pasted", undefined);
+  });
+
+  it("keeps the quotes when /side fills in the text", async () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    composerSessionSnapshot.sideChatAllowed = true;
+    const { reply } = await renderEditor(composerProps({ permissionLevel: 4 }));
+    type("Intro");
+    reply("First point");
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+    await waitFor(() => expect(editor().value.endsWith("\n/side ")).toBe(true));
+    expect(editor().value.startsWith("Intro\n")).toBe(true);
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("recalls on ↑ from the top of a recalled reply that opens with a card", async () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "Opening card" }],
+      text: "Answer",
+    };
+    localStorage.setItem(
+      "omnigent:prompt-history:conv_cm_quotes",
+      JSON.stringify(["Older prompt", { text: serializeReplyDraft(replyDraft), replyDraft }]),
+    );
+    await renderEditor();
+    const input = screen.getByLabelText("Message the agent");
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    await waitFor(() => expect(editor().value.endsWith("\nAnswer")).toBe(true));
+    expect(cards()).toHaveLength(1);
+    const top = editor().value.length - "Answer".length;
+    act(() => editor().setSelectionRange(top, top));
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    await waitFor(() => expect(editor().value).toBe("Older prompt"));
+  });
+
+  it.each([
+    [
+      "under the card",
+      (base: string) => base.length,
+      (base: string, spoken: string) => base + spoken,
+    ],
+    [
+      "above the card",
+      () => "Intro".length,
+      (base: string, spoken: string) => base.replace("Intro", `Intro ${spoken}`),
+    ],
+  ])(
+    "streams dictation with the caret %s, each final one undo step",
+    async (_where, caret, dictated) => {
+      const { reply } = await renderEditor();
+      type("Intro");
+      reply("First point");
+      const base = editor().value;
+      act(() => editor().setSelectionRange(caret(base), caret(base)));
+      // A take runs with focus on the mic button. jsdom renders none, so another composer button
+      // stands in for it.
+      act(() => screen.getByRole("button", { name: "Add" }).focus());
+      act(() => mic.current!.onListeningChange!(true));
+      act(() => mic.current!.onVoiceStart!());
+      act(() => mic.current!.onInterim!("hel"));
+      act(() => mic.current!.onInterim!("hello wor"));
+      expect(editor().value).toBe(dictated(base, "hello wor"));
+      act(() => mic.current!.onTranscript("hello world"));
+      // One socket read can carry a partial and its final, with no render between them.
+      act(() => {
+        mic.current!.onInterim!("and");
+        mic.current!.onTranscript("and more");
+      });
+      expect(editor().value).toBe(dictated(base, "hello world and more"));
+      expect(cards()).toHaveLength(1);
+
+      // The take ends, as Enter or a click on the mic ends it; undo and redo are keys from here.
+      act(() => mic.current!.onListeningChange!(false));
+      const press = (key: string) =>
+        fireEvent.keyDown(document.activeElement!, { key, ctrlKey: true });
+      press("z");
+      expect(editor().value).toBe(dictated(base, "hello world"));
+      press("z");
+      expect(editor().value).toBe(base);
+      press("y");
+      expect(editor().value).toBe(dictated(base, "hello world"));
+    },
+  );
+
+  it("leaves an edit made during a take whole, the next partial starting after it", async () => {
+    const { reply } = await renderEditor();
+    type("Intro");
+    reply("First point");
+    const base = editor().value;
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onInterim!("hel"));
+    // In a browser a partial and a keystroke can each land before the other renders.
+    act(() => {
+      insertComposerText(editor(), " typed");
+      mic.current!.onInterim!("hello");
+    });
+    act(() => {
+      mic.current!.onInterim!("hello world");
+      insertComposerText(editor(), "!");
+    });
+    type("?");
+    expect(editor().value).toBe(`${base}hel typed hello world!?`);
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("discards a take that only dictated, back to the text before it", async () => {
+    const { reply } = await renderEditor();
+    type("Intro");
+    reply("First point");
+    const before = editor().value;
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onInterim!("hello"));
+    act(() => mic.current!.onTranscript("hello there"));
+    expect(editor().value).toBe(`${before}hello there`);
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editor().value).toBe(before);
+    expect(cards()).toHaveLength(1);
+  });
+
+  const retype = (word: string, next: string) => {
+    const at = editor().value.indexOf(word);
+    act(() => editor().setSelectionRange(at, at + word.length));
+    type(next);
+  };
+  it.each([
+    ["a Reply", (reply: (text: string) => void) => reply("Added during the take"), "again"],
+    ["a typed edit", () => type(" typed"), "again"],
+    // With no transcript after it, the draft reads as dictation left it.
+    [
+      "an edit away and back",
+      () => {
+        retype("spoken", "authored");
+        retype("authored", "spoken");
+      },
+      null,
+    ],
+  ])(
+    "keeps everything when a take is discarded after %s during it",
+    async (_what, interrupt, then) => {
+      const { reply } = await renderEditor();
+      type("Intro");
+      act(() => mic.current!.onVoiceStart!());
+      act(() => mic.current!.onTranscript("spoken"));
+      interrupt(reply);
+      if (then !== null) act(() => mic.current!.onTranscript(then));
+      const kept = editor().value;
+      act(() => mic.current!.onVoiceDiscard!());
+      expect(editor().value).toBe(kept);
+    },
+  );
+
+  it("leaves a cancelled take's partial to the user, so neither a switch nor the next take waits on it", async () => {
+    const { switchTo } = await renderEditor();
+    type("Intro");
+    act(() => mic.current!.onListeningChange!(true));
+    act(() => mic.current!.onVoiceStart!());
+    type(" typed");
+    act(() => mic.current!.onInterim!("hel"));
+    act(() => mic.current!.onVoiceDiscard!());
+    act(() => mic.current!.onListeningChange!(false));
+    expect(editor().value).toBe("Intro typed hel");
+
+    switchTo(plainInfo);
+    await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+    act(() => mic.current!.onListeningChange!(true));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onInterim!("next"));
+    act(() => mic.current!.onTranscript("next"));
+    act(() => mic.current!.onListeningChange!(false));
+    expect(textarea()).toHaveValue("Intro typed hel next");
+  });
+
+  it("changes nothing when a take is cancelled before any words", async () => {
+    const { reply } = await renderEditor();
+    type("Intro");
+    reply("First point");
+    type("tail");
+    act(() => editor().setSelectionRange(2, 2));
+    const value = editor().value;
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editor().value).toBe(value);
+    expect(editor().selectionStart).toBe(2);
   });
 });

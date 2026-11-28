@@ -16,6 +16,22 @@ export interface KanbanCard {
   /** Every session the card stands for, head first. */
   members: Conversation[];
   column: StatusBucket;
+  /** Nested members that put the card in Needs attention when its head doesn't need it. */
+  attentionMembers: Conversation[];
+}
+
+/**
+ * A nested member that failed before the family's latest activity: it keeps
+ * its own Failed state but no longer holds the whole family in Needs attention.
+ */
+function isStaleNestedFailure(member: Conversation, members: readonly Conversation[]): boolean {
+  if (member.status !== "failed" || (member.pending_elicitations_count ?? 0) > 0) return false;
+  // Status changes do not advance updated_at. Some failures have no recorded
+  // timestamp, so keep those visible rather than guessing their age.
+  const failedAt = Number(member.labels?.["omnigent.last_task_error_at"]);
+  if (!Number.isFinite(failedAt) || failedAt <= 0) return false;
+  const latestActivity = Math.max(failedAt, member.updated_at);
+  return members.some((other) => other !== member && other.updated_at > latestActivity);
 }
 
 /** The board's left-to-right lanes, so a finished turn moves right into Unread beside Done. */
@@ -46,7 +62,8 @@ export function projectBoardRows(
 
 /**
  * One card per family (or lone session) in the sidebar's Status-grouping columns,
- * keeping the rows' order. A family sits in its most urgent member's column.
+ * keeping the rows' order. A family sits in its most urgent member's column,
+ * except that a nested failure older than the family's latest activity doesn't count.
  */
 export function kanbanColumns(
   rows: readonly Conversation[],
@@ -59,11 +76,38 @@ export function kanbanColumns(
     if (placed.has(row.id)) continue;
     const members = row.family ? families.get(row.family.id)! : [row];
     for (const member of members) placed.add(member.id);
+    const [head, ...nested] = members;
+    const headColumn = columnOf(head);
+    const counted = nested.flatMap((member) => {
+      const bucket = columnOf(member);
+      return bucket === "Needs attention" && isStaleNestedFailure(member, members)
+        ? []
+        : [{ member, bucket }];
+    });
     const column =
-      STATUS_BUCKETS[Math.min(...members.map((m) => STATUS_BUCKETS.indexOf(columnOf(m))))];
-    columns.get(column)!.push({ conversation: members[0], members, column });
+      STATUS_BUCKETS[
+        Math.min(
+          STATUS_BUCKETS.indexOf(headColumn),
+          ...counted.map(({ bucket }) => STATUS_BUCKETS.indexOf(bucket)),
+        )
+      ];
+    const attentionMembers =
+      headColumn === "Needs attention"
+        ? []
+        : counted.filter(({ bucket }) => bucket === "Needs attention").map(({ member }) => member);
+    columns.get(column)!.push({ conversation: head, members, column, attentionMembers });
   }
   return columns;
+}
+
+/** The card's note, beside "N nested", on nested sessions that put it in Needs attention. */
+export function nestedAttentionLabel(card: KanbanCard): string | null {
+  const count = card.attentionMembers.length;
+  if (count === 0) return null;
+  const onlyFailures = card.attentionMembers.every(
+    (member) => member.status === "failed" && (member.pending_elicitations_count ?? 0) === 0,
+  );
+  return onlyFailures ? `${count} failed` : `${count} need${count === 1 ? "s" : ""} attention`;
 }
 
 /** Cards with any session matching the search, by the sidebar search's title-or-id rule. */

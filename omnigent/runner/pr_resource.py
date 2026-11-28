@@ -12,6 +12,9 @@ Servers that track a session's PRs vouch for the PR a request targets
 
 from __future__ import annotations
 
+import contextvars
+import dataclasses
+import functools
 import logging
 import re
 import subprocess
@@ -24,11 +27,12 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from filelock import Timeout as FileLockTimeout
 
 from omnigent.git_providers import (
+    ParsedRemote,
     host_of,
     load_facet,
     provider,
@@ -36,6 +40,7 @@ from omnigent.git_providers import (
     providers,
     resolve_remote,
 )
+from omnigent.runner import github_review_fields as review_fields
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
@@ -50,7 +55,9 @@ from omnigent.runner.git_providers import (
     ReviewerRef,
     ReviewThreadsFacet,
     local_git,
+    offered_capabilities,
     unsupported_remote_info,
+    with_offered_capabilities,
 )
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
@@ -83,7 +90,7 @@ _MAX_BODY_CHARS = 65536
 # GitHub's image limit. Videos may be 100 MB there, but the server and host
 # tunnels each carry the file base64-encoded (a third larger) in one 100 MB frame.
 _MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
-_MAX_VIDEO_ATTACHMENT_BYTES = 70 * 1024 * 1024
+MAX_VIDEO_ATTACHMENT_BYTES = 70 * 1024 * 1024
 # Leading bytes of each media type GitHub accepts as an attachment, with its extension.
 _ATTACHMENT_SIGNATURES: tuple[tuple[int, bytes, str, str], ...] = (
     (0, b"\x89PNG\r\n\x1a\n", "image/png", "png"),
@@ -103,6 +110,53 @@ _DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-disco
 _DISCOVERY_LOCK = Lock()
 _DISCOVERY_JOBS: dict[tuple[str, str, str | None], Future[dict[str, Any]]] = {}
 _DISCOVERY_RESULT_LIMIT = 128
+
+# Panel polls share forge reads; see :func:`cached_pr_info`.
+_PANEL_READ_FRESH_SECONDS = 5.0
+_PANEL_READ_STALE_SECONDS = 60.0
+_PANEL_READ_LIMIT = 64
+_PANEL_READ_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-panel-read")
+_PANEL_READ_LOCK = Lock()
+# Every panel write bumps this, so no read that began before the write is served after it.
+# Only the runner caches; the host serves edits only while it is offline (see drop_panel_reads).
+_panel_read_generation = 0
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _PanelRead:
+    """One :func:`pr_info` read that identical panel requests share."""
+
+    generation: int
+    registry_version: object
+    started_at: float
+    result: Future[dict[str, Any]]
+
+
+_PANEL_READS: OrderedDict[tuple[object, ...], _PanelRead] = OrderedDict()
+_RUNNING_PANEL_READS: dict[tuple[object, ...], _PanelRead] = {}
+
+
+def drop_panel_reads() -> None:
+    """Make every panel request wait for a read that starts later, e.g. after a reconnect."""
+    global _panel_read_generation
+    with _PANEL_READ_LOCK:
+        _panel_read_generation += 1
+
+
+def _invalidates_panel_reads(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    """Make panel requests after ``function`` returns wait for a read that starts later."""
+
+    @functools.wraps(function)
+    def write(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        try:
+            return function(*args, **kwargs)
+        finally:
+            drop_panel_reads()
+
+    return write
 
 
 @dataclass(frozen=True)
@@ -177,6 +231,59 @@ def _workspace_providers(root: str) -> list[ProviderResolution]:
             unclaimed=first_host is not None,
         )
     ]
+
+
+def _keeps_provider_workspace_repo(workspace_repo: Any, preferred: ParsedRemote | None) -> bool:
+    """Whether a provider-named workspace repo is on the preferred remote's host."""
+    # An unrecognized preferred remote (ssh alias, IP, unknown host) can't vouch for
+    # it; the same host can name another repo, e.g. a fork's upstream.
+    return (
+        isinstance(workspace_repo, dict)
+        and preferred is not None
+        and str(workspace_repo.get("host") or "").lower() == preferred.host
+    )
+
+
+# gh's base-repo order among remotes when none is resolved; others follow in config order.
+_GH_REMOTE_RANK = {"upstream": 0, "github": 1, "origin": 2}
+
+
+def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
+    """Name the checkout's own repo from local config, or vet the provider's.
+
+    Precedence: gh's resolved base, then the remote gh would pick on origin's host.
+    Tracked PRs don't count toward the local pick. An unrecognized preferred remote
+    names no workspace repo.
+    """
+
+    def run(argv: list[str]) -> tuple[int | None, str]:
+        return _git_output(argv, cwd=root)
+
+    urls = local_git.remote_urls(run)
+    if not urls:
+        return
+    resolved = local_git.remote_settings(run, "gh-resolved")
+    base_url = next((url for name, url in urls if resolved.get(name) == "base"), None)
+    # Origin comes first; if unrecognized, a recognized upstream must not stand in for it.
+    preferred = resolve_remote(base_url or urls[0][1])
+    if "workspace_repo" in info:
+        # gh falls back to a github.com remote when it doesn't know origin's host.
+        if not _keeps_provider_workspace_repo(info["workspace_repo"], preferred):
+            del info["workspace_repo"]
+        return
+    if preferred is None:
+        return
+    parsed = preferred
+    if base_url is None:
+        # A remote on another host must not move the workspace off origin's host,
+        # e.g. a github.com upstream or mirror of an Enterprise checkout.
+        same_host = [
+            (name, remote)
+            for name, url in urls
+            if (remote := resolve_remote(url)) is not None and remote.host == preferred.host
+        ]
+        parsed = min(same_host, key=lambda item: _GH_REMOTE_RANK.get(item[0].lower(), 3))[1]
+    info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
 
 
 def _workspace_provider(root: str) -> ProviderResolution:
@@ -294,9 +401,11 @@ def _workspace_info(root: str, resolution: ProviderResolution | None = None) -> 
     if facet is None:
         return unsupported_remote_info(resolution.remote_host or "")
     info = facet.workspace_info(root)
-    if resolution.unclaimed and _cannot_serve(info, facet.capabilities):
+    if resolution.unclaimed and _cannot_serve(
+        info, offered_capabilities(facet, resolution.remote_host)
+    ):
         return unsupported_remote_info(resolution.remote_host or "")
-    return info
+    return with_offered_capabilities(info, facet, resolution.remote_host)
 
 
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
@@ -305,7 +414,9 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         facet = _facet(reference.provider)
         if facet is None:
             return {**unsupported_remote_info(reference.host), "selected_pr_url": reference.url}
-        return facet.reference_info(root, reference)
+        return with_offered_capabilities(
+            facet.reference_info(root, reference), facet, reference.host
+        )
     except Exception:  # retain the selector and healthy providers on failure
         _logger.warning("Git provider %s failed PR lookup", reference.provider, exc_info=True)
         return {
@@ -561,6 +672,7 @@ def pr_info(
         info["provider_display"] = (
             provider_display(provider_id) if isinstance(provider_id, str) else None
         )
+        _add_workspace_repo(root, info)
         return info
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
@@ -619,6 +731,9 @@ def pr_info(
             info.setdefault("discovery_warnings", []).extend(candidate.get("warnings", []))
     info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
+    if not pr_url:
+        # Explicit PR reads must not touch local git; chat reads the base query.
+        _add_workspace_repo(root, info)
     provider_id = info.get("provider")
     info["provider_display"] = (
         provider_display(provider_id) if isinstance(provider_id, str) else None
@@ -626,6 +741,134 @@ def pr_info(
     return info
 
 
+def _lists_tracked_prs(payload: dict[str, Any], registry: SessionPrRegistry) -> bool:
+    """Whether ``payload`` lists the session's tracked PRs as the registry holds them now."""
+    try:
+        tracked = [(entry.url, entry.relationship) for entry in registry.list()]
+    except ValueError:
+        return False
+    listed = payload.get("prs")
+    return isinstance(listed, list) and tracked == [
+        (entry.get("url"), entry.get("relationship"))
+        for entry in listed
+        if isinstance(entry, dict)
+    ]
+
+
+def _run_panel_read(
+    key: tuple[object, ...], read: _PanelRead, root: str, session_id: str, pr_url: str | None
+) -> None:
+    """Run one shared read; its outcome reaches every request that waits for it."""
+    payload: dict[str, Any] | None = None
+    try:
+        payload = pr_info(root, session_id=session_id, pr_url=pr_url)
+    except BaseException as exc:  # noqa: BLE001 - re-raised to each waiting request
+        read.result.set_exception(exc)
+    else:
+        read.result.set_result(payload)
+    registry = SessionPrRegistry(session_id)
+    version = registry.version()
+    # The read's own title cache writes change the files; a PR linked meanwhile must show.
+    try:
+        current = payload is not None and (
+            version == read.registry_version or _lists_tracked_prs(payload, registry)
+        )
+    except Exception:  # an unreadable registry keeps the read out of the cache, not running
+        _logger.debug("Could not check a panel read against the PR registry", exc_info=True)
+        current = False
+    with _PANEL_READ_LOCK:
+        if _RUNNING_PANEL_READS.get(key) is read:
+            del _RUNNING_PANEL_READS[key]
+        latest = _PANEL_READS.get(key)
+        if (
+            current
+            and read.generation == _panel_read_generation
+            and (latest is None or latest.started_at <= read.started_at)
+        ):
+            _PANEL_READS[key] = dataclasses.replace(read, registry_version=version)
+            _PANEL_READS.move_to_end(key)
+            while len(_PANEL_READS) > _PANEL_READ_LIMIT:
+                _PANEL_READS.popitem(last=False)
+
+
+def _served(read: _PanelRead, requested_at: float) -> dict[str, Any]:
+    """Return a copy of ``read``'s payload, aged when the read began before the request."""
+    payload = dict(read.result.result())
+    if (age := requested_at - read.started_at) > 0:
+        payload["cache_age_s"] = round(age, 3)
+    return payload
+
+
+def cached_pr_info(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    allow_cached: bool = False,
+    account_rights: bool = False,
+) -> dict[str, Any]:
+    """Serve :func:`pr_info`, letting panel polls share forge reads.
+
+    Without ``allow_cached`` the request reads the forge now, as :func:`pr_info`
+    does, and its result is kept for polls. A poll joins a running read of the
+    same tracked PRs; a result under :data:`_PANEL_READ_FRESH_SECONDS` old answers
+    it as is, and one under :data:`_PANEL_READ_STALE_SECONDS` old answers it while
+    one background read replaces it. After a panel write or a change to the
+    session's tracked PRs, polls wait for a new read. A payload from a read that
+    began before the request carries ``cache_age_s``, the seconds between.
+
+    :param root: Absolute workspace path.
+    :param session_id: Session whose tracked PRs to list; ``None`` reads uncached.
+    :param pr_url: The selected PR, which must be tracked by the session.
+    :param allow_cached: The caller polls again soon, so an answer one read old will be corrected.
+    :param account_rights: Whether to include what the host's account may do with each comment,
+        which a server asks for only for the session's owner. Every read fetches them, so one
+        cached answer serves both kinds of reader; each answer handed back drops them unless asked.
+    :returns: A ``session.github.info`` payload.
+    """
+    if session_id is None:
+        return _with_account_rights(pr_info(root, pr_url=pr_url), account_rights)
+    key = (root, session_id, pr_url, _SERVER_TRACKING.get())
+    version = SessionPrRegistry(session_id).version()
+    requested_at = time.monotonic()
+    with _PANEL_READ_LOCK:
+        generation = _panel_read_generation
+        done = _PANEL_READS.get(key) if allow_cached else None
+        if done is not None and (
+            done.generation != generation
+            or done.registry_version != version
+            or requested_at - done.started_at >= _PANEL_READ_STALE_SECONDS
+        ):
+            del _PANEL_READS[key]
+            done = None
+        if done is not None and requested_at - done.started_at < _PANEL_READ_FRESH_SECONDS:
+            return _with_account_rights(_served(done, requested_at), account_rights)
+        running = _RUNNING_PANEL_READS.get(key)
+        start = (
+            not allow_cached
+            or running is None
+            or running.generation != generation
+            or running.registry_version != version
+        )
+        if start:
+            running = _PanelRead(generation, version, requested_at, Future())
+            _RUNNING_PANEL_READS[key] = running
+    assert running is not None
+    if start:
+        read = functools.partial(_run_panel_read, key, running, root, session_id, pr_url)
+        if done is None:
+            read()
+        else:
+            _PANEL_READ_POOL.submit(contextvars.copy_context().run, read)
+    return _with_account_rights(_served(done or running, requested_at), account_rights)
+
+
+def _with_account_rights(info: dict[str, Any], account_rights: bool) -> dict[str, Any]:
+    """``info`` with the host account's comment rights only for a caller that asked for them."""
+    return info if account_rights else review_fields.info_without_account_rights(info)
+
+
+@_invalidates_panel_reads
 def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
     """Attach a PR the host can read, or remember that the user removed one.
 
@@ -643,15 +886,18 @@ def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict
                 raise ValueError(f"{name} pull requests are not supported")
             facet.verify_accessible(root, reference)
             registry.record([reference], relationship="attached", source="user")
-            return pr_info(root, session_id=session_id, pr_url=reference.url)
+            return _with_account_rights(
+                pr_info(root, session_id=session_id, pr_url=reference.url), False
+            )
         if action == "remove":
             registry.remove(reference.url)
-            return pr_info(root, session_id=session_id)
+            return _with_account_rights(pr_info(root, session_id=session_id), False)
     except FileLockTimeout as exc:
         raise ValueError("PR tracking is busy; try again.") from exc
     raise ValueError("Expected attach or remove")
 
 
+@_invalidates_panel_reads
 def set_pr_preference(
     root: str,
     *,
@@ -659,6 +905,7 @@ def set_pr_preference(
     remote: str | None = None,
     session_id: str | None = None,
     pr_url: str | None = None,
+    account_rights: bool = False,
 ) -> dict[str, Any]:
     """Apply an account and/or base remote choice, then return refreshed info.
 
@@ -668,19 +915,23 @@ def set_pr_preference(
 
     :param account: Account to prefer, ``None`` to leave it, or empty to clear it.
     :param remote: Base remote to set, or ``None`` to leave the base unchanged.
+    :param account_rights: Whether to include what the host's account may do with each comment.
     :returns: The refreshed :func:`pr_info` payload.
     """
     reference = _selected_pr(session_id, pr_url) if pr_url and session_id else None
-    facet = _serving_facet(root, reference)
+    resolution = _resolve(root, reference)
+    facet = _facet(resolution.provider)
     if facet is not None:
-        capabilities = facet.capabilities
+        capabilities = offered_capabilities(facet, resolution.remote_host)
         account = account if capabilities.account_switching else None
         remote = remote if capabilities.base_remote_selection else None
         if account is not None or remote:
             facet.set_preference(root, reference, account=account, remote=remote)
     if reference is not None:
-        return pr_info(root, session_id=session_id, pr_url=pr_url)
-    return pr_info(root, session_id=session_id)
+        return _with_account_rights(
+            pr_info(root, session_id=session_id, pr_url=pr_url), account_rights
+        )
+    return _with_account_rights(pr_info(root, session_id=session_id), account_rights)
 
 
 def _capable_target(
@@ -701,7 +952,7 @@ def _capable_target(
         raise ValueError(unselected)
     reference = _selected_pr(session_id, pr_url)
     facet = _facet(reference.provider)
-    if facet is None or not capable(facet.capabilities):
+    if facet is None or not capable(offered_capabilities(facet, reference.host)):
         display = provider_display(reference.provider)
         kind = (
             f"{display['display_name']} {display['request_name']}"
@@ -767,17 +1018,18 @@ def _label_names(value: object, field: str) -> list[str]:
 
 
 def pr_labels(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str, *, session_id: str | None = None, pr_url: str | None = None, text: str = ""
 ) -> dict[str, Any]:
-    """List the labels the selected PR's repository offers.
+    """List the labels the selected PR's repository offers, or those matching ``text``.
 
     :raises ValueError: Without a selected tracked PR, or when its provider
         cannot edit labels.
     """
     facet, reference = _label_target(session_id, pr_url)
-    return facet.repo_labels(root, reference)
+    return facet.repo_labels(root, reference, text=text.strip())
 
 
+@_invalidates_panel_reads
 def update_pr_labels(
     root: str,
     *,
@@ -830,6 +1082,7 @@ def _merge_request(merge_method: object, expected_head: object) -> tuple[str, st
     return merge_method, expected_head
 
 
+@_invalidates_panel_reads
 def merge_pr(
     root: str,
     *,
@@ -851,6 +1104,7 @@ def merge_pr(
     return facet.merge(root, reference, merge_method=method, expected_head=head)
 
 
+@_invalidates_panel_reads
 def merge_pr_as(
     root: str,
     *,
@@ -872,7 +1126,7 @@ def merge_pr_as(
     if not isinstance(account, str) or not account.strip():
         raise ValueError("Expected account to be an account login")
     facet, reference = _merge_target(session_id, pr_url)
-    capabilities = facet.capabilities
+    capabilities = offered_capabilities(facet, reference.host)
     if not (
         capabilities.account_switching
         and capabilities.merge_as_account
@@ -885,6 +1139,7 @@ def merge_pr_as(
     )
 
 
+@_invalidates_panel_reads
 def disable_pr_auto_merge(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
@@ -927,6 +1182,7 @@ def pr_review_candidates(
     return facet.review_candidates(root, reference)
 
 
+@_invalidates_panel_reads
 def update_pr_reviewers(
     root: str,
     *,
@@ -1005,18 +1261,25 @@ def pr_review_threads(
     after: str = "",
     head_sha: str = "",
     base_sha: str = "",
+    account_rights: bool = False,
 ) -> dict[str, Any]:
-    """Read published conversations, requiring pinned revisions for pagination."""
+    """Read published conversations, requiring pinned revisions for pagination.
+
+    :param account_rights: Whether to include what the host's account may do and did, which
+        a server asks for only for the session's owner. An older server never asks, and shows
+        the page to anyone.
+    """
     facet, reference = _review_target(session_id, pr_url)
     if after and (not _COMMIT_SHA.fullmatch(head_sha) or not _COMMIT_SHA.fullmatch(base_sha)):
         raise ValueError("Expected full head and base commit SHAs")
-    return facet.review_threads(
+    page = facet.review_threads(
         root,
         reference,
         after=_review_identifier(after) if after else "",
         head_sha=head_sha,
         base_sha=base_sha,
     )
+    return page if account_rights else review_fields.threads_without_account_rights(page)
 
 
 def pr_review_thread_comments(
@@ -1026,14 +1289,17 @@ def pr_review_thread_comments(
     pr_url: str | None = None,
     thread_id: str,
     after: str,
+    account_rights: bool = False,
 ) -> dict[str, Any]:
-    """Read additional replies from a conversation on the selected PR."""
+    """Read additional replies from a conversation on the selected PR; see above."""
     facet, reference = _review_target(session_id, pr_url)
-    return facet.review_thread_comments(
+    page = facet.review_thread_comments(
         root, reference, thread_id=_review_identifier(thread_id), after=_review_identifier(after)
     )
+    return page if account_rights else review_fields.comments_without_account_rights(page)
 
 
+@_invalidates_panel_reads
 def reply_to_pr_review_thread(
     root: str,
     *,
@@ -1050,6 +1316,7 @@ def reply_to_pr_review_thread(
     )
 
 
+@_invalidates_panel_reads
 def create_pr_review_thread(
     root: str,
     *,
@@ -1094,6 +1361,7 @@ def create_pr_review_thread(
     )
 
 
+@_invalidates_panel_reads
 def create_pr_comment(
     root: str,
     *,
@@ -1126,6 +1394,7 @@ def _details_target(
     )
 
 
+@_invalidates_panel_reads
 def update_pr_details(
     root: str,
     *,
@@ -1183,6 +1452,7 @@ def _attachment_name(name: object, extension: str) -> str:
     return f"{stem}.{extension}"
 
 
+@_invalidates_panel_reads
 def upload_pr_attachment(
     root: str,
     *,
@@ -1208,7 +1478,7 @@ def upload_pr_attachment(
         raise ValueError("Attach a PNG, JPEG, GIF, or WebP image, or an MP4, MOV, or WebM video")
     content_type, extension = media
     limit = (
-        _MAX_VIDEO_ATTACHMENT_BYTES
+        MAX_VIDEO_ATTACHMENT_BYTES
         if content_type.startswith("video/")
         else _MAX_IMAGE_ATTACHMENT_BYTES
     )

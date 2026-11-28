@@ -154,4 +154,5 @@ allowBuilds:
   workerd: true
 
 patchedDependencies:
+  '@pierre/diffs@1.3.6': patches/@pierre__diffs@1.3.6.patch
   '@tiptap/react@3.31.4': patches/@tiptap__react@3.31.4.patch

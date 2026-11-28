@@ -28,7 +28,7 @@ import mimetypes
 import secrets
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Annotated, Any
 
 import httpx
@@ -271,6 +271,7 @@ from omnigent.server.routes._sessions.common import (
     _LAST_TASK_ERROR_CODE_LABEL_KEY as _LAST_TASK_ERROR_CODE_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY as _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _MANAGED_RESUMABLE_TUNNEL_STALE_S as _MANAGED_RESUMABLE_TUNNEL_STALE_S,
+    _MANAGED_RUNNER_REPLACEMENT_WAIT_S as _MANAGED_RUNNER_REPLACEMENT_WAIT_S,
     _MAX_TERMINAL_LAUNCH_ARGS as _MAX_TERMINAL_LAUNCH_ARGS,
     _MAX_TERMINAL_LAUNCH_ARG_LEN as _MAX_TERMINAL_LAUNCH_ARG_LEN,
     _MCP_ELICITATION_TYPE as _MCP_ELICITATION_TYPE,
@@ -396,7 +397,6 @@ from omnigent.server.routes._sessions.helpers import (
     _create_session_worktree as _create_session_worktree,
     _delete_stored_session_bundle_after_failure as _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec as _derive_terminal_launch_args_from_spec,
-    _descendant_sessions as _descendant_sessions,
     _discovery_key as _discovery_key,
     _dispatch_skill_slash_command_to_runner as _dispatch_skill_slash_command_to_runner,
     _emit_server_routing_decision as _emit_server_routing_decision,
@@ -827,6 +827,7 @@ def create_sessions_router(
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     pull_request_refresher: PullRequestRefresher | None = None,
+    read_only_code_hosts: Sequence[str] = (),
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
@@ -899,6 +900,7 @@ def create_sessions_router(
         background titles in focused router tests.
     :param pull_request_refresher: The app-owned refresher of stored session
         PRs; ``None`` builds one for this router, as focused router tests do.
+    :param read_only_code_hosts: Host patterns whose pull requests are served read-only.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -968,6 +970,7 @@ def create_sessions_router(
         host_registry=host_registry,
         register_initial_file_upload=register_initial_file_upload,
         pull_request_refresher=pull_request_refresher,
+        read_only_code_hosts=read_only_code_hosts,
     )
 
     register_ui_routes(

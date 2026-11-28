@@ -55,6 +55,7 @@ from tests._helpers.compat import (
     server_executable,
 )
 from tests._helpers.live_server import find_free_port
+from tests._helpers.mock_llm import mock_llm_answers
 from tests._helpers.operator_agents import operator_agent_store, post_operator_session
 from tests._helpers.session import post_session_bundle
 from tests._model_pools import current_attempt, resolve_model
@@ -312,13 +313,8 @@ def _mock_llm_server_process(log_dir: Path) -> Iterator[str]:
     # Wait for the mock server to be ready
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
-            if resp.status_code == 200:
-                break
-        except httpx.ConnectError:
-            # Expected while the mock server is still booting.
-            continue
+        if mock_llm_answers(base_url):
+            break
         time.sleep(0.1)
     else:
         proc.kill()
@@ -405,7 +401,10 @@ def configure_mock_llm(
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
     :param required_tools: Advertised tools required to consume this queue,
-        isolating agent turns from background generation and review.
+        isolating agent turns from background generation and review. Serve
+        the queue only to requests advertising all of these tools, so a
+        tool-less request (a title generation) cannot consume a scripted tool
+        call meant for the agent's own turn.
     :param match: Optional content-routing token. When set, the queue is
         selected if this token appears in the request's user input,
         regardless of ``model``. Use a deliberately-unique token (the
@@ -1066,7 +1065,7 @@ def register_inline_agent(
         block into the executor so the harness hits the mock server
         instead of ``api.openai.com``.
     :param builtin_tools: When set, add a ``tools.builtins`` list to
-        the agent spec, e.g. ``["list_files", "upload_file"]``.
+        the agent spec, e.g. ``["web_search"]``.
     :param extra_config: When set, top-level keys shallow-merged into
         the agent YAML before upload (e.g. ``tools`` and ``policies``).
         ``name``/``prompt``/``executor`` stay helper-controlled.

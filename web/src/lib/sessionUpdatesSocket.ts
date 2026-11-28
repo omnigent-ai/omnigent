@@ -16,10 +16,19 @@
 // id list is NEVER trusted from the client for authorization — the server
 // access-checks every watched id against the connection's user.
 
-import { isHostRoutingEnabled, resolveWebSocketUrl } from "@/lib/host";
+import { getCachedServerInfo, isFeatureEnabled, resolveServerInfo } from "@/lib/capabilities";
+import { getOmnigentServerIdentity, isHostRoutingEnabled, resolveWebSocketUrl } from "@/lib/host";
+import { getCurrentUserId } from "@/lib/identity";
+import { randomUUID } from "@/lib/randomUUID";
 import { isPageHidden, nextReconnectDelay } from "@/lib/reconnectBackoff";
 import { updatesRoutingKey } from "@/lib/sessionHost";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
+import {
+  SharedSessionUpdates,
+  type SharedUpdatesEnvironment,
+  type TabChannel,
+  type UpdatesTransport,
+} from "@/lib/sharedSessionUpdates";
 
 /** A frame pushed by the server over the updates stream. */
 export type SessionUpdatesFrame =
@@ -84,10 +93,11 @@ function buildUpdatesUrl(): string {
 }
 
 /**
- * Singleton transport for the session-updates WebSocket. One instance per
- * tab; {@link SessionUpdatesProvider} starts it once at app mount.
+ * The session-updates WebSocket itself. One instance per tab; it runs while
+ * the tab is on its own or holds the socket its other tabs share (see
+ * `sharedSessionUpdates.ts`).
  */
-class SessionUpdatesSocket {
+export class SessionUpdatesSocket implements UpdatesTransport {
   private ws: WebSocket | null = null;
   private watched: string[] = [];
   private watchedKey = "";
@@ -102,6 +112,10 @@ class SessionUpdatesSocket {
   private hiddenRetryPending = false;
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
+  // Watch-sets sent on this connection that the server hasn't answered yet, oldest first.
+  private unansweredWatches: string[][] = [];
+  // The watch-set behind the server's latest snapshot on this connection.
+  private serverWatched: ReadonlySet<string> = new Set();
 
   /** Open the connection (idempotent). */
   start(): void {
@@ -175,13 +189,26 @@ class SessionUpdatesSocket {
    * so callers can recompute and push freely without churning the server.
    *
    * @param ids - Conversation ids currently displayed.
+   * @param options - `force` re-sends an unchanged set, which makes the server
+   *   restate it in a snapshot.
    */
-  setWatched(ids: string[]): void {
+  setWatched(ids: string[], options?: { force?: boolean }): void {
     const key = [...ids].sort().join(",");
-    if (key === this.watchedKey) return;
+    if (key === this.watchedKey && options?.force !== true) return;
     this.watchedKey = key;
     this.watched = ids;
     this.sendWatch();
+  }
+
+  /**
+   * Whether the server was watching `id` when it sent the frame now being
+   * delivered to subscribers.
+   *
+   * The server answers every watch request with exactly one snapshot, in
+   * order, so the latest snapshot says which request it has reached.
+   */
+  isWatching(id: string): boolean {
+    return this.serverWatched.has(id);
   }
 
   /**
@@ -208,6 +235,9 @@ class SessionUpdatesSocket {
     }
     this.ws = ws;
     this.openedAt = null;
+    // A new connection starts with the server watching nothing.
+    this.unansweredWatches = [];
+    this.serverWatched = new Set();
     ws.onopen = () => {
       this.openedAt = Date.now();
       this.setConnected(true);
@@ -304,6 +334,7 @@ class SessionUpdatesSocket {
   private sendWatch(): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "watch", session_ids: this.watched }));
+      this.unansweredWatches.push(this.watched);
     }
   }
 
@@ -318,12 +349,48 @@ class SessionUpdatesSocket {
     } catch {
       return;
     }
+    if (frame.type === "snapshot") {
+      const answered = this.unansweredWatches.shift();
+      if (answered !== undefined) this.serverWatched = new Set(answered);
+    }
     for (const listener of this.listeners) listener(frame);
   }
 }
 
-/** Shared transport instance for the current tab. */
-export const sessionUpdatesSocket = new SessionUpdatesSocket();
+/**
+ * What this tab needs to share a socket with the browser's other tabs, or
+ * null to keep its own: the release flag is off, the browser lacks Web Locks
+ * or BroadcastChannel, or the server or the user isn't known.
+ */
+function sharedUpdatesEnvironment(): SharedUpdatesEnvironment | null {
+  if (!isFeatureEnabled(getCachedServerInfo() ?? "loading", "shared_session_updates_socket")) {
+    return null;
+  }
+  if (typeof navigator === "undefined" || typeof navigator.locks?.request !== "function") {
+    return null;
+  }
+  if (typeof BroadcastChannel === "undefined") return null;
+  // An embedding host can proxy several servers behind one origin, and one
+  // browser can hold several users' tabs. Only tabs that would open the same
+  // socket as the same user may share one.
+  const server = getOmnigentServerIdentity();
+  const user = getCurrentUserId();
+  if (server === null || user === null) return null;
+  return {
+    locks: navigator.locks,
+    openChannel: (name) => new BroadcastChannel(name) as TabChannel,
+    scope: JSON.stringify([server, buildUpdatesUrl(), user]),
+    tabId: randomUUID(),
+  };
+}
+
+/** The current tab's session-updates connection: its own socket, or a share of another tab's. */
+export const sessionUpdatesSocket = new SharedSessionUpdates(
+  new SessionUpdatesSocket(),
+  sharedUpdatesEnvironment,
+  // The app renders before the server's features have loaded, so the flag may not be readable yet.
+  () => (getCachedServerInfo() === null ? resolveServerInfo() : null),
+);
 
 /**
  * Resolve with the first pushed session row matching `match`.

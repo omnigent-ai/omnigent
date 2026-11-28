@@ -709,6 +709,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       adoptResponseIdIfUnset(state, event.responseId);
       yield {
         type: "terminal_command",
+        submission: event.submission,
         ctx: ctx(state, event.itemId || null, event.responseId || null),
         kind: event.kind,
         input: event.input,

@@ -18,7 +18,7 @@ import { cn } from "@/lib/utils";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 
 /** The rail's fixed panel tabs: everything but the dynamic browser and side-chat modes. */
-export type WorkspacePanelTab = Exclude<RightRailTab, "browser" | "sidechat">;
+export type WorkspacePanelTab = Exclude<RightRailTab, "browser" | "sidechat" | "gadget">;
 
 /** What a tab's trigger may depend on, gathered once per render by `WorkspacePanel`. */
 export interface WorkspacePanelTabContext {

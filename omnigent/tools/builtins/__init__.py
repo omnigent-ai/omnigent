@@ -36,6 +36,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelAsyncTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.gadgets import GADGET_TOOLS
 from omnigent.tools.builtins.journal import (
     SysJournalReadTool,
     SysJournalWriteNoteTool,
@@ -97,6 +98,7 @@ from omnigent.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
     "BUILTIN_NAMES",
+    "GADGET_TOOLS",
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
@@ -162,18 +164,6 @@ __all__ = [
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
 
-def _create_upload_file(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for UploadFileTool.
-
-    :param config: Tool config (unused).
-    :returns: An UploadFileTool instance.
-    """
-    from omnigent.tools.builtins.upload_file import UploadFileTool
-
-    return UploadFileTool()
-
-
 def _create_search_conversations(config: dict[str, str]) -> Tool:
     """
     Lazy factory for SearchConversationsTool.
@@ -186,30 +176,6 @@ def _create_search_conversations(config: dict[str, str]) -> Tool:
     )
 
     return SearchConversationsTool()
-
-
-def _create_list_files(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for ListFilesTool.
-
-    :param config: Tool config (unused).
-    :returns: A ListFilesTool instance.
-    """
-    from omnigent.tools.builtins.list_files import ListFilesTool
-
-    return ListFilesTool()
-
-
-def _create_download_file(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for DownloadFileTool.
-
-    :param config: Tool config (unused).
-    :returns: A DownloadFileTool instance.
-    """
-    from omnigent.tools.builtins.download_file import DownloadFileTool
-
-    return DownloadFileTool()
 
 
 def _create_export_agent(config: dict[str, str]) -> Tool:
@@ -293,9 +259,6 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "web_read": lambda config: WebReadTool(config=config),
     "nimble_research": lambda config: NimbleResearchTool(config=config),
     "nimble_extract": lambda config: NimbleExtractTool(config=config),
-    "upload_file": _create_upload_file,
-    "list_files": _create_list_files,
-    "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
     # Framework-owned: need runtime context. ``web_fetch`` is
@@ -308,6 +271,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "web_fetch": None,
     "list_comments": None,
     "update_comment": None,
+    # Session file tools: registered by ``ToolManager._register_file_tools``
+    # only when the spec sets ``tool_groups.files: true``.
+    "sys_files_upload": None,
+    "sys_files_list": None,
+    "sys_files_download": None,
     # ``sys_list_models`` is auto-registered by
     # ``ToolManager._register_sub_agent_tools`` with the dispatch grant
     # and intercepted by name in the runner's tool dispatch — reserved

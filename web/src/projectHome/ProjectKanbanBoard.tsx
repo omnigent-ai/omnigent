@@ -52,7 +52,7 @@ import {
 } from "@/hooks/useConversations";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useHosts, type Host } from "@/hooks/useHosts";
-import { getSessionState } from "@/hooks/useSessionState";
+import { getSessionState, withUnreadState } from "@/hooks/useSessionState";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalLoadedConversations, useOptionalSidebarShow } from "@/hooks/useSidebarData";
 import {
@@ -78,7 +78,7 @@ import {
   type StatusBucket,
 } from "@/shell/sidebarNav";
 import { useSessionActions } from "@/shell/useSessionActions";
-import { showsUnreadFor } from "@/lib/sessionMute";
+import { showsUnreadFor, useMutedProjects } from "@/lib/sessionMute";
 import {
   SessionEnvironmentLabel,
   SessionHarnessIcon,
@@ -91,6 +91,7 @@ import {
   KANBAN_COLUMNS,
   kanbanColumns,
   kanbanDropAction,
+  nestedAttentionLabel,
   projectBoardRows,
   takeArrivals,
   type KanbanCard,
@@ -189,9 +190,10 @@ export function ProjectKanbanBoard({
   const projectId = projects?.find((project) => project.name === projectName)?.id ?? null;
   const query = useProjectSessions(projectName, true);
   const loaded = useOptionalLoadedConversations();
-  // Read marks and drafts live outside the query cache; re-render when they change.
+  // Read marks, drafts and project mutes live outside the query cache; re-render when they change.
   useUnseenTick();
   useSessionDraftIds();
+  useMutedProjects();
   const rows = useMemo(
     () =>
       projectBoardRows(
@@ -655,7 +657,7 @@ function useLastResponsePreview(conversation: Conversation): string | undefined 
   return data ? leadingSentences(data, RESPONSE_PREVIEW_SENTENCES) : undefined;
 }
 
-function KanbanCardBody({
+export function KanbanCardBody({
   card,
   hideAwaitingTag = false,
   reserveCornerAction = false,
@@ -672,10 +674,13 @@ function KanbanCardBody({
   className?: string;
 }) {
   const { conversation, members } = card;
-  const state =
-    getSessionState(conversation) ??
-    (showsUnreadFor(conversation, isUnseen(conversation)) ? { kind: "unseen" as const } : null);
-  const working = state?.kind === "running";
+  useMutedProjects();
+  const state = withUnreadState(
+    getSessionState(conversation),
+    showsUnreadFor(conversation, isUnseen(conversation)),
+  );
+  // Background work alone keeps the badge and the last reply, not the working spinner.
+  const working = state?.kind === "running" && !state.background;
   const nestedCount = members.length - 1;
   const responsePreview = useLastResponsePreview(conversation);
   const show = useOptionalSidebarShow();
@@ -692,6 +697,17 @@ function KanbanCardBody({
   }
   if (nestedCount > 0) {
     metaParts.push({ key: "nested", icon: ListChevronsUpDownIcon, value: `${nestedCount} nested` });
+  }
+  const attentionLabel = nestedAttentionLabel(card);
+  if (attentionLabel !== null) {
+    metaParts.push({
+      key: "nested-attention",
+      value: (
+        <span title={card.attentionMembers.map(conversationDisplayLabel).join(", ")}>
+          {attentionLabel}
+        </span>
+      ),
+    });
   }
   if (show.includes("environment")) {
     metaParts.push({

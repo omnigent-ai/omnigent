@@ -1776,6 +1776,7 @@ def test_repl_ignores_unrelated_elicitation_resolved(
         dimensions=(40, 120),
         timeout=_LAUNCH_TIMEOUT,
     )
+    screen = TerminalScreen(child)
     try:
         server_url = _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT)
         with httpx.Client(base_url=server_url, trust_env=False, timeout=10.0) as http:
@@ -1792,8 +1793,16 @@ def test_repl_ignores_unrelated_elicitation_resolved(
                 http, conversation_id=session_id, timeout=15, needle="first unrelated-resolve"
             )["elicitation_id"]
             child.send("n" + "\r")
-            child.expect("refused", timeout=5)
-            child.expect(r"Denied by policy", timeout=10)
+            screen.wait_for(
+                lambda text: "› refused" in text,
+                timeout=5,
+                what="the keyboard refusal",
+            )
+            screen.wait_for(
+                lambda text: "Denied by policy" in text and "state: sleeping" in text,
+                timeout=10,
+                what="the refused turn to finish",
+            )
 
             # Turn 2: pend on a second ASK and leave it unanswered.
             child.send("second unrelated-resolve" + "\r")

@@ -1,8 +1,12 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { describe, expect, it } from "vitest";
 
+import { SHORTCUT_GROUPS, shortcutBinding } from "./registry";
 import {
   type ShortcutPageContext,
   type ShortcutPageGroup,
+  type ShortcutPageRow,
   shortcutPageGroups,
 } from "./shortcutPage";
 import {
@@ -19,6 +23,8 @@ const CONTEXT_FLAGS = Object.keys({
   browser: true,
   submitWithModEnter: true,
   preventsKeyboardSubmit: true,
+  alwaysSteer: true,
+  quickPick: true,
   contentSearch: true,
   grids: true,
   splitTerminal: true,
@@ -26,33 +32,56 @@ const CONTEXT_FLAGS = Object.keys({
   desktopCommands: true,
 } satisfies Record<keyof ShortcutPageContext, true>) as (keyof ShortcutPageContext)[];
 
-/** Every combination of the context flags: 2^10 contexts. */
+/** Every combination of the context flags: 2^12 contexts. */
 function everyContext(): ShortcutPageContext[] {
   return Array.from({ length: 1 << CONTEXT_FLAGS.length }, (_, bits) =>
     Object.fromEntries(CONTEXT_FLAGS.map((flag, index) => [flag, (bits & (1 << index)) !== 0])),
   ) as unknown as ShortcutPageContext[];
 }
 
-/** The recorded groups for `context`, assembled as the page would list them. */
+const pagesByPlatform = new Map<
+  boolean,
+  { context: ShortcutPageContext; groups: ShortcutPageGroup[] }[]
+>();
+
+/** Every context with the page it lists on this platform, built once for the whole file. */
+function everyPage(mac: boolean) {
+  let pages = pagesByPlatform.get(mac);
+  if (!pages) {
+    pages = everyContext().map((context) => ({
+      context,
+      groups: shortcutPageGroups(context, mac),
+    }));
+    pagesByPlatform.set(mac, pages);
+  }
+  return pages;
+}
+
+/** A page group as recorded, before rows named their registry binding. */
+type RecordedGroup = Omit<ShortcutPageGroup, "items"> & {
+  items: Omit<ShortcutPageRow, "shortcutId">[];
+};
+
 // The recorded rows predate the registry ids, which Settings search reads from the page.
-function withoutShortcutIds(groups: ShortcutPageGroup[]): ShortcutPageGroup[] {
+function withoutShortcutIds(groups: ShortcutPageGroup[]): RecordedGroup[] {
   return groups.map((group) => ({
     ...group,
-    items: group.items.map((row) => {
-      const copy = { ...row };
-      delete copy.shortcutId;
-      return copy;
-    }),
+    items: group.items.map(({ shortcutId: _shortcutId, ...row }) => row),
   }));
 }
 
-function goldenGroupsFor(context: ShortcutPageContext, mac: boolean): ShortcutPageGroup[] {
+/** The recorded groups for `context`, as the page would list them; adds unrecorded keys to `missingKeys`. */
+function goldenGroupsFor(
+  context: ShortcutPageContext,
+  mac: boolean,
+  missingKeys = new Set<string>(),
+): RecordedGroup[] {
   const platform = mac ? 0 : 1;
   const caps = (keys: GoldenRow["keys"]) => keys[platform].split(" ");
   return Object.entries(GOLDEN_GROUP_FLAGS).flatMap(([title, flags]) => {
     const on = flags.filter((flag) => context[flag]);
     const key = `${title}: ${on.length > 0 ? on.join("+") : "-"}`;
-    expect(key in GOLDEN_GROUPS, key).toBe(true);
+    if (!(key in GOLDEN_GROUPS)) missingKeys.add(key);
     const group = GOLDEN_GROUPS[key];
     if (!group) return [];
     return [
@@ -80,14 +109,21 @@ describe("shortcutPageGroups against the recorded rows", () => {
     { platform: "macOS", mac: true },
     { platform: "other platforms", mac: false },
   ])("lists exactly the recorded rows in every context on $platform", ({ mac }) => {
-    const contexts = everyContext();
-    expect(contexts).toHaveLength(1024);
-    for (const context of contexts) {
-      expect(
-        withoutShortcutIds(shortcutPageGroups(context, mac)),
-        JSON.stringify(context),
-      ).toStrictEqual(goldenGroupsFor(context, mac));
+    const pages = everyPage(mac);
+    expect(pages).toHaveLength(4096);
+    // One assertion per kind of failure: per-context expects dominate the run time.
+    const missingKeys = new Set<string>();
+    const differing = pages.flatMap(({ context, groups }) => {
+      const listed = withoutShortcutIds(groups);
+      const recorded = goldenGroupsFor(context, mac, missingKeys);
+      return isDeepStrictEqual(listed, recorded) ? [] : [{ context, listed, recorded }];
+    });
+    expect([...missingKeys]).toEqual([]);
+    const first = differing[0];
+    if (first) {
+      expect(first.listed, JSON.stringify(first.context)).toStrictEqual(first.recorded);
     }
+    expect(differing.length).toBe(0);
   });
 });
 
@@ -98,6 +134,8 @@ const BROWSER_TAB: ShortcutPageContext = {
   browser: false,
   submitWithModEnter: false,
   preventsKeyboardSubmit: false,
+  alwaysSteer: false,
+  quickPick: false,
   contentSearch: false,
   grids: false,
   splitTerminal: false,
@@ -122,6 +160,21 @@ describe("shortcutPageGroups", () => {
     expect(
       shortcutPageGroups({ ...BROWSER_TAB, grids: true }).map((group) => group.title),
     ).toContain("Panes");
+  });
+
+  it("lists Next and Previous session instead of the recent switcher with quick_pick_palette on", () => {
+    const desktop = { ...BROWSER_TAB, native: true, electron: true };
+    expect(labelsIn(desktop, "Navigation")).toContain("Switch recent sessions");
+    expect(labelsIn({ ...desktop, quickPick: true }, "Navigation")).toEqual(
+      expect.arrayContaining(["Next session", "Previous session"]),
+    );
+    expect(labelsIn({ ...desktop, quickPick: true }, "Navigation")).not.toContain(
+      "Switch recent sessions",
+    );
+    // A browser tab keeps Ctrl+Tab, so the page lists neither there.
+    expect(labelsIn({ ...BROWSER_TAB, quickPick: true }, "Navigation")).not.toContain(
+      "Next session",
+    );
   });
 
   it("adds desktop menu rows only when the shell hands commands to the page", () => {
@@ -153,5 +206,35 @@ describe("shortcutPageGroups", () => {
     expect(labelsIn({ ...BROWSER_TAB, contentSearch: true }, "View")).toContain(
       "Search workspace contents",
     );
+  });
+});
+
+describe("rows the registry binds", () => {
+  it("are every row, each under its binding's group with its label here", () => {
+    const titles = new Map(SHORTCUT_GROUPS.map((group) => [group.id, group.title]));
+    // One assertion at the end: per-row expects across 4,096 contexts dominate the run time.
+    const mismatches = new Set<string>();
+    for (const { context, groups } of everyPage(true)) {
+      for (const group of groups) {
+        for (const row of group.items) {
+          const binding = shortcutBinding(row.shortcutId);
+          if (group.title !== titles.get(binding.group)) {
+            mismatches.add(`${row.shortcutId} listed under ${group.title}`);
+          }
+          const label = binding.rowLabel?.(context) ?? binding.label;
+          if (row.label !== label) mismatches.add(`${row.shortcutId} labelled ${row.label}`);
+        }
+      }
+    }
+    expect([...mismatches]).toEqual([]);
+  });
+
+  it("show the desktop menu's chord where the menu owns it, and the page's elsewhere", () => {
+    const settingsKeys = (context: ShortcutPageContext) =>
+      shortcutPageGroups(context, true)
+        .flatMap((group) => group.items)
+        .find((row) => row.shortcutId === "settings.open")?.keys;
+    expect(settingsKeys({ ...BROWSER_TAB, desktopCommands: true })).toEqual(["⌘", ","]);
+    expect(settingsKeys(BROWSER_TAB)).toEqual(["⌘", "⌥", ","]);
   });
 });

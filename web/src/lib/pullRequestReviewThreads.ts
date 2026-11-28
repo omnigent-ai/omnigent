@@ -5,6 +5,8 @@ import {
   type SelectedLineRange,
 } from "@pierre/diffs";
 
+import type { CommentReaction } from "@/lib/pullRequestCommentReactions";
+
 export const PULL_REQUEST_DIFF_THEME = { dark: "github-dark", light: "github-light" } as const;
 
 export interface ReviewThreadAnchor {
@@ -46,6 +48,21 @@ export interface ReviewComment {
   created_at: string | null;
   url: string | null;
   minimized?: boolean;
+  /** The viewer wrote it and GitHub lets them edit it; only a read on this Mac says. */
+  can_update?: boolean;
+  /** The viewer wrote it and GitHub lets them delete it; only a read on this Mac says. */
+  can_delete?: boolean;
+  /** A draft in the viewer's pending review, which only they can see until it's submitted. */
+  pending?: boolean;
+  /** The pending review a draft is in; its edit or delete is bound to that review. */
+  pending_review_id?: string;
+  /** Its reactions and whether the viewer may react, from this Mac's read or the host's. */
+  reactions?: CommentReaction[];
+  can_react?: boolean;
+  /** GitHub's number for it, which the session's host reacts, edits and deletes by. */
+  database_id?: number | null;
+  /** The host's account wrote it; only the host's read says. */
+  viewer_did_author?: boolean;
 }
 
 export interface ReviewPage<T> {
@@ -68,6 +85,9 @@ export interface ReviewThread {
   resolved: boolean;
   outdated: boolean;
   can_reply: boolean;
+  /** Whether the viewer may resolve or unresolve it; absent from older shells and the host. */
+  can_resolve?: boolean;
+  can_unresolve?: boolean;
   diff_hunk: string;
   comments: ReviewPage<ReviewComment>;
   /** Locally posted replies awaiting confirmation by a read. */
@@ -77,6 +97,8 @@ export interface ReviewThread {
 export interface ReviewThreadsPage extends ReviewPage<ReviewThread> {
   head_sha: string;
   base_sha: string;
+  /** The login GitHub read a first page as, where this Mac read it. */
+  read_as?: string | null;
 }
 
 export interface ReviewSuggestionSource {
@@ -179,7 +201,7 @@ export function reviewSuggestionSource(
 
 /** Keep identity separate from position: several conversations can share a line. */
 export function reviewThreadAnnotations(
-  threads: ReviewThread[],
+  threads: readonly ReviewThread[],
   fileDiff: FileDiffMetadata | undefined,
   matchingRevision: boolean,
 ): { annotations: DiffLineAnnotation<ReviewThread[]>[]; unplaced: ReviewThread[] } {

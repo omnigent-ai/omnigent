@@ -85,7 +85,7 @@ import { RunnerStartingIndicator, SandboxActionBanner } from "@/pages/ChatIndica
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
-import { shouldQueueSend } from "@/lib/messageQueue";
+import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -374,6 +374,7 @@ export function SideChatPane({
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -504,12 +505,14 @@ export function SideChatPane({
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -696,6 +699,14 @@ export function SideChatPane({
             }}
           />
         )}
+        {readOnly && !pending && (
+          <SideChatCommandsPublisher
+            childId={childId}
+            harness={sessionHarness}
+            session={session}
+            fullSession={fullSession}
+          />
+        )}
         {(!fullSession || !readOnly) && (
           <div className={cn("shrink-0 px-3 pt-3", evenComposerPadding ? "pb-3" : "pb-5")}>
             {readOnly ? (
@@ -726,6 +737,131 @@ export function SideChatPane({
       </div>
     </ConversationScopeContext.Provider>
   );
+}
+
+interface SideChatCommandCatalogOptions {
+  childId: string;
+  harness: string | null | undefined;
+  session: Session | null | undefined;
+  fullSession: boolean;
+  pending: boolean;
+  enabled: boolean;
+  starting: boolean;
+}
+
+/** The commands and skills a side chat offers, for its composer and its sent bubbles. */
+function useSideChatCommandCatalog({
+  childId,
+  harness,
+  session,
+  fullSession,
+  pending,
+  enabled,
+  starting,
+}: SideChatCommandCatalogOptions) {
+  const nativeSession = isNativeTerminalSession({ harness, labels: session?.labels });
+  // A generic side chat has no host/workspace of its own: it forks the parent and
+  // runs in the parent's workspace. Discover skills against the parent (the same
+  // catalog the main composer shows); the hostless child always reads unavailable.
+  const parentId = fullSession
+    ? childId
+    : nativeSession
+      ? null
+      : parentIdFromLabels(session?.labels);
+  const { session: parentSession, isLoading: parentLoading } = useSession(parentId);
+  const {
+    skills,
+    skillsStatus,
+    refetch: refreshSkills,
+  } = useSkills({
+    target:
+      !pending && parentId !== null && parentSession?.hostId && parentSession.workspace
+        ? {
+            sessionId: parentId,
+            scope: {
+              hostId: parentSession.hostId,
+              harness: parentSession.harness,
+              workspace: parentSession.workspace,
+              agentId: parentSession.agentId,
+              subAgentName: parentSession.subAgentName,
+            },
+          }
+        : null,
+    enabled,
+    // A still-loading parent lookup has no target yet; treat it as discovery in
+    // flight so a quickly typed /skill is held, not sent to the agent as plaintext.
+    starting: starting || (parentId !== null && parentLoading),
+  });
+  const skillPrefix = skillInvocationPrefix(harness);
+  const sideChatBuiltins = useMemo<Record<string, string>>(() => {
+    const builtins: Record<string, string> = {};
+    if (!nativeSession) builtins["/help"] = BUILTIN_SLASH_COMMANDS["/help"];
+    return builtins;
+  }, [nativeSession]);
+  // A skill whose command exactly matches a built-in can never run (the built-in
+  // wins), so drop it to keep the menu's labels aligned with what submitting runs.
+  const routableSkills = useMemo(
+    () => skills.filter((skill) => !Object.hasOwn(sideChatBuiltins, `${skillPrefix}${skill.name}`)),
+    [skills, skillPrefix, sideChatBuiltins],
+  );
+  const skillCommands = useMemo(
+    () =>
+      Object.fromEntries(
+        routableSkills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+      ),
+    [routableSkills, skillPrefix],
+  );
+  const skillLabels = useMemo(
+    () => skillDisplayNames(routableSkills, skillPrefix),
+    [routableSkills, skillPrefix],
+  );
+  const menuCommands = useMemo(
+    () => ({ ...sideChatBuiltins, ...skillCommands }),
+    [sideChatBuiltins, skillCommands],
+  );
+  return {
+    nativeSession,
+    skillsStatus,
+    refreshSkills,
+    skillPrefix,
+    sideChatBuiltins,
+    skillCommands,
+    skillLabels,
+    menuCommands,
+  };
+}
+
+/**
+ * Publishes an ended side chat's catalog while its transcript shows, so its sent commands keep
+ * their tint after the composer that published it unmounts.
+ */
+function SideChatCommandsPublisher({
+  childId,
+  harness,
+  session,
+  fullSession,
+}: {
+  childId: string;
+  harness: string | null | undefined;
+  session: Session | null | undefined;
+  fullSession: boolean;
+}) {
+  const { menuCommands } = useSideChatCommandCatalog({
+    childId,
+    harness,
+    session,
+    fullSession,
+    pending: false,
+    enabled: true,
+    starting: false,
+  });
+  const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
+  usePublishComposerCommands(
+    childId,
+    menuCommandNames,
+    session ? nativeShellHarness(harness, session.permissionLevel ?? null) : null,
+  );
+  return null;
 }
 
 /**
@@ -1028,11 +1164,7 @@ function SideChatComposer({
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
   const sendContext: ComposerSendContext = {
-    mentions: composerInlineMentions(
-      sharedTags?.files ?? [],
-      sharedTags?.sessions ?? [],
-      harness ?? null,
-    ),
+    mentions: composerInlineMentions(sharedTags ?? { files: [], sessions: [] }, harness ?? null),
     reviewComments,
   };
   const addFiles = (incoming: File[]) => {
@@ -1116,66 +1248,24 @@ function SideChatComposer({
       : undefined,
   });
   const mentionMenuOpen = mentionOpen || mentionListingPending;
-  const nativeSession = isNativeTerminalSession({ harness, labels: session?.labels });
-  // A generic side chat has no host/workspace of its own: it forks the parent and
-  // runs in the parent's workspace. Discover skills against the parent (the same
-  // catalog the main composer shows); the hostless child always reads unavailable.
-  const parentId = fullSession
-    ? childId
-    : nativeSession
-      ? null
-      : parentIdFromLabels(session?.labels);
-  const { session: parentSession, isLoading: parentLoading } = useSession(parentId);
   const {
-    skills,
+    nativeSession,
     skillsStatus,
-    refetch: refreshSkills,
-  } = useSkills({
-    target:
-      !pending && parentId !== null && parentSession?.hostId && parentSession.workspace
-        ? {
-            sessionId: parentId,
-            scope: {
-              hostId: parentSession.hostId,
-              harness: parentSession.harness,
-              workspace: parentSession.workspace,
-              agentId: parentSession.agentId,
-              subAgentName: parentSession.subAgentName,
-            },
-          }
-        : null,
+    refreshSkills,
+    skillPrefix,
+    sideChatBuiltins,
+    skillCommands,
+    skillLabels,
+    menuCommands,
+  } = useSideChatCommandCatalog({
+    childId,
+    harness,
+    session,
+    fullSession,
+    pending,
     enabled: !pending && ready,
-    // A still-loading parent lookup has no target yet; treat it as discovery in
-    // flight so a quickly typed /skill is held, not sent to the agent as plaintext.
-    starting: starting || (parentId !== null && parentLoading),
+    starting,
   });
-  const skillPrefix = skillInvocationPrefix(harness);
-  const sideChatBuiltins = useMemo<Record<string, string>>(() => {
-    const builtins: Record<string, string> = {};
-    if (!nativeSession) builtins["/help"] = BUILTIN_SLASH_COMMANDS["/help"];
-    return builtins;
-  }, [nativeSession]);
-  // A skill whose command exactly matches a built-in can never run (the built-in
-  // wins), so drop it to keep the menu's labels aligned with what submitting runs.
-  const routableSkills = useMemo(
-    () => skills.filter((skill) => !Object.hasOwn(sideChatBuiltins, `${skillPrefix}${skill.name}`)),
-    [skills, skillPrefix, sideChatBuiltins],
-  );
-  const skillCommands = useMemo(
-    () =>
-      Object.fromEntries(
-        routableSkills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
-      ),
-    [routableSkills, skillPrefix],
-  );
-  const skillLabels = useMemo(
-    () => skillDisplayNames(routableSkills, skillPrefix),
-    [routableSkills, skillPrefix],
-  );
-  const menuCommands = useMemo(
-    () => ({ ...sideChatBuiltins, ...skillCommands }),
-    [sideChatBuiltins, skillCommands],
-  );
   // /help lists what this side chat offers; shown locally, never sent as a turn.
   const showHelp = useCallback(() => {
     const lines = Object.entries(menuCommands).map(([name, desc]) => `${name} — ${desc}`);
@@ -1260,7 +1350,7 @@ function SideChatComposer({
       .finally(() => setInterrupting(false));
   };
 
-  const submit = () => {
+  const submit = ({ queue = false }: ComposerSendOptions = {}) => {
     if (settingsSavePending()) return;
     const trimmed = outgoingText;
     const refused = () => {
@@ -1328,7 +1418,7 @@ function SideChatComposer({
         child.status,
         child.sessionStatus,
         useChatStore.getState().queuedMessages,
-        readAlwaysSteer(),
+        readAlwaysSteer() && !queue,
         // A codex /side command posts now even mid-turn, as the full-screen composer does.
         gridCell && usesNativeSideChatFork(harness) && isSideChatCommand(message.trim()),
         holdsInitialDraft(child),
@@ -1357,11 +1447,16 @@ function SideChatComposer({
   };
 
   const handleKeyDown = (event: ComposerKeyboardEvent, intent: ComposerKeyIntent) => {
-    // Mod+Enter submits any draft, then steers the whole queue into the running turn.
+    // Mod+Enter inverts Always steer mid-turn: with it on, the draft waits in the queue
+    // for the turn to end; otherwise it submits any draft, then steers the whole queue.
     if (queues && intent.shouldSteerAllFromKeyboard) {
       event.preventDefault();
       // An open "@" menu keeps its draft unsent, so the queue waits with it.
       if (settingsSavePending() || mentionMenuOpen) return;
+      if (canSend && busy && readAlwaysSteer()) {
+        submit({ queue: true });
+        return;
+      }
       submit();
       steerAllQueuedMessages(childId);
       return;
@@ -1636,7 +1731,7 @@ function SideChatComposer({
                 interrupt={showInterrupt}
                 busy={showInterrupt && interrupting}
                 disabled={showInterrupt ? interrupting || !interruptReady : !canSend || !ready}
-                onClick={showInterrupt ? interruptSideChat : submit}
+                onClick={showInterrupt ? interruptSideChat : () => submit()}
                 data-testid={showInterrupt ? "side-chat-interrupt" : "side-chat-send"}
               />
             </>

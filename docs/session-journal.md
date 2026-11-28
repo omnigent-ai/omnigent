@@ -239,10 +239,20 @@ automation's **Workflow (optional)** field. Each run follows the workflow as
 saved, without a plan review. No one is watching the run, so nothing in it
 waits for you.
 Each run gets its own new session: a schedule can't continue one session, and
-a trigger starts a session for each match rather than one task session. On a
-server that advertises `session_create_workflow_id` in `/v1/info`, a trigger's
-session starts as a run of the workflow, so the workflow's page lists it right
-away; otherwise the session loads the workflow when it starts work.
+a trigger starts a session for each match rather than one task session. A
+schedule's session starts as a run of the workflow, with the workflow's saved
+steps as its plan, so the workflow's page lists it as soon as it fires. Over the
+API, on a server that advertises `scheduled_task_workflow_id` in `/v1/info`,
+send the workflow's ID as `workflow_id` and the run's details as
+`workflow_details`: the automation stores the workflow, and the server writes the
+prompt that runs it, `/workflow Run the saved workflow "<name>" (ID <id>).`
+followed by any details after a blank line. A client can still send that prompt
+itself, and the automation then stores the workflow it names. Create and update
+refuse a workflow its owner can't run. If the workflow is
+deleted or no longer shared with the owner, the next run fails with
+`workflow_missing` and the automation is paused. On a server that advertises
+`session_create_workflow_id` in `/v1/info`, a trigger's session starts as a run
+of the workflow too; otherwise the session loads the workflow when it starts work.
 The agent first looks up missing inputs, chooses reversible defaults and tries
 bounded recovery within your existing authorization. It records its choices
 in the journal. Missing input or approval justifies a failure only with the

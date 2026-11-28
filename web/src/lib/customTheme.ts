@@ -341,15 +341,21 @@ function rebaseSelection(
   base: PaletteTokens,
   primary: string | null,
   foreground: string,
-): Pick<PaletteTokens, "selectionBackground" | "selectionForeground"> {
+): Pick<PaletteTokens, "selectionBackground" | "selectionForeground" | "codeSelection"> {
   if (primary === null) {
     return {
       selectionBackground: base.selectionBackground,
       selectionForeground: base.selectionForeground,
+      codeSelection: base.codeSelection,
     };
   }
   const alpha = parseCssColor(base.selectionBackground)?.alpha ?? 0.12;
-  return { selectionBackground: setAlpha(primary, alpha), selectionForeground: foreground };
+  const codeAlpha = parseCssColor(base.codeSelection)?.alpha ?? alpha;
+  return {
+    selectionBackground: setAlpha(primary, alpha),
+    selectionForeground: foreground,
+    codeSelection: setAlpha(primary, codeAlpha),
+  };
 }
 
 function rebaseVariant(

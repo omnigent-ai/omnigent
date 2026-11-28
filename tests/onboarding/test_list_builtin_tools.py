@@ -85,6 +85,14 @@ def test_unconditional_tools_always_advertised(monkeypatch: pytest.MonkeyPatch) 
     """Tools with no optional dependency survive every gate combination."""
     _reload_with_specs(monkeypatch, present=set())
 
-    assert {"web_search", "web_fetch", "list_files", "upload_file"} <= set(
-        list_tools_mod._TOOL_CLASSES
-    )
+    declarable = set(list_tools_mod._TOOL_CLASSES)
+    assert {"web_search", "web_fetch", "export_agent", "search_conversations"} <= declarable
+    # Every agent gets the file tools by default, so neither spelling is declarable.
+    assert not declarable & {
+        "upload_file",
+        "list_files",
+        "download_file",
+        "sys_files_upload",
+        "sys_files_list",
+        "sys_files_download",
+    }

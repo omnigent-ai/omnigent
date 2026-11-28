@@ -9,15 +9,18 @@ check-summary reducer need neither ``gh`` nor the network.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.git_providers import load_facet
 from omnigent.runner import github_resource, pr_resource
 from omnigent.runner.github_resource import (
     _summarize_checks,
@@ -27,6 +30,7 @@ from omnigent.runner.github_resource import (
     github_pr_diff,
 )
 from omnigent.runner.session_prs import PullRequestRef
+from tests.budgets import budget
 
 
 def _stub_gh(
@@ -48,6 +52,168 @@ def _stub_gh(
         return (1, "", "no stub")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
+
+
+GH_TOKEN_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+
+# A whole synthetic environment, so a failing comparison can only print these values.
+SYNTHETIC_ENVIRONMENT = {
+    "PATH": "/example/bin:/usr/bin",
+    "HOME": "/home/example",
+    "LANG": "C.UTF-8",
+    "EXAMPLE_SETTING": "example-value",
+    **{name: f"synthetic-{name.lower()}" for name in GH_TOKEN_NAMES},
+}
+
+
+@pytest.fixture
+def gh_starts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Record each process ``_gh`` starts, in a synthetic environment with ambient tokens."""
+    starts: list[dict[str, object]] = []
+
+    def run(
+        argv: list[str], *, cwd: str, timeout: float, env: dict[str, str] | None = None
+    ) -> tuple[int | None, str, str]:
+        starts.append({"argv": argv, "cwd": cwd, "timeout": timeout, "env": env})
+        return 0, "answer", ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+    monkeypatch.setattr(os, "environ", dict(SYNTHETIC_ENVIRONMENT))
+    return starts
+
+
+def _without_tokens(environment: dict[str, str]) -> dict[str, str]:
+    return {name: value for name, value in environment.items() if name not in GH_TOKEN_NAMES}
+
+
+@pytest.mark.parametrize("sandbox", [False, True], ids=["local", "sandbox"])
+@pytest.mark.parametrize("token", [None, "chosen-token"], ids=["ambient", "chosen-account"])
+def test_gh_starts_gh_with_todays_command_and_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    gh_starts: list[dict[str, object]],
+    sandbox: bool,
+    token: str | None,
+) -> None:
+    """Pin the process every ``gh`` call starts: command, environment, cwd and timeout."""
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: sandbox)
+    # The synthetic environment, plus what pytest itself sets during the call.
+    ambient = dict(os.environ)
+    argv = ["pr", "view", "7", "-R", "ghe.example.test/acme/repo", "--json", "number"]
+
+    result = github_resource._gh(argv, cwd="/workspace", token=token)
+
+    if not sandbox and token is None:
+        expected_env = None
+    else:
+        expected_env = _without_tokens(ambient) if sandbox else dict(ambient)
+        if token is not None:
+            expected_env = {
+                **_without_tokens(expected_env),
+                "GH_TOKEN": token,
+                "GH_ENTERPRISE_TOKEN": token,
+            }
+    assert result == (0, "answer", "")
+    assert gh_starts == [
+        {
+            "argv": ["gh", *argv],
+            "cwd": "/workspace",
+            "timeout": github_resource._DEFAULT_GH_TIMEOUT_SECONDS,
+            "env": expected_env,
+        }
+    ]
+
+
+def test_gh_keeps_a_callers_timeout_and_starts_nothing_past_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, gh_starts: list[dict[str, object]]
+) -> None:
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+
+    github_resource._gh(["api", "user"], cwd="/workspace", timeout=90.0)
+    with github_resource._gh_deadline_scope(0.0):
+        late = github_resource._gh(["api", "user"], cwd="/workspace")
+
+    assert late == (None, "", "gh deadline exceeded")
+    assert gh_starts == [
+        {"argv": ["gh", "api", "user"], "cwd": "/workspace", "timeout": 90.0, "env": None}
+    ]
+
+
+def test_concurrent_steps_keep_their_own_target_host(
+    monkeypatch: pytest.MonkeyPatch, gh_starts: list[dict[str, object]]
+) -> None:
+    """Two steps for different hosts, overlapping in two threads, each see only their own."""
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    built = github_resource._gh_invocation
+    hosts_by_thread: dict[str, list[str | None]] = {}
+    both_scoped = threading.Barrier(2, timeout=budget(10))
+
+    def recording(argv: list[str], *, token: str | None, host: str | None):
+        invocation = built(argv, token=token, host=host)
+        hosts_by_thread.setdefault(threading.current_thread().name, []).append(invocation.host)
+        return invocation
+
+    monkeypatch.setattr(github_resource, "_gh_invocation", recording)
+
+    def step(host: str) -> None:
+        with github_resource.gh_target_host_scope(host):
+            both_scoped.wait()
+            github_resource._gh(["api", "user"], cwd="/workspace")
+            both_scoped.wait()
+            github_resource._gh(["api", "user"], cwd="/workspace")
+        github_resource._gh(["api", "user"], cwd="/workspace")
+
+    threads = [
+        threading.Thread(target=step, args=(host,), name=name)
+        for name, host in (("first", "One.Example.Test"), ("second", "two.example.test"))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(budget(10))
+
+    assert hosts_by_thread == {
+        "first": ["one.example.test", "one.example.test", None],
+        "second": ["two.example.test", "two.example.test", None],
+    }
+    assert [start["argv"] for start in gh_starts] == [["gh", "api", "user"]] * 6
+
+
+def test_the_github_facet_targets_each_steps_reference_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facet = load_facet("github", "pull_requests")
+    seen: list[str | None] = []
+
+    def record(*_args: object, **_kwargs: object) -> dict[str, object]:
+        seen.append(github_resource._gh_target_host.get())
+        return {"available": False}
+
+    monkeypatch.setattr(github_resource, "_reference_info", record)
+    monkeypatch.setattr(github_resource, "_workspace_github_info", record)
+    reference = PullRequestRef.from_url("https://github.com/acme/repo/pull/7")
+    enterprise = reference.model_copy(update={"host": "ghe.example.test"})
+
+    facet.reference_info("/workspace", reference)
+    facet.reference_info("/workspace", reference=enterprise)
+    facet.workspace_info("/workspace")
+    scoped = {
+        name
+        for name, value in vars(type(facet)).items()
+        if callable(value) and getattr(value, "__wrapped__", None) is not None
+    }
+    takes_reference = {
+        name
+        for name, value in vars(type(facet)).items()
+        if not name.startswith("_")
+        and callable(value)
+        and "reference" in inspect.signature(value).parameters
+    }
+
+    assert seen == ["github.com", "ghe.example.test", None]
+    assert github_resource._gh_target_host.get() is None
+    assert scoped == takes_reference
+    assert "reference_info" in scoped and "workspace_info" not in scoped
 
 
 def _git_env() -> dict[str, str]:
@@ -160,10 +326,12 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
     assert not any(c[:2] == ("pr", "list") for c in calls)
 
 
-def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("host", ["github.com", "ghe.example.com"])
+def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch, host: str) -> None:
     """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty).
 
-    gh's "no pull requests" failure names no refused field, so it is not retried.
+    gh's "no pull requests" failure names no refused field, so it is not retried. The
+    reachable repo is the workspace's and names its host.
     """
     calls: list[tuple[str, ...]] = []
 
@@ -175,7 +343,9 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         if head == ("auth", "status"):
             return (0, "", "")
         if head == ("repo", "view"):
-            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+            fields = argv[argv.index("--json") + 1].split(",")
+            view = {"nameWithOwner": "corp/app", "url": f"https://{host}/corp/app"}
+            return (0, json.dumps({k: v for k, v in view.items() if k in fields}), "")
         if head == ("pr", "view"):
             return (1, "", "no pull requests found for branch")
         return (1, "", "no stub")
@@ -187,6 +357,24 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert info["pr"] is None
     assert info["base_ref"] is None
     assert sum(c[:2] == ("pr", "view") for c in calls) == 1
+    assert info["repo"] == info["workspace_repo"] == {"name_with_owner": "corp/app", "host": host}
+
+
+def test_reference_info_without_gh_reports_repo_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tracked PR names its host even when gh is missing and no PR loads."""
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+    reference = PullRequestRef(
+        host="ghe.example.com",
+        repository="corp/app",
+        number=7,
+        url="https://ghe.example.com/corp/app/pull/7",
+    )
+
+    info = github_resource._reference_info(str(repo), reference)
+    assert info["pr"] is None
+    assert info["repo"] == {"name_with_owner": "corp/app", "host": "ghe.example.com"}
 
 
 def test_github_info_pr_via_commit_fork_fallback(
@@ -552,12 +740,37 @@ def test_github_info_skips_account_enumeration_on_happy_path(
 
     info = github_info(str(repo))
     assert info["pr"]["number"] == 42
-    assert info["repo"] == {"name_with_owner": "acme/repo"}  # derived from pr.url
+    assert info["repo"] == {"name_with_owner": "acme/repo", "host": "github.com"}  # from pr.url
+    assert info["workspace_repo"] == info["repo"]
     assert info["authenticated"] is True
     # The two per-poll network calls are gone on the happy path.
     assert not any(c[:4] == ("auth", "status", "--json", "hosts") for c in calls)
     assert not any(c[:2] == ("repo", "view") for c in calls)
     assert "accounts" not in info
+
+
+def test_github_info_pr_without_url_names_the_workspace_repo_from_its_remote(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR reply without a URL can't name the repo, so the remote still does."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/x")
+    monkeypatch.setattr(github_resource._config, "github_account_preference", lambda _key: None)
+    pr = {"number": 42, "title": "t", "state": "OPEN", "statusCheckRollup": []}
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (0, json.dumps(pr), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 42
+    assert info["workspace_repo"] == {"name_with_owner": "acme/repo", "host": "github.com"}
 
 
 def test_github_info_runs_gh_as_preferred_account(
@@ -1513,8 +1726,7 @@ def test_github_info_includes_body_and_comments(
             assert "pushedDate" not in query
             assert "afterCommit { oid url }" in query
             assert argv[argv.index("--cache") + 1] == "30s"
-            assert "includeComments=false" in argv
-            assert "comments(last: 100) @include(if: $includeComments)" in query
+            assert "viewerCanUpdate viewerCanDelete viewerDidAuthor" in query
             return (
                 0,
                 json.dumps({"data": {"repository": {"pullRequest": {"timelineItems": timeline}}}}),
@@ -1918,7 +2130,10 @@ def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
 @pytest.mark.parametrize("failure", [None, "api", "enterprise_auth", "invalid_json"])
 def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatch, failure):
     old = [{"body": f"old-{i}", "createdAt": "2026-01-01"} for i in range(100)]
-    latest = [{"body": f"new-{i}", "createdAt": "2026-10-26"} for i in range(100)]
+    latest = [
+        {"id": f"IC_{i}", "body": f"new-{i}", "createdAt": "2026-10-26", **_RIGHTS}
+        for i in range(100)
+    ]
     calls = []
     host = "ghe.example.com" if failure == "enterprise_auth" else "github.com"
     monkeypatch.setattr(github_resource, "_list_accounts", lambda _root: (False, []))
@@ -1973,18 +2188,21 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
     payload = github_resource._comments_payload(data)
     assert payload["timeline_events"] == []
     assert payload["timeline_partial"] is True
-    assert len(calls) == (1 if failure == "enterprise_auth" else 2)
+    assert len(calls) == 2
     if failure == "enterprise_auth":
+        assert calls[1][0] == ["auth", "status", "-h", "ghe.example.com"]
         return
     assert calls[1][0][:4] == ["api", "--hostname", "github.com", "graphql"]
     assert "--cache" not in calls[1][0]
-    assert "includeComments=true" in calls[1][0]
     assert "number=17" in calls[1][0]
     assert calls[1][1]["token"] == "selected-token"
     assert github_resource._comments_payload(data)["comments_partial"] is True
     shaped = github_resource._shape_comments(old + latest)
     assert len(shaped) == 100
     assert shaped[-1]["body"] == "new-99"
+    # The busy tail's IDs and the account's rights come from the same read.
+    assert shaped[-1]["id"] == "IC_99"
+    assert shaped[-1]["can_update"] is True
 
 
 @pytest.mark.parametrize("fields", ["title,url", "reviewRequests,latestReviews"])
@@ -2031,3 +2249,161 @@ def test_head_repository_url(
 ) -> None:
     reference = PullRequestRef.from_url(pr_url)
     assert github_resource._head_repository_url(reference, head, owner) == expected
+
+
+def _conversation_read(
+    monkeypatch: pytest.MonkeyPatch, *, listed: list[dict], latest: list[dict]
+) -> dict:
+    """The overview's comments for a PR whose ``gh`` view lists ``listed`` and whose GraphQL
+    conversation read answers ``latest``."""
+    url = "https://github.com/o/r/pull/8"
+    queries: list[list[str]] = []
+
+    def gh(argv: Sequence[str], **_kwargs: object) -> tuple[int, str, str]:
+        if list(argv[:2]) == ["pr", "view"]:
+            return 0, json.dumps({"url": url, "comments": listed, "reviews": []}), ""
+        if "graphql" in argv:
+            queries.append(list(argv))
+            pull_request = {
+                "comments": {"nodes": latest},
+                "timelineItems": {"nodes": [], "pageInfo": {"hasPreviousPage": False}},
+            }
+            return 0, json.dumps({"data": {"repository": {"pullRequest": pull_request}}}), ""
+        return 1, "", "no stub"
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    monkeypatch.setattr(github_resource, "_list_accounts", lambda _root: (False, []))
+    data = github_resource._gh_pr_view(["8"], "url,comments,reviews", cwd="/workspace", token=None)
+    assert data is not None
+    assert len(queries) == 1
+    return {"query": queries[0], "comments": github_resource._comments_payload(data)["comments"]}
+
+
+def test_a_changed_conversation_is_read_past_ghs_cache_until_its_copy_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a comment or reaction change, gh's cached read would undo it for up to 30s."""
+    url = "https://github.com/o/r/pull/8"
+    now = [1000.0]
+    monkeypatch.setattr(github_resource, "_CHANGED_CONVERSATIONS", {})
+    monkeypatch.setattr(github_resource.time, "monotonic", lambda: now[0])
+
+    def read() -> list[str]:
+        return _conversation_read(monkeypatch, listed=[], latest=[])["query"]
+
+    assert "--cache" in read()
+    github_resource.conversation_changed(url)
+    github_resource.conversation_changed("https://github.com/o/r/pull/9")
+    assert "--cache" not in read()
+    now[0] += 29.9
+    assert "--cache" not in read()
+    now[0] += 0.2
+    assert "--cache" in read()
+    # An expired mark is dropped once read, so marks don't pile up.
+    assert list(github_resource._CHANGED_CONVERSATIONS) == ["https://github.com/o/r/pull/9"]
+
+
+def test_marking_a_changed_conversation_drops_the_expired_marks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The table stays bounded by what changed in the last 30s, even when nothing reads it."""
+    now = [1000.0]
+    monkeypatch.setattr(github_resource, "_CHANGED_CONVERSATIONS", {})
+    monkeypatch.setattr(github_resource.time, "monotonic", lambda: now[0])
+    github_resource.conversation_changed("https://github.com/o/r/pull/1")
+    now[0] += 10
+    github_resource.conversation_changed("https://github.com/o/r/pull/2")
+    now[0] += 25
+    github_resource.conversation_changed("https://github.com/o/r/pull/3")
+    assert list(github_resource._CHANGED_CONVERSATIONS) == [
+        "https://github.com/o/r/pull/2",
+        "https://github.com/o/r/pull/3",
+    ]
+
+
+_RIGHTS = {
+    "viewerCanReact": True,
+    "viewerCanUpdate": True,
+    "viewerCanDelete": False,
+    "viewerDidAuthor": True,
+    "reactionGroups": [
+        {"content": "THUMBS_UP", "viewerHasReacted": True, "reactors": {"totalCount": 2}},
+        {"content": "EYES", "viewerHasReacted": False, "reactors": {"totalCount": 0}},
+    ],
+}
+
+
+def test_conversation_comments_carry_their_ids_reactions_and_the_accounts_rights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each listed comment keeps gh's fresher text, and gains what GitHub's read says of it."""
+    anchor = "https://github.com/o/r/pull/8#issuecomment-"
+    listed = [
+        {
+            "id": "IC_1",
+            "author": {"login": "amy"},
+            "body": "edited just now",
+            "createdAt": "2026-11-01T00:00:00Z",
+            "url": anchor + "501",
+            "isMinimized": False,
+        },
+        # Posted after the cached conversation read: it has an ID, but nothing GitHub says of it.
+        {
+            "id": "IC_2",
+            "author": {"login": "bo"},
+            "body": "new",
+            "createdAt": "2026-11-02T00:00:00Z",
+            "url": anchor + "502",
+            "isMinimized": False,
+        },
+    ]
+    latest = [{**listed[0], "body": "before the edit", **_RIGHTS}]
+    read = _conversation_read(monkeypatch, listed=listed, latest=latest)
+    assert "--cache" in read["query"]
+    assert read["comments"] == [
+        {
+            "author": "amy",
+            "body": "edited just now",
+            "created_at": "2026-11-01T00:00:00Z",
+            "url": anchor + "501",
+            "id": "IC_1",
+            "database_id": 501,
+            "reactions": [{"content": "THUMBS_UP", "count": 2, "viewer_reacted": True}],
+            "can_react": True,
+            "can_update": True,
+            "can_delete": False,
+            "viewer_did_author": True,
+        },
+        {
+            "author": "bo",
+            "body": "new",
+            "created_at": "2026-11-02T00:00:00Z",
+            "url": anchor + "502",
+            "id": "IC_2",
+            "database_id": 502,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("anchor", "expected"),
+    [
+        ("1", 1),
+        ("9007199254740991", 9007199254740991),
+        ("9" * 19, None),
+        ("1" * 20, None),
+        ("0", None),
+        ("12a", None),
+    ],
+)
+def test_a_conversation_comments_number_comes_only_from_a_bounded_anchor(
+    anchor: str, expected: int | None
+) -> None:
+    """An anchor too long or too large for an exact ID names no comment."""
+    url = f"https://github.com/o/r/pull/8#issuecomment-{anchor}"
+    assert github_resource._issue_comment_number(url) == expected
+
+
+@pytest.mark.parametrize("url", [None, 5, "https://github.com/o/r/pull/8"])
+def test_a_conversation_comment_without_an_anchor_has_no_number(url: object) -> None:
+    assert github_resource._issue_comment_number(url) is None

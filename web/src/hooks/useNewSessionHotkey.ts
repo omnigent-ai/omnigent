@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { isMacPlatform } from "@/lib/hotkeys";
+import { pickListOwnsKey } from "@/lib/listNavigationKeys";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
@@ -24,7 +25,10 @@ export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): vo
   useEffect(() => {
     if (!enabled) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
-      if (e.repeat || !isNewSessionHotkey(e, isMac)) return;
+      // A list that already stepped on Ctrl-N (it listens first) keeps it.
+      if (e.repeat || e.defaultPrevented || !isNewSessionHotkey(e, isMac)) return;
+      // Ctrl-N steps an open pick list; off macOS it's also this chord.
+      if (pickListOwnsKey(e)) return;
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
       e.preventDefault();

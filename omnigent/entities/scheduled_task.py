@@ -81,6 +81,11 @@ class ScheduledTask:
     :param source_session_id: The session each firing copies. Every run starts a
         new session that begins with that session's history. ``None`` for a
         task whose runs start empty.
+    :param workflow_id: The saved workflow every run starts as a run of, e.g.
+        ``"0123456789abcdef0123456789abcdef"``. ``prompt`` holds the message that
+        runs it. ``None`` for a task saved without one, whose prompt may still
+        run a workflow in the form older servers wrote (see
+        :func:`~omnigent.server.scheduled.workflow_automations.task_workflow_id`).
     :param workspace: Connected-host directory or managed-sandbox repository URL.
         ``None`` uses the execution target's default workspace.
     :param base_branch: Create a random worktree from this ref for each new
@@ -98,9 +103,10 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
-    :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
-        agent set for its own session. Clients list reminders apart from
-        automations; scheduling and firing ignore it.
+    :param kind: ``"automation"``, ``"reminder"`` for a one-time message an
+        agent set for its own session, or ``"timer"`` for a wake an agent set with
+        ``sys_timer_set``. Clients list both apart from automations, and only a
+        timer is scheduled and fired differently.
     """
 
     id: str
@@ -121,6 +127,7 @@ class ScheduledTask:
     kind: str = "automation"
     session_id: str | None = None
     source_session_id: str | None = None
+    workflow_id: str | None = None
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"

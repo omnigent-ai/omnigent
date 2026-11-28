@@ -3,7 +3,7 @@ import {
   HarnessPickerConfigRow,
   HarnessPickerConfigPage,
 } from "@/components/composer/HarnessPicker";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { WandSparklesIcon } from "lucide-react";
 import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
 import { ComposerConfigTooltipRows } from "@/components/composer/ComposerControls";
@@ -21,6 +21,10 @@ import {
   ComposerConfigSections,
   type ComposerConfigSection,
 } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerPaletteSettings,
+  MODEL_BUSY_REASON,
+} from "@/components/composer/composerSectionSettings";
 import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
@@ -83,6 +87,8 @@ export function SessionHarnessPicker({
   disabled,
   openNonce = 0,
   modelPickerShortcutEnabled = false,
+  renderIcon,
+  paletteSettingsSource,
 }: {
   appearance?: "composer" | "header";
   busy: boolean;
@@ -110,6 +116,10 @@ export function SessionHarnessPicker({
   modelPickerShortcutEnabled?: boolean;
   /** Read and change this session instead of the active conversation. */
   sessionId?: string;
+  /** Renders the session's harness glyph a second time, e.g. on another surface. */
+  renderIcon?: (icon: ReactNode) => ReactNode;
+  /** Offer Model and Reasoning Effort in ⌘K under this; unset while quick_pick_palette is off. */
+  paletteSettingsSource?: string;
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -506,7 +516,7 @@ export function SessionHarnessPicker({
       />
     </>
   );
-  return (
+  const picker = (
     <HarnessPicker
       contentSide={appearance === "header" ? "bottom" : "top"}
       cyclePreview={
@@ -584,6 +594,32 @@ export function SessionHarnessPicker({
         </HarnessPickerConfigRow>
       )}
     </HarnessPicker>
+  );
+  const routing = costRoutingEligible &&
+    showModels && {
+      active: routingOn,
+      unavailableReason: busy || pendingModelChange !== null ? MODEL_BUSY_REASON : undefined,
+      select: () => {
+        cancelCycle();
+        void apply(() => useChatStore.getState().setCostControlMode("on", ...target));
+      },
+    };
+  // The picker keeps its place as a source comes and goes, so it never remounts; without a
+  // source the ⌘K settings never mount and their hooks never run.
+  return (
+    <>
+      {paletteSettingsSource !== undefined && (
+        <ComposerPaletteSettings
+          source={paletteSettingsSource}
+          models={disabled ? undefined : modelSection}
+          efforts={disabled ? undefined : effortSection}
+          effortRouted={routingOn}
+          routing={routing || undefined}
+        />
+      )}
+      {renderIcon?.(<ComposerAgentIcon agent={iconAgent} />)}
+      {picker}
+    </>
   );
 }
 

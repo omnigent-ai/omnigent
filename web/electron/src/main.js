@@ -67,6 +67,7 @@ const {
   sanitizeServerName,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
+const { startDesktopOpenServer } = require("./desktopOpenServer");
 const {
   parseServerLabels,
   serverLabel,
@@ -83,8 +84,23 @@ const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
+const {
+  addTrustedRemoteHost,
+  isTrustedRemoteContext,
+  readTrustedRemoteHosts,
+  removeTrustedRemoteHost,
+  serializeTrustedRemoteHosts,
+  normalizeTrustedHostId,
+} = require("./trustedRemoteHosts");
+const { createTrustedRemoteHostRequests } = require("./trustedRemoteHostRequests");
+const { normalizedServerTarget } = require("./hostStatusIdentity");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
-const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const {
+  createHostThisMachineChecker,
+  SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
+} = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -129,16 +145,21 @@ const {
   settingsMenuItem,
 } = require("./settingsNavigation");
 const { createQuitConfirmation } = require("./quitConfirmation");
+const { createRightSidebarWindow } = require("./rightSidebarWindow");
 const { acceleratorLabel, createGlobalShortcuts } = require("./globalShowShortcut");
 const {
   FLOATING_COMPOSER_PATH,
   FRAME_SETTINGS_KEY,
+  FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   createFloatingComposerController,
+  createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerLaunchMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 } = require("./floating_composer_window");
+const { createFloatingLaunchOffers } = require("./floating_launch_offers");
 const {
   createFloatingComposerSupport,
   floatingComposerTarget,
@@ -146,14 +167,24 @@ const {
   serverPageOf,
 } = require("./floating_composer_support");
 const {
+  menuStateChanged,
   registerDesktopCommandStateReset,
+  registerPickListMenuYield,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
+const {
+  SESSION_WINDOW_SIZE,
+  findSessionWindow,
+  sessionWindowPath,
+  withoutSessionWindowQuery,
+} = require("./sessionWindows");
 const omnigentCli = require("./omnigent_cli");
 const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
 const { createSshHostStore } = require("./sshHosts");
 const { createSshTargetChecks } = require("./sshTargets");
+const { createSshPreviewHosts } = require("./sshPreviewHosts");
+const { verifySshPreviewIdentity } = require("./sshPreviewIdentity");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -371,9 +402,89 @@ function databricksInternalFeaturesEnabled() {
  */
 const arcaIdentities = createArcaIdentityStore();
 // Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
-const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
+const onSshDestinationChanged = (serverUrl, hostId) =>
+  sshPreviewHosts.destinationChanged(serverUrl, hostId);
+const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"), {
+  onChange: onSshDestinationChanged,
+});
 const workspaceSshForwards = createWorkspaceSshForwards();
 const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
+// Preview identity proofs must not approve workspace file access.
+const sshPreviewDestinations = createSshHostStore(
+  () => path.join(app.getPath("userData"), "ssh-preview-hosts.json"),
+  { onChange: onSshDestinationChanged },
+);
+const sshPreviewHosts = createSshPreviewHosts({
+  destination: (serverUrl, hostId) =>
+    sshHosts.destination(serverUrl, hostId) ??
+    sshPreviewDestinations.destination(serverUrl, hostId),
+  verify: verifySshPreviewIdentity,
+  record: sshPreviewDestinations.record,
+});
+
+/**
+ * Ask, in a dialog the page can't draw over, before sessions on a host reached
+ * over SSH may open this computer's localhost pages. Null when there is no window to ask in.
+ */
+async function approveSshPreviewHost(win, serverUrl, destination, needsVerification) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Let sessions on "${destination}" open localhost pages?`,
+    detail:
+      `${new URL(serverUrl).host} says this session runs on the SSH destination "${destination}". ` +
+      (needsVerification
+        ? "Omnigent will use your SSH config and keys to check its running host identity first. It won't install software, start a host or sign in. "
+        : "Omnigent has already checked this destination. ") +
+      "Sessions there, and their agents, could then open localhost, 127.0.0.1 and *.localhost pages in the Browser pane. Those are this computer's own ports, including any you forward from that host.\n\n" +
+      `Allow only if you recognize "${destination}".`,
+  });
+  return win.isDestroyed() || windows.get(win)?.serverUrl !== serverUrl ? null : response === 1;
+}
+
+/** Persisted trusted remote hosts, reread on each check so hand edits apply. */
+const trustedRemoteHostRequests = createTrustedRemoteHostRequests({
+  isTrusted: (serverUrl, hostId) => {
+    try {
+      return isTrustedRemoteContext(
+        readTrustedRemoteHosts(loadSettings({ strict: true }).trusted_remote_hosts),
+        { serverTarget: serverUrl, sourceHostId: hostId },
+        serverUrl,
+      );
+    } catch {
+      return false;
+    }
+  },
+  add: (serverUrl, hostId) => {
+    const settings = loadSettings({ strict: true });
+    const result = addTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
+    if (result.added) {
+      settings.trusted_remote_hosts = result.entries;
+      saveSettings(settings);
+    }
+    return result.added;
+  },
+});
+
+/** Ask in the shell before persisting localhost access for a remote host. */
+async function approveTrustedRemoteHost(win, serverUrl, hostId) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Trust this host"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Let sessions on "${new URL(serverUrl).host}" open localhost pages?`,
+    detail:
+      `Server: ${serverUrl}\nHost ID: ${hostId}\n\n` +
+      "Sessions there, and their agents, could then open localhost, 127.0.0.1 and *.localhost pages in the Browser pane. Those are this computer's own ports, including any you forward from that host. Trust stays in place until you remove it in Settings, and the host's port must already be forwarded to this computer.\n\n" +
+      "Only trust hosts you recognize with access to this computer's local services.",
+  });
+  return win.isDestroyed() ? null : response === 1;
+}
 
 /**
  * Ask, in a dialog the page can't draw over, before SSH runs with a destination
@@ -524,7 +635,7 @@ const arcaAutoConnect = createArcaAutoConnect({
 });
 /** Agent retry bursts after a deliberate decline should not reopen the prompt immediately. */
 const ARCA_PREVIEW_DECLINE_COOLDOWN_MS = 10 * 1000;
-const arcaPreviewRecoveries = new Set();
+const pendingPreviewReconnects = new Set();
 const arcaPreviewDeclinedUntil = new Map();
 
 /**
@@ -1061,6 +1172,9 @@ function scheduleReconnect(
   returnUrl,
   { hint, finalMessage, network = false, blocked = false, interactive = false },
 ) {
+  // A panel never retries behind the overlay: the failure then loads setup, which closes a panel
+  // instead (see loadSetupPage), and the next open builds it again.
+  if (!isMainWindow(win)) return false;
   restartReconnectsOnWake();
   const previous = reconnects.get(win);
   const same = previous?.serverUrl === serverUrl;
@@ -1347,7 +1461,8 @@ function rememberOidcServer(serverUrl, cookieName) {
 
 /** Bring a window back to the front after the user signed in in their browser. */
 function focusAfterBrowserSignIn(win) {
-  if (win.isDestroyed()) return;
+  // A panel comes on screen only through ⇧⌘Space, and never activates the app.
+  if (win.isDestroyed() || !isMainWindow(win)) return;
   if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
@@ -1422,6 +1537,8 @@ function applyDockIcon() {
  * @property {import("./desktopCommands").DesktopCommandState | null} [desktopCommands]
  *   Menu commands this window's SPA last reported it can act on (see
  *   desktopCommands.js); absent until a supporting web bundle reports.
+ * @property {string | null} [shownConversationId] The conversation this window's
+ *   page reported it has loaded; absent or null until it does.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -1797,8 +1914,18 @@ const quitConfirmation = createQuitConfirmation({
   quit: () => app.quit(),
 });
 
+// Settings → "Widen window when opening the right sidebar" (opt-in).
+const rightSidebarWindow = createRightSidebarWindow({
+  loadSettings,
+  saveSettings,
+  workAreaFor: (bounds) => screen.getDisplayMatching(bounds).workArea,
+  animate: process.platform === "darwin",
+});
+
 // Main-window documents that can render the floating New Agent panel (see registerIpc).
 const floatingComposerSupport = createFloatingComposerSupport();
+// Launch messages a routed main window may send itself (see the open-in-main-window handler).
+const floatingLaunchOffers = createFloatingLaunchOffers();
 
 // "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
 // come forward from another app. The floating panel's ⇧⌘Space is held only while a
@@ -1886,6 +2013,28 @@ function floatingComposer() {
   return floatingComposerController;
 }
 
+// Builds the panel hidden once the app is quiet, so ⇧⌘Space shows a loaded page.
+const floatingComposerPreloader = createFloatingComposerPreloader({
+  target: floatingComposerPreloadTarget,
+  preload: (serverUrl) => floatingComposer().preload(serverUrl),
+});
+
+/** The server whose panel to build ahead: the one ⇧⌘Space would open now, if it can open. */
+function floatingComposerPreloadTarget() {
+  if (process.platform !== "darwin" || appQuitting) return null;
+  if (!globalShortcuts.floatingComposer.current().enabled) return null;
+  return floatingComposerTarget({
+    focused: null,
+    panelServerUrl: () => null,
+    mainWindowsByRecency: mainWindowsByRecency(mainWindowFocusOrder, mainWindows()),
+    serverUrlOf: (win) => windows.get(win)?.serverUrl ?? null,
+    supported: floatingComposerSupported,
+  });
+}
+
+/** Each server's pending release of its panel built ahead; an announcement clears it. */
+const floatingComposerReleases = new Map();
+
 /** Whether a panel still shows the panel page of `serverUrl`, or is still loading it. */
 function floatingComposerPanelIsCurrent(panel, serverUrl) {
   if (panel.isDestroyed() || panel.webContents.isCrashed()) return false;
@@ -1911,7 +2060,10 @@ function floatingComposerServerUrl() {
 
 /** ⇧⌘Space: the panel for the most recent server, else Omnigent comes forward. */
 function openFloatingComposerFromShortcut() {
-  const serverUrl = floatingComposerServerUrl();
+  // The press builds the panel itself if it isn't there yet.
+  floatingComposerPreloader.cancel();
+  // A panel the user has open takes the press, so it never falls through to raising a window.
+  const serverUrl = floatingComposerController?.openServerUrl() ?? floatingComposerServerUrl();
   if (serverUrl !== null) {
     floatingComposer().show(serverUrl);
     return;
@@ -1932,6 +2084,18 @@ function openFloatingComposerFromShortcut() {
 function serverPageShown(win) {
   if (win.isDestroyed()) return null;
   return serverPageOf(win.webContents.getURL(), windows.get(win)?.serverUrl);
+}
+
+/**
+ * The window a panel route for `serverUrl` goes to: the most recent one showing its app.
+ *
+ * @param {string | null | undefined} serverUrl
+ * @returns {BrowserWindow | undefined}
+ */
+function appWindowOfServer(serverUrl) {
+  return mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+    (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
+  );
 }
 
 /**
@@ -1979,6 +2143,14 @@ const aboutWindow = createAboutWindow({
 });
 
 const connectionLoading = createConnectionLoading({ BrowserWindow });
+
+/**
+ * The shell's connection indicator, over main windows only. It's a window of its own that shows
+ * even while its parent is hidden, and a panel loads hidden and shows once its page is ready.
+ */
+function showConnectionLoading(win, attempt, label) {
+  if (isMainWindow(win)) connectionLoading.show(win, attempt, label);
+}
 
 // Shell-owned update toast: renders the reused web UpdateBanner in a transparent
 // corner window so it shows even against servers running old omnigent web.
@@ -2036,10 +2208,15 @@ function settingsPath() {
   return path.join(app.getPath("userData"), "settings.json");
 }
 
-function loadSettings() {
+function loadSettings({ strict = false } = {}) {
   try {
-    return JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
-  } catch {
+    const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
+    if (strict && (!settings || typeof settings !== "object" || Array.isArray(settings))) {
+      throw new Error("Desktop settings must be a JSON object.");
+    }
+    return settings;
+  } catch (error) {
+    if (strict && error.code !== "ENOENT") throw error;
     // Missing/corrupt file → empty settings (first launch).
     return {};
   }
@@ -2532,7 +2709,7 @@ async function loadServerUrl(
       win.webContents.stop();
       // The reconnect overlay already says what's happening.
       if (!isSetupPageUrl(win.webContents.getURL()) && !reconnectOverlay.isShown(win)) {
-        connectionLoading.show(win, attempt, "Signing in…");
+        showConnectionLoading(win, attempt, "Signing in…");
       }
       try {
         const entered = new URL(serverUrl);
@@ -2614,7 +2791,7 @@ async function loadServerUrl(
         }
         updateSignOutMenuItem();
         if (!isSetupPageUrl(win.webContents.getURL())) {
-          connectionLoading.show(win, attempt, "Signing in…");
+          showConnectionLoading(win, attempt, "Signing in…");
         }
         const auth = getOidcAuth();
         try {
@@ -2649,7 +2826,7 @@ async function loadServerUrl(
         if (current()) setWindowServerManifest(win, nextManifest);
       });
     }
-    if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
+    if (!reconnectOverlay.isShown(win)) showConnectionLoading(win, attempt, "Opening Omnigent…");
     await loadServerDocument(win, target, signal);
     assertCurrent();
     diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
@@ -2817,7 +2994,11 @@ function registerNavigationFallbacks(win) {
   // → black window), so did-fail-load never fires. did-navigate is
   // main-frame-only and carries httpResponseCode; reuse the setup-page
   // fallback so the user sees the status and can change server / retry.
+  let navigations = 0;
+  let latestPageLoaded = false;
   win.webContents.on("did-navigate", (_event, url, httpResponseCode, httpStatusText) => {
+    const navigation = ++navigations;
+    latestPageLoaded = httpResponseCode < 400;
     if (httpResponseCode < 400) return;
     const state = windows.get(win);
     const failedOrigin = originOf(url ?? "");
@@ -2839,7 +3020,20 @@ function registerNavigationFallbacks(win) {
       const options = { hint: UNAVAILABLE_HINT, finalMessage: status };
       if (scheduleReconnect(win, state.serverUrl, url, options)) return;
     }
-    showConnectFailure(win, state.serverUrl ?? url ?? "", status);
+    const serverUrl = state.serverUrl;
+    if (httpResponseCode === 403 && serverUrl && usesBrowserAuth(pinnedOrigin(win))) {
+      // Off the VPN the IP access list refuses the page; a session renewal tells
+      // that (reconnect behind the overlay) apart from a real 403.
+      const replaced = () => navigation !== navigations && latestPageLoaded;
+      const checked = databricksAuth?.checkSession(win, "forbidden page load", replaced);
+      if (checked) {
+        void checked.then((connected) => {
+          if (connected && navigation === navigations) showConnectFailure(win, serverUrl, status);
+        });
+        return;
+      }
+    }
+    showConnectFailure(win, serverUrl ?? url ?? "", status);
   });
 }
 
@@ -2868,6 +3062,7 @@ function registerNavigationFallbacks(win) {
  *   path?: string,
  *   role?: string,
  *   windowOptions?: Electron.BrowserWindowConstructorOptions,
+ *   sessionWindowId?: string,
  * }} [opts]
  *   ``ephemeral: true`` creates a debug multi-server window: it opens on the
  *   setup page (ignoring the saved server) and a URL connected from it is
@@ -2876,19 +3071,26 @@ function registerNavigationFallbacks(win) {
  *   A ``role`` other than ``"main"`` builds a panel from ``windowOptions``: it
  *   loads and signs in like any window, but skips the main window's saved
  *   bounds, placement and update overlay, and app-level actions skip it.
+ *   ``sessionWindowId`` marks a main window popped out for one session: it
+ *   opens at the session-window size and never saves its bounds as the main
+ *   window's.
  * @returns {BrowserWindow}
  */
 function createWindow(targetUrl, opts = {}) {
   const ephemeral = opts.ephemeral === true;
   const role = opts.role ?? "main";
   const isMain = role === "main";
-  const savedBounds = isMain ? loadSavedWindowBounds() : null;
+  const sessionWindowId = isMain ? opts.sessionWindowId : undefined;
+  const savedBounds = isMain && !sessionWindowId ? loadSavedWindowBounds() : null;
+  const defaultSize = sessionWindowId ? SESSION_WINDOW_SIZE : { width: 1280, height: 860 };
   const mainWindowOptions = {
-    width: savedBounds?.width ?? 1280,
-    height: savedBounds?.height ?? 860,
+    width: savedBounds?.width ?? defaultSize.width,
+    height: savedBounds?.height ?? defaultSize.height,
     // Without saved coordinates Electron centers the window.
     ...(savedBounds ? { x: savedBounds.x, y: savedBounds.y } : {}),
-    minWidth: 720,
+    // Narrow enough to tile beside other windows; the docked sidebar (at most half the window)
+    // still leaves the chat room for its composer.
+    minWidth: 480,
     // Tall enough that the bundled setup page (logo, Start-locally, divider,
     // URL field, Connect, and a few recents) fits without overflowing.
     minHeight: 600,
@@ -2933,6 +3135,16 @@ function createWindow(targetUrl, opts = {}) {
   };
   win.on("enter-full-screen", sendFullScreenState);
   win.on("leave-full-screen", sendFullScreenState);
+  // A right sidebar closed while full screen or maximized shrinks the window once it's restored.
+  const restoreRightSidebarWindow = () => rightSidebarWindow.restored(win);
+  win.on("leave-full-screen", restoreRightSidebarWindow);
+  win.on("unmaximize", restoreRightSidebarWindow);
+  win.on("resize", restoreRightSidebarWindow);
+  // A new page doesn't know about the window's growth, so it mustn't shrink by it later.
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) rightSidebarWindow.forget(win);
+  });
+  win.webContents.on("render-process-gone", () => rightSidebarWindow.forget(win));
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.
@@ -2971,6 +3183,7 @@ function createWindow(targetUrl, opts = {}) {
     serverUrl: destination ? serverUrl : null,
     ephemeral,
     role,
+    ...(sessionWindowId ? { sessionWindowId } : {}),
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
@@ -3104,12 +3317,17 @@ function createWindow(targetUrl, opts = {}) {
 
   registerNavigationFallbacks(win);
   registerBrowserViewDetachOnNavigate(win);
+  registerConversationShownReset(win);
   registerDesktopCommandStateReset(win.webContents, () => {
     const state = windows.get(win);
     if (!state?.desktopCommands) return;
     state.desktopCommands = null;
     if (BrowserWindow.getFocusedWindow() === win) buildMenu();
   });
+  registerPickListMenuYield(
+    win.webContents,
+    () => windows.get(win)?.desktopCommands?.pickListFocused === true,
+  );
   // macOS trackpad swipes step back and forward, like a browser.
   win.on("swipe", (_event, direction) => {
     if (direction === "left") goInHistory(win, "go-back");
@@ -3150,7 +3368,7 @@ function createWindow(targetUrl, opts = {}) {
   if (isMain) {
     cascadeIfCovering(win);
     if (savedBounds?.maximized) win.maximize();
-    trackWindowBounds(win);
+    if (!sessionWindowId) trackWindowBounds(win);
     closePanelsOnSignIn(win);
   }
   return win;
@@ -3426,7 +3644,7 @@ function isFindBarSender(event) {
  */
 function newWindow() {
   const win = activeWindow();
-  const current = win?.webContents.getURL();
+  const current = withoutSessionWindowQuery(win?.webContents.getURL());
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
   // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
@@ -3919,6 +4137,13 @@ function shouldPlayNotificationSound(key) {
   lastSoundAtByKey.set(key, now);
   return true;
 }
+
+// Electron never emits `click` for a garbage-collected Notification, so the
+// notify handler keeps each one alive until it is clicked or fails to show. The
+// cap bounds the ones dismissed without a click, whose `close` isn't reliable.
+const MAX_RETAINED_NOTIFICATIONS = 100;
+/** @type {Set<Electron.Notification>} */
+const retainedNotifications = new Set();
 
 /**
  * Forget the saved server URL and return the focused window to the bundled
@@ -4477,7 +4702,7 @@ function guardAgentPartitionRequests(partition, registry) {
  * Main-owned recovery scope for a loopback preview request, excluding the
  * renderer-supplied host match that decides whether this session may ask.
  */
-function arcaPreviewRecoveryTargetForEvent(event, url) {
+function previewRecoveryTargetForEvent(event, url) {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (
     !isLoopbackPreviewUrl(url) ||
@@ -4507,7 +4732,7 @@ function arcaPreviewRecoveryContextForEvent(
   rememberedArcaHostId,
   sourceIsArcaHost,
 ) {
-  const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+  const targetContext = previewRecoveryTargetForEvent(event, url);
   if (
     !targetContext ||
     typeof sourceHostId !== "string" ||
@@ -4525,8 +4750,8 @@ function arcaPreviewRecoveryContextForEvent(
 
 /** Open one shared consent flow and let the requesting agent retry afterward. */
 function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
-  if (arcaPreviewRecoveries.has(target)) return;
-  arcaPreviewRecoveries.add(target);
+  if (pendingPreviewReconnects.has(target)) return;
+  pendingPreviewReconnects.add(target);
   void arcaConnectFlow
     .run(win, target, { reason: "preview-reconnect" })
     .then((result) => {
@@ -4544,7 +4769,7 @@ function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
       return { ok: false, error: String(error) };
     })
     .finally(() => {
-      arcaPreviewRecoveries.delete(target);
+      pendingPreviewReconnects.delete(target);
     });
 }
 
@@ -4608,7 +4833,16 @@ function createBrowserRegistryForWindow(win) {
             isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
             isDatabricksManagedServerUrl(target),
           serverTarget: target,
-        }) || context?.hostIsThisMachine === true
+        }) ||
+        (context?.hostIsTrustedRemotePreview === true &&
+          isTrustedRemoteContext(
+            readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+            context,
+            windows.get(win)?.serverUrl,
+          )) ||
+        context?.hostIsThisMachine === true ||
+        (context?.hostIsSshPreview === true &&
+          sshPreviewHosts.allows(windows.get(win)?.serverUrl, context?.sourceHostId))
       );
     },
     createBoundsController: createBrowserViewBoundsController,
@@ -4631,6 +4865,9 @@ function createBrowserRegistryForWindow(win) {
       }
     },
     isHostFocused: () => !win.isDestroyed() && win.isFocused(),
+    focusHost: () => {
+      if (!win.isDestroyed()) win.webContents.focus();
+    },
     // Renderer measures in CSS px; convert to window DIPs using the host
     // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
     getHostZoomFactor: () => {
@@ -4646,12 +4883,24 @@ function createBrowserRegistryForWindow(win) {
       Menu.buildFromTemplate(items).popup({ window: win });
     },
   });
+  // A reloaded or replaced renderer asks again for the page keys it handles; an older
+  // bundle never asks, so pages keep them.
   win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isMainFrame && !isInPlace) {
       registry.setRecentSessionSwitchSupported(false);
+      registry.holdForwardedChords();
       registry.setOpenTabSupported(false);
     }
   });
+  // A new document, or an error page, asks for its own keys. A navigation that stopped
+  // without one, such as a cancelled reload, left the old renderer, which keeps them.
+  win.webContents.on("did-navigate", () => registry.releaseForwardedChords(false));
+  win.webContents.on("did-fail-load", (_event, errorCode, _description, _url, isMainFrame) => {
+    if (isMainFrame && errorCode !== ERR_ABORTED) registry.releaseForwardedChords(false);
+  });
+  win.webContents.on("did-stop-loading", () => registry.releaseForwardedChords(true));
+  // A crashed renderer can't take the keys it asked for.
+  win.webContents.on("render-process-gone", () => registry.setForwardedChords([]));
   return registry;
 }
 
@@ -5242,14 +5491,47 @@ function registerIpc() {
   ipcMain.on("omnigent:set-desktop-command-state", (event, state) => {
     if (!isPinnedOriginSender(event)) return;
     const win = BrowserWindow.fromWebContents(event.sender);
-    windows.get(win).desktopCommands = sanitizeDesktopCommandState(state);
-    if (BrowserWindow.getFocusedWindow() === win) buildMenu();
+    const previous = windows.get(win).desktopCommands;
+    const next = sanitizeDesktopCommandState(state);
+    windows.get(win).desktopCommands = next;
+    // A report that only moves pick-list focus leaves the menu as it is.
+    if (menuStateChanged(previous, next) && BrowserWindow.getFocusedWindow() === win) buildMenu();
+  });
+
+  // The conversation this window's page has loaded for its signed-in user. A
+  // browser's hand-off waits for this rather than for the address alone.
+  ipcMain.on("omnigent:conversation-shown", (event, conversationId) => {
+    if (!isPinnedOriginSender(event)) return;
+    const state = windows.get(BrowserWindow.fromWebContents(event.sender));
+    if (state)
+      state.shownConversationId = typeof conversationId === "string" ? conversationId : null;
   });
 
   // Close (⌘W) on the new-session page, once the page's own dialog confirmed it.
   ipcMain.handle("omnigent:close-window", (event) => {
     if (!isPinnedOriginSender(event)) return false;
     BrowserWindow.fromWebContents(event.sender)?.close();
+    return true;
+  });
+
+  // "Open in new window": the session in its own window on the sender's server. The server
+  // comes from main's window state, never the page; a session already popped out comes forward.
+  ipcMain.handle("omnigent:open-session-window", (event, sessionId) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const routePath = sessionWindowPath(sessionId);
+    const state = windows.get(BrowserWindow.fromWebContents(event.sender));
+    if (routePath === null || !state?.serverUrl) return false;
+    const existing = findSessionWindow(windows, { serverUrl: state.serverUrl, sessionId });
+    if (existing) {
+      focusAndRestore(existing);
+      return true;
+    }
+    createWindow(undefined, {
+      serverUrl: state.serverUrl,
+      path: routePath,
+      ephemeral: state.ephemeral === true,
+      sessionWindowId: sessionId,
+    });
     return true;
   });
 
@@ -5289,7 +5571,10 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("get-global-shortcut is only available to a connected server page");
     }
-    return requireSettingsShortcut(id).current();
+    const shortcut = requireSettingsShortcut(id);
+    // Opening Settings is the user's cue to retry a chord another app may have released.
+    shortcut.refresh();
+    return shortcut.current();
   });
   ipcMain.handle("omnigent:set-global-shortcut", (event, setting, id = "show") => {
     if (!isPinnedOriginSender(event)) {
@@ -5315,6 +5600,34 @@ function registerIpc() {
     return true;
   });
 
+  // Settings → "Widen window when opening the right sidebar", and the page's reports of that
+  // sidebar opening and closing, which resize only the reporting window.
+  ipcMain.handle("omnigent:get-right-sidebar-widens-window", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error(
+        "get-right-sidebar-widens-window is only available to a connected server page",
+      );
+    }
+    return rightSidebarWindow.enabled();
+  });
+  ipcMain.handle("omnigent:set-right-sidebar-widens-window", (event, enabled) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error(
+        "set-right-sidebar-widens-window is only available to a connected server page",
+      );
+    }
+    return rightSidebarWindow.setEnabled(enabled === true);
+  });
+  ipcMain.on("omnigent:right-sidebar-visibility", (event, report) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
+    // Only the window's own page speaks for its sidebar, not a frame inside it.
+    if (event.senderFrame !== event.sender.mainFrame) return;
+    if (report?.reset === true) rightSidebarWindow.forget(win);
+    else if (report?.open === true) rightSidebarWindow.opened(win, report.width);
+    else if (report?.open === false) rightSidebarWindow.closed(win);
+  });
+
   // A main window's document can render the floating panel for its server, until it's replaced.
   ipcMain.on("omnigent:floating-composer:announce", (event, version) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -5325,21 +5638,47 @@ function registerIpc() {
     const contents = win.webContents;
     const hadSupport = floatingComposerSupport.any();
     if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
+    // A new announcement means a reload finished, so the panel built ahead stays.
+    clearTimeout(floatingComposerReleases.get(serverUrl));
+    floatingComposerReleases.delete(serverUrl);
     // Support ends with this document: when another one commits, or its renderer goes away.
     const revoke = () => {
       contents.removeListener("did-navigate", revoke);
       contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
+      // Offers to this document end now, so the panel delivers without waiting out the timeout.
+      floatingLaunchOffers.forgetTaker(contents);
+      // A panel built ahead goes once its server has had no supporting page for a while; a
+      // reload announces again within moments, which calls the release off.
+      if (!floatingComposerSupport.serves(serverUrl)) {
+        clearTimeout(floatingComposerReleases.get(serverUrl));
+        const release = setTimeout(() => {
+          floatingComposerReleases.delete(serverUrl);
+          floatingComposerController?.releaseUnshown(serverUrl);
+        }, FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+        release.unref?.();
+        floatingComposerReleases.set(serverUrl, release);
+      }
       if (!floatingComposerSupport.any()) applyFloatingComposerShortcut();
     };
     contents.on("did-navigate", revoke);
     contents.on("render-process-gone", revoke);
     contents.on("destroyed", revoke);
     if (!hadSupport) applyFloatingComposerShortcut();
+    floatingComposerPreloader.schedule();
   });
 
-  // From the panel: hide it, keeping its draft.
+  // From the panel: its composer rendered, so an open shows it at once.
+  ipcMain.on("omnigent:floating-composer:ready", (event) => {
+    const panel = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
+    // Only the panel's own top document, still on its panel page, speaks for it.
+    if (event.senderFrame !== event.sender.mainFrame || serverPageShown(panel) !== "panel") return;
+    floatingComposerController.markReady(panel);
+  });
+
+  // From the panel: put it away, keeping its draft; the keyboard goes back to the app it had.
   ipcMain.on("omnigent:floating-composer:dismiss", (event) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
     if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
@@ -5356,37 +5695,89 @@ function registerIpc() {
 
   // From the panel: a session it launched, or an app page it links to, in a main window of
   // its server. The panel then hides.
-  ipcMain.handle("omnigent:floating-composer:open-in-main-window", (event, routePath) => {
-    const panel = BrowserWindow.fromWebContents(event.sender);
-    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
-      return { ok: false, error: "not-composer" };
-    }
-    const sessionPath = floatingComposerSessionPath(routePath);
-    const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
-    if (openPath === null) return { ok: false, error: "bad-path" };
-    // Bound by main when it built the panel; never taken from the page.
-    const serverUrl = floatingComposerController.serverUrlFor(panel);
-    // Only a window showing its server's app hears the route, not one on setup or sign-in.
-    const target = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
-      (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
-    );
-    // A window still connecting would drop the route when its page loads; the panel stays.
-    if (target && connectionAttempts.get(target)?.pending === true) {
-      return { ok: false, error: "window-loading" };
-    }
-    if (target) {
-      sendOpenPath(target, openPath);
-      // A linked page comes forward; a launched session waits behind the app the user is in.
-      if (sessionPath === null) {
-        focusAndRestore(target);
-        app.focus({ steal: true });
+  ipcMain.handle(
+    "omnigent:floating-composer:open-in-main-window",
+    (event, routePath, launchMessage) => {
+      const panel = BrowserWindow.fromWebContents(event.sender);
+      if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
+        return { ok: false, error: "not-composer" };
       }
-    } else {
-      createWindow(undefined, { serverUrl, path: openPath });
+      const sessionPath = floatingComposerSessionPath(routePath);
+      const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
+      if (openPath === null) return { ok: false, error: "bad-path" };
+      // Bound by main when it built the panel; never taken from the page.
+      const serverUrl = floatingComposerController.serverUrlFor(panel);
+      // Only a window showing its server's app hears the route, not one on setup or sign-in.
+      const target = appWindowOfServer(serverUrl);
+      // A window still connecting would drop the route when its page loads; the panel stays.
+      if (target && connectionAttempts.get(target)?.pending === true) {
+        return { ok: false, error: "window-loading" };
+      }
+      // A launched session or a linked page comes forward, over the app the user was in.
+      let offer = null;
+      if (target) {
+        sendOpenPath(target, openPath);
+        focusAndRestore(target);
+        const message = sessionPath === null ? null : floatingComposerLaunchMessage(launchMessage);
+        if (message !== null && floatingLaunchOffers.isTaker(target.webContents)) {
+          offer = floatingLaunchOffers.offer(target.webContents, {
+            sessionId: sessionPath.slice("/c/".length),
+            message,
+          });
+        }
+      } else {
+        createWindow(undefined, { serverUrl, path: openPath });
+      }
+      // focusAndRestore already brought the app forward on macOS.
+      if (!target || process.platform !== "darwin") app.focus({ steal: true });
+      // After a launch the next open starts at the default placement again.
+      floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
+      if (offer === null) return { ok: true };
+      // Only the offer's outcome is awaited, and no window is focused after it, so a reopened panel keeps focus.
+      return offer.then((confirmed) => (confirmed ? { ok: true, delivery: "page" } : { ok: true }));
+    },
+  );
+
+  // From the panel: whether a launch's first message would go to a window that can send it.
+  ipcMain.handle("omnigent:floating-composer:can-hand-off", (event) => {
+    const panel = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return false;
+    const target = appWindowOfServer(floatingComposerController.serverUrlFor(panel));
+    return (
+      target !== undefined &&
+      connectionAttempts.get(target)?.pending !== true &&
+      floatingLaunchOffers.isTaker(target.webContents)
+    );
+  });
+
+  // From a main window's top document: whether it sends the first messages of launches offered
+  // to it, for its server. Its unsubscribe sends false.
+  ipcMain.on("omnigent:floating-composer:launch-takers", (event, subscribed) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
+    if (event.senderFrame !== event.sender.mainFrame) return;
+    if (subscribed !== true) floatingLaunchOffers.forgetTaker(event.sender);
+    else if (floatingComposerSupport.supports(event.sender.id, windows.get(win).serverUrl)) {
+      floatingLaunchOffers.addTaker(event.sender);
     }
-    // After a launch the next open starts at the default placement again.
-    floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
-    return { ok: true };
+  });
+
+  // From a main window's top document: the message of a launch offered to it, once.
+  ipcMain.handle("omnigent:floating-composer:launch-take", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return null;
+    return floatingLaunchOffers.take(event.sender, offerId);
+  });
+
+  // From a main window's top document: it has rebuilt the offered message and will send it.
+  ipcMain.handle("omnigent:floating-composer:launch-confirm", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
+    return floatingLaunchOffers.confirm(event.sender, offerId);
+  });
+
+  // From a main window's top document: it won't send the offered message, so the panel delivers.
+  ipcMain.handle("omnigent:floating-composer:launch-decline", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
+    return floatingLaunchOffers.decline(event.sender, offerId);
   });
 
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
@@ -5449,6 +5840,7 @@ function registerIpc() {
     // Focus the window that fired the notification (so a click lands on the
     // right one in a multi-window setup), falling back to any open window.
     notification.on("click", () => {
+      retainedNotifications.delete(notification);
       const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
       if (win) {
         if (win.isMinimized()) win.restore();
@@ -5466,6 +5858,11 @@ function registerIpc() {
         }
       }
     });
+    notification.on("failed", () => retainedNotifications.delete(notification));
+    retainedNotifications.add(notification);
+    if (retainedNotifications.size > MAX_RETAINED_NOTIFICATIONS) {
+      retainedNotifications.delete(retainedNotifications.values().next().value);
+    }
     notification.show();
     signalForeground();
     // Foreground + background audible cue on macOS: play the user's chosen
@@ -5791,11 +6188,85 @@ function registerIpc() {
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
+      sshLocalhostPreview: process.platform !== "win32",
+      trustedRemoteLocalhostPreview: true,
       // The floating New Agent panel is a macOS panel window.
       floatingComposer: process.platform === "darwin",
       // Settings can read and change the panel's shortcut by id.
       floatingComposerShortcut: process.platform === "darwin",
     };
+  });
+
+  // Each connected server manages only its own entries; all grants need shell consent.
+  const trustedRemoteHostsResult = (event) => {
+    if (!isPinnedOriginSender(event)) {
+      return {
+        ok: false,
+        error: "trusted remote hosts are only available to a connected server page",
+      };
+    }
+    const serverUrl = normalizedServerTarget(senderServerUrl(event));
+    if (!serverUrl) return { ok: false, error: "This window is not connected to a server." };
+    try {
+      return {
+        ok: true,
+        serverUrl,
+        hosts: serializeTrustedRemoteHosts(
+          loadSettings({ strict: true }).trusted_remote_hosts,
+        ).filter((entry) => entry.server_url === serverUrl),
+      };
+    } catch {
+      return {
+        ok: false,
+        error: "Could not read desktop settings. Repair settings.json and retry.",
+      };
+    }
+  };
+  const requestTrustedRemoteHost = (event, serverUrl, hostId) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const current = () =>
+      win &&
+      !win.isDestroyed() &&
+      isPinnedOriginSender(event) &&
+      normalizedServerTarget(senderServerUrl(event)) === serverUrl;
+    return trustedRemoteHostRequests.request(serverUrl, hostId, async () => {
+      if (!current()) return null;
+      loadSettings({ strict: true });
+      const answer = await approveTrustedRemoteHost(win, serverUrl, hostId);
+      return current() ? answer : null;
+    });
+  };
+  ipcMain.handle("omnigent:get-trusted-remote-hosts", (event) => trustedRemoteHostsResult(event));
+  ipcMain.handle("omnigent:add-trusted-remote-host", async (event, serverUrl, hostId) => {
+    const listed = trustedRemoteHostsResult(event);
+    if (!listed.ok) return listed;
+    const host = normalizeTrustedHostId(hostId);
+    if (normalizedServerTarget(serverUrl) !== listed.serverUrl || !host) {
+      return { ...listed, ok: false, error: "Enter a host ID for this window's server." };
+    }
+    const allowed = await requestTrustedRemoteHost(event, listed.serverUrl, host);
+    if (!allowed) {
+      return {
+        ok: false,
+        error: trustedRemoteHostRequests.hint(listed.serverUrl, host) ?? "Trust was not saved.",
+      };
+    }
+    return { ...trustedRemoteHostsResult(event), added: true };
+  });
+  ipcMain.handle("omnigent:remove-trusted-remote-host", (event, serverUrl, hostId) => {
+    const listed = trustedRemoteHostsResult(event);
+    if (!listed.ok) return listed;
+    if (normalizedServerTarget(serverUrl) !== listed.serverUrl) {
+      return { ...listed, ok: false, error: "Manage trusted hosts from their server's window." };
+    }
+    const settings = loadSettings({ strict: true });
+    const result = removeTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
+    if (!result.removed) {
+      return { ...listed, ok: false, error: "That trusted host was not listed." };
+    }
+    settings.trusted_remote_hosts = result.entries;
+    saveSettings(settings);
+    return { ...trustedRemoteHostsResult(event), removed: true };
   });
 
   // SPA → a workspace API call on a session host's local socket. The socket and
@@ -6039,10 +6510,26 @@ function registerIpc() {
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
+      // Explicit grants follow the resolved server, including sign-in redirects.
+      const serverTarget = normalizedServerTarget(senderServerUrl(event));
       // Page supplies the session host ID; main verifies this machine's identity and live enrollment.
       return {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         sourceHostId,
+        ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+        opts?.trustedRemotePreviewProtocol === TRUSTED_REMOTE_PREVIEW_PROTOCOL &&
+        isTrustedRemoteContext(
+          readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+          { serverTarget, sourceHostId },
+          serverTarget,
+        )
+          ? { hostIsTrustedRemotePreview: true, serverTarget }
+          : {}),
+        ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+        opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
+        sshPreviewHosts.allows(windows.get(win)?.serverUrl, sourceHostId)
+          ? { hostIsSshPreview: true }
+          : {}),
         hostIsThisMachine:
           opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
           isHostThisMachine({
@@ -6057,6 +6544,7 @@ function registerIpc() {
       sourceHostId,
       rememberedArcaHostId,
       sourceIsArcaHost,
+      onRecoveryRequested,
     ) => {
       const context = arcaPreviewRecoveryContextForEvent(
         event,
@@ -6066,8 +6554,9 @@ function registerIpc() {
         sourceIsArcaHost,
       );
       if (!context) return false;
+      onRecoveryRequested?.();
       const { target } = context;
-      if (arcaPreviewRecoveries.has(target)) return false;
+      if (pendingPreviewReconnects.has(target)) return false;
       const declinedUntil = arcaPreviewDeclinedUntil.get(target) ?? 0;
       if (declinedUntil > Date.now()) return false;
       arcaPreviewDeclinedUntil.delete(target);
@@ -6089,15 +6578,76 @@ function registerIpc() {
         return false;
       }
     },
+    requestPreviewHostForEvent: async (event, url, opts) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const serverUrl = senderServerUrl(event);
+      const sourceHostId = opts?.sourceHostId;
+      if (
+        !win ||
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        opts?.sshPreviewProtocol !== SSH_PREVIEW_PROTOCOL ||
+        process.platform === "win32" ||
+        win.isDestroyed() ||
+        !isPinnedOriginSender(event) ||
+        !isLoopbackPreviewUrl(url) ||
+        pendingPreviewReconnects.has(previewRecoveryTargetForEvent(event, url)?.target) ||
+        sshPreviewHosts.allows(serverUrl, sourceHostId)
+      ) {
+        return false;
+      }
+      return sshPreviewHosts.request(
+        serverUrl,
+        sourceHostId,
+        (destination, needsVerification) =>
+          approveSshPreviewHost(win, serverUrl, destination, needsVerification),
+        opts?.sourceSshTarget,
+      );
+    },
+    requestTrustedRemoteHostForEvent: async (event, url, opts) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const sourceHostId = normalizeTrustedHostId(opts?.sourceHostId);
+      if (
+        !win ||
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        opts?.trustedRemotePreviewProtocol !== TRUSTED_REMOTE_PREVIEW_PROTOCOL ||
+        win.isDestroyed() ||
+        !isPinnedOriginSender(event) ||
+        !isLoopbackPreviewUrl(url)
+      ) {
+        return false;
+      }
+      const serverUrl = normalizedServerTarget(senderServerUrl(event));
+      if (!serverUrl) return false;
+      // A declined or failed SSH check must not lead to another permission question.
+      if (sshPreviewHosts.hint(senderServerUrl(event), opts?.sourceHostId)) return false;
+      return requestTrustedRemoteHost(event, serverUrl, sourceHostId);
+    },
     getAgentNavigationHintForEvent: (
       event,
       url,
       sourceHostId,
       rememberedArcaHostId,
       sourceIsArcaHost,
+      localhostBlocked = false,
+      trustedRemotePreviewProtocol,
     ) => {
-      const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
-      if (!targetContext) return null;
+      const previewHint = isLoopbackPreviewUrl(url)
+        ? sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)
+        : null;
+      if (previewHint) return previewHint;
+      const targetContext = previewRecoveryTargetForEvent(event, url);
+      if (!targetContext) {
+        if (!localhostBlocked || !isLoopbackPreviewUrl(url) || !sourceHostId) return null;
+        if (trustedRemotePreviewProtocol !== TRUSTED_REMOTE_PREVIEW_PROTOCOL) {
+          return "This server's web app does not support settings-based localhost previews. Update it, then retry.";
+        }
+        const serverUrl = normalizedServerTarget(senderServerUrl(event));
+        if (!serverUrl) return null;
+        const declinedHint = trustedRemoteHostRequests.hint(serverUrl, sourceHostId);
+        if (declinedHint) return declinedHint;
+        const entry = JSON.stringify({ server_url: serverUrl, host_id: sourceHostId });
+        return `To allow localhost previews from this session's host, trust it in Settings, or add ${entry} to trusted_remote_hosts in the desktop settings.json, then retry the preview.`;
+      }
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
       }
@@ -6115,7 +6665,7 @@ function registerIpc() {
       if ((arcaPreviewDeclinedUntil.get(target) ?? 0) > Date.now()) {
         return "Reconnect was declined. Wait a moment, then retry the preview to show the prompt again.";
       }
-      if (arcaPreviewRecoveries.has(target)) {
+      if (pendingPreviewReconnects.has(target)) {
         return "Finish the Arca reconnect in Omnigent, then retry the preview.";
       }
       return "Omnigent couldn't restore the Arca connection details. Retry the preview to reconnect.";
@@ -6203,14 +6753,18 @@ function rememberServerUrl(serverUrl) {
 }
 
 /**
- * Restore (if minimized) and focus a window. No-op when absent/destroyed.
+ * Restore (if minimized) and bring a window in front of other apps. No-op when
+ * absent/destroyed.
  *
  * @param {BrowserWindow | null | undefined} win
  */
 function focusAndRestore(win) {
   if (!win || win.isDestroyed()) return;
   if (win.isMinimized()) win.restore();
+  win.show();
   win.focus();
+  // A request from a browser page doesn't activate the app the way an OS link does.
+  if (process.platform === "darwin") app.focus({ steal: true });
 }
 
 /**
@@ -6399,6 +6953,93 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
     noLink: true,
   });
   return response === 1;
+}
+
+/**
+ * The loopback listener a server's web page uses to hand a conversation to this
+ * app (see README "Opening a conversation from the browser"); null until ready,
+ * and when every port is taken.
+ *
+ * @type {{ port: number, close: () => Promise<void> } | null}
+ */
+let desktopOpenServer = null;
+
+/** How long a browser's hand-off waits for a window to show the conversation, and how often it looks. */
+let browserHandoffTimeoutMs = 8000;
+const BROWSER_HANDOFF_POLL_MS = 100;
+
+/**
+ * Forget the conversation a window's page reported once that page is gone: a
+ * new document, or a crashed one, hasn't shown anything yet.
+ *
+ * @param {BrowserWindow} win
+ */
+function registerConversationShownReset(win) {
+  const forget = () => {
+    const state = windows.get(win);
+    if (state) state.shownConversationId = null;
+  };
+  win.webContents.on("did-navigate", forget);
+  win.webContents.on("render-process-gone", forget);
+}
+
+/**
+ * Whether a main window on this deep link's server reported that its page has
+ * loaded the conversation. The address alone doesn't say so: a signed-out page
+ * sits on the conversation's address before it goes to sign-in. A page too old
+ * to report never counts.
+ *
+ * @param {{ origin: string, path: string }} target A parsed deep link.
+ * @returns {boolean}
+ */
+function showsConversation(target) {
+  const conversationId = /^\/c\/([^/?]+)/.exec(target.path)?.[1];
+  if (!conversationId) return false;
+  return mainWindows().some(
+    (win) =>
+      pinnedOrigin(win) === target.origin &&
+      serverPageShown(win) === "app" &&
+      windows.get(win)?.shownConversationId === conversationId,
+  );
+}
+
+/**
+ * Open a conversation a browser page handed over, and report whether a window
+ * ended up showing it, so the page stays put when the app could not.
+ *
+ * @param {string} link e.g. ``"omnigent://localhost:8000/c/conv_abc"``.
+ * @returns {Promise<boolean>}
+ */
+async function openConversationFromBrowser(link) {
+  const target = parseOmnigentDeepLink(link);
+  if (!target) return false;
+  enqueueDeepLink(link);
+  const deadline = Date.now() + browserHandoffTimeoutMs;
+  while (!showsConversation(target)) {
+    if (Date.now() >= deadline) return false;
+    // oxlint-disable-next-line no-await-in-loop -- polling until the window has navigated
+    await new Promise((resolve) => {
+      setTimeout(resolve, BROWSER_HANDOFF_POLL_MS);
+    });
+  }
+  return true;
+}
+
+/**
+ * Listen for conversations handed over by the web page of a server the user
+ * has connected this app to. Other origins are refused, so a page can never
+ * make the app connect to a new server or show a prompt.
+ */
+async function startDesktopOpenListener() {
+  desktopOpenServer = await startDesktopOpenServer({
+    isKnownOrigin: (origin) => knownOrigins().includes(origin) || isPinnedServerUrl(origin),
+    openLink: openConversationFromBrowser,
+  });
+  console.log(
+    desktopOpenServer
+      ? `[omnigent] desktop-open: listening on 127.0.0.1:${desktopOpenServer.port}`
+      : "[omnigent] desktop-open: no free port; pages can't hand conversations to this app",
+  );
 }
 
 /** Deep links awaiting handling, in arrival order. */
@@ -6647,6 +7288,7 @@ if (!gotLock) {
     // (`electron .`) clicks route to the running dev instance too. No-op
     // (returns false) when another app is already the default handler.
     app.setAsDefaultProtocolClient("omnigent");
+    void startDesktopOpenListener();
     // If a deep link arrived before ready (macOS open-url, or Windows/Linux
     // argv), open it instead of the default launch window; the drain's
     // fallback opens a default window if a consent is cancelled. Otherwise
@@ -6684,6 +7326,7 @@ if (!gotLock) {
 
   app.on("will-quit", () => {
     globalShortcut.unregisterAll();
+    void desktopOpenServer?.close();
     workspaceSshForwards.closeAll();
   });
   app.on("window-all-closed", () => {

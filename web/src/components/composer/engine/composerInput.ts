@@ -26,9 +26,22 @@ export interface ComposerEditorSurface {
    * Replace `[start, end)` as typed input. Returns false when the input is locked
    * (read-only or disabled) and nothing changed.
    */
-  insertText: (text: string, start: number, end: number) => boolean;
+  insertText: (
+    text: string,
+    start: number,
+    end: number,
+    options?: ComposerInsertOptions,
+  ) => boolean;
   /** Scroll the caret's line into view. */
   revealCaret: () => void;
+}
+
+/** How an insert is recorded in the undo history. */
+export interface ComposerInsertOptions {
+  /** Make this edit its own undo step (the CodeMirror surface always does; textareas only when set). */
+  separateUndo?: boolean;
+  /** `false` leaves the edit out of the CodeMirror surface's undo history, as for a partial. */
+  history?: boolean;
 }
 
 /** What the composer edits: a <textarea> as-is, or another engine's surface. */
@@ -107,16 +120,23 @@ export interface ComposerKeyboardEvent {
 /** A change, selection, focus or scroll on a composer input; React's textarea events satisfy it. */
 export interface ComposerInputEvent {
   readonly currentTarget: ComposerTextTarget;
-  /** An engine's undo or redo made this change; a textarea reports it as its `inputType`. */
-  readonly fromHistory?: boolean;
+  /** Set when an engine's undo or redo made this change; a textarea reports it as `inputType`. */
+  readonly historyDirection?: "undo" | "redo";
   readonly nativeEvent?: Event;
+}
+
+/** The undo or redo that made `event`'s change, on either engine; `null` for any other change. */
+export function historyDirectionOf(event: ComposerInputEvent): "undo" | "redo" | null {
+  if (event.historyDirection) return event.historyDirection;
+  const inputType = (event.nativeEvent as InputEvent | undefined)?.inputType;
+  if (inputType === "historyUndo") return "undo";
+  if (inputType === "historyRedo") return "redo";
+  return null;
 }
 
 /** Whether `event` is an undo or redo, on either engine. */
 export function isHistoryInput(event: ComposerInputEvent): boolean {
-  if (event.fromHistory) return true;
-  const inputType = (event.nativeEvent as InputEvent | undefined)?.inputType;
-  return inputType === "historyUndo" || inputType === "historyRedo";
+  return historyDirectionOf(event) !== null;
 }
 
 /**
@@ -152,6 +172,8 @@ export interface ComposerInputProps {
   inputId?: string;
   /** Tagged @-mention tokens to present as one unit, such as "@README.md". */
   mentionTokens?: readonly string[];
+  /** The value is a reply draft's document, whose quote tokens the editor shows as cards. */
+  replyQuotes?: boolean;
   /** Leading command to tint, such as "/context"; a `{token, start}` pins it to an offset. */
   commandToken?: string | ComposerTokenAt | null;
   onChange?: (event: ComposerInputEvent) => void;

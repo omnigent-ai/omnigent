@@ -2,16 +2,20 @@ import {
   cursorCharLeft,
   cursorCharRight,
   deleteCharBackward,
+  deleteCharForward,
   redo,
   selectCharRight,
   undo,
 } from "@codemirror/commands";
+import { Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import userEvents from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
-import { insertComposerText } from "@/lib/composerText";
+import { insertComposerText, insertPastedText } from "@/lib/composerText";
+import { quoteLine } from "@/lib/replyDraftDocument";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
@@ -192,6 +196,22 @@ describe("CodeMirrorComposerInput", () => {
 });
 
 describe("CodeMirrorComposerInput change events", () => {
+  it.each([undefined, { separateUndo: true }])(
+    "makes a programmatic insert (%o) its own undo step apart from typing",
+    (options) => {
+      const { content, target } = mount({ value: "" });
+      const editor = EditorView.findFromDOM(content)!;
+      act(
+        () =>
+          void editor.dispatch({ changes: { from: 0, insert: "typed" }, userEvent: "input.type" }),
+      );
+      act(() => insertComposerText(target(), " inserted", 5, 5, options));
+      expect(target().value).toBe("typed inserted");
+      act(() => void undo(editor));
+      expect(target().value).toBe("typed");
+    },
+  );
+
   it("says when an undo or redo made the change", () => {
     const onChange = vi.fn((event: ComposerInputEvent) => isHistoryInput(event));
     const { content, target } = mount({ onChange });
@@ -202,6 +222,22 @@ describe("CodeMirrorComposerInput change events", () => {
     act(() => void undo(editor));
     act(() => void redo(editor));
     expect(onChange.mock.results.map((result) => result.value)).toEqual([false, true, true]);
+  });
+
+  it("reports an undo as 'undo' and a redo as 'redo', and an ordinary edit with no direction", () => {
+    const onChange = vi.fn<(event: ComposerInputEvent) => void>();
+    const { content, target } = mount({ onChange });
+    act(() => {
+      insertComposerText(target(), "draft", 0, 0);
+    });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void undo(editor));
+    act(() => void redo(editor));
+    expect(onChange.mock.calls.map(([event]) => event.historyDirection)).toEqual([
+      undefined,
+      "undo",
+      "redo",
+    ]);
   });
 
   it("takes a controlled value without reporting it or making it undoable", () => {
@@ -327,6 +363,67 @@ describe("CodeMirrorComposerInput change events", () => {
   });
 });
 
+describe("CodeMirrorComposerInput mention edges", () => {
+  const painted = ["@readme.md"];
+  function insertAt(from: number, insert: string, userEvent: string, tokens: string[]) {
+    const { content } = mount({ value: "Read @readme.md", mentionTokens: tokens });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void editor.dispatch({ changes: { from, insert }, userEvent }));
+    return editor.state.doc.toString();
+  }
+
+  it("adds the space to a typed insert beside a painted token", () => {
+    expect(insertAt(15, "x", "input.type", painted)).toBe("Read @readme.md x");
+  });
+
+  it("adds no space beside a token the editor does not paint", () => {
+    expect(insertAt(15, "x", "input.type", [])).toBe("Read @readme.mdx");
+  });
+
+  it("keeps a programmatic insert beside a painted token as its own undo step", () => {
+    const { content, target } = mount({ value: "", mentionTokens: painted });
+    const editor = EditorView.findFromDOM(content)!;
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 0, insert: "Read @readme.md" },
+          userEvent: "input.type",
+        }),
+    );
+    act(() => insertComposerText(target(), "x", 15, 15));
+    expect(editor.state.doc.toString()).toBe("Read @readme.md x");
+    act(() => void undo(editor));
+    expect(editor.state.doc.toString()).toBe("Read @readme.md");
+  });
+
+  it("keeps an adjusted insert that is marked out of history out of undo", () => {
+    const { content } = mount({ value: "", mentionTokens: painted });
+    const editor = EditorView.findFromDOM(content)!;
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 0, insert: "Read @readme.md" },
+          userEvent: "input.type",
+        }),
+    );
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 15, insert: "x" },
+          userEvent: "input",
+          annotations: Transaction.addToHistory.of(false),
+        }),
+    );
+    expect(editor.state.doc.toString()).toBe("Read @readme.md x");
+    act(() => void undo(editor));
+    expect(editor.state.doc.toString()).toBe(" x");
+  });
+
+  it("leaves an IME composition insert beside a painted token unchanged", () => {
+    expect(insertAt(15, "x", "input.type.compose", painted)).toBe("Read @readme.mdx");
+  });
+});
+
 describe("CodeMirrorComposerInput ref", () => {
   it("transfers the live surface when the forwarded ref changes", () => {
     const first = vi.fn<(target: ComposerTextTarget | null) => void>();
@@ -409,7 +506,7 @@ describe("CodeMirrorComposerInput mention tokens", () => {
     expect(tokenMarks(view.container)).toEqual([]);
   });
 
-  it("marks a token typed after mount, and drops it once the text no longer matches", () => {
+  it("marks a token typed after mount, and drops it once an edit breaks the match", () => {
     const { container, target } = mount({ mentionTokens: ["@a.ts"] });
     expect(tokenMarks(container)).toEqual([]);
 
@@ -419,14 +516,14 @@ describe("CodeMirrorComposerInput mention tokens", () => {
     expect(tokenMarks(container)).toHaveLength(1);
 
     act(() => {
-      insertComposerText(target(), "x", "@a.ts".length, "@a.ts".length);
+      insertComposerText(target(), "", 0, 1);
     });
     expect(tokenMarks(container)).toEqual([]);
   });
 });
 
-describe("CodeMirrorComposerInput mention tokens move as one character", () => {
-  // CodeMirror measures text for caret motion; jsdom has no layout.
+/** CodeMirror measures text for caret motion; jsdom has no layout, so ranges measure empty. */
+function mockEmptyRangeGeometry() {
   const originalRangeRects = {
     getClientRects: Range.prototype.getClientRects,
     getBoundingClientRect: Range.prototype.getBoundingClientRect,
@@ -436,6 +533,10 @@ describe("CodeMirrorComposerInput mention tokens move as one character", () => {
     Range.prototype.getBoundingClientRect = () => new DOMRect();
   });
   afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+}
+
+describe("CodeMirrorComposerInput mention tokens move as one character", () => {
+  mockEmptyRangeGeometry();
 
   const draft = "Read @readme.md now";
   const tokenStart = "Read ".length;
@@ -557,5 +658,239 @@ describe("leadingCommandSpan", () => {
     // The bare-string rule would refuse both: no word break after `!`, and \x01 isn't whitespace.
     expect(leadingCommandSpan("!ls", "!")).toBeNull();
     expect(leadingCommandSpan("\x01! ls", "!")).toBeNull();
+  });
+});
+
+describe("CodeMirrorComposerInput reply quotes", () => {
+  mockEmptyRangeGeometry();
+
+  const a = quoteLine("a", "Alpha");
+  const b = quoteLine("b", "Beta\nmore");
+  const lines = (...parts: string[]) => parts.join("\n");
+  function mountQuotes(value: string, props: Partial<Parameters<typeof mount>[0]> = {}) {
+    const mounted = mount({ value, replyQuotes: true, ...props });
+    const editor = EditorView.findFromDOM(mounted.content)!;
+    const caretAt = (anchor: number, head = anchor) =>
+      act(() => editor.dispatch({ selection: { anchor, head } }));
+    const run = (command: (view: EditorView) => boolean) => act(() => void command(editor));
+    const edit = (from: number, to: number, insert: string, userEvent = "input.type") =>
+      act(() =>
+        editor.dispatch({
+          changes: { from, to, insert },
+          selection: { anchor: from + insert.length },
+          userEvent,
+        }),
+      );
+    const removeButtons = () =>
+      Array.from(
+        mounted.container.querySelectorAll<HTMLButtonElement>("[aria-label='Remove quote']"),
+      );
+    return { ...mounted, editor, caretAt, run, edit, removeButtons };
+  }
+
+  it("paints each quote as a card with a truncated preview and an X that follows read-only", () => {
+    const long = "x".repeat(130);
+    const value = lines("Intro", quoteLine("long", long), "");
+    const { container, rerender, setTarget, removeButtons } = mountQuotes(value);
+    const card = container.querySelector("[data-testid='composer-reply-quote']")!;
+    expect(card.querySelector("blockquote")).toHaveAttribute("title", long);
+    expect(card.querySelector("[aria-hidden='true']")!.textContent).toBe(`${"x".repeat(120)}…`);
+    expect(card.querySelector(".sr-only")!.textContent).toBe(long);
+    expect(removeButtons()[0]).toBeEnabled();
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={value}
+        replyQuotes
+        readOnly
+        ref={setTarget}
+      />,
+    );
+    expect(removeButtons()[0]).toBeDisabled();
+  });
+
+  it("keeps the caret off cards, stepping over one with ← and →", () => {
+    const { content, editor, caretAt } = mountQuotes(lines(a, "Intro", b, "Reply"));
+    const head = () => editor.state.selection.main.head;
+    expect(head()).toBe(a.length + 1);
+    fireEvent.keyDown(content, { key: "ArrowLeft" });
+    expect(head()).toBe(a.length + 1);
+    caretAt(lines(a, "Intro").length);
+    fireEvent.keyDown(content, { key: "ArrowRight" });
+    expect(head()).toBe(lines(a, "Intro", b, "").length);
+    fireEvent.keyDown(content, { key: "ArrowLeft" });
+    expect(head()).toBe(lines(a, "Intro").length);
+  });
+
+  it("puts the caret on the line after a card when the card is clicked", () => {
+    const { container, editor, target, caretAt } = mountQuotes(lines("Intro", a, "Reply"));
+    caretAt(0);
+    const quote = container.querySelector("[data-testid='composer-reply-quote'] blockquote span")!;
+    expect(fireEvent.mouseDown(quote)).toBe(false);
+    expect(editor.state.selection.main.head).toBe(lines("Intro", a, "").length);
+    expect(editor.hasFocus).toBe(true);
+    act(() => insertComposerText(target(), "#"));
+    expect(target().value).toBe(lines("Intro", a, "#Reply"));
+  });
+
+  it.each([
+    ["at the start of the document", 0, lines("#", a, "Mid", b, "")],
+    ["at a card's end", a.length, lines(a, "#", "Mid", b, "")],
+    ["at a card's start", lines(a, "Mid", "").length, lines(a, "Mid", "#", b, "")],
+  ])("moves text typed, pasted or dropped %s to a line of its own", (_where, at, expected) => {
+    const { target, edit } = mountQuotes(lines(a, "Mid", b, ""));
+    edit(at, at, "#");
+    expect(target().value).toBe(expected);
+    expect(target().selectionStart).toBe(expected.indexOf("#") + 1);
+
+    for (const userEvent of ["input.paste", "input.drop"]) {
+      const inserted = mountQuotes(lines(a, "Mid", b, ""));
+      inserted.edit(at, at, `${quoteLine("z", "Zed")}#`, userEvent);
+      expect(inserted.target().value).toBe(expected);
+    }
+  });
+
+  it("deletes a quote typed over whole, and keeps one beside a typed-over break", () => {
+    const value = lines("Intro", a, "Reply");
+    const { target, edit, run } = mountQuotes(value);
+    edit("Intro\n".length, "Intro\n".length + a.length, "x");
+    expect(target().value).toBe(lines("Intro", "x", "Reply"));
+    run(undo);
+    expect(target().value).toBe(value);
+    edit("Intro".length, "Intro\n".length, "x");
+    expect(target().value).toBe(lines("Introx", a, "Reply"));
+  });
+
+  it("keeps a card when only the break after it is selected and deleted", () => {
+    const value = lines("Intro", a, "Reply");
+    const { target, caretAt, run } = mountQuotes(value);
+    caretAt(lines("Intro", a).length, lines("Intro", a, "").length);
+    run(deleteCharBackward);
+    expect(target().value).toBe(value);
+  });
+
+  it("drops only the part of an edit inside a token", () => {
+    const { target, editor } = mountQuotes(lines("Intro", a, "Reply"));
+    act(() =>
+      editor.dispatch({
+        changes: [
+          { from: 0, insert: "Hi " },
+          { from: "Intro\n".length + 3, insert: "zz" },
+        ],
+        userEvent: "input.type",
+      }),
+    );
+    expect(target().value).toBe(lines("Hi Intro", a, "Reply"));
+    // An insert whose range ends inside the token still lands, and the token stays whole.
+    act(() => insertComposerText(target(), "abc", 2, "Hi Intro\n".length + 3));
+    expect(target().value).toBe(lines("Hiabc", a, "Reply"));
+  });
+
+  it.each([
+    [
+      "Backspace under the last card",
+      lines("Opener", a, "", b, "").length,
+      deleteCharBackward,
+      lines("Opener", a, ""),
+    ],
+    ["Delete before the first card", "Opener".length, deleteCharForward, lines("Opener", b, "")],
+  ])("removes a card with %s, which undo brings back exactly", (_key, caret, command, removed) => {
+    const value = lines("Opener", a, "", b, "");
+    const { target, caretAt, run } = mountQuotes(value);
+    caretAt(caret);
+    run(command);
+    expect(target().value).toBe(removed);
+    run(undo);
+    expect(target().value).toBe(value);
+    run(redo);
+    expect(target().value).toBe(removed);
+    run(undo);
+    expect(target().value).toBe(value);
+  });
+
+  it.each([
+    ["first", 0, lines("Opener", b, "")],
+    ["last", 1, lines("Opener", a, "")],
+  ])(
+    "removes the %s card with its X after an undo, and undo brings it back",
+    async (_which, index, removed) => {
+      const value = lines("Opener", a, "", b, "");
+      const { target, editor, caretAt, run, removeButtons } = mountQuotes(value);
+      caretAt(value.length);
+      run(deleteCharBackward);
+      run(undo);
+      // From the keyboard, so the X holds focus when it goes, and undo is a key to the editor.
+      const user = userEvents.setup();
+      act(() => removeButtons()[index]!.focus());
+      await user.keyboard("{Enter}");
+      expect(target().value).toBe(removed);
+      expect(editor.hasFocus).toBe(true);
+      await user.keyboard("{Control>}z{/Control}");
+      expect(target().value).toBe(value);
+    },
+  );
+
+  it("removes adjacent cards one per keystroke", () => {
+    const { target, caretAt, run } = mountQuotes(lines(a, b, "Reply"));
+    caretAt(lines(a, b, "").length);
+    run(deleteCharBackward);
+    expect(target().value).toBe(lines(a, "Reply"));
+    run(deleteCharBackward);
+    expect(target().value).toBe("Reply");
+
+    const separated = mountQuotes(lines(a, "", b, "Reply"));
+    separated.caretAt(lines(a, "").length);
+    separated.run(deleteCharBackward);
+    expect(separated.target().value).toBe(lines(b, "Reply"));
+  });
+
+  it("copies, drags and cuts quotes as markdown", () => {
+    const value = lines("Intro", b, "Reply");
+    const markdown = lines("Intro", "> Beta", "> more", "Reply");
+    const { content, caretAt, target, run } = mountQuotes(value);
+    act(() => target().focus());
+    caretAt(0, value.length);
+    const setData = vi.fn();
+    fireEvent.copy(content, { clipboardData: { setData, clearData: vi.fn() } });
+    expect(setData).toHaveBeenLastCalledWith("text/plain", markdown);
+    fireEvent.dragStart(content, { dataTransfer: { setData } });
+    expect(setData).toHaveBeenLastCalledWith("Text", markdown);
+    fireEvent.cut(content, { clipboardData: { setData, clearData: vi.fn() } });
+    expect(setData).toHaveBeenLastCalledWith("text/plain", markdown);
+    expect(target().value).toBe("");
+    run(undo);
+    expect(target().value).toBe(value);
+  });
+
+  it("strips tokens from a paste the composer inserts itself", () => {
+    const onPaste = (event: ComposerPasteEvent) => void insertPastedText(event);
+    const { content, target, caretAt } = mountQuotes(lines("Intro", a, ""), { onPaste });
+    caretAt(lines("Intro", a, "").length);
+    const clipboardData = { getData: () => `pasted ${b} text`, files: [], items: [], types: [] };
+    fireEvent.paste(content, { clipboardData });
+    expect(target().value).toBe(lines("Intro", a, "pasted  text"));
+  });
+
+  it("takes a controlled value that removes a middle card as it is", () => {
+    const c = quoteLine("c", "Gamma");
+    const { target, rerender, setTarget } = mountQuotes(lines("A", a, "B", b, "C", c, ""));
+    const removed = lines("A", a, "B", "C", c, "");
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={removed}
+        replyQuotes
+        ref={setTarget}
+      />,
+    );
+    expect(target().value).toBe(removed);
+  });
+
+  it("keeps token text literally in a composer without reply quotes", () => {
+    const value = lines("Intro", a, "");
+    const { container, target } = mount({ value });
+    expect(container.querySelector("[data-testid='composer-reply-quote']")).toBeNull();
+    act(() => insertComposerText(target(), b, 0, 0));
+    expect(target().value).toBe(b + value);
   });
 });

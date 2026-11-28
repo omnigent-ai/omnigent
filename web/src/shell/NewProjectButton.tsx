@@ -1,5 +1,14 @@
-import { type CSSProperties, useEffect, useRef, useState } from "react";
-import { ChevronRightIcon, FolderOpenIcon, PlusIcon, SmilePlusIcon } from "lucide-react";
+import { type CSSProperties, useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  ChevronRightIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  FolderPlusIcon,
+  GitBranchIcon,
+  PlusIcon,
+  SmilePlusIcon,
+} from "lucide-react";
+import { CardRadioGroup, type CardRadioOption } from "@/components/theme/CardRadioGroup";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -12,6 +21,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject, useProjects } from "@/hooks/useConversations";
@@ -31,11 +47,42 @@ import { deriveRepoName, sandboxRepoProblem } from "@/lib/sandboxRepositories";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import type { PaletteCommand } from "@/store/paletteCommands";
+
+import { useQuickPickPaletteCommands } from "./screenCommands/useQuickPickPaletteCommands";
 
 interface WorkspaceSelection {
   hostId: string;
   path: string;
 }
+
+/** "Run on" value while no target is chosen; Radix Select items can't hold an empty value. */
+const NO_RUN_ON_TARGET = "__none__";
+
+type ProjectSource = "folder" | "repository";
+
+const PROJECT_SOURCE_OPTIONS: readonly CardRadioOption<ProjectSource>[] = [
+  {
+    value: "folder",
+    testId: "new-project-source-folder",
+    body: (
+      <>
+        <FolderIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+        <span className="text-ui font-normal md:font-medium">Folder</span>
+      </>
+    ),
+  },
+  {
+    value: "repository",
+    testId: "new-project-source-repository",
+    body: (
+      <>
+        <GitBranchIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+        <span className="text-ui font-normal md:font-medium">Repository</span>
+      </>
+    ),
+  },
+];
 
 function isSinglePathComponent(name: string): boolean {
   return (
@@ -130,6 +177,8 @@ function friendlyCloneError(error: unknown): string {
   return "The repository couldn’t be cloned. Check the details and try again.";
 }
 
+const NO_COMMANDS: PaletteCommand[] = [];
+
 /**
  * "New project" control in the Projects group header. Opens a dialog that
  * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
@@ -146,11 +195,14 @@ export function NewProjectButton({
   hostId,
   hosts,
   hostsLoading,
+  inPalette = false,
 }: {
   onCreated: (name: string) => void;
   hostId: string | null;
   hosts: Host[];
   hostsLoading: boolean;
+  /** Offer New project… in the QuickPick ⌘K palette; one mounted button does. */
+  inPalette?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -160,7 +212,7 @@ export function NewProjectButton({
   const [runOn, setRunOn] = useState<string | null>(null);
   // A host the user picked, as opposed to the default: only a pick is saved for a name-only project.
   const runOnPicked = useRef(false);
-  const [sourceMode, setSourceMode] = useState<"folder" | "repository">("folder");
+  const [sourceMode, setSourceMode] = useState<ProjectSource>("folder");
   const [workspace, setWorkspace] = useState<WorkspaceSelection | null>(null);
   const [createdWorkspace, setCreatedWorkspace] = useState<
     | (WorkspaceSelection & {
@@ -375,6 +427,52 @@ export function NewProjectButton({
     );
   };
 
+  // A fresh dialog each time, from the button or ⌘K.
+  const openDialog = () => {
+    submissionGeneration.current += 1;
+    setName("");
+    setIcon(undefined);
+    setRunOn(hostId);
+    runOnPicked.current = false;
+    setSourceMode("folder");
+    setWorkspace(null);
+    setCreatedWorkspace(null);
+    setWorkspacePickerOpen(false);
+    setCreateWorkspaceFolder(false);
+    setRepositories([]);
+    setPendingRepoUrl("");
+    setPendingRepoBranch("");
+    setCloneParent("~");
+    setDestinationOverride(null);
+    setParentPickerOpen(false);
+    setCheckout(null);
+    setRepositorySubmitting(false);
+    setSubmitError(null);
+    setOpen(true);
+  };
+  const openDialogRef = useRef(openDialog);
+  openDialogRef.current = openDialog;
+  const paletteCommands = useMemo<PaletteCommand[]>(
+    () =>
+      inPalette
+        ? [
+            {
+              id: "project.new",
+              label: "New project…",
+              icon: FolderPlusIcon,
+              keywords: ["project", "folder", "create", "add"],
+              // The dialog takes focus once the palette has closed.
+              movesFocus: true,
+              run: () => openDialogRef.current(),
+            },
+          ]
+        : NO_COMMANDS,
+    [inPalette],
+  );
+  // Each button's own key: one that doesn't offer the command (Canvas) never withdraws another's.
+  const paletteSource = `new-project:${useId()}`;
+  useQuickPickPaletteCommands(paletteSource, "Project", paletteCommands);
+
   const dialog = (
     <Dialog
       open={open}
@@ -491,12 +589,11 @@ export function NewProjectButton({
               <label htmlFor="new-project-run-on" className="font-medium text-ui">
                 Run on
               </label>
-              <select
-                id="new-project-run-on"
-                className="h-10 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
-                value={runOn ?? ""}
-                onChange={(event) => {
-                  const next = event.target.value;
+              <Select
+                value={runOn ?? NO_RUN_ON_TARGET}
+                // Radix opens on pointerdown without checking the fieldset's disabled state.
+                disabled={repositorySubmitting}
+                onValueChange={(next) => {
                   runOnPicked.current = true;
                   if (next !== runOn) {
                     // A submission still creating a folder for the old target must not save it.
@@ -511,59 +608,58 @@ export function NewProjectButton({
                   setSubmitError(null);
                 }}
               >
-                {runOn === null && (
-                  <option value="" disabled>
-                    {hostsLoading ? "Loading hosts…" : "No host available"}
-                  </option>
-                )}
-                {runOn !== null &&
-                  !onlineHosts.some((host) => host.host_id === runOn) &&
-                  !sandboxProviders.some((provider) => sandboxHostChoice(provider) === runOn) && (
-                    <option value={runOn}>{hostsLoading ? "Loading hosts…" : hostName}</option>
+                <SelectTrigger id="new-project-run-on" className="w-full data-[size=default]:h-10">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {runOn === null && (
+                    <SelectItem value={NO_RUN_ON_TARGET} disabled>
+                      {hostsLoading ? "Loading hosts…" : "No host available"}
+                    </SelectItem>
                   )}
-                {onlineHosts.map((host) => (
-                  <option key={host.host_id} value={host.host_id}>
-                    {host.name}
-                  </option>
-                ))}
-                {sandboxProviders.map((provider) => (
-                  <option key={sandboxHostChoice(provider)} value={sandboxHostChoice(provider)}>
-                    {sandboxOptionLabel(provider)}
-                  </option>
-                ))}
-              </select>
+                  {runOn !== null &&
+                    !onlineHosts.some((host) => host.host_id === runOn) &&
+                    !sandboxProviders.some((provider) => sandboxHostChoice(provider) === runOn) && (
+                      <SelectItem value={runOn}>
+                        {hostsLoading ? "Loading hosts…" : hostName}
+                      </SelectItem>
+                    )}
+                  {onlineHosts.map((host) => (
+                    <SelectItem key={host.host_id} value={host.host_id}>
+                      {host.name}
+                    </SelectItem>
+                  ))}
+                  {sandboxProviders.map((provider) => (
+                    <SelectItem
+                      key={sandboxHostChoice(provider)}
+                      value={sandboxHostChoice(provider)}
+                    >
+                      {sandboxOptionLabel(provider)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           )}
           {repositoryCreation && !runsOnSandbox && hostTarget !== null && (
-            <div role="radiogroup" aria-label="Project source" className="flex gap-4 text-ui">
-              <label className="flex cursor-pointer items-center gap-2">
-                <input
-                  type="radio"
-                  name="new-project-source"
-                  value="folder"
-                  checked={sourceMode === "folder"}
-                  onChange={() => {
-                    submissionGeneration.current += 1;
-                    setSourceMode("folder");
-                    setSubmitError(null);
-                  }}
-                />
-                Folder
-              </label>
-              <label className="flex cursor-pointer items-center gap-2">
-                <input
-                  type="radio"
-                  name="new-project-source"
-                  value="repository"
-                  checked={sourceMode === "repository"}
-                  onChange={() => {
-                    submissionGeneration.current += 1;
-                    setSourceMode("repository");
-                    setSubmitError(null);
-                  }}
-                />
-                Repository
-              </label>
+            <div>
+              <span id="new-project-source-label" className="sr-only">
+                Project source
+              </span>
+              <CardRadioGroup<ProjectSource>
+                compact
+                labelledBy="new-project-source-label"
+                value={sourceMode}
+                onSelect={(next) => {
+                  // Re-picking the current source must not abandon a submission in flight.
+                  if (next === sourceMode) return;
+                  submissionGeneration.current += 1;
+                  setSourceMode(next);
+                  setSubmitError(null);
+                }}
+                className="flex gap-2"
+                items={PROJECT_SOURCE_OPTIONS}
+              />
             </div>
           )}
           {repositoryMode && (
@@ -762,26 +858,7 @@ export function NewProjectButton({
             className="text-muted-foreground mobile-touch-target"
             onClick={(e) => {
               e.stopPropagation();
-              submissionGeneration.current += 1;
-              setName("");
-              setIcon(undefined);
-              setRunOn(hostId);
-              runOnPicked.current = false;
-              setSourceMode("folder");
-              setWorkspace(null);
-              setCreatedWorkspace(null);
-              setWorkspacePickerOpen(false);
-              setCreateWorkspaceFolder(false);
-              setRepositories([]);
-              setPendingRepoUrl("");
-              setPendingRepoBranch("");
-              setCloneParent("~");
-              setDestinationOverride(null);
-              setParentPickerOpen(false);
-              setCheckout(null);
-              setRepositorySubmitting(false);
-              setSubmitError(null);
-              setOpen(true);
+              openDialog();
             }}
           >
             <PlusIcon className="size-3.5" />

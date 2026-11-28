@@ -39,6 +39,8 @@ dependencies = [
     "rich>=14,<16",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
+    # Gadget collection schemas and action params (omnigent/gadgets/); mcp already needs >=4.20.
+    "jsonschema>=4.20,<5",
     "starlette>=1.0.1,<2",
     "uvicorn[standard]>=0.30,<1",
     # websockets >=15 asyncio client hangs on macOS before emitting any handshake
@@ -49,6 +51,10 @@ dependencies = [
     # Portable zombie-aware PID liveness checks for the host daemon
     # lifecycle (omnigent/host/local_server.py).
     "psutil>=5.9,<8",
+    # Ranks file paths for the workspace API's fuzzy file search
+    # (omnigent/host/workspace_fuzzy.py). Prebuilt abi3 wheels for macOS,
+    # Linux (glibc and musl) and Windows.
+    "frizbee>=0.13,<1",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
     # NOT pure-Python: cel-python hard-depends on google-re2 (a C++ extension,

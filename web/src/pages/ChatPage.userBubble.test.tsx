@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
@@ -9,8 +10,7 @@ import { SessionSharedContext } from "@/components/chat/chatBubbleParts";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { EditSentMessageContext, type SentMessage } from "@/components/chat/editSentMessage";
 import type * as IdentityModule from "@/lib/identity";
-import { BubbleView, buildPendingBubbles } from "./ChatPage";
-import type { ReactNode } from "react";
+import { BtwSidechatAnswer, BubbleView, buildPendingBubbles } from "./ChatPage";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { usePublishComposerCommands } from "@/components/composer/composerHighlight";
 
@@ -161,6 +161,53 @@ describe("UserBubble markdown rendering", () => {
     expect(katex.querySelector(".sqrt")).not.toBeNull();
     expect(katex.textContent).toContain("x");
     expect(katex.textContent).toContain("1");
+  });
+});
+
+const PR_REF_FILE_VIEWER = { ...FILE_VIEWER_NOOP, conversationId: "conv_pr" };
+
+function renderWithSessionRepo(children: ReactNode) {
+  // GitHub info never arrives over the network; the test seeds the cache.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise<Response>(() => {})),
+  );
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  queryClient.setQueryData(["github-info", "conv_pr"], {
+    object: "session.github.info",
+    available: true,
+    repo: { name_with_owner: "acme/app", host: "github.com" },
+    workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+    prs: [{ url: "https://github.com/acme/app/pull/4242", host: "github.com", number: 4242 }],
+  });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <FileViewerContext.Provider value={PR_REF_FILE_VIEWER}>{children}</FileViewerContext.Provider>
+    </QueryClientProvider>,
+  );
+}
+
+describe("UserBubble pull request references", () => {
+  it("links a PR reference to the PR the session links", () => {
+    renderWithSessionRepo(<BubbleView bubble={userBubble("See #4242 and acme/lib#7")} />);
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
+    expect(screen.getByRole("link", { name: /acme\/lib#7/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/lib/pull/7",
+    );
+  });
+});
+
+describe("/btw answer pull request references", () => {
+  it("links a PR reference to the PR the session links", () => {
+    renderWithSessionRepo(<BtwSidechatAnswer answer="Fixed in #4242." />);
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
   });
 });
 
@@ -407,7 +454,7 @@ describe("UserBubble awaiting-agent marker", () => {
   const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
 
   it.each([false, true])(
-    "shares the timestamp row while keeping mobile pending status visible (mobile=%s)",
+    "shows the whole footer beside the note until the agent reads it (mobile=%s)",
     (mobile) => {
       vi.stubGlobal("matchMedia", () => ({
         matches: mobile,
@@ -422,21 +469,15 @@ describe("UserBubble awaiting-agent marker", () => {
       renderBubble({ ...pending, createdAtS: 1_762_000_000 });
       const explanation = screen.getByTestId("message-awaiting-agent");
       expect(explanation).toHaveTextContent("The agent will read this after its current step");
-      const footer = screen.getByTestId("message-timestamp").parentElement;
-      expect(explanation.parentElement).toBe(footer);
-      expect(explanation.nextElementSibling).toBe(screen.getByTestId("message-timestamp"));
-      expect(footer).toContainElement(screen.getByRole("button", { name: "Copy" }));
-      expect(footer).toHaveClass("pt-1");
-      if (mobile) {
-        expect(footer).toHaveClass("opacity-100");
-        expect(footer).not.toHaveClass("invisible");
-      } else {
-        expect(footer).toHaveClass(
-          "md:opacity-0",
-          "md:group-hover:opacity-100",
-          "md:group-focus-within:opacity-100",
-        );
-      }
+      const row = explanation.parentElement;
+      const actions = screen.getByTestId("message-timestamp").parentElement;
+      expect(explanation.nextElementSibling).toBe(actions);
+      expect(actions).not.toContainElement(explanation);
+      expect(actions).toContainElement(screen.getByRole("button", { name: "Copy" }));
+      expect(row).toHaveClass("pt-1");
+      expect(row?.className).not.toMatch(/opacity|invisible/);
+      expect(actions).toHaveClass("opacity-100");
+      expect(actions?.className).not.toMatch(/invisible|opacity-0/);
       expect(explanation).toHaveClass("truncate");
       expect(explanation.querySelector("svg")).toBeNull();
     },
@@ -456,24 +497,35 @@ describe("UserBubble awaiting-agent marker", () => {
     if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
     renderBubble({ ...pending, createdAtS: 1_762_000_000 });
     const explanation = screen.getByTestId("message-awaiting-agent");
-    const footer = explanation.parentElement;
+    const actions = screen.getByTestId("message-timestamp").parentElement;
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
     expect(screen.getByTestId("copy-message-link")).toBeDisabled();
-    expect(footer).toHaveClass("opacity-100");
-    expect(footer).not.toHaveClass("md:opacity-0");
+    expect(explanation.parentElement?.className).not.toMatch(/opacity|invisible/);
+    expect(actions).toHaveClass("opacity-100");
+    expect(actions).not.toHaveClass("md:opacity-0");
   });
 
   it("stays hidden for a send that started a turn and for committed history", () => {
+    const hoverReveal = [
+      "md:opacity-0",
+      "md:group-hover:opacity-100",
+      "md:group-focus-within:opacity-100",
+    ];
     const [pending] = buildPendingBubbles([{ tempId: "pend_2", content }], null);
-    const { rerender } = renderBubble(pending!);
+    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+    const { rerender } = renderBubble({ ...pending, createdAtS: 1_762_000_000 });
     expect(screen.queryByTestId("message-awaiting-agent")).toBeNull();
+    expect(screen.getByTestId("message-timestamp").parentElement).toHaveClass(...hoverReveal);
     // A promoted bubble drops the marker even if a stale flag were carried over.
     rerender(
       <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-        <BubbleView bubble={userBubble("steer", { awaitingAgent: true })} />
+        <BubbleView
+          bubble={userBubble("steer", { awaitingAgent: true, createdAtS: 1_762_000_000 })}
+        />
       </FileViewerContext.Provider>,
     );
     expect(screen.queryByTestId("message-awaiting-agent")).toBeNull();
+    expect(screen.getByTestId("message-timestamp").parentElement).toHaveClass(...hoverReveal);
   });
 });
 
@@ -898,6 +950,22 @@ describe("UserBubble command tint", () => {
     expect(token.closest("p")).toHaveTextContent("/team fix the bug");
   });
 
+  it("tints the command and links a PR reference in the same paragraph", () => {
+    queryClient.setQueryData(["github-info", "conv_cmd"], {
+      object: "session.github.info",
+      available: true,
+      repo: { name_with_owner: "acme/app", host: "github.com" },
+      workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+      prs: [{ url: "https://github.com/acme/app/pull/4242", host: "github.com", number: 4242 }],
+    });
+    renderScoped(userBubble("/team review #4242"), <PublishCommands />);
+    expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
+  });
+
   it("tints the command and pills a tagged file in the same paragraph", () => {
     renderScoped(userBubble("/team review [Attached: src/a.ts] now"), <PublishCommands />);
     const token = screen.getByText("/team");
@@ -961,12 +1029,6 @@ describe("UserBubble command tint", () => {
     rerender(null);
     expect(tinted()).toBeNull();
     expect(text()).toBe("/team fix it");
-  });
-
-  it("tints a built-in the composer sent canonicalized, such as `/Goal` as `/goal`", () => {
-    renderScoped(userBubble("/goal Fix CI"), <PublishCommands commands={["/goal"]} />);
-    expect(screen.getByText("/goal")).toHaveClass("text-brand-accent");
-    expect(screen.getByTestId("user-message-content")).toHaveTextContent("/goal Fix CI");
   });
 
   it("adds no trailing space after a command sent without args", () => {

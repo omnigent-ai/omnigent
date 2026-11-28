@@ -1,9 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ServerInfo } from "@/lib/capabilities";
-import { AppShellOverlays, type AppShellOverlaysProps } from "./AppShellOverlays";
+import type { AppShellOverlaysProps } from "./AppShellOverlays";
 
 // The flag only chooses the palette; each palette's behavior has its own suites.
 vi.mock("./CommandPalette", () => ({
@@ -11,18 +11,65 @@ vi.mock("./CommandPalette", () => ({
     <div data-testid="cmdk-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
   ),
 }));
-vi.mock("./QuickPickCommandPalette", () => ({
-  QuickPickCommandPalette: ({ sessionsOnly }: { sessionsOnly?: boolean }) => (
-    <div data-testid="quick-pick-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
-  ),
-}));
 vi.mock("@/components/KeyboardShortcutsDialog", () => ({ KeyboardShortcutsDialog: () => null }));
 vi.mock("@/components/onboarding/HostImportReview", () => ({ ImportReviewGate: () => null }));
-vi.mock("./RecentSessionsSwitcher", () => ({ RecentSessionsSwitcher: () => null }));
+vi.mock("./RecentSessionsSwitcher", () => ({
+  RecentSessionsSwitcher: ({ enabled }: { enabled: boolean }) => (
+    <div data-testid="recent-sessions-switcher" data-enabled={String(enabled)} />
+  ),
+}));
+// The desktop shell, where the recent switcher takes Ctrl+Tab.
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  isElectronShell: () => true,
+}));
+vi.mock("./openSession", () => ({
+  OpenSessionPublisher: ({ sessionId }: { sessionId: string | null }) => (
+    <div data-testid="open-session-publisher" data-session={sessionId ?? ""} />
+  ),
+}));
 
 afterEach(cleanup);
+// Which flagged modules this case imported. Each case loads the shell and these mocks afresh,
+// so a flag-on case can't hide or cause a load in a later one.
+const loaded = new Set<string>();
+beforeEach(() => {
+  vi.resetModules();
+  loaded.clear();
+  vi.doMock("./QuickPickCommandPalette", () => {
+    loaded.add("QuickPickCommandPalette");
+    return {
+      QuickPickCommandPalette: ({ sessionsOnly }: { sessionsOnly?: boolean }) => (
+        <div data-testid="quick-pick-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
+      ),
+    };
+  });
+  vi.doMock("./ThemePicker", () => {
+    loaded.add("ThemePicker");
+    return { ThemePicker: () => <div data-testid="theme-picker" /> };
+  });
+  vi.doMock("./sessionCommands/SessionActionHost", () => {
+    loaded.add("SessionActionHost");
+    return { SessionActionHost: () => <div data-testid="session-action-host" /> };
+  });
+  vi.doMock("./projectCommands/ProjectActionHost", () => {
+    loaded.add("ProjectActionHost");
+    return { ProjectActionHost: () => <div data-testid="project-action-host" /> };
+  });
+  vi.doMock("./quickPickShortcuts/RecentSessionSwitchHost", () => {
+    loaded.add("RecentSessionSwitchHost");
+    return { RecentSessionSwitchHost: () => <div data-testid="recent-session-switch-host" /> };
+  });
+  vi.doMock("./quickPickShortcuts/QuickPickShortcutHost", () => {
+    loaded.add("QuickPickShortcutHost");
+    return { QuickPickShortcutHost: () => <div data-testid="quick-pick-shortcut-host" /> };
+  });
+});
 
-function renderOverlays(features: Record<string, boolean> | "loading", sessionSearch = false) {
+async function renderOverlays(
+  features: Record<string, boolean> | "loading",
+  sessionSearch = false,
+) {
   const serverInfo =
     features === "loading" ? ("loading" as const) : ({ features } as unknown as ServerInfo);
   const props: AppShellOverlaysProps = {
@@ -33,17 +80,32 @@ function renderOverlays(features: Record<string, boolean> | "loading", sessionSe
     setCommandPaletteOpen: vi.fn(),
     toggleLeftSidebar: vi.fn(),
     toggleRightPanel: vi.fn(),
+    goToSession: vi.fn(),
     gridRoute: false,
     allConversations: undefined,
-    serverConversationId: undefined,
+    serverConversationId: "c1",
     updateOverlayHeight: 0,
   };
+  const { AppShellOverlays } = await import("./AppShellOverlays");
   return render(
     <QueryClientProvider client={new QueryClient()}>
       <AppShellOverlays {...props} />
     </QueryClientProvider>,
   );
 }
+
+describe("AppShellOverlays recent sessions switcher", () => {
+  it.each([
+    ["off", { quick_pick_palette: false }, "true"],
+    ["on", { quick_pick_palette: true }, "false"],
+  ] as const)(
+    "takes Ctrl+Tab in the desktop app only with quick_pick_palette %s",
+    async (_state, features, enabled) => {
+      const { getByTestId } = await renderOverlays(features);
+      expect(getByTestId("recent-sessions-switcher").dataset.enabled).toBe(enabled);
+    },
+  );
+});
 
 describe("AppShellOverlays palette flag", () => {
   const notOn = [
@@ -57,22 +119,42 @@ describe("AppShellOverlays palette flag", () => {
     ),
   )(
     "keeps the current palette when the flag is %s (sessions only: %s)",
-    (_state, features, sessionSearch) => {
-      const { getByTestId, queryByTestId } = renderOverlays(features, sessionSearch);
+    async (_state, features, sessionSearch) => {
+      const { getByTestId, queryByTestId } = await renderOverlays(features, sessionSearch);
       expect(getByTestId("cmdk-palette").dataset.sessionsOnly).toBe(String(sessionSearch));
       expect(queryByTestId("quick-pick-palette")).toBeNull();
+      expect(queryByTestId("theme-picker")).toBeNull();
+      expect(queryByTestId("open-session-publisher")).toBeNull();
+      // Without the flag, neither the QuickPick palette nor its theme picker is even fetched.
+      expect([...loaded]).toEqual([]);
     },
   );
 
   it.each([false, true])(
     "shows the QuickPick palette when the flag is on (sessions only: %s)",
-    (sessionSearch) => {
-      const { getByTestId, queryByTestId } = renderOverlays(
+    async (sessionSearch) => {
+      const { findByTestId, queryByTestId } = await renderOverlays(
         { quick_pick_palette: true },
         sessionSearch,
       );
-      expect(getByTestId("quick-pick-palette").dataset.sessionsOnly).toBe(String(sessionSearch));
+      expect((await findByTestId("quick-pick-palette")).dataset.sessionsOnly).toBe(
+        String(sessionSearch),
+      );
+      expect(await findByTestId("theme-picker")).toBeTruthy();
       expect(queryByTestId("cmdk-palette")).toBeNull();
+      expect(await findByTestId("session-action-host")).toBeTruthy();
+      expect(await findByTestId("project-action-host")).toBeTruthy();
+      expect(await findByTestId("quick-pick-shortcut-host")).toBeTruthy();
+      expect(await findByTestId("recent-session-switch-host")).toBeTruthy();
+      expect((await findByTestId("open-session-publisher")).dataset.session).toBe("c1");
+      expect([...loaded].sort()).toEqual([
+        "ProjectActionHost",
+        "QuickPickCommandPalette",
+        "QuickPickShortcutHost",
+        "RecentSessionSwitchHost",
+        "SessionActionHost",
+        "ThemePicker",
+      ]);
     },
   );
 });

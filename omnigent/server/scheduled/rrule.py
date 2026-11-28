@@ -9,7 +9,7 @@ caller-supplied IANA timezone so a preset such as "Daily at 9:00 AM" fires at
 The rule is anchored at midnight of the reference day (localized to the task
 timezone), so occurrence phase is deterministic: an hourly rule fires on the
 hour, a daily rule at its ``BYHOUR``/``BYMINUTE``. :func:`validate_rrule`
-additionally enforces a minimum interval based on execution target and session mode and
+additionally enforces a ten-minute minimum interval and
 rejects rules that never fire or fire only once within the search window — each
 fire starts or continues real agent work, so a runaway cadence is expensive. A
 caller whose scheduler counts ``COUNT`` from the task's creation can opt in to
@@ -34,9 +34,8 @@ from dateutil.rrule import rrule, rrulestr  # type: ignore[import-untyped]
 
 from omnigent.server.scheduled._bounded_rrule import RRuleSearchLimitError, iter_bounded
 
-# Connected hosts and continued sessions avoid provisioning a sandbox per fire.
-MIN_INTERVAL_SECONDS = 60 * 60
-MIN_SUBHOUR_INTERVAL_SECONDS = 10 * 60
+# The same floor applies to every execution target and session mode.
+MIN_INTERVAL_SECONDS = 10 * 60
 
 _UTC = ZoneInfo("UTC")
 
@@ -290,16 +289,13 @@ def validate_rrule(
     rule_str: str,
     tz: ZoneInfo | None = None,  # noqa: ARG001
     *,
-    session_mode: str = "new",
-    execution_target: str | None = None,
     allow_single_fire: bool = False,
 ) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
     Beyond syntax, enforces that the rule (a) fires at least twice within the
-    search window and (b) has a minimum gap of at least
-    ten minutes for connected hosts or continued sessions, and one hour for
-    new sandbox sessions, between sampled consecutive fires.
+    search window and (b) has a minimum gap of at least ten minutes between
+    sampled consecutive fires.
 
     The interval check samples fires from a fixed UTC anchor, so the verdict is
     deterministic (independent of the wall-clock instant it runs at) and immune
@@ -308,9 +304,6 @@ def validate_rrule(
     :param rule_str: The RFC 5545 recurrence rule string.
     :param tz: Accepted for API compatibility but not used by the interval
         check, which is timezone-agnostic for the cadences we allow.
-    :param session_mode: Continued sessions permit the ten-minute minimum.
-    :param execution_target: Connected hosts also permit ten-minute new sessions.
-        Omit to retain the conservative new-session hourly floor.
     :param allow_single_fire: Accept a rule with an explicit ``COUNT=1``, e.g. a
         reminder. Only the database scheduler, which counts ``COUNT`` from the
         task's creation, may pass ``True``: the legacy timer counts from midnight
@@ -347,13 +340,9 @@ def validate_rrule(
         if not (allow_single_fire and is_one_time_rule(rule_str)):
             raise RRuleValidationError("RRULE fires only once")
         return RRuleTrigger(rule=rule_str)
-    minimum = (
-        MIN_SUBHOUR_INTERVAL_SECONDS
-        if session_mode == "continue" or execution_target == "connected_host"
-        else MIN_INTERVAL_SECONDS
-    )
-    if min_gap < minimum:
+    if min_gap < MIN_INTERVAL_SECONDS:
         raise RRuleValidationError(
-            f"Minimum interval is {minimum // 60} minutes (this rule fires every {int(min_gap)}s)"
+            f"Minimum interval is {MIN_INTERVAL_SECONDS // 60} minutes "
+            f"(this rule fires every {int(min_gap)}s)"
         )
     return RRuleTrigger(rule=rule_str)

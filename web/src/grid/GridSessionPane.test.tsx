@@ -4,6 +4,7 @@ import type { Session } from "@/lib/types";
 import type * as ConversationEntryStateModule from "@/hooks/useConversationEntryState";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
 import type * as GridSessionsModule from "./GridSessionsContext";
+import type * as IdentityModule from "@/lib/identity";
 import {
   type ComponentProps,
   type ReactElement,
@@ -64,6 +65,8 @@ const fixture = vi.hoisted(() => ({
   renderError: new Error("Grid surface render failed"),
   // Set while a cell's viewer holds unsaved edits and is asking to discard them.
   discardEdits: null as (() => void) | null,
+  // Kills the grid's shell close confirmation requested, by terminal id.
+  deleteTerminal: vi.fn((_terminalId: string) => Promise.resolve()),
   // Sessions the viewer can't edit, and each session's sandbox launch.
   readOnlySessions: [] as string[],
   launches: {} as Record<string, { stage: string; error: null }>,
@@ -108,6 +111,29 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+// The runner's answer before a shell closes; unknown by default, so every close asks.
+const shellRead = vi.hoisted(() => ({
+  status: 200,
+  body: { state: "unknown" } as Record<string, unknown>,
+  asked: [] as string[],
+}));
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return {
+    ...actual,
+    authenticatedFetch: (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!url.endsWith("/shell")) return actual.authenticatedFetch(input, init);
+      shellRead.asked.push(url);
+      return Promise.resolve(
+        new Response(JSON.stringify(shellRead.body), {
+          status: shellRead.status,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    },
+  };
+});
 vi.mock("@/shell/PullRequestPanel", () => ({ selectPullRequestInPanel: vi.fn() }));
 vi.mock("@/shell/FilesPanel", async (original) => ({
   ...(await original<typeof FilesPanelModule>()),
@@ -166,7 +192,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof TerminalsModule>()),
   useTerminals: () => ({ terminals: fixture.terminals }),
-  useDeleteTerminal: () => ({}),
+  useDeleteTerminal: () => ({ mutateAsync: fixture.deleteTerminal }),
 }));
 vi.mock("./GridSessionsContext", async (original) => ({
   ...(await original<typeof GridSessionsModule>()),
@@ -233,6 +259,44 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     );
   },
 }));
+// The tabs sidebar's routing: off unless a test turns the flag on.
+const tabsRouting = vi.hoisted(() => ({
+  enabled: false,
+  routes: [] as [string, ...unknown[]][],
+  hosts: [] as {
+    conversationId: string;
+    bindsHistory?: boolean;
+    open?: boolean;
+    openTerminalTab?: (key: string) => void;
+  }[],
+}));
+vi.mock("@/shell/workspaceTabsRouting", () => ({
+  useTabsSidebar: () => tabsRouting.enabled,
+  LazyWorkspaceTabsHost: (props: {
+    conversationId: string;
+    bindsHistory?: boolean;
+    open?: boolean;
+    openTerminalTab?: (key: string) => void;
+  }) => {
+    tabsRouting.hosts.push(props);
+    return <aside aria-label="Workspace tabs" data-testid={`tabs-${props.conversationId}`} />;
+  },
+  routeToWorkspaceTabs: async (open: (tabs: Record<string, unknown>) => Promise<unknown>) => {
+    const record =
+      (name: string) =>
+      async (...args: unknown[]) => {
+        tabsRouting.routes.push([name, ...args]);
+        return { ok: true };
+      };
+    await open({
+      isWorkspacePage: (value: string | null) => value === "files" || value === "github",
+      openWorkspacePage: record("openWorkspacePage"),
+      openWorkspaceFileLink: record("openWorkspaceFileLink"),
+      openWorkspaceTerminal: record("openWorkspaceTerminal"),
+      showWorkspacePullRequests: record("showWorkspacePullRequests"),
+    });
+  },
+}));
 vi.mock("@/shell/WorkspacePanel", () => ({
   WorkspacePanel: (props: ComponentProps<typeof WorkspacePanel>) => {
     const [draft, setDraft] = useState("");
@@ -265,6 +329,23 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         <button type="button" onClick={props.onToggleMaximized}>
           Maximize
         </button>
+        <button
+          type="button"
+          onClick={() => props.onCloseTerminals(props.openTerminals, { onConfirmed: vi.fn() })}
+        >
+          Close shells
+        </button>
+        <button type="button" onClick={() => props.openTerminalTab("terminal:terminal_b")}>
+          Select shell b
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            props.onCloseTerminal(props.selectedTerminalKey!, { onConfirmed: vi.fn() })
+          }
+        >
+          Close selected shell
+        </button>
       </aside>
     );
   },
@@ -286,9 +367,13 @@ afterEach(() => {
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
+  fixture.deleteTerminal = vi.fn((_terminalId: string) => Promise.resolve());
   fixture.readOnlySessions = [];
   fixture.launches = {};
   fixture.inferenceConfigured = undefined;
+  shellRead.status = 200;
+  shellRead.body = { state: "unknown" };
+  shellRead.asked = [];
   vi.restoreAllMocks();
 });
 
@@ -435,6 +520,109 @@ it("asks each cell's viewer before the shell's Close leaves the grid", () => {
   // Discard changes: leaving goes ahead.
   act(() => fixture.discardEdits?.());
   expect(leave).toHaveBeenCalledOnce();
+});
+
+it("closes workspace tabs without asking the viewer again", () => {
+  // The workspace panel asks the file on screen before it closes, once per batch, so the
+  // grid's own close must not ask again and replace that viewer's pending action.
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "close-unguarded", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Open citation"));
+  const workspace = screen.getByTestId("workspace-first");
+  expect(workspace).toHaveTextContent("notes.md");
+  fireEvent.click(first.getByText("Edit file"));
+
+  fireEvent.click(within(workspace).getByText("Close file"));
+  expect(fixture.discardEdits).toBeNull();
+  expect(workspace).toHaveTextContent("No file");
+});
+
+it("asks once before a bulk shell close and kills nothing when cancelled", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  render(twoCellGrid());
+  const workspace = screen.getByTestId("workspace-first");
+
+  fireEvent.click(within(workspace).getByText("Close shells"));
+  expect(await screen.findByRole("dialog")).toHaveTextContent("Close 2 shells?");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+
+  fireEvent.click(within(workspace).getByText("Close shells"));
+  fireEvent.click(await screen.findByRole("button", { name: "Close shells" }));
+  expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
+});
+
+it("keeps a shell selected while an earlier close is still deleting", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  let finishDelete = () => {};
+  fixture.deleteTerminal = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        finishDelete = resolve;
+      }),
+  );
+  writeSessionWorkspaceState("first", { selectedTerminalKey: "terminal:terminal_a" });
+  render(twoCellGrid());
+  const workspace = screen.getByTestId("workspace-first");
+
+  fireEvent.click(within(workspace).getByText("Close selected shell"));
+  fireEvent.click(await screen.findByRole("button", { name: "Close shell" }));
+  expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"]]);
+  fireEvent.click(within(workspace).getByText("Select shell b"));
+  expect(workspace).toHaveAttribute("data-terminal", "terminal:terminal_b");
+
+  await act(async () => finishDelete());
+  expect(workspace).toHaveAttribute("data-terminal", "terminal:terminal_b");
+});
+
+it("asks about a bulk shell close when the server can't inspect shells", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  // An older server has no shell route.
+  shellRead.status = 404;
+  shellRead.body = { detail: "Not Found" };
+  render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  expect(await screen.findByRole("dialog")).toHaveTextContent("Close 2 shells?");
+  expect(shellRead.asked).toHaveLength(2);
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+});
+
+it("closes idle shells without asking and asks about a busy one, naming its job", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
+  fixture.terminals = [{ id: "terminal_a", name: "a", session: "main", running: true }];
+  shellRead.body = { state: "busy", foreground: "vim", background_jobs: 0 };
+  const { unmount } = render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  await waitFor(() => expect(screen.getByRole("dialog")).toHaveTextContent("vim is running in a"));
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+  unmount();
+
+  shellRead.body = { state: "idle" };
+  render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  await waitFor(() => expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"]]));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(shellRead.asked).toHaveLength(2);
 });
 
 it("opens chat-linked folders and PRs in that pane's workspace", () => {
@@ -994,4 +1182,41 @@ it("keeps a Claude Code sub-agent child's picker disabled, with no PATCH, even w
   expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
   expect(updateSession).not.toHaveBeenCalled();
   view.unmount();
+});
+
+it("shows each cell's sidebar as tabs with the flag on, routing its links there", async () => {
+  tabsRouting.enabled = true;
+  tabsRouting.routes = [];
+  tabsRouting.hosts = [];
+  vi.mocked(selectPullRequestInPanel).mockClear();
+  onTestFinished(() => {
+    tabsRouting.enabled = false;
+    // Later cases assert this reveal was never asked for their cells.
+    vi.mocked(revealFolderInFilesPanel).mockClear();
+  });
+  render(twoCellGrid());
+
+  expect(screen.queryByTestId("workspace-first")).toBeNull();
+  expect(screen.getByTestId("tabs-first")).toBeInTheDocument();
+  // Only the selected cell binds Back and Forward.
+  const latest = (id: string) =>
+    tabsRouting.hosts.filter((host) => host.conversationId === id).at(-1);
+  expect(latest("first")?.bindsHistory).toBe(true);
+  expect(latest("second")?.bindsHistory).toBe(false);
+
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Open citation"));
+  fireEvent.click(first.getByText("Open PR"));
+  fireEvent.click(first.getByText("Open folder"));
+  // A shell the tabs ask for opens in the cell's own tabs.
+  act(() => latest("first")!.openTerminalTab!("terminal:t1"));
+  await waitFor(() =>
+    expect(tabsRouting.routes).toEqual([
+      ["openWorkspaceFileLink", "first", "notes.md", { line: 7, endLine: 9 }, "user"],
+      ["showWorkspacePullRequests", "first", { kind: "pull", url: LINKED_PR, overview: true }],
+      ["openWorkspacePage", "first", "files"],
+      ["openWorkspaceTerminal", "first", "terminal:t1"],
+    ]),
+  );
+  expect(selectPullRequestInPanel).not.toHaveBeenCalled();
 });

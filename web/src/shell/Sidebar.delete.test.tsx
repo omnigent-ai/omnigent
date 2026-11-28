@@ -55,7 +55,9 @@ import {
 } from "@/lib/scheduledTasksApi";
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
 import { Sidebar } from "./Sidebar";
+import { resetArchiveNavigationForTests } from "./sessionCommands/archiveNavigation";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -271,6 +273,36 @@ describe("active-session redirect on delete", () => {
     // conv_2 is untouched, so the user stays in the chat they're reading —
     // a redirect here would yank them out of an unrelated session.
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
+  });
+});
+
+describe("active-session landing on archive", () => {
+  afterEach(() => {
+    resetArchiveNavigationForTests();
+    useRecentSessionSwitchStore.setState({ history: [], readLiveSessionIds: null });
+  });
+
+  it("opens the session visited before it once the recent sessions are live", () => {
+    // As quick_pick_palette's recent-session host records them, and as ⌘K's Archive lands.
+    useRecentSessionSwitchStore.setState({
+      history: ["conv_1", "conv_2"],
+      readLiveSessionIds: () => new Set(["conv_1", "conv_2"]),
+      sessionsKnown: true,
+      sessionsFailed: false,
+    });
+    mockConversations([CONV, CONV_OTHER]);
+    renderSidebarRouted("/c/conv_1");
+    const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
+    fireEvent.click(within(row).getByTestId("quick-archive-conversation"));
+    expect(screen.getByTestId("loc").textContent).toBe("/c/conv_2");
+  });
+
+  it("goes home without them, as before", () => {
+    mockConversations([CONV, CONV_OTHER]);
+    renderSidebarRouted("/c/conv_1");
+    const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
+    fireEvent.click(within(row).getByTestId("quick-archive-conversation"));
+    expect(screen.getByTestId("loc").textContent).toBe("/");
   });
 });
 

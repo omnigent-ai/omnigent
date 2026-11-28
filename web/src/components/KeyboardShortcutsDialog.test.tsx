@@ -19,6 +19,7 @@ const contentSearchEnabled = vi.fn(() => false);
 const gridsEnabled = vi.fn(() => false);
 const splitTerminalEnabled = vi.fn(() => false);
 const siblingSessionsEnabled = vi.fn(() => false);
+const quickPickEnabled = vi.fn(() => false);
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     sibling_sessions: siblingSessionsEnabled(),
@@ -26,6 +27,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
       workspace_content_search: contentSearchEnabled(),
       grid_sessions_display_ui: gridsEnabled(),
       splittable_terminal_view_ui: splitTerminalEnabled(),
+      quick_pick_palette: quickPickEnabled(),
     },
   }),
 }));
@@ -34,6 +36,7 @@ vi.mock("@/lib/nativeBridge", () => ({
   isElectronShell: () => isElectronShell(),
   supportsBrowser: () => supportsBrowser(),
   supportsDesktopCommands: () => supportsDesktopCommands(),
+  shellRoutesDesktopCommands: () => false,
   // DialogContent (rendered here) reads isIOSShell to size modals for the iOS
   // keyboard; this suite exercises the browser path, so it's always false.
   isIOSShell: () => false,
@@ -48,6 +51,7 @@ beforeEach(() => {
   gridsEnabled.mockReturnValue(false);
   splitTerminalEnabled.mockReturnValue(false);
   siblingSessionsEnabled.mockReturnValue(false);
+  quickPickEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -236,21 +240,35 @@ describe("KeyboardShortcutsDialog", () => {
   it("shows the pinned-session shortcut with the Alt chord in a plain browser", () => {
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–9)").closest("li");
     expect(row).toBeTruthy();
-    // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…0 chip.
+    // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…9 chip.
     expect(within(row!).getByText("Alt")).toBeTruthy();
-    expect(within(row!).getByText("1…0")).toBeTruthy();
+    expect(within(row!).getByText("1…9")).toBeTruthy();
   });
 
   it("shows the pinned-session shortcut without Alt in the Electron shell", () => {
     isNativeShell.mockReturnValue(true);
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–9)").closest("li");
     expect(row).toBeTruthy();
     expect(within(row!).queryByText("Alt")).toBeNull();
-    expect(within(row!).getByText("1…0")).toBeTruthy();
+    expect(within(row!).getByText("1…9")).toBeTruthy();
+  });
+
+  it("lists Next and Previous session for Ctrl+Tab in Electron with quick_pick_palette on", () => {
+    isNativeShell.mockReturnValue(true);
+    isElectronShell.mockReturnValue(true);
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(keysFor("Switch recent sessions")).toEqual(["Ctrl", "Tab"]);
+    expect(screen.queryByText("Next session")).toBeNull();
+
+    quickPickEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Switch recent sessions")).toBeNull();
+    expect(keysFor("Next session")).toEqual(["Ctrl", "Tab"]);
+    expect(keysFor("Previous session")).toEqual(["Ctrl", "⇧", "Tab"]);
   });
 
   it("shows the recent-session switcher and Back/Forward only in Electron", () => {

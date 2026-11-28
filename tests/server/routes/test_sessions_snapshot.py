@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import itertools
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -658,6 +660,83 @@ async def test_session_snapshot_populates_runner_online_from_session_lookup() ->
     assert snapshot.host_online is False
 
 
+class _JobTaggingExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Default executor that tags every submitted job with a sequence number."""
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=1)
+        self.current = threading.local()
+        self._next_job = itertools.count()
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> concurrent.futures.Future[Any]:
+        job = next(self._next_job)
+
+        def run() -> Any:
+            self.current.job = job
+            return fn(*args, **kwargs)
+
+        return super().submit(run)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_reads_overlays_in_one_executor_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Liveness, usage and the resume-host read share one executor hop.
+
+    Each ``asyncio.to_thread`` hop waits in the default executor's queue, so on
+    a busy replica the snapshot's latency grows with its hop count.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "1949523062921b6989466e2fc257925a"
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    conv.host_id = "host_1"
+    executor = _JobTaggingExecutor()
+    jobs: dict[str, int] = {}
+
+    def _liveness_lookup(session_ids: list[str]) -> dict[str, SessionLiveness]:
+        jobs["liveness"] = executor.current.job
+        return {session_id: SessionLiveness(runner_online=True, host_online=False)}
+
+    class _HostStore:
+        def get_host(self, host_id: str) -> object:
+            jobs["host"] = executor.current.job
+            return SimpleNamespace(id=host_id)
+
+    real_usage = orchestration.load_session_usage
+
+    def _usage(*args: Any, **kwargs: Any) -> Any:
+        jobs["usage"] = executor.current.job
+        return real_usage(*args, **kwargs)
+
+    monkeypatch.setattr(orchestration, "load_session_usage", _usage)
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda host, config: True)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(executor)
+    try:
+        snapshot = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            session_id,
+            conversation=conv,
+            liveness_lookup=_liveness_lookup,
+            host_store=_HostStore(),  # type: ignore[arg-type]
+            sandbox_config=SimpleNamespace(),  # type: ignore[arg-type]
+        )
+    finally:
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor())
+        executor.shutdown(wait=True)
+
+    assert set(jobs) == {"liveness", "host", "usage"}
+    assert len(set(jobs.values())) == 1
+    assert snapshot.runner_online is True
+    assert snapshot.host_online is False
+    assert snapshot.host_resumable is True
+    assert snapshot.usage_included is True
+
+
 @pytest.mark.asyncio
 async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
     """A crashed runner's exit report surfaces as failed + last_task_error.
@@ -895,9 +974,23 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
             'version 2.1.280 or newer is required."}',
             "client_update_required",
         ),
+        (
+            "API Error: Sonnet 4 can't help with this. Start a new session to continue.",
+            "content_policy_refusal",
+        ),
+        (
+            "Output limit reached — the response exceeded the model’s maximum output "
+            "length and was cut off. Ask for a shorter answer, or break the request "
+            "into smaller pieces and continue step by step.",
+            "output_limit_exceeded",
+        ),
+        (
+            "Claude Code ended the turn with an API error (max_output_tokens).",
+            "output_limit_exceeded",
+        ),
     ],
 )
-async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(
+async def test_session_snapshot_classifies_preexisting_generic_native_errors(
     message: str,
     expected_code: str,
 ) -> None:
@@ -3571,47 +3664,80 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(
 
 
 @pytest.mark.asyncio
-async def test_persist_error_labels_short_message_stored_verbatim() -> None:
-    """A short failure message is stored without modification."""
+async def test_persist_error_labels_timestamp_and_recovery_preserve_activity(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure occurrence and recovery leave the transcript timestamp unchanged."""
+    from omnigent.server.routes._sessions import helpers
     from omnigent.server.schemas import ErrorDetail
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
-    captured: dict[str, dict[str, str]] = {}
-
-    class _MockStore:
-        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
-            captured[session_id] = updates
-
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
     error = ErrorDetail(code="runner_error", message="Process exited with code 1")
 
-    await _persist_session_status_error_labels(
-        "d6e1678fb446a1cf5a892e0df60aaba3", error, _MockStore()
-    )  # type: ignore[arg-type]
+    for occurred_at in (conversation.updated_at + 60, conversation.updated_at + 120):
+        monkeypatch.setattr(helpers.time, "time", lambda occurred_at=occurred_at: occurred_at)
+        await _persist_session_status_error_labels(conversation.id, error, store)
 
-    assert (
-        captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_message"]
-        == "Process exited with code 1"
+        stored = store.get_conversation(conversation.id)
+        assert stored is not None
+        assert stored.labels["omnigent.last_task_error_message"] == error.message
+        assert stored.labels["omnigent.last_task_error_code"] == error.code
+        assert stored.labels["omnigent.last_task_error_at"] == str(occurred_at)
+        assert stored.updated_at == conversation.updated_at
+
+    await _persist_session_status_error_labels(conversation.id, None, store)
+
+    recovered = store.get_conversation(conversation.id)
+    assert recovered is not None
+    assert recovered.labels["omnigent.last_task_error_at"] == ""
+    assert all(
+        value == ""
+        for key, value in recovered.labels.items()
+        if key.startswith("omnigent.last_task_error_")
     )
-    assert (
-        captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
-        == "runner_error"
-    )
+    assert recovered.updated_at == conversation.updated_at
 
 
 # ── _runner_reject_detail ────────────────────────────────────────────────────
 
 
-def test_runner_reject_detail_combines_error_code_and_detail() -> None:
-    """The runner's own ``{error, detail}`` shape reads as ``code: detail``."""
+@pytest.mark.parametrize(
+    "status,payload,expected",
+    [
+        (
+            503,
+            {"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+            "harness_spawn_failed: harness spawn failed (see log)",
+        ),
+        (
+            400,
+            {"error": {"code": "invalid_input", "message": "unsupported harness configuration"}},
+            "invalid_input: unsupported harness configuration",
+        ),
+        (
+            400,
+            {"error": {"code": "invalid_input", "message": "  "}, "detail": "policy rejected"},
+            "invalid_input: policy rejected",
+        ),
+    ],
+    ids=["flat-spawn-failure", "nested-policy-failure", "blank-nested-message-keeps-detail"],
+)
+def test_runner_reject_detail_combines_error_code_and_detail(
+    status: int, payload: dict[str, object], expected: str
+) -> None:
+    """Flat and nested runner rejections retain a readable code and detail."""
     import httpx
 
     from omnigent.server.routes.sessions import _runner_reject_detail
 
     resp = httpx.Response(
-        503,
+        status,
         request=httpx.Request("POST", "http://runner/v1/sessions/conv_x/events"),
-        json={"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+        json=payload,
     )
-    assert _runner_reject_detail(resp) == "harness_spawn_failed: harness spawn failed (see log)"
+    assert _runner_reject_detail(resp) == expected
 
 
 def test_runner_reject_detail_falls_back_through_code_body_and_status() -> None:

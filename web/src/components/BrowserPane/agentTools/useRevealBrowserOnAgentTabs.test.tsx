@@ -24,13 +24,21 @@ it("reveals the pane when an agent opens or selects a tab in the shown session",
   renderHook(() => useRevealBrowserOnAgentTabs("conv_a", reveal));
   request("tabs", { action: "new" }, "conv_a");
   request("tabs", { action: "select", tab_id: "t1" }, "conv_a");
-  expect(reveal).toHaveBeenCalledTimes(2);
+  // A selection without a usable tab id still reveals, naming no tab.
+  request("tabs", { action: "select" }, "conv_a");
+  request("tabs", { action: "select", tab_id: 7 }, "conv_a");
+  expect(reveal.mock.calls).toEqual([
+    [{ actionId: "a1", action: "new" }],
+    [{ actionId: "a1", action: "select", tabId: "t1" }],
+    [{ actionId: "a1", action: "select", tabId: null }],
+    [{ actionId: "a1", action: "select", tabId: null }],
+  ]);
   // Listing or closing tabs, other actions and other sessions leave the pane alone.
   request("tabs", { action: "list" }, "conv_a");
   request("tabs", { action: "close" }, "conv_a");
   request("click", { selector: "#x" }, "conv_a");
   request("tabs", { action: "new" }, "conv_b");
-  expect(reveal).toHaveBeenCalledTimes(2);
+  expect(reveal).toHaveBeenCalledTimes(4);
 });
 
 it("leaves a viewer without the embedded browser alone", () => {
