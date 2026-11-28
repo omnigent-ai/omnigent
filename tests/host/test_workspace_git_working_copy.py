@@ -831,6 +831,22 @@ async def test_a_long_lived_branch_still_compares_with_the_branch_it_started_fro
     assert response.base.base == fork_next
 
 
+async def test_an_oversized_oldest_entry_falls_back_to_origins_default(tmp_path: Path) -> None:
+    """Once the creation entry expires, a huge commit subject can be the oldest entry."""
+    root, main, _fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _push_upstream(root, "fork", "feature")
+    reflog = root / ".git" / "logs" / "refs" / "heads" / "feature"
+    created = reflog.read_text().splitlines()[0]
+    identity = created.split("\t", 1)[0]
+    reflog.write_text(f"{identity}\tcommit: {'x' * (80 * 1024)}\n")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/main"
+    assert response.base.base == main
+
+
 async def test_an_untracked_branch_never_compares_with_its_own_copy_on_origin(
     tmp_path: Path,
 ) -> None:

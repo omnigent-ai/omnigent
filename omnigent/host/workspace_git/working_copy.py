@@ -347,7 +347,8 @@ async def _remote_start_point(
     count = first_line(counted.stdout) if counted.success else ""
     if not count.isdecimal() or int(count) == 0:
         return None
-    # Through ``log``, which the runner keeps from running a signature helper.
+    # Through ``log``, which the runner keeps from running a signature helper. An entry past the
+    # output cap is some long subject, never a usable start.
     entry = await repository.run_unchecked(
         [
             "log",
@@ -358,8 +359,9 @@ async def _remote_start_point(
             "--",
         ],
         deadline=deadline,
+        allow_partial=True,
     )
-    oldest = first_line(entry.stdout) if entry.success else ""
+    oldest = first_line(entry.stdout) if entry.success and not entry.overflowed else ""
     if not oldest.startswith(_CREATED_FROM):
         return None
     start = oldest.removeprefix(_CREATED_FROM)
