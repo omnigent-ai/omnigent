@@ -125,7 +125,6 @@ _HOST_INFO: dict[str, Any] = {
     "selected_account": "owner-login",
     "auth": {"authenticated": True, "accounts": _ACCOUNTS, "selected_account": "owner-login"},
     "capabilities": {"account_switching": True, "merging": True, "line_counts": True},
-    "pr": {"number": 42, "title": "Ship it", "state": "OPEN", "url": _PR},
 }
 # A comment as the host reads it: its rights are the host account's.
 _THREAD_COMMENT: dict[str, Any] = {
@@ -137,6 +136,14 @@ _THREAD_COMMENT: dict[str, Any] = {
     "can_update": True,
     "can_delete": True,
     "viewer_did_author": True,
+}
+# The overview's conversation comments carry the same rights, sent even unasked by a forked host.
+_HOST_INFO["pr"] = {
+    "number": 42,
+    "title": "Ship it",
+    "state": "OPEN",
+    "url": _PR,
+    "comments": [{**_THREAD_COMMENT, "id": "IC_1"}],
 }
 _HOST_THREADS: dict[str, Any] = {
     "data": [
@@ -495,6 +502,11 @@ async def test_only_the_owner_sees_the_host_s_accounts_and_change_controls(
     assert {name for name, on in info["capabilities"].items() if on} == {"line_counts"}
     assert set(info["capabilities"]) >= READ_CAPABILITIES
     assert info["pr"]["number"] == 42
+    [comment] = info["pr"]["comments"]
+    assert (comment["id"], comment["database_id"]) == ("IC_1", 5)
+    assert {name: comment[name] for name in _RIGHTS_OFF} == _RIGHTS_OFF
+    assert comment["viewer_did_author"] is False
+    assert comment["reactions"] == [{"content": "HEART", "count": 2, "viewer_reacted": False}]
 
 
 @pytest.mark.asyncio
@@ -509,6 +521,7 @@ async def test_the_owner_sees_the_host_s_info_unchanged(
     assert info["accounts"] == _ACCOUNTS
     assert info["auth"]["accounts"] == _ACCOUNTS
     assert info["capabilities"] == _HOST_INFO["capabilities"]
+    assert info["pr"]["comments"] == _HOST_INFO["pr"]["comments"]
     assert "owner_only_changes" not in info
     assert "read_only" not in info
 
@@ -584,13 +597,15 @@ async def test_anyone_else_reads_a_threads_comments_without_the_rights(
 
 
 _REVIEW_READS = [
+    ("github_info", "/resources/github", {}),
     ("github_review_threads", _THREADS_PATH, {"pr_url": _PR}),
     ("github_review_thread_comments", _COMMENTS_PATH, {"pr_url": _PR, "after": "c"}),
 ]
+_REVIEW_READ_IDS = ["overview", "threads", "comments"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("op", "path", "params"), _REVIEW_READS, ids=["threads", "comments"])
+@pytest.mark.parametrize(("op", "path", "params"), _REVIEW_READS, ids=_REVIEW_READ_IDS)
 @pytest.mark.parametrize(
     ("caller", "asks"),
     [(_OWNER, True), (_ADMIN_OWNER, True), (_EDITOR, False), (_MANAGER, False), (_ADMIN, False)],
@@ -612,7 +627,7 @@ async def test_the_server_asks_the_host_for_its_accounts_rights_for_the_owner_al
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("op", "path", "params"), _REVIEW_READS, ids=["threads", "comments"])
+@pytest.mark.parametrize(("op", "path", "params"), _REVIEW_READS, ids=_REVIEW_READ_IDS)
 async def test_unsure_who_reads_the_server_does_not_ask_for_the_accounts_rights(
     client: httpx.AsyncClient,
     host: _RecordingHost,

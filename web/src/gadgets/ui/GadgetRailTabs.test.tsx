@@ -18,12 +18,14 @@ import {
 import {
   type Gadget,
   createGadget,
+  createGadgetFromTemplate,
   deleteGadget,
   getSessionGadgets,
   getGadget,
   getGadgetShelf,
   getGadgetGadgetSession,
   linkGadgetToSession,
+  listGadgetTemplateShares,
 } from "@/gadgets/api/gadgetApi";
 import { openGadgetSession } from "@/gadgets/host/gadgetSession";
 import {
@@ -51,6 +53,8 @@ vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   getGadgetShelf: vi.fn(),
   getGadgetGadgetSession: vi.fn(),
   createGadget: vi.fn(),
+  createGadgetFromTemplate: vi.fn(),
+  listGadgetTemplateShares: vi.fn(),
   deleteGadget: vi.fn(),
 }));
 vi.mock("@/gadgets/host/gadgetSession", async (importOriginal) => ({
@@ -357,6 +361,58 @@ describe("New gadget tab", () => {
       ),
     );
     expect(screen.queryByRole("tab", { name: "New gadget" })).toBeNull();
+  });
+
+  it("shows a gadget made from a shared template beside this session, in its tab", async () => {
+    const created = gadgetFixture({ id: "9", name: "Onboarding course" });
+    vi.mocked(listGadgetTemplateShares).mockResolvedValue([
+      { id: "course", name: "Onboarding course", owner_email: "alice@example.com" },
+    ]);
+    vi.mocked(createGadgetFromTemplate).mockResolvedValue(created);
+    vi.mocked(linkGadgetToSession).mockResolvedValue([BOARD, REPORT, created]);
+    renderWithGadgets(<Rail conversationId="conv_1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    const content = await screen.findByRole("region", { name: "content" });
+    fireEvent.click(await within(content).findByRole("button", { name: "Onboarding course" }));
+
+    await waitFor(() => expect(linkGadgetToSession).toHaveBeenCalledWith("9", "conv_1", true));
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Onboarding course" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    expect(screen.queryByRole("tab", { name: "New gadget" })).toBeNull();
+    expect(screen.getByRole("status", { name: "location" })).not.toHaveTextContent("/gadget/9");
+  });
+
+  it("tries only the session link again after it fails, not the creation", async () => {
+    const created = gadgetFixture({ id: "9", name: "Onboarding course" });
+    vi.mocked(listGadgetTemplateShares).mockResolvedValue([
+      { id: "course", name: "Onboarding course", owner_email: "alice@example.com" },
+    ]);
+    vi.mocked(createGadgetFromTemplate).mockResolvedValue(created);
+    vi.mocked(linkGadgetToSession).mockResolvedValue([BOARD, REPORT, created]);
+    renderWithGadgets(<Rail conversationId="conv_1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    const content = await screen.findByRole("region", { name: "content" });
+    const card = await within(content).findByRole("button", { name: "Onboarding course" });
+    vi.mocked(linkGadgetToSession).mockRejectedValueOnce(new Error("Link failed"));
+
+    fireEvent.click(card);
+    fireEvent.click(await within(content).findByRole("button", { name: /try again|retry/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Onboarding course" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    expect(createGadgetFromTemplate).toHaveBeenCalledTimes(1);
+    expect(
+      vi.mocked(linkGadgetToSession).mock.calls.filter(([id]) => id === "9").length,
+    ).toBeGreaterThanOrEqual(2);
   });
 
   it.each(["link", "send"] as const)(

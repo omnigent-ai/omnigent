@@ -23,7 +23,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1039,15 +1039,64 @@ def test_back_and_reload_bring_diffs_back_to_a_visits_worktree(
     expect(_changed(sidebar, "only_in_workspace.txt")).to_be_visible(timeout=30_000)
 
 
+@pytest.mark.parametrize("slow_server", [False, True], ids=["prompt-server", "slow-server"])
 def test_diff_file_link_opens_its_diff_in_diffs(
-    page: Page, git_session: tuple[str, str], tmp_path: Path
+    page: Page, git_session: tuple[str, str], tmp_path: Path, slow_server: bool
 ) -> None:
-    """A ``?file=`` link with ``diff=1`` to a changed file opens Diffs on that file's diff."""
+    """A ``?file=`` link with ``diff=1`` to a changed file opens Diffs on that file's diff,
+    also when the server says the tabs sidebar is on only after the page has loaded."""
     base_url, session_id = git_session
     (tmp_path / "repository" / "base.txt").write_text("Add the base\nedited for the link\n")
     _set_flag(page, True)
+    # Until the server answers, the classic sidebar shows the file, and its viewer takes
+    # ``diff`` off the URL while the file's diff loads. A slow server answers only once it has,
+    # and the classic file's diff and changes stay unanswered until the link is handed over,
+    # so ``diff`` can't come back first.
+    held: dict[str, list[Route]] = {"info": [], "changes": []}
+    released: set[str] = set()
+
+    def hold(kind: str) -> Callable[[Route], None]:
+        def handle(route: Route) -> None:
+            if kind in released:
+                route.fallback()
+            else:
+                held[kind].append(route)
+
+        return handle
+
+    def release(kind: str) -> None:
+        released.add(kind)
+        for route in held[kind]:
+            route.fallback()
+
+    if slow_server:
+        page.route("**/v1/info", hold("info"))
+        page.route("**/resources/environments/default/changes", hold("changes"))
+        page.route("**/resources/environments/default/diff/**", hold("changes"))
     page.set_viewport_size(_VIEWPORTS["desktop"])
     page.goto(f"{base_url}/c/{session_id}?file=base.txt&diff=1")
+    if slow_server:
+        page.wait_for_function(
+            """() => {
+              const params = new URLSearchParams(location.search);
+              return params.get("file") === "base.txt" && !params.has("diff");
+            }""",
+            timeout=30_000,
+        )
+        assert held["info"], "the app asked the server nothing before the viewer took diff off"
+        # The router writes the URL at once but renders it in a transition; let that render
+        # land before the answer, so the shell reads the rewritten link.
+        page.evaluate(
+            """async () => {
+              for (let frame = 0; frame < 30; frame += 1) {
+                await new Promise((resolve) => requestAnimationFrame(resolve));
+              }
+            }"""
+        )
+        assert "diff=" not in page.evaluate("location.search")
+        release("info")
+        expect(page).not_to_have_url(re.compile(r"[?&]file="), timeout=60_000)
+        release("changes")
 
     sidebar = page.get_by_role("complementary", name="Workspace")
     strip = sidebar.get_by_role("tablist", name="Workspace tabs")

@@ -76,6 +76,8 @@ vi.mock("@/components/BrowserPane/agentTools/tabStore", async (importOriginal) =
 
 // The file action host has its own suite; these tests check that it mounts only with the flag.
 const fileActionHost = vi.hoisted(() => ({ throws: false }));
+// Like the real viewer before a file's diff loads, the classic viewer can take `diff` off the URL.
+const classicViewer = vi.hoisted(() => ({ dropsDiff: false }));
 vi.mock("./fileCommands/FileActionHost", () => ({
   FileActionHost: () => {
     if (fileActionHost.throws) throw new Error("file action host broke");
@@ -195,7 +197,27 @@ vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
   revealFolderInFilesPanel: vi.fn(),
 }));
-vi.mock("./FileViewer", () => ({ FileViewer: () => <div data-testid="file-viewer" /> }));
+vi.mock("./FileViewer", async () => {
+  const { useEffect } = await import("react");
+  const { useSearchParams } = await import("react-router-dom");
+  return {
+    FileViewer: ({ syncUrl }: { syncUrl?: boolean }) => {
+      const [params, setParams] = useSearchParams();
+      useEffect(() => {
+        if (!classicViewer.dropsDiff || !syncUrl || !params.has("diff")) return;
+        setParams(
+          (previous) => {
+            const next = new URLSearchParams(previous);
+            next.delete("diff");
+            return next;
+          },
+          { replace: true },
+        );
+      }, [syncUrl, params, setParams]);
+      return <div data-testid="file-viewer" />;
+    },
+  };
+});
 vi.mock("./InlineTerminalsSection", () => ({ InlineTerminalsSection: () => null }));
 vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 
@@ -305,6 +327,12 @@ function ChatProbe() {
       <button type="button" onClick={() => navigate("/c/conv_ws?file=README.md&line=4")}>
         Follow README link
       </button>
+      <button
+        type="button"
+        onClick={() => navigate("/c/conv_ws?file=src/app.ts", { replace: true })}
+      >
+        Rewrite the link to another file
+      </button>
       <button type="button" onClick={() => navigate("/c/conv_other?file=README.md&fullscreen=1")}>
         Follow another session's full screen link
       </button>
@@ -317,8 +345,8 @@ function ChatProbe() {
 
 function renderShell(info: ServerInfo | "loading", entry = "/c/conv_ws") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <CapabilitiesProvider info={info}>
+  const tree = (current: ServerInfo | "loading") => (
+    <CapabilitiesProvider info={current}>
       <QueryClientProvider client={client}>
         <SidebarDataProvider>
           <TooltipProvider>
@@ -332,8 +360,12 @@ function renderShell(info: ServerInfo | "loading", entry = "/c/conv_ws") {
           </TooltipProvider>
         </SidebarDataProvider>
       </QueryClientProvider>
-    </CapabilitiesProvider>,
+    </CapabilitiesProvider>
   );
+  const view = render(tree(info));
+  /** The server's answer arriving, or changing, for the shell already on screen. */
+  const setInfo = (next: ServerInfo | "loading") => view.rerender(tree(next));
+  return { ...view, setInfo };
 }
 
 /** The session's browser tabs change, as the relay's write to main reports it. */
@@ -954,6 +986,48 @@ describe("workspace_sidebar_v2", () => {
     await waitFor(() => expect(tabs.host).toMatchObject({ maximized: false }));
     expect(screen.getByTestId("search")).not.toHaveTextContent("file=");
     expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(linkOpens);
+  });
+
+  it("opens a ?diff= link as it arrived, though the classic sidebar rewrote it before the server answered", async () => {
+    setViewport(DESKTOP);
+    classicViewer.dropsDiff = true;
+    onTestFinished(() => {
+      classicViewer.dropsDiff = false;
+    });
+    const shell = renderShell("loading", "/c/conv_ws?file=README.md&line=4&diff=1");
+    // Until the server answers, the classic sidebar shows the file and its viewer drops `diff`.
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("diff="));
+    expect(screen.getByTestId("search")).toHaveTextContent("file=README.md");
+
+    shell.setInfo(withFlag(true));
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledWith(
+        "conv_ws",
+        "README.md",
+        { line: 4, view: "diff" },
+        "link",
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("file="));
+    expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the URL's own link when it was rewritten to another file before the server answered", async () => {
+    setViewport(DESKTOP);
+    const shell = renderShell("loading", "/c/conv_ws?file=README.md&diff=1");
+    fireEvent.click(screen.getByRole("button", { name: "Rewrite the link to another file" }));
+    await waitFor(() => expect(screen.getByTestId("search")).toHaveTextContent("file=src"));
+
+    shell.setInfo(withFlag(true));
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledWith(
+        "conv_ws",
+        "src/app.ts",
+        {},
+        "link",
+      ),
+    );
+    expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(1);
   });
 
   it("fills the window with the sidebar for a ?fullscreen=1 link, and leaves the URL", async () => {

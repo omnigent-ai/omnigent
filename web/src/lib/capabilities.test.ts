@@ -304,6 +304,7 @@ describe.each([
   "workflow_sharing",
   "gadget_sharing",
   "gadget_copy",
+  "gadget_templates",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],

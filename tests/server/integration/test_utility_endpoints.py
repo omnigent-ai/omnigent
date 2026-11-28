@@ -124,6 +124,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["gadgets"] is False
     assert data["gadget_sharing"] is False
     assert data["gadget_copy"] is False
+    assert data["gadget_templates"] is False
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
     # installable_harnesses is the allowlist the SPA offers setup for; blank

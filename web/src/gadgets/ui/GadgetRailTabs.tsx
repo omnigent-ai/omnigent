@@ -305,6 +305,11 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
           await show(gadget);
           openGadgetTab(gadget);
         }}
+        // One made from a shared template is shown beside this session the same way.
+        onCreatedFromShared={async (gadget) => {
+          await show(gadget);
+          openGadgetTab(gadget);
+        }}
       />
     </div>
   );

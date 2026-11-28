@@ -111,6 +111,7 @@ def test_sharing_data_does_not_grant_frontend_publication(gadgets: Fixture) -> N
         "write_data": True,
         "publish": False,
         "manage": False,
+        "use_template": False,
     }
     assert seen["viewer_id"] == person(2)
     assert seen["owner_id"] == person(1)

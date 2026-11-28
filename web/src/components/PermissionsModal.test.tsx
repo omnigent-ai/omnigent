@@ -2127,6 +2127,83 @@ describe("PermissionsModal", () => {
       expect(grantMock).not.toHaveBeenCalled();
     });
 
+    const TEMPLATES = { features: { gadgets: true }, gadget_templates: true };
+
+    it("shares it as a template, which nobody already holds", async () => {
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 0, "Bob")]));
+      grantShareMock.mockResolvedValue(grantee("carol@example.com", 0));
+
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper(TEMPLATES),
+      });
+
+      expect(
+        await screen.findByRole("combobox", { name: "Permission level for bob@example.com" }),
+      ).toHaveTextContent("Can use as template");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol@example.com" },
+      });
+      await chooseLevel(
+        screen.getByRole("combobox", { name: "New user permission" }),
+        "Can use as template",
+      );
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "carol@example.com", 0, true),
+      );
+    });
+
+    it("moves someone else down to template-only by sending the change", async () => {
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 1, "Bob")]));
+      grantShareMock.mockResolvedValue(grantee("bob@example.com", 0));
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper(TEMPLATES),
+      });
+
+      await chooseLevel(
+        await screen.findByRole("combobox", { name: "Permission level for bob@example.com" }),
+        "Can use as template",
+      );
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com", 0),
+      );
+    });
+
+    it("keeps a manager's own access as a template when they choose it, not removes it", async () => {
+      const managed = { ...gadget, owner_id: "alice@example.com", viewer_id: "bob@example.com" };
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
+      grantShareMock.mockResolvedValue(grantee("bob@example.com", 0));
+      render(<PermissionsModal gadget={managed} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper(TEMPLATES),
+      });
+
+      await chooseLevel(
+        await screen.findByRole("combobox", { name: "Permission level for bob@example.com" }),
+        "Can use as template",
+      );
+      const confirm = screen.getByRole("alertdialog", { name: "Change your own access" });
+      expect(within(confirm).queryByRole("button", { name: "Remove my access" })).toBeNull();
+      fireEvent.click(within(confirm).getByRole("button", { name: "Give up Can manage" }));
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "bob@example.com", 0),
+      );
+      expect(revokeShareMock).not.toHaveBeenCalled();
+    });
+
+    it("doesn't offer template sharing on a server that doesn't say it supports it", async () => {
+      listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 1, "Bob")]));
+      render(<PermissionsModal gadget={gadget} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { gadgets: true } }),
+      });
+
+      const trigger = await screen.findByRole("combobox", { name: "New user permission" });
+      await waitFor(() => expect(trigger).toBeEnabled());
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      expect(await screen.findByRole("option", { name: "Can view" })).toBeInTheDocument();
+      expect(screen.queryByRole("option", { name: "Can use as template" })).toBeNull();
+    });
+
     it("names the owner and asks before a manager gives up their own access", async () => {
       const managed = { ...gadget, owner_id: "alice@example.com", viewer_id: "bob@example.com" };
       listGadgetMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));

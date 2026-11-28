@@ -173,10 +173,9 @@ SysGadgetRevisionGetTool = _gadget_tool(
 )
 SysGadgetRevisionCreateTool = _gadget_tool(
     "sys_gadget_revision_create",
-    "Upload an immutable revision of a gadget: one self-contained HTML page using the gadget "
-    "SDK, with its collections (JSON Schemas), rules, actions and a guide for agents. To change "
-    "a revision, give base_revision_id and edits instead of html; the rest is carried over."
-    + _SKILL,
+    "Upload an immutable gadget revision: one self-contained HTML page using the gadget SDK, "
+    "with its collections (JSON Schemas), rules, actions and a guide for agents. To change one, "
+    "give base_revision_id and edits instead of html; the rest is carried over." + _SKILL,
     {
         "gadget_id": _ID,
         "base_revision_id": _STRING,
@@ -192,8 +191,8 @@ SysGadgetRevisionCreateTool = _gadget_tool(
                 },
                 "required": ["new"],
             },
-            "description": "Exact replacements, in order: old (must appear once) with new, or "
-            "the text between the start and end markers (each once) with new.",
+            "description": "Exact replacements in order: old (once) with new, or the text "
+            "between start and end markers (each once) with new.",
         },
         "html": _STRING,
         "sdk_version": {"type": "integer", "enum": [1]},
@@ -204,6 +203,7 @@ SysGadgetRevisionCreateTool = _gadget_tool(
         "collections": {"type": "object"},
         # Values "shared" or "viewer"; the skill explains them and the server checks them.
         "collection_scopes": {"type": "object"},
+        "starter_collections": {"type": "array"},
         "guide": _STRING,
         "constraints": {"type": "array", "items": {"type": "object"}},
         "actions": {"type": "array", "items": {"type": "object"}},

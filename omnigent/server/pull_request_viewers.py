@@ -55,8 +55,9 @@ def info_for_viewer(info: dict[str, Any], viewer: PullRequestViewer) -> dict[str
 
     :param info: A ``session.github.info`` payload, e.g. ``{"auth": {"accounts": [...]}}``.
     :param viewer: Who reads it.
-    :returns: For anyone but the owner, a copy with ``owner_only_changes``, no account list
-        and a full ``capabilities`` object whose change capabilities are all false.
+    :returns: For anyone but the owner, a copy with ``owner_only_changes``, no account list,
+        a full ``capabilities`` object whose change capabilities are all false, and
+        conversation comments that keep their IDs and counts but none of the account's rights.
     """
     if viewer is PullRequestViewer.OWNER:
         return info
@@ -67,6 +68,10 @@ def info_for_viewer(info: dict[str, Any], viewer: PullRequestViewer) -> dict[str
     if isinstance(auth, dict):
         shown["auth"] = {**auth, **dict.fromkeys(hidden)}
     shown["capabilities"] = _read_only_capabilities(info.get("capabilities"))
+    pr = info.get("pr")
+    if isinstance(pr, dict) and isinstance(pr.get("comments"), list):
+        # A host sends these only when asked; one that sends them anyway is shaped here.
+        shown["pr"] = {**pr, "comments": [_comment_for_others(item) for item in pr["comments"]]}
     return shown
 
 

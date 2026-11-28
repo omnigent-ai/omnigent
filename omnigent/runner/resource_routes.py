@@ -1552,12 +1552,14 @@ def register_resource_routes(
         server_tracked: bool = False,
         default_pr_url: str | None = None,
         allow_cached: bool = False,
+        account_rights: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "cached_pr_info",
             pr_url=pr_url,
             allow_cached=allow_cached,
+            account_rights=account_rights,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )

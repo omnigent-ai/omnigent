@@ -17,6 +17,8 @@ export interface GadgetPermissions {
   write_data: boolean;
   publish: boolean;
   manage: boolean;
+  /** Make one's own gadget from it under New gadget; older servers omit it. */
+  use_template?: boolean;
 }
 
 export interface Gadget {
@@ -226,6 +228,10 @@ function parseGadget(value: unknown): Gadget {
       write_data: permissions.write_data === true,
       publish: permissions.publish === true,
       manage: permissions.manage === true,
+      // Older servers don't say; leave it out rather than claim false.
+      ...(permissions.use_template !== undefined && {
+        use_template: permissions.use_template === true,
+      }),
     },
     ...createdAt,
   };
@@ -343,6 +349,42 @@ function parseSharedGadget(value: unknown): SharedGadget {
 export async function listSharedGadgets(signal?: AbortSignal): Promise<SharedGadget[]> {
   const { items } = await everyPage(`${GADGETS_PATH}/shared`, {}, signal, "shared app list");
   return items.map(parseSharedGadget);
+}
+
+/** A gadget shared with the viewer as a template only: they can make their own from it. */
+export interface GadgetTemplateShare {
+  id: string;
+  name: string;
+  /** The owner's display name. */
+  owner_email: string;
+}
+
+/** Every gadget shared with the viewer as a template only, for New gadget. */
+export async function listGadgetTemplateShares(
+  signal?: AbortSignal,
+): Promise<GadgetTemplateShare[]> {
+  const { items } = await everyPage(`${GADGETS_PATH}/templates`, {}, signal, "gadget templates");
+  return items.flatMap((item) =>
+    isRecord(item) &&
+    typeof item.id === "string" &&
+    typeof item.name === "string" &&
+    typeof item.owner_email === "string"
+      ? [{ id: item.id, name: item.name, owner_email: item.owner_email }]
+      : [],
+  );
+}
+
+/**
+ * Makes a gadget the viewer owns from a gadget shared with them as a template: its current
+ * published code and starter data. Resolves the new gadget.
+ */
+export async function createGadgetFromTemplate(appId: string): Promise<Gadget> {
+  return parseGadget(
+    await gadgetRequest(`${appPath(appId)}/from-template`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  );
 }
 
 export async function getGadget(appId: string, signal?: AbortSignal): Promise<Gadget> {

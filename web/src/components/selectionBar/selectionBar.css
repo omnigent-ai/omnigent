@@ -1,0 +1,26 @@
+/* Copies of a selection bar's parts at each form, which the fit measures and nobody sees: in a
+   box of no size, so they never widen what the bar scrolls, while their row keeps its own width. */
+.selection-bar-sizers {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+.selection-bar-sizer-row {
+  display: flex;
+  width: max-content;
+}
+.selection-bar-sizer-row > * {
+  flex: none;
+}
+.selection-bar-sizer-row > [data-bar-action-size] {
+  display: flex;
+}
+.selection-bar-sizer-text::before {
+  content: attr(data-text);
+  white-space: pre;
+}
