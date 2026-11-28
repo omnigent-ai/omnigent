@@ -72,7 +72,7 @@ def resolve_session_surface(
     the originating surface: the parent's label, then the originating session's
     (an independent placement's source, or a fork's source), then the create body's
     copied label (a native ``/clear`` replacement). With none of these it gets what
-    main gave the request. Other clients keep their own surface.
+    main gave the request (bare httpx/requests: ``cli``). Other clients keep their own surface.
 
     :param headers: Request headers (lower-cased keys).
     :param parent_labels: The parent session's labels, for a child session.
@@ -89,6 +89,9 @@ def resolve_session_surface(
         return inherited
     user_agent = headers.get("user-agent")
     classified = classify_surface(user_agent)
+    # A bare httpx/requests client is "script" for request telemetry; its session stays cli.
+    if classified == "script" and _is_bare_python_client(user_agent or ""):
+        classified = "cli"
     if classified not in _INTERNAL_SURFACES:
         return _storable(classified) or "unknown"
     # Attribution is self-reported (User-Agent and labels), not authenticated.
@@ -132,6 +135,11 @@ def _main_surface(user_agent: str | None) -> str:
     return "web"
 
 
+def _is_bare_python_client(user_agent: str) -> bool:
+    """Return whether *user_agent* names httpx or requests, with no Omnigent component token."""
+    return "python-httpx" in user_agent or "python-requests" in user_agent
+
+
 def harness_client_surface() -> str | None:
     """Return the creating surface the runner recorded in this harness worker's environment.
 
@@ -150,8 +158,9 @@ def classify_surface(user_agent: str | None) -> str:
     * ``None`` or absent → ``"unknown"``
     * ``"omnigent-<component>/"`` prefix → ``"cli"``, ``"runner"``, ``"host"``,
       ``"harness"``, ``"sdk"`` (``omnigent-client``), or ``"slack"``
-    * empty / bare ``"python-httpx"`` / ``"python-requests"`` → ``"cli"``: older
-      Omnigent CLIs, hosts and runners send only httpx, with no component token
+    * empty → ``"cli"``
+    * bare ``"python-httpx"`` / ``"python-requests"`` → ``"script"``: older Omnigent
+      CLIs, hosts and runners send only httpx, but so do custom scripts
     * ``"Electron"`` in UA → ``"desktop"``
     * ``"iPhone"`` or ``"iPad"`` in UA → ``"ios"``
     * ``"Android"`` in UA → ``"android"``
@@ -167,10 +176,10 @@ def classify_surface(user_agent: str | None) -> str:
     for prefix, surface in _OMNIGENT_USER_AGENT_SURFACES.items():
         if user_agent.startswith(prefix):
             return surface
-    # Deprecated: bare httpx/requests also covers custom scripts. Classify them as
-    # "script" in v0.24.0, once clients older than v0.22 are no longer supported.
-    if not user_agent or "python-httpx" in user_agent or "python-requests" in user_agent:
+    if not user_agent:
         return "cli"
+    if _is_bare_python_client(user_agent):
+        return "script"
     if "Electron" in user_agent:
         return "desktop"
     if "iPhone" in user_agent or "iPad" in user_agent:
