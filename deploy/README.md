@@ -244,6 +244,10 @@ gone. So:
    registration would let a new account inherit them. Roll back further only
    after removing the grants, which drops every share.
 
+Gadgets with per-viewer collections are refused by releases from before them,
+so while replicas are mixed, or after a rollback, those gadgets don't load there
+rather than keep private records as shared ones.
+
 See [`designs/GADGETS.md`](../designs/GADGETS.md) for details.
 
 ## Execution model

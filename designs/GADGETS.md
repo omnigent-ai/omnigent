@@ -292,6 +292,13 @@ Rules:
 - **Actions** run in the clicker's gadget session and see the clicker's `viewer` records plus
   the shared ones. Gadget code and the SDK address a collection by name either way; the server
   picks the viewer's records from the scope. The opaque per-gadget viewer ID is unchanged.
+- **Older releases fail closed.** A stored revision keeps viewer collections' schemas apart,
+  in `viewer_collections`, and `collections` holds only the shared ones, which is all a
+  release from before per-viewer collections reads. Such a release refuses the published
+  revision (its digest covers the whole revision), and even unpublished, a viewer collection
+  is undeclared there, so it can never read or write one as shared. During a rolling
+  upgrade or after a rollback, gadgets with viewer collections stop working on older
+  replicas instead of mixing private records into shared data.
 - **Changing a collection's scope** is refused at publish, like changing its schema (the
   collection's published identity covers both): data is not moved between scopes, so a
   publisher who needs it uses a new collection name.
