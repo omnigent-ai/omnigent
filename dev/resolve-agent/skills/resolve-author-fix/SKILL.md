@@ -198,6 +198,9 @@ fallback if rendering is blocked; keep any usable footage.
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
   assertions, debug logs, or test source.
+- Caption only states the viewer can see. `to_be_visible()` alone also passes
+  for transparent or off-screen elements, such as a desktop message footer
+  before hover; use the shared guide's on-screen check before captioning one.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.
