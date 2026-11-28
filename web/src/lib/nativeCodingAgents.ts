@@ -70,6 +70,7 @@ export type NativeCodingAgentIconKind =
   | "cursor"
   | "kiro"
   | "goose"
+  | "grok"
   | "qwen"
   | "antigravity"
   | "kimi"
@@ -270,6 +271,18 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Hermes",
     iconKind: "hermes",
     sortRank: 80,
+  },
+  {
+    // grok is a native-server harness (`grok agent serve` over WebSocket, not
+    // a TUI wrap); no brand glyph yet, so `iconKind: "grok"` intentionally
+    // matches no icon branch (falls back to the generic bot icon).
+    key: "grok",
+    agentName: "grok-native-ui",
+    harness: "grok-native",
+    wrapperLabel: "grok-native-ui",
+    displayName: "Grok Build",
+    iconKind: "grok",
+    sortRank: 75,
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 

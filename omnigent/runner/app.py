@@ -1666,6 +1666,7 @@ def create_runner_app(
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _grok_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     # Keyed by native agent key, which is also the pane's terminal name. Launch
     # and ensure paths take a session's lock here; so does the idle pane reaper.
@@ -1683,6 +1684,7 @@ def create_runner_app(
             "qwen": _qwen_terminal_ensure_locks,
             "kimi": _kimi_terminal_ensure_locks,
             "devin": _devin_terminal_ensure_locks,
+            "grok": _grok_terminal_ensure_locks,
         }
     )
     app.state.native_terminal_ensure_locks = _native_terminal_ensure_locks
@@ -4294,6 +4296,7 @@ def create_runner_app(
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
+        _grok_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
@@ -9265,6 +9268,7 @@ def create_runner_app(
         _ensure_comment_relay_started=_ensure_comment_relay_started,
         _ensure_session_registered=_ensure_session_registered,
         _goose_terminal_ensure_locks=_goose_terminal_ensure_locks,
+        _grok_terminal_ensure_locks=_grok_terminal_ensure_locks,
         _hermes_terminal_ensure_locks=_hermes_terminal_ensure_locks,
         _kimi_terminal_ensure_locks=_kimi_terminal_ensure_locks,
         _kiro_terminal_ensure_locks=_kiro_terminal_ensure_locks,
@@ -9564,6 +9568,7 @@ def create_runner_app(
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
+        _grok_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
@@ -9595,6 +9600,7 @@ def create_runner_app(
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
+        _grok_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)

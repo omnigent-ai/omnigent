@@ -2220,6 +2220,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "doctor",
         "extensions",
         "goose",
+        "grok",
         "hermes",
         "host",
         "host-service-entry",
@@ -8635,6 +8636,12 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         function="run_goose_native",
         args_param="extra_args",
         model_strategy="explicit_passthrough",
+    ),
+    "grok": _NativeTerminalDispatchSpec(
+        module="omnigent.harnesses.grok_native.main",
+        function="run_grok_native",
+        args_param="extra_args",
+        prompt_param="prompt",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
         module="omnigent.harnesses.antigravity_native.main",
