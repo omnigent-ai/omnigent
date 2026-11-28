@@ -30,6 +30,66 @@
         ],
         "type": "object"
       },
+      "Connection.CredentialInfo": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "method": {
+            "enum": [
+              "key",
+              "oauth"
+            ],
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "credential"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "label",
+          "method"
+        ],
+        "type": "object"
+      },
+      "Connection.EnvInfo": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "env"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "name"
+        ],
+        "type": "object"
+      },
+      "Connection.Info": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Connection.CredentialInfo"
+          },
+          {
+            "$ref": "#/components/schemas/Connection.EnvInfo"
+          }
+        ]
+      },
       "FileDiff.Info": {
         "additionalProperties": false,
         "properties": {
@@ -225,6 +285,30 @@
         ]
       },
       "Form.Fields": {
+        "items": {
+          "$ref": "#/components/schemas/Form.Field"
+        },
+        "minItems": 1,
+        "prefixItems": [
+          {
+            "$ref": "#/components/schemas/Form.Field"
+          }
+        ],
+        "type": "array"
+      },
+      "Form.Fields_1": {
+        "items": {
+          "$ref": "#/components/schemas/Form.Field"
+        },
+        "minItems": 1,
+        "prefixItems": [
+          {
+            "$ref": "#/components/schemas/Form.Field"
+          }
+        ],
+        "type": "array"
+      },
+      "Form.Fields_2": {
         "items": {
           "$ref": "#/components/schemas/Form.Field"
         },
@@ -791,6 +875,154 @@
           "_tag",
           "id",
           "message"
+        ],
+        "type": "object"
+      },
+      "Integration.CommandMethod": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "command"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "label",
+          "command"
+        ],
+        "type": "object"
+      },
+      "Integration.EnvMethod": {
+        "additionalProperties": false,
+        "properties": {
+          "names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": {
+            "enum": [
+              "env"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "names"
+        ],
+        "type": "object"
+      },
+      "Integration.Info": {
+        "additionalProperties": false,
+        "properties": {
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/Connection.Info"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "methods": {
+            "items": {
+              "$ref": "#/components/schemas/Integration.Method"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "methods",
+          "connections"
+        ],
+        "type": "object"
+      },
+      "Integration.KeyMethod": {
+        "additionalProperties": false,
+        "properties": {
+          "form": {
+            "$ref": "#/components/schemas/Form.Fields_2"
+          },
+          "label": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "key"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      "Integration.Method": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Integration.OAuthMethod"
+          },
+          {
+            "$ref": "#/components/schemas/Integration.CommandMethod"
+          },
+          {
+            "$ref": "#/components/schemas/Integration.KeyMethod"
+          },
+          {
+            "$ref": "#/components/schemas/Integration.EnvMethod"
+          }
+        ]
+      },
+      "Integration.OAuthMethod": {
+        "additionalProperties": false,
+        "properties": {
+          "form": {
+            "$ref": "#/components/schemas/Form.Fields_1"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "oauth"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "label"
         ],
         "type": "object"
       },
@@ -3756,6 +3988,97 @@
         "summary": "Get server info",
         "tags": [
           "server"
+        ]
+      }
+    },
+    "/api/integration": {
+      "get": {
+        "description": "Retrieve available integrations and their authentication methods.",
+        "operationId": "integration.list",
+        "parameters": [
+          {
+            "explode": true,
+            "in": "query",
+            "name": "location",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "directory": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "style": "deepObject"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/Integration.Info"
+                      },
+                      "type": "array"
+                    },
+                    "location": {
+                      "$ref": "#/components/schemas/Location.PublicRef"
+                    }
+                  },
+                  "required": [
+                    "location",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          }
+        },
+        "security": [],
+        "summary": "List integrations",
+        "tags": [
+          "integration"
         ]
       }
     },
