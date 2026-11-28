@@ -186,6 +186,8 @@ export function pullRequestWriteKey(
 // sent for that PR's queue until a read made after Check again shows where it stands.
 // Each marker has its own revision, so a check only clears the marker it began for.
 interface UnconfirmedQueueChange {
+  owner: string;
+  prUrl: string;
   operation: MergeQueueWriteOperation;
   revision: number;
   /** The login it was sent as; only it can check it. */
@@ -205,6 +207,7 @@ function unconfirmedQueueKey(owner: string, prUrl: string): string {
 function unconfirmedQueueChanged(): void {
   unconfirmedQueueVersion += 1;
   for (const listener of unconfirmedQueueListeners) listener();
+  holdsChanged();
 }
 
 /**
@@ -219,6 +222,8 @@ export function markQueueChangeUnconfirmed(
 ): number {
   unconfirmedQueueRevision += 1;
   unconfirmedQueueChanges.set(unconfirmedQueueKey(owner, prUrl), {
+    owner,
+    prUrl,
     operation,
     revision: unconfirmedQueueRevision,
     madeAs: { login: madeAs.login },
@@ -257,9 +262,17 @@ export function useUnconfirmedQueueChange(prUrl: string): UnconfirmedQueueChange
   return unconfirmedQueueChange(prUrl);
 }
 
-/** Changes to a PR's state GitHub may or may not have made, by workspace user and PR. */
-export type UnconfirmedStateChanges = () => Iterable<{ owner: string; prUrl: string }>;
-const unconfirmedStateChangeSources = new Set<UnconfirmedStateChanges>();
+/**
+ * Changes to a PR's state GitHub may or may not have made, by workspace user and PR: its link,
+ * or its {@link pullRequestIdentity}.
+ */
+export type UnconfirmedStateChanges = () => Iterable<
+  { owner: string; prUrl: string } | { owner: string; identity: string }
+>;
+// A queue change GitHub may have made holds the PR's other state changes too.
+const unconfirmedStateChangeSources = new Set<UnconfirmedStateChanges>([
+  () => unconfirmedQueueChanges.values(),
+]);
 
 /**
  * Hold merging, auto-merge, the queue and state changes for each PR `source` lists, for its
@@ -307,7 +320,9 @@ function unconfirmedFor(key: string): boolean {
   const owner = draftOwner();
   for (const source of unconfirmedStateChangeSources) {
     for (const change of source()) {
-      if (change.owner === owner && pullRequestUrlKey(change.prUrl) === key) return true;
+      if (change.owner !== owner) continue;
+      const identity = "identity" in change ? change.identity : pullRequestUrlKey(change.prUrl);
+      if (identity === key) return true;
     }
   }
   return false;

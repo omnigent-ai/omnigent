@@ -2,7 +2,7 @@
 // queue offers Add to Merge Queue, pinned to the shown head; a queued PR shows where it stands
 // and offers Remove from Queue. Where the host doesn't serve the queue, the section merges.
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -31,7 +31,10 @@ import { PullRequestMaybeSentError } from "@/lib/workspaceApi";
 import {
   holdPullRequestStateChanges,
   resetPullRequestStateHoldsForTests,
+  sendStateChange,
+  unconfirmedStateChangeHolds,
 } from "@/lib/pullRequestStateHolds";
+import { mergeQueueKey } from "@/newPullRequestPage/hooks/useMergeQueue";
 
 import { PullRequestMerge } from "./PullRequestMerge";
 
@@ -101,6 +104,7 @@ function renderMerge() {
       <PullRequestMerge conversationId="conv_1" prUrl={PR_URL} pr={pullRequest()} />
     </QueryClientProvider>,
   );
+  return client;
 }
 
 /** Press Add to Merge Queue, then confirm in the dialog it opens. */
@@ -213,6 +217,45 @@ describe("a base that merges through a queue, where the host serves it", () => {
         "The app couldn’t tell whether GitHub added this pull request to the merge queue.",
       ),
     );
+  });
+
+  it("holds the PR's other state changes after a lost add, until a queue read answers", async () => {
+    host.served = new Set(["getMergeOptions", ...QUEUE_METHODS]);
+    answerReads(queueAnswer());
+    const client = renderMerge();
+    await screen.findByRole("button", { name: "Add to Merge Queue" });
+    // The read that checks the add waits, then fails.
+    const queueReads: { resolve: (answer: unknown) => void; reject: (error: Error) => void }[] = [];
+    host.read.mockImplementation((_conversationId: string, method: string) =>
+      method === "getMergeQueue"
+        ? new Promise((resolve, reject) => {
+            queueReads.push({ resolve, reject });
+          })
+        : Promise.resolve({ object: "session.github.merge_options", methods: ["squash"] }),
+    );
+    host.write.mockRejectedValueOnce(new PullRequestMaybeSentError(new TypeError("dropped")));
+    await addAndConfirm();
+    await waitFor(() => expect(queueReads).toHaveLength(1));
+
+    const merge = vi.fn(async () => "merged");
+    const refusedWhileHeld = async () => {
+      expect(unconfirmedStateChangeHolds(PR_URL, "pull_request_close")).toBe(true);
+      await expect(sendStateChange(PR_URL, "pull_request_merge", merge)).rejects.toMatchObject({
+        code: "unconfirmed",
+      });
+    };
+    await refusedWhileHeld();
+    await act(async () => queueReads[0]!.reject(new Error("offline")));
+    await refusedWhileHeld();
+    expect(merge).not.toHaveBeenCalled();
+
+    void client.invalidateQueries({ queryKey: mergeQueueKey("conv_1", PR_URL) });
+    await waitFor(() => expect(queueReads).toHaveLength(2));
+    await act(async () => queueReads[1]!.resolve(queueAnswer({ queued: true, position: 1 })));
+    await waitFor(() =>
+      expect(unconfirmedStateChangeHolds(PR_URL, "pull_request_close")).toBe(false),
+    );
+    await expect(sendStateChange(PR_URL, "pull_request_merge", merge)).resolves.toBe("merged");
   });
 
   it("shows a queued PR without Remove where the host serves only the read", async () => {

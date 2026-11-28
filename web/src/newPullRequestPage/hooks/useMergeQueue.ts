@@ -9,11 +9,49 @@ import {
   type MergeQueueState,
   readMergeQueue,
 } from "@/lib/hostMergeQueue";
-import { sendStateChange } from "@/lib/pullRequestStateHolds";
+import {
+  confirmQueueChangeChecked,
+  markQueueChangeUnconfirmed,
+  type MergeQueueWriteOperation,
+  sendStateChange,
+  unconfirmedQueueChange,
+} from "@/lib/pullRequestStateHolds";
+import { PullRequestWriteError } from "@/lib/pullRequestWriteAnswers";
+import { draftOwner } from "@/lib/workspaceDraftOwner";
 import { usePullRequestMethodServed } from "@/pullRequestPage/pullRequestPageRoute";
 
 export const mergeQueueKey = (conversationId: string, prUrl: string) =>
   ["pr-page-github-merge-queue", conversationId, prUrl] as const;
+
+/** Read the queue; an answer to a read begun after a lost change settles that change. */
+async function readQueueSettling(conversationId: string, prUrl: string, signal: AbortSignal) {
+  const owner = draftOwner();
+  const unconfirmed = unconfirmedQueueChange(prUrl);
+  const state = await readMergeQueue(conversationId, prUrl, signal);
+  if (state && unconfirmed) confirmQueueChangeChecked(owner, prUrl, unconfirmed.revision);
+  return state;
+}
+
+/**
+ * Send a queue change, held with the PR's other state changes. One whose answer was lost holds
+ * them until a queue read begun after it answers.
+ */
+function sendQueueChange(
+  prUrl: string,
+  operation: MergeQueueWriteOperation,
+  send: () => Promise<MergeQueueState>,
+): Promise<MergeQueueState> {
+  return sendStateChange(prUrl, operation, async () => {
+    try {
+      return await send();
+    } catch (error) {
+      // The host makes it as its own account, so no login of ours names who made it.
+      if (error instanceof PullRequestWriteError && error.outcomeUnknown)
+        markQueueChangeUnconfirmed(draftOwner(), prUrl, operation, { login: "" });
+      throw error;
+    }
+  });
+}
 
 /** The PR's queue state where the host reads it; null where it isn't served or can't say. */
 export function useMergeQueue(
@@ -24,7 +62,7 @@ export function useMergeQueue(
   const served = usePullRequestMethodServed(conversationId, "getMergeQueue");
   const query = useQuery({
     queryKey: mergeQueueKey(conversationId, prUrl),
-    queryFn: ({ signal }) => readMergeQueue(conversationId, prUrl, signal),
+    queryFn: ({ signal }) => readQueueSettling(conversationId, prUrl, signal),
     enabled: served && wanted,
     retry: false,
     staleTime: 30_000,
@@ -47,14 +85,14 @@ export function useMergeQueueChanges(conversationId: string, prUrl: string) {
   const add = useMutation({
     // The queue changes the PR's state, so it waits for a merge or close in flight, and they for it.
     mutationFn: (expectedHead: string) =>
-      sendStateChange(prUrl, "pull_request_merge_queue_add", () =>
+      sendQueueChange(prUrl, "pull_request_merge_queue_add", () =>
         enqueueOnHost(conversationId, prUrl, expectedHead),
       ),
     ...settle,
   });
   const remove = useMutation({
     mutationFn: () =>
-      sendStateChange(prUrl, "pull_request_merge_queue_remove", () =>
+      sendQueueChange(prUrl, "pull_request_merge_queue_remove", () =>
         dequeueOnHost(conversationId, prUrl),
       ),
     ...settle,

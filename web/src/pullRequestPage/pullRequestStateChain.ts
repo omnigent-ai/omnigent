@@ -5,7 +5,12 @@
 import { useSyncExternalStore } from "react";
 
 import type { PullRequestStateChangeOutcome } from "@/newPullRequestPage/hooks/usePullRequests";
-import { pullRequestIdentity, type StateChangeOperation } from "@/lib/pullRequestStateHolds";
+import {
+  pullRequestIdentity,
+  registerUnconfirmedStateChanges,
+  type StateChangeOperation,
+  unconfirmedStateChangesChanged,
+} from "@/lib/pullRequestStateHolds";
 import type { PullRequestState } from "@/lib/pullRequestWriteAnswers";
 import type { HostChangeRoute } from "./pullRequestPageRoute";
 
@@ -100,7 +105,18 @@ export function setStateChainState(key: string, next: StateChainState): void {
   if (!next.running && !next.notice) chains.delete(key);
   else chains.set(key, next);
   for (const listener of listeners) listener();
+  unconfirmedStateChangesChanged();
 }
+
+// A close or reopen GitHub may have made holds the PR's merge, auto-merge and queue changes
+// too, until Check Again's fresh read clears its notice.
+registerUnconfirmedStateChanges(function* unknownStateChains() {
+  for (const [key, state] of chains) {
+    if (state.notice?.outcome.kind !== "unknown") continue;
+    const split = key.indexOf("\n");
+    yield { owner: key.slice(0, split), identity: key.slice(split + 1) };
+  }
+});
 
 /** Every chain's notice now, with its key, for a list of what's left to see. */
 export function stateChainNotices(): { key: string; notice: StateChainNotice }[] {
@@ -184,4 +200,5 @@ export function stateNoticeActionLabel(
 export function resetStateChainsForTests(): void {
   chains.clear();
   for (const listener of listeners) listener();
+  unconfirmedStateChangesChanged();
 }
