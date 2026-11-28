@@ -37,6 +37,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.host import routable_host
 from tests.e2e.routing._helpers import wait_for
 
 #: Opt-in gate: this suite launches real claude/codex TUIs and does real
@@ -325,13 +326,10 @@ class ModelFlowsRig:
                     f"rig host exited early; log tail:\n{self._tail(self.host_log)}"
                 )
             try:
-                resp = httpx.get(f"{self.base_url}/v1/hosts", timeout=5)
+                row = routable_host(httpx, base_url=self.base_url)
             except httpx.HTTPError:
                 return None
-            if resp.status_code != 200:
-                return None
-            online = [h for h in resp.json().get("hosts", []) if h.get("status") == "online"]
-            return str(online[0]["host_id"]) if online else None
+            return str(row["host_id"]) if row else None
 
         self.host_id = wait_for(
             _online, timeout=_HOST_REGISTER_TIMEOUT_S, what="the rig host to register"

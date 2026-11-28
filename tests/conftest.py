@@ -79,6 +79,7 @@ os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine  # noqa: E402
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry  # noqa: E402
 from tests import _model_pools  # noqa: E402
+from tests._helpers.crdb_schema_lock import crdb_schema_ddl_lock  # noqa: E402
 
 pytest_plugins = ["tests._token_usage"]
 
@@ -749,6 +750,10 @@ def cleanup_snapshot_failures(pytestconfig: pytest.Config) -> Generator[None, No
     yield
 
 
+# Well inside the per-test timeout, which covers a session fixture's setup and teardown.
+_WORKER_DB_LOCK_WAIT_S = 120.0
+
+
 @pytest.fixture(scope="session")
 def _worker_db_uri() -> Generator[str, None, None]:
     """
@@ -777,38 +782,44 @@ def _worker_db_uri() -> Generator[str, None, None]:
 
     root_engine = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
     dialect = root_engine.dialect.name
-    with root_engine.connect() as conn:
-        if dialect == "mysql":
-            conn.execute(
-                _sa.text(
-                    f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
-                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+    # Bounded, as the wait counts against the test's timeout; past it, go unlocked.
+    with crdb_schema_ddl_lock(dialect, wait_s=_WORKER_DB_LOCK_WAIT_S):
+        with root_engine.connect() as conn:
+            if dialect == "mysql":
+                conn.execute(
+                    _sa.text(
+                        f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
+                        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                    )
                 )
-            )
-        elif dialect == "cockroachdb":
-            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" CASCADE'))
-            conn.execute(_sa.text(f'CREATE DATABASE "{db_name}"'))
-        else:
-            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}"'))
-            conn.execute(_sa.text(f'CREATE DATABASE "{db_name}"'))
-    root_engine.dispose()
-
-    engine = get_or_create_engine(uri)
+            elif dialect == "cockroachdb":
+                conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" CASCADE'))
+                conn.execute(_sa.text(f'CREATE DATABASE "{db_name}"'))
+            else:
+                conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}"'))
+                conn.execute(_sa.text(f'CREATE DATABASE "{db_name}"'))
+        root_engine.dispose()
+        # Migrating to head is the largest schema change a worker makes.
+        engine = get_or_create_engine(uri)
     yield uri
 
     with _engine_lock:
         _engine_cache.pop(uri, None)
     engine.dispose()
 
-    root_engine2 = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
-    with root_engine2.connect() as conn:
-        if dialect == "mysql":
-            conn.execute(_sa.text(f"DROP DATABASE IF EXISTS `{db_name}`"))
-        elif dialect == "cockroachdb":
-            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" CASCADE'))
-        else:
-            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
-    root_engine2.dispose()
+    with crdb_schema_ddl_lock(dialect, wait_s=_WORKER_DB_LOCK_WAIT_S) as locked:
+        if not locked:
+            # The next run's setup drops the leftover database.
+            return
+        root_engine2 = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
+        with root_engine2.connect() as conn:
+            if dialect == "mysql":
+                conn.execute(_sa.text(f"DROP DATABASE IF EXISTS `{db_name}`"))
+            elif dialect == "cockroachdb":
+                conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" CASCADE'))
+            else:
+                conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
+        root_engine2.dispose()
 
 
 @pytest.fixture(scope="session")

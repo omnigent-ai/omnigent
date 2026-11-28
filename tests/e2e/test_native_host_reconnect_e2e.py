@@ -31,6 +31,7 @@ import pytest
 
 from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, ci_request_tags
 from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+from tests._helpers.host import routable_host
 from tests._helpers.live_server import local_server_env, terminate_process
 from tests._helpers.server_runner import server_runner
 from tests.e2e.helpers import model_base_url
@@ -220,14 +221,12 @@ def test_native_message_survives_host_restart(
             return process
 
         host = spawn_host(1)
-        online_hosts = _wait(
-            lambda: [
-                row for row in _get(client, "/v1/hosts")["hosts"] if row["status"] == "online"
-            ],
-            "the real host daemon to register",
-        )
+        registered = _wait(lambda: routable_host(client), "the real host daemon to register")
+        host_id = registered["host_id"]
+        online_hosts = [
+            row for row in _get(client, "/v1/hosts")["hosts"] if row["status"] == "online"
+        ]
         assert len(online_hosts) == 1, online_hosts
-        host_id = online_hosts[0]["host_id"]
         agent = next(
             row
             for row in _get(client, "/v1/agents")["data"]

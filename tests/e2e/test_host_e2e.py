@@ -38,6 +38,7 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.host import wait_for_routable_host
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,
     configure_mock_llm,
@@ -240,18 +241,7 @@ def _wait_for_host_online(
     :param timeout: Max seconds to wait.
     :raises AssertionError: If the host never appears online.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            resp = client.get("/v1/hosts")
-            if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
-                        return
-        except httpx.ConnectError:
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
+    wait_for_routable_host(client, timeout=timeout, host_id=host_id, poll_interval=POLL_INTERVAL_S)
 
 
 def test_host_connect_and_list(
@@ -388,19 +378,9 @@ def _wait_for_host_online_by_name(
     :returns: The matching host dict from the list response.
     :raises AssertionError: If no such host appears online.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            resp = client.get("/v1/hosts")
-            if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["name"] == host_name and host["status"] == "online":
-                        return host
-        except httpx.ConnectError:
-            # The API may be temporarily unreachable during startup; retry until timeout.
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Host named {host_name!r} did not appear online within {timeout}s")
+    return wait_for_routable_host(
+        client, timeout=timeout, name=host_name, poll_interval=POLL_INTERVAL_S
+    )
 
 
 def test_host_name_only_config_generates_host_id(

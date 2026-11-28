@@ -13,6 +13,7 @@ import yaml
 
 from dev.repro_env.runtime import write_model_config
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from tests._helpers.host import wait_for_routable_host
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -51,15 +52,7 @@ def test_private_manager_launch_send_read_and_sharing(
             host_features = None if orchestration_enabled else "session_orchestration"
             stack.start_host(env={**env, "OMNIGENT_FEATURES": host_features}, cwd=_REPO)
             with httpx.Client(base_url=stack.base_url, timeout=60, trust_env=False) as client:
-                poll_until(
-                    lambda: [
-                        h
-                        for h in client.get("/v1/hosts").json().get("hosts", [])
-                        if h.get("status") == "online"
-                    ],
-                    timeout_s=45,
-                )
-                host_id = client.get("/v1/hosts").json()["hosts"][0]["host_id"]
+                host_id = wait_for_routable_host(client, timeout=45)["host_id"]
                 set_fallback_mock_llm(
                     mock, key="_policy_llm_", text='{"action":"allow","reason":""}'
                 )

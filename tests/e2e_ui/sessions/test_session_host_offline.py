@@ -13,6 +13,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+from tests._helpers.host import routable_host
 from tests._helpers.native_session import NativeHarness, create_native_session
 from tests._helpers.server_runner import server_runner
 
@@ -96,7 +97,7 @@ def test_offline_native_host_refuses_input_and_keeps_reconnect_action(
             response.raise_for_status()
             return response.json()["hosts"]
 
-        _wait_until(lambda: any(host["status"] == "online" for host in hosts()))
+        _wait_until(lambda: routable_host(client) is not None)
         [host] = [host for host in hosts() if host["status"] == "online"]
         host_id = host["host_id"]
         created = create_native_session(
