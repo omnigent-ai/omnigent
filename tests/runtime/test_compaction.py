@@ -13,6 +13,7 @@ from omnigent.entities import (
     FunctionCallData,
     FunctionCallOutputData,
     MessageData,
+    NativeToolData,
     StoredFile,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
@@ -1182,7 +1183,8 @@ async def test_summarize_history_recursive_prompt_includes_continuation_prefix()
     assert result["text"] == "Combined summary."
 
 
-def test_compaction_to_history_items_produces_valid_pair() -> None:
+@pytest.mark.parametrize("model", ["openai/gpt-4o", None])
+def test_compaction_to_history_items_produces_valid_pair(model: str | None) -> None:
     """
     compaction_to_history_items() produces a user+assistant synthetic pair
     for inclusion at the start of conversation history.
@@ -1196,7 +1198,7 @@ def test_compaction_to_history_items_produces_valid_pair() -> None:
         data=CompactionData(
             summary="The user asked to analyze the dataset. The agent loaded data.csv.",
             last_item_id="msg_xyz999",
-            model="openai/gpt-4o",
+            model=model,
             token_count=42,
         ),
     )
@@ -1230,6 +1232,7 @@ def test_compaction_to_history_items_produces_valid_pair() -> None:
     # Assistant item must have the summary text verbatim.
     assert isinstance(assistant_item.data, MessageData)
     assert assistant_item.data.role == "assistant"
+    assert assistant_item.data.agent == (model or "compaction")
     assistant_text = assistant_item.data.content[0]["text"]
     assert assistant_text == "The user asked to analyze the dataset. The agent loaded data.csv.", (
         f"Assistant content must equal the CompactionData.summary, got: {assistant_text!r}"
@@ -2010,3 +2013,131 @@ def test_route_bare_model_preserves_databricks_and_prefixed_ids() -> None:
         assert _route_bare_model_for_compaction(LLMConfig(model=prefixed)).model == prefixed
     # Bare gpt-* is correctly OpenAI already — unchanged.
     assert _route_bare_model_for_compaction(LLMConfig(model="gpt-4o")).model == "gpt-4o"
+
+
+@pytest.mark.parametrize("provenance", ["agent", "model", "checkpoint_model", "unknown"])
+def test_compaction_snapshot_preserves_assistant_provenance(provenance: str) -> None:
+    snapshot = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Retained assistant output"}],
+        }
+    ]
+    if provenance in {"agent", "model"}:
+        snapshot[0][provenance] = "synthetic_assistant"
+    item = _make_conv_item(
+        "checkpoint",
+        "compaction",
+        CompactionData(
+            summary="Synthetic summary",
+            last_item_id="last_input",
+            token_count=1,
+            model="synthetic_checkpoint" if provenance == "checkpoint_model" else None,
+            compacted_messages=snapshot,
+        ),
+    )
+    [restored] = compaction_to_history_items(item)
+    expected_agent = (
+        "synthetic_assistant"
+        if provenance in {"agent", "model"}
+        else "synthetic_checkpoint"
+        if provenance == "checkpoint_model"
+        else "compaction"
+    )
+    assert isinstance(restored.data, MessageData)
+    assert restored.data.agent == expected_agent
+    assert restored.data.content == snapshot[0]["content"]
+
+
+@pytest.mark.parametrize(
+    "snapshot_entry",
+    [
+        {
+            "type": "local_shell_call",
+            "call_id": "local-call",
+            "action": {"type": "exec", "command": ["pwd"]},
+        },
+        {"type": "tool_search_call", "id": "search-call", "status": "completed"},
+        {"type": "ghost_snapshot", "ghost_commit": {"id": "synthetic-commit"}},
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "Developer instructions"}],
+        },
+        {
+            "type": "message",
+            "role": "system",
+            "content": [{"type": "input_text", "text": "System instructions"}],
+        },
+    ],
+)
+def test_compaction_snapshot_preserves_provider_only_entries(
+    snapshot_entry: dict[str, Any],
+) -> None:
+    item = _make_conv_item(
+        "checkpoint",
+        "compaction",
+        CompactionData(
+            summary="Summary",
+            last_item_id="last",
+            token_count=1,
+            compacted_messages=[snapshot_entry],
+        ),
+    )
+    [restored] = compaction_to_history_items(item)
+    assert restored.type == "native_tool"
+    assert isinstance(restored.data, NativeToolData)
+    assert restored.data.item == snapshot_entry
+
+
+@pytest.mark.parametrize("output", [None, 0, False, 1.5])
+def test_compaction_snapshot_serializes_scalar_function_outputs(output: Any) -> None:
+    import json
+
+    item = _make_conv_item(
+        "checkpoint",
+        "compaction",
+        CompactionData(
+            summary="Summary",
+            last_item_id="last",
+            token_count=1,
+            compacted_messages=[
+                {"type": "function_call_output", "call_id": "call", "output": output}
+            ],
+        ),
+    )
+    [restored] = compaction_to_history_items(item)
+    assert isinstance(restored.data, FunctionCallOutputData)
+    assert json.loads(restored.data.output) == output
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"type": "compaction"},
+        {"type": "function_call", "name": "missing-call-id"},
+        {"type": "function_call_output", "call_id": "missing-output"},
+        {"type": "message", "role": "invalid-role", "content": []},
+        {"type": "message", "role": ["user"], "content": []},
+        {"type": None},
+        {"type": []},
+    ],
+)
+def test_malformed_compaction_snapshot_uses_summary_instead_of_partial_history(
+    malformed: dict[str, Any],
+) -> None:
+    item = _make_conv_item(
+        "checkpoint",
+        "compaction",
+        CompactionData(
+            summary="Retained summary",
+            last_item_id="last",
+            token_count=1,
+            compacted_messages=[{"type": "message", "role": "user", "content": []}, malformed],
+        ),
+    )
+    restored = compaction_to_history_items(item)
+    assert [entry.id for entry in restored] == ["checkpoint_user", "checkpoint_assistant"]
+    assert isinstance(restored[1].data, MessageData)
+    assert restored[1].data.content == [{"type": "output_text", "text": "Retained summary"}]

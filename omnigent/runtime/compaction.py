@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import tiktoken
+from pydantic import ValidationError
 
 from omnigent.entities import (
     CompactionData,
@@ -27,6 +28,8 @@ from omnigent.entities import (
     FunctionCallData,
     FunctionCallOutputData,
     MessageData,
+    NativeToolData,
+    parse_item_data,
 )
 from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.llms.summarize import (
@@ -34,6 +37,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.llms.types import NATIVE_TOOL_OUTPUT_TYPES
 from omnigent.spec.types import CompactionConfig
 
 _logger = logging.getLogger(__name__)
@@ -499,10 +503,9 @@ def compaction_to_history_items(
     compaction_item: ConversationItem,
 ) -> list[ConversationItem]:
     """
-    Convert a compaction item into a synthetic user + assistant
-    message pair for inclusion at the front of conversation history.
+    Restore a typed compaction snapshot, or synthesize a summary message pair.
 
-    The pair preserves natural turn-taking structure: a synthetic
+    The fallback pair preserves natural turn-taking structure: a synthetic
     user message requests a summary, and a synthetic assistant
     message provides it. This avoids attribution confusion —
     the LLM knows it produced a summary (not a real prior response).
@@ -514,9 +517,7 @@ def compaction_to_history_items(
     :param compaction_item: The compaction item from the store,
         with ``type="compaction"`` and
         ``data`` of type :class:`~omnigent.entities.CompactionData`.
-    :returns: Two :class:`~omnigent.entities.ConversationItem`
-        instances: a ``role=user`` message requesting the summary
-        and a ``role=assistant`` message containing it.
+    :returns: Replayable typed snapshot items, or a user/assistant summary pair.
     """
     assert isinstance(compaction_item.data, CompactionData)
     data = compaction_item.data
@@ -529,20 +530,58 @@ def compaction_to_history_items(
     if data.compacted_messages:
         items: list[ConversationItem] = []
         for i, msg in enumerate(data.compacted_messages):
+            item_type = msg.get("type", "message")
+            if not isinstance(item_type, str) or not item_type:
+                _logger.warning("Invalid compaction snapshot type; restoring summary")
+                break
+            payload: dict[str, Any] = dict(msg)
+            if (
+                item_type in NATIVE_TOOL_OUTPUT_TYPES
+                or item_type in {"custom_tool_call", "custom_tool_call_output"}
+                or (item_type == "compaction" and "encrypted_content" in msg)
+                or (item_type == "reasoning" and not (msg.get("agent") or msg.get("model")))
+                or (item_type == "message" and msg.get("role") in ("developer", "system"))
+            ):
+                item_type = "native_tool"
+                payload.clear()
+                payload["item"] = msg
+            elif item_type == "message":
+                payload.setdefault("role", "user")
+                payload.setdefault("content", [])
+            if item_type in {"function_call", "reasoning"} or (
+                item_type == "message" and payload.get("role") == "assistant"
+            ):
+                payload["agent"] = (
+                    msg.get("agent") or msg.get("model") or data.model or "compaction"
+                )
+            if (
+                item_type == "function_call_output"
+                and "output" in payload
+                and not isinstance(payload["output"], str)
+            ):
+                payload["output"] = json.dumps(payload["output"], ensure_ascii=False)
+            try:
+                parsed = parse_item_data(item_type, payload)
+            except ValidationError:
+                _logger.warning(
+                    "Invalid %s compaction snapshot entry; restoring summary", item_type
+                )
+                break
+            except ValueError:
+                item_type = "native_tool"
+                parsed = NativeToolData(item=msg)
             items.append(
                 ConversationItem(
                     id=f"{compaction_item.id}_compacted_{i}",
-                    type=msg.get("type", "message"),
+                    type=item_type,
                     status="completed",
                     response_id=compaction_item.response_id,
                     created_at=compaction_item.created_at,
-                    data=MessageData(
-                        role=msg.get("role", "user"),
-                        content=msg.get("content", []),
-                    ),
+                    data=parsed,
                 )
             )
-        return items
+        else:
+            return items
 
     synthetic_user_content = (
         "[This is an automatically generated summary of the prior conversation "
@@ -570,7 +609,7 @@ def compaction_to_history_items(
         data=MessageData(
             role="assistant",
             content=[{"type": "output_text", "text": data.summary}],
-            agent=data.model,
+            agent=data.model or "compaction",
         ),
     )
     return [user_item, assistant_item]
