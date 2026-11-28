@@ -465,3 +465,72 @@ def test_the_header_and_toolbar_fit_a_narrowing_rail(
     for label in ("Skip test files", "Hide whitespace changes", "Collapse all files"):
         expect(menu.get_by_role("menuitem", name=label)).to_be_visible()
     page.keyboard.press("Escape")
+
+
+# The rich diff's look, read from the rendered page: an added section's bar and tint, a changed
+# word's mark, and whether off-screen groups of sections skip layout.
+_RICH_DIFF_STYLE = """() => {
+  const style = (selector) => {
+    const element = document.querySelector(selector);
+    return element && getComputedStyle(element);
+  };
+  const root = getComputedStyle(document.documentElement);
+  const added = style('[data-markdown-diff-kind="added"]');
+  const word = style('[data-markdown-diff-kind="added"] .markdown-diff-word');
+  const group = style(".markdown-diff-group");
+  return {
+    bar: added && added.borderLeftColor,
+    tint: added && added.backgroundColor,
+    word: word && word.backgroundColor,
+    groups: group && group.contentVisibility,
+    transparent: "rgba(0, 0, 0, 0)",
+    addition: root.getPropertyValue("--diff-addition-color").trim(),
+  };
+}"""
+
+
+@pytest.mark.parametrize(
+    ("color_scheme", "palette"), [("light", None), ("dark", None), ("dark", "dracula")]
+)
+def test_a_markdown_rich_diff_marks_its_changes_and_skips_laying_out_far_sections(
+    page: Page,
+    git_session: tuple[str, str],  # noqa: F811 — pytest injects the imported fixture
+    tmp_path: Path,
+    color_scheme: str,
+    palette: str | None,
+) -> None:
+    """A Markdown file's rich diff marks an added block with the diff's addition bar and tint
+    and its changed words, and a long document's groups skip layout while off screen. Under
+    another palette the tints follow that palette's background."""
+    base_url, session_id = git_session
+    paragraphs = "".join(f"Paragraph {index} says hello.\n\n" for index in range(2_000))
+    commit_then_edit(
+        _repository(tmp_path),
+        {
+            "docs/guide.md": (
+                paragraphs,
+                paragraphs.replace("Paragraph 0 says", "Paragraph 0 now says"),
+            )
+        },
+    )
+    page.emulate_media(color_scheme=color_scheme)  # type: ignore[arg-type]
+    _sidebar, review = open_diffs(page, base_url, session_id)
+    review.get_by_role("button", name="Rich diff of docs/guide.md").click()
+    preview = review.get_by_test_id("markdown-diff-preview")
+    expect(preview.locator("[data-markdown-diff-complete]")).to_have_count(1, timeout=60_000)
+    expect(preview.locator(".markdown-diff-word").first).to_be_visible()
+
+    style = page.evaluate(_RICH_DIFF_STYLE)
+    assert style["addition"], style
+    assert style["bar"] not in (None, style["transparent"]), style
+    assert style["tint"] not in (None, style["transparent"]), style
+    assert style["word"] not in (None, style["transparent"], style["tint"]), style
+    assert style["groups"] == "auto", style
+
+    if palette is not None:
+        page.evaluate(
+            "(name) => document.documentElement.setAttribute('data-theme', name)", palette
+        )
+        themed = page.evaluate(_RICH_DIFF_STYLE)
+        assert themed["tint"] != style["tint"], (style, themed)
+        assert themed["word"] != style["word"], (style, themed)
