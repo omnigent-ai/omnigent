@@ -864,6 +864,29 @@ async def test_saved_provider_is_inherited_only_while_the_server_offers_it(
     assert resolved.body.sandbox_provider == ("modal" if launchable else None)
 
 
+async def test_saved_provider_leaves_a_chosen_profile_on_the_default_provider(
+    db_uri: str,
+) -> None:
+    """A profile chosen without a provider is looked up under the server default."""
+    project_store = SqlAlchemyProjectStore(db_uri)
+    project = project_store.create(
+        "a87b7cb7ac30abf4debfaa578d052ec6",
+        "provider-with-profile",
+        ALICE,
+        {**MANAGED_PROJECT_CONFIG, "repository": None},
+    )
+    resolved = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(
+            project_id=project.id, host_type="managed", sandbox_profile_id="default-profile"
+        ),
+        user_id=ALICE,
+        project_store=project_store,
+        launchable_sandbox_providers=("modal",),
+    )
+    assert resolved.body.sandbox_provider is None
+    assert resolved.body.sandbox_profile_id == "default-profile"
+
+
 async def test_managed_child_inherits_its_parent_instead_of_project_defaults(db_uri: str) -> None:
     """A child of a managed session keeps its parent's placement, not the project's."""
     project_store = SqlAlchemyProjectStore(db_uri)
