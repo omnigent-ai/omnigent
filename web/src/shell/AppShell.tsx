@@ -15,7 +15,6 @@ import {
   showWorkspaceTabOrChooser,
   useTabsSidebar,
 } from "@/shell/workspaceTabsRouting";
-import type { WorkspaceFileOpenOptions } from "@/shell/workspaceTabs/workspacePlaceNavigation";
 import {
   type ComponentProps,
   type CSSProperties,
@@ -150,6 +149,7 @@ import { useWorkspaceResources } from "./useWorkspaceResources";
 import { relativizeToWorkspace } from "@/hooks/useWorkspaceChangedFiles";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { citedFilePosition } from "./filePositionState";
+import { fileLinkOpenOptions, useArrivedFileLink } from "./arrivedFileLink";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -2029,15 +2029,13 @@ function AppShellImpl() {
   }, [setSearchParams]);
   // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, its diff in
   // Changes, or its comment's thread, and the request leaves the URL once it's handed over.
+  // It opens as it arrived: before the sidebar choice is known, the classic one can rewrite it.
+  const arrivedFileLink = useArrivedFileLink();
   useEffect(() => {
     const tabsSession = tabsSessionRef.current;
     if (tabsSession === null || !citationPath) return;
-    const commentId = searchParams.get("comment") || undefined;
-    const options: WorkspaceFileOpenOptions = {
-      ...urlNavigation?.position,
-      ...(searchParams.get("diff") === "1" ? { view: "diff" } : {}),
-      ...(commentId !== undefined ? { commentId } : {}),
-    };
+    const link = arrivedFileLink.peek(citationPath) ?? searchParams;
+    const options = fileLinkOpenOptions(link);
     void routeToWorkspaceTabs((tabs) =>
       tabs.openWorkspaceFileLink(tabsSession, citationPath, options, "link"),
     );
@@ -2046,7 +2044,7 @@ function AppShellImpl() {
       setRightPanelOpenImmediately(true);
       // ?fullscreen=1 fills the window with the sidebar, as its Full screen button does. Arriving
       // from another session's full screen, the left sidebar it closed is the one to restore.
-      if (urlFileFullscreen && !rightPanelMaximized) {
+      if (link.get("fullscreen") === "1" && !rightPanelMaximized) {
         const leftFullScreen =
           tabsLinkRestoreRef.current !== restoredWorkspace && !!restoredWorkspace?.exitedMaximized;
         if (!leftFullScreen) sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
