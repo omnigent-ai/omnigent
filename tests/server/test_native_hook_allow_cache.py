@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import click
 import pytest
 
 from omnigent.cli import _parse_native_hook_allow_cache_seconds
 from omnigent.runtime.caps import RuntimeCaps
+from omnigent.runtime.policies import builder
 from omnigent.runtime.policies.builder import (
     _DEFAULT_POLICY_SPECS_CACHE,
     _DEFAULT_POLICY_SPECS_KEY,
@@ -58,7 +60,9 @@ def test_failing_window_resolver_still_allows() -> None:
     assert body == {"result": "POLICY_ACTION_ALLOW"}
 
 
-def test_cache_window_counts_from_the_policy_list_reads(db_uri: str) -> None:
+def test_cache_window_counts_from_the_policy_list_reads(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The window shrinks by the age of the cached lists behind the no-policy answer.
 
     Otherwise a list cached just before an admin added a policy elsewhere
@@ -68,6 +72,7 @@ def test_cache_window_counts_from_the_policy_list_reads(db_uri: str) -> None:
     """
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
+    monkeypatch.setattr(builder, "time", SimpleNamespace(monotonic=lambda: 100.0))
     store = SqlAlchemyPolicyStore(db_uri)
     _DEFAULT_POLICY_SPECS_CACHE.clear()
     _SESSION_POLICY_SPECS_CACHE.clear()
@@ -79,18 +84,21 @@ def test_cache_window_counts_from_the_policy_list_reads(db_uri: str) -> None:
 
     body = _no_policy_allow_body(caps, _SESSION_ID, store)
 
-    assert 34.0 < body["allow_cache_seconds"] <= 35.0
+    assert body["allow_cache_seconds"] == 35.0
     _DEFAULT_POLICY_SPECS_CACHE.clear()
     _SESSION_POLICY_SPECS_CACHE.clear()
 
 
-def test_sub_agent_window_counts_from_the_root_policy_list(db_uri: str) -> None:
+def test_sub_agent_window_counts_from_the_root_policy_list(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A sub-agent's window also shrinks by the age of its root's inherited list.
 
     :param db_uri: Per-test SQLite URI from the root conftest.
     """
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
+    monkeypatch.setattr(builder, "time", SimpleNamespace(monotonic=lambda: 100.0))
     store = SqlAlchemyPolicyStore(db_uri)
     root_id = "9a1b2c3d4e5f60718293a4b5c6d7e8f9"
     _DEFAULT_POLICY_SPECS_CACHE.clear()
@@ -104,7 +112,7 @@ def test_sub_agent_window_counts_from_the_root_policy_list(db_uri: str) -> None:
 
     body = _no_policy_allow_body(caps, _SESSION_ID, store, root_id)
 
-    assert 34.0 < body["allow_cache_seconds"] <= 35.0
+    assert body["allow_cache_seconds"] == 35.0
     _DEFAULT_POLICY_SPECS_CACHE.clear()
     _SESSION_POLICY_SPECS_CACHE.clear()
 
