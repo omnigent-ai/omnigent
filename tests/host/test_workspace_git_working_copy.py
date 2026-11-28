@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from connectrpc.code import Code
@@ -758,6 +760,350 @@ async def test_the_tracked_remotes_default_branch_wins_over_its_upstream(tmp_pat
     response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
     assert _unavailable_problem(response) is None
     assert response.base.reference == "databricks/main"
+    assert response.base.base == main
+
+
+def _fork_checkout(tmp_path: Path) -> tuple[Path, str, str]:
+    """`origin` with ``origin/HEAD`` at main, and a fork whose `next` is one commit ahead of it.
+
+    :returns: The repository, origin's main and the fork's next.
+    """
+    root = _repository(tmp_path / "repo")
+    main = _head(root)
+    _add_remote(root, "origin")
+    _git(root, "update-ref", "refs/remotes/origin/main", main)
+    _git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    _write(root / "next.txt", "next\n")
+    _commit(root, "next")
+    fork_next = _head(root)
+    _add_remote(root, "fork")
+    _git(root, "update-ref", "refs/remotes/fork/next", fork_next)
+    _git(root, "reset", "-q", "--hard", main)
+    return root, main, fork_next
+
+
+def _push_upstream(root: Path, remote: str, branch: str) -> None:
+    """What ``git push -u <remote> <branch>`` leaves: the branch tracks its own copy there."""
+    _git(root, "update-ref", f"refs/remotes/{remote}/{branch}", _head(root))
+    _git(root, "config", f"branch.{branch}.remote", remote)
+    _git(root, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+
+
+async def test_a_pushed_branch_still_compares_with_the_branch_it_started_from(
+    tmp_path: Path,
+) -> None:
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _write(root / "feature.txt", "feature\n")
+    _commit(root, "feature")
+
+    before = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert before.base.reference == "fork/next"
+    # The fork has no fork/HEAD, and the upstream is now the branch's own copy.
+    _push_upstream(root, "fork", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "fork/next"
+    assert response.base.base == fork_next
+    assert _paths(response) == ["feature.txt"]
+
+
+@pytest.mark.parametrize(
+    "suffix", ["\u00a0", "\u2028suffix"], ids=["trailing no-break space", "line separator"]
+)
+async def test_a_start_whose_name_holds_unicode_spaces_is_read_whole(
+    tmp_path: Path, suffix: str
+) -> None:
+    """A start named ``fork/literal`` plus a no-break space or line separator, both valid in a
+    ref name, compares with that branch, not with ``fork/literal``."""
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    _git(root, "update-ref", "refs/remotes/fork/literal", fork_next)
+    _git(root, "checkout", "-q", "--detach", fork_next)
+    _write(root / "source.txt", "source\n")
+    _commit(root, "source")
+    source = _head(root)
+    _git(root, "update-ref", f"refs/remotes/fork/literal{suffix}", source)
+    _git(root, "checkout", "-q", "-b", "feature", f"fork/literal{suffix}")
+    _write(root / "feature.txt", "feature\n")
+    _commit(root, "feature")
+    _push_upstream(root, "fork", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == f"fork/literal{suffix}"
+    assert response.base.base == source
+    assert _paths(response) == ["feature.txt"]
+
+
+async def test_a_long_lived_branch_still_compares_with_the_branch_it_started_from(
+    tmp_path: Path,
+) -> None:
+    """A reflog far past the runner's output cap still yields its oldest entry."""
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _push_upstream(root, "fork", "feature")
+    reflog = root / ".git" / "logs" / "refs" / "heads" / "feature"
+    created = reflog.read_text().splitlines()[0]
+    identity = created.split("\t", 1)[0]
+    subject = "Keep the session list's scroll position when a row above it updates"
+    entries = "".join(
+        f"{identity}\tcommit (amend): {subject} ({index})\n" for index in range(1000)
+    )
+    reflog.write_text(reflog.read_text() + entries)
+    # Every entry's message together is more than the runner reads from one command.
+    assert len(_git(root, "reflog", "show", "--format=%gs", "refs/heads/feature")) > 64 * 1024
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "fork/next"
+    assert response.base.base == fork_next
+
+
+@pytest.mark.parametrize("remote", ["_mirror", "team@site", "mirror."])
+async def test_a_remote_with_an_unusual_but_valid_name_is_still_where_a_branch_started(
+    tmp_path: Path, remote: str
+) -> None:
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    _add_remote(root, remote)
+    _git(root, "update-ref", f"refs/remotes/{remote}/next", fork_next)
+    _git(root, "checkout", "-q", "-b", "feature", f"{remote}/next")
+    _push_upstream(root, remote, "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == f"{remote}/next"
+    assert response.base.base == fork_next
+
+
+async def test_an_oversized_oldest_entry_falls_back_to_origins_default(tmp_path: Path) -> None:
+    """Once the creation entry expires, a huge commit subject can be the oldest entry."""
+    root, main, _fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _push_upstream(root, "fork", "feature")
+    reflog = root / ".git" / "logs" / "refs" / "heads" / "feature"
+    created = reflog.read_text().splitlines()[0]
+    identity = created.split("\t", 1)[0]
+    reflog.write_text(f"{identity}\tcommit: {'x' * (80 * 1024)}\n")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/main"
+    assert response.base.base == main
+
+
+async def test_an_untracked_branch_never_compares_with_its_own_copy_on_origin(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")
+    _add_remote(root, "origin")
+    _git(root, "update-ref", "refs/remotes/origin/feature", _head(root))
+    _git(root, "checkout", "-q", "--no-track", "-b", "feature", "origin/feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) == COMPARISON_PROBLEM_NO_DEFAULT_BRANCH
+
+
+async def test_reading_where_a_branch_started_runs_no_signature_helper(tmp_path: Path) -> None:
+    """A repository's ``log.showSignature`` can't make the reflog read run its ``gpg.program``."""
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    tree = _git(root, "rev-parse", f"{fork_next}^{{tree}}").strip()
+    signed_commit = (
+        f"tree {tree}\nparent {fork_next}\n"
+        "author Dev <dev@example.com> 1700000000 +0000\n"
+        "committer Dev <dev@example.com> 1700000000 +0000\n"
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n"
+        "\nsigned\n"
+    )
+    signed = subprocess.run(
+        ["git", "-C", str(root), "hash-object", "-t", "commit", "-w", "--stdin"],
+        input=signed_commit,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(root, "update-ref", "refs/remotes/fork/next", signed)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _push_upstream(root, "fork", "feature")
+    marker = tmp_path / "helper-ran"
+    helper = tmp_path / "signature-helper"
+    helper.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+    helper.chmod(0o755)
+    _git(root, "config", "log.showSignature", "true")
+    _git(root, "config", "gpg.program", str(helper))
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "fork/next"
+    assert not marker.exists()
+
+
+async def test_a_pushed_worktree_branch_still_compares_with_the_branch_it_started_from(
+    tmp_path: Path,
+) -> None:
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    worktree = tmp_path / "worktree"
+    _git(root, "worktree", "add", "-q", "-b", "feature", str(worktree), "fork/next")
+    _push_upstream(worktree, "fork", "feature")
+
+    response = await _changes(worktree, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "fork/next"
+    assert response.base.base == fork_next
+
+
+async def test_a_branch_on_origin_without_a_default_compares_with_the_branch_it_started_from(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")
+    release = _head(root)
+    _add_remote(root, "origin")
+    _git(root, "update-ref", "refs/remotes/origin/release", release)
+    _git(root, "checkout", "-q", "-b", "feature", "origin/release")
+    _write(root / "feature.txt", "feature\n")
+    _commit(root, "feature")
+    _push_upstream(root, "origin", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/release"
+    assert response.base.base == release
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        "HEAD",
+        "commit",
+        "tag",
+        "local branch",
+        "remote branch a local one now shadows",
+        "upstream expression retargeted since",
+        "another remote's HEAD",
+        "another remote's name, which means its HEAD",
+        "deleted remote branch",
+        "own copy",
+        "own name on the remote it no longer tracks",
+        "qualified name",
+        "deleted qualified name a longer ref now matches",
+        "a remote the branch neither tracks nor pushes to",
+        "no reflog",
+    ],
+)
+async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_default(
+    tmp_path: Path, start: str
+) -> None:
+    root, main, fork_next = _fork_checkout(tmp_path)
+    _git(root, "tag", "v1", fork_next)
+    _git(root, "branch", "--track", "local-next", "fork/next")
+    _git(root, "update-ref", "refs/remotes/fork/feature", fork_next)
+    # A remote whose HEAD names its next, ahead of origin's main.
+    _add_remote(root, "source")
+    _git(root, "update-ref", "refs/remotes/source/next", fork_next)
+    _git(root, "symbolic-ref", "refs/remotes/source/HEAD", "refs/remotes/source/next")
+    starts = {
+        "HEAD": ["HEAD"],
+        "commit": [fork_next],
+        "tag": ["v1"],
+        "local branch": ["local-next"],
+        "remote branch a local one now shadows": ["fork/next"],
+        "upstream expression retargeted since": ["local-next@{upstream}"],
+        "another remote's HEAD": ["source/HEAD"],
+        "another remote's name, which means its HEAD": ["source"],
+        "deleted remote branch": ["fork/next"],
+        "own copy": ["fork/feature"],
+        "own name on the remote it no longer tracks": ["origin/feature"],
+        "qualified name": ["refs/remotes/fork/next"],
+        "deleted qualified name a longer ref now matches": ["refs/remotes/fork/next"],
+        "a remote the branch neither tracks nor pushes to": ["source/next"],
+        "no reflog": ["fork/next"],
+    }
+    if start == "own name on the remote it no longer tracks":
+        # Started from its own name on origin, then pushed to and tracking the fork instead.
+        _git(root, "update-ref", "refs/remotes/origin/feature", fork_next)
+    options = ["-c", "core.logAllRefUpdates=false"] if start == "no reflog" else []
+    _git(root, *options, "checkout", "-q", "-b", "feature", *starts[start])
+    if start == "upstream expression retargeted since":
+        # Only another branch's configuration changed, so the recorded start isn't followed.
+        _git(root, "update-ref", "refs/remotes/fork/other", main)
+        _git(root, "branch", "--set-upstream-to", "fork/other", "local-next")
+    if start == "remote branch a local one now shadows":
+        # Git no longer reads the recorded name as fork's branch, so neither does the base.
+        _git(root, "branch", "fork/next", main)
+    if start == "deleted remote branch":
+        _git(root, "update-ref", "-d", "refs/remotes/fork/next")
+        # Enough branches below the deleted name that listing it runs past the output cap.
+        subprocess.run(
+            ["git", "-C", str(root), "update-ref", "--stdin"],
+            input="".join(
+                f"create refs/remotes/fork/next/{index:04} {fork_next}\n" for index in range(2_500)
+            ),
+            text=True,
+            check=True,
+        )
+    if start == "deleted qualified name a longer ref now matches":
+        # Git would now read the recorded name as this ref, which isn't where the branch started.
+        _git(root, "update-ref", "-d", "refs/remotes/fork/next")
+        _git(root, "update-ref", "refs/remotes/refs/remotes/fork/next", fork_next)
+    _push_upstream(root, "fork", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/main"
+    assert response.base.base == main
+
+
+async def test_a_deleted_start_isnt_found_under_another_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a case-insensitive filesystem a deleted ``fork/next`` still opens as ``fork/Next``."""
+    root, main, _fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _write(root / "feature.txt", "feature\n")
+    _commit(root, "feature")
+    _push_upstream(root, "fork", "feature")
+    _git(root, "update-ref", "-d", "refs/remotes/fork/next")
+    _git(root, "update-ref", "refs/remotes/fork/Next", _head(root))
+    # As there: a loose ref read by its path answers for the other spelling, while Git's
+    # listing of refs still spells it as it is.
+    run_unchecked = runner.GitRepository.run_unchecked
+
+    async def case_insensitive(
+        self: runner.GitRepository, arguments: Sequence[str], **options: Any
+    ) -> runner.GitOutput:
+        if arguments and arguments[0] != "for-each-ref":
+            arguments = [
+                argument.replace("refs/remotes/fork/next", "refs/remotes/fork/Next")
+                for argument in arguments
+            ]
+        return await run_unchecked(self, arguments, **options)
+
+    monkeypatch.setattr(runner.GitRepository, "run_unchecked", case_insensitive)
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/main"
+    assert response.base.base == main
+
+
+@pytest.mark.parametrize(
+    "start", ["fork/next~1", "fork/../fork/next", "fork/next^{tree}", "HEAD@{99}", "@{-1}"]
+)
+async def test_a_crafted_start_point_falls_back_to_origins_default(
+    tmp_path: Path, start: str
+) -> None:
+    """A start point that isn't a plain remote branch's name never becomes the base."""
+    root, main, _fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "HEAD")
+    _push_upstream(root, "fork", "feature")
+    reflog = root / ".git" / "logs" / "refs" / "heads" / "feature"
+    entry = reflog.read_text()
+    assert "\tbranch: Created from HEAD\n" in entry
+    reflog.write_text(entry.replace("Created from HEAD", f"Created from {start}"))
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/main"
     assert response.base.base == main
 
 

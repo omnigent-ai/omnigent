@@ -7,6 +7,7 @@ fetches. Comparisons of revisions a person typed build on these helpers in ``com
 from __future__ import annotations
 
 import asyncio
+import re
 import stat
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -266,13 +267,15 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
     """The default branch as a full ref and its short name, or None when there is none.
 
     The remote is the current branch's upstream remote, else its push remote, else ``origin``.
-    That remote's default branch wins, then an upstream naming a different branch, then
-    ``origin/HEAD``.
+    That remote's default branch wins, then an upstream naming a different branch, then the
+    remote branch the current branch was created from, then ``origin/HEAD``.
     """
     branch_output = await run_allowing_absent(repository, ["symbolic-ref", "-q", "HEAD"], deadline)
     branch_ref = first_line(branch_output) if branch_output else ""
     remote: str | None = None
     upstream_candidate: str | None = None
+    own_copies: set[str] = set()
+    tracked_remotes: set[str] = set()
     if branch_ref:
         tracking = await repository.run(
             [
@@ -286,7 +289,10 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
         )
         fields = tracking.decode("utf-8", "replace").rstrip("\n").split("\0")
         if len(fields) == 5:
-            _ref, upstream, upstream_remote, _push, push_remote = fields
+            _ref, upstream, upstream_remote, push, push_remote = fields
+            tracked_remotes = {
+                name for name in (upstream_remote, push_remote) if name not in ("", ".")
+            }
             remote = next(
                 (name for name in (upstream_remote, push_remote) if name not in ("", ".")), None
             )
@@ -297,7 +303,16 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
             branch_name = branch_ref.removeprefix("refs/heads/")
             if upstream_branch and upstream_branch != branch_name:
                 upstream_candidate = upstream
+            # The branch's own copies on its remotes, as after ``git push -u``.
+            own_copies = {upstream, push} | {
+                f"refs/remotes/{name}/{branch_name}"
+                for name in (upstream_remote, push_remote)
+                if name not in ("", ".")
+            }
     remote_name = remote or "origin"
+    if branch_ref:
+        # Its copy on the remote it falls back to, for a branch that tracks nothing.
+        own_copies.add(f"refs/remotes/{remote_name}/{branch_ref.removeprefix('refs/heads/')}")
     found = await _remote_default_ref(repository, remote_name, deadline)
     if found is not None:
         return found
@@ -305,9 +320,122 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
         repository, upstream_candidate, deadline
     ):
         return upstream_candidate, upstream_candidate.removeprefix("refs/remotes/")
+    if branch_ref:
+        start = await _remote_start_point(
+            repository, branch_ref, tracked_remotes | {remote_name}, own_copies, deadline
+        )
+        if start is not None:
+            return start, start.removeprefix("refs/remotes/")
     if remote_name == "origin":
         return None
     return await _remote_default_ref(repository, "origin", deadline)
+
+
+_CREATED_FROM = "branch: Created from "
+# Characters Git refuses in a ref name, which revision expressions such as ``next~1`` use.
+_NOT_IN_A_REF_NAME = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+
+
+def _is_plain_ref_name(name: str) -> bool:
+    """Whether Git would accept ``name`` as a ref's name, not an expression like ``HEAD@{2}``."""
+    if (
+        not name
+        or name == "@"
+        or name.startswith("-")
+        or name.endswith(".")
+        or "@{" in name
+        or ".." in name
+        or _NOT_IN_A_REF_NAME.search(name)
+    ):
+        return False
+    components = name.split("/")
+    return all(
+        component and not component.startswith(".") and not component.endswith(".lock")
+        for component in components
+    )
+
+
+async def _remote_start_point(
+    repository: GitRepository,
+    branch_ref: str,
+    remotes: set[str],
+    own_copies: set[str],
+    deadline: Deadline,
+) -> str | None:
+    """The remote branch ``branch_ref`` was created from, by its oldest reflog entry, or None.
+
+    The recorded start counts only as exactly ``<remote>/<name>``: ``<remote>`` one of
+    ``remotes``, ``<name>`` neither ``HEAD`` nor the branch's own name, and Git listing that
+    exact remote-tracking ref, spelled the same, with no ref, tag or local branch of that name.
+    Anything else, such as a commit, a tag, a local branch, a qualified, deleted or shadowed name
+    or an expression, or a reflog that's off or expired, is None.
+    """
+    # Only the oldest entry is read, so a long-lived branch's reflog stays within the output cap.
+    counted = await repository.run_unchecked(
+        ["rev-list", "--walk-reflogs", "--count", branch_ref, "--"], deadline=deadline
+    )
+    count = first_line(counted.stdout) if counted.success else ""
+    if not count.isdecimal() or int(count) == 0:
+        return None
+    # Through ``log``, which the runner keeps from running a signature helper. An entry past the
+    # output cap is some long subject, never a usable start.
+    entry = await repository.run_unchecked(
+        [
+            "log",
+            "--walk-reflogs",
+            "-1",
+            "--format=%gs",
+            f"{branch_ref}@{{{int(count) - 1}}}",
+            "--",
+        ],
+        deadline=deadline,
+        allow_partial=True,
+    )
+    # Git ends the entry with LF alone; a ref name may hold other Unicode spaces and separators.
+    oldest = (
+        entry.stdout.decode("utf-8", "replace").split("\n", 1)[0]
+        if entry.success and not entry.overflowed
+        else ""
+    )
+    if not oldest.startswith(_CREATED_FROM):
+        return None
+    start = oldest.removeprefix(_CREATED_FROM)
+    if not _is_plain_ref_name(start) or start.startswith("refs/"):
+        return None
+    # Exactly one of the branch's remotes names it, so ``a/b/c`` can't be read two ways.
+    names = [start[len(remote) + 1 :] for remote in remotes if start.startswith(f"{remote}/")]
+    if len(names) != 1:
+        return None
+    name = names[0]
+    candidate = f"refs/remotes/{start}"
+    if (
+        name in ("", "HEAD")
+        or name == branch_ref.removeprefix("refs/heads/")
+        or candidate in own_copies
+    ):
+        return None
+    # The refs of exactly these names, as Git lists them. A lookup by path would also find
+    # ``fork/Next`` for ``fork/next`` on a case-insensitive filesystem; a listing doesn't.
+    shadows = {f"refs/{start}", f"refs/tags/{start}", f"refs/heads/{start}"}
+    # The patterns match refs below these names too. A listing past the cap could leave out a
+    # shadowing ref, so it's no start at all, like a failed one.
+    listed = await repository.run_unchecked(
+        ["for-each-ref", "--format=%(refname)", "--", candidate, *sorted(shadows)],
+        deadline=deadline,
+        allow_partial=True,
+    )
+    if not listed.success or listed.overflowed:
+        return None
+    names = set(listed.stdout.decode("utf-8", "replace").split("\n"))
+    # That exact remote-tracking ref still there, and nothing else Git could have read the name
+    # as when the branch was created: a ref, tag or local branch of that name.
+    if (
+        candidate not in names
+        or shadows & names
+        or await verify_commit(repository, candidate, deadline) is None
+    ):
+        return None
+    return candidate
 
 
 async def _remote_default_ref(
