@@ -35,6 +35,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
+from tests.budgets import budget
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -811,6 +812,147 @@ async def test_resize_notice_uses_hidden_hook_context(
 
     assert sent[0]["content"] == "inspect this"
     assert (tmp_path / "pending_framework_context.txt").read_text() == resize_notice(dimensions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["clear", "write", "cleanup"])
+@pytest.mark.parametrize("steering", [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_framework_context_io_retains_delivery_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: str,
+    steering: bool,
+    cancel: bool,
+) -> None:
+    """Slow context storage keeps dispatch live without releasing the pane early."""
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    context_path = tmp_path / claude_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    context_path.write_text("old context")
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    injected: list[str] = []
+    reaped: list[Path] = []
+    failed = False
+    held = False
+    original_unlink = Path.unlink
+    original_write = Path.write_text
+
+    def hold() -> None:
+        nonlocal held
+        if held:
+            return
+        held = True
+        entered.set()
+        release.wait(timeout=budget(5))
+        finished.set()
+
+    def unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == context_path and (operation == "clear" or (operation == "cleanup" and failed)):
+            hold()
+        original_unlink(path, *args, **kwargs)
+
+    def write(path: Path, *args: Any, **kwargs: Any) -> int:
+        if path == context_path and operation == "write":
+            hold()
+        return original_write(path, *args, **kwargs)
+
+    def inject(_bridge_dir: Path, *, content: str) -> None:
+        nonlocal failed
+        claude_bridge._check_injection_cancelled()
+        assert context_path.read_text() != "old context"
+        if operation == "cleanup":
+            failed = True
+            raise RuntimeError("injection failed")
+        injected.append(content)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(Path, "write_text", write)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda path, **kwargs: reaped.append(path)
+    )
+    executor = ClaudeNativeExecutor(tmp_path)
+    content = [
+        {"type": "input_text", "text": "inspect this"},
+        framework_notice_block({"width": 6000, "height": 4000}),
+    ]
+
+    async def deliver() -> object:
+        if steering:
+            return await executor.enqueue_session_message("main", content)
+        return [
+            event
+            async for event in executor.run_turn([{"role": "user", "content": content}], [], "")
+        ]
+
+    task = asyncio.create_task(deliver())
+    try:
+        assert await asyncio.to_thread(entered.wait, budget(10))
+        assert not finished.is_set(), "context storage blocked runner dispatch"
+        assert executor._inject_lock.locked()
+        if cancel:
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                assert executor._inject_lock.locked()
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=budget(10))
+            assert reaped == ([] if operation == "cleanup" else [tmp_path])
+            assert injected == []
+        else:
+            result = await asyncio.wait_for(task, timeout=budget(10))
+            if operation == "cleanup":
+                assert result is False if steering else isinstance(result[0], ExecutorError)
+                assert not context_path.exists()
+            else:
+                assert result is True if steering else result == [TurnComplete(response=None)]
+                assert injected == ["inspect this"]
+        assert finished.is_set()
+        assert not executor._inject_lock.locked()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_submit_clears_framework_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancellation still clears context when the injection worker just succeeded."""
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    loop = asyncio.get_running_loop()
+    injected: list[str] = []
+
+    def inject(_bridge_dir: Path, *, content: str) -> None:
+        injected.append(content)
+        loop.call_soon_threadsafe(task.cancel)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", lambda *args, **kwargs: None)
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    async def deliver() -> None:
+        await executor.enqueue_session_message(
+            "main",
+            [
+                {"type": "input_text", "text": "inspect this"},
+                framework_notice_block({"width": 6000, "height": 4000}),
+            ],
+        )
+
+    task = asyncio.create_task(deliver())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert injected == ["inspect this"]
+    assert not (tmp_path / claude_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE).exists()
+    assert not executor._inject_lock.locked()
 
 
 @pytest.mark.asyncio
