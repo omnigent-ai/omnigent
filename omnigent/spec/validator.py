@@ -335,6 +335,8 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
                 result.add(f"{prefix}.args", "not allowed when transport is 'http'")
             if mcp.env:
                 result.add(f"{prefix}.env", "not allowed when transport is 'http'")
+            if mcp.auth_command is not None and not mcp.auth_command.strip():
+                result.add(f"{prefix}.auth_command", "must be a non-empty command string")
         elif mcp.transport == "registry":
             if (
                 mcp.url
@@ -343,6 +345,7 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
                 or mcp.args
                 or mcp.env
                 or mcp.databricks_profile
+                or mcp.auth_command
             ):
                 result.add(prefix, "registry services cannot override server connection settings")
         elif mcp.transport == "stdio":
@@ -352,6 +355,8 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
                 result.add(f"{prefix}.url", "not allowed when transport is 'stdio'")
             if mcp.headers:
                 result.add(f"{prefix}.headers", "not allowed when transport is 'stdio'")
+            if mcp.auth_command is not None:
+                result.add(f"{prefix}.auth_command", "not allowed when transport is 'stdio'")
         else:
             result.add(
                 f"{prefix}.transport",

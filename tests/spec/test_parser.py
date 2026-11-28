@@ -3443,6 +3443,44 @@ def test_parse_mcp_unknown_transport_raises(agent_dir: Path) -> None:
         parse(agent_dir)
 
 
+def test_parse_mcp_http_auth_command_preserves_runtime_vars(agent_dir: Path) -> None:
+    """``auth_command`` on HTTP MCP preserves ``${VAR}`` for shell runtime expansion."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "corp.yaml").write_text(
+        yaml.dump(
+            {
+                "name": "corp",
+                "transport": "http",
+                "url": "https://mcp.example.com/mcp",
+                "auth_command": "mint-token --user ${OMNIGENT_MCP_USER_ID}",
+            }
+        )
+    )
+    mcp = parse(agent_dir).mcp_servers[0]
+    assert mcp.auth_command == "mint-token --user ${OMNIGENT_MCP_USER_ID}"
+    assert "mint-token" not in repr(mcp)
+    assert "[REDACTED]" in repr(mcp)
+
+
+def test_parse_mcp_stdio_rejects_auth_command(agent_dir: Path) -> None:
+    """``auth_command`` is rejected on stdio MCP servers."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "local.yaml").write_text(
+        yaml.dump(
+            {
+                "name": "local",
+                "transport": "stdio",
+                "command": "npx",
+                "auth_command": "mint-token",
+            }
+        )
+    )
+    with pytest.raises(OmnigentError, match="auth_command"):
+        parse(agent_dir)
+
+
 # ─── Top-level ``timers:`` flag (step 10 of harness contract) ─
 
 

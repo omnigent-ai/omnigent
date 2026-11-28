@@ -851,7 +851,7 @@ def _body_to_file_yaml(
     if body.transport == "http":
         result["url"] = body.url
         _apply_headers(result, body, existing)
-        _preserve_keys(result, existing, ("auth", "timeout", "retry"))
+        _preserve_keys(result, existing, ("auth", "auth_command", "timeout", "retry"))
     else:
         result["command"] = body.command
         if body.args:
@@ -870,7 +870,7 @@ def _body_to_inline_yaml(
     if body.transport == "http":
         result["url"] = body.url
         _apply_headers(result, body, existing)
-        _preserve_keys(result, existing, ("auth", "timeout", "retry"))
+        _preserve_keys(result, existing, ("auth", "auth_command", "timeout", "retry"))
     else:
         result["command"] = body.command
         if body.args:

@@ -3116,3 +3116,128 @@ async def test_bounded_discovery_rejects_repeated_cursor() -> None:
             session.list_tools.assert_awaited_with(cursor="same-page")
         finally:
             await conn.close()
+
+
+def test_cache_key_scopes_by_auth_command_and_user_id() -> None:
+    """``_cache_key`` isolates cached discovery by ``auth_command`` and ``user_id``."""
+    cfg_a = MCPServerConfig(
+        name="srv",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command="get-token --secret-flag",
+    )
+    cfg_b = MCPServerConfig(
+        name="srv",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command="get-token --other-flag",
+    )
+    key_a_alice = _cache_key(cfg_a, user_id="alice-user")
+    key_a_bob = _cache_key(cfg_a, user_id="bob-user")
+    key_b_alice = _cache_key(cfg_b, user_id="alice-user")
+
+    assert key_a_alice != key_a_bob
+    assert key_a_alice != key_b_alice
+    assert "alice-user" not in key_a_alice
+    assert "--secret-flag" not in key_a_alice
+
+
+@pytest.mark.asyncio()
+async def test_http_auth_command_connect_and_per_request_refresh(tmp_path) -> None:
+    """``auth_command`` runs with ``OMNIGENT_MCP_USER_ID`` and refreshes per request."""
+    import httpx
+
+    counter_file = tmp_path / "count.txt"
+    script = (
+        f'n=$(cat "{counter_file}" 2>/dev/null || echo 0); '
+        f'n=$((n + 1)); echo "$n" > "{counter_file}"; '
+        'printf "tok-${OMNIGENT_MCP_USER_ID}-${n}"'
+    )
+    cfg = MCPServerConfig(
+        name="srv",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command=script,
+    )
+    conn = McpServerConnection(config=cfg, user_id="alice")
+
+    headers = await conn._resolve_http_headers()
+    assert headers == {"Authorization": "Bearer tok-alice-1"}
+
+    req1 = httpx.Request("POST", "https://mcp.example.com/mcp")
+    await conn._apply_per_request_auth(req1)
+    assert req1.headers["Authorization"] == "Bearer tok-alice-2"
+
+    req2 = httpx.Request("POST", "https://mcp.example.com/mcp")
+    await conn._apply_per_request_auth(req2)
+    assert req2.headers["Authorization"] == "Bearer tok-alice-3"
+
+
+@pytest.mark.asyncio()
+async def test_http_auth_command_fails_closed() -> None:
+    """``auth_command`` raises RuntimeError on non-zero exit, empty output, or timeout."""
+    cfg_fail = MCPServerConfig(
+        name="srv",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command="echo boom >&2; exit 2",
+    )
+    with pytest.raises(RuntimeError, match="exit code 2"):
+        await McpServerConnection(config=cfg_fail)._resolve_http_headers()
+
+    cfg_empty = MCPServerConfig(
+        name="srv",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command="printf '   \\n'",
+    )
+    with pytest.raises(RuntimeError, match="empty output"):
+        await McpServerConnection(config=cfg_empty)._resolve_http_headers()
+
+    cfg_slow = MCPServerConfig(
+        name="srv",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command="sleep 1",
+    )
+    with pytest.raises(RuntimeError, match="timed out"):
+        conn_slow = McpServerConnection(config=cfg_slow, auth_command_timeout_s=0.05)
+        await conn_slow._resolve_http_headers()
+
+
+@pytest.mark.asyncio()
+async def test_http_credential_resolver_sync_and_async() -> None:
+    """``credential_resolver`` supplies per-user headers at connect and per request."""
+    import httpx
+
+    cfg = MCPServerConfig(
+        name="srv",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        headers={"X-Static": "keep", "Authorization": "Bearer stale"},
+    )
+    calls = 0
+
+    async def _async_resolver(_cfg: MCPServerConfig, uid: str | None) -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        return {"Authorization": f"Bearer {uid}-{calls}"}
+
+    conn = McpServerConnection(config=cfg, user_id="bob", credential_resolver=_async_resolver)
+    headers = await conn._resolve_http_headers()
+    assert headers == {"X-Static": "keep", "Authorization": "Bearer bob-1"}
+
+    req = httpx.Request("POST", "https://mcp.example.com/mcp")
+    await conn._apply_per_request_auth(req)
+    assert req.headers["Authorization"] == "Bearer bob-2"
+
+    # Cross-origin redirect hops must strip dynamic auth headers and not re-invoke resolver.
+    redirected = httpx.Request(
+        "POST",
+        "https://other.example.net/mcp",
+        headers={"Authorization": "Bearer bob-2", "X-Static": "keep"},
+    )
+    await conn._apply_per_request_auth(redirected)
+    assert "Authorization" not in redirected.headers
+    assert redirected.headers["X-Static"] == "keep"
+    assert calls == 2
