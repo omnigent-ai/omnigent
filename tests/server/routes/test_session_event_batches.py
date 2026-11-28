@@ -15,15 +15,18 @@ from itertools import count
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
 
 import omnigent.server.routes._sessions.orchestration as orchestration_mod
 import omnigent.server.routes.sessions.routes_events as routes_events_mod
 from omnigent.entities import NewConversationItem
 from omnigent.entities.conversation import Conversation, ConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import pending_inputs
 from omnigent.server._elicitation_registry import (
     _harness_parked_elicitations,
@@ -50,7 +53,9 @@ def _stable_id(source_id: str) -> str:
     ).hex
 
 
-def _make_conv(session_id: str = _SESSION_ID, *, title: str = "Test conv") -> Conversation:
+def _make_conv(
+    session_id: str = _SESSION_ID, *, title: str = "Test conv", runner_id: str | None = None
+) -> Conversation:
     # title is non-None so _seed_missing_title does not call update_conversation.
     return Conversation(
         id=session_id,
@@ -58,6 +63,7 @@ def _make_conv(session_id: str = _SESSION_ID, *, title: str = "Test conv") -> Co
         updated_at=0,
         root_conversation_id=session_id,
         title=title,
+        runner_id=runner_id,
     )
 
 
@@ -396,6 +402,93 @@ def test_other_event_type_in_middle_splits_run() -> None:
     assert len(acks) == 3
     assert "item_id" not in acks[1]
     assert [len(c) for c in store.append_calls] == [1, 1]
+
+
+# ── tests: streamed chunk runs ────────────────────────────────────────────────
+
+
+def _record_published_deltas(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Capture the text of every ``response.output_text.delta`` the route publishes."""
+    deltas: list[str] = []
+
+    def _publish(_session_id: str, event: dict[str, Any]) -> None:
+        if event.get("type") == "response.output_text.delta":
+            deltas.append(event["delta"])
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _publish)
+    return deltas
+
+
+def test_streamed_delta_runs_authorize_once_and_publish_every_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive text chunks share one authorization; an item between them
+    starts a new run, and every chunk still publishes in order."""
+    published = _record_published_deltas(monkeypatch)
+    batch = [
+        _text_delta_event("a"),
+        _text_delta_event("b"),
+        _text_delta_event("c"),
+        _assistant_event(source_id="between"),
+        _text_delta_event("d"),
+        _text_delta_event("e"),
+    ]
+    resp, store = _post(batch)
+
+    assert resp.status_code == 202, resp.text
+    acks = resp.json()
+    assert len(acks) == 6
+    assert [ack for i, ack in enumerate(acks) if i != 3] == [{"queued": False}] * 5
+    assert published == ["a", "b", "c", "d", "e"]
+    # One authorization per run: chunks a-c, the item, chunks d-e.
+    assert len(store.get_calls) == 3
+    assert [len(call) for call in store.append_calls] == [1]
+
+
+async def test_runner_batch_authorizes_consecutive_deltas_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner-tunnel batch authorizes each run of text chunks once; an item
+    between chunks ends the run, so the next chunk authorizes again."""
+    published = _record_published_deltas(monkeypatch)
+    store = _RecordingStore(_make_conv(runner_id="runner-a"))
+    ingest_handlers: list[Any] = []
+    create_sessions_router(
+        conversation_store=store,  # type: ignore[arg-type]
+        agent_store=MagicMock(),
+        runner_router=None,
+        auth_provider=None,
+        permission_store=None,
+        register_runner_ingest=ingest_handlers.append,
+    )
+    (ingest,) = ingest_handlers
+
+    def _delta(text: str) -> dict[str, Any]:
+        return {"type": "external_output_text_delta", "data": {"delta": text}}
+
+    async def _ingest(batch_id: str, events: list[dict[str, Any]]) -> tuple[EventAckFrame, int]:
+        reads_before = len(store.get_calls)
+        ack = await ingest(
+            app=FastAPI(),
+            headers=Headers({}),
+            owner=None,
+            runner_id="runner-a",
+            batch=EventBatchFrame(id=batch_id, session_id=_SESSION_ID, events=events),
+        )
+        return ack, len(store.get_calls) - reads_before
+
+    item_only_ack, item_reads = await _ingest("item", [_assistant_event(source_id="solo")])
+    assert item_only_ack == EventAckFrame("item", 1)
+
+    chunks_ack, chunk_reads = await _ingest("chunks", [_delta(t) for t in "abcde"])
+    assert chunks_ack == EventAckFrame("chunks", 5)
+    assert chunk_reads == 1
+
+    split_events = [_delta("f"), _delta("g"), _assistant_event(source_id="mid"), _delta("h")]
+    split_ack, split_reads = await _ingest("split", split_events)
+    assert split_ack == EventAckFrame("split", 4)
+    assert split_reads == item_reads + 2
+    assert published == list("abcdefgh")
 
 
 # ── tests: deduplication ──────────────────────────────────────────────────────

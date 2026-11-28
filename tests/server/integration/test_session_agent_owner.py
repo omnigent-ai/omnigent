@@ -564,3 +564,37 @@ async def test_native_approval_changes_require_owner_authority(
     response = await auth_client.post(f"{path}/events", json=event, headers=owner)
     assert response.status_code == 202, response.text
     assert (await auth_client.get(path, headers=owner)).json()["terminal_launch_args"] == args
+
+
+@pytest.mark.parametrize(("level", "expected_status"), [(LEVEL_READ, 403), (LEVEL_EDIT, 202)])
+async def test_streamed_chunk_batch_requires_edit_access(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+    expected_status: int,
+) -> None:
+    """A batch of streamed chunks is authorized before any chunk publishes."""
+    published: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event.get("delta")),
+    )
+    agent = await create_test_agent(auth_client, name="chunk-writer", user=ALICE)
+    path = f"/v1/sessions/{agent['_session_id']}"
+    response = await auth_client.put(
+        f"{path}/permissions",
+        json={"user_id": BOB, "level": level},
+        headers={"X-Forwarded-Email": ALICE},
+    )
+    assert response.status_code in (200, 204), response.text
+    published.clear()
+    chunks = [
+        {"type": "external_output_text_delta", "data": {"delta": text}} for text in ("a", "b")
+    ]
+
+    response = await auth_client.post(
+        f"{path}/events", json=chunks, headers={"X-Forwarded-Email": BOB}
+    )
+
+    assert response.status_code == expected_status, response.text
+    assert published == (["a", "b"] if expected_status == 202 else [])
