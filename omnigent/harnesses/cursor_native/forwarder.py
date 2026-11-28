@@ -760,7 +760,12 @@ async def _patch_external_session_id(
 
 
 async def _post_external_session_status(
-    client: httpx.AsyncClient, *, session_id: str, status: str, turn_outcome: str
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    status: str,
+    turn_outcome: str,
+    output: str | None = None,
 ) -> None:
     """POST one ``external_session_status`` event to the Sessions API.
 
@@ -776,11 +781,14 @@ async def _post_external_session_status(
 
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data = {"status": status, "turn_outcome": turn_outcome}
+    if output is not None:
+        data["output"] = output
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": status, "turn_outcome": turn_outcome},
+            "data": data,
         },
     )
     resp.raise_for_status()
@@ -910,6 +918,7 @@ async def forward_cursor_store_to_session(
     launch_epoch_ms: int,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
+    turn_failure: cursor_native_status.CursorTurnFailure | None = None,
 ) -> None:
     """Tail the cursor chat store and mirror new messages into the AP session.
 
@@ -940,6 +949,9 @@ async def forward_cursor_store_to_session(
     :param auth: Optional refresh-capable httpx Auth for remote deployments.
     :returns: Never normally returns; cancel the task to stop it.
     """
+    failure = (
+        turn_failure if turn_failure is not None else cursor_native_status.CursorTurnFailure()
+    )
     persisted = _read_state(bridge_dir)
     store_path: Path | None = None
     last_rowid = 0
@@ -1058,6 +1070,17 @@ async def forward_cursor_store_to_session(
                             _read_new_items, store_path, last_rowid, agent_name
                         )
                         for item in items:
+                            if (
+                                item.item_type == "message"
+                                and item.item_data.get("role") == "user"
+                            ):
+                                async with failure.lock:
+                                    if item.rowid > failure.before_rowid:
+                                        failure.after_stop = None
+                                        failure.suppressed_stops.update(failure.uncertain_stops)
+                                        failure.uncertain_stops.clear()
+                                        failure.generations.update(failure.uncertain_generations)
+                                        failure.uncertain_generations.clear()
                             if item.item_type == "compaction_completed":
                                 # cursor finished /summarize: tell the web UI so
                                 # its "Compacting…" spinner upgrades to the
@@ -1213,10 +1236,16 @@ async def forward_cursor_store_to_session(
                 # Deliver the hook outcome after its transcript, even without a
                 # bound store. Failed posts retain this snapshot for the next poll.
                 if not retrying_items and pending_turn_end is not None:
+                    stop_generation: object = None
                     try:
                         outcome = await asyncio.to_thread(
                             cursor_native_status.read_turn_outcome, bridge_dir, pending_turn_end
                         )
+                        stop_generation = (
+                            await asyncio.to_thread(
+                                cursor_native_status.read_turn_end, bridge_dir, pending_turn_end
+                            )
+                        ).get("generation_id")
                     except (ValueError, IndexError):
                         outcome_parse_failures += 1
                         if outcome_parse_failures < _TURN_OUTCOME_PARSE_ATTEMPTS:
@@ -1233,15 +1262,54 @@ async def forward_cursor_store_to_session(
                         outcome = "failed"
                     else:
                         outcome_parse_failures = 0
-                    await _post_external_session_status(
-                        client,
-                        session_id=session_id,
-                        status="failed" if outcome == "failed" else "idle",
-                        turn_outcome=outcome,
-                    )
-                    await asyncio.to_thread(
-                        cursor_native_status.write_posted_count, bridge_dir, pending_turn_end
-                    )
+                    async with failure.lock:
+                        current_generation = await asyncio.to_thread(
+                            cursor_native_status.read_current_generation, bridge_dir
+                        )
+                        fresh_generation = (
+                            isinstance(stop_generation, str)
+                            and stop_generation == current_generation
+                            and stop_generation not in failure.generations
+                            and stop_generation not in failure.uncertain_generations
+                        )
+                        uncertain_old_turn = current_generation is not None and (
+                            (
+                                isinstance(stop_generation, str)
+                                and stop_generation in failure.uncertain_generations
+                                and stop_generation != current_generation
+                            )
+                            or (
+                                pending_turn_end in failure.uncertain_stops
+                                and current_generation != failure.uncertain_stops[pending_turn_end]
+                            )
+                        )
+                        suppressed = not fresh_generation and (
+                            uncertain_old_turn
+                            or (
+                                isinstance(stop_generation, str)
+                                and stop_generation in failure.generations
+                            )
+                            or pending_turn_end in failure.suppressed_stops
+                            or (
+                                failure.after_stop is not None
+                                and pending_turn_end > failure.after_stop
+                                and outcome in ("cancelled", "failed")
+                            )
+                        )
+                        if not suppressed:
+                            await _post_external_session_status(
+                                client,
+                                session_id=session_id,
+                                status="failed" if outcome == "failed" else "idle",
+                                turn_outcome=outcome,
+                            )
+                            if outcome == "completed":
+                                failure.after_stop = None
+                        await asyncio.to_thread(
+                            cursor_native_status.write_posted_count, bridge_dir, pending_turn_end
+                        )
+                        failure.suppressed_stops.discard(pending_turn_end)
+                        failure.uncertain_stops.pop(pending_turn_end, None)
                     pending_turn_end = None
                     outcome_parse_failures = 0
                 if fd_exhausted_since is not None:
@@ -1305,6 +1373,7 @@ async def supervise_cursor_forwarder(
     launch_epoch_ms: int,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
+    turn_failure: cursor_native_status.CursorTurnFailure | None = None,
 ) -> None:
     """Run :func:`forward_cursor_store_to_session` under a restart supervisor.
 
@@ -1326,6 +1395,9 @@ async def supervise_cursor_forwarder(
     :param auth: Optional refresh-capable httpx Auth.
     :returns: Never normally returns; cancel the task to stop it.
     """
+    failure = (
+        turn_failure if turn_failure is not None else cursor_native_status.CursorTurnFailure()
+    )
     backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
     while True:
         run_started_at = _supervisor_monotonic()
@@ -1341,6 +1413,7 @@ async def supervise_cursor_forwarder(
                 launch_epoch_ms=launch_epoch_ms,
                 poll_interval_s=poll_interval_s,
                 auth=auth,
+                turn_failure=failure,
             )
             _logger.warning(
                 "cursor forwarder returned unexpectedly; restarting; session=%s bridge_dir=%s",
