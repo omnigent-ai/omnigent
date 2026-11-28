@@ -761,6 +761,148 @@ async def test_the_tracked_remotes_default_branch_wins_over_its_upstream(tmp_pat
     assert response.base.base == main
 
 
+def _fork_checkout(tmp_path: Path) -> tuple[Path, str, str]:
+    """`origin` with ``origin/HEAD`` at main, and a fork whose `next` is one commit ahead of it.
+
+    :returns: The repository, origin's main and the fork's next.
+    """
+    root = _repository(tmp_path / "repo")
+    main = _head(root)
+    _add_remote(root, "origin")
+    _git(root, "update-ref", "refs/remotes/origin/main", main)
+    _git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    _write(root / "next.txt", "next\n")
+    _commit(root, "next")
+    fork_next = _head(root)
+    _add_remote(root, "fork")
+    _git(root, "update-ref", "refs/remotes/fork/next", fork_next)
+    _git(root, "reset", "-q", "--hard", main)
+    return root, main, fork_next
+
+
+def _push_upstream(root: Path, remote: str, branch: str) -> None:
+    """What ``git push -u <remote> <branch>`` leaves: the branch tracks its own copy there."""
+    _git(root, "update-ref", f"refs/remotes/{remote}/{branch}", _head(root))
+    _git(root, "config", f"branch.{branch}.remote", remote)
+    _git(root, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+
+
+async def test_a_pushed_branch_still_compares_with_the_branch_it_started_from(
+    tmp_path: Path,
+) -> None:
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _write(root / "feature.txt", "feature\n")
+    _commit(root, "feature")
+
+    before = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert before.base.reference == "fork/next"
+    # The fork has no fork/HEAD, and the upstream is now the branch's own copy.
+    _push_upstream(root, "fork", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "fork/next"
+    assert response.base.base == fork_next
+    assert _paths(response) == ["feature.txt"]
+
+
+async def test_a_pushed_worktree_branch_still_compares_with_the_branch_it_started_from(
+    tmp_path: Path,
+) -> None:
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    worktree = tmp_path / "worktree"
+    _git(root, "worktree", "add", "-q", "-b", "feature", str(worktree), "fork/next")
+    _push_upstream(worktree, "fork", "feature")
+
+    response = await _changes(worktree, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "fork/next"
+    assert response.base.base == fork_next
+
+
+async def test_a_branch_on_origin_without_a_default_compares_with_the_branch_it_started_from(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")
+    release = _head(root)
+    _add_remote(root, "origin")
+    _git(root, "update-ref", "refs/remotes/origin/release", release)
+    _git(root, "checkout", "-q", "-b", "feature", "origin/release")
+    _write(root / "feature.txt", "feature\n")
+    _commit(root, "feature")
+    _push_upstream(root, "origin", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/release"
+    assert response.base.base == release
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        "HEAD",
+        "commit",
+        "tag",
+        "local branch",
+        "remote branch a local one now shadows",
+        "deleted remote branch",
+        "own copy",
+        "no reflog",
+    ],
+)
+async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_default(
+    tmp_path: Path, start: str
+) -> None:
+    root, main, fork_next = _fork_checkout(tmp_path)
+    _git(root, "tag", "v1", fork_next)
+    _git(root, "branch", "local-next", fork_next)
+    _git(root, "update-ref", "refs/remotes/fork/feature", fork_next)
+    starts = {
+        "HEAD": ["HEAD"],
+        "commit": [fork_next],
+        "tag": ["v1"],
+        "local branch": ["local-next"],
+        "remote branch a local one now shadows": ["fork/next"],
+        "deleted remote branch": ["fork/next"],
+        "own copy": ["fork/feature"],
+        "no reflog": ["fork/next"],
+    }
+    options = ["-c", "core.logAllRefUpdates=false"] if start == "no reflog" else []
+    _git(root, *options, "checkout", "-q", "-b", "feature", *starts[start])
+    if start == "remote branch a local one now shadows":
+        # Git no longer reads the recorded name as fork's branch, so neither does the base.
+        _git(root, "branch", "fork/next", main)
+    if start == "deleted remote branch":
+        _git(root, "update-ref", "-d", "refs/remotes/fork/next")
+    _push_upstream(root, "fork", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/main"
+    assert response.base.base == main
+
+
+@pytest.mark.parametrize("start", ["fork/next~1", "fork/../fork/next", "fork/next^{tree}"])
+async def test_a_crafted_start_point_falls_back_to_origins_default(
+    tmp_path: Path, start: str
+) -> None:
+    """A start point that isn't a plain remote branch's name never becomes the base."""
+    root, main, _fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "HEAD")
+    _push_upstream(root, "fork", "feature")
+    reflog = root / ".git" / "logs" / "refs" / "heads" / "feature"
+    entry = reflog.read_text()
+    assert "\tbranch: Created from HEAD\n" in entry
+    reflog.write_text(entry.replace("Created from HEAD", f"Created from {start}"))
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/main"
+    assert response.base.base == main
+
+
 def _git_appending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crafted: dict[str, str]
 ) -> None:

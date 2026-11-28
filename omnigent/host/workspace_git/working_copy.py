@@ -266,13 +266,14 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
     """The default branch as a full ref and its short name, or None when there is none.
 
     The remote is the current branch's upstream remote, else its push remote, else ``origin``.
-    That remote's default branch wins, then an upstream naming a different branch, then
-    ``origin/HEAD``.
+    That remote's default branch wins, then an upstream naming a different branch, then the
+    remote branch the current branch was created from, then ``origin/HEAD``.
     """
     branch_output = await run_allowing_absent(repository, ["symbolic-ref", "-q", "HEAD"], deadline)
     branch_ref = first_line(branch_output) if branch_output else ""
     remote: str | None = None
     upstream_candidate: str | None = None
+    own_copies: set[str] = set()
     if branch_ref:
         tracking = await repository.run(
             [
@@ -286,7 +287,7 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
         )
         fields = tracking.decode("utf-8", "replace").rstrip("\n").split("\0")
         if len(fields) == 5:
-            _ref, upstream, upstream_remote, _push, push_remote = fields
+            _ref, upstream, upstream_remote, push, push_remote = fields
             remote = next(
                 (name for name in (upstream_remote, push_remote) if name not in ("", ".")), None
             )
@@ -297,6 +298,12 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
             branch_name = branch_ref.removeprefix("refs/heads/")
             if upstream_branch and upstream_branch != branch_name:
                 upstream_candidate = upstream
+            # The branch's own copies on its remotes, as after ``git push -u``.
+            own_copies = {upstream, push} | {
+                f"refs/remotes/{name}/{branch_name}"
+                for name in (upstream_remote, push_remote)
+                if name not in ("", ".")
+            }
     remote_name = remote or "origin"
     found = await _remote_default_ref(repository, remote_name, deadline)
     if found is not None:
@@ -305,9 +312,51 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
         repository, upstream_candidate, deadline
     ):
         return upstream_candidate, upstream_candidate.removeprefix("refs/remotes/")
+    if branch_ref:
+        start = await _remote_start_point(repository, branch_ref, own_copies, deadline)
+        if start is not None:
+            return start, start.removeprefix("refs/remotes/")
     if remote_name == "origin":
         return None
     return await _remote_default_ref(repository, "origin", deadline)
+
+
+_CREATED_FROM = "branch: Created from "
+
+
+async def _remote_start_point(
+    repository: GitRepository, branch_ref: str, own_copies: set[str], deadline: Deadline
+) -> str | None:
+    """The remote branch ``branch_ref`` was created from, by its oldest reflog entry, or None.
+
+    None when the reflog is off or expired, or the start was ``HEAD``, a commit, a tag, a local
+    branch, a deleted branch or the branch's own copy on a remote, or its name is now ambiguous.
+    """
+    output = await repository.run_unchecked(
+        ["reflog", "show", "--format=%gs", branch_ref, "--"], deadline=deadline
+    )
+    lines = output.stdout.decode("utf-8", "replace").splitlines() if output.success else []
+    oldest = lines[-1] if lines else ""
+    if not oldest.startswith(_CREATED_FROM):
+        return None
+    start = oldest.removeprefix(_CREATED_FROM)
+    if not start:
+        return None
+    # Git's own lookup: only a ref's name resolves, and an ambiguous name resolves to none.
+    resolved = await run_allowing_absent(
+        repository,
+        ["rev-parse", "--verify", "-q", "--symbolic-full-name", "--end-of-options", start],
+        deadline,
+    )
+    candidate = first_line(resolved) if resolved else ""
+    if (
+        not candidate.startswith("refs/remotes/")
+        or candidate.endswith("/HEAD")
+        or candidate in own_copies
+        or await verify_commit(repository, candidate, deadline) is None
+    ):
+        return None
+    return candidate
 
 
 async def _remote_default_ref(
