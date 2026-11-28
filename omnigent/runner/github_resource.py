@@ -537,11 +537,26 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     return authenticated, accounts
 
 
+# Each host listed is one gh call; a long hosts.yml mustn't stall the panel.
+_MAX_SIGN_IN_HOSTS = 20
+
+
 def _sign_in_hosts() -> list[str]:
-    """github.com, ``GH_HOST``, then every other host set up for GitHub, each once."""
-    configured = EnvInstances().hosts_for("github") | _gh_signed_in_hosts()
-    hosts = ["github.com", _default_github_host(), *sorted(configured)]
-    return [host for host in dict.fromkeys(hosts) if _known_github_host(host)]
+    """github.com, ``GH_HOST``, configured hosts, then hosts.yml's, each once, up to the cap."""
+    hosts = [
+        "github.com",
+        _default_github_host(),
+        *sorted(EnvInstances().hosts_for("github")),
+        *sorted(_gh_signed_in_hosts()),
+    ]
+    known = [host for host in dict.fromkeys(hosts) if _known_github_host(host)]
+    if len(known) > _MAX_SIGN_IN_HOSTS:
+        _logger.warning(
+            "Listed GitHub sign-ins for the first %d hosts set up and skipped %d more",
+            _MAX_SIGN_IN_HOSTS,
+            len(known) - _MAX_SIGN_IN_HOSTS,
+        )
+    return known[:_MAX_SIGN_IN_HOSTS]
 
 
 def _listed_accounts(root: str, host: str) -> tuple[bool, list[dict[str, Any]]]:

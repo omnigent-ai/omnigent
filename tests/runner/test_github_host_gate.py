@@ -541,6 +541,31 @@ def test_the_sign_in_listing_checks_each_host_alone_with_only_its_own_tokens(
     ]
 
 
+def test_the_sign_in_listing_checks_set_up_hosts_first_and_at_most_its_cap(
+    environment: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stored = [f"stored-{index:02}.example.com" for index in range(4)]
+    (environment / "hosts.yml").write_text(
+        "".join(f"{host}:\n    user: octo\n" for host in stored), encoding="utf-8"
+    )
+    monkeypatch.setenv("GH_HOST", OTHER_KNOWN)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", KNOWN)
+    monkeypatch.setattr(github_resource, "_MAX_SIGN_IN_HOSTS", 4)
+    listed: list[str] = []
+
+    def run(argv: list[str], **_kwargs: object):
+        listed.append(argv[-1])
+        return 0, json.dumps({"hosts": {}}), ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+
+    with caplog.at_level("WARNING", logger=github_resource.__name__):
+        github_resource._list_accounts("/workspace")
+
+    assert listed == ["github.com", OTHER_KNOWN, KNOWN, stored[0]]
+    assert "skipped 3 more" in caplog.text
+
+
 def test_an_older_gh_answers_the_sign_in_listing_from_each_hosts_status(
     environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
