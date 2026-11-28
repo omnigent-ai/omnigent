@@ -38,7 +38,12 @@ import {
   useHostPendingChangeInFlight,
   usePendingHolds,
 } from "./pendingReviewChanges";
-import { hostPendingIdentity, hostPendingRoute, hostPendingScopeOf } from "./hostPendingRoute";
+import {
+  hostPendingIdentity,
+  hostPendingOffers,
+  hostPendingRoute,
+  hostPendingScopeOf,
+} from "./hostPendingRoute";
 import { invalidatePendingReview, usePendingReview } from "./usePendingReview";
 
 /** One button: its label, whether it can run, and what it does. */
@@ -128,6 +133,13 @@ export function usePendingComposer({
   const recovery = recoveryHere();
 
   const mode = pendingComposerMode({ state, hold, recovery });
+  // Start goes as a start and an add, so it's offered only where both are served; without
+  // them the box comments as it does today.
+  const route = hostPendingRoute(conversationId, prUrl);
+  const adds = !!route && hostPendingOffers(route, "add");
+  const starts = adds && hostPendingOffers(route, "start");
+  const unserved =
+    (mode.kind === "comment_or_start" && !starts) || (mode.kind === "add_to_review" && !adds);
   const viewKey = place ? [owner, prUrl.toLowerCase(), placeKey(place)].join("\n") : null;
   const draftName = draftKey.join("\n");
   // While this box shows its draft, its view is live; leaving retires it for good.
@@ -138,7 +150,7 @@ export function usePendingComposer({
   if (!place || !viewKey) return null;
   // The view this box shows its draft in; an answer applies to the draft only in this view.
   const viewToken = noteComposerView(draftKey, viewKey);
-  if (mode.kind === "today") return null;
+  if (mode.kind === "today" || unserved) return null;
 
   const draftNow = () => queryClient.getQueryData<PullRequestCommentDraft>(draftKey);
   const openOnGitHub: PendingComposerAction = {

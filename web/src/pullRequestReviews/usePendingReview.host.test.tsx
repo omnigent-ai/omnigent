@@ -178,8 +178,8 @@ describe("a comment box whose start made a review but didn't add its comment", (
   };
   const DRAFT_KEY = ["pr-draft", SESSION, PR, "line"];
 
-  async function renderComposer() {
-    host.served = new Set(EDITOR);
+  async function renderComposer(served: readonly string[] = EDITOR) {
+    host.served = new Set(served);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData(DRAFT_KEY, { body: "Why strip?", pending: false, error: null });
     const wrapper = ({ children }: { children: ReactNode }) => (
@@ -200,7 +200,8 @@ describe("a comment box whose start made a review but didn't add its comment", (
       }),
       { wrapper },
     );
-    await waitFor(() => expect(view.result.current.composer?.mode).toBe("comment_or_start"));
+    await waitFor(() => expect(view.result.current.route).not.toBe("loading"));
+    view.rerender();
     return { view, queryClient };
   }
 
@@ -218,6 +219,7 @@ describe("a comment box whose start made a review but didn't add its comment", (
       })
       .mockRejectedValueOnce(new PullRequestApiError("That line isn't in the diff.", 400));
     const { view, queryClient } = await renderComposer();
+    await waitFor(() => expect(view.result.current.composer?.mode).toBe("comment_or_start"));
     host.read.mockResolvedValue(pendingAnswer());
     act(() => view.result.current.composer!.secondary!.run());
     await waitFor(() => expect(view.result.current.composer?.mode).toBe("recovering"));
@@ -233,5 +235,27 @@ describe("a comment box whose start made a review but didn't add its comment", (
     expect(reuse.label).toBe("Use for a new comment");
     act(() => reuse.run());
     expect(view.result.current.composer?.mode).not.toBe("recovery_gone");
+  });
+
+  const READ_ONLY = [...READS, "GetPendingReview"];
+  it.each([
+    ["no start or add", READ_ONLY, noReviewAnswer(), null],
+    ["a start but no add", [...READ_ONLY, "StartPendingReview"], noReviewAnswer(), null],
+    ["an add but no start", [...READ_ONLY, "AddPendingReviewComment"], noReviewAnswer(), null],
+    ["both", EDITOR, noReviewAnswer(), "comment_or_start"],
+    ["no add, with a review pending", READ_ONLY, pendingAnswer(), null],
+    [
+      "an add, with a review pending",
+      [...READ_ONLY, "AddPendingReviewComment"],
+      pendingAnswer(),
+      "add_to_review",
+    ],
+  ])("offers pending review actions only where served: %s", async (_case, served, read, mode) => {
+    host.read.mockResolvedValue(read);
+    const { view } = await renderComposer(served);
+    await waitFor(() => expect(host.read).toHaveBeenCalled());
+    await waitFor(() => expect(view.result.current.composer?.mode ?? null).toBe(mode));
+    // Where nothing's offered, the box comments as it does today.
+    expect(view.result.current.composer === null).toBe(mode === null);
   });
 });
