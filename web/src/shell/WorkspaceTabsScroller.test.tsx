@@ -163,7 +163,9 @@ describe("WorkspaceTabsScroller compact mode", () => {
     );
 
     const box = screen.getByText("selected").getBoundingClientRect();
-    expect(document.querySelector("[data-compact]")).not.toBeNull();
+    // Scrolled icon-only tabs stay inside the row that opts out of window dragging.
+    expect(document.querySelector("[data-compact]")).toHaveClass("no-drag", "w-max");
+    expect(document.querySelector("[data-compact]")).not.toHaveClass("max-w-full");
     expect(box.left).toBeGreaterThanOrEqual(0);
     expect(box.right).toBeLessThanOrEqual(100);
   });

@@ -1783,6 +1783,19 @@ html[data-electron-mac]
   .workspace-tab-strip {
   padding-left: var(--mac-header-actions-clearance);
 }
+/* The maximized rail covers the chat header, whose hidden controls would still exclude the
+ * rail's tab strip from window dragging. */
+html[data-electron-mac]
+  [data-main-view]:has(
+    aside[aria-label="Workspace"][data-maximized]:is([data-state="open"], [data-rail-state="open"])
+  )
+  > .chat-header {
+  visibility: hidden;
+  /* A visibility transition would keep the controls' regions for its duration. */
+  & * {
+    transition: none;
+  }
+}
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
  * Scoped from <html> to cover portals outside AppShell on macOS only. */
 html[data-electron-mac]
