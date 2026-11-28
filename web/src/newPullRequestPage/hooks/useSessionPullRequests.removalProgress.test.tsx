@@ -15,12 +15,14 @@ import {
   useSessionUnlinkPending,
   useUnlinkSessionPr,
 } from "./useSessionPullRequests";
+import { ANNOUNCE_REFILL_DELAY_MS } from "@/components/pendingChange/announceChange";
 
 // Every announcement the runs make, as they ask for it; the live region still receives each.
 const announced = vi.hoisted(() => [] as string[]);
 vi.mock("@/components/pendingChange/announceChange", async (importOriginal) => {
   const actual = await importOriginal<typeof AnnounceChange>();
   return {
+    ...actual,
     announceChange: (message: string) => {
       announced.push(message);
       actual.announceChange(message);
@@ -90,9 +92,12 @@ function renderProgress(client: QueryClient, conversationId = "conv_1") {
 
 /** What the live region says once its pending write lands. */
 async function spoken(): Promise<string | null> {
-  await act(async () => {
-    await Promise.resolve();
-  });
+  await act(
+    () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, ANNOUNCE_REFILL_DELAY_MS);
+      }),
+  );
   return document.querySelector('[data-testid="change-announcer"]')?.textContent ?? null;
 }
 

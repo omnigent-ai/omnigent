@@ -17,6 +17,7 @@ import {
 import { PullRequestDestinationContext } from "@/pullRequestPage/pullRequestDestination";
 import { PullRequestReviewers } from "./PullRequestReviewers";
 import { typedReviewer } from "../../shell/ReviewerPickerList";
+import { ANNOUNCE_REFILL_DELAY_MS } from "@/components/pendingChange/announceChange";
 
 vi.mock("@/lib/pullRequestRpc", async (importOriginal) =>
   (await import("@/test/pullRequestRpcOverRest")).pullRequestRpcOverRest(await importOriginal()),
@@ -111,6 +112,17 @@ function announced(): string {
   return document.querySelector('[data-testid="change-announcer"]')?.textContent ?? "";
 }
 
+/** What the live region says once its pending refill lands. */
+async function spoken(): Promise<string> {
+  await act(
+    () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, ANNOUNCE_REFILL_DELAY_MS);
+      }),
+  );
+  return announced();
+}
+
 function shownReviewers(): string[] {
   const section = screen.getByRole("heading", { name: "Reviewers" }).closest("section")!;
   return within(section)
@@ -168,7 +180,7 @@ it("checks and unchecks while open, then sends every change at once when it clos
     add: [{ login: "alice", kind: "user" }],
     remove: [{ login: "core", kind: "team" }],
   });
-  expect(announced()).toBe(
+  expect(await spoken()).toBe(
     "Requesting a review from alice; withdrawing the review request from Team core…",
   );
 
@@ -390,13 +402,13 @@ it("keeps a refused withdrawal's failure after its section remounts, until Retry
   const client = renderReviewers([{ login: "core", kind: "team", state: "PENDING" }]);
   fireEvent.click(screen.getByRole("button", { name: "Withdraw review request from Team core" }));
   await waitFor(() => expect(posts).toHaveLength(1));
-  expect(announced()).toBe("Withdrawing the review request from Team core…");
+  expect(await spoken()).toBe("Withdrawing the review request from Team core…");
   await act(async () => posts[0].respond(json({ detail: "Invalid request." }, 400)));
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Couldn’t withdraw the review request from Team core: Invalid request.",
   );
   // Said once, by the alert: the polite region doesn't repeat it.
-  expect(announced()).not.toMatch(/Couldn’t/);
+  expect(await spoken()).not.toMatch(/Couldn’t/);
 
   // The PR was closed and opened again: the failure is still said, read from the cache.
   cleanup();
@@ -417,7 +429,7 @@ it("keeps a refused withdrawal's failure after its section remounts, until Retry
   );
   await waitFor(() => expect(shownReviewers()).toEqual([]));
   expect(screen.queryByRole("alert")).toBeNull();
-  expect(announced()).toBe("Withdrew the review request from Team core.");
+  expect(await spoken()).toBe("Withdrew the review request from Team core.");
 });
 
 it("forgets repeated refusals with one Dismiss, also after a remount", async () => {

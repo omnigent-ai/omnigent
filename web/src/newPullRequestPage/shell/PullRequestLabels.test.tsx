@@ -12,6 +12,7 @@ import {
 } from "@/pullRequestPage/controlRequests";
 import { PullRequestDestinationContext } from "@/pullRequestPage/pullRequestDestination";
 import { PullRequestLabels } from "./PullRequestLabels";
+import { ANNOUNCE_REFILL_DELAY_MS } from "@/components/pendingChange/announceChange";
 
 vi.mock("@/lib/pullRequestRpc", async (importOriginal) =>
   (await import("@/test/pullRequestRpcOverRest")).pullRequestRpcOverRest(await importOriginal()),
@@ -110,6 +111,17 @@ function announced(): string {
   return document.querySelector('[data-testid="change-announcer"]')?.textContent ?? "";
 }
 
+/** What the live region says once its pending refill lands. */
+async function spoken(): Promise<string> {
+  await act(
+    () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, ANNOUNCE_REFILL_DELAY_MS);
+      }),
+  );
+  return announced();
+}
+
 /** Close the picker as Esc does; its checks are applied then. */
 function closePicker() {
   fireEvent.keyDown(screen.getByPlaceholderText("Filter labels…"), { key: "Escape" });
@@ -138,7 +150,7 @@ it("applies the picker's checks when it closes, and keeps the labels the host re
   expect(within(chip).queryByRole("button")).toBeNull();
   await waitFor(() => expect(posts).toHaveLength(1));
   expect(posts[0].body).toEqual({ pr_url: PR_URL, add: ["ready"], remove: [] });
-  expect(announced()).toBe("Adding the label ready…");
+  expect(await spoken()).toBe("Adding the label ready…");
 
   const reported = { ...ready, description: "Reported by GitHub" };
   await act(async () =>
@@ -170,7 +182,7 @@ it("applies several checks as one change once the picker closes", async () => {
   closePicker();
   await waitFor(() => expect(posts).toHaveLength(1));
   expect(posts[0].body).toEqual({ pr_url: PR_URL, add: ["ready", "docs"], remove: ["bug"] });
-  expect(announced()).toBe("Adding the labels ready and docs and removing the label bug…");
+  expect(await spoken()).toBe("Adding the labels ready and docs and removing the label bug…");
   await act(async () =>
     posts[0].respond(json({ object: "session.github.pr_labels", labels: [docs, ready] })),
   );
@@ -253,7 +265,7 @@ it("keeps a refused edit's failure after its section remounts, until Retry goes 
     "Couldn’t remove the label bug: Refused by GitHub.",
   );
   // Said once, by the alert: the polite region doesn't repeat it.
-  expect(announced()).not.toMatch(/Couldn’t/);
+  expect(await spoken()).not.toMatch(/Couldn’t/);
 
   // The PR was closed and opened again: the failure is still said, read from the cache.
   cleanup();
@@ -271,7 +283,7 @@ it("keeps a refused edit's failure after its section remounts, until Retry goes 
   expect(screen.queryByRole("alert")).toBeNull();
   await act(async () => posts[1].respond(json({ object: "session.github.pr_labels", labels: [] })));
   await waitFor(() => expect(shownLabels()).toEqual([]));
-  expect(announced()).toBe("Removed the label bug.");
+  expect(await spoken()).toBe("Removed the label bug.");
 });
 
 it("forgets repeated refusals with one Dismiss", async () => {
