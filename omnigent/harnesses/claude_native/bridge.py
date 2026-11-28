@@ -101,6 +101,8 @@ from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
+from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
+from omnigent.runtime.tool_result_replay import document_omitted_placeholder
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -12063,7 +12065,7 @@ def _stripped_image_placeholder(source: _JsonObject) -> str:
     )
 
 
-def _strip_inline_image_data(value: object) -> object:
+def _strip_inline_image_data(value: object, *, strip_documents: bool = False) -> object:
     """
     Replace base64 image payloads with a lightweight placeholder.
 
@@ -12078,16 +12080,50 @@ def _strip_inline_image_data(value: object) -> object:
     recoverable on demand. Non-image content is returned unchanged.
 
     :param value: Decoded tool-result content (list, dict, or scalar).
+    :param strip_documents: Also replace base64 ``document`` blocks, such as
+        a PDF that Read returns, with a placeholder.
     :returns: The same structure with image base64 data removed.
     """
     if isinstance(value, list):
-        return [_strip_inline_image_data(item) for item in value]
+        return [_strip_inline_image_data(item, strip_documents=strip_documents) for item in value]
     if isinstance(value, dict):
         source = value.get("source")
         if value.get("type") == "image" and isinstance(source, dict):
             return {"type": "text", "text": _stripped_image_placeholder(source)}
-        return {key: _strip_inline_image_data(val) for key, val in value.items()}
+        if (
+            strip_documents
+            and value.get("type") == "document"
+            and isinstance(source, dict)
+            and source.get("type") == "base64"
+        ):
+            media_type = source.get("media_type")
+            return {
+                "type": "text",
+                "text": document_omitted_placeholder(
+                    media_type if isinstance(media_type, str) else None
+                ),
+            }
+        return {
+            key: _strip_inline_image_data(val, strip_documents=strip_documents)
+            for key, val in value.items()
+        }
     return value
+
+
+def _serialized_tool_result(value: object) -> str:
+    """
+    Serialize structured tool-result content for a ``function_call_output``.
+
+    Base64 documents are kept so a cold resume can replay them, unless they
+    would exceed the stored-output cap: clipped base64 cannot be replayed.
+
+    :param value: Decoded tool-result content (list, dict, or scalar).
+    :returns: Compact JSON without inline image data.
+    """
+    output = json.dumps(_strip_inline_image_data(value), separators=(",", ":"))
+    if len(output.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES:
+        return output
+    return json.dumps(_strip_inline_image_data(value, strip_documents=True), separators=(",", ":"))
 
 
 def _completed_subagent_tool_id(entry: _JsonObject) -> str | None:
@@ -12105,7 +12141,8 @@ def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:
 
     Inline base64 image data (e.g. from reading an image file) is
     stripped to a placeholder so the stored output stays small and can
-    be replayed on resume without overflowing the context window.
+    be replayed on resume without overflowing the context window. Base64
+    documents are stripped too when they would exceed the stored-output cap.
 
     :param entry: Decoded Claude transcript record containing
         optional ``toolUseResult`` metadata.
@@ -12116,12 +12153,12 @@ def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:
     if isinstance(content, str):
         return content
     if content is not None:
-        return json.dumps(_strip_inline_image_data(content), separators=(",", ":"))
+        return _serialized_tool_result(content)
     tool_use_result = entry.get("toolUseResult")
     if isinstance(tool_use_result, str):
         return tool_use_result
     if tool_use_result is not None:
-        return json.dumps(_strip_inline_image_data(tool_use_result), separators=(",", ":"))
+        return _serialized_tool_result(tool_use_result)
     return ""
 
 
