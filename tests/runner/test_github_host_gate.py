@@ -584,6 +584,55 @@ def test_github_coms_token_never_follows_a_call_gh_sends_to_the_one_stored_host(
         assert (rc, started) == (1, [])
 
 
+def test_a_fork_branchs_pull_request_found_by_its_commit_is_read_through_the_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """gh can't name the fork branch's PR, so it's found by commit and read from its base."""
+    root = _checkout(tmp_path, {"origin": f"https://{KNOWN}/contributor/repo.git"})
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            root,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "c",
+        ],
+        check=True,
+    )
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", KNOWN)
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    real_run = github_resource._run
+    started: list[list[str]] = []
+    pull_request = {"number": 17, "url": f"https://{KNOWN}/acme/repo/pull/17", "title": "t"}
+
+    def run(argv: list[str], **kwargs: object) -> tuple[int | None, str, str]:
+        if argv[0] == "git":
+            return real_run(argv, **kwargs)  # type: ignore[arg-type]
+        started.append(argv[1:])
+        if argv[1:3] == ["pr", "view"] and argv[3] == "--json":
+            return 1, "", "no pull requests found for branch"
+        if argv[1] == "api" and argv[2].endswith("/pulls"):
+            base = {"ref": "main", "repo": {"full_name": "acme/repo"}}
+            return 0, json.dumps([{"number": 17, "state": "open", "base": base}]), ""
+        if argv[1:4] == ["pr", "view", "17"]:
+            return 0, json.dumps(pull_request), ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(github_resource, "_run", run)
+
+    with github_resource.gh_target_host_scope(github_resource.CHECKOUT_SCOPE):
+        data = github_resource._pr_view_json(root, "number,url,title")
+
+    assert data is not None and data["number"] == 17
+    assert any(argv[:5] == ["pr", "view", "17", "-R", f"{KNOWN}/acme/repo"] for argv in started)
+
+
 @pytest.mark.parametrize(
     "origin", [f"https://{KNOWN}/o/r.git", f"git@{KNOWN}:o/r.git", f"{KNOWN}:o/r.git"]
 )

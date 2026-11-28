@@ -452,7 +452,7 @@ def test_github_info_pr_via_commit_fork_fallback(
             return (0, json.dumps([row]), "")
         # The full object is fetched from the PR's base repo via explicit -R.
         if tuple(argv[:2]) == ("pr", "view") and "-R" in argv:
-            assert argv[argv.index("-R") + 1] == "acme/repo"
+            assert argv[argv.index("-R") + 1] == "github.com/acme/repo"
             assert argv[2] == "77"
             return (0, json.dumps(pr), "")
         return (1, "", "no stub")
@@ -528,7 +528,7 @@ def test_resolve_pr_via_commit_prefers_open(repo: Path, monkeypatch: pytest.Monk
         return (1, "", "no stub")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
-    assert github_resource._resolve_pr_via_commit(str(repo)) == (2, "acme/repo")
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (2, "acme/repo", "github.com")
 
 
 def test_resolve_pr_via_commit_rejects_closed_only(
@@ -582,7 +582,7 @@ def test_resolve_pr_via_commit_skips_checkout_on_up_to_date_base(
         return (1, "", "no stub")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
-    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo", "github.com")
     _run(["git", "checkout", "-q", "main"], repo)
     assert github_resource._resolve_pr_via_commit(str(repo)) is None
 
@@ -613,7 +613,7 @@ def test_resolve_pr_via_commit_ignores_same_named_repo_on_another_host(
     }
     _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
 
-    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo", "github.com")
     _run(["git", "checkout", "-q", "main"], repo)
     assert github_resource._resolve_pr_via_commit(str(repo)) is None
 
@@ -643,7 +643,7 @@ def test_resolve_pr_via_commit_keeps_open_pr_without_base_tracking_ref(
     }
     _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
 
-    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo", "github.com")
 
 
 def test_resolve_pr_via_commit_picks_later_open_pr_after_skipping_one(
@@ -667,7 +667,7 @@ def test_resolve_pr_via_commit_picks_later_open_pr_after_skipping_one(
     ]
     _stub_gh(monkeypatch, {("api",): (0, json.dumps(rows), "")})
 
-    assert github_resource._resolve_pr_via_commit(str(repo)) == (271, "acme/repo")
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (271, "acme/repo", "github.com")
 
 
 def test_resolve_pr_via_commit_none_without_repo(

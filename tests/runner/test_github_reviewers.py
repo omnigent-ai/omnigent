@@ -373,7 +373,11 @@ def test_commit_resolved_pr_preserves_data_without_reviewer_fields() -> None:
     data = _pr_data()
     del data["reviewRequests"], data["latestReviews"]
     with (
-        patch.object(github_resource, "_resolve_pr_via_commit", return_value=(17, "acme/widgets")),
+        patch.object(
+            github_resource,
+            "_resolve_pr_via_commit",
+            return_value=(17, "acme/widgets", "github.com"),
+        ),
         patch.object(github_resource, "_resolved_base_nwo", return_value="acme/widgets"),
         patch.object(
             github_resource,
@@ -387,7 +391,13 @@ def test_commit_resolved_pr_preserves_data_without_reviewer_fields() -> None:
         ) as run_gh,
     ):
         assert github_resource._pr_view_json("/workspace", github_resource._PR_VIEW_FIELDS) == data
-    assert run_gh.call_args_list[-2].args[0][:5] == ["pr", "view", "17", "-R", "acme/widgets"]
+    assert run_gh.call_args_list[-2].args[0][:5] == [
+        "pr",
+        "view",
+        "17",
+        "-R",
+        "github.com/acme/widgets",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -1092,8 +1092,8 @@ def _contained_in_base_branch(root: str, sha: str, remotes: Sequence[str], base_
     return False
 
 
-def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int, str] | None:
-    """Resolve ``(PR number, base owner/repo)`` by pushed-commit identity, or ``None``.
+def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int, str, str] | None:
+    """Resolve ``(PR number, base owner/repo, host)`` by pushed-commit identity, or ``None``.
 
     Branch-name-independent: asks GitHub which PR a pushed commit belongs to
     (``repos/{owner}/{repo}/commits/{sha}/pulls``), so it finds the PR even when a
@@ -1165,7 +1165,7 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
         base_repo = base.get("repo") if isinstance(base, dict) else None
         base_full = base_repo.get("full_name") if isinstance(base_repo, dict) else None
         if isinstance(number, int) and isinstance(base_full, str) and "/" in base_full:
-            return number, base_full
+            return number, base_full, host
     return None
 
 
@@ -1382,14 +1382,15 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
     resolved = _resolve_pr_via_commit(root, token=token)
     if resolved is None:
         return None
-    number, base_repo = resolved
+    number, base_repo, host = resolved
     # First-run convenience: point gh's default at the PR's real base so the
     # agent's own `gh` in the terminal targets it too. Only when unset, so a
     # manual `gh repo set-default` is never overridden; best-effort — resolution
     # itself doesn't need it (the explicit ``-R`` below carries the base).
     if not _resolved_base_nwo(root):
         _gh(["repo", "set-default", base_repo], cwd=root, token=token)
-    return _gh_pr_view([str(number), "-R", base_repo], fields, cwd=root, token=token)
+    # The base repo is on the host the commit was found on; gh needs it named.
+    return _gh_pr_view([str(number), "-R", f"{host}/{base_repo}"], fields, cwd=root, token=token)
 
 
 def _repo_payload(name_with_owner: str | None, url: object) -> dict[str, Any]:
