@@ -1,0 +1,92 @@
+/* The page header's two rows: the pull request with where it's read, then its sections. */
+.pr-page-header {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.375rem;
+  padding: 0.5rem 0.75rem;
+}
+/* Always one line. The fit folds or hides what doesn't fit; the name truncates meanwhile, as in
+   the frame a resize paints before the fit catches up, so nothing moves to a second line. */
+.pr-page-header-top {
+  display: flex;
+  min-width: 0;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.375rem 0.5rem;
+}
+.pr-page-header-identity {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 0.5rem;
+}
+.pr-page-header-badges {
+  flex-shrink: 0;
+}
+/* In the narrowest header, the top row's parts sit closer, at half their usual gap. */
+.pr-page-header[data-spacing="tight"] .pr-page-header-top,
+.pr-page-header[data-spacing="tight"] .pr-page-header-identity {
+  column-gap: 0.25rem;
+}
+/* Takes what the row leaves and keeps the read source in its far corner, where it truncates. */
+.pr-page-header-source {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 0;
+  justify-content: flex-end;
+}
+.pr-page-header-source > button {
+  overflow: hidden;
+}
+/* Down to its icon, the source keeps its size; the number truncates if anything must. */
+.pr-page-header[data-source="icon"] .pr-page-header-source {
+  flex: 1 0 auto;
+}
+/* The sections lead their row; the actions keep to its end. */
+/* One line: where the tabs and actions can't share it, the fit offers the picker instead. */
+.pr-page-header-navigation {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.5rem;
+}
+/* With no actions, the tabs keep the whole row, and no gap goes unmeasured. */
+.pr-page-header [data-header-part="actions"]:empty {
+  display: none;
+}
+.pr-page-header-sections {
+  display: flex;
+  /* As tall as the tabs, so folding them into the shorter picker never moves the page. */
+  min-height: 2rem;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+}
+/* The tabs keep their labels' width, as the reference's do. A narrow pane shares the row between
+   them; the shared tabs drop their icons there, in their measuring copies too. */
+@container (width < 28rem) {
+  .pr-page-header [data-header-tabs] {
+    width: 100%;
+  }
+  .pr-page-header [data-header-tabs] > [role="tab"] {
+    flex: 1 1 0;
+  }
+}
+.pr-page-header[data-sections="menu"] .pr-page-header-sections {
+  flex: 0 1 auto;
+}
+/* Measured, never shown: laid out at their natural width, outside the rows. */
+.pr-page-header-sizers {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  width: max-content;
+  gap: 0.5rem;
+  visibility: hidden;
+  pointer-events: none;
+  contain: layout;
+}
