@@ -232,8 +232,15 @@ def gh_target_host_scope(host: str | None) -> Iterator[None]:
 
 
 def _default_github_host() -> str:
-    """Where ``gh`` sends a call that names no host and reads no checkout."""
-    return (os.environ.get("GH_HOST") or "").strip().lower() or "github.com"
+    """Where ``gh`` sends a call that names no host and reads no checkout.
+
+    As ``gh`` picks it: ``GH_HOST``, else the host ``hosts.yml`` lists when it lists just
+    one, else github.com.
+    """
+    if gh_host := (os.environ.get("GH_HOST") or "").strip().lower():
+        return gh_host
+    stored = _gh_signed_in_hosts()
+    return next(iter(stored)) if len(stored) == 1 else "github.com"
 
 
 def checkout_github_host(root: str) -> str | None:
@@ -1045,6 +1052,12 @@ def _commit_lookup_repo(root: str) -> str | None:
     return _remote_nwo(root, _commit_lookup_remote(root))
 
 
+def _commit_lookup_host(root: str) -> str | None:
+    """The host of the remote the branch was pushed to, which ``gh api`` must be told."""
+    rc, url, _ = _git(["remote", "get-url", _commit_lookup_remote(root)], cwd=root)
+    return host_of(url.strip()) if rc == 0 else None
+
+
 def _commit_lookup_remote(root: str) -> str:
     """The branch's tracking remote if it names a repo, else ``origin``."""
     rc, br, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
@@ -1114,7 +1127,8 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     """
     shas = _head_commit_shas(root)
     repo = _commit_lookup_repo(root)
-    if not shas or not repo:
+    host = _commit_lookup_host(root)
+    if not shas or not repo or not host:
         return None
     base_remotes: dict[str, list[str]] | None = None
     on_base_branch: dict[tuple[str, str, str], bool] = {}
@@ -1138,7 +1152,11 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
         return not on_base_branch[key]
 
     for sha in shas:
-        rc, out, _ = _gh(["api", f"repos/{repo}/commits/{sha}/pulls"], cwd=root, token=token)
+        rc, out, _ = _gh(
+            ["api", f"repos/{repo}/commits/{sha}/pulls", "--hostname", host],
+            cwd=root,
+            token=token,
+        )
         if rc != 0:
             continue
         try:

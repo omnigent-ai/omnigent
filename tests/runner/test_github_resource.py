@@ -505,6 +505,7 @@ def test_resolve_pr_via_commit_prefers_open(repo: Path, monkeypatch: pytest.Monk
     """When one commit maps to several PRs (a stack), the open one is chosen, and
     the PR's own base repo is returned alongside the number."""
     monkeypatch.setattr(github_resource, "_commit_lookup_repo", lambda _root: "acme/repo")
+    monkeypatch.setattr(github_resource, "_commit_lookup_host", lambda _root: "github.com")
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
@@ -527,6 +528,7 @@ def test_resolve_pr_via_commit_rejects_closed_only(
     """Only closed/merged rows → None. On master the endpoint returns the merged
     PR that introduced the tip; that's a false positive, not the branch's PR."""
     monkeypatch.setattr(github_resource, "_commit_lookup_repo", lambda _root: "mlflow/mlflow")
+    monkeypatch.setattr(github_resource, "_commit_lookup_host", lambda _root: "github.com")
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None

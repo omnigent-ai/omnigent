@@ -498,6 +498,10 @@ def test_a_configured_host_with_its_own_login_never_gets_the_enterprise_token(
 def test_a_call_naming_no_host_gets_the_tokens_of_where_it_goes(
     environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # With two stored logins, gh sends a hostless call to github.com.
+    (environment / "hosts.yml").write_text(
+        f"github.com:\n    user: octo\n{STORED}:\n    user: octo\n", encoding="utf-8"
+    )
     assert _passed_tokens("github.com", ["api", "user"]) == {"GH_TOKEN", "GITHUB_TOKEN"}
     monkeypatch.setenv("GH_HOST", KNOWN)
     enterprise = {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
@@ -584,6 +588,76 @@ def test_an_older_gh_answers_the_sign_in_listing_from_each_hosts_status(
         ["auth", "status", "-h", "github.com"],
         ["auth", "status", "-h", STORED],
     ]
+
+
+@pytest.mark.parametrize(
+    ("stored", "gh_host", "default"),
+    [
+        ([], None, "github.com"),
+        ([STORED], None, STORED),
+        (["github.com", STORED], None, "github.com"),
+        ([OTHER_KNOWN, STORED], None, "github.com"),
+        ([STORED], KNOWN, KNOWN),
+    ],
+)
+def test_a_call_naming_no_host_goes_where_gh_sends_it(
+    environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stored: list[str],
+    gh_host: str | None,
+    default: str,
+) -> None:
+    """GH_HOST, else hosts.yml's host when it lists just one, else github.com."""
+    (environment / "hosts.yml").write_text(
+        "".join(f"{host}:\n    user: octo\n" for host in stored), encoding="utf-8"
+    )
+    if gh_host:
+        monkeypatch.setenv("GH_HOST", gh_host)
+
+    assert github_resource._default_github_host() == default
+
+
+def test_github_coms_token_never_follows_a_call_gh_sends_to_the_one_stored_host(
+    environment: Path, started: list[list[str]]
+) -> None:
+    """With hosts.yml listing one host, gh sends a hostless call there, GH_TOKEN and all."""
+    with github_resource.gh_target_host_scope("github.com"):
+        rc, _, _ = github_resource._gh(["api", "user"], cwd="/workspace")
+
+    assert (rc, started) == (1, [])
+    assert _passed_tokens(STORED, ["api", "user"]) == set()
+
+
+def test_the_commit_lookup_names_the_host_the_branch_was_pushed_to(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _checkout(tmp_path, {"origin": f"https://{KNOWN}/o/r.git"})
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            root,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "c",
+        ],
+        check=True,
+    )
+    asked: list[list[str]] = []
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        asked.append(argv)
+        return 0, "[]", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+
+    assert github_resource._resolve_pr_via_commit(root) is None
+    assert asked and all(argv[-2:] == ["--hostname", KNOWN] for argv in asked)
 
 
 def test_a_sandbox_passes_no_environment_token_and_a_chosen_one_replaces_them(
