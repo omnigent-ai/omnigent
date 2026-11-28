@@ -1014,3 +1014,22 @@ async def test_a_template_grantee_creates_their_own_gadget_without_opening_it(
     assert (
         await client.post(f"{base}/from-template", json={}, headers=_as("carol@example.com"))
     ).status_code == 404
+
+
+async def test_template_routes_are_off_where_gadgets_cant_be_shared(
+    stores: SimpleNamespace, tmp_path: Path
+) -> None:
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    unshared = SimpleNamespace(
+        **{**vars(stores), "permissions": SqlAlchemyPermissionStore(stores.db_uri)}
+    )
+    async for client in _client(_app(unshared, tmp_path)):
+        info = (await client.get("/v1/info")).json()
+        assert info["gadget_sharing"] is False and info["gadget_templates"] is False
+        gadget = await _published(client)
+        listed = await client.get("/v1/gadgets/templates", headers=_as(ALICE))
+        made = await client.post(
+            f"/v1/gadgets/{gadget['id']}/from-template", json={}, headers=_as(ALICE)
+        )
+        assert listed.status_code == 403 and made.status_code == 403, (listed.text, made.text)
