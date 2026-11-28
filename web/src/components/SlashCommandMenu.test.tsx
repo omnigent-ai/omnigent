@@ -21,6 +21,25 @@ import {
 
 afterEach(cleanup);
 
+describe("exact command match ranking", () => {
+  const skills = { "/team-1on1s": "Plan 1:1s", "/team": "Orchestrate a team" };
+
+  it("puts an exact name ahead of longer names that start with it", () => {
+    expect(rankedSlashCommandNames(skills, "team", new Set())).toEqual(["/team", "/team-1on1s"]);
+    expect(rankedSlashCommandNames(skills, "TEAM", new Set())).toEqual(["/team", "/team-1on1s"]);
+  });
+
+  it("keeps the exact name first within its group, and built-ins above skills", () => {
+    const commands = { "/teams-sync": "", "/team-1on1s": "", "/team": "", "/teammate": "" };
+    expect(rankedSlashCommandNames(commands, "team", new Set(["/teammate"]))).toEqual([
+      "/teammate",
+      "/team",
+      "/teams-sync",
+      "/team-1on1s",
+    ]);
+  });
+});
+
 describe("builtin command matching", () => {
   it("matches /new by its command name rather than a display alias", () => {
     expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "n")).toContain("/new");
