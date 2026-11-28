@@ -503,16 +503,26 @@ def build_native_controls(
             return False
         lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
         async with lock:
+            terminal = registry.get(conv_id, "codex", "main")
+            failed_process = getattr(failed_backend, "proc", None)
+            current_state = await asyncio.to_thread(read_bridge_state, bridge_dir)
             if (
-                resource_registry.terminal_resource_role(
+                resource_registry.terminal_registry is not registry
+                or terminal is None
+                or registry.get(conv_id, "codex", "main") is not terminal
+                or resource_registry.terminal_resource_role(
                     conv_id, terminal_resource_id("codex", "main")
                 )
                 != CODEX_NATIVE_TERMINAL_ROLE
-                or read_bridge_state(bridge_dir) != state
+                or current_state != state
             ):
                 return False
             backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
-            if backend is None or backend is not failed_backend:
+            if (
+                backend is None
+                or backend is not failed_backend
+                or backend.proc is not failed_process
+            ):
                 return False
             if backend.bridge_dir != bridge_dir or (
                 backend.proc is not None and backend.proc.returncode is None
