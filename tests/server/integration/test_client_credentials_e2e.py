@@ -57,6 +57,7 @@ def _build_app(
     machine_client: bool = True,
     device_grant: bool = False,
     partial_machine_config: bool = False,
+    machine_sub: str = _MACHINE_SUB,
 ) -> SimpleNamespace:
     """Build an accounts-mode app, with or without the machine client configured.
 
@@ -68,6 +69,7 @@ def _build_app(
         ``POST /oauth/token`` with this grant — both dispatch from it.
     :param partial_machine_config: When True, set only one ``OMNIGENT_MACHINE_*``
         variable, which the config parser rejects as an operator error.
+    :param machine_sub: The machine client's principal.
     :returns: The built app and its permission store.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -101,7 +103,7 @@ def _build_app(
         monkeypatch.setenv(
             "OMNIGENT_MACHINE_CLIENT_SECRET_HASH", hash_secret(_CLIENT_SECRET, _COOKIE_SECRET)
         )
-        monkeypatch.setenv("OMNIGENT_MACHINE_SUB", _MACHINE_SUB)
+        monkeypatch.setenv("OMNIGENT_MACHINE_SUB", machine_sub)
         monkeypatch.setenv("OMNIGENT_MACHINE_TOKEN_TTL", "1800")
     if partial_machine_config:
         monkeypatch.setenv("OMNIGENT_MACHINE_CLIENT_ID", _CLIENT_ID)
@@ -363,6 +365,66 @@ async def test_machine_client_owns_and_operates_its_own_session(env: SimpleNames
     # Delete its own session (the owner-only path).
     deleted = await env.client.delete(f"/v1/sessions/{session_id}", headers=auth)
     assert deleted.status_code == 200, deleted.text
+
+
+async def test_share_with_a_mixed_case_machine_subject_reaches_the_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sign-in lowercases human accounts, but the machine keeps its subject's exact case.
+
+    A share typed as the machine's subject must reach the machine token, not a
+    human account whose username is that subject lowercased.
+    """
+    from omnigent.db.utils import clear_engine_cache
+
+    built = _build_app(tmp_path, monkeypatch, machine_sub="BuildBot")
+    transport = httpx.ASGITransport(app=built.app)
+    try:
+        async with (
+            httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+            httpx.AsyncClient(transport=transport, base_url="http://test") as human,
+        ):
+            machine_auth = {"Authorization": f"Bearer {await _mint_token(client)}"}
+            admin_auth = {"Authorization": f"Bearer {await _login_grant_token(client)}"}
+            invite = await client.post("/auth/invite", json={}, headers=admin_auth)
+            assert invite.status_code == 200, invite.text
+            registered = await human.post(
+                "/auth/register",
+                json={
+                    "invite": invite.json()["token"],
+                    "username": "buildbot",
+                    "password": "buildbot-pw-1234",
+                },
+            )
+            assert registered.status_code == 200, registered.text
+            created = await client.post(
+                "/v1/sessions",
+                data={"metadata": "{}"},
+                files={
+                    "bundle": (
+                        "agent.tar.gz",
+                        build_agent_bundle(name="cc-shared-agent"),
+                        "application/gzip",
+                    )
+                },
+                headers=admin_auth,
+            )
+            assert created.status_code == 201, created.text
+            session_id = created.json()["session_id"]
+
+            shared = await client.put(
+                f"/v1/sessions/{session_id}/permissions",
+                json={"user_id": "BuildBot", "level": 1},
+                headers=admin_auth,
+            )
+
+            assert shared.status_code == 200, shared.text
+            assert shared.json()["user_id"] == "BuildBot"
+            machine_view = await client.get(f"/v1/sessions/{session_id}", headers=machine_auth)
+            assert machine_view.status_code == 200, machine_view.text
+            assert (await human.get(f"/v1/sessions/{session_id}")).status_code == 404
+    finally:
+        clear_engine_cache()
 
 
 # Paths off the delegated allowlist that a machine token must never reach:

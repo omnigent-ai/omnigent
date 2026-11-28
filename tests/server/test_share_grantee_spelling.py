@@ -57,6 +57,19 @@ def test_session_share_is_revoked_in_the_spelling_it_was_granted_in(setup_app, g
     assert alice.get(f"/v1/sessions/{session_id}").status_code == 404
 
 
+def test_session_revoke_removes_a_legacy_mixed_case_grant_as_given(setup_app):  # noqa: F811
+    admin, _, stores, _ = setup_app
+    session_id = create_session(admin).json()["session_id"]
+    path = f"/v1/sessions/{session_id}/permissions"
+    stores["permission_store"].ensure_user("Alice")
+    stores["permission_store"].grant("Alice", session_id, 1)
+    assert admin.put(path, json={"user_id": "alice", "level": 1}).status_code == 200
+    revoked = admin.delete(f"{path}/Alice")
+    assert revoked.status_code == 204, revoked.text
+    listed = admin.get(path).json()["permissions"]
+    assert sorted(grant["user_id"] for grant in listed) == ["admin", "alice"]
+
+
 @pytest.mark.parametrize("spelling", _GRANTEE_SPELLINGS)
 def test_read_only_grantee_leaves_a_session_in_any_spelling_of_their_name(setup_app, spelling):  # noqa: F811
     admin, alice, _, _ = setup_app

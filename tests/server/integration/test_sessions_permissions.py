@@ -625,16 +625,17 @@ async def test_read_grant_allows_get_but_blocks_post_events(
 async def test_header_mode_grant_keeps_the_grantee_case(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """The proxy's identity is used as-is, so a grant matches only the case it was given in."""
+    """The proxy's identity is used as-is, so a grant drops outer space but keeps its case."""
     session_id = (await _create_session_as(auth_client, "", "owner@example.com"))["id"]
     resp = await _grant_permission(
         auth_client,
         session_id,
         granter="owner@example.com",
-        target_user="Bob@Example.com",
+        target_user="  Bob@Example.com ",
         level=LEVEL_READ,
     )
     assert resp.status_code == 200, resp.text
+    assert resp.json()["user_id"] == "Bob@Example.com"
     for identity, status in (("Bob@Example.com", 200), ("bob@example.com", 404)):
         resp = await auth_client.get(
             f"/v1/sessions/{session_id}", headers={"X-Forwarded-Email": identity}
@@ -2067,28 +2068,6 @@ async def test_grant_valid_level_succeeds(
         f"Grant with valid level=2 should return 200, got {resp.status_code}."
     )
     assert resp.json()["level"] == LEVEL_EDIT, "Returned level should match the granted level."
-
-
-async def test_grant_stores_the_canonical_grantee_id(
-    auth_client: httpx.AsyncClient,
-) -> None:
-    """The grant route stores the grantee as canonicalized, not as typed.
-
-    Header mode keeps case, so only the outer space is dropped here; the
-    lowercasing modes are covered by the ``canonical_grantee_id`` unit tests.
-    """
-    s1 = await _create_session_as(auth_client, "", "bryan")
-
-    resp = await _grant_permission(
-        auth_client,
-        s1["id"],
-        granter="bryan",
-        target_user="  Someone@Example.com ",
-        level=LEVEL_READ,
-    )
-
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["user_id"] == "Someone@Example.com"
 
 
 # ── Pagination with permission filter ──────────────────────
