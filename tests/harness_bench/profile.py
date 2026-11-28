@@ -65,6 +65,16 @@ class BenchProfile:
     auth: str = ""
     implementation: str = ""
     declared: Mapping[str, Verdict] = field(default_factory=dict)
+    label: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        """Row key for reports and progress: ``label`` when set, else ``harness``.
+
+        ``--harness NAME=MODEL`` sets the label so one harness probed on several
+        models gets one row per model instead of sharing a row.
+        """
+        return self.label or self.harness
 
     def declared_for(self, probe_name: str) -> Verdict:
         """Return the declared verdict for *probe_name* (``UNKNOWN`` if unclaimed)."""
