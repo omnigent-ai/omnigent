@@ -375,7 +375,10 @@ async def test_tool_call_deny_with_default_policy(
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"] == "POLICY_ACTION_DENY"
-    assert body["reason"] == "Bash is blocked by admin policy."
+    assert (
+        body["reason"]
+        == 'Bash is blocked by admin policy. (policy "admin__deny_bash" from server default)'
+    )
 
     # Read → ALLOW (the policy only denies Bash).
     resp2 = await client.post(
@@ -384,6 +387,44 @@ async def test_tool_call_deny_with_default_policy(
     )
     assert resp2.status_code == 200
     assert resp2.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_same_named_policies_do_not_guess_source(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An allowing agent policy cannot be mistaken for a same-named default deny."""
+    policy = FunctionPolicySpec(
+        name="shared",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout, default_policies=[policy]
+        ),
+    )
+    agent = await create_test_agent(
+        client,
+        guardrails={
+            "policies": {
+                "shared": {
+                    "type": "function",
+                    "function": {
+                        "path": "omnigent.policies.builtins.cost.cost_budget",
+                        "arguments": {"max_cost_usd": 5.0},
+                    },
+                }
+            }
+        },
+    )
+    session_id = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate", json=_tool_call_request("Bash")
+    )
+    assert resp.status_code == 200
+    assert resp.json()["reason"] == 'Bash is blocked by admin policy. (policy "shared")'
 
 
 async def test_deny_verdict_log_carries_deciding_policy_workspace_id(
@@ -427,6 +468,7 @@ async def test_deny_verdict_log_carries_deciding_policy_workspace_id(
         )
     assert resp.status_code == 200
     assert resp.json()["result"] == "POLICY_ACTION_DENY"
+    assert '(policy "admin__deny_bash" from workspace 7780)' in resp.json()["reason"]
 
     verdict_logs = [
         r.getMessage() for r in caplog.records if "policy_eval_verdict" in r.getMessage()
@@ -471,7 +513,10 @@ async def test_tool_result_deny_with_default_policy(
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"] == "POLICY_ACTION_DENY"
-    assert body["reason"] == "Output contains sensitive data."
+    assert body["reason"] == (
+        'Output contains sensitive data. (policy "admin__deny_sensitive_output" '
+        "from server default)"
+    )
 
     # Clean tool result → ALLOW.
     resp2 = await client.post(
@@ -611,7 +656,9 @@ async def test_evaluate_endpoint_passes_actor_to_policy(
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"] == "POLICY_ACTION_DENY"
-    assert body["reason"] == "Blocked user"
+    assert (
+        body["reason"] == 'Blocked user (policy "admin__deny_blocked_actor" from server default)'
+    )
 
 
 async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
@@ -668,7 +715,9 @@ async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
     assert body["result"] == "POLICY_ACTION_DENY", (
         "persisted turn actor label should override the request user_id"
     )
-    assert body["reason"] == "Blocked user"
+    assert (
+        body["reason"] == 'Blocked user (policy "admin__deny_blocked_actor" from server default)'
+    )
 
 
 async def test_evaluate_body_actor_field_is_ignored(
@@ -753,7 +802,9 @@ async def test_evaluate_falls_back_to_request_user_id_when_no_turn_actor(
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"] == "POLICY_ACTION_DENY"
-    assert body["reason"] == "Blocked user"
+    assert (
+        body["reason"] == 'Blocked user (policy "admin__deny_blocked_actor" from server default)'
+    )
 
 
 # ── Native ASK gate (URL-based elicitation) ──────────────────
@@ -1030,6 +1081,38 @@ def test_native_ask_gate_lock_keys_by_session_and_policy() -> None:
         _native_ask_gate_lock("19b2d8e5c4e1733f25034907cb7d05ed", "session_cost_guard")
         is not lock_a
     )
+
+
+@pytest.mark.parametrize("phase", ["PHASE_REQUEST", "PHASE_TOOL_CALL"])
+async def test_cost_deny_names_agent_policy(
+    client: httpx.AsyncClient, db_uri: str, phase: str
+) -> None:
+    """A native hook exposes the deciding agent-spec budget to the user."""
+    agent = await create_test_agent(
+        client,
+        guardrails={
+            "policies": {
+                "session_cost": {
+                    "type": "function",
+                    "function": {
+                        "path": "omnigent.policies.builtins.cost.cost_budget",
+                        "arguments": {"max_cost_usd": 5.0},
+                    },
+                }
+            }
+        },
+    )
+    session_id = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_session_usage(session_id, {"total_cost_usd": 6.0})
+    payload = (
+        {"event": {"type": phase, "data": "continue"}}
+        if phase == "PHASE_REQUEST"
+        else _tool_call_request("Bash")
+    )
+    response = await client.post(f"/v1/sessions/{session_id}/policies/evaluate", json=payload)
+    assert response.status_code == 200
+    assert response.json()["result"] == "POLICY_ACTION_DENY"
+    assert '(policy "session_cost" from agent spec)' in response.json()["reason"]
 
 
 async def test_concurrent_cost_asks_serialize_and_collapse_sibling(

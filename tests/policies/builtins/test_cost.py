@@ -210,6 +210,17 @@ def test_over_budget_denies_all_models_by_default() -> None:
         assert "All model calls are blocked" in result["reason"]
 
 
+@pytest.mark.parametrize("event", [_request, _tool])
+def test_hard_stop_default_and_explicit_downgrade_gate(event: Any) -> None:
+    """An explicit list changes the hard stop to a model-specific gate."""
+    hard_stop = cost_budget(max_cost_usd=5.0)
+    downgrade_gate = cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
+
+    assert hard_stop(event(6.0, model="haiku"))["result"] == "DENY"
+    assert downgrade_gate(event(6.0, model="haiku"))["result"] == "ALLOW"
+    assert downgrade_gate(event(6.0, model="opus"))["result"] == "DENY"
+
+
 def test_deny_reason_for_codex_points_to_terminal() -> None:
     """A codex-native session's deny reason says to switch in the terminal.
 
