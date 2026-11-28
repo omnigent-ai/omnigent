@@ -1,7 +1,7 @@
 # Sandbox providers
 
 Omnigent supports running agent hosts in remote sandboxes. Built-in providers
-(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
+(Modal, Daytona, Boat, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
 Boxlite, Kubernetes, microsandbox)
 ship with the core package. Third-party packages can add new providers through
 the `omnigent.sandbox_providers` entrypoint group.
