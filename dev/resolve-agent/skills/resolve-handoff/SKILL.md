@@ -222,7 +222,8 @@ readiness; name pending publication/review steps in `remaining_work`.
   impact. This narrative does not certify execution or replace `test_audit`.
 - `remaining_work` — a list of specific unresolved behavior, required checks, or
   delivery steps for `partially_fixed`; empty when none remain. Resolved original
-  facets do not hide a regression or an uncovered required boundary.
+  facets do not hide a regression or an uncovered required boundary. List first
+  any deliverable the report explicitly requested that you did not produce.
 - `hermetic_check` — the result of the Step 2B.5 hostile-env re-run when the diff
   touched env-derived defaults: which added/edited tests you re-ran with ambient
   vars set and that they still passed. Empty string when not applicable (no such

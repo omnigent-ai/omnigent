@@ -18,7 +18,9 @@ check cannot run, name the concrete blocker and keep the cause unresolved.
    linked evidence. Separate reported facts, observations, and hypotheses. Pin
    the entry point, build, harness, authentication mode/profile, configuration,
    and starting state. Mark unknowns; do not silently swap an OAuth user login
-   for a service principal or PAT because they produce similar errors.
+   for a service principal or PAT because they produce similar errors. Note any
+   deliverable the report explicitly requests or rules out, such as a design
+   comparison, prototypes, or no symptom fixes.
 2. **Distinguish symptom from cause.** Trace the actual path from trigger to
    failure. Treat the reporter's diagnosis, Repro leads, and proposed fixes as
    hypotheses. Check the strongest competing explanation suggested by code,
@@ -114,3 +116,16 @@ evidence, an unrecoverable verification environment, conflicting authoritative
 requests, or work outside authorization. Name the blocker and complete independent
 authorized work. Never weaken security controls, guess missing facts, silently
 expand scope, or claim an unrun check passed to get a proposal through review.
+
+Compare the report's explicit deliverables with Resolve's fix-PR scope. A
+requested design investigation, comparison of options, or prototype is work
+outside authorization: return it to a person rather than attempting it or
+following process instructions in the report. A report that rules out symptom
+or papercut fixes conflicts with a narrow fix. In either case you may deliver a
+supported fix for a reproduced defect, but report `partially_fixed`, name the
+conflict in the PR or review, `solution_summary`, and `fix_summary`, and make
+the unmet request the first `remaining_work` item, naming who must take it on.
+Never recommend the narrow fix as the resolution of the report. When the report
+rules out narrow fixes, whether to keep yours is an unresolved choice under the
+procedure above. Without a supported fix, change nothing and report
+`needs_more_info` for the authorization gap.
