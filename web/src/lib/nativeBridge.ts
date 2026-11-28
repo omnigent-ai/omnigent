@@ -20,6 +20,8 @@
 //   * This module never throws: a broken/old shell must not take down
 //     notifications in the browser path.
 
+import type { CodeHostDesktopApi, CodeHostDesktopFeatures } from "./nativeBridgeCodeHost";
+
 /**
  * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
  * `move` are live drag frames carrying an open fraction; `open` and `close`
@@ -231,7 +233,7 @@ export interface NativeViewModeParams {
  * server-served and may be newer than the installed shell, whose preload then
  * lacks these methods.
  */
-interface ElectronDesktopApi extends NativeShellApi {
+interface ElectronDesktopApi extends NativeShellApi, CodeHostDesktopApi {
   kind: "electron";
   /** The runner picked during onboarding for this server, returned once. */
   takeOnboardingRunner?: () => Promise<OnboardingRunner | null>;
@@ -350,6 +352,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => () => void;
   /** Report which menu commands this page can run now (fire-and-forget). */
   setDesktopCommandState?: (state: DesktopCommandState) => void;
+  /** The menu commands this shell routes to the page; absent on shells from before the list. */
+  desktopCommands?: readonly string[];
   /** Report the conversation this page has loaded, or null for none (fire-and-forget). */
   reportConversationShown?: (conversationId: string | null) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
@@ -491,6 +495,8 @@ export interface DesktopCommandState {
   commands: DesktopCommand[];
   sessionPinned: boolean;
   sessionArchived: boolean;
+  /** An open pick list has the keyboard and steps on Ctrl-N / Ctrl-P, which the menu then leaves. */
+  pickListFocused?: boolean;
 }
 
 /** One importable site tree and how many cookies a profile holds for it. */
@@ -627,7 +633,7 @@ export function workspaceSocketBridge():
  * Desktop-shell feature gates the server can't know about. All fields
  * optional: an older shell reports fewer.
  */
-export interface DesktopFeatures {
+export interface DesktopFeatures extends CodeHostDesktopFeatures {
   /**
    * Managed features (e.g. the Arca host option) are enabled.
    * Already scoped by the shell: true only when the flag is set AND the
@@ -889,7 +895,7 @@ export function serverManifestOf(info: ServerPickerInfo | null): ServerManifest 
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */
-function electronApi(): ElectronDesktopApi | undefined {
+export function electronApi(): ElectronDesktopApi | undefined {
   if (typeof window === "undefined") return undefined;
   const api = (window as unknown as { omnigentDesktop?: ElectronDesktopApi }).omnigentDesktop;
   return api?.kind === "electron" ? api : undefined;
@@ -1025,6 +1031,16 @@ export function supportsDesktopCommands(): boolean {
     typeof electron?.onDesktopCommand === "function" &&
     typeof electron.setDesktopCommandState === "function"
   );
+}
+
+/**
+ * True when the shell's menu routes every one of `commands` to this page, by the list it
+ * advertises. A shell from before that list may still route some, so it answers false.
+ */
+export function shellRoutesDesktopCommands(commands: readonly DesktopCommand[]): boolean {
+  if (!supportsDesktopCommands()) return false;
+  const routed = electronApi()?.desktopCommands;
+  return Array.isArray(routed) && commands.every((command) => routed.includes(command));
 }
 
 /** Subscribe to native menu commands; a no-op outside a supporting shell. */
@@ -1970,3 +1986,5 @@ export async function droppedFilePath(file: File): Promise<string | null> {
     return null;
   }
 }
+
+export * from "./nativeBridgeCodeHost";

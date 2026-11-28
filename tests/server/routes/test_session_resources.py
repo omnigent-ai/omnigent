@@ -4111,7 +4111,7 @@ def test_pr_attachments_fit_one_tunnel_frame() -> None:
     from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
     largest = routes_resources._MAX_PR_ATTACHMENT_BYTES
-    assert largest == pr_resource._MAX_VIDEO_ATTACHMENT_BYTES
+    assert largest == pr_resource.MAX_VIDEO_ATTACHMENT_BYTES
     encoded_length = 4 * -(-largest // 3)  # base64's exact output length
     assert encoded_length < RUNNER_TUNNEL_MAX_MESSAGE_BYTES * 0.95
 

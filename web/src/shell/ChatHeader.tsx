@@ -6,6 +6,7 @@ import {
   BotIcon,
   EllipsisVerticalIcon,
   FileIcon,
+  FlagIcon,
   FolderPlusIcon,
   GitCompareIcon,
   GitForkIcon,
@@ -16,6 +17,7 @@ import {
   Maximize2Icon,
   MessagesSquareIcon,
   PanelLeftIcon,
+  PanelsTopLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   SearchIcon,
@@ -57,6 +59,9 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOmnigentAnalytics } from "@/lib/analytics";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { activeUiFeatureOverrides } from "@/lib/uiFeatureOverrides";
+import { openFeatureFlagsPicker } from "@/store/featureFlagsPicker";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
@@ -137,6 +142,8 @@ interface MobileSessionMenuProps {
   showSideChats: boolean;
   /** Open the mobile side-chats drawer. */
   onOpenSideChats: () => void;
+  /** The gadgets shown beside the session; each opens over it. */
+  gadgets?: readonly { key: string; label: string; onSelect: () => void }[];
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -165,6 +172,8 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** The URL-owned workspace can lag a warm header switch. */
+  workspaceConversationId?: string | null;
   workingDirectory?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
@@ -238,6 +247,8 @@ interface ChatHeaderProps {
   rightPanelOpen: boolean;
   /** Toggle the right workspace panel. */
   onToggleRightPanel: () => void;
+  /** The open Workspace sidebar has its own Collapse button, so the header's toggle only opens it. */
+  rightPanelCollapsesItself?: boolean;
   /** Show dependency-free disabled chrome while the server session is pending. */
   pending?: boolean;
   /** Gating + handlers for the mobile session-menu FAB. */
@@ -363,6 +374,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  workspaceConversationId = conversationId,
   workingDirectory,
   permissionLevel,
   actionConversation = null,
@@ -388,12 +400,17 @@ export function ChatHeader({
   hasRailContent,
   rightPanelOpen,
   onToggleRightPanel,
+  rightPanelCollapsesItself = false,
   pending = false,
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
   // Floating panes give the switch to the chat pane's own strip.
-  const viewToggleHost = useChatPaneViewToggleHost(conversationId);
+  const viewToggleHost = useChatPaneViewToggleHost(workspaceConversationId ?? undefined);
+  const info = useServerInfo();
+  const overrides = activeUiFeatureOverrides(info);
+  const overrideNames = overrides.map(({ label, value }) => `${label} ${value ? "On" : "Off"}`);
+  const overrideLabel = `UI feature flags overridden: ${overrideNames.join(", ")}`;
   const canvas = useCanvasWorkspace();
   useCanvasHeaderPaletteCommands(canvas);
   const { trackClick } = useOmnigentAnalytics();
@@ -502,6 +519,16 @@ export function ChatHeader({
             Side chats
           </DropdownMenuItem>
         )}
+        {mobileMenu.gadgets?.map((gadget) => (
+          <DropdownMenuItem
+            key={gadget.key}
+            onSelect={gadget.onSelect}
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <PanelsTopLeftIcon className="size-4 shrink-0" />
+            <span className="min-w-0 truncate">{gadget.label}</span>
+          </DropdownMenuItem>
+        ))}
         {/* Shells — the mobile entry into the session's shells
             (desktop has no Shells tab; it opens shells as soft tabs):
             visible when a real shell exists, or when the agent spec
@@ -614,6 +641,12 @@ export function ChatHeader({
         !conversationId && "pointer-events-none *:pointer-events-auto",
         settingsMode && !sidebarOpen && "settings-mobile-header",
       )}
+      // Collapsed, the sidebar's toggle ends the row where its own Collapse button sits open.
+      data-corner-toggle={
+        conversationId && hasRailContent && rightPanelCollapsesItself && !rightPanelOpen && !canvas
+          ? ""
+          : undefined
+      }
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
           back-to-parent link (when this is a sub-agent session). The
@@ -678,6 +711,23 @@ export function ChatHeader({
       </div>
 
       <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:empty:hidden">
+        {overrides.length > 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <MobileHeaderButton
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={overrideLabel}
+                onClick={openFeatureFlagsPicker}
+                className="text-warning border-none"
+              >
+                <FlagIcon aria-hidden className="size-4" />
+              </MobileHeaderButton>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{overrideLabel}</TooltipContent>
+          </Tooltip>
+        )}
         {isMobile && !settingsMode && (
           <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
         )}
@@ -876,7 +926,7 @@ export function ChatHeader({
         ) : null}
         {/* Beside the right-panel toggle: both show or hide a panel on the right. */}
         {!pending && conversationId && sessionOverviewControl}
-        {conversationId && hasRailContent && (
+        {conversationId && hasRailContent && !(rightPanelOpen && rightPanelCollapsesItself) && (
           <Tooltip>
             <TooltipTrigger asChild>
               <Button

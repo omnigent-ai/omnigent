@@ -14,6 +14,7 @@ import {
   nextFileActionRequest,
   useFileActionStore,
 } from "./fileCommands/fileActionStore";
+import type { GoToFileHostProps } from "./goToFile/GoToFileHost";
 import type { ShowAllPullRequestsCommandProps } from "./workspaceCommands/useShowAllPullRequestsCommand";
 import type * as WorkspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
 
@@ -96,6 +97,29 @@ export function loadShowAllPullRequestsCommand(
 
 /** Registers ⌘K's Show all pull requests for a tabs sidebar session; loaded with the sidebar. */
 export const LazyShowAllPullRequestsCommand = lazy(() => loadShowAllPullRequestsCommand());
+
+interface GoToFileHostModule {
+  GoToFileHost: ComponentType<GoToFileHostProps>;
+}
+
+/**
+ * Go to File's host, or nothing when its code can't load: no session is offered, so its entry
+ * points say it's unavailable rather than the shell breaking.
+ */
+export function loadGoToFileHost(
+  load: () => Promise<GoToFileHostModule> = () => import("./goToFile/GoToFileHost"),
+): Promise<{ default: ComponentType<GoToFileHostProps> }> {
+  return load().then(
+    (module) => ({ default: module.GoToFileHost }),
+    (error: unknown) => {
+      console.error("[go-to-file] couldn't load Go to File:", error);
+      return { default: () => null };
+    },
+  );
+}
+
+/** Go to File and Search Text for a tabs sidebar session; loaded with the sidebar. */
+export const LazyGoToFileHost = lazy(() => loadGoToFileHost());
 
 export { useTabsSidebar } from "./useTabsSidebar";
 

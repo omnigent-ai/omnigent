@@ -83,8 +83,10 @@ export function WorkspaceTabsHost({
   });
   // A focused browser page hands its app chords to the sidebar that binds history, one per window.
   const canReopen = useCanReopenTab(conversationId);
+  // A drawer and a grid cell never fill the window, so their pages keep ⇧⌘F.
+  const canFullScreen = panelProps.placement !== "drawer" && !panelProps.contained;
   useBrowserForwardedChords(
-    bindsHistory ? tabsSidebarForwardedShortcuts(canReopen) : NO_FORWARDED_SHORTCUTS,
+    bindsHistory ? tabsSidebarForwardedShortcuts(canReopen, canFullScreen) : NO_FORWARDED_SHORTCUTS,
   );
   const historyProps = useMemo(
     () => (bindsHistory ? { historyCommands, onHistoryGo: go } : {}),
@@ -112,6 +114,7 @@ export function WorkspaceTabsHost({
       <CloseShellDialog
         open={shellClose.question !== null && shellClose.question.count === 1}
         shellLabel={shellClose.question?.label ?? null}
+        busy={shellClose.question?.busy}
         onCancel={() => shellClose.answerQuestion(false)}
         onConfirm={() => shellClose.answerQuestion(true)}
       />

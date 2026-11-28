@@ -1362,6 +1362,7 @@ tool_groups:
   user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
   memory: false           # memory_search / _get / _list / _write / _delete
   files: true             # sys_files_upload / sys_files_list / sys_files_download (off by default)
+  gadgets: false          # sys_gadget_* (gadgets: describe, create, records, actions, comments, revisions)
 ```
 
 Every group except `files` defaults to `true`, so omitting the block changes
@@ -1373,10 +1374,13 @@ requires the server's `workflows` feature flag, which defaults off; enable it
 with `OMNIGENT_FEATURES=workflows` on the server. The `user_inbox` group, which
 posts to and reads the session owner's Inbox, requires the server's `user_inbox`
 feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox`.
+The `gadgets` group requires the server's `gadgets` feature flag, which
+defaults off; enable it with `OMNIGENT_FEATURES=gadgets` on the server.
 Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt, and
 disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
-[Session journal](session-journal.md)). The block is read the same way from a
+[Session journal](session-journal.md)), and disabling `gadgets` drops the
+agent-facing `gadget` skill. The block is read the same way from a
 `config.yaml` bundle and a single-file agent YAML.
 
 The `memory` group is the long-term memory tools. It applies only when the server

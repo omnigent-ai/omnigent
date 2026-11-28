@@ -39,6 +39,7 @@ import {
 } from "./sessionWorkspaceState";
 import { notifyTerminalThemeChanged } from "./terminalThemePreferences";
 import {
+  notifyWorkspaceTabPreferencesChanged,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
@@ -201,5 +202,6 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   if (previousDefault !== readDefaultWorkspaceTab()) {
     resetSessionWorkspaceTabSelections();
   }
+  notifyWorkspaceTabPreferencesChanged();
   return count;
 }

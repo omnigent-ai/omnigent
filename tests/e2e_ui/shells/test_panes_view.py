@@ -31,6 +31,7 @@ import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from tests.e2e_ui._shell_states import wait_until_shells_read
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, open_right_rail
 
 _AGENT_NAME = "panes_demo"
@@ -187,8 +188,9 @@ def test_split_move_between_list_and_close_panes_in_the_terminal_view(
     expect(shell).to_be_focused()
     shell_strip = panes.get_by_role("toolbar", name=re.compile(r"^zsh · .* pane$"))
     shell_strip.click(button="right")
+    # Once the runner reads the shell idle at its prompt, Close Pane ends it without asking.
+    wait_until_shells_read(base_url, session_id, ["idle"])
     page.get_by_role("menuitem", name="Close Pane").click()
-    page.get_by_role("button", name="Close shell").click()
     expect(panes.get_by_test_id("terminal-view")).to_have_count(1, timeout=30_000)
     expect(panes.locator(_AGENT_PANE)).to_be_visible()
 
@@ -275,8 +277,9 @@ def test_a_tabs_sidebar_shell_splits_keeps_both_shells_through_a_reload_and_clos
             "data-state", "connected", timeout=60_000
         )
 
+    # Once the runner reads both shells idle at their prompts, the split closes without asking.
+    wait_until_shells_read(base_url, session_id, ["idle", "idle"])
     sidebar.get_by_role("button", name=re.compile(r"^Close zsh · .* \+1$")).click()
-    page.get_by_role("button", name="Close shells").click()
     expect(sidebar.get_by_test_id("terminal-view")).to_have_count(0, timeout=30_000)
     expect(sidebar.get_by_role("tab", name=re.compile(r"^zsh · "))).to_have_count(0)
 

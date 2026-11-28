@@ -71,7 +71,8 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
-from omnigent.git_providers import host_of
+from omnigent.git_providers import EnvInstances, host_of
+from omnigent.git_providers.github import GitHubProvider
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
@@ -102,6 +103,20 @@ _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
 # The host the current panel step's ``gh`` calls are for, set by the provider facet.
 _gh_target_host: ContextVar[str | None] = ContextVar("gh_target_host", default=None)
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
+# The token one pull request action resolved up front, by the PR's URL (see _one_pr_account).
+_bound_pr_token: ContextVar[tuple[str, str | None] | None] = ContextVar(
+    "bound_pr_token", default=None
+)
+
+
+@dataclass
+class GhCallCount:
+    """How many ``gh`` processes started inside a :func:`_gh_call_count_scope`."""
+
+    started: int = 0
+
+
+_gh_call_count: ContextVar[GhCallCount | None] = ContextVar("gh_call_count", default=None)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
 # reviews, labels, and the merge fields feed the Summary and Comments tabs.
@@ -262,6 +277,8 @@ def _gh(
             _gh_timed_out.set(True)
             return None, "", "gh deadline exceeded"
     invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
+    if (count := _gh_call_count.get()) is not None:
+        count.started += 1
     result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     if (
         deadline is not None
@@ -286,6 +303,17 @@ def _gh_deadline_scope(deadline: float) -> Iterator[None]:
     finally:
         _gh_timed_out.reset(timed_out_token)
         _gh_deadline.reset(deadline_token)
+
+
+@contextmanager
+def _gh_call_count_scope() -> Iterator[GhCallCount]:
+    """Count every ``gh`` process the block starts, including inside other helpers."""
+    count = GhCallCount()
+    token = _gh_call_count.set(count)
+    try:
+        yield count
+    finally:
+        _gh_call_count.reset(token)
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -365,6 +393,17 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     return rc == 0, []
 
 
+def _known_github_host(host: str) -> bool:
+    """Whether the user set ``host`` up for GitHub: github.com, ``GH_HOST``, a configured
+    GitHub instance, or a host with a stored ``gh`` login.
+
+    It never runs ``gh``. A pull request URL can name any host, and with an enterprise token
+    in the environment ``gh`` treats every host but github.com as signed in, so a command or
+    check naming an unknown host would send that token there.
+    """
+    return GitHubProvider().matches_host(host, EnvInstances())
+
+
 def _gh_signed_in_to_host(root: str, host: str) -> bool:
     """Whether ``gh`` reports a login on ``host``.
 
@@ -416,6 +455,14 @@ def _workspace_key(root: str) -> str | None:
 def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
     """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
     rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _gh_active_token(root: str, host: str = "github.com") -> str | None:
+    """Return the token of ``gh``'s active account on *host* (never logged)."""
+    rc, out, _ = _gh(["auth", "token", "-h", host], cwd=root)
     if rc != 0:
         return None
     return out.strip() or None
@@ -656,6 +703,8 @@ def _timeline_payload(raw: Any) -> dict[str, Any]:
 _LABEL_COLOR = re.compile(r"[0-9a-fA-F]{6}")
 # The label picker lists at most this many of the repository's labels.
 _MAX_REPO_LABELS = 1000
+# A label search answers its best matches, enough for one picker page.
+_MAX_LABEL_MATCHES = 50
 # Every ``gh`` call of one label, reviewer, or merge request shares this budget,
 # under the 20-second waits of the server and the host tunnel.
 _PR_EDIT_REQUEST_SECONDS = 15.0
@@ -1169,12 +1218,20 @@ def _repo_argument(ref: PullRequestRef) -> str:
 
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        return bound[1]
     if _in_sandbox():
         return None
     login = _config.github_account_preference(_repo_argument(reference))
     if login:
         return _gh_auth_token(root, login, reference.host)
     return None
+
+
+_ACTIVE_ACCOUNT_UNREADABLE = (
+    "Couldn't read the host's GitHub sign-in. Nothing was sent; sign in with gh and try again."
+)
 
 
 def _signed_out_account(login: str) -> str:
@@ -1198,6 +1255,35 @@ def _write_token(root: str, reference: PullRequestRef, *, timed_out: str) -> str
     if login and token is None:
         raise ValueError(_signed_out_account(login))
     return token
+
+
+@contextmanager
+def _one_pr_account(root: str, reference: PullRequestRef, *, timed_out: str) -> Iterator[None]:
+    """Run every read and write in the block as one account: the one chosen at its start.
+
+    The token is looked up once, and a chosen login without one refuses before anything is
+    read, so a check can't run as one account and the write it guards as another. With no
+    login chosen, the active account's token is bound, so switching it mid-action can't
+    split one either. Only a sandbox, which has a single identity, runs without a token.
+    """
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        yield
+        return
+    sandbox = _in_sandbox()
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        token = _write_token(root, reference, timed_out=timed_out)
+        if token is None and not sandbox:
+            token = _gh_active_token(root, reference.host)
+            if _gh_timed_out.get():
+                raise ValueError(timed_out)
+            if token is None:
+                raise ValueError(_ACTIVE_ACCOUNT_UNREADABLE)
+    binding = _bound_pr_token.set((reference.url, token))
+    try:
+        yield
+    finally:
+        _bound_pr_token.reset(binding)
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
@@ -1982,11 +2068,15 @@ def _pr_file_contents(
     }
 
 
-def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
-    """List the PR repository's labels by name for the label picker.
+def _repo_labels(root: str, reference: PullRequestRef, *, text: str = "") -> dict[str, Any]:
+    """List the PR repository's labels for the label picker, by name or by best match.
 
+    :param text: Words to match in a label's name or description; empty lists them all.
     :raises ValueError: When ``gh`` cannot list them within :data:`_PR_EDIT_REQUEST_SECONDS`.
     """
+    limit = _MAX_LABEL_MATCHES if text else _MAX_REPO_LABELS
+    # ``--search=`` keeps text that starts with a dash from reading as a flag.
+    search = [f"--search={text}"] if text else []
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         _host_args(root, reference)
         rc, out, _ = _gh(
@@ -1995,11 +2085,12 @@ def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
                 "list",
                 "-R",
                 _repo_argument(reference),
+                *search,
                 "--json",
                 "name,color,description",
                 "--limit",
                 # One past the cap tells a full list from a truncated one.
-                str(_MAX_REPO_LABELS + 1),
+                str(limit + 1),
             ],
             cwd=root,
             token=_pr_token(root, reference),
@@ -2011,10 +2102,11 @@ def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
     except ValueError as exc:
         raise ValueError("GitHub returned an unexpected label list") from exc
     raw = raw if isinstance(raw, list) else []
-    labels = sorted(
-        _shape_labels(raw[:_MAX_REPO_LABELS]), key=lambda label: str(label["name"]).casefold()
-    )
-    return {"object": "list", "data": labels, "has_more": len(raw) > _MAX_REPO_LABELS}
+    labels = _shape_labels(raw[:limit])
+    if not text:
+        labels.sort(key=lambda label: str(label["name"]).casefold())
+    # A search keeps gh's best-match order.
+    return {"object": "list", "data": labels, "has_more": len(raw) > limit}
 
 
 def _labels_api(

@@ -22,12 +22,12 @@ export interface SelectionActionHandlers {
   onAttachToAgent: () => void;
 }
 
-const ADD_COMMENT = {
+export const ADD_COMMENT = {
   label: "Add comment",
   icon: MessageSquarePlusIcon,
   keywords: ["comment", "selection", "note", "review", "annotate"],
 };
-const ATTACH_TO_AGENT = {
+export const ATTACH_TO_AGENT = {
   label: "Attach to agent",
   icon: AtSignIcon,
   keywords: ["attach", "selection", "lines", "agent", "composer", "mention"],

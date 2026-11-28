@@ -369,42 +369,10 @@ _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_SERVER_NAME = "omnigent"
-# agy auto-approves a relay tool when it is named in the server's ``enabledTools``
-# allowlist (agy's per-server MCP schema; mirrors cursor's ``autoApprove``).
-# Omnigent's own TOOL_CALL policy + elicitation gate still applies on the server
-# side, so auto-approving the agy-side MCP gate only avoids a hidden in-terminal
-# prompt blocking the call before Omnigent ever sees it.
-_AGY_ENABLED_TOOLS = [
-    "list_comments",
-    "sys_add_policy",
-    "sys_agent_download",
-    "sys_agent_get",
-    "sys_agent_list",
-    "sys_call_async",
-    "sys_cancel_async",
-    "sys_cancel_task",
-    "sys_list_models",
-    "sys_os_edit",
-    "sys_os_read",
-    "sys_os_shell",
-    "sys_os_write",
-    "sys_policy_registry",
-    "sys_project_list",
-    "sys_project_update",
-    "sys_session_close",
-    "sys_session_create",
-    "sys_session_get_history",
-    "sys_session_get_info",
-    "sys_session_list",
-    "sys_session_send",
-    "sys_session_update",
-    "sys_terminal_close",
-    "sys_terminal_launch",
-    "sys_terminal_list",
-    "sys_terminal_read",
-    "sys_terminal_send",
-    "update_comment",
-]
+# agy auto-approves MCP calls via ``permissions.allow`` in settings.json (NOT
+# ``enabledTools`` in mcp_config.json, which is a visibility allowlist that
+# hides omitted tools). Omnigent's server-side policy/elicitation stays active.
+_AGY_MCP_ALLOW_RULE = f"mcp({_MCP_SERVER_NAME}/*)"
 
 # Files copied from the user's real ``~/.gemini`` into the per-session isolated
 # Gemini dir for platforms whose agy auth provider uses file-backed credentials,
@@ -500,10 +468,12 @@ def build_mcp_config(
 ) -> dict[str, object]:
     """Build agy's ``mcp_config.json`` payload for the Omnigent relay server.
 
-    Mirrors cursor #742's :func:`omnigent.harnesses.cursor_native.bridge.build_mcp_config`
-    but emits agy's per-server MCP schema (lowercase ``command`` / ``args`` /
-    ``env`` keys plus ``enabledTools``, agy's auto-approve allowlist — verified
-    against agy 1.0.12's config struct) under the top-level ``mcpServers`` key.
+    Mirrors cursor's :func:`omnigent.harnesses.cursor_native.bridge.build_mcp_config`
+    using agy's per-server MCP schema (lowercase ``command`` / ``args`` / ``env``)
+    under top-level ``mcpServers``. ``enabledTools`` is intentionally omitted so
+    agy exposes every tool dynamically advertised by ``serve-mcp``; agy-side
+    auto-approval is configured separately in isolated ``settings.json`` via
+    :data:`_AGY_MCP_ALLOW_RULE`.
     The server command is the SAME shared relay claude/codex/cursor use:
     ``<python> -I -m omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>``.
 
@@ -534,7 +504,6 @@ def build_mcp_config(
                     "--bridge-dir",
                     str(bridge_dir),
                 ],
-                "enabledTools": list(_AGY_ENABLED_TOOLS),
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
                     # Pin the relay to the RUNNER's real home and data dir so its
@@ -545,6 +514,36 @@ def build_mcp_config(
             }
         }
     }
+
+
+def write_agent_instructions(bridge_dir: Path, instructions: str | None) -> Path | None:
+    """Write composed startup text as a private, always-on agy rule."""
+    gemini_dir = agy_gemini_dir(bridge_dir)
+    path = gemini_dir / "config" / "rules" / "omnigent_instructions.md"
+    try:
+        contained = gemini_dir.resolve().is_relative_to(bridge_dir.resolve()) and (
+            path.parent.resolve().is_relative_to(gemini_dir.resolve())
+        )
+    except RuntimeError:
+        contained = False
+    if not contained:
+        raise ValueError("Antigravity startup rules must stay inside the isolated Gemini dir.")
+    if instructions is None or not instructions.strip():
+        path.unlink(missing_ok=True)
+        return None
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="omnigent_instructions.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("---\ntrigger: always_on\n---\n\n")
+            handle.write(instructions)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+    return path
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
@@ -676,6 +675,7 @@ def seed_isolated_agy_home(
             os.chmod(dst, 0o600)
 
     _seed_isolated_agy_settings(real_home, iso_gemini)
+    _seed_isolated_agy_mcp_permissions(bridge_dir)
     _seed_isolated_agy_onboarding_marker(real_home, iso_gemini)
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
@@ -712,6 +712,105 @@ def _seed_isolated_agy_settings(real_home: Path, iso_gemini: Path) -> None:
         with contextlib.suppress(OSError):
             iso_settings.write_bytes(real_settings.read_bytes())
             os.chmod(iso_settings, 0o600)
+
+
+def _seed_isolated_agy_mcp_permissions(bridge_dir: Path) -> None:
+    """Ensure ``permissions.allow`` in isolated ``settings.json`` permits the Omnigent relay.
+
+    Merges :data:`_AGY_MCP_ALLOW_RULE` without disturbing existing permission
+    rules or other keys. Malformed or non-object files are left untouched.
+
+    :param bridge_dir: The session-owned bridge directory.
+    """
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    settings_path = iso_gemini / "antigravity-cli" / "settings.json"
+    try:
+        contained = iso_gemini.resolve().is_relative_to(bridge_dir.resolve()) and (
+            settings_path.parent.resolve().is_relative_to(iso_gemini.resolve())
+        )
+    except (OSError, RuntimeError):
+        contained = False
+    if not contained:
+        _logger.warning("Skipping agy relay permissions outside the isolated session")
+        return
+    data: dict[str, object] = {}
+    if settings_path.is_file():
+        try:
+            raw = settings_path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            _logger.warning(
+                "Could not read agy settings.json at %s; leaving permissions untouched",
+                settings_path,
+            )
+            return
+        if raw.strip():
+            try:
+                loaded = json.loads(raw)
+            except ValueError:
+                _logger.warning(
+                    "Could not parse agy settings.json at %s; leaving permissions untouched",
+                    settings_path,
+                )
+                return
+            if not isinstance(loaded, dict):
+                _logger.warning(
+                    "agy settings.json at %s is not a JSON object; leaving permissions untouched",
+                    settings_path,
+                )
+                return
+            data = loaded
+
+    raw_perms = data.get("permissions")
+    if raw_perms is None:
+        perms: dict[str, object] = {}
+    elif isinstance(raw_perms, dict):
+        perms = dict(raw_perms)
+    else:
+        _logger.warning(
+            "agy settings.json permissions at %s is not a JSON object; leaving untouched",
+            settings_path,
+        )
+        return
+
+    raw_allow = perms.get("allow")
+    if raw_allow is None:
+        allow: list[object] = []
+    elif isinstance(raw_allow, list):
+        allow = list(raw_allow)
+    else:
+        _logger.warning(
+            "agy settings.json permissions.allow at %s is not a list; leaving untouched",
+            settings_path,
+        )
+        return
+
+    if _AGY_MCP_ALLOW_RULE in allow:
+        return
+    allow.append(_AGY_MCP_ALLOW_RULE)
+    perms["allow"] = allow
+    data["permissions"] = perms
+
+    try:
+        settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, settings_path)
+        finally:
+            with contextlib.suppress(OSError):
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+    except OSError:
+        _logger.warning(
+            "Could not write agy settings.json at %s to allow Omnigent MCP tools",
+            settings_path,
+            exc_info=True,
+        )
 
 
 def _seed_isolated_agy_onboarding_marker(real_home: Path, iso_gemini: Path) -> None:

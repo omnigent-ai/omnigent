@@ -4,22 +4,33 @@ import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { StickToBottom } from "use-stick-to-bottom";
 import type * as StickToBottomModule from "use-stick-to-bottom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type { Bubble } from "@/lib/renderItems";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
-import { type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
+import {
+  type PaletteCommand,
+  unavailableBecause,
+  usePaletteCommandsStore,
+} from "@/store/paletteCommands";
 
 import type { UserMessageBlock } from "@/lib/blocks";
+import type * as HotkeysModule from "@/lib/hotkeys";
 import { writePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import { useChatStore } from "@/store/chatStore";
 
 import { useStopResponsePaletteCommand } from "./stopResponse";
 import { Transcript } from "./Transcript";
+import { NO_PROMPT_YET } from "./latestMessageCommands";
 import { AT_NEWEST_MESSAGE, TranscriptPaletteCommands } from "./TranscriptPaletteCommands";
 
+const platform = vi.hoisted(() => ({ mac: false }));
+vi.mock("@/lib/hotkeys", async (importOriginal) => ({
+  ...(await importOriginal<typeof HotkeysModule>()),
+  isMacPlatform: () => platform.mac,
+}));
 const clipboard = vi.hoisted(() => ({
   text: vi.fn(async (_text: string) => {}),
   markdown: vi.fn(async (_text: string) => {}),
@@ -174,6 +185,31 @@ describe("TranscriptPaletteCommands", () => {
     act(() => command("Fork from latest response…").run());
     expect(openForkDialog).toHaveBeenCalledWith({ upToResponseId: "r1" });
   });
+
+  it("steps through the prompts as ⌘⌥↑ and ⌘⌥↓ do, once there is one", () => {
+    const messageNav = { goPrev: vi.fn(), goNext: vi.fn() };
+    const { rerender } = render(
+      <TranscriptPaletteCommands conversationId="c1" bubbles={BUBBLES} messageNav={messageNav} />,
+      { wrapper: withFlag(true) },
+    );
+    const previous = command("Go to previous message");
+    expect([previous.shortcut, command("Go to next message").shortcut]).toEqual([
+      "message.previous",
+      "message.next",
+    ]);
+    act(() => previous.run());
+    act(() => command("Go to next message").run());
+    expect([messageNav.goPrev.mock.calls.length, messageNav.goNext.mock.calls.length]).toEqual([
+      1, 1,
+    ]);
+
+    rerender(
+      <TranscriptPaletteCommands conversationId="c1" bubbles={[]} messageNav={messageNav} />,
+    );
+    for (const label of ["Go to previous message", "Go to next message"]) {
+      expect(command(label).availability).toEqual(unavailableBecause(NO_PROMPT_YET));
+    }
+  });
 });
 
 function userBlock(itemId: string, content: UserMessageBlock["content"]): UserMessageBlock {
@@ -257,5 +293,87 @@ describe("useStopResponsePaletteCommand", () => {
     expect(command("Stop response").availability?.available).toBe(false);
     rerender({ working: false, readOnly: false });
     expect(command("Stop response").availability?.available).toBe(false);
+  });
+});
+
+/** The real transcript of conversation c1, holding whatever `useChatStore` holds. */
+function renderTranscript(quickPick: boolean) {
+  const Flag = withFlag(quickPick);
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter initialEntries={["/c/c1"]}>
+        <Flag>
+          <Transcript
+            setConversationEl={vi.fn()}
+            containerEl={null}
+            scroller={null}
+            setScroller={vi.fn()}
+            sendScrollNonce={0}
+            hasMoreHistory={false}
+            loadingMoreHistory={false}
+            isMobileViewport={false}
+            showsWorking={false}
+            agentsError={null}
+            sandboxLaunching={false}
+            spacerMeasureRef={{ current: null }}
+          />
+        </Flag>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+/** Dispatches a keydown on the window and says whether something handled it. */
+function press(init: KeyboardEventInit): boolean {
+  const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+  window.dispatchEvent(event);
+  return event.defaultPrevented;
+}
+
+describe("Transcript message steps", () => {
+  // Pinned off macOS, where the steps' chords use Ctrl.
+  beforeEach(() => {
+    platform.mac = false;
+  });
+
+  it.each([
+    [false, true],
+    [true, false],
+  ])(
+    "steps messages on Ctrl+Alt+Shift+↑ off macOS only with quick_pick_palette off (on: %s)",
+    (quickPick, shiftSteps) => {
+      useChatStore.setState({
+        conversationId: "c1",
+        blocks: [userBlock("u1", [{ type: "input_text", text: "Fix the parser" }])],
+      });
+      renderTranscript(quickPick);
+      // Ctrl+Alt+↑ steps either way; with the flag, Shift added is Previous session's.
+      expect(press({ key: "ArrowUp", ctrlKey: true, altKey: true })).toBe(true);
+      expect(press({ key: "ArrowUp", ctrlKey: true, altKey: true, shiftKey: true })).toBe(
+        shiftSteps,
+      );
+    },
+  );
+
+  it("steps from ⌘K and the keyboard through one shared position", () => {
+    useChatStore.setState({
+      conversationId: "c1",
+      blocks: [
+        userBlock("u1", [{ type: "input_text", text: "Fix the parser" }]),
+        userBlock("u2", [{ type: "input_text", text: "Now the lexer" }]),
+      ],
+    });
+    const landedOn: (string | undefined)[] = [];
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(function (this: Element) {
+      landedOn.push(this.closest<HTMLElement>("[data-user-message-id]")?.dataset.userMessageId);
+    });
+    renderTranscript(true);
+
+    act(() => command("Go to previous message").run());
+    act(() => {
+      press({ key: "ArrowUp", ctrlKey: true, altKey: true });
+    });
+    act(() => command("Go to next message").run());
+    expect(landedOn).toEqual(["u2", "u1", "u2"]);
   });
 });

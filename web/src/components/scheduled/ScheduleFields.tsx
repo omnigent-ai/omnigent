@@ -89,6 +89,7 @@ export function ScheduleFields({
   sessionMode = "new",
   executionTarget,
   subhourSupported = false,
+  newSandboxSubhourSupported = false,
   onChange,
   timezone,
   onTimezoneChange,
@@ -104,6 +105,7 @@ export function ScheduleFields({
   sessionMode?: "new" | "continue";
   executionTarget?: "connected_host" | "managed_sandbox";
   subhourSupported?: boolean;
+  newSandboxSubhourSupported?: boolean;
   onChange: (next: ScheduleModel) => void;
   timezone: string;
   onTimezoneChange: (timezone: string) => void;
@@ -122,8 +124,13 @@ export function ScheduleFields({
   // The visual schedule to return to when RRULE text has no visual equivalent.
   const [visualBeforeRule, setVisualBeforeRule] = useState<ScheduleModel | null>(null);
   const minuteSchedulesSupported =
-    minimumScheduleInterval("minutely", sessionMode, subhourSupported, executionTarget) ===
-    MIN_SUBHOUR_MINUTE_INTERVAL;
+    minimumScheduleInterval(
+      "minutely",
+      sessionMode,
+      subhourSupported,
+      executionTarget,
+      newSandboxSubhourSupported,
+    ) === MIN_SUBHOUR_MINUTE_INTERVAL;
   // Both editors save the same minute recurrence; saved rules reopen as Interval.
   const [customMinutes, setCustomMinutes] = useState(false);
   const [timezoneOpen, setTimezoneOpen] = useState(false);
@@ -154,7 +161,7 @@ export function ScheduleFields({
       : null;
   const error = validateSchedule(
     { ...model, end: undefined },
-    { sessionMode, subhourSupported, executionTarget },
+    { sessionMode, subhourSupported, executionTarget, newSandboxSubhourSupported },
   );
   const endingError =
     activeDateInput?.error ??
@@ -194,6 +201,7 @@ export function ScheduleFields({
           sessionMode,
           subhourSupported,
           executionTarget,
+          newSandboxSubhourSupported,
         );
     } else if (value === "custom") {
       if (model.preset === "weekdays") next.customFreq = "weekly";
@@ -214,6 +222,7 @@ export function ScheduleFields({
         sessionMode,
         subhourSupported,
         executionTarget,
+        newSandboxSubhourSupported,
       );
       next.interval = Math.max(minimum, next.interval || minimum);
     } else if (model.customFreq === "minutely") next.interval = 1;
@@ -278,6 +287,7 @@ export function ScheduleFields({
         sessionMode,
         subhourSupported,
         executionTarget,
+        newSandboxSubhourSupported,
       )}
       max={minutely ? MAX_MINUTE_INTERVAL : 366}
       step={1}

@@ -21,6 +21,13 @@ import { InboxPage } from "./InboxPage";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as approvalCard from "@/components/blocks/ApprovalCard";
+import type * as InboxPaletteCommandsModule from "./inboxPaletteCommands";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import {
+  chooseSettingValue,
+  expectSetting,
+  registeredPaletteCommands,
+} from "@/test/paletteCommands";
 import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
@@ -87,6 +94,18 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useAutomationInbox", () => ({ useAutomationInbox: vi.fn() }));
+// Counts renders of the Inbox's ⌘K commands, which render nothing themselves.
+const inboxPaletteCommands = vi.hoisted(() => ({ renders: 0 }));
+vi.mock("./inboxPaletteCommands", async (importOriginal) => {
+  const original = await importOriginal<typeof InboxPaletteCommandsModule>();
+  return {
+    ...original,
+    InboxPaletteCommands: (props: Parameters<typeof original.InboxPaletteCommands>[0]) => {
+      inboxPaletteCommands.renders += 1;
+      return original.InboxPaletteCommands(props);
+    },
+  };
+});
 vi.mock("@/hooks/useProactiveInbox", () => ({ useProactiveInbox: vi.fn() }));
 // The settings query: `settings` undefined with `available` means still loading
 // or failed, which the page must not read as "no suggestions".
@@ -180,13 +199,17 @@ function commentInboxStub(overrides: Partial<CommentInbox> = {}): CommentInbox {
 function renderPage(
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
   taskDetailsEnabled = false,
+  features: Record<string, boolean> = {},
 ) {
   // Fresh client per render so cached queries never leak between tests. A
   // fresh element per render too: React skips an identical element object.
   const tree = () => (
     <QueryClientProvider client={queryClient}>
       <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: taskDetailsEnabled } }}
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          features: { automations_v2: taskDetailsEnabled, ...features },
+        }}
       >
         <SidebarDataProvider>
           <MemoryRouter>
@@ -2366,5 +2389,85 @@ describe("InboxPage mark all as read", () => {
     await act(async () => settle(true));
     selectTab("All");
     expect(screen.getByRole("button", { name: "Mark all as read" })).toBeEnabled();
+  });
+});
+
+describe("the Inbox in ⌘K", () => {
+  /** Markup without React's generated ids, which count every `useId` call in the tree. */
+  const markup = (element: HTMLElement) => element.innerHTML.replace(/:r[0-9a-z]+:/g, ":id:");
+  const command = (label: string) =>
+    registeredPaletteCommands().find((candidate) => candidate.label === label);
+
+  beforeEach(() => {
+    inboxPaletteCommands.renders = 0;
+  });
+  afterEach(() => usePaletteCommandsStore.setState({ groups: {} }));
+
+  it("mounts nothing with quick_pick_palette off, and the page renders the same", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation()]),
+    );
+    const off = renderPage(undefined, false, { quick_pick_palette: false });
+    await screen.findByTestId("inbox-unread");
+    const withoutCommands = markup(off.container);
+    expect(inboxPaletteCommands.renders).toBe(0);
+    expect(registeredPaletteCommands()).toEqual([]);
+    off.unmount();
+
+    // The commands render nothing themselves, so turning the flag on changes no markup.
+    const on = renderPage(undefined, false, { quick_pick_palette: true });
+    await screen.findByTestId("inbox-unread");
+    expect(inboxPaletteCommands.renders).toBeGreaterThan(0);
+    expect(markup(on.container)).toBe(withoutCommands);
+  });
+
+  it("marks an unread card read and switches the tab from ⌘K, as the card and tabs do", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation()]),
+    );
+    renderPage(undefined, false, { quick_pick_palette: true });
+    await screen.findByTestId("inbox-unread");
+
+    act(() => command("Mark “Unread Session” as read")!.run());
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+
+    const filter = expectSetting(registeredPaletteCommands(), "Inbox filter", { current: "All" });
+    await act(async () => chooseSettingValue(filter, "Unread"));
+    expect(screen.getByRole("tab", { name: "Unread" })).toHaveAttribute("aria-selected", "true");
+    expect(localStorage.getItem("omnigent:inbox-filter")).toBe("unread");
+  });
+
+  it("expands a collapsed unread card and focuses its reply field from ⌘K's Reply", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation()]),
+    );
+    renderPage(undefined, false, { quick_pick_palette: true });
+    const item = await screen.findByTestId("inbox-unread");
+    expect(within(item).queryByRole("textbox", { name: /Reply to/ })).toBeNull();
+
+    act(() => command("Reply to “Unread Session”…")!.run());
+    const box = await within(item).findByRole<HTMLTextAreaElement>("textbox", {
+      name: /Reply to/,
+    });
+    await waitFor(() => expect(box).toHaveFocus());
+    // Replying from ⌘K leaves the card unread until the reply sends.
+    expect(screen.getByTestId("inbox-unread")).toBeInTheDocument();
+
+    // Asked again on the open card, it comes back to the draft with the caret after it.
+    fireEvent.change(box, { target: { value: "Check the parser" } });
+    act(() => box.blur());
+    act(() => command("Reply to “Unread Session”…")!.run());
+    await waitFor(() => expect(box).toHaveFocus());
+    expect([box.selectionStart, box.selectionEnd]).toEqual([16, 16]);
+  });
+
+  it("offers no Reply on a card the viewer can't edit", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation({ permission_level: 1 })]),
+    );
+    renderPage(undefined, false, { quick_pick_palette: true });
+    await screen.findByTestId("inbox-unread");
+    expect(command("Open “Unread Session”")).toBeDefined();
+    expect(command("Reply to “Unread Session”…")).toBeUndefined();
   });
 });

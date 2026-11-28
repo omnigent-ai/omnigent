@@ -1,7 +1,7 @@
 """Shared session and sidebar setup for browser journeys through the real server."""
 
 import httpx
-from playwright.sync_api import Page, Route
+from playwright.sync_api import Locator, Page, Route
 
 
 def wait_for_sidebar_collapse(page: Page) -> None:
@@ -13,6 +13,16 @@ def wait_for_sidebar_collapse(page: Page) -> None:
     page.evaluate(
         "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
     )
+
+
+def sidebar_row(page: Page, session_id: str) -> Locator:
+    """Locate the sidebar row (``<li>``) for *session_id* by its href."""
+    return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+
+
+def unread_dot(row: Locator) -> Locator:
+    """Locate the row's unread dot: the unseen session-state badge."""
+    return row.locator('[data-testid="session-state-badge"][data-state="unseen"]')
 
 
 def patch_session(base_url: str, session_id: str, **fields: object) -> None:

@@ -7,7 +7,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FileTreeModel } from "@/components/file-tree/vendored";
 import { folderTreePath } from "../breadcrumbPaths";
-import { type FolderListing, type FolderTreeSync, syncFolderListings } from "../folderTreeSync";
+import {
+  type FolderListing,
+  type FolderTreeSync,
+  type TreePathShows,
+  syncFolderListings,
+} from "../folderTreeSync";
 
 export interface LazyFolderTreeState {
   /** Folders the tree needs listed beyond the caller's own: expanded or no longer chained. */
@@ -20,6 +25,22 @@ export interface LazyFolderTreeState {
   present: ReadonlySet<string>;
   /** Every path the tree holds right now, for work done in the same commit as a sync. */
   currentPresent: () => ReadonlySet<string>;
+  /** Whether the snapshot above reflects this render's listings, not ones they replaced. */
+  synced: boolean;
+}
+
+/**
+ * How many paths one sync adds or removes before rebuilding the tree beats changing
+ * it one path at a time: each insert reorders its folder's rows, so a folder of
+ * thousands costs quadratic time inserted, against one sort rebuilt.
+ */
+export const BULK_SYNC_OPERATIONS = 500;
+
+export interface LazyFolderTreeOptions {
+  /** Rebuilds the tree to hold `paths`, for a sync of at least {@link BULK_SYNC_OPERATIONS}. */
+  rebuild?: (paths: ReadonlySet<string>) => void;
+  /** The filter the tree shows through; what it turns down leaves the tree at the next sync. */
+  shows?: TreePathShows;
 }
 
 /** The model's starting state for `listings`, before any sync. */
@@ -29,7 +50,8 @@ export function initialFolderTree(listings: readonly FolderListing[]): FolderTre
 
 /**
  * Applies `listings` to `model` whenever `listingVersion` changes. `required`
- * folders are the caller's own and are never reported as wanted.
+ * folders are the caller's own and are never reported as wanted. A sync of
+ * hundreds of paths goes through `rebuild` when the caller gives one.
  */
 export function useLazyFolderTree(
   model: FileTreeModel,
@@ -37,22 +59,30 @@ export function useLazyFolderTree(
   listings: readonly FolderListing[],
   listingVersion: string,
   required: readonly string[],
+  { rebuild, shows }: LazyFolderTreeOptions = {},
 ): LazyFolderTreeState {
   const present = useRef<Set<string>>(initial.present);
   const loadedFolders = useRef<Set<string>>(initial.loadedFolders);
   const [wantedFolders, setWantedFolders] = useState<string[]>([]);
   const [snapshot, setSnapshot] = useState({
+    version: null as string | null,
     isEmpty: initial.present.size === 0,
     loadedFolders: initial.loadedFolders as ReadonlySet<string>,
     present: initial.present as ReadonlySet<string>,
   });
-  const latest = useRef({ listings, required });
-  latest.current = { listings, required };
+  const latest = useRef({ listings, required, rebuild, shows });
+  latest.current = { listings, required, rebuild, shows };
 
   useEffect(() => {
-    const { listings: listingsNow, required: requiredNow } = latest.current;
-    const sync = syncFolderListings(present.current, listingsNow);
-    if (sync.operations.length > 0) model.batch(sync.operations);
+    const {
+      listings: listingsNow,
+      required: requiredNow,
+      rebuild: rebuildNow,
+      shows: showsNow,
+    } = latest.current;
+    const sync = syncFolderListings(present.current, listingsNow, showsNow);
+    if (rebuildNow && sync.operations.length >= BULK_SYNC_OPERATIONS) rebuildNow(sync.present);
+    else if (sync.operations.length > 0) model.batch(sync.operations);
     // A folder a chain hint no longer describes may have gained entries: list it.
     const relisted = [...loadedFolders.current].filter(
       (folder) =>
@@ -71,6 +101,7 @@ export function useLazyFolderTree(
       return kept.length === current.length && added.length === 0 ? current : [...kept, ...added];
     });
     setSnapshot({
+      version: listingVersion,
       isEmpty: sync.present.size === 0,
       loadedFolders: sync.loadedFolders,
       present: sync.present,
@@ -97,5 +128,6 @@ export function useLazyFolderTree(
   }, [model]);
 
   const currentPresent = useCallback((): ReadonlySet<string> => present.current, []);
-  return { wantedFolders, ...snapshot, currentPresent };
+  const { version: syncedVersion, ...state } = snapshot;
+  return { wantedFolders, ...state, currentPresent, synced: syncedVersion === listingVersion };
 }

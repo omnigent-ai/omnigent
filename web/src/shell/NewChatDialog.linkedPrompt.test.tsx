@@ -75,7 +75,7 @@ vi.mock("@/hooks/useDictationInsert", async (importOriginal) => {
   return {
     ...actual,
     useDictationInsert: (...args: Parameters<typeof actual.useDictationInsert>) => {
-      dictationSetMessage = args[1];
+      dictationSetMessage = (text) => void args[1](text, { from: 0, to: 0, insert: text }, true);
       return actual.useDictationInsert(...args);
     },
   };

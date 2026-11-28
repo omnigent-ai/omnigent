@@ -3,10 +3,12 @@
 // palettes list stay in `useAppCommands`.
 
 import { useMemo } from "react";
-import { KeyboardIcon, MessagesSquareIcon, PaletteIcon, SearchIcon } from "lucide-react";
+import { FlagIcon, KeyboardIcon, MessagesSquareIcon, PaletteIcon, SearchIcon } from "lucide-react";
 
 import { openKeyboardShortcuts } from "@/components/KeyboardShortcutsDialog";
 import { openFindFromCommand, useCanOpenFindFromCommand } from "@/lib/findRouting";
+import { canOverrideUiFeatures } from "@/lib/uiFeatureOverrides";
+import { FEATURE_FLAGS_COMMAND, openFeatureFlagsPicker } from "@/store/featureFlagsPicker";
 import { AVAILABLE, HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
 import { openThemePicker, SELECT_THEME_COMMAND } from "@/store/themePicker";
 
@@ -25,6 +27,7 @@ export function useQuickPickAppCommands({
 }: QuickPickAppCommandOptions = {}): PaletteCommand[] {
   const canOpenFind = useCanOpenFindFromCommand();
   const settingsCommands = useSettingsCommands();
+  const canOverrideFlags = canOverrideUiFeatures();
   return useMemo<PaletteCommand[]>(
     () => [
       ...(onGoToSession
@@ -70,8 +73,15 @@ export function useQuickPickAppCommands({
         movesFocus: true,
         run: openThemePicker,
       },
+      {
+        ...FEATURE_FLAGS_COMMAND,
+        icon: FlagIcon,
+        movesFocus: true,
+        availability: canOverrideFlags ? AVAILABLE : HIDDEN,
+        run: openFeatureFlagsPicker,
+      },
       ...settingsCommands,
     ],
-    [canOpenFind, onGoToSession, settingsCommands],
+    [canOpenFind, canOverrideFlags, onGoToSession, settingsCommands],
   );
 }

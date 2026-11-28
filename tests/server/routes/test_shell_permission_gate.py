@@ -59,6 +59,11 @@ from omnigent.server.auth import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes.sessions import create_sessions_router
+from tests._helpers.connect_stream import connect_frame
+from tests.host.test_workspace_methods import (
+    _PULL_REQUEST_OWNER_METHODS,
+    _PULL_REQUEST_OWNER_STREAMS,
+)
 
 # The server route is mounted under /v1 and proxies to the runner at the
 # same path, so the client URL and the recorded runner path are identical.
@@ -1298,7 +1303,7 @@ async def test_workspace_api_gates_a_repository_folder_like_the_workspace(
             "X-Forwarded-Email": "viewer@example.com",
             "Content-Type": "application/connect+json" if streaming else "application/json",
         },
-        content=b"\x00" + len(body).to_bytes(4, "big") + body if streaming else body,
+        content=connect_frame(body) if streaming else body,
     )
 
     if not passes:
@@ -1337,7 +1342,73 @@ _PR_OWNER_METHODS = {
         "account": "octocat",
     },
     "DisableAutoMerge": {},
+    "SetPullRequestState": {"state": "closed"},
+    "SetPullRequestDraft": {"draft": True},
+    # A batch names its pull requests in its list, not in ``prUrl``.
+    "EnableAutoMerge": {
+        "pullRequests": [
+            {
+                "prUrl": "https://github.com/example/app/pull/7",
+                "mergeMethod": "squash",
+                "expectedHeadOid": "a" * 40,
+            }
+        ]
+    },
+    "GetPendingReview": {},
+    "StartPendingReview": {"commitOid": "a" * 40},
+    "AddPendingReviewComment": {
+        "body": "Why?",
+        "inReplyToThreadId": "PRRT_1",
+        "pendingReviewId": "PRR_1",
+        "expectedHeadOid": "a" * 40,
+    },
+    "UpdatePendingReviewComment": {
+        "commentNodeId": "PRRC_1",
+        "body": "Better",
+        "expectedBodySha256": "c" * 64,
+        "pendingReviewId": "PRR_1",
+    },
+    "DeletePendingReviewComment": {"commentNodeId": "PRRC_1", "pendingReviewId": "PRR_1"},
+    "SubmitPendingReview": {
+        "event": "APPROVE",
+        "commitOid": "a" * 40,
+        "pendingReviewId": "PRR_1",
+    },
+    "DiscardPendingReview": {"pendingReviewId": "PRR_1"},
+    "SubmitReview": {"event": "COMMENT", "body": "Nit", "commitOid": "a" * 40},
+    "SubmitReviewVerdict": {"event": "APPROVE", "commitOid": "a" * 40},
+    "SetReviewThreadResolved": {"threadId": "PRRT_1", "resolved": True},
+    "EditComment": {
+        "kind": "issue",
+        "commentId": "5",
+        "body": "Mine",
+        "expectedBodySha256": "c" * 64,
+    },
+    "DeleteComment": {"kind": "review", "commentId": "5"},
+    "AddReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
+    "RemoveReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
+    # JSON carries the bytes base64-encoded.
+    "UploadAttachment": {"name": "shot.png", "content": "iVBORw0KGgo="},
+    "GetMergeQueue": {},
+    "EnqueuePullRequest": {"expectedHeadOid": "a" * 40},
+    "DequeuePullRequest": {},
+    "GetPullRequestStack": {},
+    "GetPullRequestNativeStack": {},
+    "SearchReviewers": {"text": "al", "pageSize": 5},
+    "SearchCompletions": {"kind": "COMPLETION_KIND_MENTION", "text": "al"},
+    "LookupPullRequest": {},
+    # Names its pull requests in a list of URLs, not in ``prUrl``.
+    "GetPullRequestListStats": {"prUrls": ["https://github.com/example/app/pull/8"]},
+    # Names no pull request: it finds them by the workspace's branch.
+    "ListBranchPullRequests": {"branch": "main"},
+    "ReadPullRequestImage": {
+        "imageUrl": "https://github.com/user-attachments/assets/0f1e2d3c-aaaa"
+    },
 }
+
+
+def test_every_owner_method_has_a_gate_case() -> None:
+    assert set(_PR_OWNER_METHODS) == _PULL_REQUEST_OWNER_METHODS
 
 
 def _pull_request_call_passes(method: str, caller: str | None, session: str) -> int:
@@ -1412,15 +1483,27 @@ async def test_workspace_api_pull_request_changes_are_the_session_owners_alone(
     headers = {"Content-Type": "application/json"}
     if caller is not None:
         headers["X-Forwarded-Email"] = caller
-    body = {"prUrl": "https://github.com/example/app/pull/7", **_PR_OWNER_METHODS[method]}
+    fields = _PR_OWNER_METHODS[method]
+    named = "pullRequests" in fields or "prUrls" in fields or "branch" in fields
+    pr_url = {} if named else {"prUrl": "https://github.com/example/app/pull/7"}
+    body = {**pr_url, **fields}
+    content = json.dumps(body).encode()
+    expected = _pull_request_call_passes(method, caller, session)
+    if method in _PULL_REQUEST_OWNER_STREAMS:
+        content = connect_frame(content)
+        headers["Content-Type"] = "application/connect+json"
+        # A stream that got past the gate ends with its error inside a 200 answer.
+        expected = 200 if expected == 503 else expected
     resp = await client.post(
         f"/v1/sessions/{session}/workspace"
         f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
         headers=headers,
-        content=json.dumps(body).encode(),
+        content=content,
     )
 
-    assert resp.status_code == _pull_request_call_passes(method, caller, session), resp.text
+    assert resp.status_code == expected, resp.text
+    if method in _PULL_REQUEST_OWNER_STREAMS and expected == 200:
+        assert b"unavailable" in resp.content
     if resp.status_code == 403:
         assert "Only the session's owner can use this" in resp.text
     if resp.status_code == 503:

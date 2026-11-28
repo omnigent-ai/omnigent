@@ -757,8 +757,6 @@ class PersistentTaskScheduler:
                 await asyncio.to_thread(
                     validate_rrule,
                     task.rrule,
-                    session_mode=task.session_mode,
-                    execution_target=task.execution_target,
                     # COUNT counts from creation here, so a one-time rule fires once.
                     allow_single_fire=True,
                 )

@@ -12,7 +12,10 @@ import { useSessionActive, useTrailingInvalidate } from "@/hooks/useWorkspaceCha
  * rejecting the query, so the status bar never mislabels a failed probe.
  */
 export type SessionWorktreesResult =
-  { status: "ok"; worktrees: HostWorktree[] } | { status: "not_git" } | { status: "unknown" };
+  | { status: "ok"; worktrees: HostWorktree[] }
+  | { status: "not_git" }
+  // `denied`: only the host's owner may list its worktrees, so asking again won't help.
+  | { status: "unknown"; denied?: true };
 
 interface HostWorktreesResponse {
   object: string;
@@ -39,6 +42,8 @@ async function fetchSessionWorktrees(
       ? { status: "not_git" }
       : { status: "unknown" };
   }
+  // Not the host's owner (403): still no claim about the repo, but it won't change.
+  if (res.status === 403) return { status: "unknown", denied: true };
   // Host offline (409), missing (404), server error — genuinely unknown, never
   // a claim about the repo.
   return { status: "unknown" };

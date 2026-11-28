@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 from tests._helpers.live_server import find_free_port
+from tests._helpers.mock_llm import mock_llm_answers
 
 # Root of the Omnigent checkout that ships the ``omnigent``
 # package, the example YAMLs, and (in the main checkout) the
@@ -198,12 +199,8 @@ def mock_llm_server_url(
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
-            if resp.status_code == 200:
-                break
-        except httpx.ConnectError:
-            continue
+        if mock_llm_answers(base_url):
+            break
         time.sleep(0.1)
     else:
         proc.kill()

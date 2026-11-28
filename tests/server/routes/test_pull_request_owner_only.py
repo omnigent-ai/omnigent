@@ -28,6 +28,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE, READ_CAPABILITIES
+from omnigent.server.read_only_code_hosts import READ_ONLY_CODE_HOST_MESSAGE
 from omnigent.server.routes import _host_filesystem
 from omnigent.server.routes.sessions import create_sessions_router, routes_resources
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -126,6 +127,35 @@ _HOST_INFO: dict[str, Any] = {
     "capabilities": {"account_switching": True, "merging": True, "line_counts": True},
     "pr": {"number": 42, "title": "Ship it", "state": "OPEN", "url": _PR},
 }
+# A comment as the host reads it: its rights are the host account's.
+_THREAD_COMMENT: dict[str, Any] = {
+    "id": "PRRC_1",
+    "database_id": 5,
+    "body": "Why this?",
+    "reactions": [{"content": "HEART", "count": 2, "viewer_reacted": True}],
+    "can_react": True,
+    "can_update": True,
+    "can_delete": True,
+    "viewer_did_author": True,
+}
+_HOST_THREADS: dict[str, Any] = {
+    "data": [
+        {
+            "id": "PRRT_1",
+            "can_reply": True,
+            "can_resolve": True,
+            "can_unresolve": False,
+            "comments": {"data": [_THREAD_COMMENT], "has_more": False},
+        }
+    ],
+    "has_more": False,
+}
+_HOST_THREAD_COMMENTS: dict[str, Any] = {"data": [_THREAD_COMMENT], "has_more": False}
+_HOST_READS: dict[str, dict[str, Any]] = {
+    "github_info": _HOST_INFO,
+    "github_review_threads": _HOST_THREADS,
+    "github_review_thread_comments": _HOST_THREAD_COMMENTS,
+}
 _ROUTE_IDS = [f"{method} {path} {sorted(options)}" for method, path, options in _OWNER_ONLY_ROUTES]
 
 
@@ -149,10 +179,12 @@ class _RecordingHost:
     def __init__(self) -> None:
         self.reads: list[str] = []
         self.writes: list[str] = []
+        self.read_params: dict[str, dict[str, Any]] = {}
 
-    async def read(self, *, op: str, session_id: str, **_kwargs: Any) -> dict[str, Any]:
+    async def read(self, *, op: str, session_id: str, **kwargs: Any) -> dict[str, Any]:
         self.reads.append(f"{session_id}:{op}")
-        return copy.deepcopy(_HOST_INFO) if op == "github_info" else {"object": "x"}
+        self.read_params[op] = kwargs.get("params") or {}
+        return copy.deepcopy(_HOST_READS.get(op, {"object": "x"}))
 
     async def write(self, *, op: str, session_id: str, **_kwargs: Any) -> dict[str, Any]:
         self.writes.append(f"{session_id}:{op}")
@@ -197,7 +229,7 @@ def _conversations(db_uri: str) -> SqlAlchemyConversationStore:
     return conversations
 
 
-def _app(db_uri: str, *, auth: bool = True) -> FastAPI:
+def _app(db_uri: str, *, auth: bool = True, read_only_code_hosts: tuple[str, ...] = ()) -> FastAPI:
     application = FastAPI()
 
     @application.exception_handler(OmnigentError)
@@ -213,6 +245,7 @@ def _app(db_uri: str, *, auth: bool = True) -> FastAPI:
             _conversations(db_uri),
             object(),  # type: ignore[arg-type]  # No agents are loaded on these routes.
             host_registry=_ConnectedHosts(),  # type: ignore[arg-type]
+            read_only_code_hosts=read_only_code_hosts,
             **(
                 {
                     "auth_provider": UnifiedAuthProvider(source="header", local_single_user=False),
@@ -477,6 +510,7 @@ async def test_the_owner_sees_the_host_s_info_unchanged(
     assert info["auth"]["accounts"] == _ACCOUNTS
     assert info["capabilities"] == _HOST_INFO["capabilities"]
     assert "owner_only_changes" not in info
+    assert "read_only" not in info
 
 
 @pytest.mark.asyncio
@@ -490,3 +524,251 @@ async def test_with_permissions_off_the_info_is_unchanged(
     assert response.status_code == 200, response.text
     assert response.json()["accounts"] == _ACCOUNTS
     assert host.reads == [f"{_ROOT}:github_info"]
+
+
+_THREADS_PATH = "/resources/github/review-threads"
+_COMMENTS_PATH = "/resources/github/review-threads/PRRT_1/comments"
+_RIGHTS_OFF = {"can_react": False, "can_update": False, "can_delete": False}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", [_OWNER, _ADMIN_OWNER])
+async def test_the_owner_reads_threads_with_the_host_accounts_rights(
+    client: httpx.AsyncClient, caller: str
+) -> None:
+    threads = await _call(client, "GET", _THREADS_PATH, {"params": {"pr_url": _PR}}, caller=caller)
+    comments = await _call(
+        client, "GET", _COMMENTS_PATH, {"params": {"pr_url": _PR, "after": "c"}}, caller=caller
+    )
+
+    assert threads.status_code == 200, threads.text
+    assert threads.json() == _HOST_THREADS
+    assert comments.status_code == 200, comments.text
+    assert comments.json() == _HOST_THREAD_COMMENTS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", [_EDITOR, _MANAGER, _ADMIN])
+async def test_anyone_else_reads_threads_with_ids_and_counts_but_no_rights(
+    client: httpx.AsyncClient, caller: str
+) -> None:
+    """The edit, delete, reply and resolve controls act as the owner's account."""
+    response = await _call(
+        client, "GET", _THREADS_PATH, {"params": {"pr_url": _PR}}, caller=caller
+    )
+
+    assert response.status_code == 200, response.text
+    [thread] = response.json()["data"]
+    assert (thread["id"], thread["can_reply"], thread["can_resolve"]) == ("PRRT_1", False, False)
+    [comment] = thread["comments"]["data"]
+    assert (comment["id"], comment["database_id"]) == ("PRRC_1", 5)
+    assert comment["reactions"] == [{"content": "HEART", "count": 2, "viewer_reacted": False}]
+    assert {name: comment[name] for name in _RIGHTS_OFF} == _RIGHTS_OFF
+    assert comment["viewer_did_author"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", [_EDITOR, _VIEWER])
+async def test_anyone_else_reads_a_threads_comments_without_the_rights(
+    client: httpx.AsyncClient, caller: str
+) -> None:
+    response = await _call(
+        client, "GET", _COMMENTS_PATH, {"params": {"pr_url": _PR, "after": "c"}}, caller=caller
+    )
+
+    assert response.status_code == 200, response.text
+    [comment] = response.json()["data"]
+    assert comment["database_id"] == 5
+    assert {name: comment[name] for name in _RIGHTS_OFF} == _RIGHTS_OFF
+    assert comment["reactions"][0]["count"] == 2
+
+
+_REVIEW_READS = [
+    ("github_review_threads", _THREADS_PATH, {"pr_url": _PR}),
+    ("github_review_thread_comments", _COMMENTS_PATH, {"pr_url": _PR, "after": "c"}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("op", "path", "params"), _REVIEW_READS, ids=["threads", "comments"])
+@pytest.mark.parametrize(
+    ("caller", "asks"),
+    [(_OWNER, True), (_ADMIN_OWNER, True), (_EDITOR, False), (_MANAGER, False), (_ADMIN, False)],
+)
+async def test_the_server_asks_the_host_for_its_accounts_rights_for_the_owner_alone(
+    client: httpx.AsyncClient,
+    host: _RecordingHost,
+    op: str,
+    path: str,
+    params: dict[str, Any],
+    caller: str,
+    asks: bool,
+) -> None:
+    """A host sends what its account may do only when asked, so no one else's read asks."""
+    response = await _call(client, "GET", path, {"params": params}, caller=caller)
+
+    assert response.status_code == 200, response.text
+    assert host.read_params[op].get("account_rights") is (True if asks else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("op", "path", "params"), _REVIEW_READS, ids=["threads", "comments"])
+async def test_unsure_who_reads_the_server_does_not_ask_for_the_accounts_rights(
+    client: httpx.AsyncClient,
+    host: _RecordingHost,
+    monkeypatch: pytest.MonkeyPatch,
+    op: str,
+    path: str,
+    params: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(routes_resources, "_is_session_owner", _lookup_fails)
+    response = await _call(client, "GET", path, {"params": params}, caller=_OWNER)
+
+    assert response.status_code == 200, response.text
+    assert "account_rights" not in host.read_params[op]
+
+
+# A page from a host older than account rights: it sends only whether the account may reply.
+_OLDER_HOST_THREADS: dict[str, Any] = {
+    "data": [{"id": "PRRT_1", "can_reply": True, "comments": {"data": [{"id": "PRRC_1"}]}}],
+    "has_more": False,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("caller", "can_reply"), [(_OWNER, True), (_EDITOR, False)])
+async def test_an_older_hosts_threads_read_as_before(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+    can_reply: bool,
+) -> None:
+    """The owner gets no rights the host didn't send; anyone else, none of the account's."""
+    monkeypatch.setitem(_HOST_READS, "github_review_threads", _OLDER_HOST_THREADS)
+    response = await _call(
+        client, "GET", _THREADS_PATH, {"params": {"pr_url": _PR}}, caller=caller
+    )
+
+    assert response.status_code == 200, response.text
+    [thread] = response.json()["data"]
+    assert thread["can_reply"] is can_reply
+    if caller == _OWNER:
+        assert response.json() == _OLDER_HOST_THREADS
+    else:
+        assert thread["comments"]["data"][0]["viewer_did_author"] is False
+
+
+@pytest.mark.asyncio
+async def test_unsure_who_reads_the_threads_the_server_shows_no_rights(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(routes_resources, "_is_session_owner", _lookup_fails)
+    response = await _call(
+        client, "GET", _THREADS_PATH, {"params": {"pr_url": _PR}}, caller=_OWNER
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"][0]["can_reply"] is False
+
+
+# The owner's routes that change the pull request on its code host.
+_CODE_HOST_WRITES = [
+    route
+    for route in _OWNER_ONLY_ROUTES
+    if route[0] == "POST"
+    and route[1] not in {"/resources/github/prs", "/resources/github/preferences"}
+]
+
+
+@pytest.fixture
+async def read_only_client(db_uri: str, host: _RecordingHost) -> AsyncIterator[httpx.AsyncClient]:
+    """A server that serves pull requests on ``github.com`` read-only."""
+    del host
+    transport = httpx.ASGITransport(app=_app(db_uri, read_only_code_hosts=("github.com",)))
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as session:
+        yield session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "options"),
+    _CODE_HOST_WRITES,
+    ids=[f"{method} {path}" for method, path, _options in _CODE_HOST_WRITES],
+)
+async def test_the_owner_s_change_on_a_read_only_host_is_refused_before_the_host(
+    read_only_client: httpx.AsyncClient,
+    host: _RecordingHost,
+    method: str,
+    path: str,
+    options: dict[str, Any],
+) -> None:
+    response = await _call(read_only_client, method, path, options, caller=_OWNER)
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["message"] == READ_ONLY_CODE_HOST_MESSAGE
+    assert host.writes == []
+
+
+@pytest.mark.asyncio
+async def test_the_account_choice_on_a_read_only_host_still_reaches_the_host(
+    read_only_client: httpx.AsyncClient, host: _RecordingHost
+) -> None:
+    options = {"json": {"account": "", "pr_url": _PR}}
+    response = await _call(
+        read_only_client, "POST", "/resources/github/preferences", options, caller=_OWNER
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(host.calls) == 1, host.calls
+
+
+@pytest.mark.asyncio
+async def test_a_read_only_host_s_info_is_marked_and_offers_no_changes(
+    read_only_client: httpx.AsyncClient,
+) -> None:
+    response = await _call(read_only_client, "GET", "/resources/github", {}, caller=_OWNER)
+
+    assert response.status_code == 200, response.text
+    info = response.json()
+    assert info["read_only"] is True
+    assert info["capabilities"] == {
+        "account_switching": True,
+        "merging": False,
+        "line_counts": True,
+    }
+    assert info["pr"]["number"] == 42
+
+
+@pytest.fixture
+async def unsynced_read_only_client(
+    db_uri: str, host: _RecordingHost, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[httpx.AsyncClient]:
+    """A read-only ``github.com`` server that hasn't imported the session's PRs yet."""
+    del host
+    monkeypatch.setattr(routes_resources.server_prs, "vouch", lambda _stored, _pr_url: {})
+    transport = httpx.ASGITransport(app=_app(db_uri, read_only_code_hosts=("github.com",)))
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as session:
+        yield session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Every route needs a ``pr_url`` string; an empty one names no pull request.
+        {"pr_url": "", "merge_method": "squash"},
+        {"pr_url": "\u00a0" + _PR, "merge_method": "squash"},
+    ],
+    ids=["empty-pr-url", "padded-url"],
+)
+async def test_a_change_the_server_cant_place_off_a_read_only_host_is_refused(
+    unsynced_read_only_client: httpx.AsyncClient, host: _RecordingHost, body: dict[str, Any]
+) -> None:
+    """Without the stored PRs, the host would pick or normalize the PR the change goes to."""
+    response = await _call(
+        unsynced_read_only_client, "POST", "/resources/github/merge", {"json": body}, caller=_OWNER
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["message"] == READ_ONLY_CODE_HOST_MESSAGE
+    assert host.writes == []

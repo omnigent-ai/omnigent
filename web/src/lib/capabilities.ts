@@ -16,6 +16,7 @@
  */
 
 import { hostFetch } from "./host";
+import { effectiveQuickPickEnabled, readUiFeatureOverrides } from "./uiFeatureOverrides";
 
 /**
  * Server session-sharing policy (mirrors the backend ``SharingMode``):
@@ -80,6 +81,8 @@ export type FeatureKey =
   | "workspace_sidebar_v2"
   | "sidebar_saved_views"
   | "floating_panes"
+  | "gadgets"
+  | "pull_requests_v2"
   | "shared_session_updates_socket";
 
 /** Deployment-wide release-feature values advertised by the server. */
@@ -315,6 +318,8 @@ export interface ServerInfo {
   scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
+  /** A sandbox starting a new session each run also accepts ten-minute schedules. */
+  scheduled_task_subhour_new_sandbox?: boolean;
   /** Runs drop a trigger prompt's header line before dispatch, so the form can save one. */
   scheduled_task_trigger_headers?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
@@ -383,6 +388,11 @@ export interface ServerInfo {
    * servers (off).
    */
   workflow_sharing?: boolean;
+  /**
+   * The server keeps gadget grants (``/v1/gadgets/{id}/permissions``), so gadgets
+   * can be shared; absent on older servers and on stores without grants (off).
+   */
+  gadget_sharing?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -576,6 +586,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_workflow_id: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
+  scheduled_task_subhour_new_sandbox: false,
   scheduled_task_trigger_headers: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
@@ -617,7 +628,15 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
 
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
-  return info !== "loading" && info.features?.[feature] === true;
+  if (info === "loading") return false;
+  if (info.features && Object.hasOwn(info.features, feature)) {
+    const overrides = readUiFeatureOverrides();
+    if (feature === "quick_pick_palette" || effectiveQuickPickEnabled(info, overrides)) {
+      const override = overrides[feature];
+      if (override !== undefined) return override;
+    }
+  }
+  return info.features?.[feature] === true;
 }
 
 export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
@@ -770,6 +789,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_workflow_id: data.scheduled_task_workflow_id === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
+          scheduled_task_subhour_new_sandbox: data.scheduled_task_subhour_new_sandbox === true,
           scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
           session_message_max_chars:
             typeof data.session_message_max_chars === "number" &&
@@ -800,6 +820,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_journal: data.session_journal === true,
           workflows: data.workflows === true,
           workflow_sharing: data.workflow_sharing === true,
+          gadget_sharing: data.gadget_sharing === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,

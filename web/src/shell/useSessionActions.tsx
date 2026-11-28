@@ -32,6 +32,7 @@ import { useArchivePrompt } from "./ArchivePrompt";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { isOpenSession } from "./openSession";
+import type { SessionLeaveCause } from "./sessionCommands/archiveNavigation";
 
 export interface SessionActions {
   setShareOpen: (open: boolean) => void;
@@ -55,7 +56,7 @@ export interface SessionActions {
  * :param viewerId: The signed-in user's id, which Leave revokes.
  * :param serverInfo: Server capabilities, for the automation delete notice.
  * :param onLeave: Called right before the session is deleted, archived, or
- *     left, e.g. to navigate off a view that shows it.
+ *     left, with which one, e.g. to navigate off a view that shows it.
  * :param componentIdPrefix: Analytics prefix for the confirm buttons, e.g.
  *     ``"sidebar.conversation"``.
  * :param reportsAfterUnmount: Whether a Leave or Stop still reports how it went once the
@@ -75,7 +76,7 @@ export function useSessionActions({
   label: string;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
-  onLeave?: () => void;
+  onLeave?: (cause: SessionLeaveCause) => void;
   componentIdPrefix: string;
   reportsAfterUnmount?: boolean;
 }): SessionActions {
@@ -117,7 +118,7 @@ export function useSessionActions({
       return;
     }
     // Leave a view showing the session now, so it doesn't sit on an id that's about to 404.
-    onLeave?.();
+    onLeave?.("delete");
     del.mutate({ id: conversation.id, deleteBranch: gitBranch !== null && deleteBranch });
   }
 
@@ -127,6 +128,9 @@ export function useSessionActions({
       showToast("Couldn't delete the automation, so the session was kept");
       return;
     }
+    // A caller replaced while the automation deleted can't see the route, so the open session
+    // is read live: leave it only if it's still the one shown.
+    if (reportsAfterUnmount && isOpenSession(conversation.id)) onLeave?.("delete");
     del.mutate({ id: conversation.id, deleteBranch: deleteLocalBranch });
   }
 
@@ -151,7 +155,7 @@ export function useSessionActions({
     // frame. Leaving the archived session's view therefore has to happen HERE,
     // synchronously — not in an onSuccess callback that fires a round-trip
     // later with a stale view. Mirrors confirmDelete.
-    onLeave?.();
+    onLeave?.("archive");
     archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Offer an Undo (and point at where the session went) — fire NOW, not in a
     // mutate onSuccess: per-call mutate callbacks don't fire once their observer
@@ -182,7 +186,7 @@ export function useSessionActions({
       leave.mutate(
         { id: conversation.id, viewerId },
         // The session 404s for this user now, so don't leave them staring at it.
-        { onSuccess: () => onLeave?.(), onError: reportFailure },
+        { onSuccess: () => onLeave?.("leave"), onError: reportFailure },
       );
       return;
     }
@@ -194,7 +198,7 @@ export function useSessionActions({
       // The session 404s for this user now, so don't leave them staring at it, unless they've
       // already opened another one.
       () => {
-        if (!leftFromItsView || isOpenSession(conversation.id)) onLeave?.();
+        if (!leftFromItsView || isOpenSession(conversation.id)) onLeave?.("leave");
       },
       reportFailure,
     );

@@ -124,6 +124,14 @@ import {
   workspacePanelTabPresentation,
 } from "./workspacePanelTabs";
 import { Button } from "../components/ui/button";
+import {
+  GadgetFullScreenSlot,
+  GadgetMobileDrawer,
+  type GadgetRailNewItem,
+  GadgetRailTabStrip,
+  useGadgetRailTabState,
+} from "@/gadgets/ui/GadgetRailTabs";
+import { GadgetOpenSessionButton } from "@/gadgets/ui/GadgetOpenSessionButton";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
@@ -361,6 +369,8 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
   }
 }
 
+const NO_EXTRA_ITEMS: readonly GadgetRailNewItem[] = [];
+
 function NewTabMenu({
   conversationId,
   panels,
@@ -369,6 +379,7 @@ function NewTabMenu({
   onOpenBrowser,
   onOpen,
   onOpenSideChat,
+  extraItems = NO_EXTRA_ITEMS,
   onCreateStart,
   onCreateError,
   liveness,
@@ -385,6 +396,8 @@ function NewTabMenu({
   /** Open a new side chat (a fork of this conversation) as a rail tab. Absent
    *  when the session can't host one (e.g. Codex uses its typed `/side`). */
   onOpenSideChat?: () => void;
+  /** More tabs to open, after Side chat, such as a new gadget. */
+  extraItems?: readonly GadgetRailNewItem[];
   /** Called when a shell create is initiated (before the POST resolves), so
    *  the shell can be focused as soon as its tab appears in the list. */
   onCreateStart?: () => void;
@@ -414,7 +427,14 @@ function NewTabMenu({
   // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
-  if (!canOpenShell && !onOpenBrowser && !onOpenSideChat && panels.length === 0) return null;
+  if (
+    !canOpenShell &&
+    !onOpenBrowser &&
+    !onOpenSideChat &&
+    extraItems.length === 0 &&
+    panels.length === 0
+  )
+    return null;
 
   // The remembered shell, or the first declared type. Used only when shell
   // access is available; the menu can also contain just built-in pages.
@@ -517,9 +537,10 @@ function NewTabMenu({
             </DropdownMenuItem>
           );
         })}
-        {panels.length > 0 && (onOpenBrowser || onOpenSideChat || canOpenShell) && (
-          <DropdownMenuSeparator />
-        )}
+        {panels.length > 0 &&
+          (onOpenBrowser || onOpenSideChat || extraItems.length > 0 || canOpenShell) && (
+            <DropdownMenuSeparator />
+          )}
         {onOpenBrowser && (
           <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
             <GlobeIcon className="size-4" />
@@ -536,6 +557,12 @@ function NewTabMenu({
             Side chat
           </DropdownMenuItem>
         )}
+        {extraItems.map(({ key, label, icon: Icon, onSelect }) => (
+          <DropdownMenuItem key={key} onSelect={onSelect} className="cursor-pointer">
+            <Icon className="size-4" />
+            {label}
+          </DropdownMenuItem>
+        ))}
         {canOpenShell &&
           (multipleShells ? (
             // Several types → a single "Shell (default)" row that launches the
@@ -1008,6 +1035,12 @@ interface WorkspacePanelProps {
   maximized: boolean;
   /** Toggle the rail's maximized state. */
   onToggleMaximized: () => void;
+  /** Maximizes the rail and leaves the sidebar open, for a gadget opened from the sidebar. */
+  onMaximizeKeepingSidebar?: () => void;
+  /** Whether the sidebar is open, for a full screen gadget's bar. */
+  sidebarOpen?: boolean;
+  /** Opens the sidebar from a full screen gadget's bar. */
+  onOpenSidebar?: (peek?: boolean) => void;
   /** Viewer's permission level (gates edit affordances). */
   permissionLevel: number | null;
   /** Changed-files sort order, shared with the viewer's prev/next order. */
@@ -1154,6 +1187,9 @@ function WorkspacePanelImpl({
   onCloseTerminals,
   maximized,
   onToggleMaximized,
+  onMaximizeKeepingSidebar,
+  sidebarOpen,
+  onOpenSidebar,
   permissionLevel,
   filesPanelSort,
   onSortChange,
@@ -1175,6 +1211,22 @@ function WorkspacePanelImpl({
   const sideChats = useSideChats(conversationId);
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
+  // The gadgets shown beside the session, as tabs after its side chats.
+  const gadgetRail = useGadgetRailTabState(conversationId, {
+    readOnly: pending || !isEditorLevel(permissionLevel),
+    showing: rightRailTab === "gadget" && selectedFilePath === null && selectedTerminalKey === null,
+    onShow: () => onRightRailTabChange("gadget"),
+    onReveal,
+    maximized,
+    onMaximizedChange: (next, options) => {
+      if (next === maximized) return;
+      if (next && options?.keepSidebar && onMaximizeKeepingSidebar) onMaximizeKeepingSidebar();
+      else onToggleMaximized();
+    },
+    // Phones have no rail: a requested gadget covers the session in its own drawer.
+    mobile: isMobile,
+    routed: !contained,
+  });
   const floatingPanes = useFloatingPanesShown();
   const activeView = resolveWorkspaceActiveView(
     {
@@ -1183,6 +1235,7 @@ function WorkspacePanelImpl({
       selectedTerminalKey,
       selectedBrowserId: browsers.selected,
       selectedSideChatId: sideChats.selected,
+      selectedGadgetKey: gadgetRail.selected,
     },
     {
       terminalPresent: (key) => openTerminals.includes(key),
@@ -1194,8 +1247,12 @@ function WorkspacePanelImpl({
       mobile: isMobile,
     },
   );
-  const { browserSelected, sideChatSelected } = activeView;
+  const { browserSelected, sideChatSelected, gadgetSelected } = activeView;
   const terminalShown = activeView.terminalKey !== null;
+  // In full screen a gadget shows alone: the strip holds its controls and Open session.
+  const gadgetFullScreen = maximized && gadgetSelected;
+  const [gadgetToolbar, setGadgetToolbar] = useState<HTMLElement | null>(null);
+  const fullScreenLabel = maximized ? "Exit full screen" : "Full screen";
   const returnPointRef = useRef<ReturnPoint | null>(null);
   // Tabs the user is closing, by strip key, mapped to whether the rail hides if their
   // departure leaves no open tabs. Entries go once their tab leaves or its close fails.
@@ -1542,6 +1599,13 @@ function WorkspacePanelImpl({
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
+  // Records the user's close, like every other tab's, so closing the last one hides the rail.
+  const closeGadget = (key: string, hideWhenLast = true) => {
+    if (!gadgetRail.canClose) return;
+    closeIntentsRef.current.set(`gadget:${key}`, hideWhenLast);
+    gadgetRail.close(key);
+  };
+  const gadgetStripState = { ...gadgetRail, close: (key: string) => closeGadget(key) };
   const closeSideChat = (childId: string, hideWhenLast = true) =>
     stopSideChat(childId, () => {
       closeIntentsRef.current.set(`sidechat:${childId}`, hideWhenLast);
@@ -1625,6 +1689,7 @@ function WorkspacePanelImpl({
     ...openTerminals,
     ...(showBrowserTab ? browsers.tabs : []).map((tabId) => `browser:${tabId}`),
     ...sideChats.tabs.map((childId) => `sidechat:${childId}`),
+    ...gadgetRail.tabs.map((tab) => `gadget:${tab.key}`),
   ];
   const openTabCount = openTabKeys.length;
   const openTabsSignature = JSON.stringify(openTabKeys);
@@ -1668,6 +1733,7 @@ function WorkspacePanelImpl({
       openFiles.length > 0 ||
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
+      gadgetRail.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
@@ -1677,6 +1743,7 @@ function WorkspacePanelImpl({
       onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
       onOpen={noteMenuOrigin}
       onOpenSideChat={onNewSideChat}
+      extraItems={gadgetRail.newItems}
       onOpenTerminal={openTerminalTab}
       onCreateStart={onShellCreateStart}
       onCreateError={onShellCreateFailed}
@@ -1716,7 +1783,9 @@ function WorkspacePanelImpl({
   useEffect(() => {
     if (
       ((rightRailTab === "browser" && browsers.selected === null) ||
-        (rightRailTab === "sidechat" && sideChats.selected === null)) &&
+        (rightRailTab === "sidechat" && sideChats.selected === null) ||
+        // A saved gadget tab waits for the session's gadgets before it counts as gone.
+        (rightRailTab === "gadget" && gadgetRail.selected === null && !gadgetRail.loading)) &&
       selectedFilePath === null &&
       selectedTerminalKey === null
     ) {
@@ -1726,6 +1795,8 @@ function WorkspacePanelImpl({
     rightRailTab,
     browsers.selected,
     sideChats.selected,
+    gadgetRail.selected,
+    gadgetRail.loading,
     selectedFilePath,
     selectedTerminalKey,
     browserFallbackTab,
@@ -1785,6 +1856,13 @@ function WorkspacePanelImpl({
         sideChats.select(childId);
         onRightRailTabChange("sidechat");
       },
+      disabled: false,
+    })),
+    ...gadgetRail.tabs.map((tab) => ({
+      key: `gadget:${tab.key}`,
+      label: tab.label,
+      active: gadgetSelected && gadgetRail.selected === tab.key,
+      select: () => gadgetRail.select(tab.key),
       disabled: false,
     })),
   ];
@@ -1852,6 +1930,8 @@ function WorkspacePanelImpl({
         handleCloseTab();
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
         void closeSideChat(sideChats.selected);
+      } else if (scopeView === "gadget" && gadgetRail.selected !== null) {
+        closeGadget(gadgetRail.selected);
       } else if (scopeView === "browser" && browsers.selected !== null) {
         void closeBrowserTab(browsers.selected);
       } else if (openPanel !== undefined) {
@@ -1949,6 +2029,10 @@ function WorkspacePanelImpl({
     ...sideChats.tabs.map((childId) => ({
       key: `sidechat:${childId}`,
       closeNow: (hide: boolean) => void closeSideChat(childId, hide),
+    })),
+    ...(gadgetRail.canClose ? gadgetRail.tabs : []).map((tab) => ({
+      key: `gadget:${tab.key}`,
+      closeNow: (hide: boolean) => closeGadget(tab.key, hide),
     })),
   ];
   // The tab a bulk close keeps, selected once the closed tabs (and any file viewer among
@@ -2109,6 +2193,8 @@ function WorkspacePanelImpl({
       className={cn(
         "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+        // A full screen gadget meets the window's edge with the sidebar closed.
+        gadgetFullScreen && !sidebarOpen && "md:border-l-0",
         contained &&
           "flex min-h-0 flex-col overflow-hidden border-l border-border bg-card shrink-0",
         contained && maximized && "absolute inset-0",
@@ -2147,7 +2233,7 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
-          {visiblePermanentTabs.length > 0 && (
+          {!gadgetFullScreen && visiblePermanentTabs.length > 0 && (
             <Tabs
               className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
               // Soft tabs own their highlight. A vanished shell falls back to a
@@ -2158,6 +2244,7 @@ function WorkspacePanelImpl({
                   : selectedFilePath !== null ||
                       browserSelected ||
                       sideChatSelected ||
+                      gadgetSelected ||
                       terminalShown
                     ? "__tab__"
                     : (rightRailTab ?? "__empty__")
@@ -2171,7 +2258,7 @@ function WorkspacePanelImpl({
             </Tabs>
           )}
           {/* The divider follows the fixed panel icons' visibility. */}
-          {visiblePermanentTabs.length > 0 && (
+          {!gadgetFullScreen && visiblePermanentTabs.length > 0 && (
             <div
               aria-hidden
               className={cn(
@@ -2180,7 +2267,7 @@ function WorkspacePanelImpl({
               )}
             />
           )}
-          {showOpenTabs && (
+          {!gadgetFullScreen && showOpenTabs && (
             <>
               {/* Open tabs fill the space before the pinned trailing controls. */}
               <WorkspaceTabsScroller tabCount={openTabCount}>
@@ -2261,16 +2348,25 @@ function WorkspacePanelImpl({
                     />
                   );
                 })}
+                <GadgetRailTabStrip state={gadgetStripState} active={gadgetSelected} />
               </WorkspaceTabsScroller>
             </>
           )}
           {/* With no open tabs, "+" sits right after the nav tabs. */}
-          {!pending && !showOpenTabs && newTabMenu("start")}
+          {!pending && !gadgetFullScreen && !showOpenTabs && newTabMenu("start")}
+          {/* A full screen gadget fills the bar with its own controls. */}
+          {gadgetFullScreen && (
+            <GadgetFullScreenSlot
+              onToolbar={setGadgetToolbar}
+              sidebarOpen={sidebarOpen}
+              onOpenSidebar={onOpenSidebar}
+            />
+          )}
           {/* The picker and fullscreen toggle form the trailing control group,
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
-            {showOpenTabs && newTabMenu("end")}
-            {panelOptions.length > 0 && (
+            {!gadgetFullScreen && showOpenTabs && newTabMenu("end")}
+            {!gadgetFullScreen && panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {
                   if (isOpen) markPickerKeyboard();
@@ -2342,28 +2438,38 @@ function WorkspacePanelImpl({
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
-            <WorkspaceTabTooltip
-              label={maximized ? "Exit full screen" : "Full screen"}
-              // Escape exits full screen only from a file; other tabs keep Escape for themselves.
-              shortcut={fileViewerInFront && maximized && !isMobile ? [ESC_KEY] : undefined}
-            >
-              <Button
-                type="button"
-                variant="ghost"
-                aria-label={maximized ? "Exit full screen" : "Full screen"}
-                aria-pressed={maximized}
-                onClick={onToggleMaximized}
-                disabled={pending}
-                size="icon-xs"
-                className="flex size-6 text-muted-foreground hover:text-foreground"
+            {gadgetFullScreen ? (
+              // Leaving a full screen gadget shows its session, so the button shows the session's
+              // harness, with its composer controls in a popover.
+              <GadgetOpenSessionButton
+                sessionId={conversationId}
+                onOpenSession={onToggleMaximized}
+                className="text-muted-foreground hover:text-foreground"
+              />
+            ) : (
+              <WorkspaceTabTooltip
+                label={fullScreenLabel}
+                // Escape exits full screen only from a file; other tabs keep Escape for themselves.
+                shortcut={fileViewerInFront && maximized && !isMobile ? [ESC_KEY] : undefined}
               >
-                {maximized ? (
-                  <MinimizeIcon className="size-4" />
-                ) : (
-                  <MaximizeIcon className="size-4" />
-                )}
-              </Button>
-            </WorkspaceTabTooltip>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  aria-label={fullScreenLabel}
+                  aria-pressed={maximized}
+                  onClick={onToggleMaximized}
+                  disabled={pending}
+                  size="icon-xs"
+                  className="flex size-6 text-muted-foreground hover:text-foreground"
+                >
+                  {maximized ? (
+                    <MinimizeIcon className="size-4" />
+                  ) : (
+                    <MaximizeIcon className="size-4" />
+                  )}
+                </Button>
+              </WorkspaceTabTooltip>
+            )}
           </div>
         </div>
         {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
@@ -2383,6 +2489,7 @@ function WorkspacePanelImpl({
               frontTerminalKey,
               sideChats.selected,
               browsers.viewId,
+              gadgetRail.selected,
             ])}
           >
             {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
@@ -2473,6 +2580,15 @@ function WorkspacePanelImpl({
                   sort={filesPanelSort}
                 />
               </ResponsiveViewerSlot>
+            ) : scopeView === "gadget" && gadgetRail.selected !== null ? (
+              // Phones show the gadget in its drawer; the hidden rail keeps only the
+              // selection for a return to desktop, so the gadget never runs twice.
+              isMobile ? null : (
+                gadgetRail.render(gadgetRail.selected, {
+                  fullScreen: gadgetFullScreen,
+                  toolbar: gadgetFullScreen ? gadgetToolbar : null,
+                })
+              )
             ) : scopeView === "sidechat" ? (
               // A side chat: a forked child conversation streamed here in its own
               // scoped surface, beside the still-active main chat. Phones show it
@@ -2522,6 +2638,7 @@ function WorkspacePanelImpl({
   return (
     <>
       {rail}
+      {isMobile && <GadgetMobileDrawer state={gadgetRail} />}
       {gutterHandle && (
         <WorkspaceRailGutterHandle
           onMouseDown={handleProps.onMouseDown}

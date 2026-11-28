@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { isPageHiding } from "@/lib/pageLifecycle";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { randomUUID } from "@/lib/randomUUID";
 import {
@@ -448,6 +449,8 @@ export function useCreateTerminal(conversationId: string) {
       })
       .catch((error: unknown) => {
         clearClosedDuringLaunch(predicted.id);
+        // A page going away cuts the create off, but the shell may exist; leave its tab saved.
+        if (isPageHiding()) return;
         removeFromCache(predicted.id);
         callbacks.onError?.(error instanceof Error ? error : new Error(String(error)), predicted);
       })

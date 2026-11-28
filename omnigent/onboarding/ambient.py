@@ -31,11 +31,14 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
+from omnigent.claude_paths import claude_account_home_dir, claude_joined_path
 from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
@@ -570,11 +573,35 @@ def read_claude_managed_settings(
     return None
 
 
+def claude_user_settings_path(
+    cwd: str | Path | None = None, env: Mapping[str, str] | None = None
+) -> Path:
+    """Return the user settings path Claude Code reads from *cwd*.
+
+    :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
+        ``None`` means this process's working directory.
+    :param env: The CLI's launch environment; ``None`` means this process's.
+    :returns: ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
+        ``~/.claude/settings.json``. Cowork mode selects ``cowork_settings.json``.
+    """
+    env = os.environ if env is None else env
+    configured = env.get("CLAUDE_CONFIG_DIR")
+    home = env.get("HOME") or str(claude_account_home_dir())
+    config_dir = configured if configured is not None else os.path.join(home, ".claude")
+    config_dir = unicodedata.normalize("NFC", config_dir)
+    filename = (
+        "cowork_settings.json"
+        if env.get("CLAUDE_CODE_USE_COWORK_PLUGINS", "").lower() in {"1", "true", "yes", "on"}
+        else "settings.json"
+    )
+    return claude_joined_path(Path(cwd) if cwd is not None else None, config_dir, filename)
+
+
 def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
     """Return Claude Code's user ``settings.json``, parsed.
 
-    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
-    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
+    Uses a non-empty ``$CLAUDE_CONFIG_DIR/settings.json`` override, else
+    ``~/.claude/settings.json``.
     As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
     relative value is relative to the CLI's working directory.
 
@@ -693,8 +720,8 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
     return urlsplit(base_url).hostname or "Claude Code gateway"
 
 
-def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
-    """Claude Code's enterprise MCP config, which sits beside its managed settings.
+def claude_code_platform_managed_settings_paths() -> tuple[Path, ...]:
+    """The managed ``settings.json`` files Claude Code reads on this platform.
 
     Claude Code reads only its own platform's directory, so this skips the other POSIX
     one, and Windows paths on POSIX, which would resolve against the working directory.
@@ -705,9 +732,17 @@ def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
         else _CLAUDE_CODE_MACOS_MANAGED_DIR
     )
     return tuple(
-        path.with_name("managed-mcp.json")
+        path
         for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS
         if path.is_absolute() and path.parent != other_platform_dir
+    )
+
+
+def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
+    """Claude Code's enterprise MCP config, which sits beside its managed settings."""
+    return tuple(
+        path.with_name("managed-mcp.json")
+        for path in claude_code_platform_managed_settings_paths()
     )
 
 

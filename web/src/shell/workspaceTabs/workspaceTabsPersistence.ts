@@ -13,6 +13,8 @@ import type {
   Visit,
   WorkspacePlace,
 } from "./workspacePlace";
+import { linkPathOrNull } from "./workspaceLink";
+import { type AppliedTabSettings, parseAppliedTabSettings } from "./workspaceTabSettings";
 import type {
   ClosedTab,
   TabBinding,
@@ -36,6 +38,8 @@ export interface WorkspaceTabsSessionState {
   timeline: Visit[];
   cursor: number;
   closed: ClosedTab[];
+  /** The Workspace settings the strip last took; missing on strips that never took them. */
+  tabSettings?: AppliedTabSettings;
 }
 
 interface StoredSession {
@@ -98,6 +102,12 @@ const PULL_REQUEST_VIEWS: readonly PullRequestView[] = [
   "changes",
 ];
 
+/** A saved compared folder as its link reads it: absolute, or undefined when a link refuses it. */
+function savedComparisonRoot(value: unknown): string | undefined {
+  if (!nonEmptyString(value) || !value.startsWith("/")) return undefined;
+  return linkPathOrNull(value) ?? undefined;
+}
+
 /** The place in `value`, null for a malformed one, or "unknown" for a kind this app lacks. */
 export function parsePlace(value: unknown): WorkspacePlace | null | "unknown" {
   if (!isRecord(value) || typeof value.kind !== "string") return null;
@@ -115,16 +125,21 @@ export function parsePlace(value: unknown): WorkspacePlace | null | "unknown" {
         ...(path === undefined ? {} : optional("line", parseLine(value.line))),
         ...(path === undefined ? {} : optional("comment", comment)),
       };
-    case "changes":
+    case "changes": {
+      const comparison = parseComparison(value.comparison);
+      // A folder means nothing without the comparison its review showed.
+      const comparisonRoot = comparison ? savedComparisonRoot(value.comparisonRoot) : undefined;
       return {
         kind: "changes",
         ...optional("path", path),
         ...(path === undefined ? {} : optional("line", parseLine(value.line))),
         ...(path === undefined ? {} : optional("comment", comment)),
         ...optional("range", parseRange(value.range)),
-        ...optional("comparison", parseComparison(value.comparison)),
+        ...optional("comparison", comparison),
+        ...optional("comparisonRoot", comparisonRoot),
         ...(path !== undefined && value.fileTab === true ? { fileTab: true as const } : {}),
       };
+    }
     case "pulls":
       return { kind: "pulls" };
     case "pull": {
@@ -138,6 +153,7 @@ export function parsePlace(value: unknown): WorkspacePlace | null | "unknown" {
         ...optional("commit", nonEmptyString(value.commit) ? value.commit : undefined),
         ...optional("path", path),
         ...(path === undefined ? {} : optional("line", parseLine(value.line))),
+        ...(value.list === true ? { list: true as const } : {}),
       };
     }
     case "terminal":
@@ -270,6 +286,8 @@ export function parseSessionState(value: unknown): WorkspaceTabsSessionState | n
     cursor,
     closed,
   };
+  const tabSettings = parseAppliedTabSettings(value.tabSettings);
+  if (tabSettings) state.tabSettings = tabSettings;
   return state;
 }
 
@@ -320,6 +338,7 @@ export function serializeSessionState(state: WorkspaceTabsSessionState): Record<
     timeline: state.timeline,
     cursor: state.cursor,
     closed: state.closed,
+    ...(state.tabSettings ? { tabSettings: state.tabSettings } : {}),
   };
 }
 

@@ -2,7 +2,7 @@
 // the setting, its owner or the command target changes; after a choice, the row shows the
 // value the owner reports.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "zustand";
 
 import type { QuickPickAcceptResult, QuickPickItem } from "@/components/ui/quick-pick";
@@ -27,6 +27,17 @@ export {
   settingFailedStatus,
   settingWaitingStatus,
 } from "./settingChoiceStatus";
+
+/** The footer's line for what a page waits on, or why a choice didn't apply. */
+export function pageStatusSummary(text: string): () => ReactNode {
+  return function PageStatus() {
+    return (
+      <span role="status" data-slot="palette-page-status">
+        {text}
+      </span>
+    );
+  };
+}
 
 /** A value's row id on its setting's page. */
 export function choiceItemId(itemId: string, value: string): string {

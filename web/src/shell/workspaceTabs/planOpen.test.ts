@@ -387,6 +387,27 @@ describe("planOpen", () => {
           ok: true,
           plan: expect.objectContaining({ action: "navigate", tabId: "D", place: head }),
         });
+        // The folder that showed a comparison travels with it, and a stale one goes.
+        const inWorktree = { ...head, comparisonRoot: "/repo/.worktrees/feature" } as const;
+        const stale: PlanTab = {
+          ...shown,
+          place: {
+            ...diffFile,
+            comparison: { kind: "saved", intent: "branch-point" },
+            comparisonRoot: "/repo/.worktrees/other",
+          },
+        };
+        for (const [tab, asked] of [
+          [shown, inWorktree],
+          [stale, inWorktree],
+          [stale, head],
+          [stale, diffFile],
+        ] as const) {
+          expect(plan(state([changes, tab], "C"), asked, reuse)).toEqual({
+            ok: true,
+            plan: expect.objectContaining({ action: "navigate", tabId: "D", place: asked }),
+          });
+        }
       });
 
       it("refuses at the tab cap", () => {

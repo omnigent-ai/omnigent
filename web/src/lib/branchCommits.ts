@@ -83,8 +83,14 @@ export async function fetchBranchCommits(
   sessionId: string,
   range: RevisionSpec = BRANCH_RANGE,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<BranchCommits> {
-  const response = await workspaceSidebarSource().listBranchCommits(sessionId, range, signal);
+  const response = await workspaceSidebarSource().listBranchCommits(
+    sessionId,
+    range,
+    signal,
+    repository,
+  );
   const unavailable = response.base?.unavailable;
   if (unavailable) return { kind: "unavailable", problem: comparisonProblemFrom(unavailable) };
   return {

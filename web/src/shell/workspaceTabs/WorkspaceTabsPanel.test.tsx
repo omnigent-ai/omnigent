@@ -23,7 +23,13 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type { PullRequest, PullRequestAssociation } from "@/hooks/usePullRequests";
 import type * as PanesViewGateModule from "../panesViewGate";
 import { resetPaneSplitsCache, updatePaneSplit } from "../paneSplitStore";
+import { useFileFinderStore } from "@/store/fileFinder";
 import type { TerminalGroup } from "@/lib/terminalGroups";
+import {
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
+  writeDefaultWorkspaceTab,
+  writePinnedWorkspaceTabs,
+} from "@/lib/workspaceTabPreferences";
 
 import { resetTerminalGroupsCache, updateTerminalGroups } from "../terminalGroupsStore";
 import { requestTerminalOpen, resetTerminalOpenRequestsForTests } from "../terminalOpenRequest";
@@ -31,6 +37,7 @@ import { resetTerminalPlacement, usePublishMainTerminalKeys } from "../terminalP
 import { MOUNTED_SHELL_TAB_LIMIT } from "./shellTabBudget";
 import { LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
+import { readRecentWorkspaceFiles } from "@/lib/recentWorkspaceFiles";
 import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
 import {
   isCommandAvailable,
@@ -41,6 +48,7 @@ import { usePullRequestListCounts } from "@/store/pullRequestListCounts";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import type { WorkspacePlaceViewProps } from "./placeViews/WorkspacePlaceView";
+import { treeFileChosen } from "./placeViews/placeViewActions";
 import type { RecentPullRequestFacts } from "./recentPullRequestRow";
 import { SHELL_LIST_LIMIT_MS } from "./terminalTabConnection";
 import { OWNER_RECONNECT_HINT, VIEWER_RESUME_HINT } from "./TerminalTabStatus";
@@ -53,6 +61,7 @@ import {
   resetWorkspaceTabsSessionsForTests,
   workspaceTabsSession,
 } from "./workspaceTabsSessions";
+import { MAX_WORKSPACE_TABS, saveWorkspaceTabsSession } from "./workspaceTabsPersistence";
 
 // The tabs' content has its own suites; these tests cover which panel owns the keyboard, and
 // what the panel hands each place view.
@@ -207,6 +216,8 @@ function pressCloseTab() {
 }
 
 beforeEach(() => {
+  // These sessions start on an empty New tab; the Settings pins have their own tests.
+  window.localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, "[]");
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   placeViews.latest.clear();
   placeViews.bySession.clear();
@@ -405,6 +416,46 @@ describe("the gutter beside floating panes", () => {
     floatingPanes.on = floating;
     renderPanels([{ conversationId: "conv_a", open: true, ...overrides }]);
     expect(gutter()).toBeNull();
+  });
+});
+
+describe("the strip's Collapse right panel button", () => {
+  const collapse = () => screen.getByRole("button", { name: "Collapse right panel", hidden: true });
+
+  it("with floating panes, shows the collapse-right icon, stays in a narrow strip and hides the sidebar", () => {
+    floatingPanes.on = true;
+    const onHide = vi.fn();
+    renderPanels([{ conversationId: "conv_a", open: true, onHide }]);
+    expect(collapse().querySelector(".lucide-panel-right-close")).not.toBeNull();
+    expect(collapse().querySelector(".lucide-x")).toBeNull();
+    // The header hides its own toggle while this sidebar is open, so this one never folds away.
+    expect(collapse().className).not.toContain("@max-[240px]/rail:hidden");
+    fireEvent.click(collapse());
+    expect(onHide).toHaveBeenCalledTimes(1);
+  });
+
+  it("without floating panes, keeps its X and leaves a narrow strip to the header's toggle", () => {
+    renderPanels([{ conversationId: "conv_a", open: true, onHide: vi.fn() }]);
+    expect(collapse().querySelector(".lucide-x")).not.toBeNull();
+    expect(collapse().querySelector(".lucide-panel-right-close")).toBeNull();
+    expect(collapse().className).toContain("@max-[240px]/rail:hidden");
+  });
+});
+
+describe("the New tab's Search text", () => {
+  afterEach(() => {
+    useFileFinderStore.setState({ availableSessionId: null, textSearchAvailable: false });
+  });
+
+  it("shows only where the session's files can be searched for text, not just found", async () => {
+    useFileFinderStore.setState({ availableSessionId: "s-files", textSearchAvailable: false });
+    renderPanels([{ conversationId: "s-files" }]);
+    act(() => void openWorkspaceNewTab("s-files"));
+    await screen.findByTestId("workspace-new-tab-page");
+    expect(screen.queryByRole("option", { name: /^Search text/ })).toBeNull();
+
+    act(() => useFileFinderStore.setState({ textSearchAvailable: true }));
+    expect(await screen.findByRole("option", { name: /^Search text/ })).toBeInTheDocument();
   });
 });
 
@@ -630,6 +681,97 @@ describe("WorkspaceTabsPanel search results", () => {
           .tabs()
           .flatMap((tab) => ("place" in tab && tab.place.kind === "files" ? [tab.place] : [])),
       ).toContainEqual({ kind: "files", path: "src/app.py", line: { start: 351, column: 3 } }),
+    );
+  });
+});
+
+describe("WorkspaceTabsPanel and the Workspace settings", () => {
+  it("starts a new session on its pinned pages and follows a changed first page", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents", "tasks"]);
+    writeDefaultWorkspaceTab("subagents");
+    // Tasks isn't offered in this session, so it isn't pinned there.
+    renderPanels([{ conversationId: "s-settings", showTasksTab: false }]);
+    const { store } = workspaceTabsSession("s-settings");
+    const strip = () =>
+      store.tabs().map((tab) => ("place" in tab ? [tab.place.kind, tab.pinned === true] : null));
+    await waitFor(() =>
+      expect(strip()).toEqual([
+        ["files", true],
+        ["agents", true],
+      ]),
+    );
+    expect(store.selectedTab()?.place.kind).toBe("agents");
+    act(() => writeDefaultWorkspaceTab("files"));
+    await waitFor(() => expect(store.selectedTab()?.place.kind).toBe("files"));
+  });
+
+  it("keeps a file a link opened before the sidebar first showed, with Settings as shipped", async () => {
+    window.localStorage.removeItem(PINNED_WORKSPACE_TABS_STORAGE_KEY);
+    const sessionId = "s-settings-link";
+    await openWorkspaceFile(sessionId, "src/linked.ts", { line: 7, commentId: "c1" }, "link");
+    const { store } = workspaceTabsSession(sessionId);
+    renderPanels([{ conversationId: sessionId }]);
+    await waitFor(() =>
+      expect(store.tabs().some((tab) => "place" in tab && tab.place.kind === "agents")).toBe(true),
+    );
+    expect(store.selectedTab()?.place).toMatchObject({ kind: "files", path: "src/linked.ts" });
+  });
+
+  it("adds a pinned page that didn't fit once a tab closes", async () => {
+    const sessionId = "s-settings-full";
+    const full = Array.from({ length: MAX_WORKSPACE_TABS }, (_, index) => ({
+      id: `kept-${index}`,
+      place: { kind: "files" as const, path: `src/file-${index}.ts` },
+      openedBy: "user" as const,
+    }));
+    saveWorkspaceTabsSession(sessionId, {
+      tabs: full,
+      selectedTabId: full[0].id,
+      timeline: [{ tabId: full[0].id, place: full[0].place }],
+      cursor: 0,
+      closed: [],
+    });
+    writePinnedWorkspaceTabs(["tasks"]);
+    writeDefaultWorkspaceTab("tasks");
+    renderPanels([{ conversationId: sessionId, showTasksTab: true }]);
+    const { store } = workspaceTabsSession(sessionId);
+    const hasTasks = () => store.tabs().some((tab) => "place" in tab && tab.place.kind === "tasks");
+    expect(store.tabs()).toHaveLength(MAX_WORKSPACE_TABS);
+    expect(hasTasks()).toBe(false);
+    await act(async () => {
+      await store.close(full.at(-1)!.id);
+    });
+    await waitFor(() => expect(hasTasks()).toBe(true));
+    expect(store.tabs()).toHaveLength(MAX_WORKSPACE_TABS);
+  });
+});
+
+describe("recently opened files, for Go to File", () => {
+  it("lists a file opened from the Files tree, and from a Search result", async () => {
+    renderPanels([{ conversationId: "s-recent-files", showContentSearch: true }]);
+    const { store } = workspaceTabsSession("s-recent-files");
+    await act(async () => {
+      await store.open({ place: { kind: "files" } }, { opener: "user" });
+    });
+    await waitFor(() => expect(placeViews.latest.get("files:")).toBeDefined());
+    const tree = treeFileChosen("src/tree.ts");
+    if (tree.type !== "open") throw new Error("the tree opens its file");
+    await act(async () => {
+      placeViews.latest.get("files:")?.onOpen(tree.link, tree.options);
+    });
+    await waitFor(() =>
+      expect(readRecentWorkspaceFiles("s-recent-files")).toEqual(["src/tree.ts"]),
+    );
+
+    await act(async () => {
+      await store.open({ place: { kind: "search" } }, { opener: "user" });
+    });
+    await waitFor(() => expect(contentSearch.onFileSelect).toBeDefined());
+    await act(async () => {
+      contentSearch.onFileSelect?.("src/found.py", { line: 7 });
+    });
+    await waitFor(() =>
+      expect(readRecentWorkspaceFiles("s-recent-files")).toEqual(["src/found.py", "src/tree.ts"]),
     );
   });
 });

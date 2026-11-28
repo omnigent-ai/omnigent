@@ -1,5 +1,6 @@
 //! `omnidev ui` — run only this checkout's Vite UI in the foreground, proxied
 //! to a remote Omnigent server given by `--server` or picked from recent ones.
+//! `--prod` builds the production bundle and serves it with `vite preview`.
 //!
 //! Vite's dev proxy (`web/vite.config.ts`) does the server-specific work: it
 //! fills in the workspace API mount, turns a `?o=<org-id>` selector into the
@@ -30,7 +31,11 @@ pub struct Server {
     pub databricks_profile: Option<String>,
 }
 
-pub fn run(server_url: Option<String>, databricks_profile: Option<String>) -> Result<()> {
+pub fn run(
+    server_url: Option<String>,
+    databricks_profile: Option<String>,
+    prod: bool,
+) -> Result<()> {
     let repo_root = paths::find_repo_root(&std::env::current_dir()?, false)?;
     let recent_path = paths::recent_servers_path()?;
     let mut recent = load_recent(&recent_path);
@@ -73,22 +78,55 @@ pub fn run(server_url: Option<String>, databricks_profile: Option<String>) -> Re
         }
     }
 
-    eprintln!("Starting this checkout's UI against {}", label(&server));
-    let mut vite = Command::new("pnpm");
-    vite.args(["run", "dev", "--open"])
-        .current_dir(&web)
-        .env("OMNIGENT_URL", &server.url);
-    match &server.databricks_profile {
-        Some(profile) => vite.env("OMNIGENT_DATABRICKS_PROFILE", profile),
-        None => vite.env_remove("OMNIGENT_DATABRICKS_PROFILE"),
-    };
     // A static token left in the shell would be sent to whichever server was picked.
     if std::env::var_os("OMNIGENT_AUTH_TOKEN").is_some() {
         eprintln!("omnidev: ignoring OMNIGENT_AUTH_TOKEN; use --databricks-profile instead");
-        vite.env_remove("OMNIGENT_AUTH_TOKEN");
     }
+    let mut vite = if prod {
+        // Outside omnigent/server/static; per server, since the bundle inlines the workspace flag
+        // and a build empties its dir under any preview still serving it.
+        let out_dir = paths::default_pod_dir(&repo_root)?.join(format!(
+            "web-ui-prod-{}",
+            paths::short_hash(server.url.as_bytes())
+        ));
+        let out_dir = out_dir.to_string_lossy();
+        eprintln!(
+            "Building this checkout's production UI for {}",
+            label(&server)
+        );
+        // The build must see OMNIGENT_URL too: it inlines the workspace flag.
+        let built = pnpm(&web, &server, &["run", "build", "--outDir", &out_dir])
+            .status()
+            .context("building the UI with pnpm")?;
+        if !built.success() {
+            bail!("production UI build failed");
+        }
+        pnpm(
+            &web,
+            &server,
+            &["run", "preview", "--outDir", &out_dir, "--open"],
+        )
+    } else {
+        pnpm(&web, &server, &["run", "dev", "--open"])
+    };
+    eprintln!("Starting this checkout's UI against {}", label(&server));
     // exec so Ctrl-C and Vite's own keyboard shortcuts reach Vite directly.
     Err(vite.exec()).context("starting Vite with pnpm")
+}
+
+/// `pnpm <args>` in `web/` with the proxy env for `server`.
+fn pnpm(web: &Path, server: &Server, args: &[&str]) -> Command {
+    let mut command = Command::new("pnpm");
+    command
+        .args(args)
+        .current_dir(web)
+        .env("OMNIGENT_URL", &server.url)
+        .env_remove("OMNIGENT_AUTH_TOKEN");
+    match &server.databricks_profile {
+        Some(profile) => command.env("OMNIGENT_DATABRICKS_PROFILE", profile),
+        None => command.env_remove("OMNIGENT_DATABRICKS_PROFILE"),
+    };
+    command
 }
 
 /// Accept only what the dev proxy uses, so no credentials or typos land in the
@@ -297,6 +335,22 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(load_recent(&path).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pnpm_gives_build_and_preview_the_server_env_without_a_static_token() {
+        let command = pnpm(
+            Path::new("/web"),
+            &server("https://a.example.com/?o=1", None),
+            &["run", "build"],
+        );
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.contains(&(
+            "OMNIGENT_URL".as_ref(),
+            Some("https://a.example.com/?o=1".as_ref())
+        )));
+        assert!(envs.contains(&("OMNIGENT_AUTH_TOKEN".as_ref(), None)));
+        assert!(envs.contains(&("OMNIGENT_DATABRICKS_PROFILE".as_ref(), None)));
     }
 
     #[test]

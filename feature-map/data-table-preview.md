@@ -30,7 +30,7 @@ CSV, TSV, Excel (`.xlsx`) and Parquet files open as a read-only table in the fil
 - Comments: a `?comment=` link to a CSV or TSV, or picking one of its comments in the Comments panel, opens Source, where comment anchors show; View preview switches back to the table.
 - Find: with the table open, press Cmd/Ctrl+F; matches refresh after sorting, filtering or a file change, and the table scrolls sideways to a match in a hidden column.
 - Keyboard: Tab reaches the table as one stop; arrow keys and Home/End move between cells, and focusing a cell selects it for Copy cell and Copy row. A column's resize handle takes Left and Right and reports its width (64–2,048 pixels) to assistive technology.
-- Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a touch client), file links, tool rows and `?file=` links open the file in its Files tab, at the cited line. A `?comment=` link opens the file at that comment's thread, a `?diff=1` link opens its diff in the Changes tab, and `?fullscreen=1` fills the window with the sidebar. A file tab's breadcrumb lists each folder's files; picking one opens it in the same tab.
+- Tabs sidebar: with `workspace_sidebar_v2` on and the `gadgets` feature off, in a desktop app or desktop browser (not a touch client), file links, tool rows and `?file=` links open the file in its Files tab, at the cited line. A `?comment=` link opens the file at that comment's thread, a `?diff=1` link opens its diff in the Changes tab, and `?fullscreen=1` fills the window with the sidebar. A file tab's breadcrumb lists each folder's files; picking one opens it in the same tab.
 - Mobile web: the same entry points at a narrow viewport; the table scrolls horizontally.
 
 ## Driving it with the repro environment

@@ -310,16 +310,17 @@ jobs:
       - name: Install project + test dependencies
         run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
-      - name: Install bubblewrap + tmux
+      - name: Install bubblewrap, ripgrep and tmux
         # bubblewrap: the UI tests open terminals under os_env, whose
         # linux_bwrap backend fails loud if `bwrap` is missing. The apparmor
         # sysctl mirrors ci.yml (Ubuntu 24.04 blocks unprivileged user
         # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs).
         # tmux: the claude-native render-parity test drives Claude Code
         # through a tmux pane, so `tmux` must be on PATH.
+        # ripgrep: the runner's content search, which Go to File's Text tab journeys use.
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap tmux
+          sudo apt-get install -y bubblewrap ripgrep tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       # Fetch the prebuilt Codex-parity sidecar from the build-sidecar job

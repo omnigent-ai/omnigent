@@ -17,6 +17,12 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   })),
 }));
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import {
+  onFirstInputAccepted,
+  onSessionCreatedHere,
+  onSessionCreationAttempt,
+  resetSessionCreations,
+} from "@/lib/sessionCreations";
 import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
@@ -59,6 +65,9 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { requestGadgetCreateSessionMenu, resetGadgetRailRequests } from "@/lib/gadgetRailTabs";
+import { GadgetOpenSessionButton } from "@/gadgets/ui/GadgetOpenSessionButton";
+import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { writeLastHostChoice } from "@/lib/hostPreferences";
@@ -284,6 +293,7 @@ function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
   presentation: ComposerPresentation = { kind: "page" },
+  beside?: ReactNode,
 ): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -335,7 +345,17 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  render(
+    beside === undefined ? (
+      <NewChatLandingScreen />
+    ) : (
+      <MobileHeaderControlsProvider>
+        {beside}
+        <NewChatLandingScreen />
+      </MobileHeaderControlsProvider>
+    ),
+    { wrapper: Wrapper },
+  );
   return client;
 }
 
@@ -460,6 +480,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetGadgetRailRequests();
   cleanup();
   localStorage.clear();
 });
@@ -599,6 +620,263 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(beginLocalConversationMock).not.toHaveBeenCalled();
     expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it("starts the session from a full screen gadget's Create session menu as Start does", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+    const onOpenSession = vi.fn();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} onOpenSession={onOpenSession} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    act(() => {
+      requestGadgetCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    // The menu holds New session's own controls.
+    expect(
+      within(screen.getByTestId("gadget-open-session-popover")).getByTestId(
+        "new-chat-landing-agent-select",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "inspect the repo" }),
+      ),
+    );
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
+    expect(onOpenSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps a full screen gadget's Create session off while the host can't run the harness", async () => {
+    // The host reports the selected agent's harness as not set up there.
+    setHosts([host({ configured_harnesses: { "claude-sdk": false } })]);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    act(() => {
+      requestGadgetCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    // New session only warns under its composer, which full screen hides: the menu says why
+    // and doesn't start a session that can't run.
+    expect(await screen.findByTestId("gadget-create-session-harness")).toHaveTextContent(
+      "Pick another harness",
+    );
+    expect(create).toBeDisabled();
+    fireEvent.click(create);
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(panel.launch).not.toHaveBeenCalled();
+  });
+
+  it("shows a prompt link's message in a full screen gadget's Create session menu before it is sent", async () => {
+    // A link that fills the composer and opens a gadget full screen over it: nothing the
+    // gadget wrote, so only the composer's own text can say what Create session sends.
+    searchParams = new URLSearchParams("prompt=LINK_PREFILL_PROBE&gadget_start=g1&gadget=g1");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g1" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    act(() => {
+      requestGadgetCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    const popover = screen.getByTestId("gadget-open-session-popover");
+    expect(within(popover).getByTestId("gadget-create-session-draft")).toHaveTextContent(
+      "LINK_PREFILL_PROBE",
+    );
+    await waitFor(() => expect(create).toBeEnabled());
+    // Focus stays on the menu, so a stray Enter doesn't send text the viewer hasn't read.
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+    expect(document.activeElement).not.toBe(create);
+    fireEvent.click(create);
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "LINK_PREFILL_PROBE" }),
+      ),
+    );
+  });
+
+  it("shows a message the gadget wrote in its Create session menu before Create session sends it", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g1" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    // Gadget code filled the composer, which full screen hides.
+    typeMessage("delete every branch");
+    act(() => {
+      requestGadgetCreateSessionMenu({
+        prompt: "delete every branch",
+        gadgetId: "g1",
+        gadgetName: "Synthetic board",
+      });
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    const popover = screen.getByTestId("gadget-open-session-popover");
+    // The viewer can read exactly what will be sent, and from which gadget, before sending it.
+    const review = within(popover).getByTestId("gadget-open-session-review");
+    expect(review).toHaveTextContent("Written by the gadget “Synthetic board”");
+    expect(review).toHaveTextContent("delete every branch");
+    // Shown once: the menu's own copy of the draft stays out while the review shows it.
+    expect(screen.queryByTestId("gadget-create-session-draft")).toBeNull();
+    await waitFor(() => expect(document.activeElement).not.toBe(create));
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "delete every branch" }),
+      ),
+    );
+  });
+
+  it("still shows what Create session sends after switching from the gadget that wrote it to another", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    // Gadget A wrote the message and its menu was dismissed; the viewer opened gadget B, whose
+    // menu shows no review of A's text.
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g2" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("delete every branch");
+    act(() => {
+      requestGadgetCreateSessionMenu({
+        prompt: "delete every branch",
+        gadgetId: "g1",
+        gadgetName: "Synthetic board",
+      });
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    expect(screen.queryByTestId("gadget-open-session-review")).toBeNull();
+    // New session's own copy shows it instead: Create session never sends unseen text.
+    expect(await screen.findByTestId("gadget-create-session-draft")).toHaveTextContent(
+      "delete every branch",
+    );
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "delete every branch" }),
+      ),
+    );
+  });
+
+  it("names the session a gadget's Create session made, but not its first message accepted before it is sent", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Earlier cases created conv_new too; this tab forgets them.
+    resetSessionCreations();
+    // The panel has the session but hasn't sent its first message, or the send fails.
+    const panel = floatingPanel();
+    const outcomes: string[] = [];
+    const stopCreated = onSessionCreatedHere((sessionId) => outcomes.push(`created:${sessionId}`));
+    const stopAccepted = onFirstInputAccepted((sessionId) =>
+      outcomes.push(`accepted:${sessionId}`),
+    );
+    try {
+      renderLanding(
+        [],
+        {},
+        panel,
+        <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+      );
+      await waitForWorkspaceSeed();
+      typeMessage("inspect the repo");
+      act(() => {
+        requestGadgetCreateSessionMenu();
+      });
+      const create = await screen.findByTestId("gadget-create-session");
+      await waitFor(() => expect(create).toBeEnabled());
+      fireEvent.click(create);
+      await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+      expect(outcomes).toEqual(["created:conv_new"]);
+    } finally {
+      stopCreated();
+      stopAccepted();
+    }
+  });
+
+  it("tells a gadget's Create session its create failed, and names no session", async () => {
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new Error("offline"));
+    const panel = floatingPanel();
+    const outcomes: string[] = [];
+    const stopAttempts = onSessionCreationAttempt((attempt, outcome) =>
+      outcomes.push(`${outcome}:${attempt}`),
+    );
+    const stopCreated = onSessionCreatedHere((sessionId) => outcomes.push(`created:${sessionId}`));
+    try {
+      renderLanding(
+        [],
+        {},
+        panel,
+        <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+      );
+      await waitForWorkspaceSeed();
+      typeMessage("inspect the repo");
+      act(() => {
+        requestGadgetCreateSessionMenu();
+      });
+      const create = await screen.findByTestId("gadget-create-session");
+      await waitFor(() => expect(create).toBeEnabled());
+      fireEvent.click(create);
+      // The gadget's requests stay undelivered: its attempt fails and no session is noted.
+      await waitFor(() => expect(outcomes.some((o) => o.startsWith("failed:"))).toBe(true));
+      expect(outcomes.filter((o) => o.startsWith("created:"))).toEqual([]);
+      expect(panel.launch).not.toHaveBeenCalled();
+    } finally {
+      stopAttempts();
+      stopCreated();
+    }
   });
 
   // The panel keeps the prompt when delivery fails, and remounts the composer when it succeeds.
@@ -1148,6 +1426,35 @@ describe("NewChatLandingScreen create flow", () => {
     typeMessage("Create a regular session");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("returns a failed page create to the gadget's New session, gadget and full screen kept", async () => {
+    // Build opened New session for a gadget; the temporary create then fails. Going back
+    // to a plain New session would read as leaving the gadget and delete it.
+    const query = "gadget_start=0123456789abcdef0123456789abcdef&gadget_full=1";
+    searchParams = new URLSearchParams(query);
+    const previousUrl = window.location.href;
+    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+    });
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_gadget",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    removeLocalConversationMock.mockReturnValue(true);
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new Error("offline"));
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("Build the gadget");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
+      );
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
   });
 
   it.each([

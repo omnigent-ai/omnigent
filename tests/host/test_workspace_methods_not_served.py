@@ -6,7 +6,6 @@ server's route each refuse them without work, and no GetCapabilities answer list
 
 from __future__ import annotations
 
-import json
 import socket
 from pathlib import Path
 
@@ -23,6 +22,7 @@ from omnigent.host.workspace_service import start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.server.workspace_access import METHOD_GATES, gate_for
 from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.connect_stream import connect_frame, end_of_stream_code
 from tests.host import test_workspace_api_pull_requests as server_tests
 from tests.host import test_workspace_pull_requests as host_tests
 from tests.host import test_workspace_service as service_tests
@@ -44,23 +44,6 @@ def _request(name: str) -> bytes:
 def _streams(name: str) -> bool:
     method = pb.DESCRIPTOR.services_by_name["WorkspaceService"].methods_by_name[name]
     return method.server_streaming
-
-
-def _envelope(flags: int, payload: bytes) -> bytes:
-    """One Connect streaming frame: a flags byte, a big-endian length and the payload."""
-    return bytes([flags]) + len(payload).to_bytes(4, "big") + payload
-
-
-def _end_of_stream_code(body: bytes) -> str | None:
-    """The error code in a Connect stream's end-of-stream frame, which a refusal carries."""
-    offset = 0
-    while offset + 5 <= len(body):
-        flags, size = body[offset], int.from_bytes(body[offset + 1 : offset + 5], "big")
-        payload = body[offset + 5 : offset + 5 + size]
-        offset += 5 + size
-        if flags & 0x02:
-            return json.loads(payload).get("error", {}).get("code")
-    return None
 
 
 @pytest.fixture(autouse=True)
@@ -132,11 +115,11 @@ async def test_the_direct_socket_lists_none_and_refuses_each(
                 if _streams(name):
                     response = await http.post(
                         f"{service}/{name}",
-                        content=_envelope(0, _request(name)),
+                        content=connect_frame(_request(name)),
                         headers={**headers, "Content-Type": "application/connect+proto"},
                     )
                     assert response.status_code == 200, (name, response.text)
-                    assert _end_of_stream_code(response.content) == "unimplemented", name
+                    assert end_of_stream_code(response.content) == "unimplemented", name
                     continue
                 response = await http.post(
                     f"{service}/{name}",

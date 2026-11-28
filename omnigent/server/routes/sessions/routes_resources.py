@@ -13,7 +13,7 @@ import re
 import time
 import urllib.parse
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
@@ -68,6 +68,17 @@ from omnigent.server.pull_request_viewers import (
     OWNER_ONLY_CHANGES_MESSAGE,
     PullRequestViewer,
     info_for_viewer,
+    review_comments_for_viewer,
+    review_read_params,
+    review_threads_for_viewer,
+)
+from omnigent.server.read_only_code_hosts import (
+    READ_ONLY_CODE_HOST_MESSAGE,
+    is_read_only_pull_request,
+    mark_read_only,
+    parse_patterns,
+    refuses_change,
+    selected_pull_request,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -212,6 +223,8 @@ _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
 # the runner and host tunnels carry it base64-encoded (a third larger) in one frame.
 _MAX_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
+# Room in a workspace API upload's body for its URL, name and protobuf framing.
+_UPLOAD_FIELDS_MARGIN_BYTES = 64 * 1024
 
 # Automatic previews can require this acknowledgement when talking to older servers.
 _WORKSPACE_FILE_SCOPE_HEADERS = {
@@ -284,9 +297,30 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+    read_only_code_hosts: Sequence[str] = (),
 ) -> None:
-    """Register the resources routes on router."""
+    """Register the resources routes on router.
+
+    :param read_only_code_hosts: Host patterns whose pull requests are served read-only,
+        from the server config's ``read_only_code_hosts``.
+    """
     pull_request_store = server_prs.open_store(conversation_store)
+    read_only_patterns = parse_patterns(list(read_only_code_hosts))
+
+    def _refuse_read_only_write(params: dict[str, Any]) -> None:
+        """Refuse a write to a pull request on a read-only host before it reaches the host.
+
+        :param params: The write's parameters: the PR it names, else the server's first.
+        """
+        target = params.get("pr_url") or params.get("default_pr_url")
+        if refuses_change(target, read_only_patterns):
+            raise OmnigentError(READ_ONLY_CODE_HOST_MESSAGE, code=ErrorCode.FORBIDDEN)
+
+    def _marked_read_only(info: dict[str, Any]) -> dict[str, Any]:
+        """An overview whose selected PR is on a read-only host, with its writes turned off."""
+        if is_read_only_pull_request(selected_pull_request(info), read_only_patterns):
+            return mark_read_only(info)
+        return info
 
     async def _require_filesystem_attachment_support(
         request: Request, conv: Conversation, filename: str, capability: str
@@ -1256,6 +1290,7 @@ def register_resources_routes(
         :raises HTTPException: With the runner's status and ``detail`` when it refuses.
         """
         params = await _github_params(session_id, params)
+        _refuse_read_only_write(params)
         try:
             status, result = await _proxy_post_to_runner(
                 session_id, runner_path, params, conv, timeout=_PR_EDIT_PROXY_TIMEOUT_S
@@ -2984,14 +3019,17 @@ def register_resources_routes(
                 status_code=501, detail="The workspace API needs `omnigent[workspace-api]`"
             ) from None
         from connectrpc.errors import ConnectError
+        from connectrpc.server import DEFAULT_READ_MAX_BYTES
 
         from omnigent.api.workspace.v1alpha1.workspace_connect import (
             WorkspaceServiceASGIApplication,
         )
         from omnigent.host.frames import CAP_WORKSPACE_API
         from omnigent.host.workspace_methods import WORKSPACE_METHODS
+        from omnigent.host.workspace_pull_request_input import MAX_ATTACHMENT_BYTES
         from omnigent.server.workspace_access import WorkspaceGate, callable_methods, gate_for
         from omnigent.server.workspace_api import (
+            VIEWER_SHAPED_METHODS,
             ConnectCallResponse,
             HostTarget,
             HostWorkspaceService,
@@ -3011,15 +3049,15 @@ def register_resources_routes(
             conv = await _validate_session(session_id, request, LEVEL_READ)
         # The owner grant itself, with no admin pass: only the owner acts as the host's account.
         # Only an owner-gated method and GetCapabilities, which lists them, need it.
-        session_owner = (
-            gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities"
-        ) and await asyncio.to_thread(
-            _is_session_owner,
-            _get_user_id(request, auth_provider),
-            conv,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-        )
+        if gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities":
+            session_owner = await _caller_is_session_owner(conv, request)
+        elif method in VIEWER_SHAPED_METHODS:
+            # The thread reads show the host account's rights to the owner alone; as on REST,
+            # a failed lookup reads them as anyone else would rather than failing the read.
+            viewer = await _pull_request_viewer(conv, request)
+            session_owner = viewer is PullRequestViewer.OWNER
+        else:
+            session_owner = False
         if gate is WorkspaceGate.SESSION_OWNER and not session_owner:
             raise OmnigentError(
                 "Only the session's owner can use this through the workspace API",
@@ -3048,13 +3086,22 @@ def register_resources_routes(
                 overview=lambda payload, sent_at: _with_server_pull_requests(
                     session_id, payload, sent_at
                 ),
+                viewer=PullRequestViewer.OWNER if session_owner else PullRequestViewer.VIEWER,
+                read_only_code_hosts=read_only_patterns,
             ),
             # Only GetCapabilities lists methods, and it needs the browse gate.
             callable_methods=callable_methods(
                 browse=gate is WorkspaceGate.BROWSE, session_owner=session_owner
             ),
         )
-        app = WorkspaceServiceASGIApplication(forwarder)
+        # An upload may be as large as an attachment, but only once the owner gate has passed;
+        # every other call, and anyone else's, keeps connectrpc's default read limit.
+        read_max_bytes = (
+            MAX_ATTACHMENT_BYTES + _UPLOAD_FIELDS_MARGIN_BYTES
+            if method == "UploadAttachment" and session_owner
+            else DEFAULT_READ_MAX_BYTES
+        )
+        app = WorkspaceServiceASGIApplication(forwarder, read_max_bytes=read_max_bytes)
         # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
         return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 
@@ -3761,7 +3808,7 @@ def register_resources_routes(
         :param requested_at: Epoch seconds the server sent the request ``info`` answers.
         """
         if pull_request_store is None:
-            return info
+            return _marked_read_only(info)
         try:
             stored = await asyncio.to_thread(
                 server_prs.ingest_info,
@@ -3776,10 +3823,10 @@ def register_resources_routes(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-            return info
+            return _marked_read_only(info)
         if pull_request_refresher is not None:
             pull_request_refresher.note_read(session_id, requested_at)
-        return server_prs.answer(info, stored)
+        return _marked_read_only(server_prs.answer(info, stored))
 
     async def _record_attached(session_id: str, info: dict[str, Any]) -> None:
         """Link the PR a successful attach selected, clearing an earlier unlink.
@@ -4573,7 +4620,10 @@ def register_resources_routes(
                 "base_sha": base_sha,
             },
         )
-        return await _fs_get_with_host_fallback(
+        # The host account's rights in each conversation are the owner's to see.
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
+        threads = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_threads",
@@ -4581,6 +4631,7 @@ def register_resources_routes(
             runner_params=params,
             runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
         )
+        return review_threads_for_viewer(threads, viewer)
 
     @router.get(
         "/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments",
@@ -4596,7 +4647,9 @@ def register_resources_routes(
         """Load additional replies in a published PR review conversation."""
         conv = await _validate_session(session_id, request, LEVEL_READ)
         params = await _github_params(session_id, {"pr_url": pr_url, "after": after})
-        return await _fs_get_with_host_fallback(
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
+        comments = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_thread_comments",
@@ -4607,6 +4660,7 @@ def register_resources_routes(
                 f"{urllib.parse.quote(thread_id, safe='')}/comments"
             ),
         )
+        return review_comments_for_viewer(comments, viewer)
 
     @router.post(
         "/sessions/{session_id}/resources/github/review-threads",
@@ -4748,6 +4802,7 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         await _require_pull_request_owner(conv, request)
+        _refuse_read_only_write({"pr_url": pr_url})
         content = await _read_upload_capped(file, _MAX_PR_ATTACHMENT_BYTES)
         name = file.filename or ""
         tracking = await _github_params(session_id, {"pr_url": pr_url})

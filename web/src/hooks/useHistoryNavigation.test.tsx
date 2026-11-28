@@ -23,7 +23,8 @@ vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => embedded }));
 type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
 let sendCommand: CommandListener = () => {};
 
-function installDesktop(): void {
+/** A desktop shell with the command bridge, whose menu routes `desktopCommands` if it lists them. */
+function installDesktop(desktopCommands: string[] | null = ["go-back", "go-forward"]): void {
   Object.assign(window, {
     omnigentDesktop: {
       kind: "electron",
@@ -32,8 +33,14 @@ function installDesktop(): void {
         return () => {};
       },
       setDesktopCommandState: () => {},
+      ...(desktopCommands ? { desktopCommands } : {}),
     },
   });
+}
+
+/** An Electron shell from before the menu handed its commands to the page. */
+function installOlderDesktop(): void {
+  Object.assign(window, { omnigentDesktop: { kind: "electron" } });
 }
 
 function pressBracket(code: "BracketLeft" | "BracketRight", target: HTMLElement = document.body) {
@@ -67,7 +74,8 @@ afterEach(() => {
 });
 
 describe("useHistoryNavigation", () => {
-  it("steps back and forward with Cmd+[ and Cmd+]", () => {
+  it("steps back and forward with Cmd+[ and Cmd+] on a shell whose menu leaves them", () => {
+    installOlderDesktop();
     renderHook(() => useHistoryNavigation(true));
     expect(pressBracket("BracketLeft").defaultPrevented).toBe(true);
     pressBracket("BracketRight");
@@ -75,6 +83,7 @@ describe("useHistoryNavigation", () => {
   });
 
   it("goes back after a session link followed from a terminal", () => {
+    installOlderDesktop();
     setHistoryIndex(0);
     renderHook(() => useHistoryNavigation(true));
     openTerminalLink(new MouseEvent("click"), `${window.location.origin}/c/conv_next`);
@@ -83,6 +92,7 @@ describe("useHistoryNavigation", () => {
   });
 
   it("does not go back past the first in-app entry", () => {
+    installOlderDesktop();
     setHistoryIndex(0);
     renderHook(() => useHistoryNavigation(true));
     pressBracket("BracketLeft");
@@ -91,6 +101,7 @@ describe("useHistoryNavigation", () => {
   });
 
   it("embedded, does not go back past the page the app opened on", () => {
+    installOlderDesktop();
     embedded = true;
     // The host's own pages are earlier entries in the same history.
     setHistoryIndex(4);
@@ -111,12 +122,33 @@ describe("useHistoryNavigation", () => {
   });
 
   it("leaves bracket chords to a focused terminal or code editor", () => {
+    installOlderDesktop();
     renderHook(() => useHistoryNavigation(true));
     document.body.innerHTML = '<div class="xterm"><textarea></textarea></div>';
     const terminal = document.querySelector("textarea")!;
     terminal.focus();
     pressBracket("BracketLeft", terminal);
     expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["has the command bridge but no Go menu", null],
+    ["routes other commands but not Go", ["close", "quit"]],
+  ])("keeps Cmd+[ and Cmd+] on a shell that %s", (_shell, desktopCommands) => {
+    installDesktop(desktopCommands);
+    renderHook(() => useHistoryNavigation(true));
+    expect(pressBracket("BracketLeft").defaultPrevented).toBe(true);
+    pressBracket("BracketRight");
+    expect(navigate.mock.calls).toEqual([[-1], [1]]);
+  });
+
+  it("leaves Cmd+[ and Cmd+] to the Go menu on a shell that routes Go to the page", () => {
+    renderHook(() => useHistoryNavigation(true));
+    expect(pressBracket("BracketLeft").defaultPrevented).toBe(false);
+    pressBracket("BracketRight");
+    expect(navigate).not.toHaveBeenCalled();
+    sendCommand({ command: "go-back", browserViewId: null });
+    expect(navigate).toHaveBeenCalledWith(-1);
   });
 
   it("maps the mouse back/forward buttons and the Go menu in the desktop app", () => {

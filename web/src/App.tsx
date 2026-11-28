@@ -13,6 +13,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
 import { isElectronShell } from "@/lib/nativeBridge";
+import { CANVAS_SESSION_ROUTE, CHAT_SESSION_ROUTE } from "@/lib/sessionRoutes";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -111,6 +112,24 @@ const WorkflowDetailPage = withPageView(
     lazy(() =>
       import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage })),
     ),
+  ),
+);
+const GadgetListPage = withPageView(
+  "gadgets",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetListPage").then((m) => ({ default: m.GadgetListPage }))),
+  ),
+);
+const GadgetStartPage = withPageView(
+  "gadgets.new",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetStart").then((m) => ({ default: m.GadgetStartPage }))),
+  ),
+);
+const GadgetOpenPage = withPageView(
+  "gadgets.open",
+  withPaneLoading(
+    lazy(() => import("@/gadgets/ui/GadgetOpenPage").then((m) => ({ default: m.GadgetOpenPage }))),
   ),
 );
 const SettingsPage = withPaneLoading(
@@ -259,7 +278,7 @@ function AppRoutes({ basename }: AppProps) {
         />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route path={`${prefix}${CHAT_SESSION_ROUTE}`} element={<ChatPage />} />
           <Route
             path={`${prefix}/grid/:gridId`}
             element={
@@ -286,7 +305,7 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route
-            path={`${prefix}/canvas/c/:conversationId`}
+            path={`${prefix}${CANVAS_SESSION_ROUTE}`}
             element={
               <FeatureGatedPage feature="canvas">
                 <ChatPage />
@@ -331,6 +350,30 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="workflows">
                 <WorkflowDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetListPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget/new`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetStartPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/gadget/:gadgetId`}
+            element={
+              <FeatureGatedPage feature="gadgets">
+                <GadgetOpenPage />
               </FeatureGatedPage>
             }
           />

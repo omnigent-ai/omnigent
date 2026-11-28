@@ -58,7 +58,12 @@ import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
-import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+import {
+  isMessageItem,
+  isTerminalCommandItem,
+  type ConversationItem,
+  type MessageItem,
+} from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -92,6 +97,7 @@ import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
   SessionInputConsumedEvent,
+  TerminalCommandEvent,
   SessionViewer,
   StreamEvent,
 } from "@/lib/events";
@@ -211,6 +217,12 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
+import {
+  beginSessionCreation,
+  noteSessionCreatedHere,
+  noteSessionCreationFailed,
+  noteFirstInputAccepted,
+} from "@/lib/sessionCreations";
 import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
@@ -673,6 +685,8 @@ export function removeLocalConversation(tempConvId: string): boolean {
  */
 export interface PendingUserMessage {
   tempId: string;
+  /** Client submission identity, available before the POST response. */
+  stableId?: string;
   content: MessageContentBlock[];
   /** Unsent draft awaiting session/model readiness, including unuploaded files. */
   initialDraft?: { text: string; files: File[] };
@@ -827,6 +841,7 @@ export interface ConversationState {
     itemId: string;
     tempId?: string;
     pendingId?: string;
+    stableId?: string;
     contentKey?: string;
   }[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
@@ -3115,6 +3130,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               ...s.pendingUserMessages,
               {
                 tempId,
+                stableId,
                 content,
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
@@ -3130,6 +3146,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // authoritatively. Only the parked-dialog reason clears — a fresh send is
         // not parked on a dialog.
         blockedOn: null,
+      }));
+    } else {
+      pinnedSetter((s) => ({
+        pendingUserMessages: s.pendingUserMessages.map((p) =>
+          p.tempId === tempId ? { ...p, stableId } : p,
+        ),
       }));
     }
 
@@ -3196,7 +3218,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
+      const sessionId = await ensureBoundSession(
+        agentId,
+        get,
+        opts,
+        submitConversationId,
+        rekey,
+        text,
+      );
       postedSessionId = sessionId;
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
@@ -3353,6 +3382,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
       } else {
         endPlanStop();
+        noteFirstInputAccepted(sessionId, text);
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
@@ -4799,7 +4829,7 @@ function isConversationDisposed(id: string): boolean {
  * next send. `switchTo` rebinds when this is false; `ensureBoundSession` makes
  * the same check before POSTing.
  */
-function isConversationStreamCurrent(id: string): boolean {
+export function isConversationStreamCurrent(id: string): boolean {
   const entry = conversationRegistry.peek(id);
   if (entry === undefined || entry.disposed) return false;
   const state = entry.getState();
@@ -5211,6 +5241,7 @@ async function ensureBoundSession(
   opts?: SendOptions,
   pinnedConversationId?: string | null,
   onSessionResolved?: (sessionId: string) => void,
+  firstMessage?: string,
 ): Promise<string> {
   // Use the session pinned at submit time so a queued send still targets
   // where it was composed, not wherever the user switched to meanwhile.
@@ -5224,13 +5255,21 @@ async function ensureBoundSession(
     // initial_items dispatch synchronously inside create_session,
     // before we can subscribe to /stream, so early events can be
     // missed). Bind the stream FIRST, then post the first message.
-    const session = await createSession(agentId, []);
+    const creationAttempt = beginSessionCreation();
+    let session: Awaited<ReturnType<typeof createSession>>;
+    try {
+      session = await createSession(agentId, []);
+    } catch (error) {
+      noteSessionCreationFailed(creationAttempt);
+      throw error;
+    }
     sessionId = session.id;
     // Register the create_session span (see interactionTelemetry). This path
     // sends no host params, so the server always makes an external ("computer")
     // session — managed sandboxes are created by the New Chat dialog, which
     // registers itself.
     markSessionCreated(sessionId, "computer");
+    noteSessionCreatedHere(sessionId, firstMessage ?? null, creationAttempt);
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send
@@ -5897,8 +5936,8 @@ async function bindStream(
       // (on cold load) keep the per-conversation stash consistent.
       //
       // Rebind (``hydratePending=false``): the live ``pendingUserMessages``
-      // are authoritative — keep them untouched. Deduping/merging here would
-      // flink the live bubble; they clear via the consumed FIFO path.
+      // are authoritative. Only durable submission identities may acknowledge
+      // shell inputs here; ordinary messages clear via their consumed events.
       //
       // Cold load (``hydratePending=true``): the server's ``pending_inputs``
       // is the source of truth for queued-but-unpersisted messages — replay
@@ -5981,10 +6020,17 @@ async function bindStream(
           ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
           : {}),
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
-        pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }
           : {}),
+        ...recoverShellInputs(
+          {
+            ...state,
+            pendingUserMessages: snapshotPending,
+            failedSendDraft: state.failedSendDraft ?? unsentDraft,
+          },
+          allBlocks,
+        ),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
@@ -6861,6 +6907,7 @@ async function rehydrateWindowOnReconnect(
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+      ...recoverShellInputs(s, freshBlocks),
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
@@ -7071,12 +7118,14 @@ async function reconcileOnReconnect(
       s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
+    const shellSettlement = recoverShellInputs(s, snapshotBlocks);
     const patch: Partial<ChatState> = {
       ...statusPatchFor(s),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
       ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
+      ...shellSettlement,
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -7084,7 +7133,7 @@ async function reconcileOnReconnect(
       (b) => b.type === "user_message" && !isSystemUserContent(b.content),
     ).length;
     if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
+      patch.pendingUserMessages = shellSettlement.pendingUserMessages.slice(recoveredUserInputs);
     }
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
@@ -8880,8 +8929,8 @@ async function boundedSendVerdict(
  * reloaded or closed mid-send, e.g. while the server held the POST for a
  * sandbox wake, which persists nothing until the wake ends. Only the sender
  * gets the text back, and only if the snapshot holds no item under its stable
- * id. Matching text is no proof: `pending_inputs` entries and native mirrors
- * carry no stable id, and another message can say the same thing. Messages the
+ * id or a terminal input's submission identity. Matching text is no proof:
+ * another message can say the same thing. Messages the
  * page still held in its queue come back the same way, joined after any such send.
  *
  * @param conversationId - The session being bound.
@@ -8890,10 +8939,11 @@ async function boundedSendVerdict(
  */
 function unsentSendToRestore(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly ConversationItem[],
 ): ConversationState["failedSendDraft"] {
   // A send still open in this tab, or a message parked on its bubble, owns its own record.
-  const parkedHere = conversationRegistry.peek(conversationId)?.getState().failedUploads ?? [];
+  const current = conversationRegistry.peek(conversationId)?.getState();
+  const parkedHere = current?.failedUploads ?? [];
   const unsent = peekUnsentSends(conversationId).filter(
     (record) =>
       !inFlightSends.has(record.stableId) &&
@@ -8917,9 +8967,27 @@ function unsentSendToRestore(
       stored.filter((send) => queuedHere.has(send.stableId)),
     );
   }
+  const deliveredIds = new Set(
+    items.flatMap((item) => [
+      item.id,
+      ...(isTerminalCommandItem(item) && item.kind === "input" && item.submission?.stable_id
+        ? [item.submission.stable_id]
+        : []),
+    ]),
+  );
+  // Identity can resolve after a live acknowledgement, before its block flushes.
+  for (const shell of current?.settledShellInputs ?? []) {
+    if (shell.stableId) deliveredIds.add(shell.stableId);
+  }
+  for (const block of current?.blocks ?? []) {
+    if (block.ctx.itemId) deliveredIds.add(block.ctx.itemId);
+    if (block.type === "terminal_command" && block.kind === "input" && block.submission?.stableId) {
+      deliveredIds.add(block.submission.stableId);
+    }
+  }
   const sends = [...unsent, ...queued].filter(
     // Another account may have signed in to this tab since.
-    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+    (send) => send.authorId === viewerId && !deliveredIds.has(send.stableId),
   );
   const [first] = sends;
   if (first === undefined) return null;
@@ -8950,7 +9018,7 @@ function unsentSendToRestore(
  */
 function restoreUnsentSendOnceIdentified(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly ConversationItem[],
 ): void {
   const unsubscribe = subscribeIdentity(() => {
     if (getCurrentUserId() === null) return;
@@ -9226,6 +9294,72 @@ function isShellCommandBubble(bubble: PendingUserMessage, command: string): bool
   if (bubble.initialDraft || wanted === "") return false;
   const text = messageContentText(bubble.content);
   return text.startsWith("!") && text.slice(1).trimStart() === wanted;
+}
+
+/** Settle durable identities on both the live and history paths. */
+function settleShellInputs(
+  state: ChatState,
+  inputs: Pick<TerminalCommandEvent, "itemId" | "submission" | "input">[],
+  allowLegacy = false,
+): Pick<ChatState, "pendingUserMessages" | "settledShellInputs"> & Partial<ChatState> {
+  let { pendingUserMessages, settledShellInputs } = state;
+  const consumedIds = new Set<string>();
+  for (const input of inputs) {
+    const { itemId, submission } = input;
+    if (submission?.stableId) {
+      consumedIds.add(submission.stableId);
+      if (inFlightSends.has(submission.stableId)) inFlightSends.set(submission.stableId, true);
+    }
+    if (
+      submission === undefined &&
+      (!allowLegacy || settledShellInputs.some((e) => e.itemId === itemId))
+    )
+      continue;
+    const at = pendingUserMessages.findIndex((p) => {
+      if (p.initialDraft) return false;
+      if (submission !== undefined) {
+        return (
+          (Boolean(submission.pendingId) &&
+            (p.pendingId === submission.pendingId || p.tempId === submission.pendingId)) ||
+          (Boolean(submission.stableId) && p.stableId === submission.stableId)
+        );
+      }
+      return input.input !== null && isShellCommandBubble(p, input.input);
+    });
+    const popped = pendingUserMessages[at];
+    if (popped) pendingUserMessages = pendingUserMessages.filter((_, index) => index !== at);
+    const previous = settledShellInputs.find((entry) => entry.itemId === itemId);
+    settledShellInputs = [
+      ...settledShellInputs.filter((entry) => entry.itemId !== itemId),
+      {
+        itemId,
+        tempId: popped?.tempId ?? previous?.tempId,
+        pendingId: submission?.pendingId ?? popped?.pendingId ?? previous?.pendingId,
+        stableId: submission?.stableId ?? previous?.stableId,
+        // Modern shells never generate legacy skip receipts; text is not an identity.
+        contentKey: submission === undefined && popped ? contentKeyOf(popped.content) : undefined,
+      },
+    ].slice(-MAX_SETTLED_SHELL_INPUTS);
+  }
+  return {
+    pendingUserMessages,
+    settledShellInputs,
+    ...retractDeliveredSendDraft(state, consumedIds, "consumed"),
+  };
+}
+
+function recoverShellInputs(state: ChatState, blocks: AnyBlock[]) {
+  return settleShellInputs(
+    state,
+    blocks.flatMap((block) =>
+      block.type === "terminal_command" &&
+      block.kind === "input" &&
+      block.ctx.itemId &&
+      block.submission !== undefined
+        ? [{ itemId: block.ctx.itemId, input: block.input, submission: block.submission }]
+        : [],
+    ),
+  );
 }
 
 /** Bound replay protection to the server's maximum pending queue size. */
@@ -10159,28 +10293,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "terminal_command": {
-      // Shell inputs have no consumed receipt; remove only the matching sent bubble.
-      const command = event.kind === "input" ? event.input : null;
-      if (command === null) return;
-      applyToConversation((s) => {
-        if (s.settledShellInputs.some((entry) => entry.itemId === event.itemId)) return {};
-        const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
-        const popped = s.pendingUserMessages[at];
-        return {
-          pendingUserMessages: popped
-            ? [...s.pendingUserMessages.slice(0, at), ...s.pendingUserMessages.slice(at + 1)]
-            : s.pendingUserMessages,
-          settledShellInputs: [
-            ...s.settledShellInputs,
-            {
-              itemId: event.itemId,
-              tempId: popped?.tempId,
-              pendingId: popped?.pendingId,
-              contentKey: popped ? contentKeyOf(popped.content) : undefined,
-            },
-          ].slice(-MAX_SETTLED_SHELL_INPUTS),
-        };
-      });
+      if (event.kind !== "input") return;
+      applyToConversation((s) => settleShellInputs(s, [event], true));
       return;
     }
     case "session_interrupted":

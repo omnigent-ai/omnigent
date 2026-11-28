@@ -30,6 +30,21 @@ describe("chordMatches", () => {
     ).toBe(false);
   });
 
+  it("accepts ⌘, Control, or both for an either-key chord", () => {
+    const remove: Chord = { mod: true, eitherCommandKey: true, key: "Backspace" };
+    for (const mac of [true, false]) {
+      expect(chordMatches(remove, press({ key: "Backspace", metaKey: true }), mac)).toBe(true);
+      expect(chordMatches(remove, press({ key: "Backspace", ctrlKey: true }), mac)).toBe(true);
+      expect(
+        chordMatches(remove, press({ key: "Backspace", metaKey: true, ctrlKey: true }), mac),
+      ).toBe(true);
+      expect(chordMatches(remove, press({ key: "Backspace" }), mac)).toBe(false);
+      expect(
+        chordMatches(remove, press({ key: "Backspace", metaKey: true, shiftKey: true }), mac),
+      ).toBe(false);
+    }
+  });
+
   it("rejects both command keys at once", () => {
     const both = press({ key: "r", code: "KeyR", metaKey: true, ctrlKey: true, altKey: true });
     expect(chordMatches(rename, both, true)).toBe(false);
