@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import functools
 import hashlib
@@ -8945,7 +8946,18 @@ def _tool_relay_handler_factory(
             with mutation, selectors.DefaultSelector() as connection_monitor:
                 connection_monitor.register(self.connection, selectors.EVENT_READ)
                 result = _run_relay_tool(
-                    tool_executor, loop, name, arguments, keep_alive=keep_alive
+                    tool_executor,
+                    loop,
+                    name,
+                    arguments,
+                    keep_alive=keep_alive,
+                    on_detach=(
+                        functools.partial(
+                            _report_detached_tool_call, loop, policy_client, session_id
+                        )
+                        if policy_client is not None and session_id is not None
+                        else None
+                    ),
                 )
             with contextlib.suppress(OSError):
                 self.wfile.write(json.dumps(result).encode("utf-8") + b"\n")
@@ -9267,6 +9279,17 @@ def _client_tool_timeout_s() -> float | None:
     return None
 
 
+def _waits_past_client_limit(name: str) -> bool:
+    """Whether an approval wait for *name* stays open after Claude Code's tool limit.
+
+    Scheduled-task changes are made for later, so their approval can come after
+    the call that asked has returned; anything else is cancelled at the limit.
+    """
+    from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
+
+    return name.removeprefix(f"mcp__{_MCP_SERVER_NAME}__") in SCHEDULED_TASK_APPROVAL_TOOLS
+
+
 def _run_relay_tool(
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
@@ -9274,6 +9297,7 @@ def _run_relay_tool(
     arguments: _JsonObject,
     *,
     keep_alive: Callable[[], None] | None = None,
+    on_detach: Callable[[str, concurrent.futures.Future[object], str | None], None] | None = None,
 ) -> _JsonObject:
     """
     Execute one relay tool call on the harness event loop.
@@ -9284,9 +9308,13 @@ def _run_relay_tool(
     :param name: Tool name, e.g. ``"sys_os_shell"``.
     :param arguments: Decoded tool arguments.
     :param keep_alive: Check caller liveness and refresh the HTTP response while waiting.
+    :param on_detach: Takes over a scheduled-task call still waiting on approval at
+        Claude Code's limit (tool name, its future, the approval id), which then keeps
+        waiting and reports its outcome later.
     :returns: MCP tool-call response.
     """
     client_limit = _client_tool_timeout_s()
+    detached = False
     deadline = ToolCallDeadline(_TOOL_CALL_TIMEOUT_S)
     answer_by = (
         time.monotonic()
@@ -9304,6 +9332,28 @@ def _run_relay_tool(
         while not future.done():
             if answer_by is not None and time.monotonic() >= answer_by:
                 minutes = (client_limit or 0) / 60
+                if (
+                    deadline.is_paused()
+                    and on_detach is not None
+                    and _waits_past_client_limit(name)
+                ):
+                    on_detach(name, future, deadline.approval_id())
+                    detached = True
+                    return {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"{name} is waiting for a person's approval. The request "
+                                    "stays open for up to a day: they can approve it in the "
+                                    "Inbox or on the ticket you're working on. Once they "
+                                    "answer, it runs (or doesn't) and you'll get the outcome "
+                                    "as a message in this session. Don't call it again; "
+                                    "carry on with other work."
+                                ),
+                            }
+                        ]
+                    }
                 if deadline.is_paused():
                     return _mcp_error(
                         f"{name} needs a person's approval, and no one approved it within "
@@ -9338,9 +9388,52 @@ def _run_relay_tool(
         detail = str(exc).strip() or type(exc).__name__
         return _mcp_error(f"Omnigent tool dispatch failed: {detail}. Completion is unknown.")
     finally:
-        if not future.done():
+        if not future.done() and not detached:
             future.cancel()
     return _mcp_response_from_tool_result(result)
+
+
+def _report_detached_tool_call(
+    loop: asyncio.AbstractEventLoop,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    name: str,
+    future: concurrent.futures.Future[object],
+    approval_id: str | None,
+) -> None:
+    """Let a call that outlived Claude Code's limit finish, then tell its session how.
+
+    Its approval keeps waiting; the session is no longer held as awaiting one, so
+    people's messages reach it meanwhile.
+    """
+
+    async def report() -> None:
+        from omnigent.runner import pending_approvals
+        from omnigent.runner.subagent_work import _deliver_subagent_wake_post
+
+        if approval_id is not None:
+            pending_approvals.detach(approval_id, session_id)
+        try:
+            outcome = _mcp_response_from_tool_result(await asyncio.wrap_future(future))
+        except Exception as exc:  # noqa: BLE001 - reported to the agent, not raised.
+            outcome = _mcp_error(f"it failed: {str(exc).strip() or type(exc).__name__}")
+        text = "\n".join(
+            str(part.get("text", ""))
+            for part in outcome.get("content") or []
+            if isinstance(part, dict) and part.get("type") == "text"
+        ).strip()
+        notice = (
+            f"Your earlier {name} request, which was waiting for a person's approval, has "
+            f"been answered. Outcome:\n{text or '(no output)'}"
+        )
+        if not await _deliver_subagent_wake_post(server_client, session_id, notice):
+            _logger.warning(
+                "could not report the outcome of a detached %s call",
+                name,
+                extra={"session_id": session_id},
+            )
+
+    asyncio.run_coroutine_threadsafe(report(), loop)
 
 
 async def _await_tool_result(result: Awaitable[object]) -> object:

@@ -339,7 +339,7 @@ async def wait_for_user_verdict(
     answered = False
     reconnecting = False
     try:
-        with pause_tool_call_deadline(effective_timeout):
+        with pause_tool_call_deadline(effective_timeout, elicitation_id):
             if on_registered is not None:
                 await on_registered()
             verdict = await asyncio.wait_for(fut, timeout=effective_timeout)

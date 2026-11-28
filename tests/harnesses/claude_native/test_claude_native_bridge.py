@@ -18213,6 +18213,130 @@ async def test_relay_answers_an_unapproved_call_before_claudes_tool_limit(
     assert events[-1]["reason"] == "unanswered"
 
 
+async def test_a_scheduled_task_approval_outlives_claudes_tool_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At the limit the agent hears it's waiting; a later approval still runs the call."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_client_tool_timeout_s", lambda: 420.0)
+    monkeypatch.setattr(claude_native_bridge, "_CLIENT_TOOL_TIMEOUT_MARGIN_S", 419.9)
+    monkeypatch.setattr(claude_native_bridge, "_CLIENT_TOOL_ANSWER_FLOOR_S", 0.1)
+    detached: list[tuple] = []
+
+    async def executor(name, arguments):
+        approved = await pending_approvals.wait_for_user_approval(
+            elicitation_id="elicit_outlives",
+            conversation_id="conv_outlives",
+            publish_event=lambda _, event: None,
+            timeout_seconds=30,
+        )
+        return {"created": approved}
+
+    result = await asyncio.wait_for(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool,
+            executor,
+            asyncio.get_running_loop(),
+            "sys_scheduled_task_create",
+            {},
+            on_detach=lambda name, future, approval: detached.append((name, future, approval)),
+        ),
+        5,
+    )
+    assert not result.get("isError")
+    assert "waiting for a person's approval" in result["content"][0]["text"]
+    [(name, future, approval)] = detached
+    assert (name, approval) == ("sys_scheduled_task_create", "elicit_outlives")
+    # The call wasn't cancelled: the approval is still open, and answering it runs the call.
+    assert not future.done() and pending_approvals.has_pending("conv_outlives")
+    pending_approvals.detach("elicit_outlives", "conv_outlives")
+    assert not pending_approvals.has_pending("conv_outlives")
+    assert pending_approvals.resolve("elicit_outlives", True)
+    assert await asyncio.wait_for(asyncio.wrap_future(future), 5) == {"created": True}
+
+
+async def test_only_scheduled_task_approvals_outlive_claudes_tool_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Other tools waiting on approval are still cancelled at the limit."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_client_tool_timeout_s", lambda: 420.0)
+    monkeypatch.setattr(claude_native_bridge, "_CLIENT_TOOL_TIMEOUT_MARGIN_S", 419.9)
+    monkeypatch.setattr(claude_native_bridge, "_CLIENT_TOOL_ANSWER_FLOOR_S", 0.1)
+    detached: list[tuple] = []
+
+    async def executor(name, arguments):
+        return await pending_approvals.wait_for_user_approval(
+            elicitation_id="elicit_other_tool",
+            conversation_id="conv_other_tool",
+            publish_event=lambda _, event: None,
+            timeout_seconds=30,
+        )
+
+    result = await asyncio.wait_for(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool,
+            executor,
+            asyncio.get_running_loop(),
+            "sys_os_shell",
+            {},
+            on_detach=lambda *args: detached.append(args),
+        ),
+        5,
+    )
+    assert result["isError"] and "not applied" in result["content"][0]["text"]
+    assert detached == []
+
+
+async def test_a_detached_call_reports_its_outcome_to_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once answered, the session gets the outcome and is no longer held as awaiting."""
+    import concurrent.futures
+
+    from omnigent.runner import pending_approvals, subagent_work
+
+    sent: list[tuple[str, str]] = []
+
+    async def wake(client, session_id, notice, **_):
+        sent.append((session_id, notice))
+        return True
+
+    monkeypatch.setattr(subagent_work, "_deliver_subagent_wake_post", wake)
+    loop = asyncio.get_running_loop()
+    parked = asyncio.create_task(
+        pending_approvals.wait_for_user_approval(
+            elicitation_id="elicit_report",
+            conversation_id="conv_report",
+            publish_event=lambda _, event: None,
+            timeout_seconds=30,
+        )
+    )
+    await asyncio.sleep(0)
+    assert pending_approvals.has_pending("conv_report")
+    future: concurrent.futures.Future[object] = concurrent.futures.Future()
+    claude_native_bridge._report_detached_tool_call(
+        loop, object(), "conv_report", "sys_scheduled_task_create", future, "elicit_report"
+    )
+    for _ in range(50):
+        if not pending_approvals.has_pending("conv_report"):
+            break
+        await asyncio.sleep(0.01)
+    assert not pending_approvals.has_pending("conv_report")
+    future.set_result({"content": [{"type": "text", "text": '{"id": "task_1"}'}]})
+    for _ in range(50):
+        if sent:
+            break
+        await asyncio.sleep(0.01)
+    [(session_id, notice)] = sent
+    assert session_id == "conv_report"
+    assert "has been answered" in notice and "task_1" in notice
+    pending_approvals.resolve("elicit_report", False)
+    await parked
+
+
 def test_client_tool_timeout_prefers_managed_settings(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

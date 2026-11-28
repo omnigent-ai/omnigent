@@ -20,6 +20,7 @@ class ToolCallDeadline:
         self._paused_total = 0.0
         self._paused_at: float | None = None
         self._pause_limit = 0.0
+        self._approval_id: str | None = None
         self._lock = threading.Lock()
 
     def remaining(self) -> float:
@@ -36,14 +37,20 @@ class ToolCallDeadline:
         with self._lock:
             return self._paused_at is not None
 
+    def approval_id(self) -> str | None:
+        """The approval the call is waiting on right now, when the wait named it."""
+        with self._lock:
+            return self._approval_id if self._paused_at is not None else None
+
     @contextmanager
-    def pause(self, seconds: float) -> Iterator[None]:
+    def pause(self, seconds: float, approval_id: str | None = None) -> Iterator[None]:
         """Exclude at most the approval's own deadline from active elapsed time."""
         with self._lock:
             owns_pause = self._paused_at is None
             if owns_pause:
                 self._paused_at = monotonic()
                 self._pause_limit = max(0.0, seconds)
+                self._approval_id = approval_id
         try:
             yield
         finally:
@@ -52,6 +59,7 @@ class ToolCallDeadline:
                     if self._paused_at is not None:
                         self._paused_total += min(monotonic() - self._paused_at, self._pause_limit)
                     self._paused_at = None
+                    self._approval_id = None
 
 
 _current_deadline: ContextVar[tuple[ToolCallDeadline, asyncio.Task[object] | None] | None] = (
@@ -70,11 +78,11 @@ def bind_tool_call_deadline(deadline: ToolCallDeadline) -> Iterator[None]:
 
 
 @contextmanager
-def pause_tool_call_deadline(seconds: float) -> Iterator[None]:
+def pause_tool_call_deadline(seconds: float, approval_id: str | None = None) -> Iterator[None]:
     """Pause only the task that owns this call, for a bounded approval wait."""
     current = _current_deadline.get()
     if current is None or current[1] is not asyncio.current_task():
         yield
         return
-    with current[0].pause(seconds):
+    with current[0].pause(seconds, approval_id):
         yield
