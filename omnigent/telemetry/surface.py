@@ -21,15 +21,16 @@ CLIENT_SURFACES = frozenset(
         "sdk",
         "script",
         "slack",
+        "discord",
     }
 )
 # Surfaces a session may store as its ``omnigent.client_surface`` label. Internal
 # components never are: their sessions take the originating surface.
 SESSION_SURFACES = frozenset({"web", "desktop", "ios", "android", "mobile", "cli"})
-# Request surfaces stored as another session surface. SDK and Slack sessions store
+# Request surfaces stored as another session surface. SDK and chat-bot sessions store
 # ``cli``, as on main: runners older than those surfaces only accept main's labels.
 # ``script`` is stored as ``web``, as on main.
-_SESSION_SURFACE_ALIASES = {"sdk": "cli", "slack": "cli", "script": "web"}
+_SESSION_SURFACE_ALIASES = {"sdk": "cli", "slack": "cli", "discord": "cli", "script": "web"}
 # Omnigent components acting for a session another surface created.
 _INTERNAL_SURFACES = frozenset({"runner", "host", "harness"})
 # User-Agent product tokens Omnigent's own Python clients send, e.g.
@@ -41,6 +42,7 @@ _OMNIGENT_USER_AGENT_SURFACES = {
     "omnigent-harness/": "harness",
     "omnigent-client/": "sdk",
     "omnigent-slack/": "slack",
+    "omnigent-discord/": "discord",
 }
 
 
@@ -149,7 +151,7 @@ def classify_surface(user_agent: str | None) -> str:
     Mapping:
     * ``None`` or absent → ``"unknown"``
     * ``"omnigent-<component>/"`` prefix → ``"cli"``, ``"runner"``, ``"host"``,
-      ``"harness"``, ``"sdk"`` (``omnigent-client``), or ``"slack"``
+      ``"harness"``, ``"sdk"`` (``omnigent-client``), ``"slack"``, or ``"discord"``
     * empty / bare ``"python-httpx"`` / ``"python-requests"`` → ``"cli"``: older
       Omnigent CLIs, hosts and runners send only httpx, with no component token
     * ``"Electron"`` in UA → ``"desktop"``
