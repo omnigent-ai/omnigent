@@ -831,6 +831,18 @@ async def test_a_long_lived_branch_still_compares_with_the_branch_it_started_fro
     assert response.base.base == fork_next
 
 
+async def test_an_untracked_branch_never_compares_with_its_own_copy_on_origin(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")
+    _add_remote(root, "origin")
+    _git(root, "update-ref", "refs/remotes/origin/feature", _head(root))
+    _git(root, "checkout", "-q", "--no-track", "-b", "feature", "origin/feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) == COMPARISON_PROBLEM_NO_DEFAULT_BRANCH
+
+
 async def test_reading_where_a_branch_started_runs_no_signature_helper(tmp_path: Path) -> None:
     """A repository's ``log.showSignature`` can't make the reflog read run its ``gpg.program``."""
     root, _main, fork_next = _fork_checkout(tmp_path)
@@ -905,6 +917,7 @@ async def test_a_branch_on_origin_without_a_default_compares_with_the_branch_it_
         "tag",
         "local branch",
         "remote branch a local one now shadows",
+        "upstream expression retargeted since",
         "deleted remote branch",
         "own copy",
         "no reflog",
@@ -915,7 +928,7 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
 ) -> None:
     root, main, fork_next = _fork_checkout(tmp_path)
     _git(root, "tag", "v1", fork_next)
-    _git(root, "branch", "local-next", fork_next)
+    _git(root, "branch", "--track", "local-next", "fork/next")
     _git(root, "update-ref", "refs/remotes/fork/feature", fork_next)
     starts = {
         "HEAD": ["HEAD"],
@@ -923,12 +936,17 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
         "tag": ["v1"],
         "local branch": ["local-next"],
         "remote branch a local one now shadows": ["fork/next"],
+        "upstream expression retargeted since": ["local-next@{upstream}"],
         "deleted remote branch": ["fork/next"],
         "own copy": ["fork/feature"],
         "no reflog": ["fork/next"],
     }
     options = ["-c", "core.logAllRefUpdates=false"] if start == "no reflog" else []
     _git(root, *options, "checkout", "-q", "-b", "feature", *starts[start])
+    if start == "upstream expression retargeted since":
+        # Only another branch's configuration changed, so the recorded start isn't followed.
+        _git(root, "update-ref", "refs/remotes/fork/other", main)
+        _git(root, "branch", "--set-upstream-to", "fork/other", "local-next")
     if start == "remote branch a local one now shadows":
         # Git no longer reads the recorded name as fork's branch, so neither does the base.
         _git(root, "branch", "fork/next", main)
@@ -942,7 +960,9 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
     assert response.base.base == main
 
 
-@pytest.mark.parametrize("start", ["fork/next~1", "fork/../fork/next", "fork/next^{tree}"])
+@pytest.mark.parametrize(
+    "start", ["fork/next~1", "fork/../fork/next", "fork/next^{tree}", "HEAD@{99}", "@{-1}"]
+)
 async def test_a_crafted_start_point_falls_back_to_origins_default(
     tmp_path: Path, start: str
 ) -> None:

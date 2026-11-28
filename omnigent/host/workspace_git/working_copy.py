@@ -7,6 +7,7 @@ fetches. Comparisons of revisions a person typed build on these helpers in ``com
 from __future__ import annotations
 
 import asyncio
+import re
 import stat
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -305,6 +306,9 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
                 if name not in ("", ".")
             }
     remote_name = remote or "origin"
+    if branch_ref:
+        # Its copy on the remote it falls back to, for a branch that tracks nothing.
+        own_copies.add(f"refs/remotes/{remote_name}/{branch_ref.removeprefix('refs/heads/')}")
     found = await _remote_default_ref(repository, remote_name, deadline)
     if found is not None:
         return found
@@ -322,6 +326,9 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
 
 
 _CREATED_FROM = "branch: Created from "
+# A plain ref name, not an expression such as ``HEAD@{2}``, ``next@{upstream}`` or ``next~1``
+# whose meaning changes later.
+_PLAIN_REF_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/-]*")
 
 
 async def _remote_start_point(
@@ -330,7 +337,8 @@ async def _remote_start_point(
     """The remote branch ``branch_ref`` was created from, by its oldest reflog entry, or None.
 
     None when the reflog is off or expired, or the start was ``HEAD``, a commit, a tag, a local
-    branch, a deleted branch or the branch's own copy on a remote, or its name is now ambiguous.
+    branch, a deleted branch or the branch's own copy on a remote, an expression rather than a
+    plain name, or a name that's now ambiguous.
     """
     # Only the oldest entry is read, so a long-lived branch's reflog stays within the output cap.
     counted = await repository.run_unchecked(
@@ -355,15 +363,19 @@ async def _remote_start_point(
     if not oldest.startswith(_CREATED_FROM):
         return None
     start = oldest.removeprefix(_CREATED_FROM)
-    if not start:
+    if (
+        not _PLAIN_REF_NAME.fullmatch(start)
+        or ".." in start
+        or "//" in start
+        or start.endswith((".", "/", ".lock"))
+    ):
         return None
-    # Git's own lookup: only a ref's name resolves, and an ambiguous name resolves to none.
-    resolved = await run_allowing_absent(
-        repository,
+    # Git's own lookup, where an ambiguous name resolves to none; any failure means no start.
+    resolved = await repository.run_unchecked(
         ["rev-parse", "--verify", "-q", "--symbolic-full-name", "--end-of-options", start],
-        deadline,
+        deadline=deadline,
     )
-    candidate = first_line(resolved) if resolved else ""
+    candidate = first_line(resolved.stdout) if resolved.success else ""
     if (
         not candidate.startswith("refs/remotes/")
         or candidate.endswith("/HEAD")
