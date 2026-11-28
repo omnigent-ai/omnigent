@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy.dialects import sqlite
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.orm import Session
 
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
@@ -64,18 +64,40 @@ def test_launch_pricing_reference_ddl_is_additive(uri: str, column_type: str) ->
     assert "CREATE INDEX" not in sql
 
 
-def test_existing_pricing_reference_default_is_rejected_before_ddl(
+@pytest.mark.parametrize(
+    ("dialect_name", "reflected_type", "default", "compatible"),
+    [
+        pytest.param("sqlite", sa.BLOB(), "'unexpected'", False, id="unexpected-default"),
+        pytest.param("cockroachdb", sa.BLOB(), None, True, id="cockroachdb-blob-alias"),
+        pytest.param("postgresql", sa.BLOB(), None, False, id="postgresql-rejects-blob-alias"),
+        pytest.param("mysql", sa.BLOB(), None, False, id="mysql-rejects-blob-alias"),
+        pytest.param("mysql", mysql.BINARY(8), None, False, id="mysql-wrong-binary-length"),
+        pytest.param("mysql", mysql.BINARY(16), None, True, id="mysql-canonical-binary-length"),
+    ],
+)
+def test_existing_pricing_reference_contract_is_checked_before_ddl(
     monkeypatch: pytest.MonkeyPatch,
+    dialect_name: str,
+    reflected_type: sa.types.TypeEngine,
+    default: str | None,
+    compatible: bool,
 ) -> None:
     migration = import_module(
         "omnigent.db.migrations.versions.c51f8d9a27b6_add_launch_pricing_context_reference"
     )
-    connection = SimpleNamespace(dialect=sqlite.dialect())
+    dialect_factory = {"sqlite": sqlite.dialect, "mysql": mysql.dialect}.get(
+        dialect_name, postgresql.dialect
+    )
+    dialect = dialect_factory()
+    if dialect_name == "cockroachdb":
+        # Mocked CockroachDB reflection uses its PostgreSQL type compiler.
+        dialect.name = dialect_name
+    connection = SimpleNamespace(dialect=dialect)
     reflected = {
         "name": _COLUMN,
-        "type": sa.LargeBinary(16),
+        "type": reflected_type,
         "nullable": True,
-        "default": "'unexpected'",
+        "default": default,
     }
     original = dict(reflected)
     mutations: list[str] = []
@@ -89,8 +111,11 @@ def test_existing_pricing_reference_default_is_rejected_before_ddl(
     monkeypatch.setattr(migration.sa, "inspect", inspect_existing)
     monkeypatch.setattr(migration.op, "add_column", lambda *_args: mutations.append("add"))
 
-    with pytest.raises(RuntimeError, match="column has an incompatible schema"):
+    if compatible:
         migration.upgrade()
+    else:
+        with pytest.raises(RuntimeError, match="column has an incompatible schema"):
+            migration.upgrade()
 
     assert not mutations
     assert reflected == original
