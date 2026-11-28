@@ -23,7 +23,6 @@ import {
 } from "@/pullRequestPage/nativeStackMerge";
 import {
   normalizePullRequestInfo,
-  pullRequestEditCapabilities,
   usePullRequestInfos,
   type PullRequest,
   type PullRequestAssociation,
@@ -31,6 +30,10 @@ import {
 import { useWorkspaceDraftOwner } from "@/lib/workspaceDraftOwner";
 import { useCanChangePullRequests } from "@/hooks/usePermissions";
 import { useStableCallback } from "@/hooks/useStableCallback";
+import {
+  offeredEditCapabilities,
+  usePullRequestEditsServed,
+} from "@/newPullRequestPage/hooks/pullRequestEditOffers";
 import { useMergeReadiness } from "@/hooks/useMergeReadiness";
 import {
   usePullRequestListStats,
@@ -334,6 +337,8 @@ export function usePullRequestListEntries(
   const onSelect = useStableCallback(onSelectProp);
   const openSessionPage = useOpenSessionPage();
   const canEdit = useCanChangePullRequests(conversationId);
+  // Rows offer an optional edit only where the session's host serves all it needs.
+  const editsServed = usePullRequestEditsServed(conversationId);
   // The session's panel that shows this list reads its stored links; rows only follow them.
   const linker = useSessionPullRequestLinker(conversationId, { readsStoredList: false });
   // A followed row reads at least hourly, at a time of its own, instead of every 10 minutes,
@@ -791,8 +796,8 @@ export function usePullRequestListEntries(
         });
       }
       const info = infoByUrl.get(association.url);
-      const editable = canEdit && info ? pullRequestEditCapabilities(info) : null;
-      if (!readOnly && requestReviewOffered(entry.editCapabilities)) {
+      const editable = canEdit && info ? offeredEditCapabilities(info, editsServed) : null;
+      if (!readOnly && editsServed.reviewers && requestReviewOffered(entry.editCapabilities)) {
         actions.splice(firstCopyAt(), 0, {
           id: "request-review",
           section: "review",
@@ -818,12 +823,13 @@ export function usePullRequestListEntries(
         });
       }
       const placed = withExtraRowActions(actions, extraRowActions?.(association.url) ?? []);
-      if (entry.mergeHead && entry.pr && changesHere) {
+      const handoff = mergeHandoffOf?.(association.url) ?? null;
+      // Merging here needs the host's merge read and write; GitHub's own stack merge doesn't.
+      if (entry.mergeHead && entry.pr && changesHere && (handoff || editsServed.merging)) {
         const headSha = entry.mergeHead;
         const pr = entry.pr;
         const url = association.url;
         const firstCopy = placed.findIndex((action) => action.section === "copy");
-        const handoff = mergeHandoffOf?.(url) ?? null;
         placed.splice(
           firstCopy < 0 ? placed.length : firstCopy,
           0,
@@ -907,6 +913,7 @@ export function usePullRequestListEntries(
       managesSessionLinks,
       ownsSessionTree,
       linkingSessionOf,
+      editsServed,
     ],
   );
 

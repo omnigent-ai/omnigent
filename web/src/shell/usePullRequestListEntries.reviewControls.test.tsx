@@ -1,6 +1,7 @@
 // A list row's Review…, Request Review… and Edit Labels…: each is offered where the control it
 // opens would be, the Review menu's offer and the Reviewers and Labels sections' edit rules,
-// and selects the PR, asking the view the row opens it in to open that control.
+// and selects the PR, asking the view the row opens it in to open that control. Each needs the
+// session's host to serve its picker's read and its change.
 
 import type * as SonnerModule from "sonner";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -26,6 +27,7 @@ import {
 import { usePullRequestListEntries } from "./usePullRequestListEntries";
 
 const shell = vi.hoisted(() => ({ canEdit: true }));
+const PICKER_METHODS = ["listLabels", "updateLabels", "listReviewerCandidates", "updateReviewers"];
 const host = vi.hoisted(() => ({
   served: new Set<string>(),
   write: vi.fn(),
@@ -143,7 +145,7 @@ function rowFor(
 }
 
 beforeEach(() => {
-  host.served = new Set();
+  host.served = new Set(PICKER_METHODS);
   host.write.mockReset();
   host.toastError.mockReset();
   PR = GITHUB_PR;
@@ -212,6 +214,20 @@ describe("a row's Request Review… and Edit Labels…", () => {
     const readOnly = rowFor("OPEN");
     expect(readOnly.action("edit-labels")).toBeUndefined();
     expect(readOnly.action("request-review")).toBeUndefined();
+  });
+
+  it.each([
+    ["listLabels", "edit-labels"],
+    ["updateLabels", "edit-labels"],
+    ["listReviewerCandidates", "request-review"],
+    ["updateReviewers", "request-review"],
+  ])("aren't offered where the host doesn't serve %s", (method, hidden) => {
+    host.served.delete(method);
+    const { action, commands } = rowFor("OPEN");
+    expect(action(hidden)).toBeUndefined();
+    expect(commands.find((command) => command.id === `${hidden}:${PR}`)).toBeUndefined();
+    const other = hidden === "edit-labels" ? "request-review" : "edit-labels";
+    expect(action(other)).toBeDefined();
   });
 });
 

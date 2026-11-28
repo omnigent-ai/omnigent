@@ -354,14 +354,25 @@ const pageV2 = vi.hoisted(() => {
   };
 });
 // The pair Changes shows runs as it is, unless a test shows a previous push's, kept after a push.
-// The account picker's change is served as on the server's route; every other method keeps
-// its real answer, which is none without a route.
+// The account picker's change and the label, reviewer and merge edits are served as on the
+// server's route, unless a case serves fewer; every other method keeps its real answer, which
+// is none without a route.
+const routeServes = vi.hoisted(() => ({ methods: new Set<string>() }));
+const ROUTE_EDIT_METHODS = [
+  "setPullRequestAccount",
+  "listLabels",
+  "updateLabels",
+  "listReviewerCandidates",
+  "updateReviewers",
+  "getMergeOptions",
+  "mergePullRequest",
+];
 vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => {
   const original = await importOriginal<typeof PullRequestPageRouteModule>();
   return {
     ...original,
     usePullRequestMethodServed: (...args: Parameters<typeof original.usePullRequestMethodServed>) =>
-      args[1] === "setPullRequestAccount" || original.usePullRequestMethodServed(...args),
+      routeServes.methods.has(args[1]) || original.usePullRequestMethodServed(...args),
   };
 });
 // Read for real, watched for what the details hand it.
@@ -739,6 +750,7 @@ function commentBodies(): (string | null)[] {
 let scrollIntoView: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
+  routeServes.methods = new Set(ROUTE_EDIT_METHODS);
   resetPullRequestIntentsForTests();
   usePullRequestAttachStore.setState({
     openSessionId: null,
@@ -2104,6 +2116,18 @@ describe("PullRequestPanel", () => {
           delete state.info!.data!.selected_pr_url;
         },
       ],
+      [
+        "a host that doesn't list reviewer candidates",
+        () => {
+          routeServes.methods.delete("listReviewerCandidates");
+        },
+      ],
+      [
+        "a host that doesn't change reviewers",
+        () => {
+          routeServes.methods.delete("updateReviewers");
+        },
+      ],
     ])("shows reviewers read-only for %s", (_caller, setup) => {
       setup();
       renderPanel();
@@ -2177,6 +2201,19 @@ describe("PullRequestPanel", () => {
       expect(usePullRequestRepoLabels).toHaveBeenLastCalledWith("conv_1", prUrl, true);
       expect(screen.getByRole("combobox", { name: "Filter labels" })).toBeInTheDocument();
     });
+
+    it.each(["listLabels", "updateLabels"])(
+      "shows labels read-only where the host doesn't serve %s",
+      (method) => {
+        routeServes.methods.delete(method);
+        renderPanel();
+
+        expect(screen.getByRole("list", { name: "Labels" })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Edit labels" })).toBeNull();
+        expect(screen.queryByRole("button", { name: "Remove label bug" })).toBeNull();
+        expect(usePullRequestRepoLabels).not.toHaveBeenCalledWith("conv_1", prUrl, true);
+      },
+    );
   });
 
   describe("merge button", () => {
@@ -2220,6 +2257,18 @@ describe("PullRequestPanel", () => {
       fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
       expect(screen.getByRole("combobox", { name: "Merge as" })).toHaveTextContent("octo");
     });
+
+    it.each(["getMergeOptions", "mergePullRequest"])(
+      "offers no merge where the host doesn't serve %s",
+      (method) => {
+        renderPanel();
+        expect(screen.getByRole("region", { name: "Merge" })).toBeInTheDocument();
+        cleanup();
+        routeServes.methods.delete(method);
+        renderPanel();
+        expect(screen.queryByRole("region", { name: "Merge" })).toBeNull();
+      },
+    );
   });
 
   it.each([

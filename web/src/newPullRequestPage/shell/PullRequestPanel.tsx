@@ -223,7 +223,6 @@ import {
   usePullRequestInfo,
   pullRequestCommentControls,
   accountSwitchingOffered,
-  pullRequestEditCapabilities,
   mergeSectionShown,
   usePullRequestReviewThreadComposer,
   useSetPullRequestPreference,
@@ -334,6 +333,10 @@ import { PullRequestLinkButton } from "../../shell/PullRequestLinkButton";
 import { useLinkToSession } from "../../shell/pullRequestLinks/useLinkToSession";
 import { usePullRequestRefresh } from "@/pullRequestPage/usePullRequestRefresh";
 import { usePullRequestMethodServed } from "@/pullRequestPage/pullRequestPageRoute";
+import {
+  offeredEditCapabilities,
+  usePullRequestEditsServed,
+} from "@/newPullRequestPage/hooks/pullRequestEditOffers";
 import { PullRequestRefreshOwnerContext } from "@/pullRequestPage/pullRequestRefreshOwner";
 import { setPullRequestRefreshSurface } from "@/pullRequestPage/refreshPullRequest";
 import { SandboxResumeNotice } from "@/components/SandboxResumeNotice";
@@ -3008,6 +3011,7 @@ export function PullRequestPanelDetails({
     selectedAccount: info.data?.auth?.selected_account,
   });
   // Where this shell reads neither way, the session's host lists them once it serves both reads.
+  const editsServed = usePullRequestEditsServed(conversationId);
   const hostListsCommits = usePullRequestMethodServed(conversationId, "listPullRequestCommits");
   const hostDiffsCommits = usePullRequestMethodServed(conversationId, "getCommitDiff");
   const hostCommitsUrl = prUrl ?? info.data?.pr?.url;
@@ -3856,7 +3860,7 @@ export function PullRequestPanelDetails({
   const comments = pr.comments ?? [];
   const commentControls = pullRequestCommentControls(data);
   // On this Mac every edit runs as its account, so none waits on the session's machine.
-  const editCapabilities = pullRequestEditCapabilities(data);
+  const editCapabilities = offeredEditCapabilities(data, editsServed);
   const canPostComment = !!(canEdit && commentControls.comment && data.selected_pr_url);
   // A file's link opens what the diff shows: the patch's pinned head, else the PR's, in the
   // repository its commits live in. "head_repository_url" stays absent from older hosts.

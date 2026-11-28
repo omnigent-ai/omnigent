@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PullRequestAssociation } from "@/newPullRequestPage/hooks/usePullRequests";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as OpenLinkInApp from "@/lib/openLinkInApp";
+import type * as PageRouteModule from "@/pullRequestPage/pullRequestPageRoute";
 import type { NativeStackMergeHandoff } from "@/pullRequestPage/nativeStackMerge";
 import { PullRequestRowDestinationContext } from "@/pullRequestPage/pullRequestDestination";
 
@@ -19,6 +20,12 @@ import {
 vi.mock("@/hooks/usePermissions", () => ({
   useCanEdit: () => true,
   useCanChangePullRequests: () => true,
+}));
+// The session's host reads merge options and merges.
+vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => ({
+  ...(await importOriginal<typeof PageRouteModule>()),
+  usePullRequestMethodServed: (_sessionId: string, method: string) =>
+    method === "getMergeOptions" || method === "mergePullRequest",
 }));
 const opened = vi.hoisted(() => [] as string[]);
 vi.mock("@/lib/openLinkInApp", async (importOriginal) => ({

@@ -6,6 +6,7 @@ import { useId, useMemo, useRef } from "react";
 
 import type { PullRequestLabel } from "@/newPullRequestPage/hooks/usePullRequests";
 import { parseCodeHostPullRequestUrl } from "@/lib/codeHosts";
+import { usePullRequestEditsServed } from "@/newPullRequestPage/hooks/pullRequestEditOffers";
 import { useRecentLabels } from "@/lib/recentLabels";
 import type { RepositoryLabel } from "@/lib/repositoryLabelCache";
 import { requestPullRequestControl } from "@/pullRequestPage/controlRequests";
@@ -143,7 +144,7 @@ export function usePullRequestLabelPaletteCommands({
 }
 
 /**
- * The open PR's label rows in ⌘K while its view is shown and its labels can be edited. Edit
+ * The open PR's label rows in ⌘K while its view is shown and its labels can be edited here. Edit
  * Labels… opens the Labels picker as a list row's does, bringing its Summary tab forward.
  */
 export function PullRequestLabelPaletteCommands({
@@ -160,7 +161,9 @@ export function PullRequestLabelPaletteCommands({
   active: boolean;
 }): null {
   const place = useControlPlace();
-  const offered = active && editable ? prUrl : null;
+  // A host that can't list or change labels gets no label rows, which could only fail.
+  const served = usePullRequestEditsServed(conversationId).labels;
+  const offered = active && editable && served ? prUrl : null;
   const commands = usePullRequestLabelPaletteCommands({
     conversationId,
     prUrl: offered,

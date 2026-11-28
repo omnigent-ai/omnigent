@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as HostModule from "@/lib/host";
 import type * as IdentityModule from "@/lib/identity";
+import type * as PageRouteModule from "@/pullRequestPage/pullRequestPageRoute";
 import type { PullRequestLabel } from "@/newPullRequestPage/hooks/usePullRequests";
 import {
   recentLabelsOwner,
@@ -22,6 +23,13 @@ import { registeredPaletteCommands } from "@/test/paletteCommands";
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   getCurrentUserId: () => "user-1",
+}));
+// The session's host serves listing and changing labels, unless a case serves none.
+const LABEL_METHODS = ["listLabels", "updateLabels"];
+const host = vi.hoisted(() => ({ served: new Set<string>() }));
+vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => ({
+  ...(await importOriginal<typeof PageRouteModule>()),
+  usePullRequestMethodServed: (_sessionId: string, method: string) => host.served.has(method),
 }));
 vi.mock("@/lib/host", async (importOriginal) => ({
   ...(await importOriginal<typeof HostModule>()),
@@ -182,6 +190,7 @@ const chips = () => {
 
 describe("PullRequestLabelPaletteCommands", () => {
   beforeEach(() => {
+    host.served = new Set(LABEL_METHODS);
     window.localStorage.clear();
     recordRecentLabels(APP, [label("bug")], recentLabelsOwner());
     recordRecentLabels(APP, [label("automerge")], recentLabelsOwner());
@@ -232,6 +241,13 @@ describe("PullRequestLabelPaletteCommands", () => {
     expect(paletteLabels()).toEqual([]);
     cleanup();
     renderPage({ labels: [], active: false });
+    expect(paletteLabels()).toEqual([]);
+  });
+
+  it.each(LABEL_METHODS)("offers nothing where the host doesn't serve %s", (method) => {
+    stubFetch([]);
+    host.served.delete(method);
+    renderPage({ labels: [] });
     expect(paletteLabels()).toEqual([]);
   });
 });
