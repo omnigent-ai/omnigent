@@ -1,5 +1,5 @@
 // A pull request tab's new page: the session's pull requests and one of them, folded or side
-// by side. omnigent/main's view, shown where the session's route serves the PR methods.
+// by side, shown where the session's route serves the PR methods.
 
 import { type RefObject, useCallback, useEffect, useId, useMemo, useRef } from "react";
 

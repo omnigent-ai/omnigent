@@ -104,11 +104,14 @@ it("the global Pull Requests list offers no sub-agent switch, command or Agent g
   await user.click(screen.getByRole("combobox", { name: "Group by" }));
   expect(await screen.findByRole("option", { name: /^Author$/ })).toBeInTheDocument();
   expect(screen.queryByRole("option", { name: /^Agent$/ })).toBeNull();
-  const commandIds = Object.values(usePaletteCommandsStore.getState().groups)
-    .flatMap((group) => group.commands)
-    .map((command) => command.id);
-  expect(commandIds).not.toContain("pull-requests.include-sub-agents");
-  expect(commandIds).not.toContain("pull-requests.grouping");
+  const commands = Object.values(usePaletteCommandsStore.getState().groups).flatMap(
+    (group) => group.commands,
+  );
+  expect(commands.map((command) => command.id)).not.toContain("pull-requests.include-sub-agents");
+  const grouping = commands.find((command) => command.setting?.id === "pull-requests.grouping");
+  const groupings = grouping?.setting?.choices.map((choice) => choice.label);
+  expect(groupings).toContain("Author");
+  expect(groupings).not.toContain("Agent");
 });
 
 it("a session's list offers the sub-agent switch, its command and Agent grouping", async () => {
@@ -473,15 +476,18 @@ describe("a finished group's Remove All", () => {
 
     it("gives Remove All back once the removal settles", () => {
       closedFromChild();
-      const view = renderList({
+      const props: Partial<PullRequestListPageProps> = {
         ownsSessionTree: true,
         unlinkPending: true,
         removalProgress: progressOf([fixture.rows[0]!.url]),
-      });
+      };
+      const view = renderList(props);
       expect(busyOf("Merged")).toHaveAccessibleName("Removing 1 of 3");
-      cleanup();
-      void view;
-      renderList({ ownsSessionTree: true, unlinkPending: false, removalProgress: null });
+      const toggle = toggleOf("Merged");
+      // The removal settles in the same list, which keeps its group.
+      Object.assign(props, { unlinkPending: false, removalProgress: null });
+      view.rerender();
+      expect(toggleOf("Merged")).toBe(toggle);
       expect(removeAllOf("Merged")).not.toHaveAttribute("aria-disabled");
       expect(removeAllOf("Merged")).not.toHaveAttribute("aria-busy");
     });
@@ -1855,7 +1861,7 @@ describe("PullRequestListPage", () => {
         .map((url) => Number(url.split("/").pop()));
     expect(numbers()).toEqual([3, 1, 2]);
     // No status groups split the search's order.
-    expect(within(view.grid).queryByRole("rowgroup", { name: /Open|Merged/ })).toBeNull();
+    expect(within(view.grid).queryByRole("button", { name: /^(Open|Merged) group/ })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Display Options" }));
     expect(screen.getByRole("combobox", { name: "Order by" })).toHaveTextContent("Search order");
     // Nothing to reset: the search's order is this list's default.

@@ -2175,7 +2175,6 @@ function mergeAsUnsupported(error: unknown): boolean {
 }
 
 /** After a merge or auto-merge change, read the PR again: nothing shows it before GitHub does. */
-/** After a merge or auto-merge change, read the PR again: nothing shows it before GitHub does. */
 async function refreshAfterMergeChange(
   queryClient: ReturnType<typeof useQueryClient>,
   conversationId: string,
@@ -2615,7 +2614,7 @@ export function usePullRequestCommentReactionWrite(
   });
 }
 
-/** Turn off the selected PR's auto-merge; the refetched info shows the result. */ /** Turn off the selected PR's auto-merge; the refetched info shows the result. */
+/** Turn off the selected PR's auto-merge; the refetched info shows the result. */
 export function useDisablePullRequestAutoMerge(conversationId: string) {
   const queryClient = useQueryClient();
   return useHostMutation<{ prUrl: string }, PullRequestMergeResult>({

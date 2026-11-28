@@ -1,5 +1,4 @@
 // What a step inside the new PR page's tab does: move this tab or open another place.
-// The new page's rules, from omnigent/main's placeViewActions; the classic page keeps its own.
 
 import {
   type PullRequestNewTabTarget,
