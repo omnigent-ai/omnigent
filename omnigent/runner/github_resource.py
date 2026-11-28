@@ -69,7 +69,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from omnigent import config as _config
 from omnigent.git_providers import EnvInstances, host_of
@@ -241,48 +241,59 @@ def checkout_github_host(root: str) -> str | None:
 
     ``gh`` picks among the remotes on hosts it knows: the one ``repo set-default`` marked,
     else by its own order. Remotes on more than one such host have no single answer here,
-    nor does an SSH remote on a host it doesn't know, which may be an alias for one.
+    nor does a remote on a host the panel doesn't know: with an enterprise token ``gh``
+    knows every host, and an SSH host may be an alias for a known one.
     """
     rc, out, _ = _git(["remote"], cwd=root)
     if rc != 0:
         return None
     hosts: set[str] = set()
     resolved: set[str] = set()
+    unknown = False
     for name in out.split():
         # ``get-url`` applies ``insteadOf``, as git and gh do.
         rc, url, _ = _git(["remote", "get-url", name], cwd=root)
-        url = url.strip() if rc == 0 else ""
-        host = host_of(url) or _scp_host(url)
-        if not host or not _known_github_host(host):
-            # gh resolves an SSH host through the SSH config, so an alias may be a known host.
-            if _ssh_remote(url):
+        host = _remote_host(url.strip()) if rc == 0 else None
+        if host == "":
+            continue
+        rc, marked, _ = _git(["config", "--get", f"remote.{name}.gh-resolved"], cwd=root)
+        is_marked = rc == 0 and bool(marked.strip())
+        if host is None or not _known_github_host(host):
+            if is_marked:
                 return None
+            unknown = True
             continue
         hosts.add(host)
-        rc, marked, _ = _git(["config", "--get", f"remote.{name}.gh-resolved"], cwd=root)
-        if rc == 0 and marked.strip():
+        if is_marked:
             resolved.add(host)
-    for candidates in (resolved, hosts):
-        if len(candidates) == 1:
-            return next(iter(candidates))
-    return None
-
-
-def _ssh_remote(url: str) -> bool:
-    """Whether a remote URL is SSH, as ``ssh://`` or scp-style ``[user@]host:path``."""
-    scheme, separator, _ = url.partition("://")
-    if separator:
-        return scheme.lower() in {"ssh", "git+ssh", "ssh+git"}
-    # As gh reads it: a colon before any slash, and no backslash, is scp-style.
-    before, colon, _ = url.partition(":")
-    return bool(colon and before and "/" not in before and "\\" not in url)
-
-
-def _scp_host(url: str) -> str | None:
-    """The host of an scp-style remote with no user, such as ``host:o/r``."""
-    if "://" in url or not _ssh_remote(url):
+    # gh takes the marked remote over every other one.
+    if len(resolved) == 1:
+        return next(iter(resolved))
+    if unknown or resolved:
         return None
-    return url.partition(":")[0].rpartition("@")[2].lower() or None
+    return next(iter(hosts)) if len(hosts) == 1 else None
+
+
+def _remote_host(url: str) -> str | None:
+    """The host ``gh`` reads a remote URL as: ``""`` for a local path, ``None`` if unreadable.
+
+    As ``gh`` does, a URL with no scheme that has a colon and no backslash is scp-style:
+    the host runs up to the first ``/`` after the colon becomes one.
+    """
+    if not url:
+        return None
+    if "://" not in url:
+        if ":" not in url or "\\" in url:
+            return ""
+        url = "ssh://" + url.replace(":", "/", 1)
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        return None
+    if parts.scheme.lower() == "file" and not parts.netloc:
+        return ""
+    return host.lower() if host else None
 
 
 # The scope of a step on the workspace's own pull request: the checkout's GitHub host,

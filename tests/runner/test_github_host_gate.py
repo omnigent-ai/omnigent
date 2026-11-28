@@ -308,9 +308,29 @@ def test_a_call_naming_no_host_goes_to_gh_host_or_github_com_which_must_be_the_s
         ({"origin": f"https://{KNOWN}/o/r.git"}, {}, KNOWN),
         ({"origin": f"git@{KNOWN}:o/r.git"}, {}, KNOWN),
         ({"origin": "https://github.com/o/r.git"}, {}, "github.com"),
-        # A remote on a host never set up isn't one gh would pick, and counts for nothing.
-        ({"origin": f"https://{KNOWN}/o/r.git", "other": f"https://{UNKNOWN}/o/r.git"}, {}, KNOWN),
+        # With an enterprise token gh knows every host, so a remote on one never set up
+        # makes the checkout ambiguous, unless set-default marked a set-up host's remote.
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": f"https://{UNKNOWN}/o/r.git"}, {}, None),
+        (
+            {"origin": f"https://{KNOWN}/o/r.git", "other": f"https://{UNKNOWN}/o/r.git"},
+            {"remote.origin.gh-resolved": "base"},
+            KNOWN,
+        ),
+        (
+            {"origin": f"https://{KNOWN}/o/r.git", "other": f"https://{UNKNOWN}/o/r.git"},
+            {"remote.other.gh-resolved": "base"},
+            None,
+        ),
         ({"origin": f"https://{UNKNOWN}/o/r.git"}, {}, None),
+        # gh reads these with a host too: scp-style up to the first slash, ftp, ftps, file.
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "corp/x:o/r.git"}, {}, None),
+        ({"origin": f"{KNOWN}/x:o/r.git"}, {}, KNOWN),
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "ftp://corp/o/r.git"}, {}, None),
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "ftps://corp/o/r.git"}, {}, None),
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "file://corp/o/r.git"}, {}, None),
+        # Plainly local remotes name no host.
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "file:///srv/git/o/r.git"}, {}, KNOWN),
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "../o/r.git"}, {}, KNOWN),
         # Two set-up hosts are ambiguous unless set-default marked one.
         (
             {"origin": "https://github.com/o/r.git", "upstream": f"https://{KNOWN}/o/r.git"},
