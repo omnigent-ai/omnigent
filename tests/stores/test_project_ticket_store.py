@@ -1340,6 +1340,52 @@ def test_an_askers_later_agent_note_does_not_replace_the_question(board):
     assert shown() == (restated, [restated])
 
 
+def test_an_askers_later_note_that_defaulted_to_the_human_does_not_replace_the_question(board):
+    tickets, _, project = board
+    worker = TicketActor("alice", uuid4().hex, uuid4().hex)
+    ticket = tickets.create(project.id, CreateTicket(title="Decide"), worker)
+    tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "needs-human", "value": "Ship day?"}], comment="Friday?"),
+        worker,
+    )
+
+    def waiting():
+        return tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"]
+
+    asked = waiting()["ask_position"]
+    # While its own ask is open the worker's notes default to the human, but they only
+    # report progress: neither a plain comment nor one with an attachment is the question.
+    note = tickets.comment(
+        project.id, ticket["id"], CommentOnTicket(text="attached verification log"), worker
+    )
+    assert note["latest_update"] == "attached verification log"
+    tickets.comment(
+        project.id,
+        ticket["id"],
+        CommentOnTicket(
+            text="screenshot", outputs=[{"type": "link", "url": "https://example.com/log"}]
+        ),
+        worker,
+    )
+    tickets.update(project.id, ticket["id"], UpdateTicket(comment="ran tsc"), worker)
+    assert (waiting()["question"], waiting()["ask_position"]) == ("Friday?", asked)
+
+    # Changing the needs-human question re-anchors it on the comment sent with the change.
+    tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(
+            labels=[{"key": "needs-human", "value": "Ship day, given the freeze?"}],
+            comment="Monday, given the freeze?",
+        ),
+        worker,
+    )
+    assert waiting()["question"] == "Monday, given the freeze?"
+    assert waiting()["ask_position"] > asked
+
+
 def test_an_asks_question_ignores_an_earlier_resolved_ask(board):
     tickets, _, project = board
     worker = TicketActor("alice", uuid4().hex, uuid4().hex)

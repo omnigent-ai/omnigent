@@ -230,6 +230,15 @@ def _author_audience(
     return "agents"
 
 
+def _states_ask(actor: TicketActor, requested_audience: str | None) -> bool:
+    """A session's comment it addressed to the human on purpose can state its open ask.
+
+    One that only defaulted to the human, say a worker's note while its own ask is open,
+    never replaces the question.
+    """
+    return actor.session_id is not None and requested_audience == "human"
+
+
 def _note_audience(
     row: SqlProjectTicketEvent, payload: dict[str, Any], orchestrator_session_id: str | None
 ) -> str:
@@ -264,6 +273,14 @@ def _has_needs_human(labels: Any) -> bool:
     return isinstance(labels, list) and any(
         isinstance(label, dict) and label.get("key") == NEEDS_HUMAN_LABEL for label in labels
     )
+
+
+def _needs_human_value(labels: Any) -> str | None:
+    """The needs-human label's value, or None when it is absent or bare."""
+    for label in labels if isinstance(labels, list) else []:
+        if isinstance(label, dict) and label.get("key") == NEEDS_HUMAN_LABEL:
+            return label.get("value")
+    return None
 
 
 @dataclass
@@ -2553,6 +2570,12 @@ class ProjectTicketStore:
             needs_human_changed = touches_labels and _has_needs_human(
                 changes.get("labels")
             ) != _has_needs_human(row.labels)
+            # Setting needs-human, or changing its question, makes this edit's comment the ask.
+            raises_ask = adds_needs_human or (
+                touches_labels
+                and _has_needs_human(changes.get("labels"))
+                and _needs_human_value(changes.get("labels")) != _needs_human_value(row.labels)
+            )
             # A person's sign-off label answers their ask; judged on the labels before it.
             person = actor.session_id is None and actor.agent_id is None
             gates_added = (
@@ -2612,6 +2635,11 @@ class ProjectTicketStore:
                     {
                         "text": body.comment,
                         "audience": audience,
+                        **(
+                            {"ask": True}
+                            if raises_ask or _states_ask(actor, body.audience)
+                            else {}
+                        ),
                         **({"final": True} if body.final else {}),
                         **({"cleared_needs_human": True} if answers_ask else {}),
                     },
@@ -2647,6 +2675,8 @@ class ProjectTicketStore:
                 else self._comment_audience(session, project, row, actor, body.audience)
             )
             payload: dict[str, Any] = {"text": body.text, "audience": audience}
+            if _states_ask(actor, body.audience):
+                payload["ask"] = True
             if body.final:
                 payload["final"] = True
             if mentions:
@@ -2677,12 +2707,13 @@ class ProjectTicketStore:
     def _latest_ask_position(
         session: Session, ticket: SqlProjectTicket, asks: builtins.list[_HumanAsk]
     ) -> int | None:
-        """While needs-human is open, its raiser's latest comment for the human is the question.
+        """While needs-human is open, the raiser's latest comment stating the ask is the question.
 
-        A later agent-audience note from the raiser doesn't replace it, and comments from
-        before the previous ask ended don't count; a question posted just before the label
-        does. With no such comment in the raiser's newest few, the one sent with the label
-        stands in.
+        A comment states the ask when it came with setting or changing needs-human, or the
+        raiser addressed it to the human on purpose. A later note doesn't replace it, even
+        one that defaulted to the human, and comments from before the previous ask ended
+        don't count; a question for the human posted just before the label does. With no
+        such comment in the raiser's newest few, the one sent with the label stands in.
         """
         if not _has_needs_human(ticket.labels) or not asks or asks[-1].end is not None:
             return None
@@ -2707,7 +2738,10 @@ class ProjectTicketStore:
             .limit(ASK_QUESTION_SCAN)
         )
         for row in recent:
-            if row.payload.get("audience") != "agents":
+            payload = row.payload
+            if payload.get("ask") or (
+                row.position < asks[-1].start and payload.get("audience") != "agents"
+            ):
                 return row.position
         return session.scalar(
             select(func.min(SqlProjectTicketEvent.position)).where(
