@@ -223,13 +223,14 @@ def register_permissions_routes(
         """
         user_id = _require_user(request, auth_provider)
         canonical_id = canonical_grantee_id(auth_provider, target_user_id)
-        # Leaving is self-service; revoking someone else is management. Read
-        # access is the floor for the self case — enough to prove the session
-        # exists and is visible to the caller without leaking others' via
-        # 403/404. Any spelling of the caller's own ID leaves only their grant.
-        leaving_self = user_id in (target_user_id, canonical_id)
-        if leaving_self:
-            target_user_id = user_id
+        # Leaving needs only read access; revoking someone else needs manage. Another
+        # spelling of the caller's ID leaves too, unless that exact ID holds a grant.
+        leaving_self = target_user_id == user_id
+        if not leaving_self and canonical_id == user_id and permission_store is not None:
+            exact = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
+            if exact is None:
+                leaving_self = True
+                target_user_id = canonical_id
         await _require_access(
             user_id,
             session_id,

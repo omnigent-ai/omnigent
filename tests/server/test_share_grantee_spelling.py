@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import pytest
 
+from omnigent.server.auth import LEVEL_MANAGE, LEVEL_READ
 from tests.server.test_account_revocation import (  # noqa: F401
     _create_schedule,
     create_session,
@@ -57,17 +58,44 @@ def test_session_share_is_revoked_in_the_spelling_it_was_granted_in(setup_app, g
     assert alice.get(f"/v1/sessions/{session_id}").status_code == 404
 
 
-def test_session_revoke_removes_a_legacy_mixed_case_grant_as_given(setup_app):  # noqa: F811
-    admin, _, stores, _ = setup_app
+def _share_with_a_legacy_spelling(app, legacy_id: str, alice_level: int) -> str:
+    admin, _, stores, _ = app
     session_id = create_session(admin).json()["session_id"]
     path = f"/v1/sessions/{session_id}/permissions"
-    stores["permission_store"].ensure_user("Alice")
-    stores["permission_store"].grant("Alice", session_id, 1)
-    assert admin.put(path, json={"user_id": "alice", "level": 1}).status_code == 200
-    revoked = admin.delete(f"{path}/Alice")
+    stores["permission_store"].ensure_user(legacy_id)
+    stores["permission_store"].grant(legacy_id, session_id, LEVEL_READ)
+    assert admin.put(path, json={"user_id": "alice", "level": alice_level}).status_code == 200
+    return path
+
+
+@pytest.mark.parametrize(
+    ("caller", "alice_level", "legacy_id"),
+    [
+        ("admin", LEVEL_READ, "Alice"),
+        ("admin", LEVEL_READ, "Admin"),
+        ("alice", LEVEL_MANAGE, "Alice"),
+    ],
+)
+def test_session_revoke_removes_a_legacy_mixed_case_grant_as_given(
+    setup_app,  # noqa: F811
+    caller,
+    alice_level,
+    legacy_id,
+):
+    admin, alice, _, _ = setup_app
+    path = _share_with_a_legacy_spelling(setup_app, legacy_id, alice_level)
+    revoked = {"admin": admin, "alice": alice}[caller].delete(f"{path}/{legacy_id}")
     assert revoked.status_code == 204, revoked.text
     listed = admin.get(path).json()["permissions"]
     assert sorted(grant["user_id"] for grant in listed) == ["admin", "alice"]
+
+
+def test_read_only_grantee_cannot_revoke_a_legacy_grant_in_another_spelling(setup_app):  # noqa: F811
+    admin, alice, _, _ = setup_app
+    path = _share_with_a_legacy_spelling(setup_app, "Alice", LEVEL_READ)
+    assert alice.delete(f"{path}/Alice").status_code == 403
+    listed = admin.get(path).json()["permissions"]
+    assert sorted(grant["user_id"] for grant in listed) == ["Alice", "admin", "alice"]
 
 
 @pytest.mark.parametrize("spelling", _GRANTEE_SPELLINGS)
