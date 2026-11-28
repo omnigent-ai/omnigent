@@ -125,7 +125,7 @@ export function MarkdownComposer({
   // re-render a moment later, and the draft can differ (resolved uploads, the body's line endings).
   const [text, setText] = useState(() => withLineFeeds(value));
   const [ownerValue, setOwnerValue] = useState(value);
-  // The draft this composer last handed its owner, so the owner's echo isn't taken for a change.
+  // The last draft this composer handed its owner or took from it; only a different one is a change.
   const [emitted, setEmitted] = useState(value);
   // The body as it loaded, whose line endings an edit keeps.
   const [source] = useState(value);
@@ -134,8 +134,13 @@ export function MarkdownComposer({
     // same draft wrote to it. A draft that is only this text with its uploads finished (another
     // composer of the draft took the upload) leaves the text, and its history, alone.
     setOwnerValue(value);
-    const shownAsDraft = withLineFeeds(resolveSettledUploads(text));
-    if (value !== emitted && withLineFeeds(value) !== shownAsDraft) setText(withLineFeeds(value));
+    if (value !== emitted) {
+      // Adopted, so it is the draft to compare the owner's next value with, even if it returns
+      // to text this composer emitted earlier.
+      setEmitted(value);
+      const shownAsDraft = withLineFeeds(resolveSettledUploads(text));
+      if (withLineFeeds(value) !== shownAsDraft) setText(withLineFeeds(value));
+    }
   }
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // `@` and `#` completion, where the pull request around this editor offers it.

@@ -119,6 +119,53 @@ async function finishUpload(index: number, url: string): Promise<void> {
   });
 }
 
+/** Composers that edit one draft, as the Overview's pinned box and the Comments tab do. */
+function mountSharedDraft(labels: string[], initial = ""): { text: string } {
+  const store = { text: initial };
+  const listeners = new Set<() => void>();
+  const update = (change: (text: string) => string) => {
+    store.text = change(store.text);
+    listeners.forEach((listener) => listener());
+  };
+  function Shared({ label }: { label: string }) {
+    const [, rerender] = useState(0);
+    useState(() => listeners.add(() => rerender((count) => count + 1)));
+    return (
+      <MarkdownComposer
+        value={store.text}
+        onChange={(next) => update(() => next)}
+        onSubmit={() => {}}
+        submitLabel="Comment"
+        submitVerb="comment"
+        size="comment"
+        label={label}
+        preview={null}
+        attachments={{
+          conversationId: "conv_1",
+          prUrl: "https://github.com/acme/app/pull/1",
+          rememberUploadedImage: async () => {},
+          updateDraftText: update,
+          onUploadingChange: () => {},
+          onAttachmentError: () => {},
+        }}
+      />
+    );
+  }
+  render(
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        {labels.map((label) => (
+          <Shared key={label} label={label} />
+        ))}
+      </TooltipProvider>
+    </QueryClientProvider>,
+  );
+  return store;
+}
+
+const sharedTextarea = (label: string) =>
+  screen.getByRole("textbox", { name: label }) as HTMLTextAreaElement;
+
 describe("MarkdownComposer", () => {
   it("applies a toolbar format to the selection and keeps it selected", () => {
     const harness = mount("make this bold");
@@ -323,44 +370,7 @@ describe("MarkdownComposer", () => {
 
   it("keeps an edited composer's history when another composer of its draft takes the upload", async () => {
     // The Overview's pinned box and the Comments tab edit one draft; both stay mounted.
-    const store = { text: "" };
-    const listeners = new Set<() => void>();
-    const update = (change: (text: string) => string) => {
-      store.text = change(store.text);
-      listeners.forEach((listener) => listener());
-    };
-    function Shared({ label }: { label: string }) {
-      const [, rerender] = useState(0);
-      useState(() => listeners.add(() => rerender((count) => count + 1)));
-      return (
-        <MarkdownComposer
-          value={store.text}
-          onChange={(next) => update(() => next)}
-          onSubmit={() => {}}
-          submitLabel="Comment"
-          submitVerb="comment"
-          size="comment"
-          label={label}
-          preview={null}
-          attachments={{
-            conversationId: "conv_1",
-            prUrl: "https://github.com/acme/app/pull/1",
-            rememberUploadedImage: async () => {},
-            updateDraftText: update,
-            onUploadingChange: () => {},
-            onAttachmentError: () => {},
-          }}
-        />
-      );
-    }
-    render(
-      <QueryClientProvider client={queryClient}>
-        <TooltipProvider>
-          <Shared label="Pinned" />
-          <Shared label="Comment" />
-        </TooltipProvider>
-      </QueryClientProvider>,
-    );
+    const store = mountSharedDraft(["Pinned", "Comment"]);
     select(0);
     fireEvent.change(textarea(), { target: { value: "Shot: " } });
     textarea().setSelectionRange(6, 6);
@@ -374,6 +384,21 @@ describe("MarkdownComposer", () => {
     expect(textarea().value).toBe(placeholder);
     act(() => textarea().focus());
     expect(textarea().value).toBe(`Shot: ![a](${ASSET}/a)`);
+  });
+
+  it("doesn't bring back text another composer deleted, when the draft returns to an earlier text", () => {
+    const store = mountSharedDraft(["Comment", "Pinned"]);
+    fireEvent.change(sharedTextarea("Comment"), { target: { value: "x" } });
+    fireEvent.change(sharedTextarea("Pinned"), { target: { value: "xy" } });
+    expect(sharedTextarea("Comment").value).toBe("xy");
+    // The other composer deletes what it added, so the draft is "x" again.
+    fireEvent.change(sharedTextarea("Pinned"), { target: { value: "x" } });
+    expect(store.text).toBe("x");
+    expect(sharedTextarea("Comment").value).toBe("x");
+    fireEvent.change(sharedTextarea("Comment"), { target: { value: "xz" } });
+    expect(store.text).toBe("xz");
+    expect(sharedTextarea("Comment").value).toBe("xz");
+    expect(sharedTextarea("Pinned").value).toBe("xz");
   });
 
   it("shows an upload at once in a textarea nobody edited here", async () => {
