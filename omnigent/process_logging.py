@@ -970,6 +970,9 @@ def configure_process_logging(
     """
     global _current_process_log_path
 
+    from omnigent.debug_logging import set_process_source
+
+    set_process_source(destination)
     resolved_level = effective_log_level() if level is None else level
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
     if path is None:
