@@ -322,6 +322,12 @@ def test_a_call_naming_no_host_goes_to_gh_host_or_github_com_which_must_be_the_s
             {"remote.upstream.gh-resolved": "base"},
             KNOWN,
         ),
+        # An unknown SSH host may be an SSH-config alias of a known one, so it's ambiguous.
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "corp:o/r.git"}, {}, None),
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "git@corp:o/r.git"}, {}, None),
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "ssh://git@corp/o/r.git"}, {}, None),
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": "/srv/git/o/r.git"}, {}, KNOWN),
+        ({"origin": f"{KNOWN}:o/r.git"}, {}, KNOWN),
         # insteadOf rewrites the URL gh reads.
         ({"origin": "corp:o/r"}, {f"url.https://{UNKNOWN}/.insteadOf": "corp:"}, None),
         ({"origin": "corp:o/r"}, {f"url.https://{KNOWN}/.insteadOf": "corp:"}, KNOWN),

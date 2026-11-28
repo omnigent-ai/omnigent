@@ -240,7 +240,8 @@ def checkout_github_host(root: str) -> str | None:
     """The GitHub host ``gh`` reads the checkout's pull requests from, if it's just one.
 
     ``gh`` picks among the remotes on hosts it knows: the one ``repo set-default`` marked,
-    else by its own order. Remotes on more than one such host have no single answer here.
+    else by its own order. Remotes on more than one such host have no single answer here,
+    nor does an SSH remote on a host it doesn't know, which may be an alias for one.
     """
     rc, out, _ = _git(["remote"], cwd=root)
     if rc != 0:
@@ -250,8 +251,12 @@ def checkout_github_host(root: str) -> str | None:
     for name in out.split():
         # ``get-url`` applies ``insteadOf``, as git and gh do.
         rc, url, _ = _git(["remote", "get-url", name], cwd=root)
-        host = host_of(url.strip()) if rc == 0 else None
+        url = url.strip() if rc == 0 else ""
+        host = host_of(url) or _scp_host(url)
         if not host or not _known_github_host(host):
+            # gh resolves an SSH host through the SSH config, so an alias may be a known host.
+            if _ssh_remote(url):
+                return None
             continue
         hosts.add(host)
         rc, marked, _ = _git(["config", "--get", f"remote.{name}.gh-resolved"], cwd=root)
@@ -261,6 +266,23 @@ def checkout_github_host(root: str) -> str | None:
         if len(candidates) == 1:
             return next(iter(candidates))
     return None
+
+
+def _ssh_remote(url: str) -> bool:
+    """Whether a remote URL is SSH, as ``ssh://`` or scp-style ``[user@]host:path``."""
+    scheme, separator, _ = url.partition("://")
+    if separator:
+        return scheme.lower() in {"ssh", "git+ssh", "ssh+git"}
+    # As gh reads it: a colon before any slash, and no backslash, is scp-style.
+    before, colon, _ = url.partition(":")
+    return bool(colon and before and "/" not in before and "\\" not in url)
+
+
+def _scp_host(url: str) -> str | None:
+    """The host of an scp-style remote with no user, such as ``host:o/r``."""
+    if "://" in url or not _ssh_remote(url):
+        return None
+    return url.partition(":")[0].rpartition("@")[2].lower() or None
 
 
 # The scope of a step on the workspace's own pull request: the checkout's GitHub host,
