@@ -635,6 +635,33 @@ def git_session(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, str]]:
         yield stack.base_url, created.json()["id"]
 
 
+def test_a_rich_files_show_changes_opens_the_changes_review(
+    page: Page, git_session: tuple[str, str]
+) -> None:
+    """A changed Markdown file's Show changes opens the Diffs tab, as a text file's does."""
+    base_url, session_id = git_session
+    httpx.put(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/notes.md",
+        json={"content": "# Notes\n", "encoding": "utf-8"},
+        timeout=10.0,
+        trust_env=False,
+    ).raise_for_status()
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+    sidebar.locator('[role="treeitem"][data-item-path="notes.md"]').click(timeout=30_000)
+    viewer = sidebar.get_by_test_id("file-viewer").filter(visible=True)
+    expect(viewer).to_be_visible(timeout=30_000)
+    expect(viewer.get_by_role("button", name="Show diff")).to_have_count(0)
+    viewer.get_by_role("button", name="Show changes").click(timeout=30_000)
+    expect(sidebar.get_by_test_id("workspace-changes-place").filter(visible=True)).to_be_visible(
+        timeout=30_000
+    )
+
+
 def test_changes_compare_branches_and_tags_through_the_workspace_api(
     page: Page, git_session: tuple[str, str]
 ) -> None:

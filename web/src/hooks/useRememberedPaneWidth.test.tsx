@@ -356,7 +356,8 @@ describe("a tree that keeps its share of the panel", () => {
   it("remembers a key step as its share, so a wider page widens the choice", () => {
     const view = render(<Pane spec={FILES} containerWidth={800} />);
     expect(widthOf(FILES)).toBe(284);
-    fireEvent.keyDown(handleOf(FILES), { key: "ArrowRight" });
+    // The tree docks at the page's right, so ArrowLeft widens it.
+    fireEvent.keyDown(handleOf(FILES), { key: "ArrowLeft" });
     expect(widthOf(FILES)).toBe(300);
     expect(readPanelSharePreference("filesTreeShare")).toBe(0.375);
     view.rerender(<Pane spec={FILES} containerWidth={640} />);
@@ -367,12 +368,14 @@ describe("a tree that keeps its share of the panel", () => {
   });
 
   it("remembers a drag as its share on release, and double-click returns to the default", () => {
+    // The tree docks at the page's right, so its width runs from the pointer to that edge.
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
       left: 100,
+      right: 1100,
     } as DOMRect);
     const view = render(<Pane spec={FILES} containerWidth={1000} />);
     fireEvent.pointerDown(handleOf(FILES));
-    fireEvent.pointerMove(window, { clientX: 400 });
+    fireEvent.pointerMove(window, { clientX: 800 });
     expect(readPanelSharePreference("filesTreeShare")).toBeNull();
     fireEvent.pointerUp(window);
     expect(widthOf(FILES)).toBe(300);
@@ -446,7 +449,7 @@ describe("a tree that keeps its share of the panel", () => {
     expect(widthOf(FILES)).toBe(300);
     view.rerender(<Pane spec={FILES} containerWidth={900} />);
     expect(widthOf(FILES)).toBe(270);
-    fireEvent.keyDown(handleOf(FILES), { key: "ArrowRight" });
+    fireEvent.keyDown(handleOf(FILES), { key: "ArrowLeft" });
     expect(widthOf(FILES)).toBe(286);
   });
 });

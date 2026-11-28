@@ -1,5 +1,5 @@
 // The ⋯ "File actions" at the end of a Files tab's toolbar: find in the file, the file's
-// places and paths, a download, and last the session's finders.
+// places and paths, a download and its view settings, and last the session's finders.
 
 import {
   DownloadIcon,
@@ -14,6 +14,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
@@ -22,6 +23,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile } from "@/hooks/useFileContent";
 import { useMenuCloseHandOff } from "@/hooks/useMenuCloseHandOff";
+import { useStickyScroll, writeStickyScroll } from "@/lib/fileViewPreferences";
 import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
 import { FileCommandMenuItem } from "@/shell/fileCommands/FileCommandMenuItem";
 import type { FileCommandId } from "@/shell/fileCommands/model";
@@ -36,6 +38,7 @@ import {
 export const FILE_ACTIONS_LABEL = "File actions";
 export const FIND_IN_FILE_LABEL = "Find in file";
 export const GO_TO_FILE_LABEL = "Go to File in Workspace…";
+export const STICKY_SCROLL_LABEL = "Sticky scroll";
 
 const PLACE_COMMANDS = ["open-in-vscode", "open-in-cursor", "reveal"] as const;
 const PATH_COMMANDS = ["copy-path", "copy-relative-path", "copy-link"] as const;
@@ -49,6 +52,7 @@ export interface FileActionsMenuProps {
 
 export function FileActionsMenu({ conversationId, path, onFind }: FileActionsMenuProps) {
   const file = useFileCommands(path, { conversationId });
+  const stickyScroll = useStickyScroll();
   // A finder opens once the menu has returned focus to ⋯, so cancelling it lands there.
   const menuHandOff = useMenuCloseHandOff();
   // Go to File needs the session's finder; Search Text also needs its files' text searchable.
@@ -85,7 +89,7 @@ export function FileActionsMenu({ conversationId, path, onFind }: FileActionsMen
     { key: "places", rows: commandRows(PLACE_COMMANDS) },
     { key: "paths", rows: commandRows(PATH_COMMANDS) },
     {
-      key: "download",
+      key: "view",
       rows: [
         <DropdownMenuItem
           key="download"
@@ -96,6 +100,15 @@ export function FileActionsMenu({ conversationId, path, onFind }: FileActionsMen
           <DownloadIcon />
           Download file
         </DropdownMenuItem>,
+        <DropdownMenuCheckboxItem
+          key="sticky-scroll"
+          checked={stickyScroll}
+          // A view toggle keeps the menu open, as the file viewer's do.
+          onSelect={(event) => event.preventDefault()}
+          onCheckedChange={(checked) => writeStickyScroll(checked === true)}
+        >
+          {STICKY_SCROLL_LABEL}
+        </DropdownMenuCheckboxItem>,
       ],
     },
     {

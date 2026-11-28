@@ -182,7 +182,11 @@ describe("WorkspaceSidebarLayout resize", () => {
     const sidebar = screen.getByRole("button", { name: "Folder" }).parentElement!;
     expect(sidebar).toHaveStyle({ width: `${FILES_TREE_DEFAULT_WIDTH}px` });
 
-    fireEvent.keyDown(handle()!, { key: "ArrowLeft" });
+    // The sidebar docks at the page's right: its handle is its left edge, and the arrow
+    // pointing into the sidebar narrows it.
+    expect(handle()?.parentElement).toBe(sidebar);
+    expect(sidebar).toHaveClass("col-start-2", "border-l");
+    fireEvent.keyDown(handle()!, { key: "ArrowRight" });
     expect(sidebar).toHaveStyle({ width: `${FILES_TREE_DEFAULT_WIDTH - 16}px` });
   });
 
@@ -190,7 +194,7 @@ describe("WorkspaceSidebarLayout resize", () => {
     page.width = 720;
     const view = render(<ResizablePage />);
     const sidebar = () => screen.getByRole("button", { name: "Folder" }).parentElement!;
-    fireEvent.keyDown(handle()!, { key: "ArrowRight" });
+    fireEvent.keyDown(handle()!, { key: "ArrowLeft" });
     expect(sidebar()).toHaveStyle({ width: "272px" });
 
     page.width = 900;

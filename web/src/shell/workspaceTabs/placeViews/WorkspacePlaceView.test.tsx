@@ -52,7 +52,7 @@ vi.mock("./FilesPageViewer", () => ({
     captured.viewer = props;
     return (
       <div data-testid="file-viewer">
-        {props.toolbarLeading}
+        {props.toolbarTrailing}
         {props.path}
       </div>
     );

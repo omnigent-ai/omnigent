@@ -69,14 +69,15 @@ def test_the_docked_tree_resizes_and_keeps_its_width(
     default = _width(handle)
     assert default > 0
 
-    # Drag the edge 80px narrower; the width saves once the drag ends.
+    # The tree docks at the right: drag its left edge 80px narrower; the width saves once the
+    # drag ends.
     box = handle.bounding_box()
     assert box is not None
     start_x, middle_y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
     page.mouse.move(start_x, middle_y)
     page.mouse.down()
-    page.mouse.move(start_x - 40, middle_y, steps=4)
-    page.mouse.move(start_x - 80, middle_y, steps=4)
+    page.mouse.move(start_x + 40, middle_y, steps=4)
+    page.mouse.move(start_x + 80, middle_y, steps=4)
     page.mouse.up()
     expect(handle).not_to_have_attribute("aria-valuenow", str(default))
     dragged = _width(handle)
@@ -84,7 +85,7 @@ def test_the_docked_tree_resizes_and_keeps_its_width(
 
     # The arrow keys step it from the keyboard.
     handle.focus()
-    page.keyboard.press("ArrowLeft")
+    page.keyboard.press("ArrowRight")
     stepped = str(dragged - 16)
     expect(handle).to_have_attribute("aria-valuenow", stepped)
 
@@ -133,7 +134,7 @@ def test_the_tree_keeps_its_share_in_full_screen(
     assert box is not None
     page.mouse.move(box["x"] + box["width"] / 2, box["y"] + 200)
     page.mouse.down()
-    page.mouse.move(box["x"] + 200, box["y"] + 200, steps=8)
+    page.mouse.move(box["x"] - 200, box["y"] + 200, steps=8)
     page.mouse.up()
     chosen_share = _box_width(tree) / _box_width(place)
     assert chosen_share > docked_share + 0.05, (chosen_share, docked_share)

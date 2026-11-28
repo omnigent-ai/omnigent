@@ -277,6 +277,7 @@ interface RenderProps {
   frameless?: boolean;
   besideSidebar?: boolean;
   toolbarLeading?: React.ReactNode;
+  toolbarTrailing?: React.ReactNode;
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
   open?: boolean;
@@ -320,6 +321,7 @@ function viewerTree({
   frameless,
   besideSidebar,
   toolbarLeading,
+  toolbarTrailing,
   mobileOverlay,
   position,
   open = false,
@@ -351,6 +353,7 @@ function viewerTree({
           frameless={frameless}
           besideSidebar={besideSidebar}
           toolbarLeading={toolbarLeading}
+          toolbarTrailing={toolbarTrailing}
           mobileOverlay={mobileOverlay}
           position={position}
           open={open}
@@ -574,7 +577,7 @@ describe("FileViewer mobile keyboard inset", () => {
     const root = screen.getByTestId("file-viewer");
     expect(root).toHaveClass("flex", "flex-col", "bg-card");
     expect(root.firstElementChild).toHaveClass("border-b", "px-4", "py-3");
-    expect(root.querySelector(".col-start-2")).toBeNull();
+    expect(root.querySelector(".col-start-1, .col-start-2")).toBeNull();
   });
 
   it("beside a sidebar, spans the toolbar over the page with its leading control first", () => {
@@ -591,8 +594,57 @@ describe("FileViewer mobile keyboard inset", () => {
     expect(toolbar).toHaveClass("col-span-full", "row-start-1");
     const leading = within(toolbar).getByRole("button", { name: "Show tree" });
     expect(toolbar.querySelector("button")).toBe(leading);
-    // The banner and content sit in the cell beside the sidebar.
-    expect(root.children[1]).toHaveClass("col-start-2", "row-start-2");
+    // The banner and content sit in the cell beside the sidebar, which docks at the right.
+    expect(root.children[1]).toHaveClass("col-start-1", "row-start-2");
+  });
+
+  it("ends the toolbar with a trailing control, after the file's actions", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({
+      open: true,
+      frameless: true,
+      besideSidebar: true,
+      toolbarTrailing: <button type="button">Hide tree</button>,
+    });
+    const toolbar = screen.getByTestId("file-viewer").firstElementChild as HTMLElement;
+    const buttons = within(toolbar).getAllByRole("button");
+    expect(buttons.at(-1)).toHaveAccessibleName("Hide tree");
+    expect(within(toolbar).getAllByRole("button", { name: "Hide tree" })).toHaveLength(1);
+  });
+
+  it("counts the trailing control's width before deciding the file's actions fit", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    installCollapsedToolbar();
+    // Room for the path's reserve and the actions, but not for a wide trailing control as well.
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(100);
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this.tagName === "DIV" && this.textContent === "Hide tree" ? 200 : 0;
+    });
+    renderViewer({ open: true, frameless: true, besideSidebar: true });
+    expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
+    cleanup();
+
+    renderViewer({
+      open: true,
+      frameless: true,
+      besideSidebar: true,
+      toolbarTrailing: <button type="button">Hide tree</button>,
+    });
+    expect(screen.getByRole("button", { name: "More actions" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide tree" })).toBeVisible();
+  });
+
+  it("draws no trailing slot when none is given, as every classic viewer is", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, frameless: true });
+    const toolbar = screen.getByTestId("file-viewer").firstElementChild as HTMLElement;
+    const actions = within(toolbar).getByTestId("FILESTOOLBAR");
+    // The file's actions end the toolbar, followed only by the hidden measuring clones.
+    expect([...actions.children].filter((child) => !child.hasAttribute("aria-hidden")).at(-1)).toBe(
+      actions.querySelector(":scope > div.flex.items-center.justify-end"),
+    );
   });
 
   it("does not pad the desktop rail for the iOS keyboard", () => {
@@ -1116,6 +1168,54 @@ describe("FileViewer URL sync — diff param", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open file" }));
     expect(await screen.findByTestId("code-viewer")).toBeInTheDocument();
     expect(onShowChanges).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["image.png", "document.pdf", "model.stl"])(
+    "offers a changed %s's changes in the page's Changes review, which has no inline diff",
+    async (path) => {
+      const files = [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }];
+      await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+        () =>
+          ({ data: { available: true, data: files } }) as ReturnType<
+            typeof useWorkspaceChangedFiles
+          >,
+        async () => {
+          useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+          const onShowChanges = vi.fn();
+          renderViewer({ open: true, path, onShowChanges });
+          fireEvent.click(screen.getByRole("button", { name: "Show changes" }));
+          expect(onShowChanges).toHaveBeenCalledTimes(1);
+          cleanup();
+
+          // Without a Changes review, the viewer still offers no diff for it.
+          renderViewer({ open: true, path });
+          expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+        },
+      );
+    },
+  );
+
+  it("opens a deleted file in its diff, with no Show changes or Open file, beside a Changes review", async () => {
+    const files = [
+      { path: "gone.py", bytes: 0, modified_at: null, name: "gone.py", status: "deleted" },
+    ];
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () =>
+        ({ data: { available: true, data: files } }) as ReturnType<typeof useWorkspaceChangedFiles>,
+      async () => {
+        useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+        renderViewer({ open: true, path: "gone.py", onShowChanges: vi.fn() });
+        expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
+        expect(screen.queryByRole("button", { name: "Open file" })).toBeNull();
+      },
+    );
+  });
+
+  it("offers no Show changes for an unchanged file, even beside a Changes review", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, path: "image.png", onShowChanges: vi.fn() });
+    expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
   });
 
   it("removes ?diff from the URL when diff is toggled off", async () => {
