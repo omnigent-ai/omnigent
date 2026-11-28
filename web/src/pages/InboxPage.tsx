@@ -71,6 +71,8 @@ import {
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
 import { SuggestionMedia } from "@/components/inbox/SuggestionMedia";
 import { useWhatsNewStore } from "@/components/WhatsNew";
+import { TidePoolScene } from "@/components/TidePool";
+import { usePlayfulTouches } from "@/lib/playfulTouchesPreferences";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -263,6 +265,7 @@ const PRIMARY_ACTION =
 
 export function InboxPage() {
   const queryClient = useQueryClient();
+  const playful = usePlayfulTouches();
   const { trackClick } = useOmnigentAnalytics();
   useEffect(() => {
     void queryClient.invalidateQueries({ queryKey: ["automation-inbox"] });
@@ -1346,6 +1349,8 @@ export function InboxPage() {
     (!advisorOnly && hasNextPage) ||
     (showUnread && automationInbox.hasNextPage) ||
     (showSuggestions && proactiveInbox.hasNextPage);
+  // Otto's Inbox zero: only when nothing anywhere in this view is waiting or still unloaded.
+  const caughtUp = playful && !moreToLoad && !(selectedProject && tabEntries.length > 0);
 
   return (
     <PageScroll maxWidthClassName="max-w-[960px]" contentClassName="px-4 md:px-10">
@@ -1485,30 +1490,41 @@ export function InboxPage() {
             data-testid="inbox-empty"
             className="flex flex-col items-center gap-2 px-4 pt-16 pb-20 text-center"
           >
-            {/* A quiet tile: a check only when nothing is waiting anywhere in this view. */}
-            <div
-              aria-hidden
-              className="mb-2 flex size-12 items-center justify-center rounded-xl border bg-muted text-muted-foreground"
-            >
-              {(selectedProject && tabEntries.length > 0) || moreToLoad ? (
-                <InboxIcon className="size-5" />
-              ) : (
-                <CheckIcon className="size-5" />
-              )}
-            </div>
+            {caughtUp ? (
+              // Otto at Inbox zero, only when nothing is waiting anywhere in this view.
+              <TidePoolScene className="mb-1 w-44" ottoClassName="otto-working" />
+            ) : (
+              /* A quiet tile: a check only when nothing is waiting anywhere in this view. */
+              <div
+                aria-hidden
+                className="mb-2 flex size-12 items-center justify-center rounded-xl border bg-muted text-muted-foreground"
+              >
+                {(selectedProject && tabEntries.length > 0) || moreToLoad ? (
+                  <InboxIcon className="size-5" />
+                ) : (
+                  <CheckIcon className="size-5" />
+                )}
+              </div>
+            )}
             <h2 className="text-lg font-semibold tracking-tight text-balance">
-              {selectedProject
-                ? `Nothing here from ${selectedProject.name}`
-                : moreToLoad
-                  ? "Nothing waiting in the loaded items"
-                  : emptyState.title}
+              {caughtUp
+                ? "All caught up"
+                : selectedProject
+                  ? `Nothing here from ${selectedProject.name}`
+                  : moreToLoad
+                    ? "Nothing waiting in the loaded items"
+                    : emptyState.title}
             </h2>
             <p className="max-w-xs text-sm leading-relaxed text-pretty text-muted-foreground">
-              {selectedProject
-                ? tabEntries.length > 0
-                  ? "Other projects have items waiting."
-                  : emptyState.body
-                : emptyState.body}
+              {caughtUp
+                ? selectedProject
+                  ? `Nothing from ${selectedProject.name} needs you right now.`
+                  : "Nothing in this view needs you right now."
+                : selectedProject
+                  ? tabEntries.length > 0
+                    ? "Other projects have items waiting."
+                    : emptyState.body
+                  : emptyState.body}
             </p>
             {selectedProject && (
               <Button

@@ -42,6 +42,7 @@ import {
 import type { CommentInbox } from "@/hooks/useCommentInbox";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { SERVER_RESTART_MESSAGE } from "@/lib/serverRestart";
+import { writePlayfulTouches } from "@/lib/playfulTouchesPreferences";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
@@ -248,6 +249,8 @@ beforeEach(() => {
   advisor.failed = false;
   advisor.refetch = vi.fn();
   window.localStorage.removeItem("omnigent:inbox-filter");
+  // Most tests check the plain empty state; the Otto tests turn Playful touches back on.
+  writePlayfulTouches(false);
   vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(automationInboxStub());
   vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub());
   vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([]));
@@ -323,6 +326,33 @@ describe("InboxPage states", () => {
     // "Nothing waiting on you" empty state.
     renderPage();
     expect(await screen.findByText("Nothing waiting on you")).toBeInTheDocument();
+  });
+
+  it("shows Otto at Inbox zero when Playful touches is on", async () => {
+    // WHY: with nothing waiting anywhere in this view, the plain tile becomes the tide pool,
+    // with copy scoped to the view rather than a global "you're done".
+    writePlayfulTouches(true);
+    renderPage();
+    expect(await screen.findByText("All caught up")).toBeInTheDocument();
+    expect(screen.getByText("Nothing in this view needs you right now.")).toBeInTheDocument();
+    expect(screen.getByTestId("tide-pool-scene")).toBeInTheDocument();
+    expect(screen.queryByText("Nothing waiting on you")).toBeNull();
+  });
+
+  it("keeps the plain empty state when Playful touches is off", async () => {
+    renderPage();
+    expect(await screen.findByText("Nothing waiting on you")).toBeInTheDocument();
+    expect(screen.queryByTestId("tide-pool-scene")).toBeNull();
+  });
+
+  it("never shows Otto while the inbox is loading", () => {
+    writePlayfulTouches(true);
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([], { isLoading: true }),
+    );
+    renderPage();
+    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+    expect(screen.queryByTestId("tide-pool-scene")).toBeNull();
   });
 
   it("offers manual loading when older sessions remain", () => {
@@ -718,6 +748,17 @@ describe("InboxPage comments and errors", () => {
     expect(retryFailed).toHaveBeenCalled();
     // The error path also suppresses the empty state.
     expect(screen.queryByText("Nothing waiting on you")).not.toBeInTheDocument();
+  });
+
+  it("never shows Otto when inbox items failed to load", async () => {
+    writePlayfulTouches(true);
+    vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
+      commentInboxStub({ failedCount: 1, retryFailed: vi.fn() }),
+    );
+    renderPage();
+    await screen.findByTestId("inbox-load-error");
+    expect(screen.queryByTestId("tide-pool-scene")).toBeNull();
+    expect(screen.queryByText("All caught up")).toBeNull();
   });
 });
 
@@ -2154,6 +2195,22 @@ describe("InboxPage project filter", () => {
     expect(screen.getByText("Alpha work")).toBeInTheDocument();
     expect(lastLocation.search).toBe("?project=proj_alpha");
     expect(localStorage.getItem("omnigent:inbox-project")).toBe("proj_alpha");
+  });
+
+  it("keeps Otto away from a project filter that hides waiting items", async () => {
+    // WHY: "All caught up" would be false when other projects still have items waiting.
+    writePlayfulTouches(true);
+    localStorage.setItem("omnigent:inbox-project", "proj_beta");
+    const alpha = unreadConversation({
+      id: "sess_a",
+      title: "Alpha work",
+      project_id: "proj_alpha",
+    });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([alpha]));
+    renderPage();
+    expect(await screen.findByText("Nothing here from Beta")).toBeInTheDocument();
+    expect(screen.getByText("Other projects have items waiting.")).toBeInTheDocument();
+    expect(screen.queryByTestId("tide-pool-scene")).toBeNull();
   });
 
   it("restores the last pick and offers a way back from an empty project", async () => {

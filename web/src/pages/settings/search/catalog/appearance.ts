@@ -193,7 +193,7 @@ export const PLAYFUL_TOUCHES_ENTRY = settingsEntry({
   section: "appearance",
   label: "Playful touches",
   description:
-    "Show Otto's small touches: a welcome on a new project's board, a Done mark on finished tickets you asked for, friendlier empty lanes and milestone notes.",
+    "Show Otto's small touches: a welcome on a new project's board, a Done mark on finished tickets you asked for, friendlier empty lanes, Otto at Inbox zero and milestone notes.",
   keywords: ["playful", "whimsy", "otto", "mascot", "fun", "celebration", "milestone"],
 });
 

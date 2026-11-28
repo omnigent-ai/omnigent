@@ -6,7 +6,14 @@ import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 
 /** Otto resting on a sandbar in soft pink water, with a few bubbles and ripples. */
-export function TidePoolScene({ className }: { className?: string }) {
+export function TidePoolScene({
+  className,
+  ottoClassName,
+}: {
+  className?: string;
+  /** Classes for Otto himself, e.g. `otto-working` for his blink. */
+  ottoClassName?: string;
+}) {
   // Unique gradient ids, so two scenes on one page don't share (and lose) their fills.
   const id = useId().replace(/:/g, "");
   return (
@@ -28,7 +35,11 @@ export function TidePoolScene({ className }: { className?: string }) {
         </linearGradient>
       </defs>
       <ellipse cx="130" cy="96" rx="128" ry="74" fill={`url(#${id}-water)`} />
-      <path d="M40 140 Q130 112 220 140 Q130 158 40 140Z" fill={`url(#${id}-sand)`} opacity="0.75" />
+      <path
+        d="M40 140 Q130 112 220 140 Q130 158 40 140Z"
+        fill={`url(#${id}-sand)`}
+        opacity="0.75"
+      />
       <g fill="none" stroke="#f472b6" strokeLinecap="round" strokeWidth="2">
         <path d="M30 70 q15 -8 30 0 t30 0" opacity="0.5" />
         <path d="M178 54 q12 -7 24 0 t24 0" opacity="0.4" />
@@ -38,7 +49,7 @@ export function TidePoolScene({ className }: { className?: string }) {
         <circle cx="198" cy="76" r="3" opacity="0.5" />
         <circle cx="72" cy="100" r="3.5" opacity="0.5" />
       </g>
-      <OttoIcon x="88" y="58" width="84" height="84" />
+      <OttoIcon x="88" y="58" width="84" height="84" className={ottoClassName} />
     </svg>
   );
 }

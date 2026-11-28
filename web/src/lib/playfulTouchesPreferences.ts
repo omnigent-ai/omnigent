@@ -1,6 +1,7 @@
 // Per-device choice to show Otto's small playful touches: the tide-pool welcome on a new
 // project's board, a "Done" mark on finished tickets you asked for, friendlier empty
-// lanes and milestone notes. Off, every one of them falls back to the plain version.
+// lanes, Otto at Inbox zero and milestone notes. Off, every one of them falls back to the
+// plain version.
 
 import { createStoredChoicePreference } from "./storedChoicePreference";
 
