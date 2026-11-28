@@ -18,6 +18,7 @@ import pytest
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.inner import _proc
 from omnigent.models import model_catalog_store
+from omnigent.onboarding.ambient import ClaudeManagedModelPicker
 from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 
@@ -424,18 +425,35 @@ async def test_catalog_does_not_restore_a_disabled_default(
 
 
 @pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("launch", ["claude", "isaac-command", "isaac-plugin"])
 async def test_catalog_uses_cli_managed_picker_for_every_launch_config(
-    monkeypatch: pytest.MonkeyPatch, configured: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, configured: bool, launch: str
 ) -> None:
-    _stub_picker(
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    command = str(tmp_path / "isaac") if launch == "isaac-command" else "claude"
+    (config_home / "config.yaml").write_text(
+        json.dumps({"harness": {"claude-native": {"command": command}}})
+    )
+    if launch == "isaac-plugin":
+        monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
+    else:
+        monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch", lambda command, args: (command, args)
+    )
+    launches = _stub_picker(
         monkeypatch,
         [{"value": "gateway-opus", "resolvedModel": "gateway-opus", "displayName": "Opus"}],
         default="gateway-opus",
     )
-    # Managed-file rows alone cannot describe the CLI's availability decisions.
+    # Regular Claude retains its dynamic picker; Isaac reads its installed catalog.
     monkeypatch.setattr(
         "omnigent.onboarding.ambient.claude_managed_model_picker",
-        lambda: (("fable", "Fable"), ("gateway-opus", "Opus")),
+        lambda _paths: ClaudeManagedModelPicker(
+            options=(("fable", "Fable"), ("gateway-opus", "Opus"), ("gateway-opus", "Duplicate")),
+            disabled_models=("fable",),
+            default_model="gateway-opus",
+        ),
     )
     config = (
         claude_native.ClaudeNativeUcodeConfig(env={}, model="gateway-opus") if configured else None
@@ -443,6 +461,106 @@ async def test_catalog_uses_cli_managed_picker_for_every_launch_config(
     assert await claude_native.claude_model_catalog(config) == [
         {"id": "gateway-opus", "model": "gateway-opus", "displayName": "Opus", "isDefault": True}
     ]
+    assert len(launches) == (1 if launch == "claude" else 0)
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        (None, None),
+        ("{", None),
+        (json.dumps({"modelPicker": {"options": []}}), None),
+        (json.dumps({"modelPicker": {"replaceBuiltInOptions": True, "options": []}}), []),
+        (
+            json.dumps(
+                {
+                    "modelPicker": {
+                        "replaceBuiltInOptions": True,
+                        "options": [{"model": "gateway-opus", "disabled": True}],
+                    }
+                }
+            ),
+            [],
+        ),
+    ],
+    ids=["missing", "invalid", "additive", "empty", "disabled-only"],
+)
+async def test_isaac_catalog_never_launches_to_repair_managed_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contents: str | None, expected: object
+) -> None:
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    (config_home / "config.yaml").write_text(
+        json.dumps({"harness": {"claude-native": {"command": "isaac"}}})
+    )
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    path = tmp_path / "managed-settings.json"
+    if contents is not None:
+        path.write_text(contents)
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (path,))
+    launches = _stub_picker(monkeypatch, None, control_failure="exit", legacy_failure=True)
+
+    assert await claude_native.claude_launch_catalog(None) == expected
+    assert launches == []
+    assert claude_native.stored_claude_catalog_rows(None) == expected
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_isaac_catalog_refreshes_when_managed_picker_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, configured: bool
+) -> None:
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    (config_home / "config.yaml").write_text(
+        json.dumps({"harness": {"claude-native": {"command": "isaac"}}})
+    )
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    path = tmp_path / "managed-settings.json"
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (path,))
+    config = claude_native.ClaudeNativeUcodeConfig(env={}) if configured else None
+    launches = _stub_picker(monkeypatch, None, control_failure="exit", legacy_failure=True)
+    for model in ("gateway-original[1m]", "gateway-updated[1m]"):
+        path.write_text(
+            json.dumps(
+                {
+                    "modelPicker": {
+                        "replaceBuiltInOptions": True,
+                        "options": [{"model": model, "label": "Managed model"}],
+                    }
+                }
+            )
+        )
+        # No explicit default is known; the first option must not become one.
+        assert claude_native.stored_claude_catalog_rows(config) is None
+        expected = [{"id": model, "model": model, "displayName": "Managed model"}]
+        assert await claude_native.claude_launch_catalog(config) == expected
+        assert claude_native.stored_claude_catalog_rows(config) == expected
+        assert claude_native.stored_claude_picker_values(config) == [model]
+    assert launches == []
+
+
+async def test_isaac_mode_cannot_reuse_a_regular_claude_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    # A missing launcher plugin falls back to the same bare Claude command.
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch", lambda command, args: (command, args)
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_model_picker",
+        lambda _paths: ClaudeManagedModelPicker((("managed-model", "Managed model"),)),
+    )
+    launches = _stub_picker(monkeypatch, [{"value": "opus", "resolvedModel": "claude-opus-5"}])
+    assert await claude_native.claude_launch_catalog(None)
+    assert len(launches) == 1
+
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
+    assert claude_native.stored_claude_catalog_rows(None) is None
+    assert await claude_native.claude_launch_catalog(None) == [
+        {"id": "managed-model", "model": "managed-model", "displayName": "Managed model"}
+    ]
+    assert len(launches) == 1
 
 
 @pytest.mark.parametrize("failure", [None, "unsupported", "exit", "timeout"])
