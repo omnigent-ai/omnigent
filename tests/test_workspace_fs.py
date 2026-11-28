@@ -612,7 +612,7 @@ def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
 
     def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
-            return (0, '{"number": 3}', "")
+            return (0, '{"number": 3, "url": "https://github.com/o/r/pull/3"}', "")
         if tuple(argv[:1]) == ("api",):
             return (
                 0,
