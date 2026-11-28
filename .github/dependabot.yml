@@ -137,6 +137,8 @@ updates:
       prefix: "chore(deps)"
 
   # ── Container base images (deploy/*/Dockerfile*) ─────────────────────────
+  # Direct-download gh pins are handled by workflows/update-gh-cli.yml;
+  # see scripts/update-gh-cli.md for verification, cooldown and manual runs.
   - package-ecosystem: docker
     directories:
       - "/deploy/docker"
