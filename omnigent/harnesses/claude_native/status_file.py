@@ -449,6 +449,9 @@ class SessionStatusPoller:
         ended with a background agent still running. Claude stays ``busy``
         for that agent although its prompt is free, so such a ``busy`` reads
         as :data:`WAITING`. ``None`` reports every ``busy`` as running.
+    :param turn_ended: Returns whether Claude's last ``Stop`` still ends its
+        turn. Claude can stay ``busy`` after it with nothing left to wait on,
+        so such a ``busy`` reads as :data:`IDLE`. ``None`` reports it as running.
     """
 
     def __init__(
@@ -462,6 +465,7 @@ class SessionStatusPoller:
         on_replay: Callable[[str, str | None], None] | None = None,
         on_background: Callable[[bool], None] | None = None,
         background_agents_after_turn: Callable[[], bool] | None = None,
+        turn_ended: Callable[[], bool] | None = None,
     ) -> None:
         self._on_status = on_status
         self._on_replay = on_replay or on_status
@@ -474,6 +478,8 @@ class SessionStatusPoller:
         self._session_id_getter = session_id_getter
         self._background_agents_after_turn = background_agents_after_turn
         self._holding_background_agents = False
+        self._turn_ended = turn_ended
+        self._settled_after_turn = False
         # The Omnigent conversation id this poller watches — for debug-log
         # attribution only (distinct from Claude's session uuid above).
         self._omnigent_session_id = omnigent_session_id
@@ -670,6 +676,7 @@ class SessionStatusPoller:
                 self._last_status = None
                 self._last_edge = None
                 self._holding_background_agents = False
+                self._settled_after_turn = False
                 return
             # A read for the background signal alone does not observe the session's status.
             if publish_status and status != self._last_status:
@@ -681,15 +688,18 @@ class SessionStatusPoller:
                 self._publish_background(False)
         if not publish_status:
             return
+        busy = status.raw_status == "busy"
         holding = (
-            status.raw_status == "busy"
+            busy
             and self._background_agents_after_turn is not None
             and self._background_agents_after_turn()
         )
-        if holding != self._holding_background_agents:
+        settled = not holding and busy and self._turn_ended is not None and self._turn_ended()
+        if (holding, settled) != (self._holding_background_agents, self._settled_after_turn):
             self._observation_version += 1
         self._holding_background_agents = holding
-        runner_status = WAITING if holding else status.runner_status
+        self._settled_after_turn = settled
+        runner_status = WAITING if holding else IDLE if settled else status.runner_status
         edge = (runner_status, status.blocked_on)
         if edge == self._last_edge:
             if reassert:
