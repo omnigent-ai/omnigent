@@ -2005,6 +2005,48 @@ def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -
     )
 
 
+@pytest.mark.parametrize(
+    ("sdk_name", "recorded_name", "server_rule_matches"),
+    [
+        # A server Claude Code owns: the server is dropped from the stored name.
+        ("mcp__warehouse__execute_sql", "execute_sql", False),
+        # A spec-declared server runs through Omnigent's own MCP server.
+        ("mcp__omnigent__warehouse__execute_sql", "warehouse__execute_sql", True),
+    ],
+)
+def test_claude_sdk_mcp_tool_name_as_data_query_rules_see_it(
+    sdk_name: str, recorded_name: str, server_rule_matches: bool
+) -> None:
+    """A ``data_queries`` rule matches the name the adapter stores, not the SDK's."""
+    from omnigent.data_queries import classify_tool_call
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.spec.data_queries import parse_data_queries
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_test")
+    arguments = {"statement": "SELECT 1"}
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallRequest(
+            name=sdk_name,
+            args=arguments,
+            metadata={"call_id": "toolu_sql", "internally_executed": True},
+        ),
+        ctx,
+    )
+    stored_name = ctx.emitted[0].item["name"]
+    assert stored_name == recorded_name
+
+    def matches(mcp: dict[str, str]) -> bool:
+        spec = parse_data_queries(
+            {"rules": [{"name": "warehouse_sql", "mcp": mcp, "sql": {"argument": "statement"}}]}
+        )
+        return classify_tool_call(stored_name, arguments, spec=spec) is not None
+
+    assert matches({"tool": "execute_sql"})
+    assert matches({"server": "warehouse", "tool": "execute_sql"}) is server_rule_matches
+
+
 def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
     """A normal internally-handling executor's ``ToolCallComplete`` is
     suppressed mid-turn (its tools round-trip through dispatch_tool, which

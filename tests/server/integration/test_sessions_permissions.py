@@ -2330,7 +2330,7 @@ async def test_model_override_reset_requires_edit_access(
 async def test_get_session_items_with_read_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """A user with read access can GET session items; a user with no access gets 404."""
+    """Read access lists session items and their data queries; a stranger gets 404."""
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(auth_client, agent["id"], "bryan")
     session_id = s1["id"]
@@ -2367,6 +2367,14 @@ async def test_get_session_items_with_read_access(
         f"got {resp.status_code}. If 200, the permission check "
         f"on GET /items is missing."
     )
+
+    # The data-query classification of those items follows the same access.
+    for user, status in (("corey", 200), ("stranger", 404)):
+        resp = await auth_client.get(
+            f"/v1/sessions/{session_id}/data_queries",
+            headers={"X-Forwarded-Email": user},
+        )
+        assert resp.status_code == status, (user, resp.text)
 
 
 # ── SSE stream without permissions → 404 ───────────────────

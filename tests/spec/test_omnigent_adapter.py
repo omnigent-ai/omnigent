@@ -2627,6 +2627,24 @@ def test_compat_yaml_tool_groups_is_not_dropped(tmp_path: Path) -> None:
     assert spec.tool_groups.scheduled_tasks is True
 
 
+def test_compat_yaml_data_queries_reach_the_spec(tmp_path: Path) -> None:
+    """``data_queries:`` in a single-file YAML is parsed, not dropped, and kept strict."""
+    from omnigent.spec._omnigent_compat import load_omnigent_yaml
+
+    rule = {"name": "q", "mcp": {"tool": "run_sql"}, "sql": {"argument": "query"}}
+    yaml_path = _write_single_file_yaml(
+        tmp_path, {"data_queries": {"builtins": False, "rules": [rule]}}
+    )
+    data_queries = load_omnigent_yaml(yaml_path).data_queries
+    assert data_queries is not None
+    assert data_queries.builtins is False
+    assert [rule.name for rule in data_queries.rules] == ["q"]
+
+    typo_path = _write_single_file_yaml(tmp_path, {"data_queries": {"rule": [rule]}})
+    with pytest.raises(OmnigentError, match=r"unknown key\(s\) \['rule'\]"):
+        load(typo_path)
+
+
 def test_compat_yaml_tool_groups_typo_fails_the_load(tmp_path: Path) -> None:
     """A misspelled group fails through ``load()`` exactly as it does for a bundle."""
     yaml_path = _write_single_file_yaml(tmp_path, {"tool_groups": {"scheduled-tasks": False}})
