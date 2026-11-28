@@ -81,10 +81,11 @@ def test_composer_details_wrap_without_clipping(
             expect(page.locator('[aria-label^="Working directory:"]')).to_have_count(0)
         return
     expect(controls).to_be_visible(timeout=30_000)
-    expect(controls.get_by_role("button")).to_have_count(0)
+    # Only a bound working directory is interactive: it copies its path.
+    expect(controls.get_by_role("button")).to_have_count(1 if has_binding else 0)
     workspace = controls.get_by_test_id("composer-workspace-dir")
     workspace_title = (
-        f"Working directory: {_WORKSPACE}" if has_binding else "No working directory bound"
+        f"Copy working directory: {_WORKSPACE}" if has_binding else "No working directory bound"
     )
     _expect_tooltip_fits(page, workspace, workspace_title, viewport_width)
     if has_binding:
@@ -188,7 +189,8 @@ def test_composer_workspace_labels_use_available_width(
         )
         return
     expect(controls).to_be_visible(timeout=30_000)
-    expect(controls.get_by_role("button")).to_have_count(0)
+    # The bound working directory is the bar's only button: it copies its path.
+    expect(controls.get_by_role("button")).to_have_count(1)
     controls.screenshot(path=tmp_path / f"labels-{viewport_width}-{font_size}.png")
 
     # The bar shows the full names while they fit; once a name would have to
