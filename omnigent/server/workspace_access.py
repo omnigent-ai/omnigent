@@ -89,6 +89,7 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "DequeuePullRequest": WorkspaceGate.SESSION_OWNER,
     # The stack lists the repository's other pull requests, read as the host's account.
     "GetPullRequestStack": WorkspaceGate.SESSION_OWNER,
+    "GetPullRequestNativeStack": WorkspaceGate.SESSION_OWNER,
     # So does a branch's list, in the workspace's own repository.
     "ListBranchPullRequests": WorkspaceGate.SESSION_OWNER,
     # Read any pull request the host's account can see, so the owner can choose what to link.

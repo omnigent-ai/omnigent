@@ -47,3 +47,24 @@ def test_a_branch_list_at_the_limits_is_allowed(branch: str) -> None:
     refuse_unserved_request(
         "ListBranchPullRequests", pb.ListBranchPullRequestsRequest(branch=branch)
     )
+
+
+def test_a_native_stack_read_naming_an_overlong_url_is_refused() -> None:
+    url = "https://github.com/" + "x" * 2048
+
+    with pytest.raises(PullRequestRefused) as refused:
+        refuse_unserved_request(
+            "GetPullRequestNativeStack", pb.GetPullRequestNativeStackRequest(pr_url=url)
+        )
+
+    assert refused.value.code == Code.INVALID_ARGUMENT
+    assert refused.value.message == "The pull request URL is longer than 2048 characters"
+    assert refused.value.reason == INVALID_INPUT_REASON
+
+
+def test_a_native_stack_read_at_the_url_limit_is_allowed() -> None:
+    url = "https://github.com/" + "x" * (2048 - len("https://github.com/"))
+
+    refuse_unserved_request(
+        "GetPullRequestNativeStack", pb.GetPullRequestNativeStackRequest(pr_url=url)
+    )
