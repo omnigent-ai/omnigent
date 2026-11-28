@@ -69,7 +69,8 @@ export function thisServer(): string {
 const hasLocks = () => typeof navigator !== "undefined" && !!navigator.locks?.query;
 let tabLock: Promise<void> | null = null;
 // Page locks are per server, so a tab now on another server doesn't keep its requests here.
-const tabLockPrefix = () => `${TAB_LOCK_PREFIX}${thisServer()}#`;
+const tabLockName = (server: string, page: string) => `${TAB_LOCK_PREFIX}${server}#${page}`;
+const tabLockPrefix = () => tabLockName(thisServer(), "");
 
 /**
  * Hold this tab's lock for as long as it's open (the browser drops it when the tab goes).
@@ -119,15 +120,11 @@ async function exclusively<T>(task: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Tabs open on this server now (they hold their lock). */
+/** The page locks held now, on any server: each names an open tab (`tabLockName`). */
 async function openTabs(): Promise<Set<string>> {
-  const prefix = tabLockPrefix();
   const { held = [] } = await navigator.locks.query();
   return new Set(
-    held
-      .map((lock) => lock.name ?? "")
-      .filter((name) => name.startsWith(prefix))
-      .map((name) => name.slice(prefix.length)),
+    held.map((lock) => lock.name ?? "").filter((name) => name.startsWith(TAB_LOCK_PREFIX)),
   );
 }
 
@@ -250,9 +247,9 @@ export const SAVED_REQUEST_TTL_MS = 24 * 60 * 60_000;
 
 /**
  * The saved requests of `userId` on this server this tab may take back: its own, and those
- * of tabs now closed, except those of `held` (this page's own, still live). Another user's
- * for this server, and anyone's past SAVED_REQUEST_TTL_MS, are deleted: `userId` is the
- * server's answer to who is signed in, so they aren't left on a shared machine.
+ * of tabs now closed. Of the rest, another user's for this server and anyone's past
+ * SAVED_REQUEST_TTL_MS are deleted (`userId` is the server's answer to who is signed in, so
+ * they aren't left on a shared machine). A live page's, `held` here or an open tab's, stay.
  */
 export function adoptSavedRequests(
   userId: string,
@@ -261,8 +258,13 @@ export function adoptSavedRequests(
   return exclusively(async () => {
     await takeTabLock();
     const open = hasLocks() ? await openTabs() : null;
-    const free = (owner: string) => owner === tab || (open !== null && !open.has(owner));
     const server = thisServer();
+    // Held by a live page: this one's own, or another open tab's (any, without Web Locks).
+    // This tab is on this server, so it holds none of another server's.
+    const live = (record: SavedRequest) =>
+      record.page === tab
+        ? record.server === server && held.has(record.id)
+        : open === null || open.has(tabLockName(record.server, record.page));
     const objects = await store("readwrite");
     const adopted: SavedRequest[] = [];
     const reading = objects.getAll();
@@ -271,14 +273,14 @@ export function adoptSavedRequests(
       const all = reading.result as SavedRequest[];
       const expired = Date.now() - SAVED_REQUEST_TTL_MS;
       for (const record of all.sort((a, b) => a.savedAt - b.savedAt)) {
-        const mineHeld = record.page === tab && held.has(record.id);
+        // A live page's request is its own: neither dropped nor taken here.
+        if (live(record)) continue;
         const othersHere = record.server === server && record.userId !== userId;
-        if (!mineHeld && (record.savedAt < expired || othersHere)) {
+        if (record.savedAt < expired || othersHere) {
           objects.delete(record.id);
           continue;
         }
-        if (record.userId !== userId || record.server !== server || !free(record.page)) continue;
-        if (record.page === tab && held.has(record.id)) continue;
+        if (record.userId !== userId || record.server !== server) continue;
         const mine = { ...record, page: tab };
         firstSaved.set(mine.id, mine.savedAt);
         objects.put(mine);

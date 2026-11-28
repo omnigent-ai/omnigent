@@ -408,9 +408,13 @@ describe("design outbox storage", () => {
   it("without Web Locks, takes back only this tab's own requests", async () => {
     await putRecord(record({ id: "mine" }));
     await putRecord(record({ id: "another_tabs", page: "another_tab" }));
+    // It can't tell another page is closed, so what's expired or another user's stays too.
+    const old = Date.now() - SAVED_REQUEST_TTL_MS - 1;
+    await putRecord(record({ id: "another_old", page: "another_tab", savedAt: old }));
+    await putRecord(record({ id: "another_bobs", page: "another_tab", userId: "bob" }));
     await restoreSavedDesignRequests();
     expect(ids()).toEqual(["mine"]);
-    expect(await savedIds()).toEqual(["another_tabs", "mine"]);
+    expect(await savedIds()).toEqual(["another_bobs", "another_old", "another_tabs", "mine"]);
   });
 
   it("with Web Locks, takes a closed tab's requests and leaves an open one's", async () => {
@@ -445,12 +449,36 @@ describe("design outbox storage", () => {
   it("never takes or drops a request a live page holds: an open tab's, or this page's", async () => {
     installLocks(["open_tab"]);
     await putRecord(record({ id: "theirs", page: "open_tab" }));
+    // However old, or whoever's: that tab still shows them, and counts them as saved.
+    const old = Date.now() - SAVED_REQUEST_TTL_MS - 1;
+    await putRecord(record({ id: "theirs_old", page: "open_tab", savedAt: old }));
+    await putRecord(record({ id: "theirs_bobs", page: "open_tab", userId: "bob" }));
     // This page's own, which it queued and still holds.
     const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Long-lived" });
     await designOutboxSaved();
     await restoreSavedDesignRequests();
-    expect(await savedIds()).toEqual([id, "theirs"].sort());
+    expect(await savedIds()).toEqual([id, "theirs", "theirs_bobs", "theirs_old"].sort());
     expect(ids()).toEqual([id]);
+  });
+
+  it("leaves an expired request a live page holds on another server alone", async () => {
+    const elsewhere = "https://other.example/proxy/1";
+    installLocks(["open_tab"], elsewhere);
+    const old = Date.now() - SAVED_REQUEST_TTL_MS - 1;
+    await putRecord(
+      record({
+        id: "theirs_old",
+        page: "open_tab",
+        server: elsewhere,
+        userId: "bob",
+        savedAt: old,
+      }),
+    );
+    // The same page name on this server isn't held, so its expired record goes.
+    await putRecord(record({ id: "ours_old", page: "open_tab", savedAt: old }));
+    await restoreSavedDesignRequests();
+    expect(await savedIds()).toEqual(["theirs_old"]);
+    expect(ids()).toEqual([]);
   });
 
   it("saves a request queued before the user was known, once they are", async () => {
