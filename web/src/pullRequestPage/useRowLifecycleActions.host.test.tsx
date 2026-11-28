@@ -4,7 +4,7 @@
 
 import type * as SonnerModule from "sonner";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -31,6 +31,7 @@ vi.mock("@/lib/pullRequestRpc", async (importOriginal) => ({
   writePullRequestRpc: host.write,
 }));
 
+import { pullRequestRecordKey, sessionRecordOwner } from "@/lib/pullRequestRecord";
 import type { WorkspaceClient } from "@/lib/workspaceApi";
 
 import { resetLifecycleActionsForTests } from "./pullRequestLifecycleActions";
@@ -68,9 +69,12 @@ function row(pr: Partial<NonNullable<LifecycleRow["pr"]>> = {}): LifecycleRow {
 
 const listed = new Map<string, LifecycleRow>();
 
-async function renderRows(served: readonly string[]) {
+function newQueryClient() {
+  return new QueryClient({ defaultOptions: { queries: { retry: false } } });
+}
+
+async function renderRows(served: readonly string[], queryClient = newQueryClient()) {
   host.served = new Set(served);
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   );
@@ -113,6 +117,7 @@ beforeEach(() => {
   host.toast.mockReset();
 });
 afterEach(() => {
+  cleanup();
   resetPullRequestPageRoutesForTests();
   resetLifecycleActionsForTests();
   resetStateChainsForTests();
@@ -176,6 +181,41 @@ describe("a row's changes where the host serves them", () => {
     act(() => disable!.run());
     await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1));
     await expect(sent()).resolves.toEqual([["disableAutoMerge", { prUrl: PR }]]);
+  });
+});
+
+describe("turning auto-merge on from a row", () => {
+  it("asks even where the repository allows one method, and Cancel sends nothing", async () => {
+    const queryClient = newQueryClient();
+    queryClient.setQueryData(
+      pullRequestRecordKey("pr-page-github-merge-options", PR, sessionRecordOwner(SESSION)),
+      {
+        object: "session.github.merge_options",
+        methods: ["squash"],
+        default: "squash",
+        merge_queue: false,
+        merge_state_status: "BLOCKED",
+        auto_merge: null,
+      },
+    );
+    const view = await renderRows([...READS, "EnableAutoMerge"], queryClient);
+    const enable = actionsOf(view, row()).find(
+      (action) => action.id === "lifecycle:enable_auto_merge",
+    );
+    expect(enable?.href).toBeUndefined();
+    act(() => enable!.run());
+    render(
+      <QueryClientProvider client={queryClient}>
+        {view.result.current.rows.dialog}
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Turn on auto-merge for #42?")).toBeTruthy();
+    expect(screen.getByText(/using “Squash and merge”/)).toBeTruthy();
+    expect(host.write).not.toHaveBeenCalled();
+    act(() => screen.getByRole("button", { name: "Cancel" }).click());
+    await waitFor(() => expect(view.result.current.rows.dialog).toBeNull());
+    expect(host.write).not.toHaveBeenCalled();
   });
 });
 

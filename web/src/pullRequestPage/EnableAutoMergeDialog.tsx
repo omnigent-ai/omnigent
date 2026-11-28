@@ -1,8 +1,8 @@
-// Turning auto-merge on is confirmed once, by main's own sheet on this Mac. Before it, the PR page
-// and a list row only ask how it should merge where the repository allows more than one way; a
-// row reads this Mac's merge options first, and says why where it can't be turned on.
+// Turning auto-merge on is always confirmed here, since nothing asks again before it's sent. The
+// question also asks how it should merge where the repository allows more than one way; a row
+// reads this Mac's merge options first, and says why where it can't be turned on.
 
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -33,8 +33,8 @@ import { lifecycleAvailability, MERGEABLE_NOW_MESSAGE } from "./pullRequestLifec
 import { focusOnOpen } from "./dialogFocus";
 
 /**
- * The method to turn auto-merge on with, pinned to `headSha`: chosen here where the repository
- * allows several, and passed straight on where it allows one. main's sheet then confirms it.
+ * Asks before turning auto-merge on, pinned to `headSha`, with the method chosen here where the
+ * repository allows several and named where it allows one.
  */
 export function EnableAutoMergeDialog({
   number,
@@ -53,47 +53,43 @@ export function EnableAutoMergeDialog({
 }) {
   const [method, setMethod] = useState<PullRequestMergeMethod | null>(initialMethod);
   const cancelRef = useRef<HTMLButtonElement>(null);
-  // One way to merge leaves nothing to choose: main's sheet is the only question asked.
-  const only = methods.length === 1 && headSha ? methods[0]! : null;
-  const passedOn = useRef(false);
-  useEffect(() => {
-    if (!only || passedOn.current) return;
-    passedOn.current = true;
-    onConfirm(only);
-  }, [only, onConfirm]);
-  if (only) return null;
+  // One way to merge leaves nothing to choose, but turning it on is still asked.
+  const only = methods.length === 1 ? methods[0]! : null;
+  const chosen = only ?? method;
   return (
     <Dialog open onOpenChange={(next) => !next && onCancel()}>
       <DialogContent onOpenAutoFocus={focusOnOpen(cancelRef)}>
         <DialogHeader>
-          <DialogTitle>Choose how #{number} merges</DialogTitle>
+          <DialogTitle>Turn on auto-merge for #{number}?</DialogTitle>
           <DialogDescription>
             Auto-merge is turned on only if the branch is still at{" "}
-            <code>{headSha.slice(0, 7)}</code>. GitHub then merges it this way once its required
-            checks and reviews pass. You confirm it next.
+            <code>{headSha.slice(0, 7)}</code>. GitHub then merges it once its required checks and
+            reviews pass{only ? `, using “${MERGE_METHOD_LABELS[only]}”` : ", the way you choose"}.
           </DialogDescription>
         </DialogHeader>
-        <Select
-          value={method ?? undefined}
-          onValueChange={(value) => setMethod(value as PullRequestMergeMethod)}
-        >
-          <SelectTrigger aria-label="Merge method" className="h-8 w-full text-ui">
-            <SelectValue placeholder="Merge method" />
-          </SelectTrigger>
-          <SelectContent>
-            {methods.map((value) => (
-              <SelectItem key={value} value={value}>
-                {MERGE_METHOD_LABELS[value]}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {!only && (
+          <Select
+            value={method ?? undefined}
+            onValueChange={(value) => setMethod(value as PullRequestMergeMethod)}
+          >
+            <SelectTrigger aria-label="Merge method" className="h-8 w-full text-ui">
+              <SelectValue placeholder="Merge method" />
+            </SelectTrigger>
+            <SelectContent>
+              {methods.map((value) => (
+                <SelectItem key={value} value={value}>
+                  {MERGE_METHOD_LABELS[value]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
         <DialogFooter>
           <Button ref={cancelRef} variant="outline" onClick={onCancel}>
             Cancel
           </Button>
-          <Button disabled={!method || !headSha} onClick={() => method && onConfirm(method)}>
-            Continue…
+          <Button disabled={!chosen || !headSha} onClick={() => chosen && onConfirm(chosen)}>
+            Turn On Auto-merge
           </Button>
         </DialogFooter>
       </DialogContent>
