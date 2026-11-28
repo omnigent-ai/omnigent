@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
@@ -490,6 +491,73 @@ async def test_goal_read_forwards_to_a_live_codex_backend(
     assert response.status_code == 200, response.text
     assert response.json() == {"goal": None, "available": True}
     assert ("thread/goal/get", {"threadId": session.codex.thread_id}) in session.codex.requests
+    assert session.codex.launches == 1
+
+
+@pytest.mark.parametrize("metadata", ["state.json", "startup_error.json"])
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "pane", "backend"])
+async def test_goal_read_keeps_runner_responsive_during_inactive_check(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    metadata: str,
+    outcome: str,
+) -> None:
+    session = native_session
+    await session.reap(clear_bridge=False)
+    refused = threading.Event()
+    reading = threading.Event()
+    release = threading.Event()
+    safety_released = threading.Event()
+    target = session.codex.bridge_dir / metadata
+    stat = Path.stat
+
+    async def refuse_connect(_rpc: app_server.CodexAppServerClient) -> None:
+        refused.set()
+        raise ConnectionRefusedError("The idle listener is closed")
+
+    def held_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == target and refused.is_set():
+            reading.set()
+            if not release.wait(budget(5)):
+                safety_released.set()
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_server.CodexAppServerClient, "connect", refuse_connect)
+    monkeypatch.setattr(Path, "stat", held_stat)
+    pending = asyncio.create_task(client.get(f"/v1/sessions/{session.session_id}/codex_goal"))
+    try:
+        await poll_until_async(reading.is_set, timeout_s=budget(2))
+        health = await asyncio.wait_for(session.runner.get("/health"), timeout=budget(2))
+        assert health.status_code == 200
+        assert not safety_released.is_set(), "metadata reads blocked the runner event loop"
+        assert not pending.done()
+        if outcome == "cancel":
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=budget(2))
+        elif outcome == "pane":
+            session.terminals._by_conversation[session.session_id] = {
+                ("codex", "main"): make_test_terminal_instance("codex", "main", tmp_path)
+            }
+        elif outcome == "backend":
+            native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] = SimpleNamespace(
+                close=AsyncMock()
+            )
+        release.set()
+        if outcome != "cancel":
+            response = await asyncio.wait_for(pending, timeout=budget(2))
+            assert response.status_code == (200 if outcome == "complete" else 503), response.text
+            if outcome == "complete":
+                assert response.json() == {"goal": None, "available": False}
+            else:
+                assert response.json()["error"] == "codex_native_goal_failed"
+    finally:
+        release.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+    assert session.codex.requests == []
     assert session.codex.launches == 1
 
 

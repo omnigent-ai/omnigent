@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -54,7 +54,7 @@ def _make_runner(
     ),
     *,
     safe_detail: str = "safe detail",
-    bridge_is_inactive: Callable[[str, object], bool] | None = None,
+    bridge_is_inactive: Callable[[str, object], Awaitable[bool]] | None = None,
 ) -> CodexGoalRunner:
     async def _bridge_state_for_session(
         conv_id: str,
@@ -276,7 +276,7 @@ async def test_inactive_bridge_only_changes_read_connection_refusal(
         "omnigent.harnesses.codex_native.app_server",
         SimpleNamespace(client_for_transport=lambda *_args, **_kwargs: fake_client),
     )
-    runner = _make_runner(bridge_is_inactive=lambda _conv_id, _state: True)
+    runner = _make_runner(bridge_is_inactive=AsyncMock(return_value=True))
 
     result = await runner._request(
         "conv_1", action="read", method=method, params={}, require_live=require_live
