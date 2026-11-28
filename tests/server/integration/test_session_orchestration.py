@@ -2770,6 +2770,7 @@ async def test_same_host_creation_across_replicas(
         assert stack.conv_store.get_conversation(manager["id"]).host_id is None
     before = {s.id for s in stack.conv_store.list_conversations().data}
     launches = []
+    uncertain_create = routing in {"wrong_replica", "disconnect", "offline"}
 
     def answer_host(connection, payload):
         frame = decode_host_frame(payload)
@@ -2835,24 +2836,13 @@ async def test_same_host_creation_across_replicas(
                     conversation_id=manager["id"],
                 )
             )
-            workers = [s for s in listing["sessions"] if s["title"] == result["title"]]
-            assert len(workers) == 1
-            recovered = json.loads(
-                await execute_tool(
-                    tool_name="sys_session_get_info",
-                    arguments=json.dumps({"session_id": workers[0]["session_id"]}),
-                    server_client=client,
-                    conversation_id=manager["id"],
-                )
-            )
-            assert recovered["agent_id"] == result["agent_id"]
-            assert recovered["host_id"] == host_id
+            assert [s for s in listing["sessions"] if s["title"] == result["title"]] == []
     created = {s.id for s in stack.conv_store.list_conversations().data} - before
     assert len(posts) == 1
-    if routing in {"wrong_replica", "disconnect", "offline"}:
+    if uncertain_create:
         assert "do not automatically retry" in result["error"], result
         assert posts == [(host_id, 409 if routing == "offline" else 400)]
-        assert len(created) == (0 if routing == "wrong_replica" else 1)
+        assert not created
         assert launches == []
     else:
         assert "error" not in result, result
@@ -3466,14 +3456,26 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     assert not snapshot["family"]["pinned"]
 
 
-@pytest.mark.parametrize("scenario", ["allowed", "foreign_host", "restricted", "shared_source"])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "allowed",
+        "foreign_host",
+        "restricted",
+        "shared_source",
+        "launch_refused",
+        "bound_during_rollback",
+    ],
+)
 @pytest.mark.parametrize("nested", [False, True])
 async def test_scripted_host_worktree_respects_ownership_and_policy(
     auth_client, auth_app, peers, db_uri, monkeypatch, scenario, nested
 ):
+    from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.host.frames import (
         HostCreateWorktreeFrame,
         HostLaunchRunnerFrame,
+        HostRemoveWorktreeFrame,
         HostStatFrame,
         decode_host_frame,
     )
@@ -3517,10 +3519,27 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
             )
         elif isinstance(frame, HostLaunchRunnerFrame):
             connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        elif isinstance(frame, HostRemoveWorktreeFrame):
+            connection.pending_remove_worktrees[frame.request_id].set_result({"status": "ok"})
         else:
             pytest.fail(f"Unexpected host frame: {frame}")
 
     monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    if scenario in {"launch_refused", "bound_during_rollback"}:
+
+        async def refuse_launch(*_args, **_kwargs):
+            raise OmnigentError("Host runtime is too old", code=ErrorCode.CONFLICT)
+
+        monkeypatch.setattr(auth_app.state.host_registry, "admit_launch", refuse_launch)
+    if scenario == "bound_during_rollback":
+        delete_conversation = SqlAlchemyConversationStore.delete_conversation
+
+        async def bind_before_delete(conversation_store, conversation_id, **kwargs):
+            # Another request binds the session after the rollback has read it.
+            assert store.set_runner_id(conversation_id, "runner_concurrent")
+            return await delete_conversation(conversation_store, conversation_id, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "delete_conversation", bind_before_delete)
     before = {s.id for s in store.list_conversations().data}
     result = json.loads(
         await execute_tool(
@@ -3540,8 +3559,22 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
     )
     if scenario != "allowed":
         assert "error" in result, result
-        assert {s.id for s in store.list_conversations().data} == before
-        assert not frames
+        created = {s.id for s in store.list_conversations().data} - before
+        removed = [
+            (f.worktree_path, f.branch, f.delete_branch)
+            for f in frames
+            if isinstance(f, HostRemoveWorktreeFrame)
+        ]
+        assert not any(isinstance(f, HostLaunchRunnerFrame) for f in frames)
+        if scenario == "bound_during_rollback":
+            assert [store.get_conversation(c).runner_id for c in created] == ["runner_concurrent"]
+            assert removed == []
+        elif scenario == "launch_refused":
+            assert not created
+            assert removed == [("/repos/review", "review", True)]
+        else:
+            assert not created
+            assert not frames
         return
     assert "error" not in result, result
     created = store.get_conversation(result["conversation_id"])

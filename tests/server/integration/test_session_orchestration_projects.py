@@ -401,6 +401,73 @@ async def test_same_host_worker_in_a_named_project_starts_no_worktree(
     assert worker.git_branch is None
 
 
+async def test_a_refused_host_launch_removes_the_project_worktree(
+    auth_client, auth_app, db_uri, monkeypatch
+):
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.host.frames import (
+        HostCreateWorktreeFrame,
+        HostRemoveWorktreeFrame,
+        HostStatFrame,
+        decode_host_frame,
+    )
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    source = await _create_session_as(auth_client, "", "alice")
+    project = await _project(
+        auth_client, "Review", {"git": {"branch_name": "review", "base_branch": "main"}}
+    )
+    auth_app.state.feature_flags = FeatureFlags(
+        auth_app.state.feature_flags.enabled_features | {Feature.SCRIPTED_SESSIONS}
+    )
+    host_id = "b" * 32
+    _register_online_host(auth_app, host_id, "alice")
+    removed = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostCreateWorktreeFrame):
+            connection.pending_create_worktrees[frame.request_id].set_result(
+                {"status": "ok", "worktree_path": "/repos/review", "branch": frame.branch_name}
+            )
+        elif isinstance(frame, HostRemoveWorktreeFrame):
+            removed.append((frame.worktree_path, frame.branch, frame.delete_branch))
+            connection.pending_remove_worktrees[frame.request_id].set_result({"status": "ok"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    async def refuse_launch(*_args, **_kwargs):
+        raise OmnigentError("Host runtime is too old", code=ErrorCode.CONFLICT)
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    monkeypatch.setattr(auth_app.state.host_registry, "admit_launch", refuse_launch)
+    auth_client.headers.update(_bind_runner(db_uri, source["id"]))
+    store = SqlAlchemyConversationStore(db_uri)
+    before = {session.id for session in store.list_conversations().data}
+
+    # Git is omitted, so the worktree comes from the project's saved settings.
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated/host",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={
+            "agent_id": source["agent_id"],
+            "host_id": host_id,
+            "workspace": "/repos/example",
+            "project_id": project,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert {session.id for session in store.list_conversations().data} == before
+    assert removed == [("/repos/review", "review", True)]
+
+
 @_NESTED_ONLY
 async def test_the_tool_nests_a_worker_named_into_its_source_project(
     auth_client, auth_app, db_uri, monkeypatch
