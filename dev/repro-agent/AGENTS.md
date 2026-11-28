@@ -685,7 +685,10 @@ Follow these rules for each clip:
 - **Caption the screen from screen evidence.** Check that claimed elements are
   in view and unobstructed, and quote only visibly rendered text. DOM attributes,
   hidden accessibility labels and backend logs are not screen evidence. Disclose
-  unavailable frame inspection and limit claims to verified states. An absence
+  unavailable frame inspection and limit claims to verified states. A DOM,
+  layout or pixel probe verifies only what it measured: caption the measurement
+  ("the overlay text sits 8px below the caret"), not a symptom the frames were
+  not seen to show ("typed text never appears"). An absence
   check covers only the element it targets: name the checked element, as in
   "the chat pane shows no working indicator" after checking only the chat pane,
   unless every place showing that state was checked. Follow
