@@ -40,7 +40,18 @@ export function SharedGadgetTemplates({
   // A gadget made whose next step (showing it beside a session) failed: trying again goes on
   // from it instead of making another.
   const [made, setMade] = useState<{ shareId: string; gadget: Gadget } | null>(null);
-  if (!enabled || !shares.data?.length) return null;
+  if (!enabled) return null;
+  if (shares.isError && !shares.data) {
+    // Not the same as none shared: say so, and let the viewer try again.
+    return (
+      <GadgetErrorNotice
+        title="Couldn’t load the templates shared with you"
+        error={shares.error}
+        onRetry={() => void shares.refetch()}
+      />
+    );
+  }
+  if (!shares.data?.length) return null;
 
   const create = async (share: GadgetTemplateShare) => {
     if (creating !== null) return;

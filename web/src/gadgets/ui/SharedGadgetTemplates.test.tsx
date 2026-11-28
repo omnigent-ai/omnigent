@@ -40,6 +40,17 @@ describe("templates shared with the viewer", () => {
     expect(await screen.findByText(/Template unpublished/)).toBeInTheDocument();
   });
 
+  it("says when the templates couldn't be loaded, and loads them on retry", async () => {
+    vi.mocked(listGadgetTemplateShares)
+      .mockRejectedValueOnce(new Error("Server unavailable."))
+      .mockResolvedValueOnce([COURSE]);
+    renderWithGadgets(<SharedGadgetTemplates onCreated={vi.fn()} />);
+
+    expect(await screen.findByText(/Server unavailable/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /try again|retry/i }));
+    expect(await screen.findByRole("button", { name: "Onboarding course" })).toBeInTheDocument();
+  });
+
   it("isn't shown where the server doesn't share gadgets, or nothing is shared", async () => {
     vi.mocked(listGadgetTemplateShares).mockResolvedValue([COURSE]);
     for (const info of [
