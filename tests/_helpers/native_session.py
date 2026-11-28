@@ -21,6 +21,7 @@ from omnigent._wrapper_labels import (
     GOOSE_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
     KIRO_NATIVE_WRAPPER_VALUE,
+    PI_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
@@ -28,7 +29,9 @@ from omnigent._wrapper_labels import (
 from omnigent.process_logging import redact_log_text
 from tests._helpers.session import bundle_files, post_session_bundle
 
-NativeHarness = Literal["antigravity", "claude", "codex", "cursor", "goose", "kiro", "hermes"]
+NativeHarness = Literal[
+    "antigravity", "claude", "codex", "cursor", "goose", "kiro", "hermes", "pi"
+]
 
 _SENSITIVE_RESPONSE_KEY_PATTERN = re.compile(
     r"authorization|token|secret|password|passwd|passphrase|credential|cookie"
@@ -131,6 +134,11 @@ def create_native_session(
 
             spec = _materialize_hermes_agent_spec(Path(tmp))
             wrapper = HERMES_NATIVE_WRAPPER_VALUE
+        elif harness == "pi":
+            from omnigent.harnesses.pi_native.main import _materialize_pi_agent_spec
+
+            spec = _materialize_pi_agent_spec(Path(tmp))
+            wrapper = PI_NATIVE_WRAPPER_VALUE
         else:
             raise ValueError(f"Unsupported native harness: {harness}")
         if instructions is None:
