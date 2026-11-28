@@ -112,6 +112,13 @@ _harness_parked_elicitations: WorkspaceScopedCache[str, _ParkedHarnessElicitatio
     WorkspaceScopedCache()
 )
 
+# Maps ``(session_id, elicitation_id)`` to the state of a wait that ended without
+# an answer while its card is kept for the re-park grace. Popped on re-park or
+# clear. Session-keyed so another session reusing the id cannot strand this card.
+_harness_severed_elicitations: WorkspaceScopedCache[tuple[str, str], _ParkedHarnessElicitation] = (
+    WorkspaceScopedCache()
+)
+
 # Maps deterministic ``elicitation_id`` values to the session that
 # resolved them before the harness hook registered its parked wait. The
 # hook consumes the tombstone at registration time, which closes the
@@ -126,7 +133,7 @@ def reset_for_tests() -> None:
     """
     Clear every elicitation registry. For test isolation only.
 
-    The four registries are module-global and keyed by
+    The registries are module-global and keyed by
     ``elicitation_id``, so entries left behind by one test (a severed
     long-poll, an unresolved prompt, a pre-resolved tombstone) are
     visible to every later test in the same worker process. Mirrors
@@ -136,6 +143,7 @@ def reset_for_tests() -> None:
     _harness_elicitation_registry.clear()
     _harness_elicitation_owners.clear()
     _harness_parked_elicitations.clear()
+    _harness_severed_elicitations.clear()
     _harness_pre_resolved_elicitations.clear()
 
 
@@ -146,4 +154,5 @@ __all__ = [
     "_harness_elicitation_registry",
     "_harness_parked_elicitations",
     "_harness_pre_resolved_elicitations",
+    "_harness_severed_elicitations",
 ]
