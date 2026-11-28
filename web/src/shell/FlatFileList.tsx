@@ -26,6 +26,8 @@ import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 export type { ChangedSort } from "@/lib/changedSort";
 import type { ChangedSort } from "@/lib/changedSort";
 
+type ChangedStageFilter = "all" | "staged" | "unstaged";
+
 function fileExtension(name: string): string {
   const dot = name.lastIndexOf(".");
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
@@ -88,6 +90,71 @@ export function groupChangedFiles(files: WorkspaceChangedFile[], sort: ChangedSo
 
 function normalizeSearchQuery(query: string): string {
   return query.trim().toLowerCase();
+}
+
+const STAGE_FILTERS: { value: ChangedStageFilter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "staged", label: "Staged" },
+  { value: "unstaged", label: "Unstaged" },
+];
+
+function stageChangeLabel(filter: ChangedStageFilter): string {
+  if (filter === "staged") return "staged changes";
+  if (filter === "unstaged") return "unstaged changes";
+  return "changes";
+}
+
+function stageFileLabel(filter: ChangedStageFilter): string {
+  if (filter === "staged") return "staged files";
+  if (filter === "unstaged") return "unstaged files";
+  return "changed files";
+}
+
+function ChangedStageFilterControl({
+  value,
+  onChange,
+}: {
+  value: ChangedStageFilter;
+  onChange: (next: ChangedStageFilter) => void;
+}) {
+  const pill =
+    "flex cursor-pointer items-center rounded-full px-2.5 py-[2px] text-[12px] font-medium leading-5 transition-colors";
+  const activePill =
+    "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground";
+  const idlePill = "text-muted-foreground hover:text-foreground";
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Change stage"
+      className="mb-1 flex items-center gap-1 px-0.5"
+    >
+      {STAGE_FILTERS.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          role="radio"
+          aria-checked={value === option.value}
+          aria-label={option.label}
+          onClick={() => onChange(option.value)}
+          className={cn(pill, value === option.value ? activePill : idlePill)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function supportsStageFiltering(files: WorkspaceChangedFile[]): boolean {
+  return files.some(
+    (file) => typeof file.staged === "boolean" || typeof file.unstaged === "boolean",
+  );
+}
+
+function matchesStageFilter(file: WorkspaceChangedFile, filter: ChangedStageFilter): boolean {
+  if (filter === "staged") return file.staged === true;
+  if (filter === "unstaged") return file.unstaged === true;
+  return true;
 }
 
 // Space between rows, in px (Tailwind `gap-0.5`).
@@ -311,17 +378,25 @@ export function FlatFileList({
    */
   scrollParentRef?: RefObject<HTMLElement | null>;
 }) {
+  const [stageFilter, setStageFilter] = useState<ChangedStageFilter>("all");
   const ownScrollRef = useRef<HTMLDivElement>(null);
   const scrollElementRef = scrollParentRef ?? ownScrollRef;
   const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
+  const canFilterByStage = useMemo(() => supportsStageFiltering(files ?? []), [files]);
+  const stageFilteredFiles = useMemo(() => {
+    const allFiles = files ?? [];
+    return canFilterByStage
+      ? allFiles.filter((file) => matchesStageFilter(file, stageFilter))
+      : allFiles;
+  }, [files, canFilterByStage, stageFilter]);
   // Memoized so a re-render with unchanged files (a refetch, a store tick)
   // doesn't refilter and re-sort a list that can hold thousands of rows.
   const visibleFiles = useMemo(
     () =>
-      (files ?? []).filter(
+      stageFilteredFiles.filter(
         (f) => showHidden || !f.path.split("/").some((seg) => seg.startsWith(".")),
       ),
-    [files, showHidden],
+    [stageFilteredFiles, showHidden],
   );
   const sortedGroups = useMemo(() => groupChangedFiles(visibleFiles, sort), [visibleFiles, sort]);
   // Filtering keeps the sorted order, so typing a search never re-sorts.
@@ -363,30 +438,51 @@ export function FlatFileList({
     return <p className="px-2 py-1 text-muted-foreground text-sm">No workspace changes yet</p>;
   }
   const grouped = files.some((file) => file.repository_root);
-  const hiddenCount = files.length - visibleFiles.length;
+  const hiddenCount = stageFilteredFiles.length - visibleFiles.length;
+  const stageControl = canFilterByStage ? (
+    <ChangedStageFilterControl value={stageFilter} onChange={setStageFilter} />
+  ) : null;
+  const stageChange = stageChangeLabel(stageFilter);
+  const stageFiles = stageFileLabel(stageFilter);
+
+  if (stageFilteredFiles.length === 0) {
+    return (
+      <>
+        {stageControl}
+        <p className="px-2 py-1 text-muted-foreground text-sm">No {stageChange}</p>
+      </>
+    );
+  }
   if (visibleFiles.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-sm">
-        All changes are in hidden files.{" "}
-        <button
-          type="button"
-          className="cursor-pointer underline hover:text-foreground"
-          onClick={onShowHidden}
-        >
-          Click to show
-        </button>
-      </p>
+      <>
+        {stageControl}
+        <p className="px-2 py-1 text-muted-foreground text-sm">
+          All {stageChange} are in hidden files.{" "}
+          <button
+            type="button"
+            className="cursor-pointer underline hover:text-foreground"
+            onClick={onShowHidden}
+          >
+            Click to show
+          </button>
+        </p>
+      </>
     );
   }
   if (groups.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-sm">
-        No changed files match "{searchQuery.trim()}"
-      </p>
+      <>
+        {stageControl}
+        <p className="px-2 py-1 text-muted-foreground text-sm">
+          No {stageFiles} match "{searchQuery.trim()}"
+        </p>
+      </>
     );
   }
   const list = (
     <>
+      {stageControl}
       {hiddenCount > 0 && (
         <p className="px-2 py-1 text-muted-foreground text-sm">
           {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden.{" "}
