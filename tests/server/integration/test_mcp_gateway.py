@@ -80,6 +80,8 @@ def policy(monkeypatch, call_action=PolicyAction.ALLOW, result_action=PolicyActi
         )
 
     monkeypatch.setattr(orchestration, "_evaluate_policy_with_fresh_engine", evaluate)
+    # The stub verdicts stand in for a session that has policies.
+    monkeypatch.setattr(orchestration, "any_policies_apply", lambda **_: True)
     return seen
 
 
