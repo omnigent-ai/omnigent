@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from connectrpc.code import Code
@@ -1008,6 +1010,39 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
         _git(root, "update-ref", "-d", "refs/remotes/fork/next")
         _git(root, "update-ref", "refs/remotes/refs/remotes/fork/next", fork_next)
     _push_upstream(root, "fork", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "origin/main"
+    assert response.base.base == main
+
+
+async def test_a_deleted_start_isnt_found_under_another_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a case-insensitive filesystem a deleted ``fork/next`` still opens as ``fork/Next``."""
+    root, main, _fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _write(root / "feature.txt", "feature\n")
+    _commit(root, "feature")
+    _push_upstream(root, "fork", "feature")
+    _git(root, "update-ref", "-d", "refs/remotes/fork/next")
+    _git(root, "update-ref", "refs/remotes/fork/Next", _head(root))
+    # As there: a loose ref read by its path answers for the other spelling, while Git's
+    # listing of refs still spells it as it is.
+    run_unchecked = runner.GitRepository.run_unchecked
+
+    async def case_insensitive(
+        self: runner.GitRepository, arguments: Sequence[str], **options: Any
+    ) -> runner.GitOutput:
+        if arguments and arguments[0] != "for-each-ref":
+            arguments = [
+                argument.replace("refs/remotes/fork/next", "refs/remotes/fork/Next")
+                for argument in arguments
+            ]
+        return await run_unchecked(self, arguments, **options)
+
+    monkeypatch.setattr(runner.GitRepository, "run_unchecked", case_insensitive)
 
     response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
     assert _unavailable_problem(response) is None

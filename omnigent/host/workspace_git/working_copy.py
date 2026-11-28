@@ -365,10 +365,10 @@ async def _remote_start_point(
     """The remote branch ``branch_ref`` was created from, by its oldest reflog entry, or None.
 
     The recorded start counts only as exactly ``<remote>/<name>``: ``<remote>`` one of
-    ``remotes``, ``<name>`` neither ``HEAD`` nor the branch's own name, and that exact
-    remote-tracking ref still there with no ref, tag or local branch of the same name. Anything
-    else, such as a commit, a tag, a local branch, a qualified, deleted or shadowed name or an
-    expression, or a reflog that's off or expired, is None.
+    ``remotes``, ``<name>`` neither ``HEAD`` nor the branch's own name, and Git listing that
+    exact remote-tracking ref, spelled the same, with no ref, tag or local branch of that name.
+    Anything else, such as a commit, a tag, a local branch, a qualified, deleted or shadowed name
+    or an expression, or a reflog that's off or expired, is None.
     """
     # Only the oldest entry is read, so a long-lived branch's reflog stays within the output cap.
     counted = await repository.run_unchecked(
@@ -409,19 +409,21 @@ async def _remote_start_point(
         or candidate in own_copies
     ):
         return None
-    # That exact ref, with none of Git's lookup prefixes, still there and a commit.
-    exact = await repository.run_unchecked(
-        ["show-ref", "--verify", "--quiet", candidate], deadline=deadline
-    )
-    if not exact.success or await verify_commit(repository, candidate, deadline) is None:
-        return None
-    # Nothing else Git could have read the name as when the branch was created: a ref, tag or
-    # local branch of that name makes the recorded start ambiguous.
+    # The refs of exactly these names, as Git lists them. A lookup by path would also find
+    # ``fork/Next`` for ``fork/next`` on a case-insensitive filesystem; a listing doesn't.
     shadows = {f"refs/{start}", f"refs/tags/{start}", f"refs/heads/{start}"}
     listed = await repository.run_unchecked(
-        ["for-each-ref", "--format=%(refname)", "--", *sorted(shadows)], deadline=deadline
+        ["for-each-ref", "--format=%(refname)", "--", candidate, *sorted(shadows)],
+        deadline=deadline,
     )
-    if not listed.success or shadows & set(listed.stdout.decode("utf-8", "replace").split("\n")):
+    names = set(listed.stdout.decode("utf-8", "replace").split("\n")) if listed.success else set()
+    # That exact remote-tracking ref still there, and nothing else Git could have read the name
+    # as when the branch was created: a ref, tag or local branch of that name.
+    if (
+        candidate not in names
+        or shadows & names
+        or await verify_commit(repository, candidate, deadline) is None
+    ):
         return None
     return candidate
 
