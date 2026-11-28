@@ -484,7 +484,8 @@ def _owner_repo_from_url(url: str | None) -> str | None:
     if not url:
         return None
     candidate = url.strip()
-    scp = re.match(r"^[\w.\-]+@[\w.\-]+:(?P<path>.+)$", candidate)
+    # scp-style, with or without a user: ``git@host:o/r`` or ``host:o/r``.
+    scp = re.match(r"^(?:[\w.\-]+@)?[\w.\-]+:(?!//)(?P<path>.+)$", candidate)
     if scp:
         path = scp.group("path")
     else:
@@ -1041,7 +1042,8 @@ def _commit_lookup_repo(root: str) -> str | None:
 def _commit_lookup_host(root: str) -> str | None:
     """The host of the remote the branch was pushed to, which ``gh api`` must be told."""
     rc, url, _ = _git(["remote", "get-url", _commit_lookup_remote(root)], cwd=root)
-    return host_of(url.strip()) if rc == 0 else None
+    # Read as the checkout's host is, so ``host:o/r`` counts; a local path names none.
+    return (_remote_host(url.strip()) or None) if rc == 0 else None
 
 
 def _commit_lookup_remote(root: str) -> str:

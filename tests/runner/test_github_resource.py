@@ -1598,6 +1598,7 @@ def test_github_compare_failure_is_not_an_empty_success(monkeypatch: pytest.Monk
         ("https://github.com/acme/repo", "acme/repo"),
         ("https://user@github.com/acme/repo.git", "acme/repo"),
         ("git@github.com:alice/repo.git", "alice/repo"),
+        ("github.com:alice/repo.git", "alice/repo"),
         ("ssh://git@github.com/acme/repo.git", "acme/repo"),
         ("not a url", None),
         ("", None),

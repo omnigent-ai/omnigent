@@ -584,10 +584,13 @@ def test_github_coms_token_never_follows_a_call_gh_sends_to_the_one_stored_host(
         assert (rc, started) == (1, [])
 
 
+@pytest.mark.parametrize(
+    "origin", [f"https://{KNOWN}/o/r.git", f"git@{KNOWN}:o/r.git", f"{KNOWN}:o/r.git"]
+)
 def test_the_commit_lookup_names_the_host_the_branch_was_pushed_to(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, origin: str
 ) -> None:
-    root = _checkout(tmp_path, {"origin": f"https://{KNOWN}/o/r.git"})
+    root = _checkout(tmp_path, {"origin": origin})
     subprocess.run(
         [
             "git",
