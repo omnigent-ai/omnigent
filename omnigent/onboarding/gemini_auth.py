@@ -5,7 +5,8 @@ The ``agy`` CLI authenticates via a browser OAuth flow on first interactive run
 persists the resulting token is **platform-specific**:
 
 As of agy 1.1.13, it can instead use a non-empty ambient ``GEMINI_API_KEY``
-with ``modelProvider: "gemini"`` in its settings.
+with ``modelProvider: "gemini"`` in its settings. With ``AGY_ADC_AUTH`` set, it
+uses gcloud Application Default Credentials instead of its own sign-in.
 
 - macOS through agy 1.0.10 writes ``~/.gemini/oauth_creds.json`` — a flat
   OAuth2 object (verified live against agy 1.0.10)::
@@ -61,6 +62,7 @@ failure — an unreadable home, a missing ``agy`` binary, a hung or non-zero
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -68,6 +70,9 @@ from pathlib import Path
 
 from omnigent.onboarding import harness_install
 from omnigent.onboarding.provider_config import GEMINI_FAMILY
+from omnigent.process_logging import env_truthy
+
+_logger = logging.getLogger(__name__)
 
 _GEMINI_DIR: Path = Path(os.path.expanduser("~")) / ".gemini"
 
@@ -84,6 +89,8 @@ GEMINI_OAUTH_CRED_PATHS: tuple[Path, ...] = (DEFAULT_GEMINI_OAUTH_CREDS, LINUX_G
 # both places.
 _OAUTH_CRED_FIELDS: tuple[str, ...] = ("access_token", "refresh_token")
 _GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+# agy switches to gcloud Application Default Credentials when this is set.
+_AGY_ADC_AUTH_ENV = "AGY_ADC_AUTH"
 
 
 def _file_carries_token(path: Path) -> bool:
@@ -122,11 +129,69 @@ def _file_carries_token(path: Path) -> bool:
     return False
 
 
+def _adc_file_carries_credentials(path: Path) -> bool:
+    """Whether an ADC file actually carries credential material.
+
+    Checks the locally required fields rather than file existence — an ADC
+    file is only a credential when it declares its type's key material: a
+    ``refresh_token`` for ``authorized_user``, a ``private_key`` +
+    ``client_email`` for ``service_account``. Other declared types
+    (``external_account``, impersonation, …) carry type-specific material
+    this check does not model, so a declared type errs toward ready (a false
+    "ready" is the pre-warning status quo); an empty or type-less JSON body
+    (``{}``) proves nothing. Local file read only, no provider contact; never
+    raises.
+
+    :param path: The ADC JSON file path.
+    :returns: ``True`` when the file parses and declares credential material.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        # Class-only: an ADC file (or its parse error) may embed secrets.
+        _logger.debug("readiness: ADC file parse failed (%s)", type(exc).__name__)
+        return False
+    if not isinstance(data, dict):
+        return False
+    cred_type = str(data.get("type") or "").strip()
+    if not cred_type:
+        return False
+    if cred_type == "authorized_user":
+        return bool(data.get("refresh_token"))
+    if cred_type == "service_account":
+        return bool(data.get("private_key")) and bool(data.get("client_email"))
+    return True
+
+
+def google_adc_configured() -> bool:
+    """Whether GCP Application Default Credentials are visible.
+
+    Antigravity's Vertex AI path and agy's ``AGY_ADC_AUTH`` mode both
+    authenticate via ADC. The file counts only when it actually carries
+    credential material (:func:`_adc_file_carries_credentials`) — a merely
+    existing or empty ADC file supplies nothing a launch could authenticate
+    with.
+
+    :returns: ``True`` when an ADC credential file with material is present.
+    """
+    try:
+        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        if cred_path and os.path.exists(cred_path):
+            return _adc_file_carries_credentials(Path(cred_path))
+        adc = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+        return adc.exists() and _adc_file_carries_credentials(adc)
+    except Exception:
+        _logger.debug("readiness: ADC check failed", exc_info=True)
+        return False
+
+
 def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
     """Return whether ``agy`` has a usable API key or OAuth login.
 
-    First accepts a non-empty ambient ``GEMINI_API_KEY``. With *creds_path*
-    unset, checks every known platform location
+    First accepts a non-empty ambient ``GEMINI_API_KEY``, or a truthy
+    ``AGY_ADC_AUTH`` with an ADC file that carries credential material
+    (:func:`google_adc_configured`). With *creds_path* unset, checks every
+    known platform location
     (:data:`GEMINI_OAUTH_CRED_PATHS`) and returns ``True`` if any carries a
     usable token — so a logged-in user is recognized on both macOS
     (``oauth_creds.json``) and Linux
@@ -148,11 +213,13 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
     :param creds_path: A specific credential file to check; ``None`` checks all
         of :data:`GEMINI_OAUTH_CRED_PATHS`, then the macOS CLI fallback.
     :returns: ``True`` when a usable Gemini credential is present — an ambient
-        API key, a token file on any platform, or a Keychain credential seen
-        through the macOS CLI fallback. ``False`` when none is available.
+        API key, selected gcloud ADC, a token file on any platform, or a
+        Keychain credential seen through the macOS CLI fallback. ``False`` when none is available.
     """
     api_key = os.environ.get(_GEMINI_API_KEY_ENV)
     if api_key is not None and api_key.strip():
+        return True
+    if env_truthy(os.environ.get(_AGY_ADC_AUTH_ENV)) and google_adc_configured():
         return True
     paths = (creds_path,) if creds_path is not None else GEMINI_OAUTH_CRED_PATHS
     if any(_file_carries_token(path) for path in paths):
@@ -179,7 +246,8 @@ def gemini_login_detected() -> bool:
     ``True`` lets a runner spawn that dies on its first turn — so the signal has
     to prove a credential rather than merely suggest one.
 
-    :returns: ``True`` when ``GEMINI_API_KEY`` is non-empty, a token file
+    :returns: ``True`` when ``GEMINI_API_KEY`` is non-empty, ``AGY_ADC_AUTH``
+        selects a gcloud ADC file with credential material, a token file
         (macOS ``~/.gemini/oauth_creds.json``, Linux
         ``~/.gemini/antigravity-cli/antigravity-oauth-token``) carries a
         usable credential, or — on macOS only, where agy 1.1.7+ stores OAuth in

@@ -32,7 +32,6 @@ import os
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import omnigent.onboarding.kimi_auth as _kimi_auth
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
@@ -48,6 +47,7 @@ from omnigent.harness_availability import (
 )
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.harnesses.antigravity_native.credentials import antigravity_credentials_ready
+from omnigent.onboarding.gemini_auth import google_adc_configured
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
@@ -104,12 +104,13 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # Families/harnesses whose CLIs authenticate via file-based credentials rather
 # than a CLI login-status command. For these, ``harness_is_configured`` checks
 # BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
-# callable here). ``agy`` accepts ``GEMINI_API_KEY`` or writes an OAuth token on
-# its first interactive run; ``kimi login`` writes
-# ``~/.kimi-code/credentials/kimi-code.json``, and pay-per-use users instead set
-# an API key in ``~/.kimi-code/config.toml`` (kimi has no login-status probe) —
-# ``kimi_auth_configured`` accepts either. The ``anthropic`` / ``openai``
-# families authenticate via subscription provider config and do not appear here.
+# callable here). ``agy`` accepts ``GEMINI_API_KEY``, gcloud ADC selected by
+# ``AGY_ADC_AUTH``, or an OAuth token written on its first interactive run;
+# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json``, and
+# pay-per-use users instead set an API key in ``~/.kimi-code/config.toml``
+# (kimi has no login-status probe) — ``kimi_auth_configured`` accepts either.
+# The ``anthropic`` / ``openai`` families authenticate via subscription
+# provider config and do not appear here.
 # Resolve Kimi through its module so patches do not leave a cached function here.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: antigravity_credentials_ready,
@@ -746,64 +747,6 @@ def _databricks_workspace_configured() -> bool:
     return _databricks_credential_source() is not None
 
 
-def _adc_file_carries_credentials(path: Path) -> bool:
-    """Whether an ADC file actually carries credential material.
-
-    Checks the locally required fields rather than file existence — an ADC
-    file is only a credential when it declares its type's key material: a
-    ``refresh_token`` for ``authorized_user``, a ``private_key`` +
-    ``client_email`` for ``service_account``. Other declared types
-    (``external_account``, impersonation, …) carry type-specific material
-    this check does not model, so a declared type errs toward ready (a false
-    "ready" is the pre-warning status quo); an empty or type-less JSON body
-    (``{}``) proves nothing. Local file read only, no provider contact; never
-    raises.
-
-    :param path: The ADC JSON file path.
-    :returns: ``True`` when the file parses and declares credential material.
-    """
-    import json
-
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception as exc:
-        # Class-only: an ADC file (or its parse error) may embed secrets.
-        _logger.debug("readiness: ADC file parse failed (%s)", type(exc).__name__)
-        return False
-    if not isinstance(data, dict):
-        return False
-    cred_type = str(data.get("type") or "").strip()
-    if not cred_type:
-        return False
-    if cred_type == "authorized_user":
-        return bool(data.get("refresh_token"))
-    if cred_type == "service_account":
-        return bool(data.get("private_key")) and bool(data.get("client_email"))
-    return True
-
-
-def _google_adc_configured() -> bool:
-    """Whether GCP Application Default Credentials are visible.
-
-    Antigravity's Vertex AI path authenticates via ADC; whether a spec opts
-    into Vertex is invisible here. The file counts only when it actually
-    carries credential material (:func:`_adc_file_carries_credentials`) — a
-    merely existing or empty ADC file supplies nothing a launch could
-    authenticate with.
-
-    :returns: ``True`` when an ADC credential file with material is present.
-    """
-    try:
-        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-        if cred_path and os.path.exists(cred_path):
-            return _adc_file_carries_credentials(Path(cred_path))
-        adc = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
-        return adc.exists() and _adc_file_carries_credentials(adc)
-    except Exception:
-        _logger.debug("readiness: ADC check failed", exc_info=True)
-        return False
-
-
 def _antigravity_credential_configured() -> bool:
     """Whether a credential the antigravity SDK harness can use is visible.
 
@@ -827,7 +770,7 @@ def _antigravity_credential_configured() -> bool:
             return True
     except Exception:
         _logger.debug("readiness: antigravity credential check failed", exc_info=True)
-    return _google_adc_configured()
+    return google_adc_configured()
 
 
 def _global_auth_configured() -> bool:
