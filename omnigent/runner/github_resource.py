@@ -1867,6 +1867,18 @@ def _pr_number(root: str, *, token: str | None = None) -> int | None:
     return number if isinstance(number, int) else None
 
 
+def _branch_pr_reference(root: str, *, token: str | None = None) -> PullRequestRef | None:
+    """The workspace branch's PR, read from its URL, or ``None`` when none resolves."""
+    data = _pr_view_json(root, "number,url", token=token)
+    url = data.get("url") if data else None
+    if not isinstance(url, str):
+        return None
+    try:
+        return PullRequestRef.from_url(url)
+    except ValueError:
+        return None
+
+
 def github_changed_files(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
@@ -1932,15 +1944,16 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
     """
     empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
     token = _pr_token(root, reference) if reference else _account_token_for(root)
-    number = reference.number if reference else _pr_number(root, token=token)
-    if number is None:
-        return empty
-    repository = reference.repository if reference else "{owner}/{repo}"
-    host_args = _host_args(root, reference) if reference else []
+    if reference is None:
+        # gh api sends a {owner}/{repo} endpoint to its default host, not the checkout's,
+        # so the branch's PR is read by its URL's host and repository.
+        reference = _branch_pr_reference(root, token=token)
+        if reference is None:
+            return empty
     entries = _api_pages(
         root,
-        host_args,
-        f"repos/{repository}/pulls/{number}/files",
+        _host_args(root, reference),
+        f"repos/{reference.repository}/pulls/{reference.number}/files",
         token=token,
         max_pages=_MAX_FILE_PAGES,
         failed="GitHub could not load the PR's changed files. Refresh to retry.",

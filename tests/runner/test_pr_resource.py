@@ -530,7 +530,7 @@ def test_reads_and_preferences_for_an_ssh_alias_origin_reach_github(
     calls = _stub_gh(
         monkeypatch,
         {
-            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("pr", "view"): (0, json.dumps({"number": 7, "url": ALIAS_PR_URL}), ""),
             ("pr", "diff"): (0, "alias-patch", ""),
             ("api",): (0, json.dumps(files), ""),
         },

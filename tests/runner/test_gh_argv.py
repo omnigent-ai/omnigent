@@ -16,7 +16,8 @@ OTHER = "other.example.com"
         (["api", "--hostname", HOST, "repos/o/r/pulls/1"], HOST, False),
         (["api", f"--hostname={HOST}", "repos/o/r/pulls/1"], HOST, False),
         (["api", "repos/o/r/commits/abc/pulls"], None, False),
-        (["api", "repos/{owner}/{repo}/pulls/1/files?per_page=100&page=1"], None, True),
+        # gh fills the placeholders from the checkout, but sends the call to its default host.
+        (["api", "repos/{owner}/{repo}/pulls/1/files?per_page=100&page=1"], None, False),
         (["api", "graphql", "--hostname", HOST, "-f", "query={ viewer { login } }"], HOST, False),
         # Field values are free text: a URL in a label or a query isn't a host.
         (

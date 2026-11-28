@@ -372,7 +372,6 @@ def test_the_checkouts_github_host_is_the_one_known_host_its_remotes_name(
         ["repo", "set-default", "--view"],
         ["repo", "set-default", "origin"],
         ["repo", "set-default", "o/r"],
-        ["api", "repos/{owner}/{repo}/pulls/7/files?per_page=100&page=1"],
     ],
 )
 def test_a_call_gh_aims_at_the_checkout_runs_only_where_the_checkouts_host_is_the_scope(
@@ -385,6 +384,54 @@ def test_a_call_gh_aims_at_the_checkout_runs_only_where_the_checkouts_host_is_th
             github_resource._gh(argv, cwd=root)
 
     assert started == [["gh", *argv]] * 2
+
+
+@pytest.mark.parametrize("gh_host", [None, OTHER_KNOWN])
+def test_a_placeholder_endpoint_naming_no_host_never_runs(
+    started: list[list[str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gh_host: str | None
+) -> None:
+    """gh fills {owner}/{repo} from the checkout but sends the call to its default host."""
+    if gh_host:
+        monkeypatch.setenv("GH_HOST", gh_host)
+    root = _checkout(tmp_path, {"origin": f"https://{KNOWN}/o/r.git"})
+
+    for scope in (github_resource.CHECKOUT_SCOPE, KNOWN, "github.com"):
+        with github_resource.gh_target_host_scope(scope):
+            github_resource._gh(["api", "repos/{owner}/{repo}/pulls/7/files"], cwd=root)
+
+    assert started == []
+
+
+def test_the_branchs_changed_files_are_read_from_its_pull_requests_host(
+    started: list[list[str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With GH_HOST naming another host, gh's default for a hostless call would be wrong."""
+    monkeypatch.setenv("GH_HOST", OTHER_KNOWN)
+    root = _checkout(tmp_path, {"origin": f"https://{KNOWN}/acme/repo.git"})
+    answers = {
+        ("pr", "view"): json.dumps({"number": 9, "url": f"https://{KNOWN}/acme/repo/pull/9"}),
+        ("api", "--hostname"): "[]",
+    }
+    recorded = github_resource._run
+
+    def run(argv: list[str], **kwargs: object) -> tuple[int | None, str, str]:
+        result = recorded(argv, **kwargs)
+        answer = answers.get(tuple(argv[1:3]))
+        return (0, answer, "") if answer is not None else result
+
+    monkeypatch.setattr(github_resource, "_run", run)
+
+    with github_resource.gh_target_host_scope(github_resource.CHECKOUT_SCOPE):
+        files = github_resource._pr_changed_files(root, None)
+
+    assert files["data"] == []
+    assert [
+        "gh",
+        "api",
+        "--hostname",
+        KNOWN,
+        "repos/acme/repo/pulls/9/files?per_page=100&page=1",
+    ] in started
 
 
 def test_a_checkout_with_no_single_github_host_runs_nothing(

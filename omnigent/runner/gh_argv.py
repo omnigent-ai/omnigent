@@ -165,8 +165,7 @@ def _positional_host(kind: str, value: str) -> tuple[str | None, bool]:
         if "://" in value:
             host = _url_host(value)
             return ("github.com" if host == _UPLOADS_HOST else host), False
-        if any(marker in value for marker in ("{owner}", "{repo}", "{branch}")):
-            return None, True
+        # gh fills {owner}/{repo} from the checkout but sends the call to its default host.
         return None, False
     if kind == "pull_request":
         if value.isascii() and value.isdigit():

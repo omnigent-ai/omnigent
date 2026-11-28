@@ -853,7 +853,7 @@ def test_github_changed_files_via_pr_view(repo: Path, monkeypatch: pytest.Monkey
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
         if tuple(argv[:2]) == ("pr", "view"):
-            return (0, json.dumps({"number": 9}), "")
+            return (0, json.dumps({"number": 9, "url": "https://github.com/o/r/pull/9"}), "")
         if argv and argv[0] == "api":
             return (0, json.dumps(files), "")
         return (1, "", "no stub")
@@ -880,7 +880,11 @@ def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPa
     _stub_gh(
         monkeypatch,
         {
-            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("pr", "view"): (
+                0,
+                json.dumps({"number": 7, "url": "https://github.com/o/r/pull/7"}),
+                "",
+            ),
             ("api",): (0, json.dumps(files), ""),
         },
     )
@@ -1142,7 +1146,8 @@ def test_github_pr_diff_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_github_diff_failures_are_not_empty_successes(
     monkeypatch: pytest.MonkeyPatch, command, response, load, message: str
 ) -> None:
-    _stub_gh(monkeypatch, {("pr", "view"): (0, '{"number":7}', ""), command: response})
+    pr = '{"number":7,"url":"https://github.com/o/r/pull/7"}'
+    _stub_gh(monkeypatch, {("pr", "view"): (0, pr, ""), command: response})
     with pytest.raises(ValueError, match=message):
         load("/root")
 
