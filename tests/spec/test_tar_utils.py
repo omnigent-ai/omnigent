@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import random
 import tarfile
 from pathlib import Path
 
@@ -200,3 +201,19 @@ def test_extract_from_bytes_rejects_traversal(dest: Path) -> None:
 
     with pytest.raises(ExtractionError, match="path traversal"):
         extract_safe(buf.getvalue(), dest)
+
+
+@pytest.mark.parametrize("mode", ["w:gz", "w"])
+def test_extract_rejects_truncated_tarball(dest: Path, mode: str) -> None:
+    """A bundle cut off mid-stream raises ExtractionError, not a raw decode error."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode=mode) as tf:
+        # Incompressible payload so a gzip cut lands inside the deflate stream.
+        data = random.Random(0).randbytes(64 * 1024)
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    raw = buf.getvalue()
+
+    with pytest.raises(ExtractionError, match="invalid tarball"):
+        extract_safe(raw[: len(raw) // 2], dest)
