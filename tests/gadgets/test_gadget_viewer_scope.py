@@ -268,3 +268,24 @@ def test_an_older_release_never_treats_a_viewer_collection_as_shared(gadgets: Fi
     with pytest.raises(previous.CorruptData):
         older.content(app["id"])
     assert not list((gadgets.root / "gadgets" / app["id"]).rglob("data/progress/**/*.json"))
+
+
+def test_an_older_release_refuses_to_publish_a_revision_with_viewer_collections(
+    gadgets: Fixture,
+) -> None:
+    """Published there, only the shared collections would get an identity, and a newer
+    release would then read a revision whose digest it can't match."""
+    previous = _previous_release_service()
+    owner = gadgets.service(1)
+    app = owner.create("Synthetic course")
+    created = revision(owner, app)
+    older = previous.GadgetService(
+        gadgets.store, gadgets.access, previous.GadgetViewer(person(1)), None
+    )
+
+    with pytest.raises(previous.CorruptData):
+        older.publish(app["id"], {"revision_id": created["id"], "if_version": None})
+    # The newer release still publishes and serves it.
+    published = owner.publish(app["id"], {"revision_id": created["id"], "if_version": None})
+    assert "storage.viewer_collections" not in owner.content(published["id"])["capabilities"]
+    assert owner.describe(published["id"])["collection_scopes"] == {"progress": "viewer"}

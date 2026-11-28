@@ -383,6 +383,10 @@ def _mark_viewer_data(files: GadgetFiles) -> None:
             files.create_json(VIEWER_DATA_MARKER, {"viewer_data": True})
 
 
+# Stored in the capabilities of a revision with viewer collections; never granted or shown.
+VIEWER_COLLECTIONS_MARKER = "storage.viewer_collections"
+
+
 def _stored_revision(value: dict) -> dict:
     """A revision as it is stored: viewer collections' schemas in ``viewer_collections``.
 
@@ -395,6 +399,9 @@ def _stored_revision(value: dict) -> dict:
     if not scopes:
         return value
     stored = {key: item for key, item in value.items() if key != "collection_scopes"}
+    # A capability no older release knows, so it refuses to load, serve or publish this
+    # revision at all: publishing it there would record only the shared collections.
+    stored["capabilities"] = sorted({*value["capabilities"], VIEWER_COLLECTIONS_MARKER})
     stored["collections"] = {
         name: schema for name, schema in value["collections"].items() if name not in scopes
     }
@@ -413,6 +420,10 @@ def _logical_revision(stored: dict) -> dict:
     if not isinstance(viewer, dict) or not isinstance(stored.get("collections"), dict):
         raise CorruptData("Invalid frontend revision")
     value = {key: item for key, item in stored.items() if key != "viewer_collections"}
+    capabilities = stored.get("capabilities")
+    if not isinstance(capabilities, list) or VIEWER_COLLECTIONS_MARKER not in capabilities:
+        raise CorruptData("Invalid frontend revision")
+    value["capabilities"] = [item for item in capabilities if item != VIEWER_COLLECTIONS_MARKER]
     value["collections"] = {**stored["collections"], **viewer}
     value["collection_scopes"] = dict.fromkeys(viewer, "viewer")
     return value
