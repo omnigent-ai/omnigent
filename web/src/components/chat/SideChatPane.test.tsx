@@ -42,6 +42,7 @@ import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChange
 import { gridCellComposerKey, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
 import {
   codeMirrorComposerLoad,
@@ -2592,6 +2593,43 @@ describe("side chat closed by the server", () => {
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", childId] }),
     );
+  });
+});
+
+describe("side-chat context ring", () => {
+  const renderWithTooltips = (ui: ReactNode) => renderPane(<TooltipProvider>{ui}</TooltipProvider>);
+
+  it("hides the ring while the side chat matches the main chat's usage", () => {
+    useChatStore.setState({ contextWindow: 1000, tokensUsed: 400 });
+    conversationRegistry.acquire(childId).setState({ contextWindow: 1000, tokensUsed: 402 });
+    renderWithTooltips(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByTestId("composer-context-ring")).toBeNull();
+  });
+
+  it("shows the side chat's own usage once it differs from the main chat", () => {
+    useChatStore.setState({ contextWindow: 1000, tokensUsed: 400 });
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ contextWindow: 1000, tokensUsed: 400 });
+    renderWithTooltips(<SideChatPane childId={childId} />);
+    expect(screen.queryByTestId("composer-context-ring")).toBeNull();
+
+    act(() => entry.setState({ tokensUsed: 120 }));
+    expect(screen.getByLabelText("12% of context used")).toBeInTheDocument();
+  });
+
+  it("shows the ring when the main chat has no usage figures", () => {
+    conversationRegistry.acquire(childId).setState({ contextWindow: 1000, tokensUsed: 250 });
+    renderWithTooltips(<SideChatPane childId={childId} />);
+
+    expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
+  });
+
+  it("leaves a sub-agent's full session without a ring", () => {
+    conversationRegistry.acquire(childId).setState({ contextWindow: 1000, tokensUsed: 250 });
+    renderWithTooltips(<SideChatPane childId={childId} fullSession />);
+
+    expect(screen.queryByTestId("composer-context-ring")).toBeNull();
   });
 });
 

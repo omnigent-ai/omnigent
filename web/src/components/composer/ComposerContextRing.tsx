@@ -6,6 +6,18 @@ import { cn } from "@/lib/utils";
 const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
 
 /**
+ * Whole-number percentage of the context window used, clamped to 100, or
+ * ``null`` when either figure is unknown or the window is not positive.
+ */
+export function contextUsedPercent(
+  contextWindow: number | null,
+  tokensUsed: number | null,
+): number | null {
+  if (contextWindow == null || contextWindow <= 0 || tokensUsed == null) return null;
+  return Math.round(Math.min(tokensUsed / contextWindow, 1) * 100);
+}
+
+/**
  * Compact context-usage ring for the composer workspace bar.
  *
  * Grayscale by design — a near-full context window is a neutral fact, not an
@@ -26,13 +38,12 @@ export function ComposerContextRing({
   tokensUsed: number | null;
   className?: string;
 }) {
-  if (contextWindow == null || contextWindow <= 0 || tokensUsed == null) return null;
+  const usedPct = contextUsedPercent(contextWindow, tokensUsed);
+  if (contextWindow == null || tokensUsed == null || usedPct === null) return null;
 
-  const pct = Math.min(tokensUsed / contextWindow, 1);
   // Arc, %, label, and tooltip all encode context USED: a fresh session
   // shows an empty ring at 0% and the ring fills as context is consumed.
-  const usedArc = pct * RING_CIRCUMFERENCE;
-  const usedPct = Math.round(pct * 100);
+  const usedArc = Math.min(tokensUsed / contextWindow, 1) * RING_CIRCUMFERENCE;
 
   return (
     <Tooltip>
