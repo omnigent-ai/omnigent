@@ -213,8 +213,9 @@ def register_permissions_routes(
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to revoke access from,
             e.g. ``"conv_abc123"``.
-        :param target_user_id: User whose grant to revoke, or the caller's
-            own id to leave, e.g. ``"alice@example.com"``.
+        :param target_user_id: User whose grant to revoke, in any spelling the
+            grant route accepts, or the caller's own id to leave, e.g.
+            ``"alice@example.com"``.
         :returns: 204 No Content.
         :raises OmnigentError: 404 if no session or no access, 403 when the
             target holds the owner grant, 400 when leaving a sub-agent
@@ -258,6 +259,11 @@ def register_permissions_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         existing = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
+        canonical_id = canonical_grantee_id(auth_provider, target_user_id)
+        if existing is None and canonical_id != target_user_id:
+            # A grant stores the canonical ID, so the spelling it was given in removes it too.
+            target_user_id = canonical_id
+            existing = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
         if existing is not None and existing.level == LEVEL_OWNER:
             raise OmnigentError(
                 "Cannot leave a session you own. Delete or archive it instead."
