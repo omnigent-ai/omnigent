@@ -43,7 +43,7 @@ from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import claude_ask_user_question_payload, create_test_agent
 from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
@@ -280,42 +280,6 @@ def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
         "hook_event_name": "PermissionRequest",
         "tool_name": tool_name,
         "tool_input": {"command": "ls -la"},
-    }
-
-
-def _claude_ask_user_question_payload() -> dict[str, Any]:
-    """
-    Build a realistic Claude ``PermissionRequest`` body for AskUserQuestion.
-
-    Mirrors the wire shape Claude Code sends when its built-in
-    ``AskUserQuestion`` tool needs permission: ``tool_input`` carries the
-    full ``questions`` list (each with ``options``), which the server
-    projects into the structured ``params.ask_user_question`` extra. Used
-    to prove a sub-agent's interactive question card mirrors to the parent.
-
-    :returns: JSON-serializable PermissionRequest payload whose
-        ``tool_name`` is ``"AskUserQuestion"``.
-    """
-    return {
-        "session_id": "claude_sess_ask",
-        "transcript_path": "/tmp/transcript.jsonl",
-        "cwd": "/tmp/cwd",
-        "permission_mode": "default",
-        "hook_event_name": "PermissionRequest",
-        "tool_name": "AskUserQuestion",
-        "tool_input": {
-            "questions": [
-                {
-                    "question": "Which database should the worker target?",
-                    "header": "Database",
-                    "multiSelect": False,
-                    "options": [
-                        {"label": "postgres", "description": "Primary store"},
-                        {"label": "sqlite", "description": "Local dev"},
-                    ],
-                },
-            ],
-        },
     }
 
 
@@ -833,7 +797,7 @@ async def test_child_claude_ask_user_question_bubbles_to_parent_stream(
             client,
             child_id,
             parent_id,
-            payload=_claude_ask_user_question_payload(),
+            payload=claude_ask_user_question_payload(),
         )
         # The mirrored card must carry the child id (so the verdict posts to
         # the child's resolve URL) AND the structured questions (so the

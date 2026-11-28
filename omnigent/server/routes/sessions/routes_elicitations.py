@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import (
@@ -27,6 +28,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     AuthProvider,
 )
+from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -43,6 +45,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _deliver_answer_to_stopped_session,
     _resolve_elicitation,
 )
 from omnigent.server.schemas import (
@@ -68,8 +71,15 @@ def register_elicitations_routes(
     runner_router: RunnerRouter | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    message_dispatch: list[Callable[..., Awaitable[Any]]] | None = None,
+    runner_exit_reports: RunnerExitReports | None = None,
 ) -> None:
-    """Register the elicitations routes on router."""
+    """Register the elicitations routes on router.
+
+    :param message_dispatch: Holds the events route's message handler once it is
+        registered; an answer on a stopped session is sent through it.
+    :param runner_exit_reports: Runner crash reports; they end the runner wait early.
+    """
 
     @router.post(
         "/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
@@ -85,7 +95,7 @@ def register_elicitations_routes(
         session_id: str,
         elicitation_id: str,
         body: ElicitationResult,
-    ) -> dict[str, bool]:
+    ) -> dict[str, Any]:
         """
         Resolve an outstanding elicitation by its URL (URL-based
         elicitation).
@@ -118,9 +128,11 @@ def register_elicitations_routes(
         :param body: The MCP-shaped verdict — ``action``
             (``"accept"`` / ``"decline"`` / ``"cancel"``) plus
             optional form ``content``.
-        :returns: ``{"queued": False}`` — resolution is synchronous
-            and persists no conversation item.
-        :raises OmnigentError: 404 if no session exists.
+        :returns: ``{"queued": False}`` — resolution is synchronous and persists no
+            conversation item, except an answer sent as a message on a stopped session,
+            which returns that send's acknowledgement.
+        :raises OmnigentError: 404 if no session exists; for an answer sent as a message, the
+            message path's error (a 409 as 503), or 403 when a policy denies it.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -132,6 +144,18 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
+        delivered = await _deliver_answer_to_stopped_session(
+            request,
+            session_id,
+            conv,
+            _resolve_data,
+            runner_router,
+            message_dispatch[0] if message_dispatch else None,
+            conversation_store=conversation_store,
+            runner_exit_reports=runner_exit_reports,
+        )
+        if delivered is not None:
+            return delivered
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.

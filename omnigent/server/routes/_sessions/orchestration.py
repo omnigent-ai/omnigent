@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -17,6 +18,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
@@ -208,6 +210,7 @@ from omnigent.server.routes._session_create_validation import (
 from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL,
+    _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
@@ -2817,13 +2820,7 @@ async def _resolve_native_delivery(
     fingerprint = _harness_elicitation_request_fingerprint(
         ElicitationRequestParams.model_validate(params)
     )
-    _prune_pre_resolved_harness_elicitations()
-    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
-        session_id=session_id,
-        created_at=time.time(),
-        result=result,
-        request_fingerprint=fingerprint,
-    )
+    _store_pre_resolved_harness_elicitation(elicitation_id, session_id, result, fingerprint)
     waiting = {
         **event,
         "params": {
@@ -2968,20 +2965,14 @@ async def _resolve_elicitation(
                 # waiter's request fingerprint rides along so a LATER,
                 # different question reusing the id can't inherit it.
                 _parked_for_fingerprint = _harness_parked_elicitations.get(elicitation_id)
-                _prune_pre_resolved_harness_elicitations()
-                _harness_pre_resolved_elicitations[elicitation_id] = (
-                    _PreResolvedHarnessElicitation(
-                        session_id=session_id,
-                        created_at=time.time(),
-                        result=verdict_result,
-                        request_fingerprint=(
-                            _parked_for_fingerprint.request_fingerprint
-                            if _parked_for_fingerprint is not None
-                            else None
-                        ),
-                    )
+                _store_pre_resolved_harness_elicitation(
+                    elicitation_id,
+                    session_id,
+                    verdict_result,
+                    _parked_for_fingerprint.request_fingerprint
+                    if _parked_for_fingerprint is not None
+                    else None,
                 )
-                _prune_pre_resolved_harness_elicitations()
     elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
@@ -2996,23 +2987,15 @@ async def _resolve_elicitation(
             # resolved fan-out below drains it), so fingerprint the
             # tombstone with the question's params: a later, different
             # question that reuses this id must not inherit the verdict.
-            gap_fingerprint: str | None = None
             pending_entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
-            if pending_entry is not None:
-                try:
-                    gap_fingerprint = _harness_elicitation_request_fingerprint(
-                        ElicitationRequestParams.model_validate(pending_entry[1].get("params"))
-                    )
-                except ValidationError:
-                    gap_fingerprint = None
-            _prune_pre_resolved_harness_elicitations()
-            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
-                session_id=session_id,
-                created_at=time.time(),
-                result=pre_resolved,
-                request_fingerprint=gap_fingerprint,
+            gap_fingerprint = (
+                _harness_elicitation_fingerprint_or_none(pending_entry[1].get("params"))
+                if pending_entry is not None
+                else None
             )
-            _prune_pre_resolved_harness_elicitations()
+            _store_pre_resolved_harness_elicitation(
+                elicitation_id, session_id, pre_resolved, gap_fingerprint
+            )
     # Wake a currently-parked long-poll via resolved_elsewhere, not only its
     # Future: setting the Future alone races the sever/re-park cycle and the
     # ASK-gated call hangs. Set the event directly; the signal helper's
@@ -3040,6 +3023,545 @@ async def _resolve_elicitation(
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
     await _forward_approval_to_runner(session_id, data, runner_router)
+
+
+def _store_pre_resolved_harness_elicitation(
+    elicitation_id: str,
+    session_id: str,
+    result: ElicitationResult,
+    request_fingerprint: str | None,
+) -> None:
+    """Keep a verdict so a re-park of the same question adopts it (session-checked, TTL-pruned)."""
+    _prune_pre_resolved_harness_elicitations()
+    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+        session_id=session_id,
+        created_at=time.time(),
+        result=result,
+        request_fingerprint=request_fingerprint,
+    )
+    _prune_pre_resolved_harness_elicitations()
+
+
+def _harness_elicitation_fingerprint_or_none(params: Any) -> str | None:
+    """Fingerprint a question's params, or ``None`` when they do not validate."""
+    try:
+        return _harness_elicitation_request_fingerprint(
+            ElicitationRequestParams.model_validate(params)
+        )
+    except ValidationError:
+        return None
+
+
+@dataclass
+class _StoppedSessionAnswer:
+    """
+    One question's recovery on this replica: a delivery and its ack, or a pinned runner.
+
+    ``runner_id``: the session's runner at the first answer; a retry waits only for that runner.
+    ``replaced``: a different question under this id was answered during the running delivery.
+    """
+
+    started_at: float
+    fingerprint: str | None
+    runner_id: str | None
+    delivery: asyncio.Future[Any] | None = None
+    acknowledgement: dict[str, Any] | None = None
+    replaced: bool = False
+
+
+# Questions answered on a stopped session, by (session id, elicitation id), per replica.
+_stopped_session_answers: WorkspaceScopedCache[tuple[str, str], _StoppedSessionAnswer] = (
+    WorkspaceScopedCache()
+)
+_STOPPED_SESSION_ANSWER_HEADER = (
+    "[System: the user answered your earlier AskUserQuestion on the question card after this "
+    "session stopped. That tool call was interrupted, so its result was not recorded. "
+    "Continue with these answers.]"
+)
+
+
+def _stopped_session_answer_text(
+    questions: list[dict[str, Any]], content: Mapping[str, Any] | None
+) -> str:
+    """
+    Render AskUserQuestion answers as one message: a fixed header, then a Q/A pair each.
+
+    The card keys each answer by its question text; a multi-select answer is a list.
+    """
+    lines = [_STOPPED_SESSION_ANSWER_HEADER]
+    for question in questions:
+        text = str(question.get("question", ""))
+        raw = (content or {}).get(text)
+        if isinstance(raw, list):
+            answer = ", ".join(str(item) for item in raw)
+        elif raw is None or raw == "":
+            answer = "(no answer)"
+        else:
+            answer = str(raw)
+        lines.append(f"Q: {text}\nA: {answer}")
+    return "\n\n".join(lines)
+
+
+class _AnswerHostOffline(OmnigentError):
+    """The session's host is offline: the answer is not sent, so its card and hook stay."""
+
+
+def _recovery_record_changed(key: tuple[str, str], record: _StoppedSessionAnswer | None) -> bool:
+    """Return whether another request replaced, started or finished this question's recovery."""
+    current = _stopped_session_answers.get(key)
+    return current is not record or (
+        current is not None
+        and (current.delivery is not None or current.acknowledgement is not None)
+    )
+
+
+def _report_conflict_as_unavailable(
+    deliver: Callable[..., Awaitable[dict[str, Any] | None]],
+) -> Callable[..., Awaitable[dict[str, Any] | None]]:
+    """Raise a recovery 409 as 503: clients such as Slack read a 409 as an answered question."""
+
+    @functools.wraps(deliver)
+    async def _wrapped(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        try:
+            return await deliver(*args, **kwargs)
+        except OmnigentError as exc:
+            if exc.http_status != 409:
+                raise
+            _logger.info("An answer was not delivered (%s: %s); reporting 503", exc.code, exc)
+            raise OmnigentError(exc.message, code=ErrorCode.RUNNER_UNAVAILABLE) from exc
+
+    return _wrapped
+
+
+@_report_conflict_as_unavailable
+async def _deliver_answer_to_stopped_session(
+    request: Any,
+    session_id: str,
+    conv: Conversation,
+    data: Mapping[str, Any],
+    runner_router: RunnerRouter | None,
+    post_event: Callable[..., Awaitable[Any]] | None,
+    *,
+    conversation_store: ConversationStore | None,
+    runner_exit_reports: RunnerExitReports | None,
+) -> dict[str, Any] | None:
+    """
+    Send an AskUserQuestion answer as a user message when the session's runner stays gone.
+
+    The message path relaunches the runner; the card closes only after it accepts the message.
+    :returns: The acknowledgement (also for a later answer), or ``None``: the caller resolves it.
+    :raises OmnigentError: 403 on a policy denial; 503 for an offline host; a message path error.
+    """
+    elicitation_id = data.get("elicitation_id")
+    if post_event is None or not isinstance(request, Request):
+        return None
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return None
+    key = (session_id, elicitation_id)
+    _prune_stopped_session_answers()
+    entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+    params = entry[1].get("params") if entry is not None else None
+    record = _stopped_session_answers.get(key)
+    if record is not None and record.delivery is None and isinstance(params, dict):
+        fingerprint = _harness_elicitation_fingerprint_or_none(params)
+        if fingerprint is None or fingerprint != record.fingerprint:
+            # A new question under a reused id: the earlier recovery does not apply.
+            _stopped_session_answers.pop(key, None)
+            record = None
+    if record is not None and record.delivery is not None and isinstance(params, dict):
+        if _harness_elicitation_fingerprint_or_none(params) != record.fingerprint:
+            # A new question under a reused id during a delivery: its own hook takes the answer.
+            record.replaced = True
+            return None
+    if record is not None and record.delivery is None and record.acknowledgement is not None:
+        # A delivered answer also answers a later decline or cancel: the card was closed for it.
+        if isinstance(params, dict):
+            _close_answered_card(session_id, elicitation_id, params)
+        return record.acknowledgement
+    if data.get("action") != "accept":
+        return None
+    try:
+        result = ElicitationResult.model_validate(
+            {name: value for name, value in data.items() if name != "elicitation_id"}
+        )
+    except ValidationError:
+        return None
+    if record is not None and record.delivery is not None:
+        return await asyncio.shield(record.delivery)
+    if not isinstance(params, dict) or params.get("target_session_id") not in (None, session_id):
+        return None
+    ask = params.get("ask_user_question")
+    questions = ask.get("questions") if isinstance(ask, dict) else None
+    if (
+        params.get("policy_name") != "claude_native_permission"
+        or not isinstance(questions, list)
+        or conv.kind == "sub_agent"
+        or not _is_native_terminal_session(conv)
+    ):
+        return None
+    routing_host: str | None = None
+    if conv.host_id is None:
+        host_id = routing_host = (
+            await asyncio.to_thread(routing_host_id, conv, conversation_store)
+            if conversation_store is not None
+            else None
+        )
+        if host_id is None:
+            # No host in the chain can relaunch the runner, so the hook keeps the answer.
+            _logger.info(
+                "Session has no host to relaunch its runner; %s goes to its hook",
+                elicitation_id,
+                extra={"session_id": session_id},
+            )
+            return None
+        if _recovery_record_changed(key, record):
+            # Another request changed this question's recovery record during the read.
+            return await _deliver_answer_to_stopped_session(
+                request,
+                session_id,
+                conv,
+                data,
+                runner_router,
+                post_event,
+                conversation_store=conversation_store,
+                runner_exit_reports=runner_exit_reports,
+            )
+        after = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        if after is None or after[1].get("params") != params:
+            # Resolved elsewhere or asked again during the read: the caller resolves it.
+            _stopped_session_answers.pop(key, None)
+            return None
+    # Check the runner on a first answer or under the same runner id; a new runner never asked.
+    if record is None or record.runner_id == conv.runner_id:
+        try:
+            hook_can_take = await _session_runner_reachable(
+                request,
+                session_id,
+                conv,
+                runner_router,
+                conversation_store,
+                runner_exit_reports,
+                routing_host=routing_host,
+            )
+        except _AnswerHostOffline:
+            now = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+            asked = now is not None and now[1].get("params") == params
+            if asked and _stopped_session_answers.get(key) is None:
+                # Pin the asking runner: a retry under a new runner id goes as a message.
+                _logger.info(
+                    "Host offline; %s stays open for runner %s",
+                    elicitation_id,
+                    conv.runner_id,
+                    extra={"session_id": session_id},
+                )
+                _stopped_session_answers[key] = _StoppedSessionAnswer(
+                    started_at=time.time(),
+                    fingerprint=_harness_elicitation_fingerprint_or_none(params),
+                    runner_id=conv.runner_id,
+                )
+            raise
+        if _recovery_record_changed(key, record):
+            # Another request changed this question's recovery record during the wait.
+            return await _deliver_answer_to_stopped_session(
+                request,
+                session_id,
+                conv,
+                data,
+                runner_router,
+                post_event,
+                conversation_store=conversation_store,
+                runner_exit_reports=runner_exit_reports,
+            )
+        after = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        if after is None or after[1].get("params") != params or hook_can_take:
+            # Resolved elsewhere, asked again, or its hook can take it: the caller resolves it.
+            _stopped_session_answers.pop(key, None)
+            return None
+    if record is None:
+        record = _StoppedSessionAnswer(
+            started_at=time.time(),
+            fingerprint=_harness_elicitation_fingerprint_or_none(params),
+            runner_id=conv.runner_id,
+        )
+        _stopped_session_answers[key] = record
+    return await _run_stopped_session_delivery(
+        record, request, session_id, elicitation_id, params, questions, result, post_event
+    )
+
+
+async def _run_stopped_session_delivery(
+    record: _StoppedSessionAnswer,
+    request: Any,
+    session_id: str,
+    elicitation_id: str,
+    params: dict[str, Any],
+    questions: list[dict[str, Any]],
+    result: ElicitationResult,
+    post_event: Callable[..., Awaitable[Any]],
+) -> dict[str, Any]:
+    """Deliver one answer as a message; every waiting request gets this run's result or error."""
+    delivery: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    delivery.add_done_callback(lambda done: done.cancelled() or done.exception())
+    record.delivery = delivery
+    record.replaced = False
+    _logger.info(
+        "Delivering an answer to %s as a message: the session's runner is gone",
+        elicitation_id,
+        extra={"session_id": session_id},
+    )
+    try:
+        message = SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": _stopped_session_answer_text(questions, result.content),
+                    }
+                ],
+            },
+        )
+        with contextlib.ExitStack() as in_flight:
+            acknowledgement = await post_event(request, session_id, message, in_flight=in_flight)
+        if isinstance(acknowledgement, dict) and acknowledgement.get("denied") is True:
+            reason = acknowledgement.get("reason") or "Denied by policy"
+            _logger.info(
+                "Policy denied the answer to %s (%s); the question stays open",
+                elicitation_id,
+                reason,
+                extra={"session_id": session_id},
+            )
+            raise OmnigentError(f"A policy denied this answer: {reason}", code=ErrorCode.FORBIDDEN)
+        delivery.set_result(acknowledgement)
+        record.acknowledgement = acknowledgement
+        current = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        current_params = current[1].get("params") if current is not None else None
+        # A different question under this id has its own card and hook: leave them.
+        replaced = record.replaced or (
+            isinstance(current_params, dict)
+            and _harness_elicitation_fingerprint_or_none(current_params) != record.fingerprint
+        )
+        if replaced:
+            _logger.info(
+                "A new question under %s keeps its card open",
+                elicitation_id,
+                extra={"session_id": session_id},
+            )
+        else:
+            _close_answered_card(session_id, elicitation_id, params)
+        return acknowledgement
+    except Exception as exc:
+        if not delivery.done():
+            delivery.set_exception(exc)
+        raise
+    finally:
+        record.delivery = None
+        if not delivery.done():
+            _logger.warning(
+                "Delivery of the answer to %s stopped before it finished",
+                elicitation_id,
+                extra={"session_id": session_id},
+            )
+            delivery.set_exception(
+                OmnigentError(
+                    "The answer may not have been delivered. Answer the question again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            )
+
+
+async def _session_offline_host_id(
+    conv: Conversation,
+    app_state: Any,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """
+    Return the session's user-run routing host when it has no live tunnel, else ``None``.
+
+    A disconnected host cannot start or reconnect a runner. Side chats and sub-agents may inherit
+    an ancestor's host.
+    Managed sandboxes and a host whose row reads live (connected elsewhere) count as not offline.
+    """
+    host_id = conv.host_id
+    if host_id is None:
+        host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+    if host_id is None:
+        return None
+    host_registry = getattr(app_state, "host_registry", None)
+    if host_registry is None or host_registry.get(host_id) is not None:
+        return None
+    host_store = getattr(app_state, "host_store", None)
+    if host_store is None:
+        return host_id
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or host.sandbox_provider is not None or host_is_live(host):
+        return None
+    return host_id
+
+
+async def _session_runner_reachable(
+    request: Request,
+    session_id: str,
+    conv: Conversation,
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore | None,
+    runner_exit_reports: RunnerExitReports | None,
+    *,
+    routing_host: str | None = None,
+) -> bool:
+    """
+    Return whether the runner that asked can still take the answer through its hook.
+
+    True when it is reachable here, live on another replica, or back within the connect grace
+    even if admission then fails. An offline host raises ``_AnswerHostOffline``; other wait errors
+    and an admission error for a rebound or missing row propagate. ``routing_host``: inherited.
+    """
+    if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
+        return True
+    from omnigent.server.routes import sessions as _facade
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
+
+    runner_id = conv.runner_id
+    if runner_id is None or conversation_store is None:
+        return False
+    store = conversation_store
+    known_exit = runner_exit_reports.get(runner_id) if runner_exit_reports is not None else None
+
+    def live_elsewhere(row: Conversation | None) -> bool:
+        return row is not None and _runner_live_on_another_replica_from_conversations(
+            [row], runner_id, session_live_state.last_liveness_stamp(runner_id)
+        )
+
+    async def fresh_row() -> Conversation | None:
+        try:
+            return await asyncio.to_thread(store.get_conversation, session_id)
+        except Exception:  # noqa: BLE001 - a failed re-read counts as a missing row
+            _logger.warning(
+                "Could not re-read session %s for runner %s",
+                session_id,
+                runner_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return None
+
+    if known_exit is None and live_elsewhere(conv):
+        _logger.info(
+            "Runner %s is live on another replica; the answer goes to its hook",
+            runner_id,
+            extra={"session_id": session_id},
+        )
+        return True
+    grace_s = _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S
+    host_id = conv.host_id or routing_host
+    if host_id is None or grace_s <= 0:
+        return False
+    app_state = request.app.state
+    offline = (
+        await _session_offline_host_id(conv, app_state, conversation_store)
+        if known_exit is None
+        else None
+    )
+    host_registry = getattr(app_state, "host_registry", None)
+    host_conn = host_registry.get(host_id) if host_registry is not None else None
+    if offline is not None and host_conn is None:
+        # Raise, not False: the message path would wait, then cancel a returning runner's hook.
+        raise _AnswerHostOffline(
+            "The host for this session is offline. "
+            f"Start it with `{cli_invocation()} host` (or reconnect it) and answer again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    _logger.info(
+        "Waiting up to %.1fs for runner %s before sending an answer as a message",
+        grace_s,
+        runner_id,
+        extra={"session_id": session_id},
+    )
+    tunnel_registry = getattr(app_state, "tunnel_registry", None)
+    try:
+        if host_registry is not None and host_conn is not None:
+            client = await _wait_for_host_bound_runner_client(
+                session_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=runner_id,
+                timeout_s=grace_s,
+                runner_exit_reports=runner_exit_reports,
+                host_conn=host_conn,
+                host_registry=host_registry,
+                conversation_store=conversation_store,
+            )
+        else:
+            client = await _wait_for_runner_client(
+                session_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=runner_id,
+                timeout_s=grace_s,
+                runner_exit_reports=runner_exit_reports,
+            )
+    except OmnigentError as exc:
+        # Admission runs only after the tunnel connected; the hook still takes the answer.
+        admission = ErrorCode.RUNNER_CAPABILITY_MISMATCH
+        if not (isinstance(exc, RuntimeSupportError) or exc.code == admission):
+            raise
+        row = await fresh_row()
+        if row is None or row.runner_id != runner_id:
+            raise
+        _logger.info(
+            "Runner %s came back but failed admission (%s: %s); the answer goes to its hook",
+            runner_id,
+            exc.code,
+            exc,
+            extra={"session_id": session_id},
+        )
+        return True
+    exited = runner_exit_reports is not None and runner_exit_reports.get(runner_id) is not None
+    if client is None and not exited:
+        if live_elsewhere(await fresh_row()):
+            _logger.info(
+                "Runner %s moved to another replica during the wait; the answer goes to its hook",
+                runner_id,
+                extra={"session_id": session_id},
+            )
+            return True
+    _logger.info(
+        "Runner %s %s",
+        runner_id,
+        "came back; the answer goes to its hook" if client is not None else "did not come back",
+        extra={"session_id": session_id},
+    )
+    return client is not None
+
+
+def _prune_stopped_session_answers() -> None:
+    """Drop records not delivering, started more than the longest hook wait ago."""
+    cutoff = time.time() - _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S
+    for key, record in list(_stopped_session_answers.items()):
+        if record.started_at < cutoff and record.delivery is None:
+            _stopped_session_answers.pop(key, None)
+
+
+def _close_answered_card(session_id: str, elicitation_id: str, params: dict[str, Any]) -> None:
+    """
+    Close a question card whose answer went to the session as a message.
+
+    A stale hook wait gets a cancel, so it cannot deliver the answer again; a re-park of
+    the same question adopts that cancel. Other tabs see the card as answered.
+    """
+    cancel = ElicitationResult(action="cancel")
+    owned = _harness_elicitation_owners.get(elicitation_id) == session_id
+    future = _harness_elicitation_registry.get(elicitation_id)
+    if future is not None and owned and not future.done():
+        future.set_result(cancel)
+    parked = _harness_parked_elicitations.get(elicitation_id)
+    if parked is not None and owned:
+        parked.resolved_elsewhere.set()
+    _store_pre_resolved_harness_elicitation(
+        elicitation_id, session_id, cancel, _harness_elicitation_fingerprint_or_none(params)
+    )
+    _publish_elicitation_resolved(session_id, elicitation_id, action="accept")
 
 
 def _spawn_native_approval_popup_forward(
@@ -15707,6 +16229,7 @@ __all__ = [
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
+    "_deliver_answer_to_stopped_session",
     "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",
@@ -15759,6 +16282,7 @@ __all__ = [
     "_run_managed_wake",
     "_runner_reject_detail",
     "_schedule_deferred_elicitation_clear",
+    "_session_offline_host_id",
     "_spawn_archive_stop",
     "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
