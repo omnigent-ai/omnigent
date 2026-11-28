@@ -184,7 +184,8 @@ function DefaultToolBody({ call, duration, view }: ToolCardBodyProps) {
   if (shellCall === null || view?.Body !== undefined) {
     return <GenericToolBody call={call} duration={duration} view={view} />;
   }
-  const { cwd } = call.args;
+  const cwd =
+    typeof call.args.cwd === "string" && call.args.cwd.length > 0 ? call.args.cwd : call.args.Cwd;
   return (
     <ShellTerminalPanel
       command={shellCall.command}

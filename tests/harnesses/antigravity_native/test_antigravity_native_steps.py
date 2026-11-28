@@ -1263,3 +1263,252 @@ class TestStreamProjection:
                 item = event.data.get("item_data")
                 call_id = item.get("call_id", "") if isinstance(item, dict) else ""
                 assert "orphan" not in str(call_id), f"{path.stem} minted {call_id}"
+
+    def test_streamed_mcp_tool_extracts_server_tool_args_and_result(self) -> None:
+        """Streamed MCP_TOOL preserves server/tool identity, args, and unwrapped output."""
+        step: dict[str, Any] = {
+            "type": "CORTEX_STEP_TYPE_MCP_TOOL",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "toolAction": "Creating pull request",
+                "sourceTrajectoryStepInfo": {"trajectoryId": _TRAJ, "stepIndex": 21},
+            },
+            "mcpTool": {
+                "serverName": "github",
+                "toolCall": {
+                    "id": "call-1",
+                    "name": "create_pull_request",
+                    "argumentsJson": json.dumps(
+                        {"owner": "omnigent-ai", "repo": "omnigent", "toolSummary": "Create PR"}
+                    ),
+                },
+                "resultString": '{"number": 42}',
+            },
+        }
+        call, output = self._pair_step(step, label="streamed_mcp_tool")
+        assert call["name"] == "mcp__github__create_pull_request"
+        assert json.loads(str(call["arguments"])) == {"owner": "omnigent-ai", "repo": "omnigent"}
+        assert output["output"] == '{"number": 42}'
+
+    def test_polled_call_mcp_tool_uses_canonical_mcp_name_and_inner_args(self) -> None:
+        """Polled MCP_TOOL invoked via call_mcp_tool emits canonical mcp__server__tool."""
+        step: dict[str, Any] = {
+            "type": "CORTEX_STEP_TYPE_MCP_TOOL",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "toolAction": "Listing sessions",
+                "toolCall": {
+                    "id": "outer-1",
+                    "name": "call_mcp_tool",
+                    "argumentsJson": json.dumps(
+                        {
+                            "ServerName": "omnigent",
+                            "ToolName": "sys_session_list",
+                            "Arguments": "{}",
+                        }
+                    ),
+                },
+                "sourceTrajectoryStepInfo": {"trajectoryId": _TRAJ, "stepIndex": 22},
+            },
+            "mcpTool": {
+                "serverName": "omnigent",
+                "toolCall": {"id": "inner-1", "name": "sys_session_list", "argumentsJson": "{}"},
+                "resultString": "[]",
+            },
+        }
+        call, output = self._pair_step(step, label="polled_call_mcp_tool")
+        assert call["name"] == "mcp__omnigent__sys_session_list"
+        assert json.loads(str(call["arguments"])) == {}
+        assert output["output"] == "[]"
+
+    def test_mcp_tool_result_uri_and_user_rejection(self) -> None:
+        """MCP_TOOL surfaces saved-output URIs and explicit user rejections."""
+        base: dict[str, Any] = {
+            "type": "CORTEX_STEP_TYPE_MCP_TOOL",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "toolAction": "Running MCP tool",
+                "sourceTrajectoryStepInfo": {"trajectoryId": _TRAJ, "stepIndex": 23},
+            },
+            "mcpTool": {
+                "serverName": "linear",
+                "toolCall": {"name": "list_issues", "argumentsJson": "{}"},
+                "resultUri": "file:///tmp/my%20results.json",
+            },
+        }
+        _, uri_output = self._pair_step(base, label="mcp_result_uri")
+        assert uri_output["output"] == "[output saved to /tmp/my results.json]"
+
+        rejected = copy.deepcopy(base)
+        rejected["mcpTool"] = {
+            "serverName": "linear",
+            "toolCall": {"name": "delete_issue", "argumentsJson": "{}"},
+            "userRejected": True,
+        }
+        _, rejected_output = self._pair_step(rejected, label="mcp_rejected")
+        assert rejected_output["output"] == "Error: Tool call rejected by user."
+
+    def test_streamed_code_action_emits_edit_or_write_with_normalized_path(self) -> None:
+        """Streamed CODE_ACTION emits edit_file/write_file and decodes the file:// target."""
+        edit_step: dict[str, Any] = {
+            "type": "CORTEX_STEP_TYPE_CODE_ACTION",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "toolAction": "Editing file",
+                "argumentsOrder": ["Path", "Target", "Replacement"],
+                "sourceTrajectoryStepInfo": {"trajectoryId": _TRAJ, "stepIndex": 24},
+            },
+            "codeAction": {
+                "description": "Update timeout",
+                "actionSpec": {
+                    "command": {"file": {"absoluteUri": "file:///repo/my%20app/config.py"}}
+                },
+                "actionResult": {
+                    "edit": {
+                        "absoluteUri": "file:///repo/my%20app/config.py",
+                        "createFile": False,
+                    }
+                },
+            },
+        }
+        edit_call, _ = self._pair_step(edit_step, label="streamed_code_action_edit")
+        assert edit_call["name"] == "edit_file"
+        assert json.loads(str(edit_call["arguments"])) == {
+            "path": "/repo/my app/config.py",
+            "description": "Update timeout",
+        }
+
+        create_step: dict[str, Any] = {
+            "type": "CORTEX_STEP_TYPE_CODE_ACTION",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "toolAction": "Creating file",
+                "argumentsOrder": ["Path", "Content"],
+                "sourceTrajectoryStepInfo": {"trajectoryId": _TRAJ, "stepIndex": 25},
+            },
+            "codeAction": {
+                "actionSpec": {"createFile": {"path": {"absoluteUri": "file:///repo/new.ts"}}},
+                "actionResult": {
+                    "edit": {"absoluteUri": "file:///repo/new.ts", "createFile": True}
+                },
+            },
+        }
+        create_call, _ = self._pair_step(create_step, label="streamed_code_action_create")
+        assert create_call["name"] == "write_file"
+        assert json.loads(str(create_call["arguments"])) == {"path": "/repo/new.ts"}
+
+    def test_run_command_preserves_nonzero_exit_code_and_default_cwd(self) -> None:
+        """Non-zero exit codes append [exit code: N]; native run_command keeps body cwd."""
+        step = copy.deepcopy(_load("stream_run_command_done"))
+        step["metadata"]["argumentsOrder"] = ["CommandLine", "WaitMsBeforeAsync"]
+        step["runCommand"]["exitCode"] = 2
+        step["runCommand"]["combinedOutput"] = {"full": "pytest: 1 failed\n"}
+        call, output = self._pair_step(step, label="run_command_nonzero")
+        parsed_args = json.loads(str(call["arguments"]))
+        assert parsed_args["cwd"] == "/Users/bryanli/.gemini/antigravity-cli/scratch"
+        assert output["output"] == "pytest: 1 failed\n[exit code: 2]"
+
+        silent_fail = copy.deepcopy(step)
+        silent_fail["runCommand"].pop("combinedOutput", None)
+        _, silent_output = self._pair_step(silent_fail, label="run_command_silent_fail")
+        assert silent_output["output"] == "[exit code: 2]"
+
+    def test_streamed_paths_find_and_invoke_subagent_normalize_cleanly(self) -> None:
+        """file:// URIs are stripped; read_file, find, and invoke_subagent keep key args."""
+        view_step = copy.deepcopy(_load("stream_view_file_done"))
+        view_step["metadata"]["argumentsOrder"] = ["Path", "StartLine"]
+        view_step["viewFile"]["absolutePathUri"] = "file:///repo/my%20dir/package.json"
+        view_call, _ = self._pair_step(view_step, label="native_read_file_rehydrated")
+        assert json.loads(str(view_call["arguments"]))["path"] == "/repo/my dir/package.json"
+
+        list_call, _ = self._pair("stream_list_directory_done")
+        assert (
+            json.loads(str(list_call["arguments"]))["directoryPathUri"]
+            == "/Users/bryanli/.gemini/antigravity-cli/scratch"
+        )
+
+        find_step: dict[str, Any] = {
+            "type": "CORTEX_STEP_TYPE_FIND",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "toolAction": "Finding files",
+                "argumentsOrder": ["SearchDirectory", "Pattern"],
+                "sourceTrajectoryStepInfo": {"trajectoryId": _TRAJ, "stepIndex": 26},
+            },
+            "find": {"searchDirectory": "/repo", "pattern": "*.ts"},
+        }
+        find_call, _ = self._pair_step(find_step, label="streamed_find")
+        assert find_call["name"] == "find_by_name"
+
+        subagent_step: dict[str, Any] = {
+            "type": "CORTEX_STEP_TYPE_INVOKE_SUBAGENT",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "toolAction": "Launching subagent",
+                "argumentsOrder": ["TypeName", "Role", "Prompt"],
+                "sourceTrajectoryStepInfo": {"trajectoryId": _TRAJ, "stepIndex": 27},
+            },
+            "invokeSubagent": {
+                "subagents": [{"typeName": "research", "role": "Codebase Researcher"}]
+            },
+        }
+        subagent_call, _ = self._pair_step(subagent_step, label="streamed_subagent")
+        assert json.loads(str(subagent_call["arguments"])) == {
+            "subagents": [{"typeName": "research", "role": "Codebase Researcher"}]
+        }
+
+    def test_mcp_tool_edge_cases_empty_result_zero_args_and_sanitized_server(self) -> None:
+        """Empty resultString falls through to resultUri/ERROR; zero-arg MCP drops wrapper."""
+        spilled_step: dict[str, Any] = {
+            "type": "CORTEX_STEP_TYPE_MCP_TOOL",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "toolAction": "Listing Drive files",
+                "toolCall": {
+                    "id": "outer-2",
+                    "name": "call_mcp_tool",
+                    "argumentsJson": json.dumps(
+                        {"ServerName": "Google Drive", "ToolName": "list_files", "Arguments": "{}"}
+                    ),
+                },
+                "sourceTrajectoryStepInfo": {"trajectoryId": _TRAJ, "stepIndex": 28},
+            },
+            "mcpTool": {
+                "serverName": "Google Drive",
+                "toolCall": {"name": "mcp_Google Drive_list_files", "argumentsJson": ""},
+                "resultString": "",
+                "resultUri": "file:///tmp/drive.json",
+            },
+        }
+        spilled_call, spilled_output = self._pair_step(spilled_step, label="mcp_spilled")
+        assert spilled_call["name"] == "mcp__Google-Drive__list_files"
+        assert json.loads(str(spilled_call["arguments"])) == {}
+        assert spilled_output["output"] == "[output saved to /tmp/drive.json]"
+
+        error_step = copy.deepcopy(spilled_step)
+        error_step["status"] = "CORTEX_STEP_STATUS_ERROR"
+        error_step["mcpTool"].pop("resultUri", None)
+        _, error_output = self._pair_step(error_step, label="mcp_error_empty_result")
+        assert "ERROR" in str(error_output["output"])
+
+    def test_windows_file_uri_crlf_run_command_and_polled_cwd_backfill(self) -> None:
+        """Windows file:///C:/ decodes without leading slash; CRLF and polled cwd are handled."""
+        win_view = copy.deepcopy(_load("stream_view_file_done"))
+        win_view["viewFile"]["absolutePathUri"] = "file:///c%3A/Users/dev/app.ts"
+        win_call, _ = self._pair_step(win_view, label="win_view")
+        assert json.loads(str(win_call["arguments"]))["absolutePathUri"] == "c:/Users/dev/app.ts"
+
+        crlf_cmd = copy.deepcopy(_load("run_command_done"))
+        crlf_cmd["metadata"]["toolCall"]["argumentsJson"] = json.dumps({"CommandLine": "false"})
+        crlf_cmd["runCommand"]["exitCode"] = "1"
+        crlf_cmd["runCommand"]["combinedOutput"] = {"full": "boom\r\n"}
+        cmd_call, cmd_out = self._pair_step(crlf_cmd, label="crlf_polled_cmd")
+        assert json.loads(str(cmd_call["arguments"]))["cwd"] == (
+            "/Users/bryanli/.gemini/antigravity-cli/scratch"
+        )
+        assert cmd_out["output"] == "boom\n[exit code: 1]"
+
+        newline_only = copy.deepcopy(crlf_cmd)
+        newline_only["runCommand"]["combinedOutput"] = {"full": "\r\n"}
+        _, nl_out = self._pair_step(newline_only, label="newline_only_fail")
+        assert nl_out["output"] == "[exit code: 1]"

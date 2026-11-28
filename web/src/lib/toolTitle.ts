@@ -198,6 +198,71 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   edit: (args) => withPath("Edit", args.filePath ?? args.path),
   write: (args) => withPath("Write", args.filePath ?? args.path),
 
+  // Antigravity native harness tools. Streamed steps use camelCase keys and
+  // `file://` URIs; poll/replay snapshots use PascalCase keys.
+  run_command: (args) => shellTitle(shellCommandArg(args)),
+  view_file: (args) =>
+    withPath(
+      "Read",
+      firstString(args.absolutePathUri, args.absolutePath, args.AbsolutePath, args.path, args.Path),
+    ),
+  read_file: (args) =>
+    withPath("Read", firstString(args.path, args.Path, args.absolutePathUri, args.absolutePath)),
+  view_file_outline: (args) =>
+    withPath("Outline", firstString(args.absolutePathUri, args.AbsolutePath, args.path)),
+  view_code_item: (args) =>
+    withPath("View symbol", firstString(args.absoluteUri, args.File, args.path)),
+  write_file: (args) =>
+    withPath("Write", firstString(args.path, args.Path, args.TargetFile, args.targetFile)),
+  write_to_file: (args) =>
+    withPath("Write", firstString(args.TargetFile, args.targetFile, args.path, args.Path)),
+  edit_file: (args) =>
+    withPath("Edit", firstString(args.path, args.Path, args.TargetFile, args.targetFile)),
+  replace_file_content: (args) =>
+    withPath("Edit", firstString(args.TargetFile, args.targetFile, args.path, args.Path)),
+  multi_replace_file_content: (args) =>
+    withPath("Edit", firstString(args.TargetFile, args.targetFile, args.path, args.Path)),
+  list_dir: (args) => {
+    const dir = firstString(
+      args.directoryPathUri,
+      args.directoryPath,
+      args.DirectoryPath,
+      args.path,
+      args.Path,
+    );
+    return dir === null ? null : { verb: "List", body: stripFileUri(dir) };
+  },
+  grep_search: (args) => {
+    const q = firstString(args.query, args.Query);
+    return q === null ? null : { verb: "Search:", body: q };
+  },
+  code_search: (args) => {
+    const q = firstString(args.query, args.Query);
+    return q === null ? null : { verb: "Search:", body: q };
+  },
+  find_by_name: (args) => {
+    const pattern = firstString(args.pattern, args.Pattern);
+    return pattern === null ? null : { verb: "Find files:", body: pattern };
+  },
+  find: (args) => {
+    const pattern = firstString(args.pattern, args.Pattern);
+    return pattern === null ? null : { verb: "Find files:", body: pattern };
+  },
+  search_web: (args) => {
+    const q = firstString(args.query, args.Query);
+    return q === null ? null : { verb: "Web search:", body: `"${q}"` };
+  },
+  read_url_content: (args) => {
+    const url = firstString(args.url, args.Url);
+    return url === null ? null : { verb: "Web read:", body: url };
+  },
+  invoke_subagent: (args) => {
+    const role =
+      firstString(args.role, args.Role, args.typeName, args.TypeName) ??
+      firstSubagentRole(args.subagents ?? args.Subagents);
+    return role === null ? verbOnly("Run sub-agent") : { verb: "Sub-agent:", body: role };
+  },
+
   // Web tools.
   web_search: (args) => {
     const q = asString(args.query);
@@ -425,9 +490,14 @@ const RUN_CATEGORIES: Record<string, RunCategory> = {
   shell: "shell",
   local_shell: "shell",
   bash: "shell",
+  run_command: "shell",
   Read: "read",
   sys_os_read: "read",
   read: "read",
+  view_file: "read",
+  read_file: "read",
+  view_file_outline: "read",
+  view_code_item: "read",
   Edit: "edit",
   Write: "edit",
   MultiEdit: "edit",
@@ -438,13 +508,24 @@ const RUN_CATEGORIES: Record<string, RunCategory> = {
   edit: "edit",
   write: "edit",
   patch: "edit",
+  edit_file: "edit",
+  write_file: "edit",
+  write_to_file: "edit",
+  replace_file_content: "edit",
+  multi_replace_file_content: "edit",
   Grep: "search",
   Glob: "search",
   WebSearch: "search",
   web_search: "search",
   grep: "search",
   glob: "search",
+  grep_search: "search",
+  code_search: "search",
+  find_by_name: "search",
+  find: "search",
+  search_web: "search",
   list: "list",
+  list_dir: "list",
 };
 
 const RUN_CATEGORY_ORDER: readonly RunCategory[] = ["shell", "list", "read", "edit", "search"];
@@ -518,16 +599,17 @@ export interface ShellToolCall {
 const SHELL_OUTPUT_FORMATS: Record<string, ShellOutputFormat> = {
   sys_os_shell: "sys-os-json",
   shell: "codex-suffix",
+  run_command: "codex-suffix",
 };
 
 /**
  * Describe a shell tool call, or return `null` when the call is not a shell
- * tool or carries no string `command`. Only Codex's `shell` adds a
+ * tool or carries no string command. Only Codex's `shell` adds a
  * login-shell wrapper, so other harnesses' commands are shown as run.
  */
 export function shellToolCall(name: string, args: Record<string, unknown>): ShellToolCall | null {
   if (!isShellTool(name)) return null;
-  const command = asString(args.command);
+  const command = shellCommandArg(args);
   if (command === null) return null;
   const bareName = stripOmnigentPrefix(name);
   return {
@@ -577,7 +659,7 @@ export function toolCallCategory(call: ToolRunCall): RunCategory | "other" {
   const name = stripOmnigentPrefix(call.name);
   const category = ownValue(RUN_CATEGORIES, name) ?? "other";
   if (category === "shell") {
-    const raw = typeof call.args?.command === "string" ? call.args.command : "";
+    const raw = call.args ? (shellCommandArg(call.args) ?? "") : "";
     const command = unwrapShellCommand(raw);
     if (command === "ls" || command.startsWith("ls ")) return "list";
     if (command === "cat" || command.startsWith("cat ")) return "read";
@@ -629,9 +711,49 @@ function verbOnly(verb: string): ToolTitle {
   return { verb, body: "" };
 }
 
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    const text = asString(value);
+    if (text !== null) return text;
+  }
+  return null;
+}
+
+function shellCommandArg(args: Record<string, unknown>): string | null {
+  return firstString(args.command, args.commandLine, args.CommandLine);
+}
+
+function stripFileUri(raw: string): string {
+  if (!raw.startsWith("file://") || raw === "file://") return raw;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.hostname !== "" && parsed.hostname !== "localhost") return raw;
+    const rawPath = raw.slice("file://".length + parsed.hostname.length);
+    if (rawPath.length === 0) return raw;
+    const decoded = decodeURIComponent(parsed.pathname).replace(/^\/([A-Za-z]:\/)/, "$1");
+    return decoded.length > 0 ? decoded : raw;
+  } catch {
+    return raw;
+  }
+}
+
+function firstSubagentRole(raw: unknown): string | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const first = raw[0];
+  if (first === null || typeof first !== "object") return null;
+  return firstString(
+    Reflect.get(first, "role"),
+    Reflect.get(first, "Role"),
+    Reflect.get(first, "typeName"),
+    Reflect.get(first, "TypeName"),
+  );
+}
+
 function withPath(verb: string, raw: unknown): ToolTitle | null {
   const path = asString(raw);
-  return path === null ? null : { verb, body: path, filePath: path };
+  if (path === null) return null;
+  const normalized = stripFileUri(path);
+  return { verb, body: normalized, filePath: normalized };
 }
 
 function sessionTitle(verb: string, args: Record<string, unknown>): ToolTitle | null {
