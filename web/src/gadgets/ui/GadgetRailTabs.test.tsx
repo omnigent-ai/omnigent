@@ -387,6 +387,34 @@ describe("New gadget tab", () => {
     expect(screen.getByRole("status", { name: "location" })).not.toHaveTextContent("/gadget/9");
   });
 
+  it("tries only the session link again after it fails, not the creation", async () => {
+    const created = gadgetFixture({ id: "9", name: "Onboarding course" });
+    vi.mocked(listGadgetTemplateShares).mockResolvedValue([
+      { id: "course", name: "Onboarding course", owner_email: "alice@example.com" },
+    ]);
+    vi.mocked(createGadgetFromTemplate).mockResolvedValue(created);
+    vi.mocked(linkGadgetToSession).mockResolvedValue([BOARD, REPORT, created]);
+    renderWithGadgets(<Rail conversationId="conv_1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    const content = await screen.findByRole("region", { name: "content" });
+    const card = await within(content).findByRole("button", { name: "Onboarding course" });
+    vi.mocked(linkGadgetToSession).mockRejectedValueOnce(new Error("Link failed"));
+
+    fireEvent.click(card);
+    fireEvent.click(await within(content).findByRole("button", { name: /try again|retry/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Onboarding course" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    expect(createGadgetFromTemplate).toHaveBeenCalledTimes(1);
+    expect(
+      vi.mocked(linkGadgetToSession).mock.calls.filter(([id]) => id === "9").length,
+    ).toBeGreaterThanOrEqual(2);
+  });
+
   it.each(["link", "send"] as const)(
     "tries a build whose %s failed again with the gadget it already made",
     async (failing) => {

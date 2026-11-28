@@ -37,6 +37,9 @@ export function SharedGadgetTemplates({
   });
   const [creating, setCreating] = useState<string | null>(null);
   const [failed, setFailed] = useState<{ share: GadgetTemplateShare; error: unknown } | null>(null);
+  // A gadget made whose next step (showing it beside a session) failed: trying again goes on
+  // from it instead of making another.
+  const [made, setMade] = useState<{ shareId: string; gadget: Gadget } | null>(null);
   if (!enabled || !shares.data?.length) return null;
 
   const create = async (share: GadgetTemplateShare) => {
@@ -44,9 +47,14 @@ export function SharedGadgetTemplates({
     setCreating(share.id);
     setFailed(null);
     try {
-      const gadget = await createGadgetFromTemplate(share.id);
-      invalidateGadgets(queryClient);
+      let gadget = made?.shareId === share.id ? made.gadget : null;
+      if (gadget === null) {
+        gadget = await createGadgetFromTemplate(share.id);
+        setMade({ shareId: share.id, gadget });
+        invalidateGadgets(queryClient);
+      }
       await onCreated(gadget);
+      setMade(null);
     } catch (error) {
       setFailed({ share, error });
     } finally {
