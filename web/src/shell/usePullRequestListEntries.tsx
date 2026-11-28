@@ -717,9 +717,14 @@ export function usePullRequestListEntries(
       }
       // This app can't change a read-only host's PR: it offers only what opens the PR there.
       const readOnly = isReadOnlyHostPullRequest(association.url);
+      // A sub-agent's row reads through the session that links it. This list's changes go
+      // through its own session, which doesn't link the PR, so that row offers none of them.
+      const linkingSession = linkingSessionOf(association.url);
+      const throughList = !linkingSession || linkingSession === conversationId;
+      const changesHere = !readOnly && throughList;
       const rowData = infoByUrl.get(association.url);
       const approveAs =
-        approvesOnHost && entry.pr && !readOnly && rowData
+        approvesOnHost && entry.pr && changesHere && rowData
           ? rowApproveLogin(entry.pr, viewerLogin(rowData.auth))
           : null;
       const approveHead = entry.pr?.head_sha;
@@ -813,7 +818,7 @@ export function usePullRequestListEntries(
         });
       }
       const placed = withExtraRowActions(actions, extraRowActions?.(association.url) ?? []);
-      if (entry.mergeHead && entry.pr && !readOnly) {
+      if (entry.mergeHead && entry.pr && changesHere) {
         const headSha = entry.mergeHead;
         const pr = entry.pr;
         const url = association.url;
@@ -854,16 +859,18 @@ export function usePullRequestListEntries(
       }
       // Ready for review, Convert to draft, then Close or Reopen follow merging, before the
       // PR's copies; Convert and Close ask first.
-      const lifecycleActions = lifecycleActionsFor({
-        url: association.url,
-        number: row.number,
-        paletteName: pullRequestPaletteName(target),
-        pr: entry.pr,
-        onGitHub: hostedOnGitHub(association.provider),
-      });
-      const stateChange = readOnly
-        ? null
-        : rowStateChanges.actionFor(entry, pullRequestPaletteName(target));
+      const lifecycleActions = throughList
+        ? lifecycleActionsFor({
+            url: association.url,
+            number: row.number,
+            paletteName: pullRequestPaletteName(target),
+            pr: entry.pr,
+            onGitHub: hostedOnGitHub(association.provider),
+          })
+        : [];
+      const stateChange = changesHere
+        ? rowStateChanges.actionFor(entry, pullRequestPaletteName(target))
+        : null;
       const copyAt = placed.findIndex((action) => action.section === "copy");
       placed.splice(
         copyAt < 0 ? placed.length : copyAt,
@@ -899,6 +906,7 @@ export function usePullRequestListEntries(
       linker,
       managesSessionLinks,
       ownsSessionTree,
+      linkingSessionOf,
     ],
   );
 

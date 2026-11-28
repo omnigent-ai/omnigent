@@ -1,7 +1,7 @@
 // A row the session's machine won't read because the session doesn't link its PR shows "Not
 // Linked". Only the session's owner is offered Link to This Session, in the row's menu and ⌘K;
 // a refusal from the server shows its message and offers no retry. A sub-agent's row reads
-// through the session that links it.
+// through the session that links it, and offers no change this list's session would send.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
@@ -10,6 +10,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as Permissions from "@/hooks/usePermissions";
 import type * as PullRequestsModule from "@/newPullRequestPage/hooks/usePullRequests";
+import type * as PageRouteModule from "@/pullRequestPage/pullRequestPageRoute";
+import type { Method } from "@/lib/workspaceApi";
 import type * as LinkAvailability from "./linkPullRequestAvailability";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import {
@@ -49,6 +51,24 @@ vi.mock("@/newPullRequestPage/hooks/usePullRequests", async (importOriginal) => 
       const real = actual.usePullRequestInfos(...args);
       return reads.of ? args[1].map((url) => reads.of!(url)) : real;
     },
+  };
+});
+
+// Where a case says so, every session's host serves every change.
+const hosts = vi.hoisted(() => ({ serveAll: false }));
+vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => {
+  const actual = await importOriginal<typeof PageRouteModule>();
+  const route = { route: "server", key: "server:route", served: new Set<string>() };
+  return {
+    ...actual,
+    usePullRequestPageRoute: (sessionId: string) =>
+      hosts.serveAll ? route : actual.usePullRequestPageRoute(sessionId),
+    usePullRequestMethodServed: (sessionId: string, method: Method) =>
+      hosts.serveAll || actual.usePullRequestMethodServed(sessionId, method),
+    hostChangeRoute: (sessionId: string, method: Method) =>
+      hosts.serveAll
+        ? { conversationId: sessionId, key: route.key }
+        : actual.hostChangeRoute(sessionId, method),
   };
 });
 
@@ -153,6 +173,7 @@ function renderList(over: Partial<PullRequestListProps> = {}, client?: QueryClie
 
 afterEach(() => {
   reads.of = undefined;
+  hosts.serveAll = false;
   usePullRequestAttachStore.setState({ attempts: {}, drafts: {}, lastAttached: null });
   vi.unstubAllGlobals();
 });
@@ -239,6 +260,45 @@ it("reads a sub-agent's row through the session that links it", () => {
     .filter((key) => key.includes(PR));
   expect(rowKeys).toContainEqual(expect.arrayContaining(["pr-page-github-info", CHILD.id, PR]));
   expect(rowKeys.some((key) => key[1] === SESSION)).toBe(false);
+});
+
+it("offers a sub-agent's row no change, which this list's session would send and be refused", () => {
+  reads.of = loadedRow;
+  hosts.serveAll = true;
+  const changes = (sessionSources?: Map<string, PullRequestSessionSource>) => {
+    const { result } = renderHook(
+      () =>
+        usePullRequestListEntries(
+          {
+            conversationId: SESSION,
+            active: false,
+            associations: [association],
+            hostOffline: false,
+            sandboxAsleep: false,
+            onSelect: vi.fn(),
+            onUnlink: vi.fn(),
+            unlinkPending: false,
+            sessionSources,
+          },
+          { lifecycleOnRows: true, approveOnRows: true },
+        ),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider
+            client={new QueryClient({ defaultOptions: { queries: { enabled: false } } })}
+          >
+            <SidebarDataProvider>{children}</SidebarDataProvider>
+          </QueryClientProvider>
+        ),
+      },
+    );
+    const ids = result.current.actionsFor(result.current.entries[0]!).map((action) => action.id);
+    return ids.filter((id) => id === "close" || id.startsWith("lifecycle:"));
+  };
+
+  expect(changes()).toEqual(expect.arrayContaining(["lifecycle:convert_to_draft", "close"]));
+  const source: PullRequestSessionSource = { session: CHILD, alsoIn: [] };
+  expect(changes(new Map([[PR, source]]))).toEqual([]);
 });
 
 /** The row as the list page draws it, with its actions. */
