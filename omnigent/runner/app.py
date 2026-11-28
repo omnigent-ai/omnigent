@@ -4500,7 +4500,8 @@ def create_runner_app(
             "hermes-native",
         }:
             return
-        if status == "idle" and harness in {"codex-native", "antigravity-native"}:
+        # Their readers report when the native turn actually finishes.
+        if status in ("idle", "waiting") and harness in {"codex-native", "antigravity-native"}:
             return
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:

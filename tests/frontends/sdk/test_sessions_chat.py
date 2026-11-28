@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
@@ -560,18 +560,21 @@ class _StalledNativeNamespace(_FakeNamespace):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("snapshot_status", "times_out"), [("running", True), ("idle", False), ("waiting", False)]
+    ("snapshot_status", "expected_code"),
+    [("running", "turn_timeout"), ("failed", "executor_error"), ("idle", None), ("waiting", None)],
 )
 async def test_send_bounds_the_wait_after_delivery_ack(
-    monkeypatch: pytest.MonkeyPatch, snapshot_status: str, times_out: bool
+    monkeypatch: pytest.MonkeyPatch, snapshot_status: str, expected_code: str | None
 ) -> None:
-    """A harness still running at the settle deadline fails the turn; a settled one ends it."""
+    """At the settle deadline, a running or failed snapshot raises; a settled one ends the turn."""
     from omnigent_client._errors import OmnigentError
 
     monkeypatch.setattr("omnigent_client._sessions_chat._DELIVERY_SETTLE_TIMEOUT_S", 0.1)
-    ns = _StalledNativeNamespace(
-        stream_scripts=[], session_obj=_make_session(status=snapshot_status)
+    snapshot = replace(
+        _make_session(status=snapshot_status),
+        last_task_error={"code": "executor_error", "message": "agy exited"},
     )
+    ns = _StalledNativeNamespace(stream_scripts=[], session_obj=snapshot)
     chat = SessionsChat(
         namespace=ns, files_uploader=None, files_getter=None, session=_make_session()
     )
@@ -581,10 +584,10 @@ async def test_send_bounds_the_wait_after_delivery_ack(
         async for event in chat.send("hi"):
             yielded.append(event)
 
-    if times_out:
+    if expected_code is not None:
         with pytest.raises(OmnigentError) as raised:
             await asyncio.wait_for(drain(), timeout=5)
-        assert raised.value.code == "turn_timeout"
+        assert raised.value.code == expected_code
     else:
         await asyncio.wait_for(drain(), timeout=5)
     assert [event.type for event in yielded[:2]] == ["session.status", "response.completed"]

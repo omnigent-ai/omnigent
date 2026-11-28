@@ -563,9 +563,9 @@ class SessionsChat:
             :meth:`SessionsNamespace.stream`.
         :raises OmnigentError: If the underlying ``post_event`` or
             ``stream`` call fails (e.g. 404 if the session was
-            deleted out from under us), or with code ``turn_timeout``
-            if the session is still running 20 minutes after such a
-            delivery acknowledgement.
+            deleted out from under us), if the turn fails, or with code
+            ``turn_timeout`` if the session is still running 20 minutes
+            after such a delivery acknowledgement.
         :raises RuntimeError: If ``files`` is non-empty but no
             ``files_uploader`` was wired at construction.
         :raises ValueError: If the agent's spec declares a
@@ -675,7 +675,13 @@ class SessionsChat:
                     if not settle_timeout.expired():
                         raise
                     # The settling status event may have been missed; trust a fresh snapshot.
-                    if (await self.refresh()).status != "running":
+                    snapshot = await self.refresh()
+                    if snapshot.status == "failed":
+                        error = snapshot.last_task_error or {}
+                        raise OmnigentError(
+                            error.get("message") or "turn failed", code=error.get("code")
+                        ) from None
+                    if snapshot.status != "running":
                         return
                     raise OmnigentError(
                         f"session still running {_DELIVERY_SETTLE_TIMEOUT_S:.0f}s after "
