@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
+import psutil
 import pytest
 
 from omnigent.harnesses.claude_native import (
@@ -108,6 +109,7 @@ def _native_history_snapshot(config: Path) -> dict[str, object]:
         "launch-paste-diagnostic",
         "launch-framed-paste-diagnostic",
         "launch-framed-history-diagnostic",
+        "launch-framed-resubmit-diagnostic",
     ],
 )
 @pytest.mark.parametrize("editor_source", ["configured", "configured-code", "default"])
@@ -125,7 +127,9 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     framed_diagnostic = draft_mode in {
         "launch-framed-paste-diagnostic",
         "launch-framed-history-diagnostic",
+        "launch-framed-resubmit-diagnostic",
     }
+    resubmit_diagnostic = draft_mode == "launch-framed-resubmit-diagnostic"
     paste_diagnostic = draft_mode == "launch-paste-diagnostic" or framed_diagnostic
     launch_model = (
         "draft-initial-model" if draft_mode != "editor" else _PINNED_CLAUDE_MODELS["sonnet"]
@@ -145,6 +149,7 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
     observed = tmp_path / "editor-observed.jsonl"
     invoked = tmp_path / "editor-invoked.jsonl"
     hook_record = tmp_path / "blocked-prompt.json"
+    hook_submissions = tmp_path / "hook-submissions.jsonl"
     owner_source = hashlib.sha256(Path(editor_owner.__file__).read_bytes()).hexdigest()
     handoff_source = hashlib.sha256(Path(editor_handoff.__file__).read_bytes()).hexdigest()
     control_source = hashlib.sha256(Path(editor_control.__file__).read_bytes()).hexdigest()
@@ -210,6 +215,8 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "record['native_context'] = native_context()\n"
         "record['native_process'] = native_process_record()\n"
         "record['owner_binding'] = asdict(binding) if binding is not None else None\n"
+        f"with Path({str(hook_submissions)!r}).open('a') as stream:\n"
+        "    stream.write(json.dumps(record) + '\\n')\n"
         "temporary.write_text(json.dumps(record))\n"
         "temporary.replace(destination)\n"
         "print(json.dumps({'decision': 'block', "
@@ -315,6 +322,9 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
         "current_owner=current_owner, cancelled=lambda: request['cancelled'])\n"
         "with observed.open('a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps({'kind': 'manual', 'content': content, 'accepted': accepted, "
+        "'after_read': source.read_bytes().decode('utf-8'), "
+        "'native_process': native_process_record(), "
+        "'observer_process': {'pid': os.getpid(), 'created_at': psutil.Process().create_time()}, "
         "'observe_only': request.get('observe_only', False), "
         "'program': program, 'native_context': native_context()}) + '\\n')\n"
         "if not accepted or request.get('observe_only', False):\n"
@@ -637,6 +647,174 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     assert saved_settings.read_bytes() == saved_contents
                     assert get_mock_message_requests(isolated_mock_llm_server_url) == []
                     assert not controller_observations
+                    if resubmit_diagnostic:
+                        initial_export = observations()[-1]
+                        assert (
+                            initial_export["content"]
+                            == initial_export["after_read"]
+                            == typed_draft
+                        )
+                        assert initial_export["accepted"] is False
+
+                        def submissions() -> list[dict[str, object]]:
+                            try:
+                                return [
+                                    json.loads(line)
+                                    for line in hook_submissions.read_text().splitlines()
+                                ]
+                            except (FileNotFoundError, json.JSONDecodeError):
+                                return []
+
+                        def wait_observer_exit(observation: dict[str, object]) -> None:
+                            identity = observation["observer_process"]
+                            assert isinstance(identity, dict)
+
+                            def exited() -> bool:
+                                try:
+                                    return (
+                                        psutil.Process(identity["pid"]).create_time()
+                                        != identity["created_at"]
+                                    )
+                                except psutil.NoSuchProcess:
+                                    return True
+
+                            poll_until(exited, timeout_s=10)
+
+                        wait_observer_exit(initial_export)
+
+                        def live_picker():
+                            return model_switch._picker(pane())
+
+                        def observe_native_draft(kind: str) -> str:
+                            count = len(observations())
+                            command("send-keys", "-t", target, "C-g")
+                            poll_until(lambda: len(observations()) == count + 1, timeout_s=15)
+                            current = observations()[-1]
+                            assert current["observe_only"] is True
+                            assert current["accepted"] is False
+                            assert current["content"] == current["after_read"]
+                            assert current["native_process"] == payload["native_process"]
+                            wait_observer_exit(current)
+                            picker_observations.append(
+                                {"kind": kind, "export": current, "pane": pane()}
+                            )
+                            poll_until(
+                                lambda: model_switch._draft(pane()) is not None,
+                                timeout_s=10,
+                            )
+                            return str(current["content"])
+
+                        status_before = (bridge_dir / bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns
+                        command("send-keys", "-t", target, "M-p")
+                        poll_until(lambda: live_picker() is not None, timeout_s=10)
+                        for _ in range(4):
+                            current = live_picker()
+                            assert current is not None
+                            rows = [
+                                row
+                                for row in current.rows
+                                if model_switch._row_label(row) == "Draft target"
+                            ]
+                            assert len(rows) == 1
+                            if current.selected.number == rows[0].number:
+                                break
+                            command(
+                                "send-keys",
+                                "-t",
+                                target,
+                                "Up" if current.selected.number > rows[0].number else "Down",
+                            )
+                            poll_until(
+                                lambda current=current: (
+                                    (new := live_picker()) is not None
+                                    and new.selected != current.selected
+                                ),
+                                timeout_s=5,
+                            )
+                        else:
+                            pytest.fail("Could not select the native diagnostic model")
+                        picker_observations.append(
+                            {"kind": "native-resubmit-picker-before-commit", "pane": pane()}
+                        )
+                        command("send-keys", "-t", target, "s")
+                        poll_until(lambda: live_picker() is None, timeout_s=10)
+
+                        def selected_model() -> bool:
+                            raw = bridge._read_json_file(bridge_dir / bridge.CONTEXT_RAW_FILE)
+                            model = raw.get("model")
+                            return (
+                                raw.get("session_id") == payload["session_id"]
+                                and raw.get("version") == "2.1.323"
+                                and isinstance(model, dict)
+                                and model.get("id") == "draft-test-model"
+                                and (bridge_dir / bridge.CONTEXT_RAW_FILE).stat().st_mtime_ns
+                                > status_before
+                            )
+
+                        poll_until(selected_model, timeout_s=15)
+                        picker_observations.append(
+                            {
+                                "kind": "native-resubmit-selected-status",
+                                "raw": bridge._read_json_file(
+                                    bridge_dir / bridge.CONTEXT_RAW_FILE
+                                ),
+                                "after_ns": status_before,
+                                "mtime_ns": (bridge_dir / bridge.CONTEXT_RAW_FILE)
+                                .stat()
+                                .st_mtime_ns,
+                            }
+                        )
+                        command("send-keys", "-t", target, "M-p")
+                        poll_until(lambda: live_picker() is not None, timeout_s=10)
+                        current = live_picker()
+                        assert current is not None
+                        checked = [
+                            row for row in current.rows if model_switch._row_is_current(row)
+                        ]
+                        assert (
+                            len(checked) == 1
+                            and model_switch._row_label(checked[0]) == "Draft target"
+                        )
+                        picker_observations.append(
+                            {"kind": "native-resubmit-current-picker", "pane": pane()}
+                        )
+                        command("send-keys", "-t", target, "Escape")
+                        poll_until(lambda: live_picker() is None, timeout_s=10)
+                        assert observe_native_draft("before-native-resubmit") == typed_draft
+                        assert len(submissions()) == 1
+                        command("send-keys", "-t", target, "Enter")
+                        poll_until(lambda: len(submissions()) == 2, timeout_s=15)
+                        second = submissions()[-1]
+                        assert second["prompt"] == draft
+                        assert second["session_id"] == payload["session_id"]
+                        assert second["native_process"] == payload["native_process"]
+                        assert second["owner_binding"]["owner"] == owner
+                        poll_until(
+                            lambda: model_switch._draft(pane()) is not None,
+                            timeout_s=10,
+                        )
+                        assert observe_native_draft("after-native-resubmit") == typed_draft
+
+                        changed_suffix = " deliberate-native-draft-edit"
+                        command("send-keys", "-t", target, "-l", changed_suffix)
+                        command("send-keys", "-t", target, "Enter")
+                        poll_until(lambda: len(submissions()) == 3, timeout_s=15)
+                        changed = submissions()[-1]
+                        assert changed["prompt"] != draft
+                        assert changed_suffix in str(changed["prompt"])
+                        assert changed["session_id"] == payload["session_id"]
+                        assert changed["native_process"] == payload["native_process"]
+                        assert changed["owner_binding"]["owner"] == owner
+                        poll_until(
+                            lambda: model_switch._draft(pane()) is not None,
+                            timeout_s=10,
+                        )
+                        changed_export = observe_native_draft("after-edited-native-resubmit")
+                        assert changed_export != typed_draft and changed_suffix in changed_export
+                        assert selected_model()
+                        assert saved_settings.read_bytes() == saved_contents
+                        assert get_mock_message_requests(isolated_mock_llm_server_url) == []
+                        assert not controller_observations
                     return
                 session_id = bridge.read_active_session_id(bridge_dir)
                 assert session_id is not None
@@ -991,6 +1169,11 @@ def test_claude_external_editor_refuses_mismatches_without_mutating_the_draft(
                     "blocked_hook": json.loads(hook_record.read_text())
                     if hook_record.exists()
                     else None,
+                    "hook_submissions": [
+                        json.loads(line) for line in hook_submissions.read_text().splitlines()
+                    ]
+                    if hook_submissions.exists()
+                    else [],
                     "editor_observations": observations(),
                     "editor_invocations": [
                         json.loads(line) for line in invoked.read_text().splitlines()
