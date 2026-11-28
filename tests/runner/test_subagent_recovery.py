@@ -33,6 +33,7 @@ def _isolated_work_registries(monkeypatch: pytest.MonkeyPatch) -> None:
         "_subagent_recovery_locks",
         "_in_flight_send_locks",
         "_drained_delivered_subagent_children",
+        "_drained_subagent_work",
         "_subagent_recovery_done",
     ):
         original = getattr(subagent_work, name)

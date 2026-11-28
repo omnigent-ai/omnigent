@@ -210,14 +210,18 @@ from omnigent.runner.subagent_work import (
     _SubagentWorkEntry,
     _truncate_child_preview,
     arm_subagent_child_start_timeout,
+    current_subagent_work_id,
     get_subagent_work,
     is_codex_native_subagent_wrapper,
     latest_wake_eligible_subagent_work,
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    note_subagent_child_messaged,
+    note_subagent_child_resumed,
     note_subagent_child_start_reported,
     note_subagent_child_turn_settled,
+    release_subagent_child_messages,
     unregister_child_session,
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
@@ -2286,6 +2290,9 @@ def create_runner_app(
             event["blocked_on"] = blocked_on
         if inferred:
             event["inferred"] = True
+        elif status == "running":
+            # A native child can start a turn on its own after reporting its result.
+            note_subagent_child_resumed(session_id)
         _publish_event(session_id, event)
         if wire_status != status:
             # Only the server's copy is downgraded: the agent still works in
@@ -5329,7 +5336,11 @@ def create_runner_app(
         if waiter is not None or _session_harness_name(session_id) == "claude-native":
             # Cancel queued work even if the terminal control fails; restoring it
             # could restart work the user explicitly asked to stop.
-            _session_message_buffers.pop(session_id, None)
+            discarded = _session_message_buffers.pop(session_id, None) or []
+            release_subagent_child_messages(
+                session_id,
+                sum(1 for body in discarded if getattr(body, "holds_child_turn", False)),
+            )
         if waiter is not None:
             waiter.cancel()
 
@@ -5860,6 +5871,7 @@ def create_runner_app(
         only_if_work_id: str | None = None,
         confirmed_completion: bool = False,
         confirmed_cancellation: bool = False,
+        assumed: bool = False,
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(
             child_session_id,
@@ -5868,6 +5880,7 @@ def create_runner_app(
             only_if_work_id=only_if_work_id,
             confirmed_completion=confirmed_completion,
             confirmed_cancellation=confirmed_cancellation,
+            assumed=assumed,
         )
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
@@ -5895,10 +5908,6 @@ def create_runner_app(
     _recover_undrained_subagent_results = _subagent_recovery.recover_undrained_subagent_results
     _start_subagent_recovery = _subagent_recovery.start_subagent_recovery
 
-    def _subagent_work_id_for_session(conv_id: str) -> str | None:
-        entry = get_subagent_work(conv_id)
-        return entry.work_id if entry is not None else None
-
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,
         resource_registry=resource_registry,
@@ -5908,7 +5917,7 @@ def create_runner_app(
         codex_bridge_state_for_session=_codex_native_bridge_state_and_dir_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
-        subagent_work_id_for_session=_subagent_work_id_for_session,
+        subagent_work_id_for_session=current_subagent_work_id,
     )
 
     def _discard_comment_relay(session_id: str, relay: ClaudeNativeToolRelay) -> None:
@@ -8418,6 +8427,7 @@ def create_runner_app(
                         conversation_id,
                         [],
                     ).append(message_body)
+                    message_body.holds_child_turn = note_subagent_child_messaged(conversation_id)
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
@@ -8475,6 +8485,9 @@ def create_runner_app(
                         _session_message_buffers.setdefault(conversation_id, []).append(
                             message_body
                         )
+                        message_body.holds_child_turn = note_subagent_child_messaged(
+                            conversation_id
+                        )
                         _start_claude_prompt_waiter(conversation_id, pending_bridge_dir)
                         _logger.info(
                             "post_session_events: buffering message for pending Claude prompt "
@@ -8507,6 +8520,7 @@ def create_runner_app(
                     _session_histories[conversation_id] = loaded
 
                 _begin_turn_slot(conversation_id, message_body)
+                message_body.holds_child_turn = note_subagent_child_messaged(conversation_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -8596,6 +8610,8 @@ def create_runner_app(
                 # them here too; the idle watchdog reads them for native turns.
                 _record_native_pane_status(conversation_id, status)
                 resource_registry.note_external_session_status(conversation_id, status)
+                if status == "running":
+                    note_subagent_child_resumed(conversation_id)
                 if status in ("running", "waiting"):
                     note_subagent_child_start_reported(
                         conversation_id,
@@ -8627,15 +8643,13 @@ def create_runner_app(
                 # dispatch: the turn stopped early, so report ``cancelled``
                 # with whatever output the edge carried instead of guessing
                 # ``completed`` — or discarding a genuine result. Resolve the
-                # pending interrupt only when it belongs to the dispatch now
-                # registered: a stale record (its dispatch exited, or a new send
+                # pending interrupt only when it belongs to the child's current
+                # (registered or drained) dispatch: a stale record (a new send
                 # reused this child) must not capture this idle — for a legacy
                 # harness that idle is the NEW dispatch's completion.
-                _current_entry = get_subagent_work(conversation_id)
                 interrupt_pending, interrupt_work_id = (
                     _native_interrupt_runner.resolve_pending_interrupt(
-                        conversation_id,
-                        _current_entry.work_id if _current_entry is not None else None,
+                        conversation_id, current_subagent_work_id(conversation_id)
                     )
                 )
             ambiguous_idle = (

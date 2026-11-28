@@ -16,7 +16,7 @@ import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from fastapi.responses import JSONResponse
@@ -152,6 +152,16 @@ class _SubagentWorkEntry:
     :param awaiting_child_start_since: Unix timestamp when runner delivery
         finalization first recorded a validated native receipt, or ``None``
         when no turn-start report is awaited.
+    :param later_turn: The turn the child is running after this dispatch's
+        result reached the parent: ``"self_started"`` when nobody sent it, so
+        its confirmed result is delivered too, or ``"answering_message"``.
+        ``None`` when no such turn is open.
+    :param later_turn_started: Whether the child started a turn after this
+        dispatch's result reached the parent, so a repeated terminal report can
+        no longer revise the dispatch's own outcome.
+    :param message_turns_pending: How many messages were forwarded to the child
+        after this dispatch's result reached the parent without their answering
+        turns starting, so those turns are not taken as self-started.
     """
 
     parent_session_id: str
@@ -173,6 +183,9 @@ class _SubagentWorkEntry:
     child_start_response_id: str | None = None
     awaiting_child_start_since: float | None = None
     native_acceptance: NativeTurnAcceptance | None = None
+    later_turn: Literal["self_started", "answering_message"] | None = None
+    later_turn_started: bool = False
+    message_turns_pending: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -226,6 +239,9 @@ _children_accepted_turns: dict[str, _AcceptedChildTurn] = {}
 # Pending request evidence survives settlement until delivery finalization or deletion.
 _pending_child_acceptances: dict[str, set[_ChildAcceptanceRequest]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# Delivered dispatches the parent drained, kept so a turn the child starts on its
+# own can still report under the same dispatch. A new send or teardown clears it.
+_drained_subagent_work: dict[str, _SubagentWorkEntry] = {}
 # Optimistic (grace-timer) cancellations, delivered then drained, kept so a
 # surviving child's confirmed completion can still correct the parent under the
 # same dispatch. Confirmed aborts are not kept; a new send or teardown clears it.
@@ -350,6 +366,7 @@ def register_subagent_work(
         created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
+    _drained_subagent_work.pop(child_session_id, None)
     _provisional_cancelled_subagent_work.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
@@ -383,6 +400,97 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
+
+
+def note_subagent_child_resumed(child_session_id: str) -> None:
+    """
+    Record a turn the child started after its result reached the parent.
+
+    The turn answers the oldest forwarded message still waiting for one. Otherwise
+    nobody sent it, for example when one of the child's background agents
+    finishes, and its confirmed terminal edge is delivered. Running edges while a
+    turn is open belong to that turn.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: None.
+    """
+    entry = _delivered_subagent_entry(child_session_id)
+    if entry is None or entry.later_turn is not None:
+        return
+    entry.later_turn_started = True
+    if entry.message_turns_pending:
+        entry.message_turns_pending -= 1
+        entry.later_turn = "answering_message"
+    else:
+        entry.later_turn = "self_started"
+
+
+def note_subagent_child_messaged(child_session_id: str) -> bool:
+    """
+    Record a message queued for a child whose result reached the parent.
+
+    The turn answering it belongs to the message's sender, such as a user or a
+    peer session, so it does not reopen the dispatch. Claude's turn edges carry
+    no prompt identity, so each message claims the next turn to start.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: Whether the message now holds a turn, to release if it is discarded.
+    """
+    entry = _delivered_subagent_entry(child_session_id)
+    if entry is None:
+        return False
+    entry.message_turns_pending += 1
+    return True
+
+
+def release_subagent_child_messages(child_session_id: str, count: int) -> None:
+    """
+    Release the turns held by messages discarded before they reached the child.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :param count: Number of discarded messages that held a turn.
+    :returns: None.
+    """
+    entry = _delivered_subagent_entry(child_session_id)
+    if entry is not None and count:
+        entry.message_turns_pending = max(0, entry.message_turns_pending - count)
+
+
+def current_subagent_work_id(child_session_id: str) -> str | None:
+    """
+    Return the ``work_id`` of the child's registered dispatch, else its drained one.
+
+    A drained dispatch still owns the turns its child starts afterwards, so an
+    interrupt of such a turn is bound to it.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The dispatch's ``work_id``, or ``None`` when none is tracked.
+    """
+    entry = _subagent_work_by_child.get(child_session_id) or _drained_subagent_work.get(
+        child_session_id
+    )
+    return entry.work_id if entry is not None else None
+
+
+def _delivered_subagent_entry(child_session_id: str) -> _SubagentWorkEntry | None:
+    """
+    Return the child's registered or drained dispatch whose result reached the parent.
+
+    An unconfirmed cancellation is excluded: the child may still be running that
+    dispatch, and only a confirmed completion overturns it.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is None:
+        entry = _drained_subagent_work.get(child_session_id)
+    if (
+        entry is not None
+        and entry.delivered
+        and entry.status in _SUBAGENT_TERMINAL_STATUSES
+        and not entry.launch_timed_out
+        and (entry.status != "cancelled" or entry.cancellation_confirmed)
+    ):
+        return entry
+    return None
 
 
 def begin_subagent_child_acceptance(child_session_id: str) -> _ChildAcceptanceRequest:
@@ -611,6 +719,7 @@ def unregister_subagent_work(
         return
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
+        _drained_subagent_work[child_session_id] = entry
         if entry.status == "cancelled" and not entry.cancellation_confirmed:
             # Keep an optimistic cancellation so a surviving child's confirmed
             # completion can still correct this drained record.
@@ -656,11 +765,13 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
             finish_subagent_child_acceptance(request)
         note_subagent_child_turn_settled(child_id)
     _drained_delivered_subagent_children.discard(session_id)
+    _drained_subagent_work.pop(session_id, None)
     _provisional_cancelled_subagent_work.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
+        _drained_subagent_work.pop(child_id, None)
         _provisional_cancelled_subagent_work.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
     # Drained optimistic cancellations are retained keyed by child id, outside the
@@ -669,6 +780,9 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     for child_id, provisional in list(_provisional_cancelled_subagent_work.items()):
         if provisional.parent_session_id == session_id:
             _provisional_cancelled_subagent_work.pop(child_id, None)
+    for child_id, drained in list(_drained_subagent_work.items()):
+        if drained.parent_session_id == session_id:
+            _drained_subagent_work.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
 
@@ -928,15 +1042,16 @@ def mark_subagent_work_terminal(
     only_if_work_id: str | None = None,
     confirmed_completion: bool = False,
     confirmed_cancellation: bool = False,
+    assumed: bool = False,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
 
     A delivered terminal status is final: it is not overturned by a later
-    report for the same child (the ``failed``-over-``completed`` edge-race
-    exception aside). Distinguishing a confirmed completion from a bare
-    quiescence idle is the caller's job (the events route only reports
-    ``completed`` for a confirmed turn-end or a legacy harness).
+    report for the same child (the ``failed``-over-``completed`` edge race and
+    a turn the child later starts itself aside). Distinguishing a confirmed
+    completion from a bare quiescence idle is the caller's job (the events route
+    only reports ``completed`` for a confirmed turn-end or a legacy harness).
 
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :param status: Terminal status: ``"completed"``, ``"failed"``, or
@@ -959,6 +1074,9 @@ def mark_subagent_work_terminal(
         confirmed kill. It marks the dispatch's cancellation final (including
         a delivered or drained provisional entry) so a late survivor
         completion can no longer correct it.
+    :param assumed: Whether this report is a guess made without any terminal
+        edge, e.g. an interrupt's grace-timer cancel. It never ends a turn the
+        child started after its dispatch's result reached the parent.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
@@ -986,6 +1104,14 @@ def mark_subagent_work_terminal(
                 _provisional_cancelled_subagent_work.pop(child_session_id, None)
             elif corrects_cancellation:
                 return _deliver_corrected_completion(provisional, output)
+        drained = _drained_subagent_work.get(child_session_id)
+        if (
+            drained is not None
+            and not assumed
+            and (only_if_work_id is None or drained.work_id == only_if_work_id)
+            and _end_turn_after_delivery(drained, status, confirmed_completion)
+        ):
+            return _deliver_resumed_turn(drained, status=status, output=output)
         if child_session_id in _drained_delivered_subagent_children:
             return _SubagentDeliveryAck(
                 entry=None,
@@ -1023,6 +1149,25 @@ def mark_subagent_work_terminal(
             # The child survived an optimistic cancellation and finished; its
             # confirmed completion corrects the already-delivered record.
             return _deliver_corrected_completion(entry, output)
+        later_turn = (
+            _end_turn_after_delivery(entry, status, confirmed_completion)
+            if entry.delivered and not assumed
+            else None
+        )
+        if later_turn:
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.corrected_status = None
+            entry.delivered = False
+            return _deliver_subagent_completion(entry)
+        if later_turn is False:
+            return _SubagentDeliveryAck(
+                entry=entry,
+                delivered=True,
+                delivered_now=False,
+                reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+            )
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
@@ -1104,6 +1249,63 @@ def _deliver_corrected_completion(
     entry.output = output
     entry.completed_at = time.time()
     entry.corrected_status = cancelled_entry.status
+    return _deliver_subagent_completion(entry)
+
+
+def _end_turn_after_delivery(
+    entry: _SubagentWorkEntry, status: str, confirmed_completion: bool
+) -> bool | None:
+    """
+    Close the turn the child started after its dispatch's result reached the parent.
+
+    Only a self-started turn's failure or confirmed completion is delivered. Once
+    a later turn has started, a report with no turn open repeats an earlier end.
+
+    :param entry: The delivered dispatch for the reporting child.
+    :param status: Reported terminal status, e.g. ``"completed"``.
+    :param confirmed_completion: Whether a ``completed`` report is a confirmed turn end.
+    :returns: ``True`` to deliver the report as a self-started turn's result,
+        ``False`` when it closed a turn the parent does not receive or repeats an
+        earlier end, or ``None`` when the child started no turn since delivery, so
+        the report concerns the dispatch itself.
+    """
+    turn = entry.later_turn
+    if turn is None:
+        return False if entry.later_turn_started else None
+    entry.later_turn = None
+    return turn == "self_started" and (
+        status == "failed" or (status == "completed" and confirmed_completion)
+    )
+
+
+def _deliver_resumed_turn(
+    drained_entry: _SubagentWorkEntry, *, status: str, output: str | None
+) -> _SubagentDeliveryAck:
+    """
+    Deliver a self-started turn's result under the drained dispatch's ``work_id``.
+
+    Reusing the id keeps the durable delivered receipt matching the dispatch.
+
+    :param drained_entry: The delivered, drained entry whose child resumed.
+    :param status: Terminal status of the resumed turn, e.g. ``"completed"``.
+    :param output: The resumed turn's output or error text.
+    :returns: Delivery acknowledgement for the resumed turn.
+    """
+    entry = register_subagent_work(
+        parent_session_id=drained_entry.parent_session_id,
+        child_session_id=drained_entry.child_session_id,
+        agent=drained_entry.agent,
+        title=drained_entry.title,
+        wrapper_label=drained_entry.wrapper_label,
+        created_by=drained_entry.created_by,
+        work_id=drained_entry.work_id,
+    )
+    entry.status = status
+    entry.output = output
+    entry.completed_at = time.time()
+    entry.child_start_reported = True
+    entry.later_turn_started = True
+    entry.message_turns_pending = drained_entry.message_turns_pending
     return _deliver_subagent_completion(entry)
 
 

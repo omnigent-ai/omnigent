@@ -610,6 +610,588 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
         subagent_work._provisional_cancelled_subagent_work.pop(rig.child_id, None)
 
 
+async def _deliver_first_result(rig: _Rig, client: Any, *, drain: bool) -> str:
+    """Complete the dispatched turn, optionally drain it, and return its work id."""
+    from omnigent.runner.tool_dispatch import _cleanup_drained_subagent_work
+
+    await rig.create_child_session(client)
+    resp = await rig.post_status(
+        client, {"status": "idle", "turn_completed": True, "output": "the verdict"}
+    )
+    assert resp.status_code == 204, resp.text
+    first = rig.drained()
+    assert [(item["status"], item["output"]) for item in first] == [("completed", "the verdict")]
+    if drain:
+        for payload in first:
+            await _cleanup_drained_subagent_work(payload, server_client=None)
+        assert subagent_work.get_subagent_work(rig.child_id) is None
+    return str(first[0]["work_id"])
+
+
+def _forget_drained_child(child_id: str) -> None:
+    subagent_work._drained_delivered_subagent_children.discard(child_id)
+    subagent_work._drained_subagent_work.pop(child_id, None)
+
+
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.parametrize(
+    ("resumed_end", "expected"),
+    [
+        (
+            {"status": "idle", "turn_completed": True, "output": "open the PR?"},
+            ("completed", "open the PR?"),
+        ),
+        ({"status": "failed", "output": "Error: rate limited"}, ("failed", "Error: rate limited")),
+    ],
+    ids=["completed", "failed"],
+)
+@pytest.mark.asyncio
+async def test_self_resumed_turn_result_reaches_parent_once(
+    drain_first: bool, resumed_end: dict[str, Any], expected: tuple[str, str]
+) -> None:
+    """A turn the child starts on its own reports under the original dispatch.
+
+    Claude Code resumes a worker when one of its background agents finishes. The
+    resumed turn's end must reach the parent whether or not the parent already
+    drained the first result, and a retried edge must not deliver it twice.
+    """
+    rig = _Rig("claude-native")
+    subagent_work._subagent_work_by_child[rig.child_id].wrapper_label = "claude-native-ui"
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            for data in ({"status": "running"}, resumed_end, resumed_end):
+                resp = await rig.post_status(client, data)
+                assert resp.status_code == 204, resp.text
+        resumed = rig.drained()
+        assert [(item["status"], item["output"], item["work_id"]) for item in resumed] == [
+            (*expected, work_id)
+        ]
+        entry = subagent_work.get_subagent_work(rig.child_id)
+        assert entry is not None
+        assert (entry.work_id, entry.wrapper_label) == (work_id, "claude-native-ui")
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize(
+    "edges", [[], [{"status": "waiting"}]], ids=["retried-stop", "background-hold"]
+)
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_delivered_result_is_not_resent_without_a_new_turn(
+    edges: list[dict[str, Any]], drain_first: bool
+) -> None:
+    """Without a new running turn, a repeated confirmed Stop is the same result."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            await _deliver_first_result(rig, client, drain=drain_first)
+            for data in [
+                *edges,
+                {"status": "idle", "turn_completed": True, "output": "the verdict"},
+            ]:
+                resp = await rig.post_status(client, data)
+                assert resp.status_code == 204, resp.text
+        assert rig.drained() == []
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize("inferred", [False, True], ids=["pane-busy", "inferred"])
+@pytest.mark.asyncio
+async def test_pane_running_edge_reopens_drained_dispatch(inferred: bool) -> None:
+    """The pane watcher's busy edge, not an inferred one, marks a self-started turn."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            await _deliver_first_result(rig, client, drain=True)
+            publish = rig.app.state.session_resource_registry._session_status_publisher
+            publish(rig.child_id, "running", None, inferred=inferred)
+            resp = await rig.post_status(
+                client, {"status": "idle", "turn_completed": True, "output": "open the PR?"}
+            )
+            assert resp.status_code == 204, resp.text
+        outputs = [item["output"] for item in rig.drained()]
+        assert outputs == ([] if inferred else ["open the PR?"])
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+async def _forward_peer_message(rig: _Rig, client: Any) -> None:
+    """Forward a peer's message to the child and let the runner hand it to the pane."""
+    resp = await client.post(
+        f"/v1/sessions/{rig.child_id}/events",
+        json={
+            "type": "message",
+            "content": [{"type": "input_text", "text": "[Message from session s]\nhi"}],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    await poll_until_async(lambda: rig.child_id not in rig.app.state.active_turns, timeout_s=5)
+
+
+async def _post_statuses(rig: _Rig, client: Any, *edges: dict[str, Any]) -> None:
+    for data in edges:
+        resp = await rig.post_status(client, data)
+        assert resp.status_code == 204, resp.text
+
+
+_SELF_STARTED_TURN = (
+    {"status": "running"},
+    {"status": "idle", "turn_completed": True, "output": "open the PR?"},
+)
+
+
+@pytest.mark.parametrize(
+    "answer_end",
+    [
+        {"status": "idle", "turn_completed": True, "output": "hello, peer"},
+        {"status": "failed", "output": "Error: rate limited"},
+    ],
+    ids=["completed", "failed"],
+)
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_turn_answering_a_forwarded_message_is_not_reported(
+    drain_first: bool, answer_end: dict[str, Any]
+) -> None:
+    """A peer's or user's message starts a turn that answers them, not the parent.
+
+    A retried end of that turn is not reported either, and the next turn the
+    child starts on its own still reports to the parent.
+    """
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            await _forward_peer_message(rig, client)
+            await _post_statuses(
+                rig,
+                client,
+                {"status": "running"},
+                {"status": "waiting"},
+                {"status": "running"},
+                answer_end,
+                answer_end,
+            )
+            assert rig.drained() == []
+
+            await _post_statuses(rig, client, *_SELF_STARTED_TURN)
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_answer_to_a_forwarded_message_releases_the_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An interrupt ends the answering turn, so the next self-started turn reports."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=False)
+            await _forward_peer_message(rig, client)
+            await _post_statuses(rig, client, {"status": "running"})
+            _accept_claude_interrupt(monkeypatch, tmp_path)
+            resp = await client.post(
+                f"/v1/sessions/{rig.child_id}/events", json={"type": "interrupt"}
+            )
+            assert resp.status_code == 204, resp.text
+            await _post_statuses(rig, client, {"status": "idle", "output": "hello, pe"})
+            assert rig.drained() == []
+
+            await _post_statuses(rig, client, *_SELF_STARTED_TURN)
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+
+
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_message_sent_during_a_self_started_turn_is_answered_after_it(
+    drain_first: bool,
+) -> None:
+    """The self-started turn reports first; the reply to the queued message does not.
+
+    A retried end of the self-started turn does not use up the message's turn.
+    """
+    self_started_end = {"status": "idle", "turn_completed": True, "output": "open the PR?"}
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            await _post_statuses(rig, client, {"status": "running"})
+            await _forward_peer_message(rig, client)
+            await _post_statuses(
+                rig,
+                client,
+                self_started_end,
+                self_started_end,
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "hello, peer"},
+            )
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_interrupted_self_started_turn_does_not_claim_the_next_answer(
+    drain_first: bool, tmp_path: Path
+) -> None:
+    """An interrupt ends the self-started turn; the reply to a later message is not reported."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            await _post_statuses(rig, client, {"status": "running"})
+            with pytest.MonkeyPatch.context() as interrupt_patch:
+                _accept_claude_interrupt(interrupt_patch, tmp_path)
+                resp = await client.post(
+                    f"/v1/sessions/{rig.child_id}/events", json={"type": "interrupt"}
+                )
+                assert resp.status_code == 204, resp.text
+            await _post_statuses(rig, client, {"status": "idle", "output": "open the"})
+            await _forward_peer_message(rig, client)
+            await _post_statuses(
+                rig,
+                client,
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "hello, peer"},
+            )
+            assert rig.drained() == []
+
+            await _post_statuses(rig, client, *_SELF_STARTED_TURN)
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_discarded_queued_message_does_not_hold_the_dispatch(
+    drain_first: bool, tmp_path: Path
+) -> None:
+    """A message an interrupt discards before it reaches the child starts no turn."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            rig.app.state.active_turns[rig.child_id] = None
+            resp = await client.post(
+                f"/v1/sessions/{rig.child_id}/events",
+                json={
+                    "type": "message",
+                    "content": [{"type": "input_text", "text": "[Message from session s]\nhi"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            assert resp.json()["status"] == "buffered"
+            with pytest.MonkeyPatch.context() as interrupt_patch:
+                _accept_claude_interrupt(interrupt_patch, tmp_path)
+                resp = await client.post(
+                    f"/v1/sessions/{rig.child_id}/events", json={"type": "interrupt"}
+                )
+                assert resp.status_code == 204, resp.text
+            assert rig.child_id not in rig.app.state.session_message_buffers
+            rig.app.state.active_turns.pop(rig.child_id, None)
+
+            await _post_statuses(rig, client, *_SELF_STARTED_TURN)
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.asyncio
+async def test_new_send_after_a_drained_dispatch_reports_its_own_turns() -> None:
+    """A new dispatch to the child reports its result, then turns the child starts itself."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            first_work_id = await _deliver_first_result(rig, client, drain=True)
+            await _forward_peer_message(rig, client)
+            await _post_statuses(
+                rig,
+                client,
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "hello, peer"},
+            )
+
+            second = subagent_work.register_subagent_work(
+                parent_session_id=rig.parent_id,
+                child_session_id=rig.child_id,
+                agent="researcher",
+                title="re-check",
+            )
+            await _post_statuses(
+                rig,
+                client,
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "second verdict"},
+                *_SELF_STARTED_TURN,
+            )
+        assert second.work_id != first_work_id
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("second verdict", second.work_id),
+            ("open the PR?", second.work_id),
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.asyncio
+async def test_message_that_cannot_be_resolved_does_not_hold_the_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message rejected before reaching the child starts no answering turn."""
+    rig = _Rig("claude-native")
+
+    async def _file_store_unavailable(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        raise RuntimeError("file store unavailable")
+
+    monkeypatch.setattr(
+        rig.runner_app, "_resolve_forwarded_message_content", _file_store_unavailable
+    )
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=True)
+            with pytest.raises(RuntimeError, match="file store unavailable"):
+                await _forward_peer_message(rig, client)
+            await _post_statuses(rig, client, *_SELF_STARTED_TURN)
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_each_forwarded_message_holds_its_own_answering_turn(drain_first: bool) -> None:
+    """Two messages forwarded after delivery start two turns, neither reported."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            await _forward_peer_message(rig, client)
+            await _forward_peer_message(rig, client)
+            await _post_statuses(
+                rig,
+                client,
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "hello, peer"},
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "hello again"},
+            )
+            assert rig.drained() == []
+
+            await _post_statuses(rig, client, *_SELF_STARTED_TURN)
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+_CONFIRMED_CANCEL = {"status": "idle", "turn_outcome": "cancelled"}
+
+
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_cancelled_self_started_turn_does_not_claim_the_next_answer(
+    drain_first: bool,
+) -> None:
+    """A confirmed cancellation ends the self-started turn before a message arrives."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            await _deliver_first_result(rig, client, drain=drain_first)
+            await _post_statuses(rig, client, {"status": "running"}, _CONFIRMED_CANCEL)
+            await _forward_peer_message(rig, client)
+            await _post_statuses(
+                rig,
+                client,
+                {"status": "running"},
+                {"status": "idle", "turn_completed": True, "output": "hello, peer"},
+            )
+        assert rig.drained() == []
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize("drain_first", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_cancelled_answer_releases_the_next_self_started_turn(drain_first: bool) -> None:
+    """A confirmed cancellation ends the answering turn, so the next turn reports."""
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=drain_first)
+            await _forward_peer_message(rig, client)
+            await _post_statuses(rig, client, {"status": "running"}, _CONFIRMED_CANCEL)
+            assert rig.drained() == []
+
+            await _post_statuses(rig, client, *_SELF_STARTED_TURN)
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+
+
+@pytest.mark.parametrize(
+    ("survivor_end", "expected"),
+    [
+        (
+            {"status": "failed", "output": "Error: rate limited"},
+            [],
+        ),
+        (
+            {"status": "idle", "turn_completed": True, "output": "the verdict"},
+            [("completed", "the verdict", "cancelled")],
+        ),
+    ],
+    ids=["failed", "completed"],
+)
+@pytest.mark.parametrize("drain_cancel", [True, False], ids=["drained", "registered"])
+@pytest.mark.asyncio
+async def test_running_edge_after_optimistic_cancel_is_not_a_new_turn(
+    drain_cancel: bool,
+    survivor_end: dict[str, Any],
+    expected: list[tuple[str, str, str | None]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A survivor of the grace-timer cancel still only overturns it by completing."""
+    from omnigent.runner.tool_dispatch import _cleanup_drained_subagent_work
+
+    _patch_claude_interrupt(monkeypatch, grace_s=0.05)
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            await rig.create_child_session(client)
+            resp = await client.post(
+                f"/v1/sessions/{rig.child_id}/events", json={"type": "interrupt"}
+            )
+            assert resp.status_code == 204, resp.text
+            await poll_until_async(lambda: not rig.inbox.empty(), timeout_s=5)
+            cancelled = rig.drained()
+            assert [(item["status"], item["output"]) for item in cancelled] == [("cancelled", "")]
+            if drain_cancel:
+                for payload in cancelled:
+                    await _cleanup_drained_subagent_work(payload, server_client=None)
+
+            await _post_statuses(rig, client, {"status": "running"}, survivor_end)
+        assert [
+            (item["status"], item["output"], item.get("corrected_status"))
+            for item in rig.drained()
+        ] == expected
+    finally:
+        rig.close()
+        _forget_drained_child(rig.child_id)
+        subagent_work._provisional_cancelled_subagent_work.pop(rig.child_id, None)
+
+
+@pytest.mark.asyncio
+async def test_grace_timer_cancel_leaves_a_self_started_turn_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that outlives the interrupt's grace window still reports its result."""
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_claude_interrupt(monkeypatch, grace_s=0.05)
+    grace_cancels: list[str] = []
+    deliver_cancel = interrupt_mod.NativeInterruptRunner._deliver_unconfirmed_interrupt_cancel
+
+    def _record_grace_cancel(runner: Any, conv_id: str) -> None:
+        deliver_cancel(runner, conv_id)
+        grace_cancels.append(conv_id)
+
+    monkeypatch.setattr(
+        interrupt_mod.NativeInterruptRunner,
+        "_deliver_unconfirmed_interrupt_cancel",
+        _record_grace_cancel,
+    )
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            work_id = await _deliver_first_result(rig, client, drain=False)
+            await _post_statuses(rig, client, {"status": "running"})
+            resp = await client.post(
+                f"/v1/sessions/{rig.child_id}/events", json={"type": "interrupt"}
+            )
+            assert resp.status_code == 204, resp.text
+            await poll_until_async(lambda: grace_cancels == [rig.child_id], timeout_s=5)
+            assert rig.drained() == []
+
+            await _post_statuses(
+                rig, client, {"status": "idle", "turn_completed": True, "output": "open the PR?"}
+            )
+        assert [(item["output"], item["work_id"]) for item in rig.drained()] == [
+            ("open the PR?", work_id)
+        ]
+    finally:
+        rig.close()
+
+
+def test_parent_teardown_drops_resumable_drained_dispatch() -> None:
+    """A resumed child of a deleted parent does not re-register work for it."""
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    subagent_work._session_inboxes_ref[parent_id] = asyncio.Queue()
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="researcher",
+        title="cite-check",
+    )
+    try:
+        ack = subagent_work.mark_subagent_work_terminal(
+            child_id, status="completed", output="the verdict", confirmed_completion=True
+        )
+        assert ack.delivered_now
+        subagent_work.unregister_subagent_work(child_id, remember_drained_delivery=True)
+        subagent_work.note_subagent_child_resumed(child_id)
+
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work_for_session(parent_id)
+        assert child_id not in subagent_work._drained_subagent_work
+
+        late = subagent_work.mark_subagent_work_terminal(
+            child_id, status="completed", output="open the PR?", confirmed_completion=True
+        )
+        assert late.delivered and not late.delivered_now
+        assert subagent_work.get_subagent_work(child_id) is None
+    finally:
+        subagent_work.unregister_subagent_work_for_session(parent_id)
+        _forget_drained_child(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
 @pytest.mark.asyncio
 async def test_legacy_bare_idle_does_not_overturn_optimistic_cancellation() -> None:
     """A legacy harness's bare idle must not launder an optimistic cancellation.

@@ -76,6 +76,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         output: str | None,
         only_if_work_id: str | None = None,
         confirmed_cancellation: bool = False,
+        assumed: bool = False,
     ) -> _FakeAck:
         if only_if_work_id is not None and only_if_work_id != captured["current_work_id"]:
             # A newer dispatch replaced the entry: drop the delayed op untouched.
@@ -89,6 +90,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
                 "output": output,
                 "only_if_work_id": only_if_work_id,
                 "confirmed_cancellation": confirmed_cancellation,
+                "assumed": assumed,
             }
         )
         return _FakeAck()
@@ -303,6 +305,7 @@ async def test_interrupt_grace_timer_delivers_unconfirmed_cancel(
 
     await asyncio.sleep(0.1)
     assert captured["wakes"] == [("conv_g", "cancelled", None)]
+    assert captured["wake_calls"][-1]["assumed"] is True
     assert runner.take_pending_interrupt("conv_g")[0] is False
 
 
