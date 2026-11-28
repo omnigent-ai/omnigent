@@ -1004,7 +1004,7 @@ def test_codex_executor_gateway_uses_host_only_oauth_profile(
 
     overrides = "\n".join(executor._codex_config_overrides)
     assert "https://oauth-host.example.com/ai-gateway/codex/v1" in overrides
-    assert 'databricks auth token --profile \\"oauth-profile\\"' in overrides
+    assert "databricks auth token --profile oauth-profile" in overrides
 
 
 def test_read_databrickscfg_no_config_file_returns_none(

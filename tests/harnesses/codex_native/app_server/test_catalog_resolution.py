@@ -88,7 +88,7 @@ def test_build_codex_native_server_resolves_the_model_from_the_workspace(
     assert server.env["DATABRICKS_HOST"] == "https://h.example.com"
     overrides = "\n".join(server.config_overrides)
     assert "https://h.example.com/ai-gateway/codex/v1" in overrides
-    assert 'databricks auth token --profile \\"prof\\"' in overrides
+    assert "databricks auth token --profile prof" in overrides
 
 
 @pytest.mark.parametrize("cached", [False, True])

@@ -186,7 +186,7 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
 
     overrides = "\n".join(app_server.config_overrides)
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
-    assert 'databricks auth token --profile \\"oss\\"' in overrides
+    assert "databricks auth token --profile oss" in overrides
 
 
 _UCODE_HOST = "https://example.cloud.databricks.com"
@@ -381,7 +381,7 @@ def test_build_codex_native_server_keeps_profile_path_when_ucode_state_is_unread
         overrides = _ucode_codex_overrides(tmp_path, monkeypatch, None)
 
     assert f"{_UCODE_HOST}/ai-gateway/codex/v1" in overrides
-    assert 'databricks auth token --profile \\"oss\\"' in overrides
+    assert "databricks auth token --profile oss" in overrides
     # The gateway lookup's warning names the host; discovery's own fallback names the profile.
     warnings = [
         r
@@ -413,7 +413,7 @@ def test_build_codex_native_server_keeps_profile_path_without_usable_ucode_entry
     assert f"{_UCODE_HOST}/ai-gateway/codex/v1" in overrides
     assert _UCODE_BASE_URL not in overrides
     assert "ug auth-token" not in overrides
-    assert 'databricks auth token --profile \\"oss\\"' in overrides
+    assert "databricks auth token --profile oss" in overrides
 
 
 def test_build_codex_native_server_carries_the_configured_app_server_command(
