@@ -102,6 +102,7 @@ function renderPicker(props: {
   hasAgents?: boolean;
   host?: Host;
   onPrefetchEntries?: (ids: string[]) => void;
+  noneOption?: { label: string; onSelect: () => void };
 }) {
   const picker = (open = props.open, openNonce = props.openNonce) => (
     <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
@@ -130,6 +131,7 @@ function renderPicker(props: {
             onCreateCustomAgent={() => undefined}
             sandboxSelected={props.sandboxSelected ?? false}
             allowCreateCustomAgent={props.allowCreateCustomAgent ?? true}
+            noneOption={props.noneOption}
           />
         </TooltipProvider>
       </StoryQueryRouter>
@@ -534,4 +536,22 @@ describe("AgentHarnessPicker per-entry visibility", () => {
       expect(screen.queryByTestId("new-chat-landing-all-hidden") !== null).toBe(pointsAtSettings);
     },
   );
+
+  it("keeps a settings field's No default row when every entry is hidden", async () => {
+    writeHiddenPickerAgents(new Set([claude.name, codex.name, polly.name]));
+    const onSelectNone = vi.fn();
+    renderPicker({
+      harnessEntries: [claude, codex],
+      agentEntries: [polly],
+      effectiveAgentId: null,
+      noneOption: { label: "No default", onSelect: onSelectNone },
+    });
+    await openPicker();
+
+    expect(screen.getByTestId("new-chat-landing-all-hidden")).toBeInTheDocument();
+    const none = screen.getByRole("menuitem", { name: "No default" });
+    expect(none).toHaveAttribute("data-active", "true");
+    await userEvent.click(none);
+    expect(onSelectNone).toHaveBeenCalledTimes(1);
+  });
 });

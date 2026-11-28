@@ -1294,6 +1294,7 @@ export function AgentHarnessPicker({
   onPrefetchEntries,
   curatedEntries,
   entriesFailed = false,
+  noneOption,
 }: {
   appearance?: "composer" | "header";
   agentEntries: AvailableAgent[];
@@ -1386,6 +1387,9 @@ export function AgentHarnessPicker({
   /** Whether the roster could not be loaded, so an empty curated list is a
    *  failed fetch rather than the deployment's doing. */
   entriesFailed?: boolean;
+  /** Optional first row that clears the selection (e.g. a settings field's
+   *  "No default"). It reads as selected while no agent is picked. */
+  noneOption?: { label: string; onSelect: () => void };
 }) {
   // Controlled so picking a row can close the menu.
   const [internalOpen, setInternalOpen] = useState(false);
@@ -1441,8 +1445,10 @@ export function AgentHarnessPicker({
         : `${detail.label} ${compactModelTriggerLabel(detail.value)}`,
     )
     .join(", ");
+  const noAgentsLabel =
+    noneOption !== undefined && effectiveAgentId === null ? noneOption.label : "No agents";
   const triggerAccessibleName = [
-    hasAgents ? agentLabel : "No agents",
+    hasAgents ? agentLabel : noAgentsLabel,
     selectedUnavailable ? "unavailable" : triggerAccessibleDetails,
   ]
     .filter(Boolean)
@@ -1450,7 +1456,7 @@ export function AgentHarnessPicker({
   const triggerText = triggerSdk
     ? agentLabel
     : visibleModelText ||
-      (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "");
+      (triggerModel === undefined ? (hasAgents ? agentLabel : noAgentsLabel) : "");
   const triggerSecondaryText = triggerSdk
     ? compactModelTriggerLabel(triggerSdk.value)
     : visibleEffortText;
@@ -1798,6 +1804,21 @@ export function AgentHarnessPicker({
     bundleEntries.length === 0 &&
     customEntries.length === 0 &&
     pendingAgent == null;
+  const noneItem = noneOption && (
+    <>
+      <DropdownMenuItem
+        data-testid="new-chat-landing-agent-none"
+        data-active={effectiveAgentId === null ? "true" : undefined}
+        onSelect={noneOption.onSelect}
+        className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+      >
+        <span data-harness-menu-choice-label="" className="min-w-0 flex-1 truncate text-left">
+          {noneOption.label}
+        </span>
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+    </>
+  );
   const showMore = isMobile && menuPage === "more" && moreHarnessEntries.length > 0;
   const showCustom = isMobile && menuPage === "custom" && hasCustomGroup;
   const showConfig = isMobile && menuPage === "config" && selectedConfigContent != null;
@@ -1839,7 +1860,10 @@ export function AgentHarnessPicker({
       onOpenChange={changeOpen}
       trigger={{
         appearance,
-        disabled: disabledLabel !== undefined || previewOnly || (!hasAgents && !curated),
+        disabled:
+          disabledLabel !== undefined ||
+          previewOnly ||
+          (!hasAgents && !curated && noneOption === undefined),
         "aria-busy": loading || undefined,
         label: disabledLabel ?? visibleCachedPreview?.label ?? triggerAccessibleName,
         model: disabledLabel ?? visibleCachedPreview?.model ?? triggerText,
@@ -1986,6 +2010,7 @@ export function AgentHarnessPicker({
         </div>
       ) : allEntriesHidden ? (
         <>
+          {noneItem}
           <div
             data-testid="new-chat-landing-all-hidden"
             role="status"
@@ -2000,6 +2025,7 @@ export function AgentHarnessPicker({
         </>
       ) : (
         <>
+          {noneItem}
           {/* Smart Routing sits in its own unlabeled group above the
             harnesses: it routes over them rather than being one of them. */}
           {autoHarnessAvailable && (
