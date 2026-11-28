@@ -32,6 +32,7 @@ class Feature(StrEnum):
     SIBLING_SESSIONS = "sibling_sessions"
     PEER_SESSION_MESSAGING = "peer_session_messaging"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
+    WORKSPACE_UPLOAD = "workspace_upload"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     MCP_DISABLED_SERVERS = "mcp_disabled_servers"
@@ -202,6 +203,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.24.0",
         frontend_visible=False,
         default_enabled=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_UPLOAD,
+        description="Resumable uploads into session workspaces",
+        owner="server",
+        review_by_release="0.20.0",
     ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
