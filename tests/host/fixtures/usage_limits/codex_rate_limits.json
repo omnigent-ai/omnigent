@@ -1,0 +1,29 @@
+{
+  "_source": "Shape from codex-cli 0.166.0 app-server JSON schema (GetAccountRateLimitsResponse); values synthetic.",
+  "accountId": "private-account-id",
+  "ordinaryUsageAllowed": true,
+  "rateLimitResetCredits": null,
+  "rateLimits": {
+    "limitId": "codex",
+    "limitName": null,
+    "planType": "pro",
+    "primary": {"usedPercent": 12, "resetsAt": 1793556000, "windowDurationMins": 300},
+    "secondary": {"usedPercent": 47, "resetsAt": 1793988000, "windowDurationMins": 10080},
+    "credits": null,
+    "individualLimit": null,
+    "rateLimitReachedType": null,
+    "spendControlReached": null
+  },
+  "rateLimitsByLimitId": {
+    "codex": {
+      "limitId": "codex",
+      "planType": "pro",
+      "primary": {"usedPercent": 12, "resetsAt": 1793556000, "windowDurationMins": 300},
+      "secondary": {"usedPercent": 47, "resetsAt": 1793988000, "windowDurationMins": 10080}
+    },
+    "codex_spark": {
+      "limitId": "codex_spark",
+      "primary": {"usedPercent": 90, "resetsAt": 1793556000, "windowDurationMins": 300}
+    }
+  }
+}

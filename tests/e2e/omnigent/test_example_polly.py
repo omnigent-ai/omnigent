@@ -408,9 +408,8 @@ def test_subagent_cancellation_guidance_present() -> None:
 
 def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
     """
-    The orchestrator carries the spawn bound, the headless-purpose guard, and
-    the blast-radius gate. ``spawn_bounds`` counts the sub-agent dispatch tool
-    (``sys_session_send``) or fan-out is unbounded.
+    The orchestrator carries the spawn bound, the headless-purpose guard,
+    subscription usage guard, and the blast-radius gate.
     """
     assert polly_spec.guardrails is not None
     names = sorted(p.name for p in polly_spec.guardrails.policies)
@@ -418,11 +417,21 @@ def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
         "blast_radius",
         "headless_subagent_purpose_guard",
         "spawn_bounds",
+        "subscription_usage_guard",
     ]
     spawn = next(p for p in polly_spec.guardrails.policies if p.name == "spawn_bounds")
     dispatch_tools = spawn.function.arguments.get("dispatch_tools")
     assert dispatch_tools is not None
     assert "sys_session_send" in dispatch_tools  # sub-agent sends are bounded
+
+    usage_guard = next(
+        p for p in polly_spec.guardrails.policies if p.name == "subscription_usage_guard"
+    )
+    assert usage_guard.function.arguments.get("threshold_percent") == 90
+    assert usage_guard.function.arguments.get("window_kinds") == ["session", "weekly"]
+    usage_dispatch_tools = usage_guard.function.arguments.get("dispatch_tools")
+    assert usage_dispatch_tools is not None
+    assert "sys_session_send" in usage_dispatch_tools
 
 
 def test_subagent_guardrails(polly_spec: AgentSpec) -> None:
@@ -461,6 +470,6 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
             )
             checked += 1
     # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x7 (claude_code, codex, opencode, cursor,
-    # hermes, agy, pi) = 7 -> 10 total. Fewer = a policy dropped.
-    assert checked == 10, f"expected 10 function policies in the bundle, inspected {checked}"
+    # + subscription_usage_guard = 4; sub-agents: blast_radius x7 (claude_code,
+    # codex, opencode, cursor, hermes, agy, pi) = 7 -> 11 total. Fewer = a policy dropped.
+    assert checked == 11, f"expected 11 function policies in the bundle, inspected {checked}"

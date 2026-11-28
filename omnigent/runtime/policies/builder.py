@@ -926,6 +926,7 @@ def build_policy_engine(
                 s,
                 agent_llm=spec.llm,
                 connection_override=effective_connection_override,
+                agent_spec=spec,
             )
             for s in all_policy_specs
         ],
@@ -1098,6 +1099,7 @@ def _instantiate_policy(
     *,
     agent_llm: LLMConfig | None,
     connection_override: dict[str, str] | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> Policy:
     """
     Dispatch a :class:`PolicySpec` to the matching runtime
@@ -1110,6 +1112,7 @@ def _instantiate_policy(
         override. Unused for Function policies.
     :param connection_override: Forwarded to the prompt classifier
         as a fallback when the policy / agent declare no connection.
+    :param agent_spec: Owning agent spec for sub-agent provider metadata.
     :returns: A :class:`Policy` subclass instance bound to
         the spec.
     :raises NotImplementedError: When ``spec`` is not a
@@ -1117,7 +1120,9 @@ def _instantiate_policy(
         protection.
     """
     if isinstance(spec, FunctionPolicySpec):
-        return resolve_function_policy(spec)
+        policy = resolve_function_policy(spec)
+        policy.bind_agent_spec(agent_spec)
+        return policy
     raise NotImplementedError(
         f"Policy type {type(spec).__name__} for {spec.name!r} is not "
         f"a known subclass of PolicySpec (FunctionPolicySpec).",
