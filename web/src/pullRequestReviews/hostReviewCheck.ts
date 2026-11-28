@@ -11,6 +11,7 @@ import { readPullRequestRpc } from "@/lib/pullRequestRpc";
 import { forgetHostReviewBaseline, type HostReviewRoute, hostReviewBaseline } from "./hostReviews";
 import {
   EMPTY_REVIEW,
+  normalizedBody,
   readReviewSubmit,
   SUBMITTED_STATE,
   sameAttempt,
@@ -50,7 +51,7 @@ async function hostReviewerState(
   }
 }
 
-export type HostReviewCheck = "landed" | "unreadable" | "not_found" | "ambiguous";
+export type HostReviewCheck = "landed" | "unreadable" | "not_found" | "ambiguous" | "unidentified";
 
 /**
  * Check Again for the unconfirmed host review in `key`. It never sends the review again: it
@@ -101,6 +102,11 @@ export async function checkHostReviewAgain({
   if (before === undefined || before === state) {
     settle("ambiguous");
     return "ambiguous";
+  }
+  // The host names no review, so a summary can't be matched to this one; keep it held.
+  if (normalizedBody(sent.body) !== "") {
+    settle("unidentified");
+    return "unidentified";
   }
   forgetHostReviewBaseline(sent);
   updateReviewSubmit(key, () => EMPTY_REVIEW);

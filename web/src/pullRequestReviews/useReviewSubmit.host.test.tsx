@@ -255,10 +255,10 @@ describe("reviews through the session's host, as an editor", () => {
 });
 
 describe("a host review whose answer was lost", () => {
-  async function lostApproval(reviewState: string | null) {
+  async function lostApproval(reviewState: string | null, body = "") {
     host.write.mockRejectedValue(new PullRequestMaybeSentError("lost"));
     const view = await renderMenu(OWNER, { reviewState });
-    choose(view, "APPROVE", "");
+    choose(view, "APPROVE", body);
     act(() => view.result.current.review.submit());
     await waitFor(() => expect(view.result.current.review.entry.status.kind).toBe("uncertain"));
     return view;
@@ -272,6 +272,21 @@ describe("a host review whose answer was lost", () => {
     act(() => view.result.current.review.checkAgain());
     await waitFor(() => expect(view.result.current.review.entry.status.kind).toBe("idle"));
     expect(host.read.mock.calls[0]?.slice(0, 2)).toEqual([SESSION, "getPullRequest"]);
+    expect(host.write).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a summary held when the host shows only the account's new approval", async () => {
+    // The host's aggregate state can't say which approval is this one, so the summary stays.
+    const view = await lostApproval("COMMENTED", "Looks right");
+    host.read.mockResolvedValue(reviewers("APPROVED"));
+    act(() => view.result.current.review.checkAgain());
+    await waitFor(() =>
+      expect(view.result.current.review.entry.status).toMatchObject({ checked: "unidentified" }),
+    );
+    expect(view.result.current.review.entry).toMatchObject({
+      event: "APPROVE",
+      body: "Looks right",
+    });
     expect(host.write).toHaveBeenCalledTimes(1);
   });
 

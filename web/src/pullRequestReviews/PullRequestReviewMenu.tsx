@@ -694,6 +694,8 @@ function ReviewSubmitForm({
               {status.checked === "unreadable" && " The app couldn’t check GitHub. Try again."}
               {status.checked === "ambiguous" &&
                 " GitHub shows more than one review like this one, so the app can’t tell which is yours. Open the pull request on GitHub to see them."}
+              {status.checked === "unidentified" &&
+                " GitHub shows your review state, but not which review it is, so the app can’t confirm this one. Open the pull request on GitHub to check."}
             </span>
           </span>
           <span className="flex gap-3">

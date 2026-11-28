@@ -159,10 +159,11 @@ export type ReviewSubmitStatus =
       message: string;
       checking: boolean;
       /**
-       * The last Check Again couldn't read, didn't find the review, or found several that could
-       * be it, as after a reload cut the send off.
+       * The last Check Again couldn't read, didn't find the review, found several that could be
+       * it, as after a reload cut the send off, or saw only the account's state for a review with
+       * a summary, which the host doesn't tie to a review.
        */
-      checked: "never" | "unreadable" | "not_found" | "ambiguous";
+      checked: "never" | "unreadable" | "not_found" | "ambiguous" | "unidentified";
     };
 
 /** The login and sign-in a review was sent as. */
