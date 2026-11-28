@@ -802,6 +802,12 @@ of their own, so the two groups show their own progress until the server
 reports the launch, which every surface then shows. The Files and Pull Requests
 views say the sandbox is starting while it runs or the server reports its launch.
 
+**Reconnect this machine:** in the desktop app, Reconnect host for this machine
+reports success only once the server lists its host online, waiting up to 15
+seconds, since a running host whose connection is down still counts as started.
+If the host never comes online, the dialog says it is running but not connected
+and gives the `omnigent login` and `omnigent host stop` commands that recover it.
+
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
 and send a follow-up after its parent runner is replaced.

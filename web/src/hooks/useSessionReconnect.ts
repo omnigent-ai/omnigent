@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { fetchHosts } from "@/hooks/useHosts";
 import { onRunnerHealthPolled, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { getCliServerUrl } from "@/lib/host";
 import {
   connectArcaHost,
   controlHost,
@@ -21,6 +22,60 @@ export const SANDBOX_WAKE_ONLINE_GRACE_POLLS = 3;
 
 /** How long a wake may follow a launch stage that never finishes before Reconnect host returns. */
 export const SANDBOX_WAKE_STAGE_LIMIT_MS = 5 * 60_000;
+
+/** How long Reconnect host waits for the server to list this machine online after a start. */
+export const LOCAL_HOST_ONLINE_WAIT_MS = 15_000;
+
+/** How often that wait rereads the server's host list. */
+const LOCAL_HOST_ONLINE_POLL_MS = 1_000;
+
+/**
+ * Wait for the server to list *hostId* online, rereading its host list until
+ * {@link LOCAL_HOST_ONLINE_WAIT_MS} passes or *isCurrent* turns false.
+ *
+ * @param hostId - Host to wait for, e.g. this machine's host id.
+ * @param isCurrent - Whether the reconnect that started the wait still owns its result.
+ * @returns `true` once the host is listed online, `false` when the list was read but
+ *   never showed it online, and `null` when no read succeeded or the wait was abandoned.
+ */
+async function waitForHostOnline(
+  hostId: string,
+  isCurrent: () => boolean,
+): Promise<boolean | null> {
+  const deadline = Date.now() + LOCAL_HOST_ONLINE_WAIT_MS;
+  let listRead = false;
+  const poll = async (): Promise<boolean | null> => {
+    // Bound each read by the time left, so a stalled request can't hold Reconnect host.
+    const readLimit = new AbortController();
+    const readTimer = setTimeout(
+      () => readLimit.abort(),
+      Math.max(deadline - Date.now(), LOCAL_HOST_ONLINE_POLL_MS),
+    );
+    const hosts = await fetchHosts(false, undefined, readLimit.signal)
+      .catch(() => null)
+      .finally(() => clearTimeout(readTimer));
+    if (!isCurrent()) return null;
+    if (hosts !== null) {
+      if (hosts.some((host) => host.host_id === hostId && host.status === "online")) return true;
+      listRead = true;
+    }
+    if (Date.now() >= deadline) return listRead ? false : null;
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, LOCAL_HOST_ONLINE_POLL_MS);
+    });
+    return poll();
+  };
+  return poll();
+}
+
+/** Why this machine still reads offline after a start, with the commands that recover it. */
+function localHostStillOfflineMessage(serverUrl: string): string {
+  return (
+    "This machine's host is running but still isn't connected to the server. " +
+    `If its sign-in expired, run \`omnigent login ${serverUrl}\`. Otherwise restart it with ` +
+    `\`omnigent host stop --server ${serverUrl}\`, then reconnect.`
+  );
+}
 
 // One sandbox wake request per session, shared by everything that wakes it
 // (Reconnect host, opening the session, the Files and Changes tabs, the
@@ -324,6 +379,19 @@ export function useSessionReconnect({
             (result.authError
               ? "Sign-in didn't complete. A browser should have opened. Finish signing in, then try again."
               : "Couldn't reconnect this machine. Try again or run the command below from a terminal."),
+        );
+        setDialogOpen(true);
+        return;
+      }
+      // The desktop counts any running host process as started, even one whose
+      // connection is down, so only the server's view of this host decides success.
+      const online = await waitForHostOnline(hostId, () => inFlight.current === operation);
+      if (inFlight.current !== operation) return;
+      if (online !== true) {
+        setError(
+          online === null
+            ? "Couldn't check whether this machine is back online. Try again."
+            : localHostStillOfflineMessage(getCliServerUrl()),
         );
         setDialogOpen(true);
         return;
