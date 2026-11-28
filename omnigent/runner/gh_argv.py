@@ -18,6 +18,9 @@ from omnigent.git_providers.github import _valid_hostname
 
 # Where github.com's upload endpoints live; gh sends them with github.com's token.
 _UPLOADS_HOST = "uploads.github.com"
+# gh fills these from the checkout's repository, which can mean querying another host.
+_PLACEHOLDERS = ("{owner}", "{repo}", "{branch}")
+_API_FIELD_FLAGS = frozenset({"-f", "--raw-field", "-F", "--field"})
 
 
 class GhArgvRefused(ValueError):
@@ -162,10 +165,11 @@ def _repository_host(value: str) -> str | None:
 def _positional_host(kind: str, value: str) -> tuple[str | None, bool]:
     """The host a positional argument names, and whether it leaves gh to the checkout."""
     if kind == "endpoint":
+        if any(marker in value for marker in _PLACEHOLDERS):
+            raise GhArgvRefused("A gh api endpoint uses a placeholder gh fills from the checkout")
         if "://" in value:
             host = _url_host(value)
             return ("github.com" if host == _UPLOADS_HOST else host), False
-        # gh fills {owner}/{repo} from the checkout but sends the call to its default host.
         return None, False
     if kind == "pull_request":
         if value.isascii() and value.isdigit():
@@ -188,7 +192,8 @@ def classify(argv: list[str]) -> GhTarget:
 
     :raises GhArgvRefused: For a command or flag the panel doesn't run, a missing flag
         value, a repeated host or repository flag, a missing host where gh would check every
-        host, more than one positional argument, an argument that looks like a host or a URL
+        host, a ``{owner}``/``{repo}``/``{branch}`` placeholder in an ``api`` endpoint or
+        field, more than one positional argument, an argument that looks like a host or a URL
         but can't be read as one, or two arguments that name different hosts.
     """
     command = next(
@@ -235,6 +240,12 @@ def classify(argv: list[str]) -> GhTarget:
             if name in spec.repository_flags
             else None
         )
+        if (
+            command == ("api",)
+            and name in _API_FIELD_FLAGS
+            and any(marker in attached for marker in _PLACEHOLDERS)
+        ):
+            raise GhArgvRefused("A gh api field uses a placeholder gh fills from the checkout")
         if group is not None:
             if group in named_flags:
                 raise GhArgvRefused(f"gh {' '.join(command)} names its {group} more than once")

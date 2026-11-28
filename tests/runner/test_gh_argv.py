@@ -16,8 +16,6 @@ OTHER = "other.example.com"
         (["api", "--hostname", HOST, "repos/o/r/pulls/1"], HOST, False),
         (["api", f"--hostname={HOST}", "repos/o/r/pulls/1"], HOST, False),
         (["api", "repos/o/r/commits/abc/pulls"], None, False),
-        # gh fills the placeholders from the checkout, but sends the call to its default host.
-        (["api", "repos/{owner}/{repo}/pulls/1/files?per_page=100&page=1"], None, False),
         (["api", "graphql", "--hostname", HOST, "-f", "query={ viewer { login } }"], HOST, False),
         # Field values are free text: a URL in a label or a query isn't a host.
         (
@@ -190,6 +188,15 @@ def test_each_command_the_panel_runs_names_the_host_gh_sends_to(
         ["repo", "view", f"{HOST}:o/r"],
         ["repo", "set-default", "my.remote"],
         ["label", "list", "-R", f"{HOST}/o/r", "--web"],
+        # gh fills placeholders from the checkout's repository, even with --hostname.
+        ["api", "repos/{owner}/{repo}/pulls/1/files"],
+        ["api", "--hostname", HOST, "repos/{owner}/{repo}/pulls/1/files"],
+        ["api", "--hostname", HOST, "repos/o/r/commits/{branch}"],
+        ["api", f"https://{HOST}/api/v3/repos/{{owner}}/{{repo}}/pulls"],
+        ["api", "--hostname", HOST, "graphql", "-f", "owner={owner}"],
+        ["api", "--hostname", HOST, "graphql", "-F", "name={repo}"],
+        ["api", "--hostname", HOST, "graphql", "--raw-field=ref={branch}"],
+        ["api", "--hostname", HOST, "graphql", "--field", "owner={owner}"],
     ],
 )
 def test_anything_the_panel_doesnt_run_or_cant_classify_is_refused(argv: list[str]) -> None:
