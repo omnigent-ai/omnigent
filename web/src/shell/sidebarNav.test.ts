@@ -811,6 +811,20 @@ describe("statusBucket", () => {
     expect(statusBucket({ ...shells, status: "idle" }, true, true)).toBe("Working");
     expect(statusBucket({ ...shells, status: "failed" }, false, false)).toBe("Needs attention");
   });
+  it("keeps sandbox launches out of Done until they are ready", () => {
+    for (const stage of ["provisioning", "cloning", "starting", "connecting"] as const) {
+      expect(statusBucket({ ...base, sandbox_status: { stage } }, true, true)).toBe("Working");
+    }
+    expect(
+      statusBucket({ ...base, sandbox_status: { stage: "action_required" } }, false, false),
+    ).toBe("Needs attention");
+    expect(statusBucket({ ...base, sandbox_status: { stage: "failed" } }, false, false)).toBe(
+      "Needs attention",
+    );
+    expect(statusBucket({ ...base, sandbox_status: { stage: "ready" } }, false, false)).toBe(
+      "Done",
+    );
+  });
 });
 
 describe("dateBucket", () => {

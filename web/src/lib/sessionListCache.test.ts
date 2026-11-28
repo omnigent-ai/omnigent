@@ -157,6 +157,20 @@ describe("mergeItemsIntoPages", () => {
     expect(after!.pages[0].data[0].pull_request?.state).toBe("MERGED");
   });
 
+  it("compares sandbox launch status by value", () => {
+    const before = data([conv("a", { sandbox_status: { stage: "provisioning" } })]);
+    const same = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", sandbox_status: { stage: "provisioning" } }],
+    ]);
+    const merged = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", sandbox_status: { stage: "starting" } }],
+    ]);
+
+    expect(mergeItemsIntoPages(before, same, DEFAULT_FILTERS).data).toBe(before);
+    const { data: after } = mergeItemsIntoPages(before, merged, DEFAULT_FILTERS);
+    expect(after!.pages[0].data[0].sandbox_status?.stage).toBe("starting");
+  });
+
   it("does not report ids absent from any page (structural additions)", () => {
     const before = data([conv("a")]);
     const items = new Map<string, SessionListWireItem>([
