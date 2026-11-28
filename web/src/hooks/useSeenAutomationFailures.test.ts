@@ -66,3 +66,17 @@ it("does not persist ambiguous embedded backend identities", () => {
   expect(result.current.seen.has("run")).toBe(true);
   expect(localStorage.length).toBe(0);
 });
+
+it("marks many runs read and unmarks only the ones it added", () => {
+  const { result } = renderHook(() => useSeenAutomationFailures("bulk", true));
+  act(() => result.current.markRead("run-1"));
+  let added: string[] = [];
+  act(() => {
+    added = result.current.markManyRead(["run-1", "run-2", "run-3"]);
+  });
+  expect(added).toEqual(["run-2", "run-3"]);
+
+  act(() => result.current.unmarkRead(added));
+
+  expect([...result.current.seen]).toEqual(["run-1"]);
+});

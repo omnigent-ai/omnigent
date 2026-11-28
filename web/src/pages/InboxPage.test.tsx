@@ -17,7 +17,9 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { InboxPage } from "./InboxPage";
+import { Toaster } from "@/components/ui/sonner";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as approvalCard from "@/components/blocks/ApprovalCard";
@@ -1574,6 +1576,226 @@ describe("InboxPage recency groups", () => {
     expect(within(regions[1]).getByTestId("inbox-item")).toHaveAttribute("data-expanded", "true");
     // The header pill totals every kind; its label spells out the breakdown.
     expect(screen.getByText("1 approval · 1 unread")).toBeInTheDocument();
+  });
+});
+
+describe("InboxPage bulk actions", () => {
+  afterEach(() => {
+    toast.dismiss();
+  });
+
+  // Two prompts, a Done and an Error session, a comment and an automation failure.
+  function renderBulkInbox(conversationOverrides: Record<string, unknown> = {}) {
+    const approvalRow = conversation({ id: "sess_approval", title: "Approval Session" });
+    const doneRow = unreadConversation({ id: "sess_done", title: "Done Session" });
+    const errorRow = unreadConversation({
+      id: "sess_error",
+      title: "Error Session",
+      status: "failed",
+    });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([approvalRow, doneRow, errorRow], conversationOverrides),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_1", "Approve this?"),
+        rawElicitation("eli_2", "And this?"),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
+      commentInboxStub({
+        items: [
+          {
+            row: conversation({ id: "sess_comment", pending_elicitations_count: 0 }),
+            comment: {
+              id: "cm_1",
+              path: "src/app.ts",
+              body: "Please reconsider this line.",
+              created_by: "alice",
+              created_at: 1_700_000_000,
+              updated_at: 1_700_000_000_000,
+              status: "draft",
+            } as CommentInbox["items"][number]["comment"],
+          },
+        ],
+      }),
+    );
+    const markManyRead = vi.fn((runIds: string[]) => runIds);
+    vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+      automationInboxStub({
+        markManyRead,
+        unmarkRead: vi.fn(),
+        items: [
+          {
+            taskId: "task",
+            taskName: "Daily report",
+            runId: "run",
+            scheduledAt: 1_700_000_000,
+            finishedAt: 1_700_000_010,
+            errorCode: "host_offline",
+          },
+        ],
+      }),
+    );
+    render(<Toaster />);
+    renderPage();
+    return { markManyRead };
+  }
+
+  function unreadKinds() {
+    return screen.queryAllByTestId("inbox-unread").map((item) => item.dataset.kind);
+  }
+
+  function openBulkMenu() {
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Inbox bulk actions" }), {
+      button: 0,
+    });
+  }
+
+  it("marks only Done sessions read, keeping what needs attention, and Undo restores them", async () => {
+    renderBulkInbox();
+    expect(await screen.findAllByTestId("inbox-item")).toHaveLength(2);
+    expect(unreadKinds()).toEqual(expect.arrayContaining(["done", "error"]));
+
+    openBulkMenu();
+    const markDone = await screen.findByRole("menuitem", { name: /Mark done as read/ });
+    expect(markDone).toHaveTextContent("1 completed session");
+    fireEvent.click(markDone);
+
+    expect(unreadKinds()).toEqual(["error"]);
+    expect(screen.getAllByTestId("inbox-item")).toHaveLength(2);
+    expect(screen.getByTestId("inbox-comment")).toBeInTheDocument();
+    expect(screen.getByTestId("inbox-automation-item")).toBeInTheDocument();
+
+    // The Done item stays first, disabled, so a repeat click can't reach the wider action.
+    openBulkMenu();
+    const items = await screen.findAllByRole("menuitem");
+    expect(items[0]).toHaveTextContent("Mark done as readNo completed sessions");
+    expect(items[0]).toHaveAttribute("aria-disabled", "true");
+    expect(items[1]).toHaveTextContent("Mark all as read2 errors and 1 comment");
+    fireEvent.keyDown(items[0]!, { key: "Escape" });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
+    expect(unreadKinds()).toEqual(expect.arrayContaining(["done", "error"]));
+  });
+
+  it("marks errors, comments and automation failures read from the menu, never prompts", async () => {
+    const { markManyRead } = renderBulkInbox();
+    await screen.findAllByTestId("inbox-item");
+
+    openBulkMenu();
+    const markAll = await screen.findByRole("menuitem", { name: /Mark all as read/ });
+    expect(markAll).toHaveTextContent("4 unread items, including 2 errors and 1 comment");
+    fireEvent.click(markAll);
+
+    await waitFor(() => expect(unreadKinds()).toEqual([]));
+    expect(markManyRead).toHaveBeenCalledWith(["run"]);
+    expect(getSeenCommentIds().has("cm_1")).toBe(true);
+    expect(screen.getAllByTestId("inbox-item")).toHaveLength(2);
+  });
+
+  it("offers decline only on tabs that show awaiting responses", async () => {
+    renderBulkInbox();
+    await screen.findAllByTestId("inbox-item");
+    selectTab("Unread");
+
+    openBulkMenu();
+    expect(await screen.findByRole("menuitem", { name: /Mark all as read/ })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Decline/ })).toBeNull();
+  });
+
+  it("declines the awaiting responses after confirming, reporting the ones that failed", async () => {
+    const toasts: unknown[] = [];
+    const onToast = (e: Event) => toasts.push((e as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    vi.mocked(sessionsApi.approve)
+      .mockResolvedValueOnce({} as Awaited<ReturnType<typeof sessionsApi.approve>>)
+      .mockRejectedValueOnce(new Error("refused"));
+    renderBulkInbox();
+    await screen.findAllByTestId("inbox-item");
+    selectTab("Awaiting response");
+
+    openBulkMenu();
+    const decline = await screen.findByRole("menuitem", { name: /Decline awaiting responses/ });
+    expect(decline).toHaveTextContent("2 requests waiting on you");
+    expect(screen.queryByRole("menuitem", { name: /as read/ })).toBeNull();
+    fireEvent.click(decline);
+    const dialog = screen.getByRole("dialog", { name: "Decline 2 awaiting responses?" });
+    expect(within(dialog).getAllByText("Approval Session")).toHaveLength(2);
+    expect(sessionsApi.approve).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Decline 2" }));
+
+    expect(sessionsApi.approve).toHaveBeenCalledWith("sess_approval", "eli_1", {
+      action: "decline",
+    });
+    expect(sessionsApi.approve).toHaveBeenCalledWith("sess_approval", "eli_2", {
+      action: "decline",
+    });
+    await waitFor(() =>
+      expect(toasts).toEqual([
+        "Declined 1 of 2 awaiting responses. 1 couldn’t be declined and is still listed.",
+      ]),
+    );
+  });
+
+  it("leaves a question with unsent answers out of bulk decline", async () => {
+    renderBulkInbox();
+    await screen.findAllByTestId("inbox-item");
+    act(() => saveAskUserQuestionDraft("eli_1", draftSignature, unsentDraft));
+
+    openBulkMenu();
+    const decline = await screen.findByRole("menuitem", { name: /Decline awaiting responses/ });
+    expect(decline).toHaveTextContent("1 request waiting on you");
+    fireEvent.click(decline);
+    fireEvent.click(screen.getByRole("button", { name: "Decline 1" }));
+
+    expect(sessionsApi.approve).toHaveBeenCalledOnce();
+    expect(sessionsApi.approve).toHaveBeenCalledWith("sess_approval", "eli_2", {
+      action: "decline",
+    });
+    expect(getAskUserQuestionDraft("eli_1", draftSignature)).toEqual(unsentDraft);
+  });
+
+  it("says bulk actions cover loaded items only while more are unloaded", async () => {
+    renderBulkInbox({ hasNextPage: true });
+    await screen.findAllByTestId("inbox-item");
+
+    openBulkMenu();
+    expect(await screen.findByText("Loaded items only")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Decline awaiting responses/ }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Only loaded items are included.");
+  });
+
+  it("declines a ready native prompt at its attempt and skips one already being delivered", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([conversation({ id: "sess_native", title: "Kiro Session" })]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_ready", "Run ls", {
+          native_delivery: { state: "ready", attempt: "first" },
+        }),
+        rawElicitation("eli_sending", "Run pwd", {
+          native_delivery: { state: "sending", attempt: "first", action: "accept" },
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+    await screen.findAllByTestId("inbox-item");
+    selectTab("Awaiting response");
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Inbox bulk actions" }), {
+      button: 0,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Decline awaiting responses/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Decline 1" }));
+
+    expect(sessionsApi.approve).toHaveBeenCalledOnce();
+    expect(sessionsApi.approve).toHaveBeenCalledWith("sess_native", "eli_ready", {
+      action: "decline",
+      _meta: { native_delivery_attempt: "first" },
+    });
   });
 });
 
