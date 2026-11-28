@@ -1662,6 +1662,50 @@ def github_changed_files(
     return pr_resource.pr_changed_files(root, session_id=session_id, pr_url=pr_url)
 
 
+# GitHub lists at most 3000 files and 250 commits for a PR, 100 per page.
+_PAGE_SIZE = 100
+_MAX_FILE_PAGES = 30
+_MAX_COMMIT_PAGES = 3
+
+
+def _api_pages(
+    root: str,
+    host_args: list[str],
+    endpoint: str,
+    *,
+    token: str | None,
+    max_pages: int,
+    failed: str,
+    invalid: str,
+) -> list[Any]:
+    """Every entry of a paged REST list, read page by page on the endpoint's own host.
+
+    ``gh api --paginate`` follows the server's ``Link`` URLs, to any host gh holds a token
+    for, so pages are asked for by number instead.
+
+    :raises ValueError: ``failed`` when a page can't be read, ``invalid`` when it isn't a list.
+    """
+    entries: list[Any] = []
+    for page in range(1, max_pages + 1):
+        rc, out, _ = _gh(
+            ["api", *host_args, f"{endpoint}?per_page={_PAGE_SIZE}&page={page}"],
+            cwd=root,
+            token=token,
+        )
+        if rc != 0:
+            raise ValueError(failed)
+        try:
+            rows = json.loads(out)
+        except ValueError:
+            raise ValueError(invalid) from None
+        if not isinstance(rows, list):
+            raise ValueError(invalid)
+        entries.extend(rows)
+        if len(rows) < _PAGE_SIZE:
+            break
+    return entries
+
+
 def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, Any]:
     """List the PR's changed files, straight from GitHub.
 
@@ -1681,32 +1725,15 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
         return empty
     repository = reference.repository if reference else "{owner}/{repo}"
     host_args = _host_args(root, reference) if reference else []
-    rc, out, _ = _gh(
-        [
-            "api",
-            *host_args,
-            "--paginate",
-            *(["--slurp"] if reference else []),
-            f"repos/{repository}/pulls/{number}/files?per_page=100",
-        ],
-        cwd=root,
+    entries = _api_pages(
+        root,
+        host_args,
+        f"repos/{repository}/pulls/{number}/files",
         token=token,
+        max_pages=_MAX_FILE_PAGES,
+        failed="GitHub could not load the PR's changed files. Refresh to retry.",
+        invalid="GitHub returned an invalid changed-file list. Refresh to retry.",
     )
-    if rc != 0:
-        raise ValueError("GitHub could not load the PR's changed files. Refresh to retry.")
-    try:
-        entries = json.loads(out)
-    except ValueError:
-        raise ValueError(
-            "GitHub returned an invalid changed-file list. Refresh to retry."
-        ) from None
-    if not isinstance(entries, list):
-        raise ValueError("GitHub returned an invalid changed-file list. Refresh to retry.")
-
-    if reference:
-        entries = [
-            entry for page in entries for entry in (page if isinstance(page, list) else [page])
-        ]
     data: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1897,26 +1924,15 @@ def _commit_payload(entry: dict[str, Any]) -> dict[str, Any]:
 
 def _pr_commit_entries(root: str, reference: PullRequestRef) -> list[dict[str, Any]]:
     """Fetch every commit page GitHub returns for the PR, oldest first."""
-    rc, out, _ = _gh(
-        [
-            "api",
-            *_host_args(root, reference),
-            "--paginate",
-            "--slurp",
-            f"repos/{reference.repository}/pulls/{reference.number}/commits?per_page=100",
-        ],
-        cwd=root,
+    entries = _api_pages(
+        root,
+        _host_args(root, reference),
+        f"repos/{reference.repository}/pulls/{reference.number}/commits",
         token=_pr_token(root, reference),
+        max_pages=_MAX_COMMIT_PAGES,
+        failed="GitHub could not load the PR's commits. Refresh to retry.",
+        invalid="GitHub returned an invalid commit list. Refresh to retry.",
     )
-    if rc != 0:
-        raise ValueError("GitHub could not load the PR's commits. Refresh to retry.")
-    try:
-        pages = json.loads(out)
-    except ValueError:
-        raise ValueError("GitHub returned an invalid commit list. Refresh to retry.") from None
-    if not isinstance(pages, list):
-        raise ValueError("GitHub returned an invalid commit list. Refresh to retry.")
-    entries = [entry for page in pages for entry in (page if isinstance(page, list) else [page])]
     return [
         _commit_payload(entry)
         for entry in entries

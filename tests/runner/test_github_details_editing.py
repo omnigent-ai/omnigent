@@ -1160,7 +1160,7 @@ _PINNED_READS = {
     ),
     "changed_files": (
         github._pr_changed_files_at_revision,
-        json.dumps([[{"filename": "a.py", "status": "modified"}]]),
+        json.dumps([{"filename": "a.py", "status": "modified"}]),
         {
             "object": "list",
             "data": [

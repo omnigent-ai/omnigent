@@ -82,10 +82,10 @@ elif len(args) == 2 and args[0] == "api" and re.fullmatch(
 ):
     print("[]")
 elif args == [
-    "api", "--hostname", "github.com", "--paginate", "--slurp",
-    "repos/example/project/pulls/42/files?per_page=100",
+    "api", "--hostname", "github.com",
+    "repos/example/project/pulls/42/files?per_page=100&page=1",
 ]:
-    print("[[]]")
+    print("[]")
 elif args == ["api", "--hostname", "github.com", "repos/example/project/pulls/42"]:
     print(json.dumps({"head": {"sha": pr["headRefOid"]}, "base": {"sha": pr["baseRefOid"]}}))
 elif args[:2] == ["pr", "diff"]:

@@ -1162,7 +1162,10 @@ def _stub_pr_commits(
         if argv[-1] == "repos/example/two/pulls/42":
             pr = {"head": {"sha": head}, "base": {"sha": _BASE}, "commits": total}
             return 0, json.dumps(pr), ""
-        return 0, json.dumps(pages), ""
+        if "&page=" not in argv[-1]:
+            return 0, json.dumps(pages), ""
+        page = int(argv[-1].rsplit("=", 1)[1])
+        return 0, json.dumps(pages[page - 1] if page <= len(pages) else []), ""
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
@@ -1173,8 +1176,10 @@ def test_github_pr_commits_list_oldest_first_with_title_and_author(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pages = [
-        [_commit_entry(_COMMIT_ONE, "  Add the feature \n\nLonger body")],
-        [_commit_entry(_COMMIT_TWO, "Fix typo")],
+        [
+            _commit_entry(_COMMIT_ONE, "  Add the feature \n\nLonger body"),
+            _commit_entry(_COMMIT_TWO, "Fix typo"),
+        ]
     ]
     calls = _stub_pr_commits(monkeypatch, head=_HEAD, total=2, pages=pages)
 
@@ -1200,9 +1205,9 @@ def test_github_pr_commits_list_oldest_first_with_title_and_author(
             },
         ],
     }
-    listing = next(call for call in calls if "--paginate" in call)
-    assert listing[-1] == "repos/example/two/pulls/42/commits?per_page=100"
-    assert "--slurp" in listing
+    listing = next(call for call in calls if "/commits?" in call[-1])
+    assert listing[-1] == "repos/example/two/pulls/42/commits?per_page=100&page=1"
+    assert "--paginate" not in listing
 
 
 def test_github_pr_commits_cap_at_250_keeping_the_first_in_order(
@@ -1217,6 +1222,80 @@ def test_github_pr_commits_cap_at_250_keeping_the_first_in_order(
     assert result["has_more"] is True
 
 
+def test_paged_lists_read_each_page_by_number_on_the_same_host_and_stop_at_a_short_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    sizes = {1: 100, 2: 100, 3: 7}
+
+    def fake_gh(argv: Sequence[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        page = int(argv[-1].rsplit("=", 1)[1])
+        return 0, json.dumps([{"filename": f"{page}-{index}"} for index in range(sizes[page])]), ""
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    entries = github_resource._api_pages(
+        "/root",
+        ["--hostname", "ghe.example.com"],
+        "repos/example/two/pulls/42/files",
+        token=None,
+        max_pages=30,
+        failed="failed",
+        invalid="invalid",
+    )
+
+    assert len(entries) == 207
+    assert calls == [
+        [
+            "api",
+            "--hostname",
+            "ghe.example.com",
+            f"repos/example/two/pulls/42/files?per_page=100&page={page}",
+        ]
+        for page in (1, 2, 3)
+    ]
+
+
+def test_paged_lists_stop_at_their_page_cap_and_never_use_gh_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_gh(argv: Sequence[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        return 0, json.dumps([{"sha": "x"}] * 100), ""
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    entries = github_resource._api_pages(
+        "/root", [], "repos/o/r/pulls/1/commits", token=None, max_pages=3, failed="f", invalid="i"
+    )
+
+    assert len(entries) == 300
+    assert len(calls) == 3
+    assert not any("--paginate" in call or "--slurp" in call for call in calls)
+    assert (github_resource._MAX_FILE_PAGES, github_resource._MAX_COMMIT_PAGES) == (30, 3)
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [((1, "", "boom"), "failed"), ((0, "not json", ""), "invalid"), ((0, "{}", ""), "invalid")],
+)
+def test_a_paged_list_page_that_fails_or_isnt_a_list_fails_the_whole_list(
+    monkeypatch: pytest.MonkeyPatch, answer: tuple[int, str, str], message: str
+) -> None:
+    monkeypatch.setattr(github_resource, "_gh", lambda *_args, **_kwargs: answer)
+    with pytest.raises(ValueError, match=message):
+        github_resource._api_pages(
+            "/root",
+            [],
+            "repos/o/r/pulls/1/files",
+            token=None,
+            max_pages=3,
+            failed="failed",
+            invalid="invalid",
+        )
+
+
 def test_github_pr_commits_refuse_a_moved_head_before_listing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1224,7 +1303,7 @@ def test_github_pr_commits_refuse_a_moved_head_before_listing(
 
     with pytest.raises(ValueError, match="pull request changed"):
         github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
-    assert not any(call[-1].endswith("/commits?per_page=100") for call in calls)
+    assert not any(call[-1].endswith("/commits?per_page=100&page=1") for call in calls)
 
 
 def test_github_pr_commits_refuse_a_head_that_moves_while_listing(
@@ -1240,14 +1319,14 @@ def test_github_pr_commits_refuse_a_head_that_moves_while_listing(
         if argv[-1] == "repos/example/two/pulls/42":
             pr = {"head": {"sha": next(heads)}, "base": {"sha": _BASE}, "commits": 1}
             return 0, json.dumps(pr), ""
-        return 0, json.dumps([[_commit_entry(_COMMIT_ONE, "Add")]]), ""
+        return 0, json.dumps([_commit_entry(_COMMIT_ONE, "Add")]), ""
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
 
     with pytest.raises(ValueError, match="pull request changed"):
         github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
-    assert any(call[-1].endswith("/commits?per_page=100") for call in calls)
+    assert any(call[-1].endswith("/commits?per_page=100&page=1") for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -1293,7 +1372,7 @@ def _stub_commits_with_heads(
             assert timeout is not None and timeout <= 5
             return graphql
         entries = [_commit_entry(_COMMIT_ONE, "Parent work"), _commit_entry(_HEAD, "Own work")]
-        return 0, json.dumps([entries]), ""
+        return 0, json.dumps(entries), ""
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
@@ -1345,8 +1424,8 @@ def _stub_commit_patch(
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
         calls.append(list(argv))
-        if argv[-1].endswith("/commits?per_page=100"):
-            return 0, json.dumps([[_commit_entry(sha, "Commit") for sha in listed]]), ""
+        if argv[-1].endswith("/commits?per_page=100&page=1"):
+            return 0, json.dumps([_commit_entry(sha, "Commit") for sha in listed]), ""
         return patch_response
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
@@ -1414,8 +1493,8 @@ def _stub_compare(
         if endpoint == "repos/example/two/pulls/42":
             last_head = next(head_answers, last_head)
             return 0, json.dumps({"head": {"sha": last_head}, "base": {"sha": _BASE}}), ""
-        if endpoint.endswith("/commits?per_page=100"):
-            return 0, json.dumps([[_commit_entry(sha, "Commit") for sha in listed]]), ""
+        if endpoint.endswith("/commits?per_page=100&page=1"):
+            return 0, json.dumps([_commit_entry(sha, "Commit") for sha in listed]), ""
         if "/compare/" in endpoint:
             return compare_rc, "" if compare_rc else "diff --git a/x b/x\n", ""
         raise AssertionError(f"unexpected gh call: {argv}")

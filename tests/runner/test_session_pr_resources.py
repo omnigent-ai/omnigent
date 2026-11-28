@@ -92,7 +92,7 @@ def test_explicit_repo_is_used_for_all_pr_reads(
         "--json",
         github._PR_STATUS_FIELDS,
     ]
-    assert calls[2][-1] == "repos/example/two/pulls/42/files?per_page=100"
+    assert calls[2][-1] == "repos/example/two/pulls/42/files?per_page=100&page=1"
     assert calls[3][-2:] == ["-R", "github.com/example/two"]
 
 
@@ -570,9 +570,15 @@ async def test_changes_route_pins_revision_and_reports_truncation(
         if args[-1] == "repos/example/two/pulls/42":
             pr = {"head": {"sha": head}, "base": {"sha": base}, "changed_files": 3001}
             return 0, json.dumps(pr), ""
-        assert args[-1] == "repos/example/two/pulls/42/files?per_page=100"
-        page = [{"filename": f"f{index}.py", "status": "added"} for index in range(3000)]
-        return 0, json.dumps([page]), ""
+        endpoint, page = args[-1].rsplit("&page=", 1)
+        assert endpoint == "repos/example/two/pulls/42/files?per_page=100"
+        # GitHub lists at most 3000 files: 30 full pages.
+        assert 1 <= int(page) <= 30
+        start = (int(page) - 1) * 100
+        rows = [
+            {"filename": f"f{index}.py", "status": "added"} for index in range(start, start + 100)
+        ]
+        return 0, json.dumps(rows), ""
 
     monkeypatch.setattr(github, "_gh", gh)
     app = create_runner_app(
@@ -629,15 +635,13 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
     head, commit = "a" * 40, "c" * 40
     pr = {"head": {"sha": head}, "base": {"sha": "b" * 40}, "commits": 1}
     listing = [
-        [
-            {
-                "sha": commit,
-                "commit": {
-                    "message": "Fix the thing\n\nDetails",
-                    "author": {"name": "Ada", "date": "2026-11-01T10:00:00Z"},
-                },
-            }
-        ]
+        {
+            "sha": commit,
+            "commit": {
+                "message": "Fix the thing\n\nDetails",
+                "author": {"name": "Ada", "date": "2026-11-01T10:00:00Z"},
+            },
+        }
     ]
     gh_args: list[list[str]] = []
 
@@ -645,7 +649,7 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
         gh_args.append(args)
         if args[-1] == "repos/example/two/pulls/42":
             return 0, json.dumps(pr), ""
-        if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
+        if args[-1] == "repos/example/two/pulls/42/commits?per_page=100&page=1":
             return 0, json.dumps(listing), ""
         if args[-1] == f"repos/example/two/compare/{commit}...{head}":
             return 0, "compare-patch", ""
@@ -1694,10 +1698,12 @@ def test_default_selection_matches_metadata_and_all_pages(
         if args[:2] == ["pr", "diff"]:
             assert args[-1] == "github.com/example/one"
             return 0, "first", ""
-        assert "--slurp" in args
-        assert args[-1].startswith("repos/example/one/pulls/42/")
-        return 0, json.dumps([[{"filename": "a.py"}], [{"filename": "b.py"}]]), ""
+        assert "--paginate" not in args
+        assert args[-1].startswith("repos/example/one/pulls/42/files?per_page=1&page=")
+        pages = {"1": [{"filename": "a.py"}], "2": [{"filename": "b.py"}], "3": []}
+        return 0, json.dumps(pages[args[-1].rsplit("=", 1)[1]]), ""
 
+    monkeypatch.setattr(github, "_PAGE_SIZE", 1)
     monkeypatch.setattr(github, "_gh", gh)
     monkeypatch.setattr(
         github, "_git", lambda *_a, **_kw: pytest.fail("unexpected checkout inference")
@@ -1764,7 +1770,7 @@ def test_enterprise_host_signed_in_only_when_named_can_attach_and_read(
         assert args[:3] == ["api", "--hostname", "github.example.org"], args
         if "graphql" in args:
             return 1, "", "not needed"
-        return 0, json.dumps([[{"filename": "enterprise.py", "status": "added"}]]), ""
+        return 0, json.dumps([{"filename": "enterprise.py", "status": "added"}]), ""
 
     monkeypatch.setattr(github, "_gh", gh)
     info = github.update_session_pr(str(tmp_path), "session", url, "attach")

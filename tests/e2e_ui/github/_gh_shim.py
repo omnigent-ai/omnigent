@@ -70,7 +70,7 @@ if args[:1] == ["api"] and len(args) > 1 and re.fullmatch(
            "base": {"repo": {"full_name": repo}}}
     finish(0, json.dumps([row]))
 if args[:1] == ["api"] and args[-1].startswith(f"repos/{repo}/pulls/{pr['number']}/files"):
-    finish(0, "[[]]" if "--slurp" in args else "[]")
+    finish(0, "[]")
 finish(1, err="gh shim: unexpected command " + json.dumps(args))
 """
 

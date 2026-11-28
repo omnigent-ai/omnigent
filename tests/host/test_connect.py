@@ -11912,10 +11912,10 @@ def test_github_commit_ops_are_served_on_host(
         if argv[-1] == "repos/example/one/pulls/42":
             pr = {"head": {"sha": head}, "base": {"sha": "b" * 40}, "commits": 1}
             return 0, json.dumps(pr), ""
-        if "--paginate" in argv:
+        if "/commits?" in argv[-1]:
             author = {"name": "Ada", "date": "2026-11-01T10:00:00Z"}
             entries = [{"sha": commit, "commit": {"message": "Fix", "author": author}}]
-            return 0, json.dumps([entries]), ""
+            return 0, json.dumps(entries), ""
         if "/compare/" in argv[-1]:
             return 0, "compare-patch", ""
         if "graphql" in argv:
