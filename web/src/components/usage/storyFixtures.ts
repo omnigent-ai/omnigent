@@ -1,4 +1,4 @@
-import type { SessionUsage } from "@/lib/usageApi";
+import type { ProjectCost, SessionUsage } from "@/lib/usageApi";
 
 export const usageStoryNow = new Date("2026-03-10T12:00:00Z");
 
@@ -14,6 +14,8 @@ export const usageStorySessions: SessionUsage[] = [
     otherHarnesses: ["opencode", "gemini-cli"],
     llmModel: null,
     agentName: null,
+    projectId: "proj-api",
+    projectName: "API refactor",
   },
   {
     id: "conversation-alpha",
@@ -26,6 +28,8 @@ export const usageStorySessions: SessionUsage[] = [
     otherHarnesses: null,
     llmModel: null,
     agentName: null,
+    projectId: "proj-api",
+    projectName: "API refactor",
   },
   {
     id: "conversation-gamma",
@@ -42,6 +46,8 @@ export const usageStorySessions: SessionUsage[] = [
     otherHarnesses: null,
     llmModel: null,
     agentName: null,
+    projectId: null,
+    projectName: null,
   },
   {
     id: "conversation-delta",
@@ -54,5 +60,22 @@ export const usageStorySessions: SessionUsage[] = [
     otherHarnesses: null,
     llmModel: null,
     agentName: null,
+    projectId: null,
+    projectName: null,
+  },
+];
+
+export const usageStoryProjects: ProjectCost[] = [
+  {
+    projectId: "proj-api",
+    projectName: "API refactor",
+    costUsd: 141.24,
+    sessionCount: 2,
+  },
+  {
+    projectId: null,
+    projectName: null,
+    costUsd: 7.504,
+    sessionCount: 2,
   },
 ];
