@@ -19,6 +19,8 @@ from omnigent.harnesses.claude_native.bridge import (
     TranscriptReadResult,
     record_hook_event,
 )
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_item_request,
     _get_recorded_request,
@@ -136,7 +138,25 @@ async def test_forwarder_start_at_end_uses_byte_offset_for_new_lines(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_migrates_line_cursor_state_to_byte_offset(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("metadata", "cancel"),
+    [(None, False)]
+    + [
+        (name, cancel)
+        for name in (
+            "transcript_forwarder.json",
+            "subagent_forwarder.json",
+            "message_deltas_forwarder.json",
+        )
+        for cancel in (False, True)
+    ],
+)
+async def test_forwarder_migrates_line_cursor_state_to_byte_offset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: str | None,
+    cancel: bool,
+) -> None:
     """
     Old transcript forwarder state gains a byte cursor after one poll.
 
@@ -189,6 +209,24 @@ async def test_forwarder_migrates_line_cursor_state_to_byte_offset(tmp_path: Pat
         ),
         encoding="utf-8",
     )
+    reading = threading.Event()
+    release = threading.Event()
+    finished_reading = threading.Event()
+    safety_released = threading.Event()
+    read_text = Path.read_text
+
+    def held_read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if metadata is not None and path == bridge_dir / metadata and not reading.is_set():
+            reading.set()
+            if not release.wait(budget(5)):
+                safety_released.set()
+            try:
+                return read_text(path, *args, **kwargs)
+            finally:
+                finished_reading.set()
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", held_read)
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
@@ -203,12 +241,27 @@ async def test_forwarder_migrates_line_cursor_state_to_byte_offset(tmp_path: Pat
         )
     )
     try:
+        if metadata is not None:
+            await poll_until_async(reading.is_set, timeout_s=budget(2))
+            assert not safety_released.is_set(), "startup cursor reads blocked the event loop"
+            assert server.requests.empty()
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=budget(2))
+                release.set()
+                await poll_until_async(finished_reading.is_set, timeout_s=budget(2))
+                assert server.requests.empty()
+                assert task.cancelled()
+                return
+            release.set()
         request = await _get_recorded_item_request(server)
         state = await _wait_for_json_state(
             bridge_dir / "transcript_forwarder.json",
             lambda payload: payload.get("line_cursor") == 2 and "byte_offset" in payload,
         )
     finally:
+        release.set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
