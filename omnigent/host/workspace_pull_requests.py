@@ -126,6 +126,7 @@ def _set_account(
         remote=None,
         session_id=call.session_id,
         pr_url=request.pr_url,
+        account_rights=call.account_rights,
     )
 
 
@@ -225,7 +226,7 @@ _MERGE_QUEUE_OPS: dict[str, PullRequestOp] = {
 
 PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "GetPullRequest": lambda reader, call, request: reader.github_info(
-        call.session_id, _url(request)
+        call.session_id, _url(request), account_rights=call.account_rights
     ),
     "ListPullRequestFiles": lambda reader, call, request: reader.github_changes(
         call.session_id,

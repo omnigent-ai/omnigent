@@ -168,3 +168,31 @@ def test_a_page_without_data_stays_empty() -> None:
         "warning": "x",
         "data": [],
     }
+
+
+@pytest.mark.parametrize("viewer", [PullRequestViewer.EDITOR, PullRequestViewer.VIEWER])
+def test_anyone_else_reads_the_overviews_comments_without_the_accounts_rights(
+    viewer: PullRequestViewer,
+) -> None:
+    """Even from a host that sends them unasked, as an older or a forked host may."""
+    info = {"object": "session.github.info", "pr": {"number": 7, "comments": [_comment(), "x"]}}
+    shown = info_for_viewer(info, viewer)
+
+    [comment, unexpected] = shown["pr"]["comments"]
+    assert comment == {
+        **_comment(),
+        "reactions": [{"content": "EYES", "count": 3, "viewer_reacted": False}],
+        "can_react": False,
+        "can_update": False,
+        "can_delete": False,
+        "viewer_did_author": False,
+    }
+    assert unexpected == "x"
+    assert shown["pr"]["number"] == 7
+    assert info["pr"]["comments"][0] == _comment()
+
+
+@pytest.mark.parametrize("pr", [None, {"number": 7}, {"number": 7, "comments": None}])
+def test_an_overview_without_comments_keeps_its_pr_as_it_was(pr: object) -> None:
+    shown = info_for_viewer({"object": "session.github.info", "pr": pr}, PullRequestViewer.VIEWER)
+    assert shown["pr"] == pr

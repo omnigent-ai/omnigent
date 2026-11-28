@@ -47,6 +47,7 @@ from typing import NotRequired, TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import PagedList, paginate_in_memory
+from omnigent.runner import github_review_fields as review_fields
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -761,17 +762,20 @@ class WorkspaceReader:
     # the git provider's CLI or API (``gh`` for GitHub).
 
     def github_info(
-        self, session_id: str | None = None, pr_url: str | None = None
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        account_rights: bool = False,
     ) -> _WorkspacePayload:
-        """PR context for an explicit session PR or the workspace branch."""
-        return cast(
-            "_WorkspacePayload",
-            pr_resource.pr_info(
-                str(self._root),
-                session_id=session_id,
-                pr_url=pr_url,
-            ),
-        )
+        """PR context for an explicit session PR or the workspace branch.
+
+        :param account_rights: Whether the server asked for the host account's comment rights.
+        """
+        info = pr_resource.pr_info(str(self._root), session_id=session_id, pr_url=pr_url)
+        if not account_rights:
+            info = review_fields.info_without_account_rights(info)
+        return cast("_WorkspacePayload", info)
 
     def github_review_threads(
         self,

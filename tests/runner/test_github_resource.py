@@ -1726,8 +1726,7 @@ def test_github_info_includes_body_and_comments(
             assert "pushedDate" not in query
             assert "afterCommit { oid url }" in query
             assert argv[argv.index("--cache") + 1] == "30s"
-            assert "includeComments=false" in argv
-            assert "comments(last: 100) @include(if: $includeComments)" in query
+            assert "viewerCanUpdate viewerCanDelete viewerDidAuthor" in query
             return (
                 0,
                 json.dumps({"data": {"repository": {"pullRequest": {"timelineItems": timeline}}}}),
@@ -2131,7 +2130,10 @@ def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
 @pytest.mark.parametrize("failure", [None, "api", "enterprise_auth", "invalid_json"])
 def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatch, failure):
     old = [{"body": f"old-{i}", "createdAt": "2026-01-01"} for i in range(100)]
-    latest = [{"body": f"new-{i}", "createdAt": "2026-10-26"} for i in range(100)]
+    latest = [
+        {"id": f"IC_{i}", "body": f"new-{i}", "createdAt": "2026-10-26", **_RIGHTS}
+        for i in range(100)
+    ]
     calls = []
     host = "ghe.example.com" if failure == "enterprise_auth" else "github.com"
     monkeypatch.setattr(github_resource, "_list_accounts", lambda _root: (False, []))
@@ -2192,13 +2194,15 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
         return
     assert calls[1][0][:4] == ["api", "--hostname", "github.com", "graphql"]
     assert "--cache" not in calls[1][0]
-    assert "includeComments=true" in calls[1][0]
     assert "number=17" in calls[1][0]
     assert calls[1][1]["token"] == "selected-token"
     assert github_resource._comments_payload(data)["comments_partial"] is True
     shaped = github_resource._shape_comments(old + latest)
     assert len(shaped) == 100
     assert shaped[-1]["body"] == "new-99"
+    # The busy tail's IDs and the account's rights come from the same read.
+    assert shaped[-1]["id"] == "IC_99"
+    assert shaped[-1]["can_update"] is True
 
 
 @pytest.mark.parametrize("fields", ["title,url", "reviewRequests,latestReviews"])
@@ -2245,3 +2249,161 @@ def test_head_repository_url(
 ) -> None:
     reference = PullRequestRef.from_url(pr_url)
     assert github_resource._head_repository_url(reference, head, owner) == expected
+
+
+def _conversation_read(
+    monkeypatch: pytest.MonkeyPatch, *, listed: list[dict], latest: list[dict]
+) -> dict:
+    """The overview's comments for a PR whose ``gh`` view lists ``listed`` and whose GraphQL
+    conversation read answers ``latest``."""
+    url = "https://github.com/o/r/pull/8"
+    queries: list[list[str]] = []
+
+    def gh(argv: Sequence[str], **_kwargs: object) -> tuple[int, str, str]:
+        if list(argv[:2]) == ["pr", "view"]:
+            return 0, json.dumps({"url": url, "comments": listed, "reviews": []}), ""
+        if "graphql" in argv:
+            queries.append(list(argv))
+            pull_request = {
+                "comments": {"nodes": latest},
+                "timelineItems": {"nodes": [], "pageInfo": {"hasPreviousPage": False}},
+            }
+            return 0, json.dumps({"data": {"repository": {"pullRequest": pull_request}}}), ""
+        return 1, "", "no stub"
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    monkeypatch.setattr(github_resource, "_list_accounts", lambda _root: (False, []))
+    data = github_resource._gh_pr_view(["8"], "url,comments,reviews", cwd="/workspace", token=None)
+    assert data is not None
+    assert len(queries) == 1
+    return {"query": queries[0], "comments": github_resource._comments_payload(data)["comments"]}
+
+
+def test_a_changed_conversation_is_read_past_ghs_cache_until_its_copy_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a comment or reaction change, gh's cached read would undo it for up to 30s."""
+    url = "https://github.com/o/r/pull/8"
+    now = [1000.0]
+    monkeypatch.setattr(github_resource, "_CHANGED_CONVERSATIONS", {})
+    monkeypatch.setattr(github_resource.time, "monotonic", lambda: now[0])
+
+    def read() -> list[str]:
+        return _conversation_read(monkeypatch, listed=[], latest=[])["query"]
+
+    assert "--cache" in read()
+    github_resource.conversation_changed(url)
+    github_resource.conversation_changed("https://github.com/o/r/pull/9")
+    assert "--cache" not in read()
+    now[0] += 29.9
+    assert "--cache" not in read()
+    now[0] += 0.2
+    assert "--cache" in read()
+    # An expired mark is dropped once read, so marks don't pile up.
+    assert list(github_resource._CHANGED_CONVERSATIONS) == ["https://github.com/o/r/pull/9"]
+
+
+def test_marking_a_changed_conversation_drops_the_expired_marks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The table stays bounded by what changed in the last 30s, even when nothing reads it."""
+    now = [1000.0]
+    monkeypatch.setattr(github_resource, "_CHANGED_CONVERSATIONS", {})
+    monkeypatch.setattr(github_resource.time, "monotonic", lambda: now[0])
+    github_resource.conversation_changed("https://github.com/o/r/pull/1")
+    now[0] += 10
+    github_resource.conversation_changed("https://github.com/o/r/pull/2")
+    now[0] += 25
+    github_resource.conversation_changed("https://github.com/o/r/pull/3")
+    assert list(github_resource._CHANGED_CONVERSATIONS) == [
+        "https://github.com/o/r/pull/2",
+        "https://github.com/o/r/pull/3",
+    ]
+
+
+_RIGHTS = {
+    "viewerCanReact": True,
+    "viewerCanUpdate": True,
+    "viewerCanDelete": False,
+    "viewerDidAuthor": True,
+    "reactionGroups": [
+        {"content": "THUMBS_UP", "viewerHasReacted": True, "reactors": {"totalCount": 2}},
+        {"content": "EYES", "viewerHasReacted": False, "reactors": {"totalCount": 0}},
+    ],
+}
+
+
+def test_conversation_comments_carry_their_ids_reactions_and_the_accounts_rights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each listed comment keeps gh's fresher text, and gains what GitHub's read says of it."""
+    anchor = "https://github.com/o/r/pull/8#issuecomment-"
+    listed = [
+        {
+            "id": "IC_1",
+            "author": {"login": "amy"},
+            "body": "edited just now",
+            "createdAt": "2026-11-01T00:00:00Z",
+            "url": anchor + "501",
+            "isMinimized": False,
+        },
+        # Posted after the cached conversation read: it has an ID, but nothing GitHub says of it.
+        {
+            "id": "IC_2",
+            "author": {"login": "bo"},
+            "body": "new",
+            "createdAt": "2026-11-02T00:00:00Z",
+            "url": anchor + "502",
+            "isMinimized": False,
+        },
+    ]
+    latest = [{**listed[0], "body": "before the edit", **_RIGHTS}]
+    read = _conversation_read(monkeypatch, listed=listed, latest=latest)
+    assert "--cache" in read["query"]
+    assert read["comments"] == [
+        {
+            "author": "amy",
+            "body": "edited just now",
+            "created_at": "2026-11-01T00:00:00Z",
+            "url": anchor + "501",
+            "id": "IC_1",
+            "database_id": 501,
+            "reactions": [{"content": "THUMBS_UP", "count": 2, "viewer_reacted": True}],
+            "can_react": True,
+            "can_update": True,
+            "can_delete": False,
+            "viewer_did_author": True,
+        },
+        {
+            "author": "bo",
+            "body": "new",
+            "created_at": "2026-11-02T00:00:00Z",
+            "url": anchor + "502",
+            "id": "IC_2",
+            "database_id": 502,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("anchor", "expected"),
+    [
+        ("1", 1),
+        ("9007199254740991", 9007199254740991),
+        ("9" * 19, None),
+        ("1" * 20, None),
+        ("0", None),
+        ("12a", None),
+    ],
+)
+def test_a_conversation_comments_number_comes_only_from_a_bounded_anchor(
+    anchor: str, expected: int | None
+) -> None:
+    """An anchor too long or too large for an exact ID names no comment."""
+    url = f"https://github.com/o/r/pull/8#issuecomment-{anchor}"
+    assert github_resource._issue_comment_number(url) == expected
+
+
+@pytest.mark.parametrize("url", [None, 5, "https://github.com/o/r/pull/8"])
+def test_a_conversation_comment_without_an_anchor_has_no_number(url: object) -> None:
+    assert github_resource._issue_comment_number(url) is None

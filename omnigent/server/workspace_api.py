@@ -53,6 +53,7 @@ from omnigent.host.workspace_pull_request_input import (
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.pull_request_viewers import (
     PullRequestViewer,
+    info_for_viewer,
     review_comments_for_viewer,
     review_threads_for_viewer,
 )
@@ -118,6 +119,8 @@ PULL_REQUEST_FAILURE_REASONS = frozenset(
 )
 # The reads whose answer the server shapes for who reads it: the host account's rights.
 _VIEWER_SHAPES: dict[str, Callable[[dict[str, Any], PullRequestViewer], dict[str, Any]]] = {
+    "GetPullRequest": info_for_viewer,
+    "SetPullRequestAccount": info_for_viewer,
     "ListReviewThreads": review_threads_for_viewer,
     "ListReviewThreadComments": review_comments_for_viewer,
 }
@@ -278,19 +281,21 @@ class HostWorkspaceService(WorkspaceServiceMethods):
             request,
             session_id=route.session_id,
             vouch=vouch,
-            # The host sends its account's rights in a review read only when asked.
+            # The host sends its account's rights in a review read or overview only when asked.
             account_rights=shape is not None and owner,
             unconfirmed=_unconfirmed_change(method.name) if changes else None,
             timeout=_reply_timeout(method.name, changes=changes),
         )
         # Every pull request response is one ``payload`` Struct, the REST route's JSON.
         response: Any = method.response_type.FromString(message)
-        if shape is not None and not owner:
-            shaped = shape(payload_dict(response.payload), route.viewer)
-            return method.response_type(payload=payload_struct(shaped))
-        if method.name not in _OVERVIEW_METHODS:
+        if method.name not in _OVERVIEW_METHODS and (shape is None or owner):
             return response
-        payload = await route.overview(payload_dict(response.payload), sent_at)
+        payload = payload_dict(response.payload)
+        if method.name in _OVERVIEW_METHODS:
+            payload = await route.overview(payload, sent_at)
+        # Trimmed last, so nothing the server swaps in carries the account's rights.
+        if shape is not None and not owner:
+            payload = shape(payload, route.viewer)
         return method.response_type(payload=payload_struct(payload))
 
     def _check_served(self, method: WorkspaceMethod) -> None:

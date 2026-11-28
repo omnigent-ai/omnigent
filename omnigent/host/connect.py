@@ -4586,7 +4586,12 @@ class HostProcess:
                 limit=_coerce_int(params.get("limit", 500)),
             )
         if op == "github_info":
-            return r.github_info(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_info(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                # Only a server that hides them from all but the owner asks for them.
+                account_rights=params.get("account_rights") is True,
+            )
         if op == "github_review_threads":
             return r.github_review_threads(
                 session_id,

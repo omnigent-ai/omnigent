@@ -3585,7 +3585,11 @@ async def test_only_a_github_info_poll_lets_the_runner_answer_from_its_previous_
     plain = await client.get(path)
 
     assert (polled.status_code, plain.status_code) == (200, 200)
-    assert runner.get_params == [{"allow_cached": True}, None]
+    # With permissions off both reads are the owner's, so both ask for the account's rights.
+    assert runner.get_params == [
+        {"allow_cached": True, "account_rights": True},
+        {"account_rights": True},
+    ]
 
 
 @pytest.mark.asyncio
@@ -3740,16 +3744,25 @@ async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
     runner = _FakeRunnerClient(payload=_pr_info())
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
     path = f"/v1/sessions/{_PR_SESSION}/resources/github"
+
+    def vouched() -> dict[str, Any]:
+        # The vouch alone: with permissions off every read is the owner's, asking for its rights.
+        return {
+            key: value
+            for key, value in (runner.get_params[-1] or {}).items()
+            if key != "account_rights"
+        }
+
     # The first read imports the host's list; until then the host's own list decides.
     await pr_client.get(path)
-    assert runner.get_params[-1] is None
+    assert vouched() == {}
 
     # Unlinked offline, the PR stays unlinked though the host still reports and selects it.
     set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
     await pr_client.delete(f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR})
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
     refreshed = await pr_client.get(path)
-    assert runner.get_params[-1] == {"server_tracked": True, "default_pr_url": _SECOND_PR}
+    assert vouched() == {"server_tracked": True, "default_pr_url": _SECOND_PR}
     assert [pr["url"] for pr in refreshed.json()["prs"]] == [_SECOND_PR]
     assert "selected_pr_url" not in refreshed.json()
 
@@ -3764,10 +3777,10 @@ async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
     assert linked.status_code == 200, linked.text
     assert [pr["url"] for pr in linked.json()["prs"]] == [_FIRST_PR, _SECOND_PR]
     await pr_client.get(path, params={"pr_url": _FIRST_PR})
-    assert runner.get_params[-1] == {"pr_url": _FIRST_PR, "server_tracked": True}
+    assert vouched() == {"pr_url": _FIRST_PR, "server_tracked": True}
     labels = await pr_client.get(f"{path}/labels", params={"pr_url": _FIRST_PR})
     assert labels.status_code == 200, labels.text
-    assert runner.get_params[-1] == {"pr_url": _FIRST_PR, "server_tracked": True}
+    assert vouched() == {"pr_url": _FIRST_PR, "server_tracked": True}
 
     # Online, an unlink also reaches the runner, so its own list stops reporting the PR.
     await pr_client.delete(f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR})
@@ -3905,6 +3918,8 @@ async def test_background_pr_refreshes_and_plain_reads_ask_the_runner_for_a_fres
     ]
     assert len(github_reads) == 2
     assert all("allow_cached" not in params for params in github_reads)
+    # With permissions off the plain read is the owner's; the refresh has no caller to ask for.
+    assert [params.get("account_rights") for params in github_reads] == [None, True]
 
 
 @pytest.mark.asyncio
