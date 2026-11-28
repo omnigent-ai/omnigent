@@ -24,6 +24,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
   useProjects: () => ({ data: [] }),
+  isAbortTimeout: () => false,
 }));
 
 beforeEach(() => {

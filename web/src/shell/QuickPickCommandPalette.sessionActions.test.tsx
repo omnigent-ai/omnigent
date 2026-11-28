@@ -51,6 +51,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     useConversations: (...args: unknown[]) => useConversations(...args),
     useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
     useProjects: () => ({ data: [] }),
+    isAbortTimeout: () => false,
     isSessionDeleting,
     PINNED_CONVERSATIONS_KEY,
   };
